@@ -1,0 +1,2 @@
+FROM ev-nix
+RUN curl -fsSL https://get.jetify.com/devbox | bash -s -- -f && devbox version

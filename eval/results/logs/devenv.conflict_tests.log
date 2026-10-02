@@ -1,0 +1,24 @@
+• Validating lock
+✓ Validating lock in 3.76ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring shell
+• Configuring cachix
+✓ Configuring cachix in 1.42ms
+• Evaluating shell
+✓ Evaluating shell in 2.43ms (cached)
+✓ Configuring shell in 6.02ms
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 287µs (cached)
+✓ Loading tasks in 1.11ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 3.27ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 2.87ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 250ns (no command)
+✓ Running tasks in 6.31ms
+✨ devenv 2.3.1 is out of date. Please update to 2.4.0: https://devenv.sh/getting-started/#installation
+...                                                                      [100%]
+3 passed in 0.24s

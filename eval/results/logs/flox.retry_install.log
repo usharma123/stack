@@ -1,0 +1,7 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+14:44:05.923  WARN flox_rust_sdk::providers::buildenv: buildenv.nix failed: paths present on filesystem but not registered in Nix store — force-registering and retrying null_paths=["/nix/store/3677bfwiaibp0fs0dxijmn8bsmkx31vx-go-1.26.8"] attempt=1 MAX_RETRIES=3
+✔ 'go' installed to environment 'proj'
+! Your manifest has changes that may require running 'flox services restart'.
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+14:44:11.479  WARN flox::utils::detect_shell: Failed to detect shell from environment or parent process. Defaulting to bash
+go version go1.26.8 linux/arm64

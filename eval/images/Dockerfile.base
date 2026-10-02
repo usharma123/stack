@@ -1,0 +1,7 @@
+FROM buildpack-deps:noble-curl
+# Container network here only allows 443, so use HTTPS apt mirrors
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources \
+ && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      git xz-utils sudo procps psmisc iproute2 netcat-openbsd jq bc less file \
+ && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash agent && echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent

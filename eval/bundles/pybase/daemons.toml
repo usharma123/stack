@@ -1,0 +1,9 @@
+[daemons.postgres]
+preset = "postgres"
+version = "17"
+port = "auto"
+
+[daemons.redis]
+preset = "redis"
+version = "8"
+port = "auto"

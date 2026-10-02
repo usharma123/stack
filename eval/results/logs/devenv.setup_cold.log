@@ -1,0 +1,671 @@
+• Validating lock
+• Downloading https://github.com/cachix/devenv/archive/fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4.tar.gz
+✓ Downloading https://github.com/cachix/devenv/archive/fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4.tar.gz in 3.14s
+• Downloading https://github.com/cachix/devenv-nixpkgs/archive/c2f38fe7f9e04d9aadd354d380f2bd40531d9737.tar.gz
+✓ Downloading https://github.com/cachix/devenv-nixpkgs/archive/c2f38fe7f9e04d9aadd354d380f2bd40531d9737.tar.gz in 309ms
+✓ Validating lock in 4.81s
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring shell
+• Downloading https://github.com/NixOS/nixpkgs/archive/c7def046b9a883d46974757852106483d741586f.tar.gz
+✓ Downloading https://github.com/NixOS/nixpkgs/archive/c7def046b9a883d46974757852106483d741586f.tar.gz in 2.79s
+• Configuring cachix
+• Downloading https://cache.nixos.org/nix-cache-info
+✓ Downloading https://cache.nixos.org/nix-cache-info in 310ms
+• Downloading https://install.determinate.systems/nix-cache-info
+✓ Downloading https://install.determinate.systems/nix-cache-info in 204ms
+• Downloading https://devenv.cachix.org/nix-cache-info
+✓ Downloading https://devenv.cachix.org/nix-cache-info in 291ms
+✓ Configuring cachix in 1.58s
+• Evaluating shell
+• Downloading bash-5.3p15
+• Downloading https://cache.nixos.org/nar/16p9m2wii30l314xix30p39a5ww5nard3mlx5hvlp2rvihsd6gag.nar.zst
+• Downloading xz-5.8.3-bin
+• Downloading https://cache.nixos.org/nar/0l6dr876jmrzqwv7rim51krzvcxqsyd52k4al4rni88cd91hwy4i.nar.zst
+• Downloading gnugrep-3.12
+• Downloading file-5.48
+• Downloading gnumake-4.4.1
+• Downloading https://cache.nixos.org/nar/09ipahap0pvsbhadkjgk16a258l4f97pbl2av05s53psx72lq377.nar.zst
+• Downloading gzip-1.14
+• Downloading patchelf-0.15.2
+• Downloading https://cache.nixos.org/nar/1frimzflmvyappjylbihq8wk8vqgm4my94vr8fcmxrwqbb5kkghv.nar.zst
+• Downloading https://cache.nixos.org/nar/0wwig0dk7ypx7854bmj782f787295mawj4rmchb0v0vv1z8553rv.nar.zst
+• Downloading https://cache.nixos.org/nar/094afngnyjrx337m8g4hvxwb4lwcipxfh8xvbjmm57vffsq1j3b3.nar.zst
+• Downloading gnused-4.10
+• Downloading https://cache.nixos.org/nar/005gmcbwxp80sl65qajz10z75nv3wmzbj7frbayqma40rsqhl3l5.nar.zst
+• Downloading https://cache.nixos.org/nar/1557l6knwpjws9f672gyhgpq716fkhppkbib6xz2g997iqhqz1kh.nar.zst
+• Downloading bzip2-1.0.8-bin
+• Downloading gawk-5.4.1
+• Downloading gnutar-1.35
+• Downloading https://cache.nixos.org/nar/1a1hk33irrc8qi60d7ga7xm2i6dw5x34nl768gp3a9jjwmmkyawk.nar.zst
+• Downloading https://cache.nixos.org/nar/1kws5ksjnmr56zn1d6vzgdl8qaga6217y4zc3x05q3l97ldmxhg4.nar.zst
+• Downloading https://cache.nixos.org/nar/0b075jc2gmplpkazp04zgrbpsn9fsrvg73acbncl93azfmxg031y.nar.zst
+• Downloading ed-1.22.6
+• Downloading attr-2.6.0
+• Downloading https://cache.nixos.org/nar/0wcqkjns05viqhws77b47kpijijh8gbxqylb4s6w6sgs5758n8a7.nar.zst
+• Downloading https://cache.nixos.org/nar/1ng2m4ndvhdf8ysfiblnnrw365i5brhf7irmqpaqx345i01gnmff.nar.zst
+• Downloading gnu-config-2024-01-01
+• Downloading gmp-with-cxx-6.3.0
+• Downloading https://cache.nixos.org/nar/1l43qv8hnmziw5a1qfa5nv3vbwgyyzza9jlxj50p97r0ka63wjvc.nar.zst
+• Downloading https://cache.nixos.org/nar/0s4296d5nba0n53ls8if7w8kvp1xw56cm6i36wrj9ndr58mznypg.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1a1hk33irrc8qi60d7ga7xm2i6dw5x34nl768gp3a9jjwmmkyawk.nar.zst in 330ms
+✓ Downloading bzip2-1.0.8-bin in 333ms
+✓ Downloading https://cache.nixos.org/nar/094afngnyjrx337m8g4hvxwb4lwcipxfh8xvbjmm57vffsq1j3b3.nar.zst in 503ms
+✓ Downloading gzip-1.14 in 506ms
+✓ Downloading https://cache.nixos.org/nar/0l6dr876jmrzqwv7rim51krzvcxqsyd52k4al4rni88cd91hwy4i.nar.zst in 563ms
+✓ Downloading xz-5.8.3-bin in 568ms
+✓ Downloading https://cache.nixos.org/nar/1ng2m4ndvhdf8ysfiblnnrw365i5brhf7irmqpaqx345i01gnmff.nar.zst in 312ms
+✓ Downloading https://cache.nixos.org/nar/005gmcbwxp80sl65qajz10z75nv3wmzbj7frbayqma40rsqhl3l5.nar.zst in 616ms
+✓ Downloading https://cache.nixos.org/nar/1l43qv8hnmziw5a1qfa5nv3vbwgyyzza9jlxj50p97r0ka63wjvc.nar.zst in 299ms
+✓ Downloading gnu-config-2024-01-01 in 302ms
+• Downloading update-autotools-gnu-config-scripts-hook
+✓ Downloading patchelf-0.15.2 in 625ms
+✓ Downloading attr-2.6.0 in 326ms
+• Downloading https://cache.nixos.org/nar/15s3s8m5a6r2lhm6yrw3m25agcsi7vsahnygn9jd481lsdh3b68d.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0wcqkjns05viqhws77b47kpijijh8gbxqylb4s6w6sgs5758n8a7.nar.zst in 429ms
+✓ Downloading ed-1.22.6 in 433ms
+• Downloading patch-2.8
+• Downloading https://cache.nixos.org/nar/0lby2cdb11dybdccxz5izpvizdclr17g5pqm32ln32h9wp6plccw.nar.zst
+✓ Downloading https://cache.nixos.org/nar/15s3s8m5a6r2lhm6yrw3m25agcsi7vsahnygn9jd481lsdh3b68d.nar.zst in 208ms
+✓ Downloading update-autotools-gnu-config-scripts-hook in 214ms
+✓ Downloading https://cache.nixos.org/nar/16p9m2wii30l314xix30p39a5ww5nard3mlx5hvlp2rvihsd6gag.nar.zst in 1.17s
+✓ Downloading bash-5.3p15 in 1.18s
+✓ Downloading https://cache.nixos.org/nar/1557l6knwpjws9f672gyhgpq716fkhppkbib6xz2g997iqhqz1kh.nar.zst in 1.00s
+✓ Downloading gnused-4.10 in 1.00s
+✓ Downloading https://cache.nixos.org/nar/1frimzflmvyappjylbihq8wk8vqgm4my94vr8fcmxrwqbb5kkghv.nar.zst in 1.06s
+✓ Downloading gnugrep-3.12 in 1.06s
+✓ Downloading https://cache.nixos.org/nar/0lby2cdb11dybdccxz5izpvizdclr17g5pqm32ln32h9wp6plccw.nar.zst in 399ms
+✓ Downloading patch-2.8 in 402ms
+✓ Downloading https://cache.nixos.org/nar/0s4296d5nba0n53ls8if7w8kvp1xw56cm6i36wrj9ndr58mznypg.nar.zst in 898ms
+✓ Downloading gmp-with-cxx-6.3.0 in 899ms
+• Downloading coreutils-9.11
+• Downloading https://cache.nixos.org/nar/0jg0fy0bmhqmrd0y4zy94wxnvgq615nm5fjwx2ni51n0dbl22a0p.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0wwig0dk7ypx7854bmj782f787295mawj4rmchb0v0vv1z8553rv.nar.zst in 1.23s
+✓ Downloading gnumake-4.4.1 in 1.23s
+✓ Downloading https://cache.nixos.org/nar/09ipahap0pvsbhadkjgk16a258l4f97pbl2av05s53psx72lq377.nar.zst in 1.29s
+✓ Downloading file-5.48 in 1.29s
+✓ Downloading https://cache.nixos.org/nar/0b075jc2gmplpkazp04zgrbpsn9fsrvg73acbncl93azfmxg031y.nar.zst in 1.35s
+✓ Downloading gnutar-1.35 in 1.35s
+✓ Downloading https://cache.nixos.org/nar/1kws5ksjnmr56zn1d6vzgdl8qaga6217y4zc3x05q3l97ldmxhg4.nar.zst in 1.40s
+✓ Downloading gawk-5.4.1 in 1.40s
+✓ Downloading https://cache.nixos.org/nar/0jg0fy0bmhqmrd0y4zy94wxnvgq615nm5fjwx2ni51n0dbl22a0p.nar.zst in 374ms
+✓ Downloading coreutils-9.11 in 378ms
+• Downloading diffutils-3.12
+• Downloading findutils-4.11.0
+• Downloading https://cache.nixos.org/nar/0k4hvf6fl25a3msyzcpxsqqysnxrms8qfkd7q5bv3nx6kia9hsbv.nar.zst
+• Downloading https://cache.nixos.org/nar/1l90zm1xxlsizqhkjcvldc1br6d9f8sj69banpkys3bzcak1q2xf.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1l90zm1xxlsizqhkjcvldc1br6d9f8sj69banpkys3bzcak1q2xf.nar.zst in 167ms
+✓ Downloading diffutils-3.12 in 171ms
+✓ Downloading https://cache.nixos.org/nar/0k4hvf6fl25a3msyzcpxsqqysnxrms8qfkd7q5bv3nx6kia9hsbv.nar.zst in 174ms
+✓ Downloading findutils-4.11.0 in 177ms
+• Downloading stdenv-linux-no-cc
+• Downloading https://cache.nixos.org/nar/0mg3wbz5n6sl96f3012iqjsmlv3jsfd479zva3q46q049q3079fy.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0mg3wbz5n6sl96f3012iqjsmlv3jsfd479zva3q46q049q3079fy.nar.zst in 60.7ms
+✓ Downloading stdenv-linux-no-cc in 62.2ms
+• Building devenv-nixpkgs-patched
+  Running phase: unpackPhase
+  unpacking source archive /nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source
+  source root is source
+  Running phase: patchPhase
+  applying patch /nix/store/g5fhxycmi6s4mw1kbn7l3lgwj3mg5wi4-002-lean4-cmake-4.4-install-prefix.patch
+  patching file pkgs/by-name/le/lean4/package.nix
+  patching file pkgs/development/lean-modules/lean4/default.nix
+  applying patch /nix/store/rm37yfh914lbzq3xd86frnklymqinirk-003-llvm-darwin-dsymutil-codesign.patch
+  patching file pkgs/development/compilers/llvm/common/llvm/default.nix
+  Hunk #1 succeeded at 346 (offset 5 lines).
+  applying patch /nix/store/yp2dzf1vzm6i47in1rsl49pxkpzdw169-001-poetry-disable-embedded-wheel-tests.patch
+  patching file pkgs/by-name/po/poetry/unwrapped.nix
+  Hunk #1 succeeded at 143 (offset 12 lines).
+  Running phase: installPhase
+✓ Building devenv-nixpkgs-patched in 8.53s
+• Building sitecustomize.py
+  structuredAttrs is enabled
+✓ Building sitecustomize.py in 20.4ms
+• Downloading jemalloc-5.3.1
+• Downloading https://cache.nixos.org/nar/1l4hl0ynvi5fx15bln3bn3vq7c8y5ly4msg79nyw0plw5cjvincv.nar.zst
+• Downloading util-linux-minimal-2.42.3-lib
+• Downloading https://cache.nixos.org/nar/18d2hv46zkxzryfl4975kvmqr4wwkl7krc4264xssm4lr8l25kjg.nar.zst
+• Downloading readline-8.3p3
+• Downloading glibc-2.42-84-bin
+• Downloading https://cache.nixos.org/nar/1z4jxaxspa6c67bljp2w8mgfhrbxdl47ak0vqmxnksny6aqlzxxw.nar.zst
+• Downloading pkg-config-0.29.2
+• Downloading bin
+• Downloading https://cache.nixos.org/nar/1zyzzg2hbsrdck54vnb2lgvpvdfxissjqa81i3k7i3rjsamz4gb1.nar.zst
+• Downloading https://cache.nixos.org/nar/0a19pr8s85bi0mh0yxgcnlrial1b8i1wygwg1ddzqlaqip8a438b.nar.zst
+• Downloading expand-response-params
+• Downloading https://cache.nixos.org/nar/01mdsanymhs423pl1nzp2c3gy34ga6qd7yxnanx35fv21pkx3wrd.nar.zst
+• Downloading https://cache.nixos.org/nar/1xbng4qcbp4l1ypayrb4dz8hq6iai4jrdmcis1fck507zcpy4g9m.nar.zst
+• Downloading https://cache.nixos.org/nar/1886nhmd39hrcfr9a811apyf35jsvz6pzv9paxk7v901f3361jy2.nar.zst
+• Downloading lz4-1.10.0-lib
+• Downloading https://cache.nixos.org/nar/0m3dr400w5jbcah47860gv21rk8dn94df1s7rda24x5yhda2dadg.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1l4hl0ynvi5fx15bln3bn3vq7c8y5ly4msg79nyw0plw5cjvincv.nar.zst in 108ms
+✓ Downloading jemalloc-5.3.1 in 110ms
+✓ Downloading https://cache.nixos.org/nar/1xbng4qcbp4l1ypayrb4dz8hq6iai4jrdmcis1fck507zcpy4g9m.nar.zst in 64.9ms
+✓ Downloading expand-response-params in 65.9ms
+• Downloading bash-interactive-5.3p15-man
+• Downloading builder.pl
+• Downloading tzdata-2026c
+• Downloading postgresql-17.11-lib
+• Downloading https://cache.nixos.org/nar/16yz4hiyv18nx0p537kgbmggl6aky903z58rpcpaqxjcrnqnq4zm.nar.zst
+• Downloading https://cache.nixos.org/nar/12k6wahxw8wr8fxmy22fb9xwa2pnfa7brdpd76hqnjn9szszgi1w.nar.zst
+• Downloading https://cache.nixos.org/nar/14vhkdpv3dxgk51yg8c1z5jhxp2rxdg11380ngj0hpy3l75csq7p.nar.zst
+• Downloading https://cache.nixos.org/nar/1xi3klcrvh4scwn3ka3hb5qkx847gdsnna3x7jc2hxk07da91nk3.nar.zst
+✓ Downloading https://cache.nixos.org/nar/01mdsanymhs423pl1nzp2c3gy34ga6qd7yxnanx35fv21pkx3wrd.nar.zst in 130ms
+✓ Downloading bin in 131ms
+✓ Downloading https://cache.nixos.org/nar/1z4jxaxspa6c67bljp2w8mgfhrbxdl47ak0vqmxnksny6aqlzxxw.nar.zst in 147ms
+✓ Downloading readline-8.3p3 in 148ms
+✓ Downloading https://cache.nixos.org/nar/0m3dr400w5jbcah47860gv21rk8dn94df1s7rda24x5yhda2dadg.nar.zst in 139ms
+• Downloading bash-interactive-5.3p15
+✓ Downloading lz4-1.10.0-lib in 140ms
+• Downloading https://cache.nixos.org/nar/1jysdahmxs9kq5vkf5hngld6qjk3z38xa6knjl63zcn8j28fhzji.nar.zst
+• Downloading kbd-2.9.0
+• Downloading kexec-tools-2.0.32
+• Downloading kmod-31-lib
+• Downloading libapparmor-5.0.2
+• Downloading https://cache.nixos.org/nar/0hvmasxjvxxh4d0rksnzp5883by31r5agfpsfmjiknh1hbpabkgj.nar.zst
+• Downloading https://cache.nixos.org/nar/1s3xl57snlzjpk2xmasxk0arrhx8zz1lnzjjf6wib2i7ryphx5r9.nar.zst
+• Downloading https://cache.nixos.org/nar/1m96x50n10ngykn60908kckkpxm4gmfixsvmh9i0gd7zqci5vcnp.nar.zst
+• Downloading https://cache.nixos.org/nar/0cmykd6k4bvypa78snrr4ynxs660fmczqafza1blbavdc0b76xxg.nar.zst
+• Downloading kmod-31
+• Downloading https://cache.nixos.org/nar/1xyh8514zkfjfnr7w15jyg1di5764n79rmfgvz1qm20nvx33a2cj.nar.zst
+• Downloading libxcrypt-4.5.2
+• Downloading qrencode-4.1.1
+• Downloading https://cache.nixos.org/nar/1iw04djj4bis390id1zr469i4062h2m0j552gaacxjqgwv1m1r0n.nar.zst
+• Downloading https://cache.nixos.org/nar/0mg6slhpad1ywjh9slb9h5q10w07shpzk24j5h3pyn98409wqjyi.nar.zst
+✓ Downloading https://cache.nixos.org/nar/14vhkdpv3dxgk51yg8c1z5jhxp2rxdg11380ngj0hpy3l75csq7p.nar.zst in 144ms
+✓ Downloading builder.pl in 145ms
+• Downloading expand-response-params
+• Downloading https://cache.nixos.org/nar/1is3ysfmszji0kwl5v9z1xkl456b5bxiwa1cqgfvwx377xdzss2x.nar.zst
+✓ Downloading https://cache.nixos.org/nar/12k6wahxw8wr8fxmy22fb9xwa2pnfa7brdpd76hqnjn9szszgi1w.nar.zst in 240ms
+✓ Downloading bash-interactive-5.3p15-man in 242ms
+• Downloading mpdecimal-4.0.1
+• Downloading https://cache.nixos.org/nar/06nrs50dfs3vmj7yjyljl2fk8i59j59bfbi7n7xxswk6dp9hwlia.nar.zst
+• Building postgresql.conf
+  structuredAttrs is enabled
+✓ Building postgresql.conf in 42.6ms
+✓ Downloading https://cache.nixos.org/nar/0a19pr8s85bi0mh0yxgcnlrial1b8i1wygwg1ddzqlaqip8a438b.nar.zst in 360ms
+✓ Downloading pkg-config-0.29.2 in 361ms
+• Downloading db-4.8.30
+• Downloading https://cache.nixos.org/nar/18cb5ggyc8p8wshd9vki7cdl3ba85p5jsnjad0bsv6q6zsbbaidf.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0mg6slhpad1ywjh9slb9h5q10w07shpzk24j5h3pyn98409wqjyi.nar.zst in 180ms
+✓ Downloading qrencode-4.1.1 in 181ms
+• Downloading pkg-config-wrapper-0.29.2
+• Downloading https://cache.nixos.org/nar/094cl3zs7v9vyavdwilp8g405z7mm6zi1sr26bycb9z2zv7r2hk8.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1m96x50n10ngykn60908kckkpxm4gmfixsvmh9i0gd7zqci5vcnp.nar.zst in 224ms
+✓ Downloading https://cache.nixos.org/nar/1is3ysfmszji0kwl5v9z1xkl456b5bxiwa1cqgfvwx377xdzss2x.nar.zst in 180ms
+✓ Downloading expand-response-params in 182ms
+✓ Downloading kmod-31-lib in 225ms
+• Downloading libcbor-0.14.0
+• Downloading gdbm-1.26-lib
+• Downloading https://cache.nixos.org/nar/1japlcykhj7cxlin609nbg2h052y6a7ici8031vq20pxwshn3i5l.nar.zst
+• Downloading https://cache.nixos.org/nar/01b27x675jqafixkdcd4rw9iam6znc07ah3h084m5ivmz97k0sbp.nar.zst
+✓ Downloading https://cache.nixos.org/nar/16yz4hiyv18nx0p537kgbmggl6aky903z58rpcpaqxjcrnqnq4zm.nar.zst in 332ms
+✓ Downloading tzdata-2026c in 337ms
+• Downloading expat-2.8.4
+• Downloading https://cache.nixos.org/nar/12hjw48rdsll3hrcrl8700sk10cidrh8sl7rnxrja53y6nipsbj4.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1iw04djj4bis390id1zr469i4062h2m0j552gaacxjqgwv1m1r0n.nar.zst in 266ms
+✓ Downloading libxcrypt-4.5.2 in 267ms
+• Downloading libtpms-0.10.2-unstable-2026-05-06
+• Downloading https://cache.nixos.org/nar/0gk788gyjnj86xbpgrqbn0qvy3ahjg2p6ml2y7z8v4fz2ppnn4fn.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0hvmasxjvxxh4d0rksnzp5883by31r5agfpsfmjiknh1hbpabkgj.nar.zst in 316ms
+✓ Downloading https://cache.nixos.org/nar/1xyh8514zkfjfnr7w15jyg1di5764n79rmfgvz1qm20nvx33a2cj.nar.zst in 303ms
+✓ Downloading kexec-tools-2.0.32 in 318ms
+✓ Downloading kmod-31 in 305ms
+• Downloading perl-5.42.3
+• Downloading simdjson-4.6.8
+• Downloading https://cache.nixos.org/nar/0fhcly90dcp8jqza5zp4p6xqy5gpz781idffq9win2pd9mk0399g.nar.zst
+• Downloading https://cache.nixos.org/nar/15ijzhpiirfkhdbd7i6kab6gkx6q4i1mb67ccmaldb5xwlny387f.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1xi3klcrvh4scwn3ka3hb5qkx847gdsnna3x7jc2hxk07da91nk3.nar.zst in 506ms
+✓ Downloading https://cache.nixos.org/nar/0cmykd6k4bvypa78snrr4ynxs660fmczqafza1blbavdc0b76xxg.nar.zst in 403ms
+✓ Downloading postgresql-17.11-lib in 508ms
+• Downloading libtasn1-4.21.0
+✓ Downloading libapparmor-5.0.2 in 406ms
+• Downloading https://cache.nixos.org/nar/1wl9vvf8y89hlgfhbjniayzaa84770m9caszpvg6b5sad7v15zdz.nar.zst
+• Downloading pcsclite-2.4.1-lib
+• Downloading https://cache.nixos.org/nar/0d7p45haipg9vg7xzh1paqa8vlj4rfnzaz8nblxp94q02ppky6d4.nar.zst
+✓ Downloading https://cache.nixos.org/nar/094cl3zs7v9vyavdwilp8g405z7mm6zi1sr26bycb9z2zv7r2hk8.nar.zst in 226ms
+✓ Downloading pkg-config-wrapper-0.29.2 in 227ms
+• Downloading libgpg-error-1.61
+• Downloading https://cache.nixos.org/nar/0811672lciwrk5n9gya7iayrd35n1rwvlw8agxqjrzcv979mi483.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1886nhmd39hrcfr9a811apyf35jsvz6pzv9paxk7v901f3361jy2.nar.zst in 594ms
+• Downloading hdrhistogram_c-0.11.10
+• Downloading https://cache.nixos.org/nar/1p2z5gpfj21ywrplpnqf15f74jv8j07ifsjjgwblssgizjfsfidp.nar.zst
+✓ Downloading https://cache.nixos.org/nar/06nrs50dfs3vmj7yjyljl2fk8i59j59bfbi7n7xxswk6dp9hwlia.nar.zst in 318ms
+✓ Downloading mpdecimal-4.0.1 in 319ms
+• Downloading uv-0.12.11
+• Downloading https://cache.nixos.org/nar/05raf84njd3i0ns4znhcs0cnlblh4qxspsqcw8gfzvixy6fi5bsx.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1japlcykhj7cxlin609nbg2h052y6a7ici8031vq20pxwshn3i5l.nar.zst in 260ms
+✓ Downloading libcbor-0.14.0 in 261ms
+• Downloading libcap-ng-0.9.5
+• Downloading https://cache.nixos.org/nar/1db9rfxfqns0i5zwxwjnh8k04wz62bjp06cb8h5x2k8sbmx59rm4.nar.zst
+• Building redis.conf
+  structuredAttrs is enabled
+✓ Building redis.conf in 23.4ms
+✓ Downloading https://cache.nixos.org/nar/01b27x675jqafixkdcd4rw9iam6znc07ah3h084m5ivmz97k0sbp.nar.zst in 345ms
+✓ Downloading gdbm-1.26-lib in 348ms
+• Downloading gmp-6.3.0
+• Downloading https://cache.nixos.org/nar/1qdxzh79hyqymimpsgxmd6540jqgmjdhqv8v7ik6w6wq173w8g0h.nar.zst
+✓ Downloading https://cache.nixos.org/nar/12hjw48rdsll3hrcrl8700sk10cidrh8sl7rnxrja53y6nipsbj4.nar.zst in 340ms
+✓ Downloading expat-2.8.4 in 340ms
+• Downloading util-linux-minimal-2.42.3-login
+• Downloading https://cache.nixos.org/nar/154bpf275xgh6vp01g4717na7k9958svvlhkvq0bya1zzqfwf12w.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0d7p45haipg9vg7xzh1paqa8vlj4rfnzaz8nblxp94q02ppky6d4.nar.zst in 206ms
+✓ Downloading pcsclite-2.4.1-lib in 207ms
+• Downloading die-hook
+• Downloading https://cache.nixos.org/nar/16frzbml5k28hcf58a0s0m57zhgmgla7gn4vr1zaxngwdbcg7sfi.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1zyzzg2hbsrdck54vnb2lgvpvdfxissjqa81i3k7i3rjsamz4gb1.nar.zst in 794ms
+✓ Downloading glibc-2.42-84-bin in 796ms
+• Downloading oniguruma-6.9.10-lib
+• Downloading https://cache.nixos.org/nar/18k6fww99a9r85daxifj3zmxn90s54vhirigwn7l4npprdrggp6y.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1wl9vvf8y89hlgfhbjniayzaa84770m9caszpvg6b5sad7v15zdz.nar.zst in 225ms
+✓ Downloading libtasn1-4.21.0 in 226ms
+• Downloading mailcap-2.1.54
+• Downloading https://cache.nixos.org/nar/1xbjd7qddfb3r809w1dyp7bhbpa8xvll9n295q1x38fa05v68spz.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1p2z5gpfj21ywrplpnqf15f74jv8j07ifsjjgwblssgizjfsfidp.nar.zst in 244ms
+✓ Downloading https://cache.nixos.org/nar/1db9rfxfqns0i5zwxwjnh8k04wz62bjp06cb8h5x2k8sbmx59rm4.nar.zst in 182ms
+✓ Downloading libcap-ng-0.9.5 in 185ms
+✓ Downloading hdrhistogram_c-0.11.10 in 246ms
+• Downloading p11-kit-0.26.2
+• Downloading audit-4.2.1-lib
+• Downloading https://cache.nixos.org/nar/1xzvnrgksgh6503nh31ppyvq7c830k8c04681v841x7xpz3zh06s.nar.zst
+• Downloading https://cache.nixos.org/nar/04gyc1sqn4pg0w5kpp58l6ymrzq8da1v0bhcnss01zv5lf1qcflx.nar.zst
+✓ Downloading https://cache.nixos.org/nar/18d2hv46zkxzryfl4975kvmqr4wwkl7krc4264xssm4lr8l25kjg.nar.zst in 867ms
+✓ Downloading util-linux-minimal-2.42.3-lib in 868ms
+• Downloading pkg-config-0.29.2-man
+• Downloading https://cache.nixos.org/nar/1xrangyy2q18dq033jj5gvi4v163gfxf6hrw1lsf334zc2p2w25g.nar.zst
+✓ Downloading https://cache.nixos.org/nar/154bpf275xgh6vp01g4717na7k9958svvlhkvq0bya1zzqfwf12w.nar.zst in 158ms
+✓ Downloading util-linux-minimal-2.42.3-login in 159ms
+• Downloading util-linux-minimal-2.42.3-mount
+• Downloading https://cache.nixos.org/nar/060wfy6j1ihp1gpa8z3am7iyzwd022w9cbq1k8csgm5gd9qx8mwi.nar.zst
+✓ Downloading https://cache.nixos.org/nar/16frzbml5k28hcf58a0s0m57zhgmgla7gn4vr1zaxngwdbcg7sfi.nar.zst in 129ms
+✓ Downloading die-hook in 130ms
+• Downloading systemd-minimal-libs-261.2
+• Downloading https://cache.nixos.org/nar/078vkyqcn3m53da333mbablgaqpf9rf3i1bx44a76xf3myqchkw7.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0811672lciwrk5n9gya7iayrd35n1rwvlw8agxqjrzcv979mi483.nar.zst in 332ms
+✓ Downloading libgpg-error-1.61 in 334ms
+• Downloading util-linux-minimal-2.42.3-swap
+• Downloading https://cache.nixos.org/nar/0z1aby8yanz0gxnzxif9mazdb2nr564rgr712xvn3rhqsgs28ljn.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1xbjd7qddfb3r809w1dyp7bhbpa8xvll9n295q1x38fa05v68spz.nar.zst in 175ms
+✓ Downloading mailcap-2.1.54 in 176ms
+• Downloading libgcrypt-1.12.2-lib
+• Downloading https://cache.nixos.org/nar/1pscpsphww6xyv3ykjqji7z8sf75wgx7h62dvbl63vlg71c3ijn5.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1xrangyy2q18dq033jj5gvi4v163gfxf6hrw1lsf334zc2p2w25g.nar.zst in 163ms
+✓ Downloading pkg-config-0.29.2-man in 164ms
+• Downloading python3-3.13.15
+• Downloading https://cache.nixos.org/nar/0slg8z2yxwpvypxv8917z2d1mifpynyfkmrxlw2jxqqm6dbf7rps.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0gk788gyjnj86xbpgrqbn0qvy3ahjg2p6ml2y7z8v4fz2ppnn4fn.nar.zst in 580ms
+✓ Downloading libtpms-0.10.2-unstable-2026-05-06 in 581ms
+• Downloading pkg-config-wrapper-0.29.2-man
+• Downloading https://cache.nixos.org/nar/075y3ar85bbd2g23ap5sflkyg3jvbmbmqmi2cqrh58qcrnk9yf5f.nar.zst
+✓ Downloading https://cache.nixos.org/nar/15ijzhpiirfkhdbd7i6kab6gkx6q4i1mb67ccmaldb5xwlny387f.nar.zst in 562ms
+✓ Downloading simdjson-4.6.8 in 565ms
+• Downloading cracklib-2.10.3
+• Downloading https://cache.nixos.org/nar/1473i557fhra8xh4c37ap89yijaixgjscvrfhgs96zkq3vkq07bh.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1qdxzh79hyqymimpsgxmd6540jqgmjdhqv8v7ik6w6wq173w8g0h.nar.zst in 332ms
+✓ Downloading gmp-6.3.0 in 333ms
+• Downloading nbytes-0.1.4
+• Downloading https://cache.nixos.org/nar/1fpk6hbbyzxcmi75imfgjm9qqf4zqii67w37bjkzsvhpvw3f8hsw.nar.zst
+✓ Downloading https://cache.nixos.org/nar/18k6fww99a9r85daxifj3zmxn90s54vhirigwn7l4npprdrggp6y.nar.zst in 297ms
+✓ Downloading oniguruma-6.9.10-lib in 298ms
+• Downloading mpfr-4.2.2
+• Downloading https://cache.nixos.org/nar/0h9l1ah91nvlr6h1x0ba3pc2dg7qg8r6l51ayi5cq20wx0chri40.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1xzvnrgksgh6503nh31ppyvq7c830k8c04681v841x7xpz3zh06s.nar.zst in 252ms
+✓ Downloading https://cache.nixos.org/nar/060wfy6j1ihp1gpa8z3am7iyzwd022w9cbq1k8csgm5gd9qx8mwi.nar.zst in 188ms
+✓ Downloading https://cache.nixos.org/nar/0z1aby8yanz0gxnzxif9mazdb2nr564rgr712xvn3rhqsgs28ljn.nar.zst in 167ms
+✓ Downloading audit-4.2.1-lib in 252ms
+✓ Downloading util-linux-minimal-2.42.3-mount in 189ms
+• Downloading jq-1.8.2
+✓ Downloading util-linux-minimal-2.42.3-swap in 168ms
+• Downloading json-c-0.18
+• Downloading isl-0.20
+• Downloading https://cache.nixos.org/nar/0wmpxng1a7rncxsn74hkyp1pjmyca60vfmfg2sy84rf6832mhiy8.nar.zst
+• Downloading https://cache.nixos.org/nar/1vc9alpk3n5s35pj9hqirs3lqjm45sx7k7yqsyxxdbsrqhhps0cw.nar.zst
+• Downloading https://cache.nixos.org/nar/08p7vrlfkrsm7hajkd7nbfnxv1l8fwh119m8llgw95g0gsz1zk3a.nar.zst
+✓ Downloading https://cache.nixos.org/nar/075y3ar85bbd2g23ap5sflkyg3jvbmbmqmi2cqrh58qcrnk9yf5f.nar.zst in 134ms
+✓ Downloading pkg-config-wrapper-0.29.2-man in 135ms
+• Downloading merve-1.2.2
+• Downloading https://cache.nixos.org/nar/1qs7lkjk84v3yay6vm0nwk6x5vnfp5b29ipfsdw8ysn6szfcxa64.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1fpk6hbbyzxcmi75imfgjm9qqf4zqii67w37bjkzsvhpvw3f8hsw.nar.zst in 142ms
+✓ Downloading nbytes-0.1.4 in 143ms
+• Downloading llhttp-9.4.3-dev
+• Downloading https://cache.nixos.org/nar/187kxq7r49xyxc88x3infm1s8gdqldf593xpzcbrik207z7ans21.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1s3xl57snlzjpk2xmasxk0arrhx8zz1lnzjjf6wib2i7ryphx5r9.nar.zst in 1.09s
+✓ Downloading kbd-2.9.0 in 1.09s
+• Downloading icu4c-78.3-dev
+• Downloading https://cache.nixos.org/nar/0pplnj4x0zba5b2cl58ksnp4j7di59gnm07xc1z8qm6an2648w79.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1vc9alpk3n5s35pj9hqirs3lqjm45sx7k7yqsyxxdbsrqhhps0cw.nar.zst in 174ms
+✓ Downloading json-c-0.18 in 176ms
+• Downloading c-ares-1.34.8
+• Downloading https://cache.nixos.org/nar/1z1pxz14ic3fjp36wllfgwch0rai0nyj9ff5j9bd119f047cpgms.nar.zst
+✓ Downloading https://cache.nixos.org/nar/18cb5ggyc8p8wshd9vki7cdl3ba85p5jsnjad0bsv6q6zsbbaidf.nar.zst in 968ms
+✓ Downloading db-4.8.30 in 969ms
+• Downloading elfutils-0.195
+• Downloading https://cache.nixos.org/nar/1bp74hclyhq8q7x19yg31f8yh74fxpj5fy43yppdr4klza5nqyx1.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1qs7lkjk84v3yay6vm0nwk6x5vnfp5b29ipfsdw8ysn6szfcxa64.nar.zst in 171ms
+✓ Downloading merve-1.2.2 in 173ms
+• Downloading tpm2-tss-4.2.0
+• Downloading https://cache.nixos.org/nar/05xwdypxz4sy5fflrbjyf4i4b3ghld4gv0r5i862mzl3av73w705.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0wmpxng1a7rncxsn74hkyp1pjmyca60vfmfg2sy84rf6832mhiy8.nar.zst in 280ms
+✓ Downloading jq-1.8.2 in 281ms
+• Downloading nghttp3-1.16.0-dev
+• Downloading https://cache.nixos.org/nar/06c496i9cxyyc04jldhrqmd6jl4yvsc03ff09np608w9v7avpczf.nar.zst
+✓ Downloading https://cache.nixos.org/nar/187kxq7r49xyxc88x3infm1s8gdqldf593xpzcbrik207z7ans21.nar.zst in 165ms
+✓ Downloading llhttp-9.4.3-dev in 167ms
+• Downloading jq-1.8.2-bin
+• Downloading https://cache.nixos.org/nar/1mdnf96zh0aq21gan63d6c4kq4g1m9q34d4v0nbk6pi8ab3kgsrx.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1473i557fhra8xh4c37ap89yijaixgjscvrfhgs96zkq3vkq07bh.nar.zst in 335ms
+✓ Downloading cracklib-2.10.3 in 336ms
+• Downloading gtest-1.18.0
+• Downloading https://cache.nixos.org/nar/1a1561slag7lscxldbg220ys51k9aa2wc1sn2rd4mrphkr0mc8jh.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0h9l1ah91nvlr6h1x0ba3pc2dg7qg8r6l51ayi5cq20wx0chri40.nar.zst in 357ms
+✓ Downloading mpfr-4.2.2 in 358ms
+• Downloading dns-root-data-2025-04-14
+• Downloading https://cache.nixos.org/nar/1svg8wvqhl7sr3jfzf2wr1g9wg27dl49i7k6sn2s0mwqharqlcf1.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1pscpsphww6xyv3ykjqji7z8sf75wgx7h62dvbl63vlg71c3ijn5.nar.zst in 507ms
+✓ Downloading libgcrypt-1.12.2-lib in 507ms
+• Downloading libmpc-1.4.1
+• Downloading https://cache.nixos.org/nar/0249qfs8qrmvw854gwixpnc7c8p78pxa01sgankkj8s3lqi409ip.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1z1pxz14ic3fjp36wllfgwch0rai0nyj9ff5j9bd119f047cpgms.nar.zst in 220ms
+✓ Downloading c-ares-1.34.8 in 221ms
+• Downloading simdutf-6.5.0
+• Downloading https://cache.nixos.org/nar/1h3h6ym9w2l27ajyl0lbmmyc22d3338cpry9y01cwvc7h8ixa5w1.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1jysdahmxs9kq5vkf5hngld6qjk3z38xa6knjl63zcn8j28fhzji.nar.zst in 1.35s
+✓ Downloading bash-interactive-5.3p15 in 1.35s
+• Downloading c-ares-1.34.8-dev
+• Downloading https://cache.nixos.org/nar/1ysj6fg1g2yqbmfgdpfxdghw87fk1fhg76yxp8kmgy82pk2vv90v.nar.zst
+• Building devenv-enterShell
+  structuredAttrs is enabled
+✓ Downloading https://cache.nixos.org/nar/06c496i9cxyyc04jldhrqmd6jl4yvsc03ff09np608w9v7avpczf.nar.zst in 137ms
+✓ Downloading nghttp3-1.16.0-dev in 138ms
+• Downloading bash-interactive-5.3p15-dev
+• Downloading https://cache.nixos.org/nar/1nnw9abph1rr1vfvqh4w9wr2vhxibf6sqj8cr83p1hx2n7rwlac2.nar.zst
+✓ Building devenv-enterShell in 18.8ms
+✓ Downloading https://cache.nixos.org/nar/1mdnf96zh0aq21gan63d6c4kq4g1m9q34d4v0nbk6pi8ab3kgsrx.nar.zst in 137ms
+✓ Downloading jq-1.8.2-bin in 138ms
+• Downloading ngtcp2-1.23.0-dev
+• Downloading https://cache.nixos.org/nar/0fnqsidvij17iw48m7gnjgz4z1xl65z5x9mpm7jfy7bbgl06vy30.nar.zst
+• Building devenv-container-copy
+• Building devenv-files-cleanup
+  structuredAttrs is enabled
+  structuredAttrs is enabled
+✓ Building devenv-container-copy in 15.8ms
+✓ Building devenv-files-cleanup in 18.2ms
+✓ Downloading https://cache.nixos.org/nar/04gyc1sqn4pg0w5kpp58l6ymrzq8da1v0bhcnss01zv5lf1qcflx.nar.zst in 742ms
+✓ Downloading https://cache.nixos.org/nar/1svg8wvqhl7sr3jfzf2wr1g9wg27dl49i7k6sn2s0mwqharqlcf1.nar.zst in 134ms
+✓ Downloading dns-root-data-2025-04-14 in 134ms
+• Downloading jq-1.8.2-dev
+• Downloading https://cache.nixos.org/nar/1dimnnica5a8vyll7lav4vhcajvww83q41bhiq8h438h2scp32j0.nar.zst
+✓ Downloading p11-kit-0.26.2 in 745ms
+• Downloading libuv-1.52.1
+• Downloading https://cache.nixos.org/nar/15cdrdc06s4n7vs04nlyc9p7s23yzyzs3vy3m69znx23c4hqgngd.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1a1561slag7lscxldbg220ys51k9aa2wc1sn2rd4mrphkr0mc8jh.nar.zst in 247ms
+✓ Downloading gtest-1.18.0 in 247ms
+• Downloading linux-headers-7.2
+• Downloading https://cache.nixos.org/nar/09dnfzfm8zd6kcs0jg5y0n912nfbci8vd7szf7x3d6kqnnzjv5ix.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1ysj6fg1g2yqbmfgdpfxdghw87fk1fhg76yxp8kmgy82pk2vv90v.nar.zst in 140ms
+✓ Downloading c-ares-1.34.8-dev in 141ms
+• Downloading gtest-1.18.0-dev
+• Downloading https://cache.nixos.org/nar/1kr50i5qzdjbkhckbrisp7g5prkph87nijmlp8c6iks7z8h7bin0.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0249qfs8qrmvw854gwixpnc7c8p78pxa01sgankkj8s3lqi409ip.nar.zst in 181ms
+✓ Downloading libmpc-1.4.1 in 182ms
+• Downloading libev-4.33
+• Downloading https://cache.nixos.org/nar/0gqjpmnqvrk959nxl8jbrsh97r98pghpn7mzaryfg5ihvp07jjax.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0fnqsidvij17iw48m7gnjgz4z1xl65z5x9mpm7jfy7bbgl06vy30.nar.zst in 148ms
+✓ Downloading ngtcp2-1.23.0-dev in 148ms
+• Downloading nettle-3.10.2
+• Downloading https://cache.nixos.org/nar/0hvh9yr500kwsh6iiwa88yqz1w06aprf06d299jnjb6fv31kywwh.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1h3h6ym9w2l27ajyl0lbmmyc22d3338cpry9y01cwvc7h8ixa5w1.nar.zst in 187ms
+✓ Downloading simdutf-6.5.0 in 189ms
+• Downloading openssl-3.6.4-bin
+• Downloading https://cache.nixos.org/nar/0y1mpgvjngha3jr08ysi0hps6p4580dy87873xmm1jj40b0qw8k7.nar.zst
+✓ Downloading https://cache.nixos.org/nar/08p7vrlfkrsm7hajkd7nbfnxv1l8fwh119m8llgw95g0gsz1zk3a.nar.zst in 586ms
+✓ Downloading https://cache.nixos.org/nar/1nnw9abph1rr1vfvqh4w9wr2vhxibf6sqj8cr83p1hx2n7rwlac2.nar.zst in 166ms
+✓ Downloading isl-0.20 in 587ms
+• Downloading brotli-1.2.0
+• Downloading https://cache.nixos.org/nar/0sd17jj7ckj63jd1h0argn2pzp1lc390g8ikl8rkx4h24lj4kig8.nar.zst
+✓ Downloading bash-interactive-5.3p15-dev in 168ms
+• Downloading simdutf-9.1.0
+• Downloading https://cache.nixos.org/nar/0lbzlfiy6ql06sabchpxvij6l34gmilsqpq1k8ld2dhhf78csbc3.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1dimnnica5a8vyll7lav4vhcajvww83q41bhiq8h438h2scp32j0.nar.zst in 141ms
+✓ Downloading jq-1.8.2-dev in 142ms
+• Downloading sqlite-3.53.3-bin
+• Downloading https://cache.nixos.org/nar/126dxr3fakgrz9326xbh8d8rl0hq8qgp20vkkwm8pdl8r9crds6p.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1bp74hclyhq8q7x19yg31f8yh74fxpj5fy43yppdr4klza5nqyx1.nar.zst in 422ms
+✓ Downloading https://cache.nixos.org/nar/15cdrdc06s4n7vs04nlyc9p7s23yzyzs3vy3m69znx23c4hqgngd.nar.zst in 166ms
+✓ Downloading libuv-1.52.1 in 167ms
+• Downloading libevent-2.1.13
+✓ Downloading elfutils-0.195 in 424ms
+• Downloading libuv-1.52.1-dev
+• Downloading https://cache.nixos.org/nar/000c91nn9xd0vzjqcvsbrd31lwkxix007zylzpw62pzqikklw6c7.nar.zst
+• Downloading https://cache.nixos.org/nar/02nxijp822jc61da8wwmfyyfqwzknpbr515mapah8y6xgrca440m.nar.zst
+✓ Downloading https://cache.nixos.org/nar/05xwdypxz4sy5fflrbjyf4i4b3ghld4gv0r5i862mzl3av73w705.nar.zst in 438ms
+✓ Downloading tpm2-tss-4.2.0 in 440ms
+• Downloading libbpf-1.7.0
+• Downloading https://cache.nixos.org/nar/1ikd9ypchb4q25d2l71npczjrvvffmjf1s4pwd9dan7hp5fh5xng.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0sd17jj7ckj63jd1h0argn2pzp1lc390g8ikl8rkx4h24lj4kig8.nar.zst in 170ms
+✓ Downloading brotli-1.2.0 in 172ms
+• Downloading zlib-1.3.2-static
+• Downloading https://cache.nixos.org/nar/0hhmz2hlmxv73zxi76jfk3irnajsprhm28jhhhrgj87nmxvc5r0a.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1kr50i5qzdjbkhckbrisp7g5prkph87nijmlp8c6iks7z8h7bin0.nar.zst in 226ms
+✓ Downloading gtest-1.18.0-dev in 228ms
+• Downloading brotli-1.2.0-dev
+• Downloading https://cache.nixos.org/nar/1vv0y1zdp1d1i4k018g6m5nl67l3vpjd571247mp1sndzcj3d7km.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0pplnj4x0zba5b2cl58ksnp4j7di59gnm07xc1z8qm6an2648w79.nar.zst in 615ms
+✓ Downloading icu4c-78.3-dev in 618ms
+• Downloading zstd-1.5.7-bin
+• Downloading https://cache.nixos.org/nar/0q46vsw3yb27xfkbxbark6phn9gpanz33if8f6bw3diz33wj6nrb.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0gqjpmnqvrk959nxl8jbrsh97r98pghpn7mzaryfg5ihvp07jjax.nar.zst in 213ms
+✓ Downloading libev-4.33 in 214ms
+• Downloading c-ares-1.34.8
+• Downloading https://cache.nixos.org/nar/0dkl94i3d8wcdcb5x6cisgm0lq7vriq7ybn1q2b6pprw75vwmbhc.nar.zst
+✓ Downloading https://cache.nixos.org/nar/078vkyqcn3m53da333mbablgaqpf9rf3i1bx44a76xf3myqchkw7.nar.zst in 991ms
+✓ Downloading systemd-minimal-libs-261.2 in 992ms
+• Downloading binutils-2.46-lib
+• Downloading https://cache.nixos.org/nar/11xphk5irxzm6rrwfn7zacyhd553294fm1hslpwzzqa91xakivzh.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0lbzlfiy6ql06sabchpxvij6l34gmilsqpq1k8ld2dhhf78csbc3.nar.zst in 241ms
+✓ Downloading simdutf-9.1.0 in 242ms
+• Downloading lvm2-2.03.41-lib
+• Downloading https://cache.nixos.org/nar/15pgq9z5w6zrdm52s78cmf20bnkmfwrsv2ack79dbynz93v9sjjg.nar.zst
+✓ Downloading https://cache.nixos.org/nar/02nxijp822jc61da8wwmfyyfqwzknpbr515mapah8y6xgrca440m.nar.zst in 198ms
+✓ Downloading libuv-1.52.1-dev in 200ms
+• Downloading linux-pam-1.7.2
+• Downloading https://cache.nixos.org/nar/05bbrds16k7l9ghn86ifl770ldk4p12klss1s3s579v2x5l4a5ii.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0hvh9yr500kwsh6iiwa88yqz1w06aprf06d299jnjb6fv31kywwh.nar.zst in 289ms
+✓ Downloading nettle-3.10.2 in 290ms
+• Downloading libfido2-1.17.0
+• Downloading https://cache.nixos.org/nar/0crff81icy0zqhrwd11v70vznznxgwc05qrm5nhxnmvhdygvdyr3.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0y1mpgvjngha3jr08ysi0hps6p4580dy87873xmm1jj40b0qw8k7.nar.zst in 303ms
+✓ Downloading openssl-3.6.4-bin in 304ms
+• Downloading ada-4.0.0
+• Downloading https://cache.nixos.org/nar/1ji7hyc48maf84dacsnm2nfh1r33qcd8vxc6war2sqdwhscpbm2q.nar.zst
+✓ Downloading https://cache.nixos.org/nar/000c91nn9xd0vzjqcvsbrd31lwkxix007zylzpw62pzqikklw6c7.nar.zst in 261ms
+✓ Downloading libevent-2.1.13 in 262ms
+• Downloading openssl-3.6.4-dev
+• Downloading https://cache.nixos.org/nar/0dw5bv237jihg1ypcaf9al9y512mg669dwyarsn41dwnc0j881qg.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0hhmz2hlmxv73zxi76jfk3irnajsprhm28jhhhrgj87nmxvc5r0a.nar.zst in 168ms
+✓ Downloading zlib-1.3.2-static in 168ms
+• Downloading unbound-1.26.0-lib
+• Downloading https://cache.nixos.org/nar/0m58mg01k4scvd242yzdn4ph9k9xd5ad3psscv40vbbj2b77d1l8.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1vv0y1zdp1d1i4k018g6m5nl67l3vpjd571247mp1sndzcj3d7km.nar.zst in 155ms
+✓ Downloading brotli-1.2.0-dev in 157ms
+• Downloading zlib-1.3.2-dev
+• Downloading https://cache.nixos.org/nar/1mq3d3hqpqrnyrk8l6yn4j1n9gav1gd2039jzrjrr6ipqc797azd.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0q46vsw3yb27xfkbxbark6phn9gpanz33if8f6bw3diz33wj6nrb.nar.zst in 188ms
+✓ Downloading https://cache.nixos.org/nar/0dkl94i3d8wcdcb5x6cisgm0lq7vriq7ybn1q2b6pprw75vwmbhc.nar.zst in 186ms
+✓ Downloading c-ares-1.34.8 in 187ms
+• Downloading uvwasi-0.0.23
+✓ Downloading zstd-1.5.7-bin in 189ms
+• Downloading nghttp2-1.70.0
+• Downloading https://cache.nixos.org/nar/0szbsbjcsbby0xywh2nwwnh27f8wbdr0y3l2yf903d1zmd4q85vc.nar.zst
+• Downloading https://cache.nixos.org/nar/1k7nx7bs838af016q2s7sqywhv5fr52mxkrahq17scf04n6bq3v9.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1ikd9ypchb4q25d2l71npczjrvvffmjf1s4pwd9dan7hp5fh5xng.nar.zst in 313ms
+✓ Downloading libbpf-1.7.0 in 315ms
+• Downloading zstd-1.5.7-dev
+• Downloading https://cache.nixos.org/nar/16xm9m045al2s0paiyd9539380yz84ijb7hf2i615arp68ri4jwr.nar.zst
+✓ Downloading https://cache.nixos.org/nar/15pgq9z5w6zrdm52s78cmf20bnkmfwrsv2ack79dbynz93v9sjjg.nar.zst in 232ms
+✓ Downloading lvm2-2.03.41-lib in 233ms
+• Downloading cryptsetup-2.8.7
+• Downloading https://cache.nixos.org/nar/0biamrj1a52h3is2xqdr51872clqkzglz6vwqi9505kiqjqaryc6.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0crff81icy0zqhrwd11v70vznznxgwc05qrm5nhxnmvhdygvdyr3.nar.zst in 233ms
+✓ Downloading libfido2-1.17.0 in 234ms
+✓ Downloading https://cache.nixos.org/nar/1mq3d3hqpqrnyrk8l6yn4j1n9gav1gd2039jzrjrr6ipqc797azd.nar.zst in 176ms
+✓ Downloading zlib-1.3.2-dev in 178ms
+✓ Downloading https://cache.nixos.org/nar/05bbrds16k7l9ghn86ifl770ldk4p12klss1s3s579v2x5l4a5ii.nar.zst in 266ms
+✓ Downloading https://cache.nixos.org/nar/126dxr3fakgrz9326xbh8d8rl0hq8qgp20vkkwm8pdl8r9crds6p.nar.zst in 494ms
+✓ Downloading sqlite-3.53.3-bin in 495ms
+• Downloading sqlite-3.53.3-dev
+• Downloading https://cache.nixos.org/nar/1ipqjaz9m8jh3ggkra60ywd4a3k1xnka2g0217xb4dd42m1chhaa.nar.zst
+✓ Downloading linux-pam-1.7.2 in 270ms
+• Downloading libpwquality-1.4.5-lib
+• Downloading postgresql-17.11
+• Downloading https://cache.nixos.org/nar/1ay0jdk4sgf65imhq5dc3s3xnmyhf04gymdyklihgiqx3ndczksi.nar.zst
+• Downloading https://cache.nixos.org/nar/0bngaz8kr31irlfn7by3jydnmnakxivw6qjy9zzaif8qxcfd6sd2.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0szbsbjcsbby0xywh2nwwnh27f8wbdr0y3l2yf903d1zmd4q85vc.nar.zst in 159ms
+✓ Downloading uvwasi-0.0.23 in 160ms
+✓ Downloading https://cache.nixos.org/nar/1ji7hyc48maf84dacsnm2nfh1r33qcd8vxc6war2sqdwhscpbm2q.nar.zst in 316ms
+✓ Downloading ada-4.0.0 in 318ms
+✓ Downloading https://cache.nixos.org/nar/16xm9m045al2s0paiyd9539380yz84ijb7hf2i615arp68ri4jwr.nar.zst in 213ms
+✓ Downloading zstd-1.5.7-dev in 215ms
+✓ Downloading https://cache.nixos.org/nar/0dw5bv237jihg1ypcaf9al9y512mg669dwyarsn41dwnc0j881qg.nar.zst in 294ms
+✓ Downloading openssl-3.6.4-dev in 296ms
+✓ Downloading https://cache.nixos.org/nar/09dnfzfm8zd6kcs0jg5y0n912nfbci8vd7szf7x3d6kqnnzjv5ix.nar.zst in 685ms
+✓ Downloading linux-headers-7.2 in 691ms
+• Downloading glibc-2.42-84-dev
+• Downloading https://cache.nixos.org/nar/15kvkdxnlq2z5b5pdqzbwqj87a3sjxrsjg758cs8bqpl68m3h8jg.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0m58mg01k4scvd242yzdn4ph9k9xd5ad3psscv40vbbj2b77d1l8.nar.zst in 344ms
+✓ Downloading unbound-1.26.0-lib in 344ms
+• Downloading gnutls-3.8.13
+• Downloading https://cache.nixos.org/nar/1c0bynscvvcsq39vp16j92xg7hr4vba4vhbqv28lc86dm41wrh5q.nar.zst
+✓ Downloading https://cache.nixos.org/nar/11xphk5irxzm6rrwfn7zacyhd553294fm1hslpwzzqa91xakivzh.nar.zst in 479ms
+✓ Downloading binutils-2.46-lib in 480ms
+• Downloading binutils-2.46
+• Downloading https://cache.nixos.org/nar/1cwlxsvkj2q55sqmzgdh4pbhfivggjpg3wc2mgfb6ccn1h132pfi.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0bngaz8kr31irlfn7by3jydnmnakxivw6qjy9zzaif8qxcfd6sd2.nar.zst in 197ms
+✓ Downloading libpwquality-1.4.5-lib in 201ms
+✓ Downloading https://cache.nixos.org/nar/1k7nx7bs838af016q2s7sqywhv5fr52mxkrahq17scf04n6bq3v9.nar.zst in 357ms
+✓ Downloading nghttp2-1.70.0 in 359ms
+• Downloading nghttp2-1.70.0-dev
+• Downloading https://cache.nixos.org/nar/1mqpfj7g3fn25csn7x8mfp7wg3gjx4yf82zp2zddxqi2nqbx2ks7.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1ipqjaz9m8jh3ggkra60ywd4a3k1xnka2g0217xb4dd42m1chhaa.nar.zst in 236ms
+✓ Downloading sqlite-3.53.3-dev in 237ms
+✓ Downloading https://cache.nixos.org/nar/0biamrj1a52h3is2xqdr51872clqkzglz6vwqi9505kiqjqaryc6.nar.zst in 300ms
+✓ Downloading cryptsetup-2.8.7 in 302ms
+✓ Downloading https://cache.nixos.org/nar/15kvkdxnlq2z5b5pdqzbwqj87a3sjxrsjg758cs8bqpl68m3h8jg.nar.zst in 236ms
+✓ Downloading glibc-2.42-84-dev in 239ms
+• Downloading gcc-15.3.0
+• Downloading https://cache.nixos.org/nar/07l1l3b7ccdnmn8cv0fzy2n39252zn50hyq3s2nrdshj08iqinad.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1mqpfj7g3fn25csn7x8mfp7wg3gjx4yf82zp2zddxqi2nqbx2ks7.nar.zst in 159ms
+✓ Downloading nghttp2-1.70.0-dev in 161ms
+• Downloading nodejs-slim-24.20.0
+• Downloading https://cache.nixos.org/nar/02hy9a39wpz9fd9ij4b3z35wq20q2nn09si5gfbn6vkjv34v6c56.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1c0bynscvvcsq39vp16j92xg7hr4vba4vhbqv28lc86dm41wrh5q.nar.zst in 309ms
+✓ Downloading gnutls-3.8.13 in 311ms
+• Downloading libmicrohttpd-1.0.6
+• Downloading https://cache.nixos.org/nar/035n0zd0cvaxidzbv55h0iizh9phdkwmdn4h7l7hj8yzhv329v77.nar.zst
+✓ Downloading https://cache.nixos.org/nar/035n0zd0cvaxidzbv55h0iizh9phdkwmdn4h7l7hj8yzhv329v77.nar.zst in 183ms
+✓ Downloading libmicrohttpd-1.0.6 in 184ms
+• Downloading systemd-261.2
+• Downloading https://cache.nixos.org/nar/16rxzl7jdcn9zkdb0cc9w67lfvp8yn9x4h6qmm3adr3537rs0647.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1ay0jdk4sgf65imhq5dc3s3xnmyhf04gymdyklihgiqx3ndczksi.nar.zst in 1.85s
+✓ Downloading postgresql-17.11 in 1.86s
+• Building setup-postgres
+✓ Downloading https://cache.nixos.org/nar/0fhcly90dcp8jqza5zp4p6xqy5gpz781idffq9win2pd9mk0399g.nar.zst in 3.60s
+  structuredAttrs is enabled
+✓ Building setup-postgres in 209ms
+• Building start-postgres
+  structuredAttrs is enabled
+✓ Downloading perl-5.42.3 in 3.82s
+✓ Building start-postgres in 18.8ms
+• Building devenv-processes-postgres
+  structuredAttrs is enabled
+✓ Building devenv-processes-postgres in 19.3ms
+✓ Downloading https://cache.nixos.org/nar/1cwlxsvkj2q55sqmzgdh4pbhfivggjpg3wc2mgfb6ccn1h132pfi.nar.zst in 1.95s
+✓ Downloading binutils-2.46 in 1.95s
+• Downloading binutils-wrapper-2.46
+• Downloading https://cache.nixos.org/nar/1mg73wfsyinaghnpzhy35i222aykbk9zq23v6m2mpsjxfb16mic4.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1mg73wfsyinaghnpzhy35i222aykbk9zq23v6m2mpsjxfb16mic4.nar.zst in 208ms
+✓ Downloading binutils-wrapper-2.46 in 211ms
+✓ Downloading https://cache.nixos.org/nar/05raf84njd3i0ns4znhcs0cnlblh4qxspsqcw8gfzvixy6fi5bsx.nar.zst in 4.39s
+✓ Downloading uv-0.12.11 in 4.39s
+✓ Downloading https://cache.nixos.org/nar/16rxzl7jdcn9zkdb0cc9w67lfvp8yn9x4h6qmm3adr3537rs0647.nar.zst in 2.82s
+✓ Downloading systemd-261.2 in 2.82s
+• Downloading redis-8.10.1
+• Downloading https://cache.nixos.org/nar/19jb0s226pdi9hgbgf5h5iiznr6m6ak313p71vjgmyk5l10mnn9l.nar.zst
+✓ Downloading https://cache.nixos.org/nar/02hy9a39wpz9fd9ij4b3z35wq20q2nn09si5gfbn6vkjv34v6c56.nar.zst in 3.24s
+✓ Downloading nodejs-slim-24.20.0 in 3.24s
+• Downloading nodejs-slim-24.20.0-corepack
+• Downloading nodejs-slim-24.20.0-npm
+• Downloading https://cache.nixos.org/nar/0q1djbx2d0z1rahglli8qqa429vz65nafpkpm9n1lsj6arpdvll0.nar.zst
+• Downloading https://cache.nixos.org/nar/1zg2i7vn12v2149v0xyb78i4qkp0h6p6sb73kl3v8k6mack9l62w.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1zg2i7vn12v2149v0xyb78i4qkp0h6p6sb73kl3v8k6mack9l62w.nar.zst in 258ms
+✓ Downloading nodejs-slim-24.20.0-corepack in 260ms
+✓ Downloading https://cache.nixos.org/nar/19jb0s226pdi9hgbgf5h5iiznr6m6ak313p71vjgmyk5l10mnn9l.nar.zst in 442ms
+✓ Downloading redis-8.10.1 in 443ms
+• Building start-redis
+✓ Downloading https://cache.nixos.org/nar/0q1djbx2d0z1rahglli8qqa429vz65nafpkpm9n1lsj6arpdvll0.nar.zst in 403ms
+  structuredAttrs is enabled
+✓ Building start-redis in 123ms
+✓ Downloading nodejs-slim-24.20.0-npm in 422ms
+• Building devenv-processes-redis
+  structuredAttrs is enabled
+• Downloading nodejs-24.20.0
+• Downloading https://cache.nixos.org/nar/16grkzp8mgmg5xcg9x8yc2nlyj1bdzagns0jcg2i8bvylwx1cbnz.nar.zst
+✓ Building devenv-processes-redis in 22.5ms
+• Building tasks.json
+  structuredAttrs is enabled
+✓ Building tasks.json in 103ms
+✓ Downloading https://cache.nixos.org/nar/16grkzp8mgmg5xcg9x8yc2nlyj1bdzagns0jcg2i8bvylwx1cbnz.nar.zst in 235ms
+✓ Downloading nodejs-24.20.0 in 365ms
+• Downloading pyright-internal-1.1.412
+• Downloading https://cache.nixos.org/nar/1656bkl4wpy08qfhbzvk33ja0x36kz6m8wzjsl3hgck0zchqyh60.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0slg8z2yxwpvypxv8917z2d1mifpynyfkmrxlw2jxqqm6dbf7rps.nar.zst in 8.00s
+✓ Downloading python3-3.13.15 in 8.02s
+✓ Downloading https://cache.nixos.org/nar/07l1l3b7ccdnmn8cv0fzy2n39252zn50hyq3s2nrdshj08iqinad.nar.zst in 11.1s
+✓ Downloading gcc-15.3.0 in 11.1s
+• Downloading gcc-wrapper-15.3.0
+• Downloading https://cache.nixos.org/nar/0wv9cafr78xnd0ah952kivrnal32aigd8k8z4y0zbq63j4nfws79.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0wv9cafr78xnd0ah952kivrnal32aigd8k8z4y0zbq63j4nfws79.nar.zst in 822ms
+✓ Downloading gcc-wrapper-15.3.0 in 828ms
+• Downloading make-binary-wrapper-hook
+• Downloading stdenv-linux
+• Downloading https://cache.nixos.org/nar/0fqhs3v8l6klvmgfg7p8wagwhzkpchdzw4m66hpizr4b2jk4vcv3.nar.zst
+• Downloading https://cache.nixos.org/nar/1s3yaychgpfgy6v83fwcamglxl3v5l7ic0m2z48y2qdl5w75qpwz.nar.zst
+✓ Downloading https://cache.nixos.org/nar/0fqhs3v8l6klvmgfg7p8wagwhzkpchdzw4m66hpizr4b2jk4vcv3.nar.zst in 600ms
+✓ Downloading https://cache.nixos.org/nar/1s3yaychgpfgy6v83fwcamglxl3v5l7ic0m2z48y2qdl5w75qpwz.nar.zst in 600ms
+✓ Downloading stdenv-linux in 602ms
+✓ Downloading make-binary-wrapper-hook in 602ms
+• Building python3-3.13.15-env
+  structuredAttrs is enabled
+  created 15 symlinks in user environment
+✓ Downloading https://cache.nixos.org/nar/1656bkl4wpy08qfhbzvk33ja0x36kz6m8wzjsl3hgck0zchqyh60.nar.zst in 9.36s
+✓ Downloading pyright-internal-1.1.412 in 9.50s
+• Downloading pyright-1.1.412
+• Downloading https://cache.nixos.org/nar/1ckwhb0ap965jc54w0aifsyy69bj5wsm0lfr18mdikf5ld9jipnp.nar.zst
+✓ Building python3-3.13.15-env in 1.17s
+✓ Downloading https://cache.nixos.org/nar/1ckwhb0ap965jc54w0aifsyy69bj5wsm0lfr18mdikf5ld9jipnp.nar.zst in 388ms
+✓ Downloading pyright-1.1.412 in 440ms
+• Building devenv-profile
+  structuredAttrs is enabled
+  created 167 symlinks in user environment
+✓ Building devenv-profile in 247ms
+• Building devenv-shell
+  Running phase: buildPhase
+✓ Building devenv-shell in 46.7ms
+• Building devenv-shell-env
+✓ Building devenv-shell-env in 103ms
+✓ Evaluating shell in 34.3s
+✓ Configuring shell in 43.1s
+• Evaluating bash
+✓ Evaluating bash in 2.64ms
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 2.66ms
+✓ Loading tasks in 3.63ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 27.6ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 10.1ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 2.75µs (no command)
+✓ Running tasks in 38.0ms
+✨ devenv 2.3.1 is out of date. Please update to 2.4.0: https://devenv.sh/getting-started/#installation

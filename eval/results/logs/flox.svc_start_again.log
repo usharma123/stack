@@ -1,0 +1,17 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+! Skipped starting services, services are already running
+14:43:49.881  WARN flox::utils::detect_shell: Failed to detect shell from environment or parent process. Defaulting to bash
+[
+  {
+    "name": "postgres",
+    "status": "Running",
+    "pid": 639,
+    "exit_code": null
+  },
+  {
+    "name": "redis",
+    "status": "Running",
+    "pid": 652,
+    "exit_code": null
+  }
+]

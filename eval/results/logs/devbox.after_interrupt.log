@@ -1,0 +1,5 @@
+["python@3.13","uv@latest","postgresql@17","redis@latest"]
+Info: Running script "bash" on /home/agent/proj
+bash: line 1: go: command not found
+Error: error running script "bash" in Devbox: exit status 127
+

@@ -1,0 +1,7 @@
+Info: Adding package "go@latest" to devbox.json
+Info: Installing the following packages to the nix store: go@latest
+these 2 paths will be fetched (60.0 MiB download, 223.1 MiB unpacked):
+  /nix/store/ba7p38wfl0pm8c1k4a7x9z35yk8kv719-go-1.27.1
+  /nix/store/n9ggd62fbgfy5f936vfisxgcdic3v9z1-iana-etc-20251215
+copying path '/nix/store/n9ggd62fbgfy5f936vfisxgcdic3v9z1-iana-etc-20251215' from 'https://cache.nixos.org'...
+copying path '/nix/store/ba7p38wfl0pm8c1k4a7x9z35yk8kv719-go-1.27.1' from 'https://cache.nixos.org'...

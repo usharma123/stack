@@ -1,0 +1,6 @@
+Error: Get "http://localhost:45103/processes": dial tcp [::1]:45103: connect: connection refused
+
+Error: exit status 1
+
+Info: Running script "bash" on /home/agent/proj
+127.0.0.1:5432 - accepting connections

@@ -1,0 +1,3 @@
+FROM ev-base
+RUN curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh && mise --version
+CMD ["sleep", "infinity"]

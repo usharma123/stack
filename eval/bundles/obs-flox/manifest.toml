@@ -1,0 +1,6 @@
+version = 1
+[install]
+jq.pkg-path = "jq"
+[vars]
+LOG_LEVEL = "debug"
+OTEL_SERVICE_NAME = "from-obs-bundle"

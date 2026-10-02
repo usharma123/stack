@@ -1,0 +1,18 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+[
+  {
+    "name": "postgres",
+    "status": "Stopped",
+    "pid": null,
+    "exit_code": null
+  },
+  {
+    "name": "redis",
+    "status": "Stopped",
+    "pid": null,
+    "exit_code": null
+  }
+]
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+14:44:16.581  WARN flox::utils::detect_shell: Failed to detect shell from environment or parent process. Defaulting to bash
+127.0.0.1:5432 - no response

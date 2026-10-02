@@ -1,0 +1,6 @@
+[up] $ mkdir -p .state
+pg_ctl: another server might be running; trying to start server anyway
+waiting for server to start.... stopped waiting
+pg_ctl: could not start server
+Examine the log output.
+[up] ERROR task failed

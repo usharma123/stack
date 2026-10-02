@@ -1,0 +1,4 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+✘ ERROR: Cannot start services for an environment that is not activated.
+
+To activate and start services, run 'flox activate --start-services'

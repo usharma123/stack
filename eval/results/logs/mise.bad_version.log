@@ -1,0 +1,6 @@
+mise by @jdx – installing 1 tool
+mise ✗ node@99.0.0  1.4s · failed: HTTP status client error (404 Not Found) for url (https://nodejs.org/dist/v99.0.0/node-v99.0.0.tar.gz)
+mise ████████████████ 1/1 · installed 0 tools · 1 failed in 1.4s
+mise ERROR Failed to install core:node@99.0.0: HTTP status client error (404 Not Found) for url (https://nodejs.org/dist/v99.0.0/node-v99.0.0.tar.gz)
+mise ERROR Version: 2026.9.18 linux-arm64 (2026-09-30)
+mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information

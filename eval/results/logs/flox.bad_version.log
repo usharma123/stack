@@ -1,0 +1,5 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+✘ ERROR: resolution failed: multiple resolution failures:
+- No version compatible with '99.0.0' found for 'nodejs' on 'aarch64-darwin'.
+- No version compatible with '99.0.0' found for 'nodejs' on 'aarch64-linux'.
+- No version compatible with '99.0.0' found for 'nodejs' on 'x86_64-linux'.

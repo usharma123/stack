@@ -1,0 +1,2 @@
+  615     1      30 process-compose [process-compose] <defunct>
+ 1042  1009      24 process-compose /nix/store/jc2ljl5cz7i06wn1j0daz1np553ya1jj-process-compose-1.94.0/bin/process-compose up -f /nix/store/x69bc5l8h7vwcm5qakn3y8f3gpvy98if-environment-dev/service-config.yaml -u /home/agent/.cache/flox/run/flox.6dafa1a1.sock -L /home/agent/proj2/.flox/log/services.20261002144351799334.log --disable-dotenv --tui=false flox_never_exit

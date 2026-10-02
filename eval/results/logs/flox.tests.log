@@ -1,0 +1,4 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+14:43:46.083  WARN flox::utils::detect_shell: Failed to detect shell from environment or parent process. Defaulting to bash
+...                                                                      [100%]
+3 passed in 0.28s

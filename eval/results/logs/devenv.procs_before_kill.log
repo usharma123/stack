@@ -1,0 +1,16 @@
+ 2114  2110      73 postgres        /nix/store/k391a5cipfpdff638y5jdhnalcbnwvmq-postgresql-17.11/bin/postgres
+ 2115  2111      73 redis-server    /nix/store/rrbbpkysqxscr9a3a9b9jn84710cgv2j-redis-8.10.1/bin/redis-server 127.0.0.1:6379
+ 2149     1      73 postgres        [postgres] <defunct>
+ 2165  2114      72 postgres        postgres: checkpointer 
+ 2166  2114      72 postgres        postgres: background writer 
+ 2168  2114      72 postgres        postgres: walwriter 
+ 2169  2114      72 postgres        postgres: autovacuum launcher 
+ 2170  2114      72 postgres        postgres: logical replication launcher 
+14448 14444      17 redis-server    /nix/store/rrbbpkysqxscr9a3a9b9jn84710cgv2j-redis-8.10.1/bin/redis-server 127.0.0.1:6380
+14449 14445      17 postgres        /nix/store/k391a5cipfpdff638y5jdhnalcbnwvmq-postgresql-17.11/bin/postgres
+14482     1      16 postgres        [postgres] <defunct>
+14497 14449      16 postgres        postgres: checkpointer 
+14498 14449      16 postgres        postgres: background writer 
+14500 14449      16 postgres        postgres: walwriter 
+14501 14449      16 postgres        postgres: autovacuum launcher 
+14502 14449      16 postgres        postgres: logical replication launcher 

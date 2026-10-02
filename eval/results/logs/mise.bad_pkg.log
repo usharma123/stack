@@ -1,0 +1,6 @@
+mise by @jdx – installing 1 tool
+mise ✗ definitely-not-a-pkg-zz@latest  1ms · failed: definitely-not-a-pkg-zz not found in mise tool registry
+mise ████████████████ 1/1 · installed 0 tools · 1 failed in 31ms
+mise ERROR Failed to install definitely-not-a-pkg-zz@latest: definitely-not-a-pkg-zz not found in mise tool registry
+mise ERROR Version: 2026.9.18 linux-arm64 (2026-09-30)
+mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information

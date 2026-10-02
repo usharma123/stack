@@ -1,0 +1,56 @@
+• Validating lock
+✓ Validating lock in 800ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring shell
+• Configuring cachix
+✓ Configuring cachix in 3.83ms
+• Evaluating shell
+• Building python3-3.13.15-env
+  structuredAttrs is enabled
+  created 15 symlinks in user environment
+• Building devenv-files-cleanup
+  structuredAttrs is enabled
+✓ Building devenv-files-cleanup in 15.7ms
+• Building postgresql.conf
+  structuredAttrs is enabled
+✓ Building postgresql.conf in 13.2ms
+• Building setup-postgres
+  structuredAttrs is enabled
+✓ Building setup-postgres in 16.8ms
+• Building start-postgres
+  structuredAttrs is enabled
+✓ Building start-postgres in 12.7ms
+• Building devenv-processes-postgres
+  structuredAttrs is enabled
+✓ Building devenv-processes-postgres in 12.8ms
+• Building tasks.json
+  structuredAttrs is enabled
+✓ Building tasks.json in 21.5ms
+✓ Building python3-3.13.15-env in 948ms
+• Building devenv-profile
+  structuredAttrs is enabled
+  created 167 symlinks in user environment
+✓ Building devenv-profile in 41.2ms
+• Building devenv-shell
+  Running phase: buildPhase
+✓ Building devenv-shell in 43.2ms
+• Building devenv-shell-env
+✓ Building devenv-shell-env in 108ms
+✓ Evaluating shell in 3.44s
+✓ Configuring shell in 3.49s
+• Evaluating bash
+✓ Evaluating bash in 4.09ms
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 2.79ms
+✓ Loading tasks in 3.08ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 4.38ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 4.40ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 667ns (no command)
+✓ Running tasks in 8.90ms
+✨ devenv 2.3.1 is out of date. Please update to 2.4.0: https://devenv.sh/getting-started/#installation
+Python 3.13.15

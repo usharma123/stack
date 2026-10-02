@@ -1,0 +1,5 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+! Resolving packages will require authentication to FloxHub in an upcoming release.
+See https://go.flox.dev/auth for more info.
+Run 'flox auth login' to authenticate now.
+14:43:44.703  WARN flox::utils::detect_shell: Failed to detect shell from environment or parent process. Defaulting to bash

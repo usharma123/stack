@@ -1,0 +1,28 @@
+• Validating lock
+✓ Validating lock in 7.11ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+postgres                       ready restarts: 0 ports: main:5432
+redis                          ready restarts: 0 ports: main:6379
+• Validating lock
+✓ Validating lock in 5.19ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring shell
+• Configuring cachix
+✓ Configuring cachix in 2.24ms
+• Evaluating shell
+✓ Evaluating shell in 5.57ms (cached)
+✓ Configuring shell in 10.6ms
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 362µs (cached)
+✓ Loading tasks in 1.35ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 4.94ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 3.78ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 500ns (no command)
+✓ Running tasks in 8.91ms
+✨ devenv 2.3.1 is out of date. Please update to 2.4.0: https://devenv.sh/getting-started/#installation
+127.0.0.1:5432 - accepting connections

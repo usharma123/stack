@@ -1,0 +1,25 @@
+version = 1
+
+[install]
+python.pkg-path = "python313"
+uv.pkg-path = "uv"
+postgresql.pkg-path = "postgresql_17"
+redis.pkg-path = "redis"
+
+[vars]
+PGPORT = "5432"
+REDIS_PORT = "6379"
+UV_PYTHON_DOWNLOADS = "never"
+
+[hook]
+on-activate = '''
+export PGDATA="$FLOX_ENV_CACHE/pgdata"
+export PGHOST="$FLOX_ENV_CACHE"
+if [ ! -d "$PGDATA" ]; then initdb -D "$PGDATA" -U postgres --auth=trust > /dev/null; fi
+export DATABASE_URL="postgresql://postgres@127.0.0.1:$PGPORT/postgres"
+export REDIS_URL="redis://127.0.0.1:$REDIS_PORT/0"
+'''
+
+[services]
+postgres.command = "postgres -D $PGDATA -k $PGHOST -p $PGPORT -c listen_addresses=127.0.0.1"
+redis.command = "redis-server --port $REDIS_PORT --save '' --appendonly no"

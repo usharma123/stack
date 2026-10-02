@@ -1,0 +1,2 @@
+FROM ev-nix
+RUN nix profile add --profile /nix/var/nix/profiles/default --accept-flake-config 'github:flox/flox/latest' && flox --version

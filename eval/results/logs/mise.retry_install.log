@@ -1,0 +1,10 @@
+mise by @jdx – installing 1 tool
+mise ███████░░░░░░░░░ 0/1 · 3.0s
+  go@1.27.1  downloading  3.0s  42.4/67.0 MB · 6.0 MB/s
+mise █████████████░░░ 0/1 · 6.0s
+  go@1.27.1  extracting  6.0s
+mise go@1.27.1 go version go1.27.1 linux/arm64
+mise ✓ go@1.27.1  7.0s  go1.27.1.linux-arm64.tar.gz
+mise ████████████████ 1/1 · installed 1 tool in 7.0s
+mise ~/proj/mise.toml tools: go@1.27.1
+go version go1.27.1 linux/arm64

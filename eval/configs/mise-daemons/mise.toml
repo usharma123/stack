@@ -1,0 +1,24 @@
+[settings]
+experimental = true
+
+[tools]
+python = "3.13"
+uv = "latest"
+pitchfork = "2.29.0"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+
+[daemons.postgres]
+preset = "postgres"
+version = "17"
+port = "auto"
+
+[daemons.redis]
+preset = "redis"
+version = "8"
+port = "auto"
+
+[tasks.test]
+daemons = ["postgres", "redis"]
+run = "uv sync -q && uv run pytest -q"

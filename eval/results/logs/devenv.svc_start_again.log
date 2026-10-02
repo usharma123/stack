@@ -1,0 +1,39 @@
+• Validating lock
+✓ Validating lock in 7.86ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring cachix
+✓ Configuring cachix in 2.72ms
+• Configuring shell
+• Evaluating shell
+✓ Evaluating shell in 3.33ms (cached)
+✓ Configuring shell in 10.8ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.05ms (cached)
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 268µs (cached)
+✓ Loading tasks in 1.18ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 3.68ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 3.06ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 375ns (no command)
+✓ Running tasks in 6.88ms
+• Evaluating Nix
+✓ Evaluating Nix in 846µs (cached)
+• Running processes
+• Evaluating Nix
+✓ Evaluating Nix in 783µs (cached)
+• Evaluating Nix
+✓ Evaluating Nix in 692µs (cached)
+• Evaluating Nix
+✓ Evaluating Nix in 671µs (cached)
+• Already running or waiting: postgres, redis
+✓ Running processes in 2.47ms
+• Validating lock
+✓ Validating lock in 3.66ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+postgres                       ready restarts: 0 ports: main:5432
+redis                          ready restarts: 0 ports: main:6379

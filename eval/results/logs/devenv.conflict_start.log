@@ -1,0 +1,83 @@
+• Validating lock
+✓ Validating lock in 1.05s
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring cachix
+✓ Configuring cachix in 3.62ms
+• Configuring shell
+• Evaluating shell
+• Building python3-3.13.15-env
+  structuredAttrs is enabled
+  created 15 symlinks in user environment
+• Building devenv-files-cleanup
+  structuredAttrs is enabled
+✓ Building devenv-files-cleanup in 13.4ms
+• Building postgresql.conf
+  structuredAttrs is enabled
+✓ Building postgresql.conf in 12.8ms
+• Building setup-postgres
+  structuredAttrs is enabled
+✓ Building setup-postgres in 12.9ms
+• Building start-postgres
+  structuredAttrs is enabled
+✓ Building start-postgres in 13.0ms
+• Building devenv-processes-postgres
+  structuredAttrs is enabled
+✓ Building devenv-processes-postgres in 12.3ms
+• Building redis.conf
+  structuredAttrs is enabled
+✓ Building redis.conf in 12.0ms
+• Building start-redis
+  structuredAttrs is enabled
+✓ Building start-redis in 13.4ms
+• Building devenv-processes-redis
+  structuredAttrs is enabled
+✓ Building devenv-processes-redis in 11.8ms
+• Building tasks.json
+  structuredAttrs is enabled
+✓ Building tasks.json in 19.6ms
+✓ Building python3-3.13.15-env in 933ms
+• Building devenv-profile
+  structuredAttrs is enabled
+  created 167 symlinks in user environment
+✓ Building devenv-profile in 40.5ms
+• Building devenv-shell
+  Running phase: buildPhase
+✓ Building devenv-shell in 41.8ms
+• Building devenv-shell-env
+✓ Building devenv-shell-env in 99.8ms
+✓ Evaluating shell in 3.39s
+• Evaluating bash
+✓ Evaluating bash in 2.42ms
+✓ Configuring shell in 3.40s
+• Evaluating Nix
+✓ Evaluating Nix in 1.81ms
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 2.39ms
+✓ Loading tasks in 2.64ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 3.97ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 3.83ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 916ns (no command)
+✓ Running tasks in 8.00ms
+• Evaluating Nix
+✓ Evaluating Nix in 2.08ms
+• Running processes
+• Evaluating Nix
+✓ Evaluating Nix in 1.29ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.57ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.19ms
+✓ Running processes in 2.06s
+• Validating lock
+✓ Validating lock in 4.84ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Validating lock
+✓ Validating lock in 4.26ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+postgres                       ready restarts: 0 ports: main:5433
+redis                          ready restarts: 0 ports: main:6380

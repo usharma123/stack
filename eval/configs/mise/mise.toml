@@ -1,0 +1,28 @@
+[tools]
+python = "3.13"
+uv = "latest"
+postgres = "17"
+redis = "latest"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+PGDATA = "{{config_root}}/.state/pgdata"
+PGPORT = "5432"
+REDIS_PORT = "6379"
+DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/postgres"
+REDIS_URL = "redis://127.0.0.1:6379/0"
+
+# Services are DIY: mise has no process supervisor
+[tasks.up]
+run = '''
+mkdir -p .state
+[ -f "$PGDATA/PG_VERSION" ] || initdb -D "$PGDATA" -U postgres --auth=trust > /dev/null
+pg_ctl -D "$PGDATA" -l .state/pg.log -o "-p $PGPORT -k $PWD/.state -c listen_addresses=127.0.0.1" -w start
+redis-server --port $REDIS_PORT --daemonize yes --pidfile $PWD/.state/redis.pid --logfile $PWD/.state/redis.log --save "" --appendonly no
+'''
+
+[tasks.down]
+run = '''
+pg_ctl -D "$PGDATA" -m fast stop || true
+[ -f .state/redis.pid ] && kill $(cat .state/redis.pid) || true
+'''

@@ -1,0 +1,6 @@
+Error: unknown flag: --json
+
+Services running in process-compose:
+PID          NAME              NAMESPACE        STATUS         AGE        HEALTH           RESTARTS        EXIT CODE
+12673        postgresql        default          Running        0s         -                0               0
+12671        redis             default          Running        0s         Not Ready        0               0

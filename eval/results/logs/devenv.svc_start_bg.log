@@ -1,0 +1,33 @@
+• Validating lock
+✓ Validating lock in 4.92ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring cachix
+✓ Configuring cachix in 3.12ms
+• Configuring shell
+• Evaluating shell
+✓ Evaluating shell in 1.32s
+✓ Configuring shell in 1.33s
+• Evaluating Nix
+✓ Evaluating Nix in 1.96ms
+• Loading tasks
+• Evaluating devenv.config.task.config
+✓ Evaluating devenv.config.task.config in 2.43ms
+✓ Loading tasks in 2.71ms
+• Running tasks
+• Running devenv:files:cleanup
+✓ Running devenv:files:cleanup in 7.07ms
+• Running devenv:enterShell
+✓ Running devenv:enterShell in 4.90ms
+• Running devenv:enterTest
+✓ Running devenv:enterTest in 917ns (no command)
+✓ Running tasks in 12.2ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.51ms
+• Running processes
+• Evaluating Nix
+✓ Evaluating Nix in 1.15ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.55ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.78ms
+✓ Running processes in 2.08s

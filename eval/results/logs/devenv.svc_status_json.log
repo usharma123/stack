@@ -1,0 +1,5 @@
+• Validating lock
+✓ Validating lock in 4.86ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+postgres                       ready restarts: 0 ports: main:5432
+redis                          ready restarts: 0 ports: main:6379

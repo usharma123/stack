@@ -1,0 +1,31 @@
+11916     1      43 devbox          [devbox] <defunct>
+12032     1      41 devbox          [devbox] <defunct>
+12116     1      41 devbox          [devbox] <defunct>
+12593     1      36 process-compose [process-compose] <defunct>
+12594     1      36 devbox          [devbox] <defunct>
+12608     1      36 devbox          [devbox] <defunct>
+12671     1      36 redis-server    redis-server 127.0.0.1:6379
+12673     1      36 postgres        postgres -k /home/agent/proj/.devbox/virtenv/postgresql -p 5432
+12688 12673      36 postgres        postgres: checkpointer 
+12689 12673      36 postgres        postgres: background writer 
+12692 12673      36 postgres        postgres: walwriter 
+12693 12673      36 postgres        postgres: autovacuum launcher 
+12695 12673      36 postgres        postgres: logical replication launcher 
+12724     1      36 devbox          [devbox] <defunct>
+12819     1      36 devbox          [devbox] <defunct>
+12904     1      36 devbox          [devbox] <defunct>
+13014     1      36 devbox          [devbox] <defunct>
+13023     1      36 devbox          [devbox] <defunct>
+13189     1      33 devbox          [devbox] <defunct>
+13307     1      33 devbox          [devbox] <defunct>
+13432     1      33 devbox          [devbox] <defunct>
+13437     1      33 devbox          [devbox] <defunct>
+13681     1      31 devbox          [devbox] <defunct>
+13814     1      29 process-compose [process-compose] <defunct>
+13822     1      29 devbox          [devbox] <defunct>
+13833     1      29 devbox          [devbox] <defunct>
+13989     1      21 devbox          [devbox] <defunct>
+13994     1      21 devbox          [devbox] <defunct>
+14307     1      16 devbox          [devbox] <defunct>
+14675     1       7 devbox          [devbox] <defunct>
+15254     1       5 devbox          [devbox] <defunct>

@@ -1,0 +1,9 @@
+[down] $ pg_ctl -D "$PGDATA" -m fast stop || true
+waiting for server to shut down.... done
+server stopped
+[down] $ pg_ctl -D "$PGDATA" -m fast stop || true
+pg_ctl: PID file "/home/agent/proj2/.state/pgdata/postmaster.pid" does not exist
+Is server running?
+  306     1     154 postgres        [postgres] <defunct>
+  315     1     154 redis-server    [redis-server] <defunct>
+10434     1      13 mise            [mise] <defunct>

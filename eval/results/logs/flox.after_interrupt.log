@@ -1,0 +1,8 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+postgresql
+python
+redis
+uv
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+14:44:05.279  WARN flox::utils::detect_shell: Failed to detect shell from environment or parent process. Defaulting to bash
+bash: line 1: go: command not found

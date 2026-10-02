@@ -1,0 +1,79 @@
+• Validating lock
+✓ Validating lock in 4.74ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring cachix
+✓ Configuring cachix in 1.93ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.60s
+Inputs:
+├───devenv: github:cachix/devenv/fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4?dir=src/modules&narHash=sha256-0FpLHIRDYiyo3EMTnMQSobZQknZaa3JuWo6vmMCK76o%3D
+└───nixpkgs: github:cachix/devenv-nixpkgs/c2f38fe7f9e04d9aadd354d380f2bd40531d9737?narHash=sha256-vNkJbtmqyBfFhn/HnzQo4ROuoyYWuy/allqTfJb4kMY%3D
+
+# env
+- DATABASE_URL: postgresql://postgres@127.0.0.1:5432/postgres
+- DEVENV_DOTFILE: /home/agent/proj/.devenv
+- DEVENV_PROFILE: /nix/store/qwysm59q72nbgg728idkgps7a1ddi3p6-devenv-profile
+- DEVENV_ROOT: /home/agent/proj
+- DEVENV_RUNTIME: /tmp/devenv-734fe7a
+- DEVENV_STATE: /home/agent/proj/.devenv/state
+- DEVENV_TASKS: 
+- DEVENV_TASK_FILE: /nix/store/7iij8w6l3sjdy1zchci67bn4mdnk82ca-tasks.json
+- NIX_PYTHONPATH: /nix/store/qwysm59q72nbgg728idkgps7a1ddi3p6-devenv-profile/lib/python3.13/site-packages
+- PGDATA: /home/agent/proj/.devenv/state/postgres
+- PGHOST: 127.0.0.1
+- PGPORT: 5432
+- PYTHONPATH: /nix/store/5m4hkbv0xqqivfr9va6wbb1rha46v75v-sitecustomize.py
+- REDISDATA: /home/agent/proj/.devenv/state/redis
+- REDIS_UNIX_SOCKET: 
+- REDIS_URL: redis://127.0.0.1:6379/0
+- UV_PROJECT_ENVIRONMENT: /home/agent/proj/.devenv/state/venv
+- UV_PYTHON_DOWNLOADS: never
+- UV_PYTHON_PREFERENCE: only-system
+- dontAddPythonPath: 1
+
+# packages
+- bash-interactive-5.3p15
+- redis-8.10.1
+- postgresql-17.11
+- start-postgres
+- python3-3.13.15-env
+- uv-0.12.11
+- pyright-1.1.412
+- pkg-config-wrapper-0.29.2
+
+# processes
+- postgres: exec /nix/store/k00pfr6d0a9fc0fijmb22dk3r555dx73-postgres
+- redis: exec /nix/store/lkg5hv910biwgi93lnwrjrh1pq1s48qq-redis
+
+# tasks
+- devenv:container:copy:  (/nix/store/dqh1apxgpziw84vy560lhbmjj1j9kfkq-devenv-container-copy)
+- devenv:enterShell: Runs when entering the shell (/nix/store/fa7h3fryh5vlvmxn0wxfbjrydx9sl6xr-devenv-enterShell)
+- devenv:enterTest: Runs when entering the test environment (no command)
+- devenv:files:  (no command)
+- devenv:files:cleanup: Cleanup orphaned files (/nix/store/0rvcj445lhfagcsjpyq6hjxz84yhzbc9-devenv-files-cleanup)
+- devenv:processes:postgres:  (/nix/store/s0ijlr3dgixm50qipmp59wwms9plpbsc-devenv-processes-postgres)
+- devenv:processes:redis:  (/nix/store/7a418m7122ig6imsbd9jj7wgm58j773d-devenv-processes-redis)
+• Validating lock
+✓ Validating lock in 4.16ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring cachix
+✓ Configuring cachix in 2.62ms
+• Evaluating
+• Evaluating Nix
+✓ Evaluating Nix in 23.7ms
+• Evaluating Nix
+✓ Evaluating Nix in 1.46s
+✓ Evaluating in 1.48s
+{
+  "services.postgres.port": 5432,
+  "packages": [
+    "/nix/store/z9nkwcylvgcrn4dvvd91jp8blv3mx38v-bash-interactive-5.3p15",
+    "/nix/store/rrbbpkysqxscr9a3a9b9jn84710cgv2j-redis-8.10.1",
+    "/nix/store/k391a5cipfpdff638y5jdhnalcbnwvmq-postgresql-17.11",
+    "/nix/store/8rn80z8lyqb5ycgkifprdy1xjci636ag-start-postgres",
+    "/nix/store/8506rw2hcig0bwjn3j2v1qqqky6x09sv-python3-3.13.15-env",
+    "/nix/store/rfsh6fzln65ll8vw67g06rfif4ps0zgr-uv-0.12.11",
+    "/nix/store/m7dsdgs2myx9gl9a0llqm8adlq2ijii4-pyright-1.1.412",
+    "/nix/store/96rqsbg8z242724qy85sbld7dbf4hipr-pkg-config-wrapper-0.29.2"
+  ]
+}

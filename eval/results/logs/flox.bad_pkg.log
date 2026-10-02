@@ -1,0 +1,4 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+✘ ERROR: resolution failed: 
+Could not find package 'definitely-not-a-pkg-zz'.
+Try 'flox search' with a broader search term.

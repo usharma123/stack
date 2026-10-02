@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Load bundle fixture into the database"
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "task dir: $here"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$here/../fixtures/seed.sql"
+psql "$DATABASE_URL" -Atc "select v from seed_marker"

@@ -1,0 +1,11 @@
+[tools]
+python = "3.13"
+uv = "latest"
+pitchfork = "2.29.0"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+BUNDLE_NAME = "pybase"
+BUNDLE_REV = "v1"
+LOG_LEVEL = "info"
+_.path = ["{{config_root}}/bin"]

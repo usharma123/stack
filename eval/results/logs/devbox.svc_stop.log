@@ -1,0 +1,39 @@
+Process-compose stopped successfully.
+Process-compose stopped successfully.
+11916     1      47 devbox          [devbox] <defunct>
+12032     1      45 devbox          [devbox] <defunct>
+12116     1      45 devbox          [devbox] <defunct>
+12593     1      39 process-compose [process-compose] <defunct>
+12594     1      39 devbox          [devbox] <defunct>
+12608     1      39 devbox          [devbox] <defunct>
+12671     1      39 redis-server    redis-server 127.0.0.1:6379
+12673     1      39 postgres        postgres -k /home/agent/proj/.devbox/virtenv/postgresql -p 5432
+12688 12673      39 postgres        postgres: checkpointer 
+12689 12673      39 postgres        postgres: background writer 
+12692 12673      39 postgres        postgres: walwriter 
+12693 12673      39 postgres        postgres: autovacuum launcher 
+12695 12673      39 postgres        postgres: logical replication launcher 
+12724     1      39 devbox          [devbox] <defunct>
+12819     1      39 devbox          [devbox] <defunct>
+12904     1      39 devbox          [devbox] <defunct>
+13014     1      39 devbox          [devbox] <defunct>
+13023     1      39 devbox          [devbox] <defunct>
+13189     1      37 devbox          [devbox] <defunct>
+13307     1      37 devbox          [devbox] <defunct>
+13432     1      36 devbox          [devbox] <defunct>
+13437     1      36 devbox          [devbox] <defunct>
+13681     1      34 devbox          [devbox] <defunct>
+13814     1      32 process-compose [process-compose] <defunct>
+13822     1      32 devbox          [devbox] <defunct>
+13833     1      32 devbox          [devbox] <defunct>
+13989     1      24 devbox          [devbox] <defunct>
+13994     1      24 devbox          [devbox] <defunct>
+14307     1      20 devbox          [devbox] <defunct>
+14675     1      10 devbox          [devbox] <defunct>
+15254     1       8 devbox          [devbox] <defunct>
+15398     1       3 devbox          [devbox] <defunct>
+15482     1       3 devbox          [devbox] <defunct>
+15598     1       3 devbox          [devbox] <defunct>
+15603     1       3 devbox          [devbox] <defunct>
+15717     1       3 devbox          [devbox] <defunct>
+15722     1       3 devbox          [devbox] <defunct>

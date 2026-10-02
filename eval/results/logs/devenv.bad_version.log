@@ -1,0 +1,1634 @@
+• Validating lock
+✓ Validating lock in 3.76ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring shell
+• Configuring cachix
+• Downloading https://nixpkgs-python.cachix.org/nix-cache-info
+✓ Downloading https://nixpkgs-python.cachix.org/nix-cache-info in 308ms
+✓ Configuring cachix in 691ms
+• Evaluating shell
+  evaluating file '/nix/store/k8zx0v6bbn8j8k57gi2kmgin353i0kkl-source/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/minfeatures.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/impure.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/impure-overlays.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/systems/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/systems/architectures.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/systems/inspect.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/systems/parse.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/meta-types.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/fixed-points.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/config.nix'
+  evaluating file '/home/agent/proj/.devenv/nixpkgs-config-c46eff8321b73149.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/generic/problems.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/booter.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/systems/platforms.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/linux/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/linux/stage0.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/linux/bootstrap-tools/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/linux/bootstrap-tools/glibc.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/asserts.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/by-name-overlay.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/generic/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/customisation.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/bintools-wrapper/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/generic/make-derivation.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/binutils/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/patchelf/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/all.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/versions.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/meta.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/libgcc.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/builder.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/checksum.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/generic/check-meta.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/meta.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/meta.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/glibc/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/glibc/common.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/os-specific/linux/kernel-headers/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/patchelf/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/gmp/6.x.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/isl/0.20.0.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/isl/generic.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/li/libmpc/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/mp/mpfr/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/all.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/meta.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/meta.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/co/coreutils/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/acl/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/attr/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/systems/doubles.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnugrep/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/patchelf/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/k8zx0v6bbn8j8k57gi2kmgin353i0kkl-source/patches/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/generic/problems.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/5.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/licenses/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/licenses/helpers.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/licenses/operators.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/licenses/licenses.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/bash-5.3-patches.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/linux/bootstrap-files/aarch64-unknown-linux-gnu.nix'
+  evaluating file '<nix/fetchurl.nix>'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/filesystem.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/zlib/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/gettext/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/boot.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnu-config/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/bi/bison/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnum4/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/interpreters/perl/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/interpreters/perl/interpreter.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/libxcrypt/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/mirrors.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ex/expand-response-params/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/extra-target-flags.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/dependencies.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/isl/0.20.0.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/gmp/6.x.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/mp/mpfr/package.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/li/libmpc/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/configure-flags.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/platform-flags.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/versions.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/texinfo/packages.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/texinfo/common.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/wh/which/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/autoconf/2.69.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/patches/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/nuke-references/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/replace-vars/replace-vars-with.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/pre-configure.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/strip-attributes.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/interpreters/python/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/interpreters/python/cpython/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/interpreters/python/passthrufun.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/interpreters/python/setup-hook.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/replace-vars/replace-vars.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/replace-vars/replace-vars-with.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/libidn2/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/libunistring/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/zlib/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/extra-target-flags.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/dependencies.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/isl/0.20.0.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/gmp/6.x.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/mp/mpfr/package.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/li/libmpc/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/configure-flags.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/platform-flags.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/texinfo/packages.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/texinfo/common.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/gettext/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/patches/default.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/pre-configure.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/compilers/gcc/common/strip-attributes.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/xz/xz/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/tools/compression/gzip/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/tools/compression/bzip2/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/au/autoreconfHook/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/autoconf/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/automake/automake-1.18.x.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/tools/misc/libtool/libtool2.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/tools/misc/file/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/xz/xz/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/gmp/6.x.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/di/diffutils/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/tools/misc/findutils/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/tools/text/gawk/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnumake/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/pkg-config-wrapper/default.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/pk/pkg-config-unwrapped/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ve/versionCheckHook/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/replace-vars/replace-vars.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/build-support/replace-vars/replace-vars-with.nix' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/tools/text/gnused/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnutar/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/pc/pcre2/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/glibc/locales.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/development/libraries/glibc/common.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/gn/gnupatch/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/ed/ed/package.nix'
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/by-name/lz/lzip/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/pkgs/stdenv/generic/common-path.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/minfeatures.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/impure.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/trivial.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/lists.nix'
+  evaluating file '/nix/store/k8zx0v6bbn8j8k57gi2kmgin353i0kkl-source/overlays/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/systems/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/attrsets.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/systems/architectures.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/systems/inspect.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/systems/parse.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/strings.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/meta-types.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/fixed-points.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/modules.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/config.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/options.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/types.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/debug.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/problems.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/booter.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/systems/platforms.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/linux/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/linux/stage0.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/linux/bootstrap-tools/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/linux/bootstrap-tools/glibc.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/asserts.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/by-name-overlay.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/customisation.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/bintools-wrapper/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/make-derivation.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/binutils/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/patchelf/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/all.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/versions.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/meta.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/libgcc.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/builder.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/checksum.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/check-meta.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/meta.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/meta.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/glibc/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/glibc/common.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/os-specific/linux/kernel-headers/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/patchelf/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/gmp/6.x.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/isl/0.20.0.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/isl/generic.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/li/libmpc/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/mp/mpfr/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/all.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/meta.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/libgcc.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/builder.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/checksum.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/binutils/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/meta.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/versions.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/cc-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/co/coreutils/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/acl/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/attr/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/systems/doubles.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnugrep/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/patchelf/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/stage.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/variants.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/aliases.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/all-packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/top-level/splice.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/trivial-builders/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/adapters.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/5.nix'
+  evaluating file '/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/lib/process-manager-types.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/mkshell/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/problems.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/buildenv/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/perl/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/perl/interpreter.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/libxcrypt/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/licenses/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/licenses/helpers.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/licenses/operators.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/licenses/licenses.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/bash-5.3-patches.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/linux/bootstrap-files/aarch64-unknown-linux-gnu.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/filesystem.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/zlib/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/gettext/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/boot.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnu-config/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/bi/bison/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnum4/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/perl/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/perl/interpreter.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/libxcrypt/default.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/mirrors.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ex/expand-response-params/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/extra-target-flags.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/dependencies.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/isl/0.20.0.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/gmp/6.x.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/mp/mpfr/package.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/li/libmpc/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/configure-flags.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/platform-flags.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/versions.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/texinfo/packages.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/texinfo/common.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/wh/which/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/autoconf/2.69.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/patches/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/nuke-references/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars-with.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/pre-configure.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/strip-attributes.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/cpython/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/passthrufun.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/setup-hook.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars-with.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/libidn2/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/libunistring/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/zlib/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/extra-target-flags.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/dependencies.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/isl/0.20.0.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/gmp/6.x.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/mp/mpfr/package.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/li/libmpc/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/configure-flags.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/platform-flags.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/texinfo/packages.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/texinfo/common.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/gettext/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/5.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/shells/bash/bash-5.3-patches.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/patches/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/pre-configure.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/gcc/common/strip-attributes.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnu-config/package.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/xz/xz/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/boot.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/bintools-wrapper/default.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/gmp/6.x.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/xz/xz/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/pc/pcre2/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/glibc/locales.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/glibc/common.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/tools/compression/gzip/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/tools/compression/bzip2/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/au/autoreconfHook/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/autoconf/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/automake/automake-1.18.x.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/tools/misc/libtool/libtool2.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/tools/misc/file/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/di/diffutils/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/tools/misc/findutils/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/tools/text/gawk/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnumake/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/pkg-config-wrapper/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/pk/pkg-config-unwrapped/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ve/versionCheckHook/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars-with.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/tools/text/gnused/default.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnutar/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/gn/gnupatch/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ed/ed/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/lz/lzip/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/common-path.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/deprecated/misc.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/cmake.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/lib/fetchers.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/fetchurl/mirrors.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/lib/meson.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/cu/curlMinimal/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/libraries/openssl/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ma/makeBinaryWrapper/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/di/dieHook/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/li/libssh2/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/kr/krb5/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ke/keyutils/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/by/byacc/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/pkg-config-wrapper/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/pk/pkg-config-unwrapped/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/replace-vars/replace-vars-with.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ex/expand-response-params/package.nix' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/ng/nghttp2/package.nix'
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '<nix/fetchurl.nix>' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/by-name/re/redis/package.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/servers/sql/postgresql/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/servers/sql/postgresql/generic.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/servers/sql/postgresql/17.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/default.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/compilers/llvm/common/common-let.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/tcl/8.6.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/tcl/generic.nix'
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/cpython/default.nix' (cached)
+  evaluating file '/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/development/interpreters/python/passthrufun.nix' (cached)
+✖ Evaluating shell in 341ms (failed)
+✓ Configuring shell in 1.06s
+  [31m×[0m Failed to get drvPath from shell derivation: 
+  [31m [0m … while calling the '[35;1mderivationStrict[0m' builtin
+  [31m [0m   [34;1mat [35;1m«nix-internal»/derivation-internal.nix:37:12[0m:
+  [31m [0m     36|
+  [31m [0m     37|   strict = derivationStrict drvAttrs;
+  [31m [0m       |            [31;1m^[0m
+  [31m [0m     38|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating derivation '[35;1mdevenv-shell[0m'
+  [31m [0m   whose name attribute is located at [35;1m/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/make-derivation.nix:651:11[0m
+  [31m [0m
+  [31m [0m … while evaluating attribute '[35;1mDEVENV_PROFILE[0m' of derivation '[35;1mdevenv-shell[0m'
+  [31m [0m
+  [31m [0m … while calling the '[35;1mderivationStrict[0m' builtin
+  [31m [0m   [34;1mat [35;1m«nix-internal»/derivation-internal.nix:37:12[0m:
+  [31m [0m     36|
+  [31m [0m     37|   strict = derivationStrict drvAttrs;
+  [31m [0m       |            [31;1m^[0m
+  [31m [0m     38|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating derivation '[35;1mdevenv-profile[0m'
+  [31m [0m   whose name attribute is located at [35;1m/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/stdenv/generic/make-derivation.nix:651:11[0m
+  [31m [0m
+  [31m [0m … while evaluating attribute '[35;1mchosenOutputs[0m' of derivation '[35;1mdevenv-profile[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/buildenv/default.nix:113:9[0m:
+  [31m [0m    112|
+  [31m [0m    113|         chosenOutputs = map (drv: {
+  [31m [0m       |         [31;1m^[0m
+  [31m [0m    114|           paths =
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mmap[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/buildenv/default.nix:113:25[0m:
+  [31m [0m    112|
+  [31m [0m    113|         chosenOutputs = map (drv: {
+  [31m [0m       |                         [31;1m^[0m
+  [31m [0m    114|           paths =
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mpassthru.paths[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/qkxynan8nn4qwylpw405adanhxsgfk38-devenv-nixpkgs-patched/pkgs/build-support/buildenv/default.nix:151:19[0m:
+  [31m [0m    150|           # The `paths` attribute is referenced and overridden from passthru
+  [31m [0m    151|           inherit paths;
+  [31m [0m       |                   [31;1m^[0m
+  [31m [0m    152|         }
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/top-level.nix:54:13[0m:
+  [31m [0m     53|     name = "devenv-profile";
+  [31m [0m     54|     paths = lib.flatten (builtins.map drvOrPackageToPaths config.packages);
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m     55|     ignoreCollisions = true;
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'flatten'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/lists.nix:448:13[0m:
+  [31m [0m    447|   */
+  [31m [0m    448|   flatten = x: if isList x then concatMap flatten x else [ x ];
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m    449|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/lists.nix:448:16[0m:
+  [31m [0m    447|   */
+  [31m [0m    448|   flatten = x: if isList x then concatMap flatten x else [ x ];
+  [31m [0m       |                [31;1m^[0m
+  [31m [0m    449|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1misList[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/lists.nix:448:19[0m:
+  [31m [0m    447|   */
+  [31m [0m    448|   flatten = x: if isList x then concatMap flatten x else [ x ];
+  [31m [0m       |                   [31;1m^[0m
+  [31m [0m    449|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mmap[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/top-level.nix:54:26[0m:
+  [31m [0m     53|     name = "devenv-profile";
+  [31m [0m     54|     paths = lib.flatten (builtins.map drvOrPackageToPaths config.packages);
+  [31m [0m       |                          [31;1m^[0m
+  [31m [0m     55|     ignoreCollisions = true;
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/top-level.nix:54:59[0m:
+  [31m [0m     53|     name = "devenv-profile";
+  [31m [0m     54|     paths = lib.flatten (builtins.map drvOrPackageToPaths config.packages);
+  [31m [0m       |                                                           [31;1m^[0m
+  [31m [0m     55|     ignoreCollisions = true;
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:283:38[0m:
+  [31m [0m    282|             let
+  [31m [0m    283|               recurse = mapAttrs (n: v: if isOption v then v.value else recurse v);
+  [31m [0m       |                                      [31;1m^[0m
+  [31m [0m    284|             in
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mvalue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1181:7[0m:
+  [31m [0m   1180|     // {
+  [31m [0m   1181|       value = addErrorContext "while evaluating the option `${showOption loc}':" (
+  [31m [0m       |       [31;1m^[0m
+  [31m [0m   1182|         # Apply the 'apply' function to the merged value. This allows options to
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the option `packages':
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mmergedValue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1276:5[0m:
+  [31m [0m   1275|     # Type-check the remaining definitions, and merge them. Or throw if no definitions.
+  [31m [0m   1276|     mergedValue =
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1277|       if isDefined then
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mvalue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:746:13[0m:
+  [31m [0m    745|             headError = checkDefsForError check loc defs;
+  [31m [0m    746|             value = map (x: x.optionalValue.value or x.mergedValue) evals;
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m    747|             valueMeta.list = map (v: v.checkedAndMerged.valueMeta) evals;
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mmap[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:746:21[0m:
+  [31m [0m    745|             headError = checkDefsForError check loc defs;
+  [31m [0m    746|             value = map (x: x.optionalValue.value or x.mergedValue) evals;
+  [31m [0m       |                     [31;1m^[0m
+  [31m [0m    747|             valueMeta.list = map (v: v.checkedAndMerged.valueMeta) evals;
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mfilter[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:727:21[0m:
+  [31m [0m    726|           let
+  [31m [0m    727|             evals = filter (x: x.optionalValue ? value) (
+  [31m [0m       |                     [31;1m^[0m
+  [31m [0m    728|               concatLists (
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:727:29[0m:
+  [31m [0m    726|           let
+  [31m [0m    727|             evals = filter (x: x.optionalValue ? value) (
+  [31m [0m       |                             [31;1m^[0m
+  [31m [0m    728|               concatLists (
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1moptionalValue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1342:5[0m:
+  [31m [0m   1341|
+  [31m [0m   1342|     optionalValue = if isDefined then { value = mergedValue; } else { };
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1343|   };
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1342:21[0m:
+  [31m [0m   1341|
+  [31m [0m   1342|     optionalValue = if isDefined then { value = mergedValue; } else { };
+  [31m [0m       |                     [31;1m^[0m
+  [31m [0m   1343|   };
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1231:7[0m:
+  [31m [0m   1230|       # original singleton straight to the type merge.
+  [31m [0m   1231|       if
+  [31m [0m       |       [31;1m^[0m
+  [31m [0m   1232|         length defs == 1
+  [31m [0m
+  [31m [0m
+  [31m [0m … in the right operand of the AND (&&) operator
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1233:9[0m:
+  [31m [0m   1232|         length defs == 1
+  [31m [0m   1233|         && addErrorContext "while evaluating definitions from `${(head defs).file}':" (
+  [31m [0m       |         [31;1m^[0m
+  [31m [0m   1234|           !(head defs).value ? _type
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating definitions from `/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python':
+  [31m [0m
+  [31m [0m … in the argument of the not operator
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1234:12[0m:
+  [31m [0m   1233|         && addErrorContext "while evaluating definitions from `${(head defs).file}':" (
+  [31m [0m   1234|           !(head defs).value ? _type
+  [31m [0m       |            [31;1m^[0m
+  [31m [0m   1235|         )
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mvalue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:736:25[0m:
+  [31m [0m    735|                         inherit (def) file;
+  [31m [0m    736|                         value = def';
+  [31m [0m       |                         [31;1m^[0m
+  [31m [0m    737|                       }
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1melemAt[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/lists.nix:350:43[0m:
+  [31m [0m    349|   */
+  [31m [0m    350|   imap1 = f: list: genList (n: f (n + 1) (elemAt list n)) (length list);
+  [31m [0m       |                                           [31;1m^[0m
+  [31m [0m    351|
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:737:7[0m:
+  [31m [0m    736|     packages = [
+  [31m [0m    737|       cfg.package
+  [31m [0m       |       [31;1m^[0m
+  [31m [0m    738|     ]
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:283:38[0m:
+  [31m [0m    282|             let
+  [31m [0m    283|               recurse = mapAttrs (n: v: if isOption v then v.value else recurse v);
+  [31m [0m       |                                      [31;1m^[0m
+  [31m [0m    284|             in
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mvalue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1181:7[0m:
+  [31m [0m   1180|     // {
+  [31m [0m   1181|       value = addErrorContext "while evaluating the option `${showOption loc}':" (
+  [31m [0m       |       [31;1m^[0m
+  [31m [0m   1182|         # Apply the 'apply' function to the merged value. This allows options to
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the option `languages.python.package':
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1184:29[0m:
+  [31m [0m   1183|         # yield a value computed from the definitions
+  [31m [0m   1184|         if opt ? apply then opt.apply res.mergedValue else res.mergedValue
+  [31m [0m       |                             [31;1m^[0m
+  [31m [0m   1185|       );
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'apply'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:337:9[0m:
+  [31m [0m    336|       apply =
+  [31m [0m    337|         drv:
+  [31m [0m       |         [31;1m^[0m
+  [31m [0m    338|         let
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mfoldl'[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:404:11[0m:
+  [31m [0m    403|         if cfg.patches.buildEnv.enable then
+  [31m [0m    404|           lib.pipe drv [
+  [31m [0m       |           [31;1m^[0m
+  [31m [0m    405|             patchBuildEnv
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/trivial.nix:152:30[0m:
+  [31m [0m    151|   */
+  [31m [0m    152|   pipe = builtins.foldl' (x: f: f x);
+  [31m [0m       |                              [31;1m^[0m
+  [31m [0m    153|
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/trivial.nix:152:33[0m:
+  [31m [0m    151|   */
+  [31m [0m    152|   pipe = builtins.foldl' (x: f: f x);
+  [31m [0m       |                                 [31;1m^[0m
+  [31m [0m    153|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'patchBuildEnv'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:355:13[0m:
+  [31m [0m    354|           patchBuildEnv =
+  [31m [0m    355|             drv:
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m    356|             let
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:384:13[0m:
+  [31m [0m    383|             # If we got a buildEnv from withPackages, modify its postBuild to use our wrapper logic
+  [31m [0m    384|             if isBuildEnv drv then patchedEnv else drv;
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m    385|
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:384:16[0m:
+  [31m [0m    383|             # If we got a buildEnv from withPackages, modify its postBuild to use our wrapper logic
+  [31m [0m    384|             if isBuildEnv drv then patchedEnv else drv;
+  [31m [0m       |                [31;1m^[0m
+  [31m [0m    385|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'isBuildEnv'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:339:24[0m:
+  [31m [0m    338|         let
+  [31m [0m    339|           isBuildEnv = drv: lib.hasAttr "extraLibs" (lib.functionArgs drv.override);
+  [31m [0m       |                        [31;1m^[0m
+  [31m [0m    340|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mhasAttr[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:339:29[0m:
+  [31m [0m    338|         let
+  [31m [0m    339|           isBuildEnv = drv: lib.hasAttr "extraLibs" (lib.functionArgs drv.override);
+  [31m [0m       |                             [31;1m^[0m
+  [31m [0m    340|
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:339:54[0m:
+  [31m [0m    338|         let
+  [31m [0m    339|           isBuildEnv = drv: lib.hasAttr "extraLibs" (lib.functionArgs drv.override);
+  [31m [0m       |                                                      [31;1m^[0m
+  [31m [0m    340|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/trivial.nix:1109:5[0m:
+  [31m [0m   1108|     in
+  [31m [0m   1109|     f: if f ? __functor then f.__functionArgs or (functionArgs (f.__functor f)) else functionArgs f;
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1110|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/trivial.nix:1109:8[0m:
+  [31m [0m   1108|     in
+  [31m [0m   1109|     f: if f ? __functor then f.__functionArgs or (functionArgs (f.__functor f)) else functionArgs f;
+  [31m [0m       |        [31;1m^[0m
+  [31m [0m   1110|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mmergedValue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1276:5[0m:
+  [31m [0m   1275|     # Type-check the remaining definitions, and merge them. Or throw if no definitions.
+  [31m [0m   1276|     mergedValue =
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1277|       if isDefined then
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1277:7[0m:
+  [31m [0m   1276|     mergedValue =
+  [31m [0m   1277|       if isDefined then
+  [31m [0m       |       [31;1m^[0m
+  [31m [0m   1278|         if type.merge ? v2 then
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mvalues[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1270:11[0m:
+  [31m [0m   1269|         {
+  [31m [0m   1270|           values = defsSorted;
+  [31m [0m       |           [31;1m^[0m
+  [31m [0m   1271|           inherit (defsFiltered) highestPrio;
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1264:13[0m:
+  [31m [0m   1263|             # Avoid sorting if we don't have to.
+  [31m [0m   1264|             if any (def: def.value._type or "" == "order") defsFiltered.values then
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m   1265|               sortProperties defsFiltered.values
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1many[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1264:16[0m:
+  [31m [0m   1263|             # Avoid sorting if we don't have to.
+  [31m [0m   1264|             if any (def: def.value._type or "" == "order") defsFiltered.values then
+  [31m [0m       |                [31;1m^[0m
+  [31m [0m   1265|               sortProperties defsFiltered.values
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1259:26[0m:
+  [31m [0m   1258|           # Process mkOverride properties.
+  [31m [0m   1259|           defsFiltered = filterOverrides' defsNormalized;
+  [31m [0m       |                          [31;1m^[0m
+  [31m [0m   1260|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1460:5[0m:
+  [31m [0m   1459|     in
+  [31m [0m   1460|     defs:
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1461|     # Optimize for the singleton case, equivalent to the `else` clause.
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1462:5[0m:
+  [31m [0m   1461|     # Optimize for the singleton case, equivalent to the `else` clause.
+  [31m [0m   1462|     if length defs == 1 then
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1463|       {
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mlength[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1462:8[0m:
+  [31m [0m   1461|     # Optimize for the singleton case, equivalent to the `else` clause.
+  [31m [0m   1462|     if length defs == 1 then
+  [31m [0m       |        [31;1m^[0m
+  [31m [0m   1463|       {
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mconcatMap[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1244:28[0m:
+  [31m [0m   1243|           # Process mkMerge and mkIf properties.
+  [31m [0m   1244|           defsNormalized = concatMap (
+  [31m [0m       |                            [31;1m^[0m
+  [31m [0m   1245|             m:
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1245:13[0m:
+  [31m [0m   1244|           defsNormalized = concatMap (
+  [31m [0m   1245|             m:
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m   1246|             map (
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mmap[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1246:13[0m:
+  [31m [0m   1245|             m:
+  [31m [0m   1246|             map (
+  [31m [0m       |             [31;1m^[0m
+  [31m [0m   1247|               value:
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating definitions from `/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python':
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1255:82[0m:
+  [31m [0m   1254|                 }
+  [31m [0m   1255|             ) (addErrorContext "while evaluating definitions from `${m.file}':" (dischargeProperties m.value))
+  [31m [0m       |                                                                                  [31;1m^[0m
+  [31m [0m   1256|           ) defs;
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'dischargeProperties'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1411:5[0m:
+  [31m [0m   1410|   dischargeProperties =
+  [31m [0m   1411|     def:
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1412|     if def ? _type then
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1415:33[0m:
+  [31m [0m   1414|         if isBool def.condition then
+  [31m [0m   1415|           if def.condition then dischargeProperties def.content else [ ]
+  [31m [0m       |                                 [31;1m^[0m
+  [31m [0m   1416|         else
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'dischargeProperties'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1411:5[0m:
+  [31m [0m   1410|   dischargeProperties =
+  [31m [0m   1411|     def:
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1412|     if def ? _type then
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mconcatMap[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1419:9[0m:
+  [31m [0m   1418|       else if def._type == "merge" then
+  [31m [0m   1419|         concatMap dischargeProperties def.contents
+  [31m [0m       |         [31;1m^[0m
+  [31m [0m   1420|       else
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'dischargeProperties'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1411:5[0m:
+  [31m [0m   1410|   dischargeProperties =
+  [31m [0m   1411|     def:
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1412|     if def ? _type then
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1415:33[0m:
+  [31m [0m   1414|         if isBool def.condition then
+  [31m [0m   1415|           if def.condition then dischargeProperties def.content else [ ]
+  [31m [0m       |                                 [31;1m^[0m
+  [31m [0m   1416|         else
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'dischargeProperties'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1411:5[0m:
+  [31m [0m   1410|   dischargeProperties =
+  [31m [0m   1411|     def:
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1412|     if def ? _type then
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1412:5[0m:
+  [31m [0m   1411|     def:
+  [31m [0m   1412|     if def ? _type then
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m   1413|       if def._type == "if" then
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mcontent[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/modules.nix:1581:23[0m:
+  [31m [0m   1580|     _type = "if";
+  [31m [0m   1581|     inherit condition content;
+  [31m [0m       |                       [31;1m^[0m
+  [31m [0m   1582|   };
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/languages/python/default.nix:27:20[0m:
+  [31m [0m     26|
+  [31m [0m     27|   nixpkgs-python = config.lib.getInput {
+  [31m [0m       |                    [31;1m^[0m
+  [31m [0m     28|     name = "nixpkgs-python";
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'lambda'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:356:26[0m:
+  [31m [0m    355|             lambda =
+  [31m [0m    356|               loc: defs: arg:
+  [31m [0m       |                          [31;1m^[0m
+  [31m [0m    357|               anything.merge (loc ++ [ "<function body>" ]) (
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:357:15[0m:
+  [31m [0m    356|               loc: defs: arg:
+  [31m [0m    357|               anything.merge (loc ++ [ "<function body>" ]) (
+  [31m [0m       |               [31;1m^[0m
+  [31m [0m    358|                 map (def: {
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'merge'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:334:12[0m:
+  [31m [0m    333|     merge =
+  [31m [0m    334|       loc: defs:
+  [31m [0m       |            [31;1m^[0m
+  [31m [0m    335|       let
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:341:22[0m:
+  [31m [0m    340|         # don't have the same type
+  [31m [0m    341|         commonType = foldl' (
+  [31m [0m       |                      [31;1m^[0m
+  [31m [0m    342|           type: def:
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1manonymous lambda[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/lists.nix:282:9[0m:
+  [31m [0m    281|     in
+  [31m [0m    282|     op: acc:
+  [31m [0m       |         [31;1m^[0m
+  [31m [0m    283|     # The builtin `foldl'` is a bit lazier than one might expect.
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mseq[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/lists.nix:286:5[0m:
+  [31m [0m    285|     # In particular, the initial accumulator value is not forced before the first iteration starts.
+  [31m [0m    286|     seq acc (foldl' op acc);
+  [31m [0m       |     [31;1m^[0m
+  [31m [0m    287|
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:347:12[0m:
+  [31m [0m    346|             throw "The option `${showOption loc}' has conflicting option types in ${showFiles (getFiles defs)}"
+  [31m [0m    347|         ) (getType (head defs).value) defs;
+  [31m [0m       |            [31;1m^[0m
+  [31m [0m    348|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'getType'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:337:11[0m:
+  [31m [0m    336|         getType =
+  [31m [0m    337|           value: if isAttrs value && isStringLike value then "stringCoercibleSet" else builtins.typeOf value;
+  [31m [0m       |           [31;1m^[0m
+  [31m [0m    338|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating a branch condition
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:337:18[0m:
+  [31m [0m    336|         getType =
+  [31m [0m    337|           value: if isAttrs value && isStringLike value then "stringCoercibleSet" else builtins.typeOf value;
+  [31m [0m       |                  [31;1m^[0m
+  [31m [0m    338|
+  [31m [0m
+  [31m [0m
+  [31m [0m … in the left operand of the AND (&&) operator
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:337:35[0m:
+  [31m [0m    336|         getType =
+  [31m [0m    337|           value: if isAttrs value && isStringLike value then "stringCoercibleSet" else builtins.typeOf value;
+  [31m [0m       |                                   [31;1m^[0m
+  [31m [0m    338|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1misAttrs[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:337:21[0m:
+  [31m [0m    336|         getType =
+  [31m [0m    337|           value: if isAttrs value && isStringLike value then "stringCoercibleSet" else builtins.typeOf value;
+  [31m [0m       |                     [31;1m^[0m
+  [31m [0m    338|
+  [31m [0m
+  [31m [0m
+  [31m [0m … while evaluating the attribute '[35;1mvalue[0m'
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:360:19[0m:
+  [31m [0m    359|                   file = def.file;
+  [31m [0m    360|                   value = def.value arg;
+  [31m [0m       |                   [31;1m^[0m
+  [31m [0m    361|                 }) defs
+  [31m [0m
+  [31m [0m
+  [31m [0m … from call site
+  [31m [0m   [34;1mat [35;1m/nix/store/akq5azpip8xzarlxqxis02lg2zz3hmcb-source/lib/types.nix:360:27[0m:
+  [31m [0m    359|                   file = def.file;
+  [31m [0m    360|                   value = def.value arg;
+  [31m [0m       |                           [31;1m^[0m
+  [31m [0m    361|                 }) defs
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling [35;1m'getInput'[0m
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/lib.nix:48:16[0m:
+  [31m [0m     47|
+  [31m [0m     48|     getInput = args:
+  [31m [0m       |                [31;1m^[0m
+  [31m [0m     49|       inputs.${args.name} or (throw "${config.lib._mkInputError args}\n\n");
+  [31m [0m
+  [31m [0m
+  [31m [0m … while calling the '[35;1mthrow[0m' builtin
+  [31m [0m   [34;1mat [35;1m/nix/store/km4dzwjh3gcra05lf3zivxkrg4b0v2x1-source/src/modules/lib.nix:49:31[0m:
+  [31m [0m     48|     getInput = args:
+  [31m [0m     49|       inputs.${args.name} or (throw "${config.lib._mkInputError args}\n\n");
+  [31m [0m       |                               [31;1m^[0m
+  [31m [0m     50|
+  [31m [0m
+  [31m [0m
+  [31m [0m
+  [31m [0m [31;1merror:[0m To use 'languages.python.version', run the following command:
+  [31m [0m
+  [31m [0m   $ devenv inputs add nixpkgs-python github:cachix/nixpkgs-python --follows nixpkgs
+

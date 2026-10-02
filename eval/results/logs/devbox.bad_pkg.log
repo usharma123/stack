@@ -1,0 +1,6 @@
+Ensuring nixpkgs registry is downloaded.
+Downloaded 'github:NixOS/nixpkgs/b6c8664de9b6cc07fe5666a29f91884ba81197c4?narHash=sha256-641r7xrlSOHYoktL9/aArPIYNgZJ9eM5URzSEOtPJDY%3D' to '/nix/store/84xbks2h7qk6lavs0pk4j6898381sn5p-source' (hash 'sha256-641r7xrlSOHYoktL9/aArPIYNgZJ9eM5URzSEOtPJDY=').
+Ensuring nixpkgs registry is downloaded: Success
+
+Error: Package definitely-not-a-pkg-zz not found
+

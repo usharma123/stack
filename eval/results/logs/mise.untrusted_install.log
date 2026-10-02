@@ -1,0 +1,33 @@
+mise by @jdx – installing 4 tools
+mise ░░░░░░░░░░░░░░░░ 0/4 · 3.0s
+  python@3.13   resolving  3.0s
+  3 queued
+mise ░░░░░░░░░░░░░░░░ 0/4 · 6.0s
+  python@3.13.16  downloading             878ms  0.1/29.3 MB
+  uv@0.12.21      downloading             877ms
+  postgres@17.11  fetching repodata       877ms
+  redis@8.10.1    downloading 8 packages  877ms
+mise ░░░░░░░░░░░░░░░░ 0/4 · 9.0s
+  python@3.13.16  downloading              3.9s  4.2/29.3 MB · 1.3 MB/s
+  uv@0.12.21      downloading              3.9s  3.5/18.9 MB · 1.3 MB/s
+  postgres@17.11  downloading 29 packages  3.9s
+  redis@8.10.1    downloading 8 packages   3.9s
+mise █░░░░░░░░░░░░░░░ 0/4 · 12.0s
+  python@3.13.16  downloading              6.9s  7.2/29.3 MB · 1.2 MB/s
+  uv@0.12.21      downloading              6.9s  6.7/18.9 MB · 1.2 MB/s
+  postgres@17.11  downloading 29 packages  6.9s
+  redis@8.10.1    downloading 8 packages   6.9s
+mise ✓ redis@8.10.1    8.2s
+mise ✓ postgres@17.11  9.5s
+mise ██████████░░░░░░ 2/4 · 15.0s
+  python@3.13.16  downloading  9.9s  10.5/29.3 MB · 1.1 MB/s
+  uv@0.12.21      downloading  9.9s  9.7/18.9 MB · 1.1 MB/s
+mise ████████████░░░░ 2/4 · 18.0s
+  python@3.13.16  downloading  12.9s  17.4/29.3 MB · 1.4 MB/s
+  uv@0.12.21      downloading  12.9s  16.8/18.9 MB · 1.4 MB/s
+mise ✓ uv@0.12.21      15.2s  uv-aarch64-unknown-linux-gnu.tar.gz
+mise ██████████████░░ 3/4 · 21.0s
+  python@3.13.16  verifying  15.9s  29.3/29.3 MB · 51.2 MB/s
+mise python@3.13.16 Python 3.13.16
+mise ✓ python@3.13.16  16.5s  cpython-3.13.16+20261001-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+mise ████████████████ 4/4 · installed 4 tools in 21.6s

@@ -1,0 +1,20 @@
+! You are not logged in to FloxHub. Run 'flox auth login' to log in.
+[
+  {
+    "name": "postgres",
+    "status": "Completed",
+    "pid": 1066,
+    "exit_code": 1
+  },
+  {
+    "name": "redis",
+    "status": "Completed",
+    "pid": 1079,
+    "exit_code": 1
+  }
+]
+2026-10-02 14:43:51.846 UTC [1066] LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+2026-10-02 14:43:51.846 UTC [1066] HINT:  Is another postmaster already running on port 5432? If not, wait a few seconds and retry.
+2026-10-02 14:43:51.846 UTC [1066] WARNING:  could not create listen socket for "127.0.0.1"
+2026-10-02 14:43:51.846 UTC [1066] FATAL:  could not create any TCP/IP sockets
+2026-10-02 14:43:51.846 UTC [1066] LOG:  database system is shut down

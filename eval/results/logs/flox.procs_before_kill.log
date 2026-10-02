@@ -1,0 +1,9 @@
+  615   564      25 process-compose /nix/store/jc2ljl5cz7i06wn1j0daz1np553ya1jj-process-compose-1.94.0/bin/process-compose up -f /nix/store/x69bc5l8h7vwcm5qakn3y8f3gpvy98if-environment-dev/service-config.yaml -u /home/agent/.cache/flox/run/flox.7643afd1.sock -L /home/agent/proj/.flox/log/services.20261002144345806354.log --disable-dotenv --tui=false flox_never_exit
+  639   615      25 postgres        postgres -D /home/agent/proj/.flox/cache/pgdata -k /home/agent/proj/.flox/cache -p 5432 -c listen_addresses=127.0.0.1
+  652   615      25 redis-server    redis-server *:6379
+  659   639      25 postgres        postgres: checkpointer 
+  660   639      25 postgres        postgres: background writer 
+  662   639      25 postgres        postgres: walwriter 
+  663   639      25 postgres        postgres: autovacuum launcher 
+  664   639      25 postgres        postgres: logical replication launcher 
+ 1042  1009      19 process-compose /nix/store/jc2ljl5cz7i06wn1j0daz1np553ya1jj-process-compose-1.94.0/bin/process-compose up -f /nix/store/x69bc5l8h7vwcm5qakn3y8f3gpvy98if-environment-dev/service-config.yaml -u /home/agent/.cache/flox/run/flox.6dafa1a1.sock -L /home/agent/proj2/.flox/log/services.20261002144351799334.log --disable-dotenv --tui=false flox_never_exit

@@ -1,0 +1,38 @@
+error: list of process IDs must follow -p
+
+Usage:
+ ps [options]
+
+ Try 'ps --help <simple|list|output|threads|misc|all>'
+  or 'ps --help <s|l|o|t|m|a>'
+ for additional help text.
+
+For more details see ps(1).
+error: list of process IDs must follow -p
+
+Usage:
+ ps [options]
+
+ Try 'ps --help <simple|list|output|threads|misc|all>'
+  or 'ps --help <s|l|o|t|m|a>'
+ for additional help text.
+
+For more details see ps(1).
+supervisor=
+kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]
+ 2114  2110      78 postgres        /nix/store/k391a5cipfpdff638y5jdhnalcbnwvmq-postgresql-17.11/bin/postgres
+ 2115  2111      78 redis-server    /nix/store/rrbbpkysqxscr9a3a9b9jn84710cgv2j-redis-8.10.1/bin/redis-server 127.0.0.1:6379
+ 2149     1      78 postgres        [postgres] <defunct>
+ 2165  2114      77 postgres        postgres: checkpointer 
+ 2166  2114      77 postgres        postgres: background writer 
+ 2168  2114      77 postgres        postgres: walwriter 
+ 2169  2114      77 postgres        postgres: autovacuum launcher 
+ 2170  2114      77 postgres        postgres: logical replication launcher 
+14448 14444      22 redis-server    /nix/store/rrbbpkysqxscr9a3a9b9jn84710cgv2j-redis-8.10.1/bin/redis-server 127.0.0.1:6380
+14449 14445      22 postgres        /nix/store/k391a5cipfpdff638y5jdhnalcbnwvmq-postgresql-17.11/bin/postgres
+14482     1      21 postgres        [postgres] <defunct>
+14497 14449      21 postgres        postgres: checkpointer 
+14498 14449      21 postgres        postgres: background writer 
+14500 14449      21 postgres        postgres: walwriter 
+14501 14449      21 postgres        postgres: autovacuum launcher 
+14502 14449      21 postgres        postgres: logical replication launcher 

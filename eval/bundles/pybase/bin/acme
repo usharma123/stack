@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "acme internal cli (bundle $BUNDLE_NAME $BUNDLE_REV)"

@@ -1,0 +1,11 @@
+{
+  "packages": ["python@3.13", "uv@latest", "postgresql@17", "redis@latest"],
+  "env": {
+    "UV_PYTHON_DOWNLOADS": "never",
+    "DATABASE_URL": "postgresql://postgres@127.0.0.1:5432/postgres",
+    "REDIS_URL": "redis://127.0.0.1:6379/0"
+  },
+  "shell": {
+    "init_hook": ["[ -f \"$PGDATA/PG_VERSION\" ] || initdb -D \"$PGDATA\" -U postgres --auth=trust > /dev/null"]
+  }
+}

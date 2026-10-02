@@ -1,0 +1,8 @@
+Error: process-compose is already running. To stop it, run `devbox services stop`
+
+Error: exit status 1
+
+Services running in process-compose:
+PID          NAME              NAMESPACE        STATUS         AGE        HEALTH           RESTARTS        EXIT CODE
+12673        postgresql        default          Running        3s         Ready            0               0
+12671        redis             default          Running        3s         Not Ready        0               0

@@ -1,0 +1,10 @@
+• Validating lock
+✓ Validating lock in 4.25ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Validating lock
+✓ Validating lock in 6.79ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+ 2115     1     142 redis-server    [redis-server] <defunct>
+ 2149     1     141 postgres        [postgres] <defunct>
+14448     1      86 redis-server    [redis-server] <defunct>
+14482     1      85 postgres        [postgres] <defunct>

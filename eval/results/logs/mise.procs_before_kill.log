@@ -1,0 +1,8 @@
+  306     1     152 postgres        /home/agent/.local/share/mise/installs/postgres/17.11/bin/postgres -D /home/agent/proj/.state/pgdata -p 5432 -k /home/agent/proj/.state -c listen_addresses=127.0.0.1
+  307   306     152 postgres        postgres: checkpointer 
+  308   306     152 postgres        postgres: background writer 
+  310   306     152 postgres        postgres: walwriter 
+  311   306     152 postgres        postgres: autovacuum launcher 
+  312   306     152 postgres        postgres: logical replication launcher 
+  315     1     152 redis-server    /home/agent/.local/share/mise/installs/redis/8.10.1/bin/redis-server *:6379
+10434     1      11 mise            [mise] <defunct>

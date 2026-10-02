@@ -1,0 +1,2 @@
+FROM ev-nix
+RUN nix profile add --profile /nix/var/nix/profiles/default nixpkgs#devenv && devenv version

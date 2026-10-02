@@ -1,0 +1,8 @@
+mise by @jdx – installing 4 tools
+mise ⇢ python@3.13   1ms · already installed
+mise ⇢ uv@latest     0ms · already installed
+mise ⇢ postgres@17   0ms · already installed
+mise ⇢ redis@latest  0ms · already installed
+mise ████████████████ 4/4 · installed 0 tools · 4 already installed in 2ms
+mise all tools are installed
+Python 3.13.16

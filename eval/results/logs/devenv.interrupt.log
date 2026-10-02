@@ -1,0 +1,13 @@
+• Validating lock
+✓ Validating lock in 3.75ms
+  evaluating file '«nix-internal»/derivation-internal.nix'
+• Configuring shell
+• Configuring cachix
+✓ Configuring cachix in 2.90ms
+• Evaluating shell
+• Downloading iana-etc-20251215
+• Downloading https://cache.nixos.org/nar/1bh8lnan92m6j9j7ln2n24fzh5n96bw6bm21knzcx7y2bs85ygpa.nar.zst
+✓ Downloading https://cache.nixos.org/nar/1bh8lnan92m6j9j7ln2n24fzh5n96bw6bm21knzcx7y2bs85ygpa.nar.zst in 130ms
+✓ Downloading iana-etc-20251215 in 132ms
+• Downloading go-1.26.7
+• Downloading https://cache.nixos.org/nar/0n81j4xwlf9mrx9v4px37lxg4aqnsmqcb35ij01hpx4pb1fxmgx9.nar.zst

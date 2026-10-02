@@ -1,0 +1,8 @@
+Virtual environment directory doesn't exist. Creating new one...
+Starting all services: postgresql, redis 
+Process-compose is now running on port 44817
+To stop your services, run `devbox services stop`
+Services running in process-compose:
+PID          NAME              NAMESPACE        STATUS            AGE        HEALTH        RESTARTS        EXIT CODE
+13873        redis             default          Completed         0s         -             5               1
+13877        postgresql        default          Restarting        0s         -             8               1
