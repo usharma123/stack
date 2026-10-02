@@ -21,8 +21,10 @@ change what a bundle means.
   env, services, tasks, bin paths. Contains no machine-specific values.
 - **Project**: `stack.toml` lists bundles, adds its own definitions, and resolves conflicts in
   `[override.*]`. `stack.lock` pins each bundle by commit and content hash.
-- **Session** (not built yet): one running instance of a project, with actual ports, data
-  locations, resolved connection environment, ownership and observed readiness.
+- **Session**: one running instance of a project on this machine (`.stack/session.json`, indexed
+  in the machine state dir): assigned ports, supervisor PIDs, data directories, verification
+  results with timestamps, and an optional lease. It records what stack started; it is never
+  treated as proof of what is running.
 
 ## Composition rule
 
@@ -30,15 +32,37 @@ Layers apply in order: bundles (in `[[use]]` order), then the project. A key def
 layers must have equal values, otherwise it is a conflict. `[override.*]` is the only way to
 resolve a conflict or replace a value, and every override is reported with what it replaced.
 
-## Next
+## Runtime contract
 
-1. **Sessions.** Allocate per-instance ports for independent checkouts (mise's `port = "auto"`
-   only offsets git worktrees), and have `exec` and `inspect` read a single session record.
-   `exec` re-checks the required services against the supervisor before launching; readiness for
-   databases means connecting with the app's own settings and confirming instance identity.
-2. **Leases.** Sessions bound to a runner or SDK lease with an expiry policy; `down` succeeds
-   only once the session's processes are confirmed gone.
-3. **Partial failure.** Distinguish "rejected before execution" from "failed after changes", and
-   report completed steps and whether a retry is safe.
-4. **Distribution.** OCI bundle references alongside git.
-5. **MCP server** exposing the same contract as `--json`.
+- **Ports.** Assigned per checkout from 40000-49999 via a locked machine-wide registry; reused
+  across restarts; pruned when a project directory disappears; `--reassign-ports` after a foreign
+  program takes one. Projects may pin ports in `[override.services]`; pins are checked against
+  other projects' reservations. Service defaults (5432, 6379) are never used.
+- **Verification** happens on every `exec` and `status`, not from the record: supervisor state,
+  PID alive, supervisor port equals assigned port, TCP accept, then identity. Postgres and Redis
+  connect with the app's own URL and compare the server's data directory to the supervisor's.
+  Other services get liveness only, and are labelled `liveness` rather than `instance`.
+- **Withholding.** Endpoints of unverified services are poisoned (`unverified.stack.invalid`)
+  rather than unset, because apps commonly fall back to `localhost:<default>`; values with no
+  host are removed. `STACK_UNVERIFIED` lists affected services. `--require` turns this into a
+  refusal to run.
+- **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
+  short-lived shell that ran `stack up`). Reclaimed by `stack gc` and at the start of every
+  `stack up`; there is no background daemon, so expiry takes effect at the next of those.
+- **Stopping.** `down` succeeds only once recorded PIDs are dead and assigned ports closed.
+- **Partial failure.** `up` returns completed steps, whether services may have been started
+  (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
+
+## Distribution
+
+`git+<url>?ref=` pins a commit; `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
+a content hash. A bundle's content hash is identical across transports (deterministic archives).
+OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
+
+## Not covered yet
+
+- macOS: compile/inspect are tested; services and sessions are only tested on Linux.
+- Identity checks exist for Postgres and Redis presets only; other services are liveness-only.
+- OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
+- Expired leases are reclaimed lazily (next `gc`/`up`), not by a background process.
+- Sessions for deleted project directories can't be stopped by stack (see `mise daemons prune`).

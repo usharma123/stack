@@ -9,10 +9,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Content hash of a bundle tree: relative paths, executable bits and file contents.
 pub fn hash_dir(root: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
-    files.sort();
-
+    let files = list_files(root)?;
     let mut hasher = Sha256::new();
     for rel in files {
         let path = root.join(&rel);
@@ -23,6 +20,14 @@ pub fn hash_dir(root: &Path) -> Result<String> {
         hasher.update(&contents);
     }
     Ok(format!("sha256:{}", hex(&hasher.finalize())))
+}
+
+/// Files under `root` (skipping .git and .stack), relative and sorted.
+pub fn list_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -45,7 +50,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o111 != 0)
@@ -53,7 +58,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool {
+pub fn is_executable(_path: &Path) -> bool {
     false
 }
 
