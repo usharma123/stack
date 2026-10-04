@@ -48,7 +48,7 @@ enum Cmd {
         #[arg(long)]
         ttl: Option<String>,
         /// Reclaim the session when this process exits (e.g. an agent runner)
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
         owner_pid: Option<u32>,
     },
     /// Verify every service now, and show session and lease state

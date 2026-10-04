@@ -392,6 +392,24 @@ pub struct LeaseOptions {
     pub owner_pid: Option<u32>,
 }
 
+/// Largest owner PID a lease accepts. `pid_t` is a signed 32-bit integer on supported
+/// platforms; 0 and larger values name a process group, every process, or nothing, so a
+/// lease on them would never expire or would expire immediately depending on the platform.
+pub const MAX_OWNER_PID: u32 = i32::MAX as u32;
+
+/// Validate an owner PID from an untyped source (MCP) without truncation.
+pub fn owner_pid(value: u64) -> Result<u32> {
+    u32::try_from(value)
+        .ok()
+        .filter(|pid| (1..=MAX_OWNER_PID).contains(pid))
+        .ok_or_else(|| {
+            StackError::new(
+                "usage",
+                format!("owner_pid {value} is not a process ID (1-{MAX_OWNER_PID})"),
+            )
+        })
+}
+
 #[derive(Debug, Serialize)]
 pub struct UpReport {
     pub session: Session,
@@ -401,6 +419,9 @@ pub struct UpReport {
 }
 
 pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
+    if let Some(pid) = lease.owner_pid {
+        owner_pid(pid.into())?;
+    }
     let mut steps = Steps::default();
     let reaped = gc(&ctx.state)?;
     steps.ok("gc", json!({ "reaped": reaped.len() }));
@@ -1557,6 +1578,22 @@ mod tests {
             ("ANYTHING", "41234"),
         ] {
             assert_eq!(poison(PG, var, value), None, "{var}");
+        }
+    }
+
+    #[test]
+    fn owner_pids_are_checked_without_truncation() {
+        assert_eq!(owner_pid(1).unwrap(), 1);
+        assert_eq!(owner_pid(MAX_OWNER_PID.into()).unwrap(), MAX_OWNER_PID);
+        for bad in [
+            0,
+            u64::from(MAX_OWNER_PID) + 1,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::from(u32::MAX) + 2,
+            u64::MAX,
+        ] {
+            assert_eq!(owner_pid(bad).unwrap_err().code, "usage", "{bad}");
         }
     }
 

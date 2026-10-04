@@ -44,6 +44,7 @@ impl Fixture {
         fs::write(
             &mise,
             r#"#!/bin/sh
+echo "$*" >>"$REVIEW_FIXTURE/mise.log"
 case "$1 $2" in
   'env --json') cat "$REVIEW_FIXTURE/env.json" ;;
   'daemons --json')
@@ -830,5 +831,66 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
             before,
             "{name}: a withheld endpoint was reached"
         );
+    }
+}
+
+#[test]
+fn mcp_rejects_owner_pids_outside_the_supported_range_before_lifecycle_work() {
+    let fixture = Fixture::new();
+    let log = fixture.dir.path().join("mise.log");
+    let _ = fs::remove_file(&log);
+    let invalid = [
+        json!(4_294_967_296u64),
+        json!(u64::MAX),
+        json!(4_294_967_297u64),
+        json!(2_147_483_648u64),
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("123"),
+        json!(true),
+    ];
+    let calls: Vec<(&str, Value)> = invalid
+        .iter()
+        .map(|pid| ("stack_up", json!({ "owner_pid": pid })))
+        .collect();
+    for (result, pid) in fixture.mcp(&calls, &[]).iter().zip(&invalid) {
+        assert_eq!(result["isError"], true, "{pid}");
+        assert_eq!(
+            result["structuredContent"]["error"]["code"], "usage",
+            "{pid}"
+        );
+    }
+    assert!(!log.exists(), "provider work ran for an invalid owner_pid");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
+    assert!(!fixture.dir.path().join("state/sessions").exists());
+
+    let pid = std::process::id();
+    let results = fixture.mcp(
+        &[
+            ("stack_up", json!({ "owner_pid": pid })),
+            ("stack_up", json!({ "owner_pid": null })),
+            ("stack_up", json!({})),
+        ],
+        &[],
+    );
+    assert_eq!(
+        results[0]["structuredContent"]["data"]["session"]["lease"]["owner_pid"],
+        pid
+    );
+    for result in &results[1..] {
+        assert_eq!(result["isError"], false);
+        assert!(result["structuredContent"]["data"]["session"]
+            .get("lease")
+            .is_none());
+    }
+    assert!(log.exists(), "a valid stack_up must reach the provider");
+
+    for bad in ["0", "2147483648", "4294967296"] {
+        let out = fixture
+            .command(&["up", "--owner-pid", bad])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "--owner-pid {bad} was accepted");
     }
 }

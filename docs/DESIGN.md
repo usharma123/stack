@@ -62,8 +62,10 @@ resolve a conflict or replace a value, and every override is reported with what 
   databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
   turns this into a refusal to run.
 - **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
-  short-lived shell that ran `stack up`). Reclaimed by `stack gc` and at the start of every
-  `stack up`; there is no background daemon, so expiry takes effect at the next of those.
+  short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
+  `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.
+  Reclaimed by `stack gc` and at the start of every `stack up`; there is no background daemon,
+  so expiry takes effect at the next of those.
   Commands register active executions before releasing the lifecycle lock and renew on
   completion. GC ignores TTL expiry while a coordinator is alive. An explicit runner-death
   policy still takes precedence over a surviving command.

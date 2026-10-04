@@ -85,7 +85,7 @@ fn tools() -> Value {
         { "name": "stack_compile", "description": "Resolve bundles, update stack.lock and the generated provider config.",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
-          "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer" } }), &[]) },
+          "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_exec", "description": "Run a command with the stack's tools and env. Connection variables of services that fail verification are withheld; required services must verify or the command does not run.",
           "inputSchema": schema(json!({
@@ -159,7 +159,17 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         }
         "stack_up" => {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
-            let owner_pid = args["owner_pid"].as_u64().map(|p| p as u32);
+            // Validated before any lifecycle work; null means omitted.
+            let owner_pid = match &args["owner_pid"] {
+                Value::Null => None,
+                v => Some(
+                    v.as_u64()
+                        .ok_or_else(|| {
+                            StackError::new("usage", format!("owner_pid {v} is not a process ID"))
+                        })
+                        .and_then(session::owner_pid)?,
+                ),
+            };
             session::up(
                 ctx,
                 LeaseOptions {
