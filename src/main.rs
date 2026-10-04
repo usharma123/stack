@@ -123,10 +123,10 @@ fn main() -> ExitCode {
                 })
             }),
         Cmd::Status => session::status(&ctx).map(|r| {
-            let healthy = r.checks.iter().all(|c| c.ready);
+            let healthy = !r.stale && r.checks.iter().all(|c| c.ready);
             let code = emit(cli.json, &r, || {
                 match &r.session {
-                    Some(s) => println!("session {}{}", s.id, if r.stale { " (stale: stack.lock changed)" } else { "" }),
+                    Some(s) => println!("session {}{}", s.id, if r.stale { " (stale: compiled configuration changed)" } else { "" }),
                     None => println!("no session"),
                 }
                 if let Some(why) = &r.lease_expired {

@@ -101,6 +101,33 @@ esac
 }
 
 #[test]
+fn project_overrides_change_the_session_generation_even_when_bundle_pins_do_not() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let lock = fs::read(fixture.dir.path().join("app/stack.lock")).unwrap();
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n",
+    )
+    .unwrap();
+    fixture.ok(&["compile"]);
+    assert_eq!(
+        fs::read(fixture.dir.path().join("app/stack.lock")).unwrap(),
+        lock
+    );
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["data"]["stale"], true);
+    fixture.ok(&["up"]);
+    let out = fixture.ok(&["status", "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"]["stale"],
+        false
+    );
+}
+
+#[test]
 fn supervisor_failure_preserves_ownership_instead_of_confirming_cleanup() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);

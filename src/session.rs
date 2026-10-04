@@ -55,7 +55,9 @@ impl Ctx {
 }
 
 fn index_path(state: &Path, root: &Path) -> PathBuf {
-    state.join("sessions").join(format!("{}.json", project_key(root)))
+    state
+        .join("sessions")
+        .join(format!("{}.json", project_key(root)))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,6 +66,9 @@ pub struct Session {
     pub project: PathBuf,
     /// Hash of stack.lock at start. A different lock means the running services are stale.
     pub lock_digest: String,
+    /// Complete compiled configuration and ports at launch, including project overrides.
+    #[serde(default)]
+    pub config_digest: String,
     pub started_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
@@ -139,7 +144,11 @@ pub struct Check {
 
 // ---- verification --------------------------------------------------------------------------
 
-fn verify_all(report: &Report, env: &IndexMap<String, String>, statuses: &[DaemonStatus]) -> Vec<Check> {
+fn verify_all(
+    report: &Report,
+    env: &IndexMap<String, String>,
+    statuses: &[DaemonStatus],
+) -> Vec<Check> {
     report
         .stack
         .services
@@ -204,17 +213,26 @@ fn verify_one(
         _ => return Ok(Identity::Liveness),
     };
     let url = env.get(var).ok_or_else(|| format!("{var} is not set"))?;
-    let expected = status.data_dir.as_deref().ok_or("supervisor did not report a data directory")?;
+    let expected = status
+        .data_dir
+        .as_deref()
+        .ok_or("supervisor did not report a data directory")?;
     let args: Vec<&str> = match bin {
         "psql" => vec![url, "-Atc", "select current_setting('data_directory')"],
         _ => vec!["-u", url, "--no-auth-warning", "config", "get", "dir"],
     };
     let out = run_probe(env, bin, &args)?;
-    let reported = out.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
+    let reported = out
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or_default();
     if same_path(reported, expected) {
         Ok(Identity::Instance)
     } else {
-        Err(format!("{var} reaches a different server (data dir '{reported}', expected '{expected}')"))
+        Err(format!(
+            "{var} reaches a different server (data dir '{reported}', expected '{expected}')"
+        ))
     }
 }
 
@@ -224,8 +242,13 @@ fn same_path(a: &str, b: &str) -> bool {
 }
 
 /// Run a client binary from the stack's PATH with a hard deadline.
-fn run_probe(env: &IndexMap<String, String>, bin: &str, args: &[&str]) -> std::result::Result<String, String> {
-    let path = which_in(env.get("PATH").map(String::as_str), bin).ok_or_else(|| format!("{bin} not found on the stack's PATH"))?;
+fn run_probe(
+    env: &IndexMap<String, String>,
+    bin: &str,
+    args: &[&str],
+) -> std::result::Result<String, String> {
+    let path = which_in(env.get("PATH").map(String::as_str), bin)
+        .ok_or_else(|| format!("{bin} not found on the stack's PATH"))?;
     let mut child = Command::new(path)
         .args(args)
         .envs(env)
@@ -242,14 +265,22 @@ fn run_probe(env: &IndexMap<String, String>, bin: &str, args: &[&str]) -> std::r
             Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(25)),
             _ => {
                 let _ = child.kill();
-                return Err(format!("{bin} did not answer within {}s", PROBE_TIMEOUT.as_secs()));
+                return Err(format!(
+                    "{bin} did not answer within {}s",
+                    PROBE_TIMEOUT.as_secs()
+                ));
             }
         }
     }
-    let out = child.wait_with_output().map_err(|e| format!("{bin}: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("{bin}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{bin} failed: {}", err.lines().next().unwrap_or("").trim()));
+        return Err(format!(
+            "{bin} failed: {}",
+            err.lines().next().unwrap_or("").trim()
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -258,15 +289,29 @@ pub fn which_in(path: Option<&str>, bin: &str) -> Option<PathBuf> {
     if bin.contains('/') {
         return Some(PathBuf::from(bin));
     }
-    std::env::split_paths(path?).map(|d| d.join(bin)).find(|p| p.is_file())
+    std::env::split_paths(path?)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
 }
 
 /// Variables that point a command at this service.
-fn binding_vars(name: &str, service: &Service, port: Option<u16>, env: &IndexMap<String, String>) -> Vec<String> {
+fn binding_vars(
+    name: &str,
+    service: &Service,
+    port: Option<u16>,
+    env: &IndexMap<String, String>,
+) -> Vec<String> {
     let mut vars: Vec<String> = match service.preset.as_deref() {
-        Some("postgres") => ["DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD"]
-            .map(String::from)
-            .to_vec(),
+        Some("postgres") => [
+            "DATABASE_URL",
+            "PGHOST",
+            "PGPORT",
+            "PGUSER",
+            "PGDATABASE",
+            "PGPASSWORD",
+        ]
+        .map(String::from)
+        .to_vec(),
         Some("redis") => vec!["REDIS_URL".into()],
         _ => Vec::new(),
     };
@@ -275,7 +320,11 @@ fn binding_vars(name: &str, service: &Service, port: Option<u16>, env: &IndexMap
     vars.push(format!("{folded}_URL"));
     if let Some(port) = port {
         let (bare, colon) = (port.to_string(), format!(":{port}"));
-        vars.extend(env.iter().filter(|(_, v)| **v == bare || v.contains(&colon)).map(|(k, _)| k.clone()));
+        vars.extend(
+            env.iter()
+                .filter(|(_, v)| **v == bare || v.contains(&colon))
+                .map(|(k, _)| k.clone()),
+        );
     }
     let mut out: Vec<String> = Vec::new();
     for v in vars {
@@ -288,20 +337,26 @@ fn binding_vars(name: &str, service: &Service, port: Option<u16>, env: &IndexMap
 
 // ---- lifecycle -----------------------------------------------------------------------------
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 struct Steps(Vec<Value>);
 
 impl Steps {
     fn ok(&mut self, step: &str, detail: Value) {
-        self.0.push(json!({ "step": step, "status": "ok", "detail": detail }));
+        self.0
+            .push(json!({ "step": step, "status": "ok", "detail": detail }));
     }
 
     /// Attach the steps that already ran, and whether repeating the command is safe.
     fn fail(mut self, step: &str, err: StackError, changed: bool) -> StackError {
-        self.0.push(json!({ "step": step, "status": "failed", "code": err.code }));
-        let mut err = err.with_detail(json!({ "steps": self.0, "retry_safe": true, "changed": changed }));
+        self.0
+            .push(json!({ "step": step, "status": "failed", "code": err.code }));
+        let mut err =
+            err.with_detail(json!({ "steps": self.0, "retry_safe": true, "changed": changed }));
         if changed && err.hint.is_none() {
-            err.hint = Some("services may be running; `stack status` shows them, `stack down` stops them".into());
+            err.hint = Some(
+                "services may be running; `stack status` shows them, `stack down` stops them"
+                    .into(),
+            );
         }
         err
     }
@@ -327,6 +382,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     steps.ok("gc", json!({ "reaped": reaped.len() }));
 
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let previous = load(ctx)?;
     let report = match ctx.compile(true) {
         Ok(r) => r,
         Err(e) => return Err(steps.fail("compile", e, false)),
@@ -338,6 +394,18 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     }
     steps.ok("install", json!(null));
 
+    // `start` can reuse an already-running daemon with an old definition. Stop it first
+    // when changing generations, or when no launch record establishes its configuration.
+    let digest = config_digest(ctx, &report);
+    let restart = previous.as_ref().is_some_and(|s| s.config_digest != digest);
+    let unrecorded = previous.is_none() && !report.stack.services.is_empty();
+    if restart || unrecorded {
+        if let Err(e) = down_locked(ctx) {
+            return Err(steps.fail("stop_previous", e, true));
+        }
+        steps.ok("stop_previous", json!(null));
+    }
+
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
         if let Err(e) = mise::start(&ctx.root) {
@@ -347,8 +415,9 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
 
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            let env = mise::env(&ctx.root)?;
-            let statuses = mise::daemons(&ctx.root)?;
+            let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
+            let statuses =
+                mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
             checks = verify_all(&report, &env, &statuses);
             if checks.iter().all(|c| c.ready) {
                 break;
@@ -359,20 +428,39 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                     .filter(|c| !c.ready)
                     .map(|c| json!({ "service": c.service, "reason": c.reason }))
                     .collect();
-                let err = StackError::new("not_ready", format!("{} service(s) failed verification", failed.len()))
-                    .details(failed);
+                let err = StackError::new(
+                    "not_ready",
+                    format!("{} service(s) failed verification", failed.len()),
+                )
+                .details(failed);
                 return Err(steps.fail("verify", err, true));
             }
             sleep(Duration::from_millis(300));
         }
-        steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
+        steps.ok(
+            "verify",
+            json!(checks
+                .iter()
+                .map(|c| (c.service.clone(), c.identity))
+                .collect::<IndexMap<_, _>>()),
+        );
     }
 
     let stamp = now();
     let session = Session {
-        id: sha256_hex(format!("{}{:?}{}", ctx.root.display(), Instant::now(), std::process::id()).as_bytes())[..12].to_string(),
+        id: sha256_hex(
+            format!(
+                "{}{:?}{}",
+                ctx.root.display(),
+                Instant::now(),
+                std::process::id()
+            )
+            .as_bytes(),
+        )[..12]
+            .to_string(),
         project: ctx.root.clone(),
         lock_digest: lock_digest(&ctx.root),
+        config_digest: digest,
         started_at: stamp,
         lease: (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
             ttl_secs: lease.ttl_secs,
@@ -395,8 +483,13 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             })
             .collect(),
     };
-    save(ctx, &session)?;
-    Ok(UpReport { session, checks, steps: steps.0, reaped })
+    save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
+    Ok(UpReport {
+        session,
+        checks,
+        steps: steps.0,
+        reaped,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -486,7 +579,11 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
 }
 
 fn accepting(port: u16) -> bool {
-    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(200)).is_ok()
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
 }
 
 #[derive(Debug, Serialize)]
@@ -495,7 +592,7 @@ pub struct StatusReport {
     pub checks: Vec<Check>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expired: Option<String>,
-    /// stack.lock changed since the session started.
+    /// The complete compiled configuration changed since the session started.
     pub stale: bool,
 }
 
@@ -509,11 +606,16 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     } else {
         let env = mise::env(&ctx.root)?;
         let statuses = mise::daemons(&ctx.root)?;
-        verify_all(&report, &env, &statuses)
+        verify_session(ctx, &report, &env, &statuses, session.as_ref())
     };
     Ok(StatusReport {
-        lease_expired: session.as_ref().and_then(|s| s.lease.as_ref()).and_then(|l| l.expired(now())),
-        stale: session.as_ref().is_some_and(|s| s.lock_digest != lock_digest(&ctx.root)),
+        lease_expired: session
+            .as_ref()
+            .and_then(|s| s.lease.as_ref())
+            .and_then(|l| l.expired(now())),
+        stale: session
+            .as_ref()
+            .is_some_and(|s| s.config_digest != config_digest(ctx, &report)),
         session,
         checks,
     })
@@ -535,7 +637,9 @@ pub const UNVERIFIED_HOST: &str = "unverified.stack.invalid";
 /// Replace the host in an endpoint value. `None` if the value has no host to replace,
 /// in which case the variable is removed instead.
 fn poison(value: &str) -> Option<String> {
-    let poisoned = value.replace("127.0.0.1", UNVERIFIED_HOST).replace("localhost", UNVERIFIED_HOST);
+    let poisoned = value
+        .replace("127.0.0.1", UNVERIFIED_HOST)
+        .replace("localhost", UNVERIFIED_HOST);
     (poisoned != value).then_some(poisoned)
 }
 
@@ -550,13 +654,20 @@ pub enum Require {
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let mut session = load(ctx)?;
     let report = ctx.compile(true)?;
     mise::trust(&ctx.root)?;
     let mut env = mise::env(&ctx.root)?;
     let checks = if report.stack.services.is_empty() {
         Vec::new()
     } else {
-        verify_all(&report, &env, &mise::daemons(&ctx.root)?)
+        verify_session(
+            ctx,
+            &report,
+            &env,
+            &mise::daemons(&ctx.root)?,
+            session.as_ref(),
+        )
     };
 
     let required: Vec<&String> = match require {
@@ -566,7 +677,10 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     };
     for name in &required {
         if !report.stack.services.contains_key(*name) {
-            return Err(StackError::new("unknown_service", format!("no service named '{name}'")));
+            return Err(StackError::new(
+                "unknown_service",
+                format!("no service named '{name}'"),
+            ));
         }
     }
     let unavailable: Vec<Value> = checks
@@ -575,9 +689,12 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         .map(|c| json!({ "service": c.service, "reason": c.reason }))
         .collect();
     if !unavailable.is_empty() {
-        return Err(StackError::new("service_unavailable", format!("{} required service(s) not verified", unavailable.len()))
-            .hint("run `stack up`, or `stack status` to see why")
-            .details(unavailable));
+        return Err(StackError::new(
+            "service_unavailable",
+            format!("{} required service(s) not verified", unavailable.len()),
+        )
+        .hint("run `stack up`, or `stack status` to see why")
+        .details(unavailable));
     }
 
     // Unsetting is not enough: apps often fall back to a default like localhost:5432, which may
@@ -594,24 +711,43 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
             }
         }
     }
-    let unverified: Vec<&str> = checks.iter().filter(|c| !c.ready).map(|c| c.service.as_str()).collect();
+    let unverified: Vec<&str> = checks
+        .iter()
+        .filter(|c| !c.ready)
+        .map(|c| c.service.as_str())
+        .collect();
     if !unverified.is_empty() {
         env.insert("STACK_UNVERIFIED".into(), unverified.join(","));
     }
-    if let Some(mut session) = load(ctx)? {
+    let (head, args) = cmd
+        .split_first()
+        .ok_or_else(|| StackError::new("usage", "no command given"))?;
+    let program = which_in(env.get("PATH").map(String::as_str), head).ok_or_else(|| {
+        StackError::new(
+            "command_not_found",
+            format!("'{head}' is not on the stack's PATH"),
+        )
+    })?;
+
+    if let Some(session) = session.as_mut().filter(|s| s.config_digest == config_digest(ctx, &report)) {
         if let Some(lease) = session.lease.as_mut() {
             lease.renewed_at = now();
-            save(ctx, &session)?;
+            save(ctx, session)?;
         }
-        env.insert("STACK_SESSION".into(), session.id);
+        env.insert("STACK_SESSION".into(), session.id.clone());
+    } else {
+        env.shift_remove("STACK_SESSION");
+        removed.push("STACK_SESSION".into());
     }
     env.insert("STACK_PROJECT".into(), ctx.root.to_string_lossy().into());
 
-    let (head, args) = cmd.split_first().ok_or_else(|| StackError::new("usage", "no command given"))?;
-    let program = which_in(env.get("PATH").map(String::as_str), head).ok_or_else(|| {
-        StackError::new("command_not_found", format!("'{head}' is not on the stack's PATH"))
-    })?;
-    Ok(ExecPlan { program, args: args.to_vec(), env, removed, checks })
+    Ok(ExecPlan {
+        program,
+        args: args.to_vec(),
+        env,
+        removed,
+        checks,
+    })
 }
 
 pub fn renew(ctx: &Ctx) -> Result<Session> {
@@ -619,10 +755,12 @@ pub fn renew(ctx: &Ctx) -> Result<Session> {
     let mut session = load(ctx)?.ok_or_else(|| {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
-    let lease = session
-        .lease
-        .as_mut()
-        .ok_or_else(|| StackError::new("no_lease", "this session has no lease; it lives until `stack down`"))?;
+    let lease = session.lease.as_mut().ok_or_else(|| {
+        StackError::new(
+            "no_lease",
+            "this session has no lease; it lives until `stack down`",
+        )
+    })?;
     lease.renewed_at = now();
     save(ctx, &session)?;
     Ok(session)
@@ -713,8 +851,52 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn config_digest(ctx: &Ctx, report: &Report) -> String {
+    let config =
+        json!({ "lock": lock_digest(&ctx.root), "stack": report.stack, "ports": report.ports });
+    sha256_hex(config.to_string().as_bytes())
+}
+
+fn verify_session(
+    ctx: &Ctx,
+    report: &Report,
+    env: &IndexMap<String, String>,
+    statuses: &[DaemonStatus],
+    session: Option<&Session>,
+) -> Vec<Check> {
+    let mut checks = verify_all(report, env, statuses);
+    let reason = match session {
+        None => Some("no launch record; run `stack up`"),
+        Some(s) if s.config_digest != config_digest(ctx, report) => {
+            Some("session configuration changed; run `stack up` to restart and verify it")
+        }
+        _ => None,
+    };
+    for check in &mut checks {
+        let changed_process = session
+            .and_then(|s| s.services.get(&check.service))
+            .is_some_and(|r| r.pid != check.pid);
+        if let Some(reason) = reason
+            .or(changed_process.then_some("service process changed since launch; run `stack up`"))
+        {
+            check.ready = false;
+            check.identity = None;
+            check.reason = Some(reason.into());
+            check.withheld = binding_vars(
+                &check.service,
+                &report.stack.services[&check.service].value,
+                check.port,
+                env,
+            );
+        }
+    }
+    checks
+}
+
 fn lock_digest(root: &Path) -> String {
-    fs::read(root.join(crate::lock::LOCK_FILE)).map(|b| sha256_hex(&b)).unwrap_or_default()
+    fs::read(root.join(crate::lock::LOCK_FILE))
+        .map(|b| sha256_hex(&b))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -728,29 +910,54 @@ mod tests {
             "postgresql://postgres@unverified.stack.invalid:41234/postgres"
         );
         assert_eq!(poison("127.0.0.1").unwrap(), UNVERIFIED_HOST);
-        assert_eq!(poison("redis://localhost:6379").unwrap(), "redis://unverified.stack.invalid:6379");
+        assert_eq!(
+            poison("redis://localhost:6379").unwrap(),
+            "redis://unverified.stack.invalid:6379"
+        );
         assert_eq!(poison("41234"), None);
     }
 
     #[test]
     fn lease_expiry() {
-        let lease = Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 1000 };
+        let lease = Lease {
+            ttl_secs: Some(60),
+            owner_pid: None,
+            renewed_at: 1000,
+        };
         assert!(lease.expired(1060).is_none());
         assert!(lease.expired(1061).is_some());
 
-        let none = Lease { ttl_secs: None, owner_pid: None, renewed_at: 0 };
+        let none = Lease {
+            ttl_secs: None,
+            owner_pid: None,
+            renewed_at: 0,
+        };
         assert!(none.expired(u64::MAX).is_none());
 
-        let me = Lease { ttl_secs: None, owner_pid: Some(std::process::id()), renewed_at: 0 };
-        assert!(me.expired(now()).is_none(), "a live owner keeps the session");
-        let gone = Lease { ttl_secs: None, owner_pid: Some(u32::MAX - 1), renewed_at: 0 };
+        let me = Lease {
+            ttl_secs: None,
+            owner_pid: Some(std::process::id()),
+            renewed_at: 0,
+        };
+        assert!(
+            me.expired(now()).is_none(),
+            "a live owner keeps the session"
+        );
+        let gone = Lease {
+            ttl_secs: None,
+            owner_pid: Some(u32::MAX - 1),
+            renewed_at: 0,
+        };
         assert!(gone.expired(now()).unwrap().contains("exited"));
     }
 
     #[test]
     fn binding_vars_cover_preset_and_port_references() {
         let env: IndexMap<String, String> = [
-            ("DATABASE_URL", "postgresql://postgres@127.0.0.1:41234/postgres"),
+            (
+                "DATABASE_URL",
+                "postgresql://postgres@127.0.0.1:41234/postgres",
+            ),
             ("PGPORT", "41234"),
             ("PGHOST", "127.0.0.1"),
             ("APP_DB", "host=127.0.0.1:41234"),
@@ -760,7 +967,14 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let pg = Service { preset: Some("postgres".into()), version: None, run: None, ready_cmd: None, ready_port: None, port: None };
+        let pg = Service {
+            preset: Some("postgres".into()),
+            version: None,
+            run: None,
+            ready_cmd: None,
+            ready_port: None,
+            port: None,
+        };
         let vars = binding_vars("postgres", &pg, Some(41234), &env);
         for v in ["DATABASE_URL", "PGPORT", "PGHOST", "APP_DB"] {
             assert!(vars.contains(&v.to_string()), "{v} not withheld: {vars:?}");
