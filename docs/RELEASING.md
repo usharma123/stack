@@ -76,8 +76,8 @@ provenance.
    git push origin v0.1.1
    ```
 
-`release.yml` repeats all checks before publishing. A manual dispatch is a dry run
-that runs the build and installation gates without publishing. It accepts only commits on
+`release.yml` runs only when a `v*` tag is pushed and repeats all checks before
+publishing. It accepts only commits on
 `origin/main` in `usharma123/stack`, with a tag matching the Rust/npm version.
 Stable versions use `latest`; prereleases use `next`.
 The publish script checks the immutable version first. An existing version is
