@@ -412,14 +412,41 @@ pub fn down(ctx: &Ctx) -> Result<DownReport> {
 }
 
 fn down_locked(ctx: &Ctx) -> Result<DownReport> {
-    let before = mise::daemons(&ctx.root).unwrap_or_default();
-    let ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?.values().copied().collect();
-    let pids: Vec<(String, u32)> = before
+    // Failure to discover ownership cannot establish that nothing is running.
+    let before = mise::daemons(&ctx.root)?;
+    let session = load(ctx)?;
+    let mut ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?
+        .values()
+        .copied()
+        .collect();
+    let mut pids: Vec<(String, u32)> = before
         .iter()
         .filter_map(|d| d.pid.map(|p| (d.name.clone(), p)))
         .collect();
+    ports.extend(before.iter().filter_map(|d| d.port));
+    if let Some(session) = &session {
+        ports.extend(session.services.values().map(|s| s.port));
+        pids.extend(
+            session
+                .services
+                .iter()
+                .filter_map(|(name, s)| s.pid.map(|p| (name.clone(), p))),
+        );
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports.retain(|p| *p != 0);
+    pids.sort_unstable();
+    pids.dedup();
 
-    if !before.is_empty() {
+    // Providers may list configured but never-started daemons. Stopping those returns
+    // "no matching daemons"; only invoke stop when there is actual ownership to reconcile.
+    let needs_stop = pids.iter().any(|(_, pid)| pid_alive(*pid))
+        || before
+            .iter()
+            .any(|d| matches!(d.status.as_str(), "running" | "starting"))
+        || ports.iter().any(|port| accepting(*port));
+    if needs_stop {
         mise::stop(&ctx.root)?;
     }
 
@@ -429,7 +456,12 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
             .iter()
             .filter(|(_, pid)| pid_alive(*pid))
             .map(|(name, pid)| json!({ "service": name, "pid": pid }))
-            .chain(ports.iter().filter(|p| accepting(**p)).map(|p| json!({ "port": p })))
+            .chain(
+                ports
+                    .iter()
+                    .filter(|p| accepting(**p))
+                    .map(|p| json!({ "port": p })),
+            )
             .collect();
         if alive.is_empty() || Instant::now() >= deadline {
             break alive;
@@ -442,10 +474,13 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
             .details(leftovers));
     }
 
-    let _ = fs::remove_file(ctx.session_file());
-    let _ = fs::remove_file(ctx.index_file());
+    remove_if_exists(&ctx.session_file())?;
+    remove_if_exists(&ctx.index_file())?;
     Ok(DownReport {
-        stopped: pids.iter().map(|(name, pid)| json!({ "service": name, "pid": pid })).collect(),
+        stopped: pids
+            .iter()
+            .map(|(name, pid)| json!({ "service": name, "pid": pid }))
+            .collect(),
         confirmed: true,
     })
 }
@@ -668,6 +703,14 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
     write_json(&ctx.index_file(), session)?;
     write_json(&ctx.session_file(), session)
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(crate::error::io_error(path.display(), e)),
+    }
 }
 
 fn lock_digest(root: &Path) -> String {

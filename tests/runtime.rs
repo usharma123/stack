@@ -101,6 +101,51 @@ esac
 }
 
 #[test]
+fn supervisor_failure_preserves_ownership_instead_of_confirming_cleanup() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let paths = fixture.session_paths();
+    let mut session: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+    session["services"] = json!({ "worker": { "port":0, "pid":std::process::id(), "identity":"liveness", "verified_at":0 } });
+    for path in &paths {
+        fs::write(path, session.to_string()).unwrap();
+    }
+    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
+        "provider_failed"
+    );
+    for path in paths {
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
+            session
+        );
+    }
+}
+
+#[test]
+fn recorded_ownership_is_used_even_when_the_supervisor_lists_no_daemons() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let paths = fixture.session_paths();
+    let mut session: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+    session["services"] = json!({ "worker": { "port":0, "pid":std::process::id(), "identity":"liveness", "verified_at":0 } });
+    for path in &paths {
+        fs::write(path, session.to_string()).unwrap();
+    }
+    fs::write(fixture.dir.path().join("fail-stop"), "").unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
+        "stop_failed"
+    );
+    assert!(paths.iter().all(|p| p.exists()));
+}
+
+#[test]
 fn concurrent_renewals_keep_both_records_valid_and_consistent() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "10m"]);
