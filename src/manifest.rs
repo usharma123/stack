@@ -119,7 +119,26 @@ impl Service {
                 format!("service '{name}' in {origin} must set exactly one of `preset` or `run`"),
             ));
         }
+        match &self.port {
+            None => {}
+            Some(toml::Value::String(s)) if s == "auto" => {}
+            Some(toml::Value::Integer(p)) if (1..=65535).contains(p) => {}
+            Some(other) => {
+                return Err(StackError::new(
+                    "invalid_service",
+                    format!("service '{name}' in {origin} has port {other}; use \"auto\" or 1-65535"),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The pinned port, if any. Only meaningful after `validate`.
+    pub fn fixed_port(&self) -> Option<u16> {
+        match &self.port {
+            Some(toml::Value::Integer(p)) => u16::try_from(*p).ok(),
+            _ => None,
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 //! mise installs tools; Pitchfork (via `mise daemons`) supervises services.
 
 use crate::compose::Composed;
+use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
@@ -12,7 +13,8 @@ pub fn output_path(root: &Path) -> PathBuf {
     root.join(".config/mise/conf.d/stack.toml")
 }
 
-pub fn render(stack: &Composed) -> String {
+/// `ports` are this checkout's assigned ports; every service gets a concrete one.
+pub fn render(stack: &Composed, ports: &IndexMap<String, u16>) -> String {
     let mut doc = Table::new();
     let has_services = !stack.services.is_empty();
 
@@ -65,8 +67,9 @@ pub fn render(stack: &Composed) -> String {
                 put(&mut t, "run", s.run.clone().map(Value::String));
                 put(&mut t, "ready_cmd", s.ready_cmd.clone().map(Value::String));
                 put(&mut t, "ready_port", s.ready_port.map(|p| Value::Integer(p.into())));
-                let port = s.port.clone().unwrap_or_else(|| Value::String("auto".into()));
-                t.insert("port".into(), port);
+                if let Some(port) = ports.get(name) {
+                    t.insert("port".into(), Value::Integer((*port).into()));
+                }
                 (name.clone(), Value::Table(t))
             })
             .collect();
@@ -100,4 +103,99 @@ fn put(t: &mut Table, key: &str, value: Option<Value>) {
     if let Some(v) = value {
         t.insert(key.into(), v);
     }
+}
+
+// ---- runtime -------------------------------------------------------------------------------
+
+use crate::error::{Result, StackError};
+use serde::Deserialize;
+use std::process::{Command, Output, Stdio};
+
+/// One supervised service as Pitchfork reports it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonStatus {
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub data_dir: Option<String>,
+}
+
+fn mise(root: &Path, args: &[&str]) -> Result<Output> {
+    Command::new("mise")
+        .args(args)
+        .current_dir(root)
+        .env("MISE_YES", "1")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| {
+            StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
+                .hint("install mise: https://mise.jdx.dev")
+        })
+}
+
+fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
+    let out = mise(root, args)?;
+    if out.status.success() {
+        return Ok(out);
+    }
+    Err(StackError::new(code, format!("mise {} failed", args.join(" ")))
+        .details(vec![serde_json::json!({ "output": tail(&out) })]))
+}
+
+/// Last lines of combined output, without terminal escape codes.
+pub fn tail(out: &Output) -> String {
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let mut clean = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip CSI sequences: ESC [ params final-byte
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        clean.push(c);
+    }
+    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(12)..].join("\n")
+}
+
+pub fn trust(root: &Path) -> Result<()> {
+    checked(root, &["trust", "--quiet", &output_path(root).to_string_lossy()], "provider_failed").map(|_| ())
+}
+
+pub fn install(root: &Path) -> Result<()> {
+    checked(root, &["install", "--yes", "--quiet"], "install_failed").map(|_| ())
+}
+
+/// The environment mise would give a command: tools on PATH, env, service connection vars.
+pub fn env(root: &Path) -> Result<IndexMap<String, String>> {
+    let out = checked(root, &["env", "--json"], "provider_failed")?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise env --json` output: {e}")))
+}
+
+pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
+    let out = checked(root, &["daemons", "--json"], "provider_failed")?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons --json` output: {e}")))
+}
+
+pub fn start(root: &Path) -> Result<()> {
+    checked(root, &["daemons", "start"], "start_failed").map(|_| ())
+}
+
+pub fn stop(root: &Path) -> Result<()> {
+    checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
 }

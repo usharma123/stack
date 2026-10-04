@@ -91,6 +91,8 @@ impl Sandbox {
             mode,
             write: true,
             cache: self.path("cache"),
+            state: self.path("state"),
+            reassign_ports: false,
         })
     }
 }
@@ -142,12 +144,67 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
         "pitchfork = \"2.29.0\"",
         "[daemons.postgres]",
         "preset = \"postgres\"",
-        "port = \"auto\"",
         "daemons = [\"postgres\"]",
     ] {
         assert!(rendered.contains(expected), "missing `{expected}` in:\n{rendered}");
     }
     assert!(!rendered.contains("{{bundle_dir}}"));
+
+    // Every service gets a concrete port from stack's range, never the service default.
+    for (service, port) in &report.ports {
+        assert!((40000..=49999).contains(port), "{service} got {port}");
+        assert!(rendered.contains(&format!("port = {port}")));
+    }
+    assert_eq!(report.ports.len(), 2);
+}
+
+#[test]
+fn independent_checkouts_get_distinct_stable_ports() {
+    let sb = Sandbox::new();
+    let repo = sb.bundle("pybase", PYBASE);
+    let a = sb.path("a");
+    let b = sb.path("b");
+    for dir in [&a, &b] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("stack.toml"), use_git(&repo, "v1")).unwrap();
+    }
+    let pa = sb.compile(&a, Mode::UseLock).unwrap().ports;
+    let pb = sb.compile(&b, Mode::UseLock).unwrap().ports;
+    for port in pa.values() {
+        assert!(!pb.values().any(|p| p == port), "a and b share port {port}");
+    }
+    assert_eq!(sb.compile(&a, Mode::UseLock).unwrap().ports, pa, "ports are stable across compiles");
+}
+
+#[test]
+fn pinned_ports_cannot_collide_across_projects() {
+    let sb = Sandbox::new();
+    let repo = sb.bundle("pybase", PYBASE);
+    let pin = "[override.services.redis]\npreset = \"redis\"\nversion = \"8\"\nport = 46379\n";
+    let a = sb.path("a");
+    let b = sb.path("b");
+    for dir in [&a, &b] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("stack.toml"), format!("{}{pin}", use_git(&repo, "v1"))).unwrap();
+    }
+    assert_eq!(sb.compile(&a, Mode::UseLock).unwrap().ports["redis"], 46379);
+    assert_eq!(sb.compile(&b, Mode::UseLock).unwrap_err().code, "port_conflict");
+}
+
+#[test]
+fn deleted_projects_release_their_ports() {
+    let sb = Sandbox::new();
+    let repo = sb.bundle("pybase", PYBASE);
+    let a = sb.path("a");
+    fs::create_dir_all(&a).unwrap();
+    fs::write(a.join("stack.toml"), use_git(&repo, "v1")).unwrap();
+    sb.compile(&a, Mode::UseLock).unwrap();
+    assert_eq!(stack::ports::lookup(&sb.path("state"), &a).unwrap().len(), 2);
+
+    fs::remove_dir_all(&a).unwrap();
+    let b = sb.project(&use_git(&repo, "v1"));
+    sb.compile(&b, Mode::UseLock).unwrap();
+    assert!(stack::ports::lookup(&sb.path("state"), &a).unwrap().is_empty());
 }
 
 #[test]
@@ -276,6 +333,8 @@ fn inspect_writes_nothing() {
         mode: Mode::Frozen,
         write: false,
         cache: sb.path("cache"),
+        state: sb.path("state"),
+        reassign_ports: false,
     })
     .unwrap();
     assert_eq!(report.stack.services.len(), 2);

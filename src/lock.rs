@@ -22,6 +22,9 @@ pub struct LockedBundle {
     /// Resolved commit for git sources. Tags and branches never re-resolve without `--update`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Resolved manifest digest for OCI sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     pub content_hash: String,
 }
 

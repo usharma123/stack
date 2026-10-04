@@ -4,11 +4,13 @@ use crate::error::{Result, StackError};
 use crate::git;
 use crate::hash::hash_dir;
 use crate::lock::LockedBundle;
+use crate::oci::{self, Reference};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
     Git { url: String, reference: String },
+    Oci(Reference),
     Path { path: PathBuf },
 }
 
@@ -27,8 +29,9 @@ pub enum Mode {
 pub struct Fetched {
     pub dir: PathBuf,
     pub commit: Option<String>,
+    pub digest: Option<String>,
     pub content_hash: String,
-    /// Set when `--update` moved a bundle to a different commit.
+    /// Set when `--update` moved a bundle to a different commit or digest.
     pub moved_from: Option<String>,
 }
 
@@ -38,6 +41,9 @@ impl Source {
             return Ok(Source::Path {
                 path: project_root.join(path),
             });
+        }
+        if let Some(rest) = spec.strip_prefix("oci:") {
+            return Ok(Source::Oci(Reference::parse(rest)?));
         }
         if let Some(rest) = spec.strip_prefix("git+") {
             let (url, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -55,7 +61,7 @@ impl Source {
             });
         }
         Err(StackError::new("source_invalid", format!("unrecognised bundle source '{spec}'"))
-            .hint("use git+<url>?ref=<ref> or path:<dir>"))
+            .hint("use git+<url>?ref=<ref>, oci:<registry>/<repo>:<tag> or path:<dir>"))
     }
 
     pub fn fetch(
@@ -67,6 +73,7 @@ impl Source {
     ) -> Result<Fetched> {
         match self {
             Source::Git { url, reference } => fetch_git(spec, url, reference, locked, mode, cache),
+            Source::Oci(r) => fetch_oci(spec, r, locked, mode, cache),
             Source::Path { path } => fetch_path(spec, path, locked, mode),
         }
     }
@@ -129,9 +136,44 @@ fn fetch_git(
     Ok(Fetched {
         dir,
         commit: Some(commit),
+        digest: None,
         content_hash,
         moved_from,
     })
+}
+
+fn fetch_oci(
+    spec: &str,
+    r: &Reference,
+    locked: Option<&LockedBundle>,
+    mode: Mode,
+    cache: &Path,
+) -> Result<Fetched> {
+    let client = oci::Client::default();
+    let locked_digest = locked.and_then(|l| l.digest.clone());
+    let (digest, moved_from) = match (mode, locked_digest) {
+        (Mode::UseLock | Mode::Frozen, Some(d)) => (d, None),
+        (Mode::Frozen, None) => {
+            return Err(StackError::new("lock_outdated", format!("{spec} is not in stack.lock"))
+                .hint("run `stack compile` and commit stack.lock"));
+        }
+        (_, previous) => {
+            let digest = client.resolve(r)?;
+            let moved = previous.filter(|p| *p != digest);
+            (digest, moved)
+        }
+    };
+
+    let dir = cache.join("bundles").join(format!("oci-{}", digest.trim_start_matches("sha256:")));
+    client.pull(r, &digest, &dir)?;
+    let content_hash = hash_dir(&dir)?;
+    if let Some(locked) = locked {
+        if locked.digest.as_deref() == Some(digest.as_str()) && locked.content_hash != content_hash {
+            return Err(StackError::new("content_hash_mismatch", format!("{spec}: contents of {digest} do not match stack.lock"))
+                .hint(format!("delete {} and retry; if it persists, the lock was edited", dir.display())));
+        }
+    }
+    Ok(Fetched { dir, commit: None, digest: Some(digest), content_hash, moved_from })
 }
 
 fn fetch_path(spec: &str, path: &Path, locked: Option<&LockedBundle>, mode: Mode) -> Result<Fetched> {
@@ -149,6 +191,7 @@ fn fetch_path(spec: &str, path: &Path, locked: Option<&LockedBundle>, mode: Mode
     Ok(Fetched {
         dir,
         commit: None,
+        digest: None,
         content_hash,
         moved_from: None,
     })

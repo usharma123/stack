@@ -31,6 +31,11 @@ impl StackError {
         self.details = details;
         self
     }
+
+    pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
+        self.details.push(detail);
+        self
+    }
 }
 
 impl fmt::Display for StackError {
