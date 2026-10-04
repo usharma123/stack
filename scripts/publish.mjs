@@ -12,10 +12,10 @@ export async function publishPackage(file, { verifyOnly = false, fetchImpl = fet
   const registry = 'https://registry.npmjs.org';
   const url = `${registry}/${encodeURIComponent(manifest.name)}/${manifest.version}`;
   const delay = pause;
-  async function metadata(endpoint = url) {
+  async function metadata(endpoint = url, accept = 'application/json') {
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        const response = await fetchImpl(endpoint, { signal: AbortSignal.timeout(15000) });
+        const response = await fetchImpl(endpoint, { headers: { accept }, signal: AbortSignal.timeout(15000) });
         if (response.status === 404) return null;
         if (response.status === 429 || response.status >= 500) throw new Error(`Registry HTTP ${response.status}`);
         if (!response.ok) throw new TypeError(`Registry HTTP ${response.status}`);
@@ -43,7 +43,7 @@ export async function publishPackage(file, { verifyOnly = false, fetchImpl = fet
         if (!response.ok) throw new Error(`Tarball HTTP ${response.status}`);
         const downloaded = Buffer.from(await response.arrayBuffer());
         assert.equal(`sha512-${createHash('sha512').update(downloaded).digest('base64')}`, integrity);
-        const index = await metadata(`${registry}/${encodeURIComponent(manifest.name)}`);
+        const index = await metadata(`${registry}/${encodeURIComponent(manifest.name)}`, 'application/vnd.npm.install-v1+json');
         if (!index?.versions?.[manifest.version]) throw new Error('Registry package index has not propagated yet');
         assert.equal(index.versions[manifest.version].dist.integrity, integrity, 'Registry package index differs from this tarball');
         console.log(`Verified ${manifest.name}@${manifest.version}: registry integrity, provenance, and downloadable tarball`);

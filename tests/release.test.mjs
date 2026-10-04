@@ -59,9 +59,10 @@ try {
   });
   await test('publication waits for the package index needed by npm install', async () => {
     let indexReads = 0;
-    await publishPackage(tarball, { pause, fetchImpl: async url => {
+    await publishPackage(tarball, { pause, fetchImpl: async (url, options) => {
       if (url.endsWith('.tgz')) return new Response(bytes);
       if (url.endsWith('/0.1.0-beta.1')) return json(remote);
+      assert.equal(options.headers.accept, 'application/vnd.npm.install-v1+json');
       return ++indexReads === 1 ? new Response('', { status: 404 }) : json(index);
     } });
     assert.equal(indexReads, 2);
