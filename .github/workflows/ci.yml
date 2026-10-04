@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+  required:
+    name: CI passed
+    if: always()
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: test "$RESULT" = success
+        env:
+          RESULT: ${{ needs.validate.result }}

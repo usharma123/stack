@@ -99,6 +99,19 @@ stack down                             # succeeds only once the processes are co
 
 All accept `-C <dir>` and `--json`. Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`.
 
+## Install
+
+Once published, install the CLI with:
+
+```sh
+npm install -g @ushawarma/stack
+stack --version
+```
+
+Prebuilt binaries cover macOS 13+ and Linux with glibc 2.39+, on x64 and arm64.
+Node.js 22.14+ is required. See [docs/RELEASING.md](docs/RELEASING.md) for CI checks,
+trusted publishing setup, release tags, and recovery.
+
 ## Develop
 
 ```sh

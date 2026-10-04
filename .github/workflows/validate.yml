@@ -1,0 +1,107 @@
+name: Validate and package
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  native:
+    name: Native (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-x64 }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64 }
+          - { runner: macos-15-intel, platform: darwin-x64 }
+          - { runner: macos-15, platform: darwin-arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.16.0'
+          package-manager-cache: false
+      - name: Install Rust
+        run: rustup toolchain install 1.93.1 --profile minimal --component clippy
+      - run: node --test tests/*.test.mjs
+      - run: cargo +1.93.1 clippy --locked --all-targets -- -D warnings
+      - run: cargo +1.93.1 test --locked --all-targets
+      - run: cargo +1.93.1 build --locked --release
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+      - name: Verify and identify binary
+        run: node scripts/artifact.mjs '${{ matrix.platform }}'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: artifacts/${{ matrix.platform }}/
+          if-no-files-found: error
+          retention-days: 7
+  oci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - run: cargo +1.93.1 build --locked
+      - run: bash tests/e2e/ci-oci.sh target/debug/stack
+  package:
+    needs: [native, oci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.16.0'
+          package-manager-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: downloads
+      - name: Assemble checked binaries
+        run: |
+          mkdir artifacts
+          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            mv "downloads/native-$platform" "artifacts/$platform"
+          done
+          node scripts/package.mjs
+          mkdir dist
+          npm pack ./npm --pack-destination dist
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      - run: node scripts/smoke-install.mjs dist/*.tgz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+  install:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.16.0'
+          package-manager-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package
+          path: dist
+      - run: node scripts/smoke-install.mjs dist/*.tgz

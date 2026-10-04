@@ -1,0 +1,13 @@
+{
+  "name": "@ushawarma/stack",
+  "version": "0.1.0",
+  "description": "Reusable, agent-safe development stacks",
+  "repository": { "type": "git", "url": "git+https://github.com/usharma123/stack.git" },
+  "homepage": "https://github.com/usharma123/stack#readme",
+  "bin": { "stack": "bin/stack.cjs" },
+  "files": ["bin/stack.cjs", "binaries/", "build-info.json", "README.md"],
+  "engines": { "node": ">=22.14" },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"],
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }
+}
