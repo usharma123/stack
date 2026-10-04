@@ -21,6 +21,23 @@ rg_check=$(grep -c 'unverified.stack.invalid' /tmp/wrong-instance.log || true)
 (( rg_check > 0 )) || fail 'test did not fail on the poisoned endpoint'
 expect_error service_unavailable stack exec --require-all --json -- true
 
+echo 'libpq overrides in withheld endpoints cannot reach the foreign server'
+for url in 'postgresql://postgres@localhost:5432/postgres#x?host=127.0.0.1' \
+  'host = /tmp port = 5432 dbname = postgres' \
+  "host=/tmp password='a b' port=5432 dbname=postgres" ''; do
+  printf '\nDATABASE_URL = "%s"\n' "$url" >>stack.toml
+  stack compile >/dev/null
+  for args in '"$DATABASE_URL"' ''; do
+    if PGHOSTADDR=127.0.0.1 PGHOST=/tmp PGPORT=5432 PGCONNECT_TIMEOUT=3 \
+      stack exec -- bash -c "psql -w -Atc 'select 1' $args" >/tmp/libpq.log 2>&1; then
+      fail "psql reached the foreign server through '$url' ($args)"
+    fi
+    grep -q 'unverified.stack.invalid' /tmp/libpq.log || fail "psql did not use the invalid host for '$url' ($args)"
+  done
+  git checkout -q -- stack.toml
+done
+stack compile >/dev/null
+
 echo 'Project endpoint changes invalidate the generation before execution'
 stack up >/dev/null
 printf '\nDATABASE_URL = "postgresql://postgres@127.0.0.1:5432/postgres"\n' >>stack.toml

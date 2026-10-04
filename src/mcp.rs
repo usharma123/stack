@@ -210,11 +210,15 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
             .unwrap_or(DEFAULT_EXEC_TIMEOUT),
     );
 
+    // Inherit the server's environment as raw bytes, like `stack exec`; `std::env::vars`
+    // panics on values that are not Unicode.
+    let mut command = Command::new(&plan.program);
+    for var in &plan.removed {
+        command.env_remove(var);
+    }
     let output = crate::process::capture(
-        Command::new(&plan.program)
+        command
             .args(&plan.args)
-            .env_clear()
-            .envs(std::env::vars().filter(|(k, _)| !plan.removed.contains(k)))
             .envs(&plan.env)
             .current_dir(&ctx.root),
         timeout,

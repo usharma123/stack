@@ -152,6 +152,7 @@ fn verify_all(
     env: &IndexMap<String, String>,
     statuses: &[DaemonStatus],
 ) -> Vec<Check> {
+    let inherited = inherited_env();
     report
         .stack
         .services
@@ -177,7 +178,7 @@ fn verify_all(
                 }
                 Err(reason) => {
                     check.reason = Some(reason);
-                    check.withheld = binding_vars(name, &entry.value, port, env);
+                    check.withheld = binding_vars(name, &entry.value, port, env, &inherited);
                 }
             }
             check
@@ -297,17 +298,21 @@ pub fn which_in(path: Option<&str>, bin: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Variables that point a command at this service.
+/// Variables that point a command at this service: its preset's and name's variables, whether
+/// set by the provider or inherited from the caller, and provider values naming its port.
 fn binding_vars(
     name: &str,
     service: &Service,
     port: Option<u16>,
     env: &IndexMap<String, String>,
+    inherited: &IndexMap<String, String>,
 ) -> Vec<String> {
     let mut vars: Vec<String> = match service.preset.as_deref() {
         Some("postgres") => [
             "DATABASE_URL",
             "PGHOST",
+            "PGHOSTADDR",
+            "PGSERVICE",
             "PGPORT",
             "PGUSER",
             "PGDATABASE",
@@ -319,6 +324,7 @@ fn binding_vars(
         _ => Vec::new(),
     };
     let folded = name.to_uppercase().replace('-', "_");
+    vars.push(format!("{folded}_HOST"));
     vars.push(format!("{folded}_PORT"));
     vars.push(format!("{folded}_URL"));
     if let Some(port) = port {
@@ -331,11 +337,26 @@ fn binding_vars(
     }
     let mut out: Vec<String> = Vec::new();
     for v in vars {
-        if env.contains_key(&v) && !out.contains(&v) {
+        // libpq falls back to its default host when PGHOST is unset, so it is always poisoned.
+        let set = env.contains_key(&v) || inherited.contains_key(&v);
+        if (set || (v == "PGHOST" && service.preset.as_deref() == Some("postgres")))
+            && !out.contains(&v)
+        {
             out.push(v);
         }
     }
     out
+}
+
+/// The caller's environment, which commands inherit beneath the provider's. Used only to find
+/// and poison connection variables; commands inherit the raw values of everything else. Unix
+/// allows any bytes, so this must not panic like `std::env::vars`: a key that is not Unicode
+/// cannot name a connection variable, and a value that is not is read lossily so it is still
+/// withheld rather than passed through.
+fn inherited_env() -> IndexMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
+        .collect()
 }
 
 // ---- lifecycle -----------------------------------------------------------------------------
@@ -650,13 +671,294 @@ pub struct ExecPlan {
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
 pub const UNVERIFIED_HOST: &str = "unverified.stack.invalid";
 
-/// Replace the host in an endpoint value. `None` if the value has no host to replace,
-/// in which case the variable is removed instead.
-fn poison(value: &str) -> Option<String> {
-    let poisoned = value
-        .replace("127.0.0.1", UNVERIFIED_HOST)
-        .replace("localhost", UNVERIFIED_HOST);
-    (poisoned != value).then_some(poisoned)
+/// Withheld value for a connection variable of a service with `preset`. `None` only for
+/// bindings that name no host (ports, users, databases, passwords), which are removed. Anything
+/// that may select a host keeps a value that cannot resolve, whatever host it named: removing it
+/// would let the app fall back to a default such as localhost.
+fn poison(preset: Option<&str>, var: &str, value: &str) -> Option<String> {
+    let upper = var.to_ascii_uppercase();
+    if ["PGHOST", "PGHOSTADDR", "PGSERVICE"].contains(&upper.as_str())
+        || upper.ends_with("_HOST")
+        || upper.ends_with("_HOSTNAME")
+    {
+        return Some(UNVERIFIED_HOST.into());
+    }
+    let endpoint = ["_URL", "_URI", "_DSN"].iter().any(|s| upper.ends_with(s));
+    if !endpoint
+        && (["PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD"].contains(&upper.as_str())
+            || upper.ends_with("_PORT")
+            || (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())))
+    {
+        return None;
+    }
+    // A value no format below recognises becomes this, which names only the invalid host. A
+    // bare host name would not do for Postgres: libpq clients such as psql read it as a
+    // database name and connect to the default host.
+    let fallback = |port: Option<&str>| {
+        let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+        match preset {
+            Some("postgres") => format!("postgresql://{UNVERIFIED_HOST}{port}"),
+            Some("redis") => format!("redis://{UNVERIFIED_HOST}{port}"),
+            _ => format!("{UNVERIFIED_HOST}{port}"),
+        }
+    };
+    if let Some((scheme, rest)) = value.split_once("://") {
+        if ["postgres", "postgresql"]
+            .iter()
+            .any(|s| scheme.eq_ignore_ascii_case(s))
+        {
+            return Some(poison_libpq_uri(scheme, rest));
+        }
+        let valid_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+-.:".contains(&b));
+        return Some(match poison_url(value) {
+            Some(url) => url,
+            None if valid_scheme => format!("{scheme}://{UNVERIFIED_HOST}"),
+            None => fallback(None),
+        });
+    }
+    if let Some(pairs) = libpq_keywords(value).filter(|p| !p.is_empty()) {
+        let mut out = vec![format!("host={UNVERIFIED_HOST}")];
+        out.extend(
+            pairs
+                .iter()
+                .filter(|(k, _)| !LIBPQ_HOST_KEYS.contains(&k.as_str()))
+                .map(|(k, v)| format!("{k}={}", libpq_quote(v))),
+        );
+        return Some(out.join(" "));
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        let bracketed = host.starts_with('[') && host.ends_with(']');
+        let plain = !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if (bracketed || plain) && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(if endpoint {
+                fallback(Some(port))
+            } else {
+                format!("{UNVERIFIED_HOST}:{port}")
+            });
+        }
+    }
+    // Unrecognised shape: the whole value is replaced rather than guessing where the host is.
+    Some(fallback(None))
+}
+
+/// Parameters that let libpq connect somewhere other than the named host: `service` looks one
+/// up in a service file, which may set `hostaddr`.
+const LIBPQ_HOST_KEYS: [&str; 3] = ["host", "hostaddr", "service"];
+
+/// Replace the host of a URL, keeping credentials, port, path and other query parameters.
+/// The fragment is dropped: parsers disagree on whether `#` starts one, and text after it can
+/// read as a query (`/db#x?host=...`). URLs without a host may name a socket path instead, so
+/// only the scheme is kept.
+fn poison_url(value: &str) -> Option<String> {
+    let mut url = url::Url::parse(value).ok()?;
+    if url.host_str().unwrap_or_default().is_empty() {
+        return None;
+    }
+    url.set_host(Some(UNVERIFIED_HOST)).ok()?;
+    url.set_fragment(None);
+    if url.query().is_some() {
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| !LIBPQ_HOST_KEYS.iter().any(|h| k.eq_ignore_ascii_case(h)))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !pairs.is_empty() {
+            url.query_pairs_mut().extend_pairs(pairs);
+        }
+    }
+    Some(url.into())
+}
+
+/// Rewrite a PostgreSQL URI as libpq reads it, which is not as a WHATWG URL: `#` has no
+/// meaning, the user ends at the first `@` before a `/`, several comma-separated hosts may be
+/// named, and `?host=`, `?hostaddr=` and `?service=` override them. The result names only the
+/// invalid host, with every kept component percent-encoded so that libpq and URL parsers agree
+/// on where each one ends. Credentials, the first port, the database and other parameters are
+/// kept; anything libpq would reject is dropped.
+fn poison_libpq_uri(scheme: &str, rest: &str) -> String {
+    let mut out = format!("{scheme}://");
+    let mut rest = rest;
+    if let Some(at) = rest
+        .find(['@', '/'])
+        .filter(|i| rest.as_bytes()[*i] == b'@')
+    {
+        let (user, password) = match rest[..at].split_once(':') {
+            Some((user, password)) => (user, Some(password)),
+            None => (&rest[..at], None),
+        };
+        out.push_str(&percent_encode(&percent_decode(user)));
+        if let Some(password) = password {
+            out.push(':');
+            out.push_str(&percent_encode(&percent_decode(password)));
+        }
+        out.push('@');
+        rest = &rest[at + 1..];
+    }
+    out.push_str(UNVERIFIED_HOST);
+
+    // Hosts and ports, up to the database (`/`) or parameters (`?`).
+    let mut port = None;
+    let terminator = loop {
+        if let Some(inner) = rest.strip_prefix('[') {
+            let Some(end) = inner.find(']') else {
+                return out;
+            };
+            rest = &inner[end + 1..];
+        } else {
+            rest = &rest[rest.find([':', '/', '?', ',']).unwrap_or(rest.len())..];
+        }
+        if let Some(after) = rest.strip_prefix(':') {
+            let end = after.find(['/', '?', ',']).unwrap_or(after.len());
+            if port.is_none() && !after[..end].is_empty() {
+                port = Some(&after[..end]);
+            }
+            rest = &after[end..];
+        }
+        match rest.chars().next() {
+            Some(',') => rest = &rest[1..],
+            Some(c @ ('/' | '?')) => {
+                rest = &rest[1..];
+                break Some(c);
+            }
+            Some(_) => return out,
+            None => break None,
+        }
+    };
+    if let Some(port) = port.filter(|p| p.bytes().all(|b| b.is_ascii_digit())) {
+        out.push(':');
+        out.push_str(port);
+    }
+    let params = match terminator {
+        Some('/') => {
+            let (db, params) = match rest.split_once('?') {
+                Some((db, params)) => (db, Some(params)),
+                None => (rest, None),
+            };
+            out.push('/');
+            out.push_str(&percent_encode(&percent_decode(db)));
+            params
+        }
+        Some(_) => Some(rest),
+        None => None,
+    };
+    let kept: Vec<String> = params
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|param| {
+            let (key, value) = param.split_once('=')?;
+            let key = percent_decode(key);
+            (!value.contains('=') && !LIBPQ_HOST_KEYS.contains(&&*String::from_utf8_lossy(&key)))
+                .then(|| {
+                    format!(
+                        "{}={}",
+                        percent_encode(&key),
+                        percent_encode(&percent_decode(value))
+                    )
+                })
+        })
+        .collect();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out
+}
+
+/// Parse a libpq keyword/value connection string (`host = h password='a b'`), or `None` if
+/// libpq would reject it.
+fn libpq_keywords(value: &str) -> Option<Vec<(String, String)>> {
+    let mut chars = value.chars().peekable();
+    let mut pairs = Vec::new();
+    loop {
+        while chars.next_if(libpq_space).is_some() {}
+        if chars.peek().is_none() {
+            return Some(pairs);
+        }
+        let mut key = String::new();
+        while let Some(c) = chars.next_if(|c| *c != '=' && !libpq_space(c)) {
+            key.push(c);
+        }
+        while chars.next_if(libpq_space).is_some() {}
+        chars.next_if_eq(&'=')?;
+        while chars.next_if(libpq_space).is_some() {}
+        let mut val = String::new();
+        if chars.next_if_eq(&'\'').is_some() {
+            loop {
+                match chars.next()? {
+                    '\'' => break,
+                    '\\' => val.push(chars.next()?),
+                    c => val.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| !libpq_space(c)) {
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        val.push(escaped);
+                    }
+                } else {
+                    val.push(c);
+                }
+            }
+        }
+        pairs.push((key, val));
+    }
+}
+
+/// `isspace` in the C locale, which libpq uses to separate keywords.
+fn libpq_space(c: &char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+fn libpq_quote(value: &str) -> String {
+    if !value.is_empty() && !value.contains(|c: char| c.is_whitespace() || c == '\'' || c == '\\') {
+        return value.into();
+    }
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Encode everything but RFC 3986 unreserved characters, so no delimiter survives.
+fn percent_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 /// Which services a command needs. Unverified services are always withheld; required ones
@@ -715,15 +1017,30 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
 
     // Unsetting is not enough: apps often fall back to a default like localhost:5432, which may
     // be some other server. Poison host-bearing values so connections fail loudly instead.
-    let mut removed = Vec::new();
-    for var in checks.iter().flat_map(|c| c.withheld.iter()) {
-        match env.get(var).and_then(|v| poison(v)) {
-            Some(bad) => {
-                env.insert(var.clone(), bad);
+    // A variable only the caller set is still inherited by the command, so it is withheld too.
+    let inherited = inherited_env();
+    let mut removed: Vec<String> = Vec::new();
+    let mut seen: Vec<&String> = Vec::new();
+    for check in &checks {
+        let preset = report
+            .stack
+            .services
+            .get(&check.service)
+            .and_then(|s| s.value.preset.as_deref());
+        for var in &check.withheld {
+            if seen.contains(&var) {
+                continue;
             }
-            None => {
-                env.shift_remove(var);
-                removed.push(var.clone());
+            seen.push(var);
+            let value = env.get(var).or_else(|| inherited.get(var));
+            match poison(preset, var, value.map_or("", String::as_str)) {
+                Some(bad) => {
+                    env.insert(var.clone(), bad);
+                }
+                None => {
+                    env.shift_remove(var);
+                    removed.push(var.clone());
+                }
             }
         }
     }
@@ -944,6 +1261,7 @@ fn verify_session(
                 &report.stack.services[&check.service].value,
                 check.port,
                 env,
+                &inherited_env(),
             );
         }
     }
@@ -995,18 +1313,251 @@ fn lock_digest(root: &Path) -> String {
 mod tests {
     use super::*;
 
+    const PG: Option<&str> = Some("postgres");
+
+    /// A poisoned URL must name only the invalid host to WHATWG parsers too.
+    fn assert_url_host(value: &str) {
+        let url = url::Url::parse(value).unwrap();
+        assert_eq!(url.host_str(), Some(UNVERIFIED_HOST), "{value}");
+        assert!(url.fragment().is_none(), "{value}");
+        assert!(
+            !url.query_pairs()
+                .any(|(k, _)| LIBPQ_HOST_KEYS.contains(&k.as_ref())),
+            "{value}"
+        );
+    }
+
     #[test]
-    fn poison_replaces_hosts_or_declines() {
+    fn poison_replaces_every_url_host_and_keeps_the_rest() {
+        for (preset, input, expected) in [
+            (
+                PG,
+                "postgresql://postgres@127.0.0.1:41234/postgres",
+                "postgresql://postgres@unverified.stack.invalid:41234/postgres",
+            ),
+            (
+                PG,
+                "postgresql://user@[::1]:5432/db",
+                "postgresql://user@unverified.stack.invalid:5432/db",
+            ),
+            (
+                PG,
+                "postgresql://user@db.internal:5432/db",
+                "postgresql://user@unverified.stack.invalid:5432/db",
+            ),
+            (
+                // Credentials and paths that merely contain a host name are left alone.
+                PG,
+                "postgres://localhost:p%40ss-127.0.0.1@localhost:5432/localhost?sslmode=disable",
+                "postgres://localhost:p%40ss-127.0.0.1@unverified.stack.invalid:5432/localhost?sslmode=disable",
+            ),
+            (
+                Some("redis"),
+                "redis://localhost:6379",
+                "redis://unverified.stack.invalid:6379",
+            ),
+            (
+                Some("redis"),
+                "redis://:secret@[::1]:6379/0",
+                "redis://:secret@unverified.stack.invalid:6379/0",
+            ),
+            (
+                Some("redis"),
+                "rediss://cache.example.internal:6380",
+                "rediss://unverified.stack.invalid:6380",
+            ),
+            (
+                // libpq lets query parameters override the authority; they are dropped.
+                PG,
+                "postgresql://u@127.0.0.1/db?host=10.0.0.5&sslmode=disable",
+                "postgresql://u@unverified.stack.invalid/db?sslmode=disable",
+            ),
+            (
+                PG,
+                "postgresql:///db?host=/var/run/postgresql",
+                "postgresql://unverified.stack.invalid/db",
+            ),
+            (
+                PG,
+                "postgresql://u@h/db?ho%73t=127.0.0.1&service=prod&application_name=a%20b",
+                "postgresql://u@unverified.stack.invalid/db?application_name=a%20b",
+            ),
+            (
+                // libpq has no fragments: the database is `db#x` and `host` is a parameter.
+                PG,
+                "postgresql://u@localhost/db#x?host=127.0.0.1",
+                "postgresql://u@unverified.stack.invalid/db%23x",
+            ),
+            (
+                PG,
+                "postgresql://u@localhost/db#x?hostaddr=127.0.0.1",
+                "postgresql://u@unverified.stack.invalid/db%23x",
+            ),
+            (
+                // libpq's user ends at the first `@`; a URL parser's at the last before `/?#`.
+                PG,
+                "postgresql://localhost#@127.0.0.1/db",
+                "postgresql://localhost%23@unverified.stack.invalid/db",
+            ),
+            (
+                PG,
+                "postgresql://a@b@localhost:5432/db",
+                "postgresql://a@unverified.stack.invalid:5432/db",
+            ),
+            (
+                PG,
+                "postgresql://h1:5432,[::1]:5433/db",
+                "postgresql://unverified.stack.invalid:5432/db",
+            ),
+            (
+                PG,
+                "postgresql://u@[::1:5432/db",
+                "postgresql://u@unverified.stack.invalid",
+            ),
+            (
+                // Other URL schemes have fragments; they are dropped so no parser reads a query.
+                PG,
+                "postgresql+asyncpg://u@localhost/db#x?host=127.0.0.1",
+                "postgresql+asyncpg://u@unverified.stack.invalid/db",
+            ),
+            (
+                // No host: the path may be a socket.
+                Some("redis"),
+                "unix:///tmp/redis.sock",
+                "unix://unverified.stack.invalid",
+            ),
+            (
+                PG,
+                "jdbc:postgresql://localhost:5432/db",
+                "jdbc:postgresql://unverified.stack.invalid",
+            ),
+        ] {
+            assert_eq!(
+                poison(preset, "DATABASE_URL", input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+            if !expected.starts_with("jdbc:") {
+                assert_url_host(expected);
+            }
+        }
+    }
+
+    #[test]
+    fn poison_fails_closed_for_hosts_and_malformed_endpoints() {
+        for host in ["127.0.0.1", "localhost", "::1", "db.internal", "/tmp", ""] {
+            for var in ["PGHOST", "PGHOSTADDR", "PGSERVICE", "CACHE_HOST"] {
+                assert_eq!(poison(PG, var, host).as_deref(), Some(UNVERIFIED_HOST));
+            }
+        }
+        for (preset, var, input, expected) in [
+            // Malformed or empty endpoints keep a value that names the invalid host: removal,
+            // or a bare word that libpq reads as a database name, would reach the default host.
+            (
+                PG,
+                "DATABASE_URL",
+                "",
+                "postgresql://unverified.stack.invalid",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "41234",
+                "postgresql://unverified.stack.invalid",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "localhost:5432",
+                "postgresql://unverified.stack.invalid:5432",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "dbname='unterminated",
+                "postgresql://unverified.stack.invalid",
+            ),
+            (
+                Some("redis"),
+                "REDIS_URL",
+                "",
+                "redis://unverified.stack.invalid",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "host=::1 port=5432 dbname=app",
+                "host=unverified.stack.invalid port=5432 dbname=app",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "port=5432 dbname=app",
+                "host=unverified.stack.invalid port=5432 dbname=app",
+            ),
+            (
+                // libpq allows spaces around `=` and quoted values.
+                PG,
+                "DATABASE_URL",
+                "host = localhost dbname = app",
+                "host=unverified.stack.invalid dbname=app",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "host=localhost password='has space\\' q' dbname=app",
+                "host=unverified.stack.invalid password='has space\\' q' dbname=app",
+            ),
+            (
+                PG,
+                "DATABASE_URL",
+                "hostaddr=127.0.0.1\tservice=prod dbname=''",
+                "host=unverified.stack.invalid dbname=''",
+            ),
+            (None, "APP_DB", "tcp(127.0.0.1:41234)/db", UNVERIFIED_HOST),
+        ] {
+            assert_eq!(
+                poison(preset, var, input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        for authority in ["127.0.0.1:41234", "[::1]:41234", "db.internal:41234"] {
+            assert_eq!(
+                poison(PG, "APP_DB", authority).as_deref(),
+                Some("unverified.stack.invalid:41234")
+            );
+        }
+    }
+
+    #[test]
+    fn libpq_keywords_follow_libpq_quoting() {
         assert_eq!(
-            poison("postgresql://postgres@127.0.0.1:41234/postgres").unwrap(),
-            "postgresql://postgres@unverified.stack.invalid:41234/postgres"
+            libpq_keywords(" a=1  b = 'x y' c=\\'d e='' f=g\\").unwrap(),
+            [("a", "1"), ("b", "x y"), ("c", "'d"), ("e", ""), ("f", "g")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
         );
-        assert_eq!(poison("127.0.0.1").unwrap(), UNVERIFIED_HOST);
-        assert_eq!(
-            poison("redis://localhost:6379").unwrap(),
-            "redis://unverified.stack.invalid:6379"
-        );
-        assert_eq!(poison("41234"), None);
+        for rejected in ["a", "a=1 b", "a='open", "a='open\\'"] {
+            assert!(libpq_keywords(rejected).is_none(), "{rejected}");
+        }
+        for value in ["", "x", "a b", "it's", "back\\slash", "tab\tbed"] {
+            let quoted = format!("k={}", libpq_quote(value));
+            assert_eq!(libpq_keywords(&quoted).unwrap()[0].1, value, "{quoted}");
+        }
+    }
+
+    #[test]
+    fn poison_removes_bindings_that_name_no_host() {
+        for (var, value) in [
+            ("PGPORT", "41234"),
+            ("PGUSER", "postgres"),
+            ("PGDATABASE", "app"),
+            ("PGPASSWORD", "secret"),
+            ("POSTGRES_PORT", "41234"),
+            ("ANYTHING", "41234"),
+        ] {
+            assert_eq!(poison(PG, var, value), None, "{var}");
+        }
     }
 
     #[test]
@@ -1045,21 +1596,30 @@ mod tests {
 
     #[test]
     fn binding_vars_cover_preset_and_port_references() {
-        let env: IndexMap<String, String> = [
+        let map = |pairs: &[(&str, &str)]| -> IndexMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let env = map(&[
             (
                 "DATABASE_URL",
                 "postgresql://postgres@127.0.0.1:41234/postgres",
             ),
             ("PGPORT", "41234"),
-            ("PGHOST", "127.0.0.1"),
+            ("PGHOSTADDR", "127.0.0.1"),
             ("APP_DB", "host=127.0.0.1:41234"),
             ("REDIS_URL", "redis://127.0.0.1:45555"),
             ("PATH", "/usr/bin"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-        let pg = Service {
+        ]);
+        // Inherited by commands even though the provider does not set them.
+        let inherited = map(&[
+            ("PGSERVICE", "prod"),
+            ("POSTGRES_HOST", "db.internal"),
+            ("HOME", "/home/u"),
+        ]);
+        let mut service = Service {
             preset: Some("postgres".into()),
             version: None,
             run: None,
@@ -1067,11 +1627,24 @@ mod tests {
             ready_port: None,
             port: None,
         };
-        let vars = binding_vars("postgres", &pg, Some(41234), &env);
-        for v in ["DATABASE_URL", "PGPORT", "PGHOST", "APP_DB"] {
+        let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
+        for v in [
+            "DATABASE_URL",
+            "PGPORT",
+            "PGHOST",
+            "PGHOSTADDR",
+            "PGSERVICE",
+            "POSTGRES_HOST",
+            "APP_DB",
+        ] {
             assert!(vars.contains(&v.to_string()), "{v} not withheld: {vars:?}");
         }
-        assert!(!vars.contains(&"REDIS_URL".to_string()));
-        assert!(!vars.contains(&"PATH".to_string()));
+        for v in ["REDIS_URL", "PATH", "HOME", "PGUSER"] {
+            assert!(!vars.contains(&v.to_string()), "{v} withheld: {vars:?}");
+        }
+
+        service.preset = Some("redis".into());
+        let vars = binding_vars("cache", &service, None, &env, &map(&[("CACHE_URL", "x")]));
+        assert_eq!(vars, ["REDIS_URL", "CACHE_URL"]);
     }
 }

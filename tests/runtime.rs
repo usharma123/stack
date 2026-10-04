@@ -15,15 +15,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_bundle("[bundle]\nname='test'\n")
+    }
+
+    fn with_bundle(bundle: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         for name in ["bin", "bundle", "app"] {
             fs::create_dir(dir.path().join(name)).unwrap();
         }
-        fs::write(
-            dir.path().join("bundle/bundle.toml"),
-            "[bundle]\nname='test'\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("bundle/bundle.toml"), bundle).unwrap();
         fs::write(
             dir.path().join("app/stack.toml"),
             "[[use]]\nbundle='path:../bundle'\n",
@@ -49,6 +49,11 @@ case "$1 $2" in
   'daemons --json')
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     cat "$REVIEW_FIXTURE/daemons.json" ;;
+  'daemons start')
+    if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
+      cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
+      touch "$REVIEW_FIXTURE/started"
+    fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi ;;
 esac
@@ -285,4 +290,545 @@ fn container_mcp_scenario_rejects_a_server_that_only_returns_an_error() {
         "broken MCP passed: {}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+impl Fixture {
+    fn set_env(&self, vars: &[(&str, String)]) {
+        let mut env: serde_json::Map<String, Value> =
+            serde_json::from_slice(&fs::read(self.dir.path().join("env.json")).unwrap()).unwrap();
+        env.retain(|k, _| k == "PATH");
+        for (k, v) in vars {
+            env.insert(k.to_string(), json!(v));
+        }
+        fs::write(
+            self.dir.path().join("env.json"),
+            Value::Object(env).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Run one `stack mcp` session and return each response's tool envelope by request id.
+    fn mcp(&self, calls: &[(&str, Value)], caller: &[(&str, &str)]) -> Vec<Value> {
+        let mut command = self.command(&["mcp"]);
+        command.envs(caller.iter().copied());
+        self.mcp_with(command, calls)
+    }
+
+    /// `mcp` with a prepared server command; the server must exit cleanly at end of input.
+    fn mcp_with(&self, mut command: Command, calls: &[(&str, Value)]) -> Vec<Value> {
+        let mut input =
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}).to_string();
+        input.push('\n');
+        let app = self.dir.path().join("app");
+        for (i, (name, args)) in calls.iter().enumerate() {
+            let mut args = args.clone();
+            args["dir"] = json!(app);
+            let call = json!({"jsonrpc":"2.0","id":i + 1,"method":"tools/call","params":{"name":name,"arguments":args}});
+            input.push_str(&format!("{call}\n"));
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "MCP server failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let responses: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (1..=calls.len())
+            .map(|id| {
+                let r = responses.iter().find(|r| r["id"] == id).unwrap();
+                r["result"].clone()
+            })
+            .collect()
+    }
+}
+
+const PRINT_ENDPOINTS: &str = r#"for v in DATABASE_URL PGHOST PGPORT PGUSER REDIS_URL WEB_URL STACK_UNVERIFIED; do eval "printf '%s=%s\n' $v \"\${$v-ABSENT}\""; done"#;
+
+fn printed(stdout: &str) -> std::collections::BTreeMap<String, String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
+    let fixture = Fixture::with_bundle(
+        "[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n[services.redis]\npreset='redis'\n",
+    );
+    // The caller's own values must not leak through either, whether poisoned or removed.
+    let caller = [
+        ("DATABASE_URL", "postgresql://caller@localhost:5432/caller"),
+        ("PGHOST", "localhost"),
+        ("PGPORT", "5432"),
+        ("PGUSER", "caller"),
+        ("REDIS_URL", "redis://localhost:6379"),
+    ];
+    for (url_host, bare_host) in [
+        ("127.0.0.1", "127.0.0.1"),
+        ("[::1]", "::1"),
+        ("db.internal", "db.internal"),
+    ] {
+        fixture.set_env(&[
+            (
+                "DATABASE_URL",
+                format!("postgresql://app:pw@{url_host}:5432/db?sslmode=disable"),
+            ),
+            ("PGHOST", bare_host.into()),
+            ("PGPORT", "5432".into()),
+            ("PGUSER", "app".into()),
+            ("REDIS_URL", format!("redis://:pw@{url_host}:6379/0")),
+        ]);
+        let expected: std::collections::BTreeMap<String, String> = [
+            (
+                "DATABASE_URL",
+                "postgresql://app:pw@unverified.stack.invalid:5432/db?sslmode=disable",
+            ),
+            ("PGHOST", "unverified.stack.invalid"),
+            ("PGPORT", "ABSENT"),
+            ("PGUSER", "ABSENT"),
+            ("REDIS_URL", "redis://:pw@unverified.stack.invalid:6379/0"),
+            ("WEB_URL", "ABSENT"),
+            ("STACK_UNVERIFIED", "postgres,redis"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let out = fixture
+            .command(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS])
+            .envs(caller)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            printed(&String::from_utf8_lossy(&out.stdout)),
+            expected,
+            "CLI, {url_host}"
+        );
+
+        let results = fixture.mcp(
+            &[
+                (
+                    "stack_exec",
+                    json!({ "command": ["sh", "-c", PRINT_ENDPOINTS] }),
+                ),
+                (
+                    "stack_exec",
+                    json!({ "command": ["true"], "require": ["postgres"] }),
+                ),
+            ],
+            &caller,
+        );
+        let data = &results[0]["structuredContent"]["data"];
+        assert_eq!(data["exit_code"], 0, "{data}");
+        assert_eq!(
+            printed(data["stdout"].as_str().unwrap()),
+            expected,
+            "MCP, {url_host}"
+        );
+        assert_eq!(
+            results[1]["structuredContent"]["error"]["code"],
+            "service_unavailable"
+        );
+
+        let out = fixture
+            .command(&["exec", "--json", "--require", "postgres", "--", "true"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
+            "service_unavailable"
+        );
+    }
+}
+
+#[test]
+fn verified_endpoints_pass_through_and_are_poisoned_once_verification_fails() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value =
+        serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+    fixture.set_env(&[("WEB_URL", format!("http://[::1]:{port}/health"))]);
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }])
+            .to_string(),
+    )
+    .unwrap();
+
+    // Accept connections only once the provider has started, so `up` sees nothing to stop first.
+    let up = fixture
+        .command(&["up", "--json"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let verified = format!("http://[::1]:{port}/health");
+    let out = fixture.ok(&[
+        "exec",
+        "--require",
+        "web",
+        "--",
+        "sh",
+        "-c",
+        PRINT_ENDPOINTS,
+    ]);
+    let seen = printed(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(seen["WEB_URL"], verified);
+    assert_eq!(seen["STACK_UNVERIFIED"], "ABSENT");
+    let results = fixture.mcp(
+        &[(
+            "stack_exec",
+            json!({ "command": ["sh", "-c", PRINT_ENDPOINTS] }),
+        )],
+        &[],
+    );
+    let seen = printed(
+        results[0]["structuredContent"]["data"]["stdout"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(seen["WEB_URL"], verified);
+
+    drop(listener);
+    let out = fixture.ok(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]);
+    let seen = printed(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        seen["WEB_URL"],
+        format!("http://unverified.stack.invalid:{port}/health")
+    );
+    assert_eq!(seen["STACK_UNVERIFIED"], "web");
+}
+
+/// Counts connections to a TCP port and a Unix socket that a libpq client would use for it,
+/// closing each at once so the client fails fast.
+/// Each named variable's raw bytes as the command saw them, or `None` when unset.
+const DUMP_RAW: &str = r#"for v in UNRELATED_RAW DATABASE_URL PGHOST PGHOSTADDR PGPASSWORD; do eval "if test \"\${$v+set}\"; then printf '%s=%s\n' $v \"\$$v\"; fi"; done >"$REVIEW_FIXTURE/raw.out""#;
+
+fn dumped(fixture: &Fixture) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let raw = fs::read(fixture.dir.path().join("raw.out")).unwrap();
+    fs::remove_file(fixture.dir.path().join("raw.out")).unwrap();
+    raw.split(|b| *b == b'\n')
+        .filter_map(|line| {
+            let eq = line.iter().position(|b| *b == b'=')?;
+            Some((
+                String::from_utf8(line[..eq].to_vec()).unwrap(),
+                line[eq + 1..].to_vec(),
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let unrelated: &[u8] = b"raw\xff\xfebytes";
+    let raw_url: &[u8] = b"postgresql://u@127.0.0.1:5432/db\xff";
+    let caller: [(&str, &[u8]); 5] = [
+        ("UNRELATED_RAW", unrelated),
+        ("DATABASE_URL", raw_url),
+        ("PGHOST", b"localhost\xff"),
+        ("PGHOSTADDR", b"127.0.0.1\xff"),
+        ("PGPASSWORD", b"secret\xff"),
+    ];
+    let with_caller = |fixture: &Fixture, args: &[&str], vars: &[(&str, &[u8])]| {
+        let mut command = fixture.command(args);
+        for (k, v) in vars {
+            command.env(k, OsStr::from_bytes(v));
+        }
+        command
+    };
+    let exec = ["exec", "--", "sh", "-c", DUMP_RAW];
+    let mcp_exec = ("stack_exec", json!({ "command": ["sh", "-c", DUMP_RAW] }));
+
+    // No services: commands inherit an unrelated value byte for byte.
+    let fixture = Fixture::new();
+    let out = with_caller(&fixture, &exec, &caller[..1]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "CLI exec: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(dumped(&fixture)["UNRELATED_RAW"], unrelated, "CLI exec");
+    let results = fixture.mcp_with(
+        with_caller(&fixture, &["mcp"], &caller[..1]),
+        std::slice::from_ref(&mcp_exec),
+    );
+    assert_eq!(results[0]["structuredContent"]["data"]["exit_code"], 0);
+    assert_eq!(dumped(&fixture)["UNRELATED_RAW"], unrelated, "MCP exec");
+
+    // An unverified service: relevant values are poisoned or removed even when not Unicode,
+    // and unrelated ones still pass through untouched.
+    let fixture =
+        Fixture::with_bundle("[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n");
+    let check_withheld = |context: &str| {
+        let seen = dumped(&fixture);
+        assert_eq!(seen["UNRELATED_RAW"], unrelated, "{context}");
+        let url = String::from_utf8(seen["DATABASE_URL"].clone())
+            .unwrap_or_else(|_| panic!("{context}: raw DATABASE_URL passed through"));
+        assert!(
+            url.starts_with("postgresql://u@unverified.stack.invalid:5432/"),
+            "{context}: {url}"
+        );
+        assert_eq!(seen["PGHOST"], UNVERIFIED.as_bytes(), "{context}");
+        assert_eq!(seen["PGHOSTADDR"], UNVERIFIED.as_bytes(), "{context}");
+        assert!(!seen.contains_key("PGPASSWORD"), "{context}");
+    };
+    let out = with_caller(&fixture, &exec, &caller).output().unwrap();
+    assert!(
+        out.status.success(),
+        "CLI exec: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    check_withheld("CLI exec");
+
+    let out = with_caller(&fixture, &["status", "--json"], &caller)
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("CLI status: {}", String::from_utf8_lossy(&out.stderr)));
+    let withheld = &status["data"]["checks"][0]["withheld"];
+    for var in ["DATABASE_URL", "PGHOST", "PGHOSTADDR", "PGPASSWORD"] {
+        assert!(
+            withheld.as_array().unwrap().contains(&json!(var)),
+            "CLI status: {status}"
+        );
+    }
+
+    let results = fixture.mcp_with(
+        with_caller(&fixture, &["mcp"], &caller),
+        &[("stack_status", json!({})), mcp_exec],
+    );
+    assert_eq!(
+        results[0]["structuredContent"]["data"]["checks"][0]["withheld"], *withheld,
+        "MCP status"
+    );
+    assert_eq!(results[1]["structuredContent"]["data"]["exit_code"], 0);
+    check_withheld("MCP exec");
+}
+
+struct Listeners {
+    port: u16,
+    socket_dir: TempDir,
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Listeners {
+    fn start() -> Self {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::Ordering;
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let socket_dir = tempfile::Builder::new()
+            .prefix("pg")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let unix = UnixListener::bind(socket_dir.path().join(format!(".s.PGSQL.{port}"))).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        unix.set_nonblocking(true).unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        thread::spawn(move || loop {
+            if tcp.accept().is_ok() || unix.accept().is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            thread::sleep(Duration::from_millis(5));
+        });
+        Self {
+            port,
+            socket_dir,
+            seen,
+        }
+    }
+
+    fn seen(&self) -> usize {
+        // Let a connection that was just made reach the accept loop.
+        thread::sleep(Duration::from_millis(50));
+        self.seen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Connect once with the URL and once from libpq's environment variables alone.
+const PSQL: &str = r#"psql -w -Atc 'select 1' "${DATABASE_URL-}" 2>&1; echo "status=$?"; psql -w -Atc 'select 1' 2>&1; echo "status=$?""#;
+
+fn assert_refused(output: &str, context: &str) {
+    assert_eq!(
+        output.matches("status=2").count(),
+        2,
+        "{context}: psql did not fail to connect: {output}"
+    );
+    assert!(
+        output.matches(UNVERIFIED).count() >= 2,
+        "{context}: psql did not try the invalid host: {output}"
+    );
+}
+
+const UNVERIFIED: &str = "unverified.stack.invalid";
+
+#[test]
+fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
+    let Some(psql) = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join("psql"))
+        .find(|p| p.is_file())
+    else {
+        eprintln!("skipping: psql is not on PATH");
+        return;
+    };
+    let fixture =
+        Fixture::with_bundle("[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n");
+    let listeners = Listeners::start();
+    let (port, dir) = (
+        listeners.port.to_string(),
+        listeners.socket_dir.path().display().to_string(),
+    );
+    let at = |url: &str| url.replace("PORT", &port).replace("DIR", &dir);
+    type Vars = Vec<(&'static str, String)>;
+    // Each case reaches a listener without stack: (provider variables, caller variables).
+    let cases: Vec<(&str, Vars, Vars)> = vec![
+        (
+            "host parameter after #",
+            vec![(
+                "DATABASE_URL",
+                at("postgresql://u@localhost:PORT/db#x?host=127.0.0.1"),
+            )],
+            vec![],
+        ),
+        (
+            "hostaddr parameter after #",
+            vec![(
+                "DATABASE_URL",
+                at("postgresql://u@localhost:PORT/db#x?hostaddr=127.0.0.1"),
+            )],
+            vec![],
+        ),
+        (
+            "socket host parameter",
+            vec![(
+                "DATABASE_URL",
+                at("postgresql://u@localhost:PORT/db?host=DIR"),
+            )],
+            vec![],
+        ),
+        (
+            "provider PGHOSTADDR",
+            vec![
+                ("DATABASE_URL", at("postgresql://u@db.invalid:PORT/db")),
+                ("PGHOSTADDR", "127.0.0.1".into()),
+            ],
+            vec![],
+        ),
+        (
+            "caller PGHOSTADDR",
+            vec![("DATABASE_URL", at("postgresql://u@db.invalid:PORT/db"))],
+            vec![("PGHOSTADDR", "127.0.0.1".into())],
+        ),
+        (
+            "keywords with spaces around =",
+            vec![("DATABASE_URL", at("host = DIR port = PORT dbname = app"))],
+            vec![],
+        ),
+        (
+            "keywords with a quoted value",
+            vec![(
+                "DATABASE_URL",
+                at("host=DIR password='has space' port=PORT dbname=app"),
+            )],
+            vec![],
+        ),
+        (
+            "empty URL with caller defaults",
+            vec![("DATABASE_URL", String::new())],
+            vec![("PGHOST", dir.clone()), ("PGPORT", port.clone())],
+        ),
+        (
+            "caller-only endpoints",
+            vec![],
+            vec![
+                ("DATABASE_URL", at("postgresql://u@127.0.0.1:PORT/db")),
+                ("PGHOST", dir.clone()),
+                ("PGPORT", port.clone()),
+            ],
+        ),
+    ];
+    for (name, provider, caller) in cases {
+        let mut caller = caller;
+        caller.push(("PGCONNECT_TIMEOUT", "3".into()));
+        // Control: the unpoisoned configuration does reach a listener.
+        let before = listeners.seen();
+        Command::new(&psql)
+            .args(["-w", "-Atc", "select 1"])
+            .args(
+                // The provider's value wins over the caller's, as in `stack exec`.
+                caller
+                    .iter()
+                    .chain(&provider)
+                    .rfind(|(k, _)| *k == "DATABASE_URL")
+                    .map(|(_, v)| v),
+            )
+            .envs(caller.iter().cloned())
+            .envs(provider.iter().cloned())
+            .output()
+            .unwrap();
+        assert!(listeners.seen() > before, "{name}: control never connected");
+
+        fixture.set_env(&provider);
+        let before = listeners.seen();
+        let out = fixture
+            .command(&["exec", "--", "sh", "-c", PSQL])
+            .envs(caller.iter().cloned())
+            .output()
+            .unwrap();
+        assert_refused(
+            &String::from_utf8_lossy(&out.stdout),
+            &format!("CLI, {name}"),
+        );
+        let caller_refs: Vec<(&str, &str)> = caller.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let results = fixture.mcp(
+            &[("stack_exec", json!({ "command": ["sh", "-c", PSQL] }))],
+            &caller_refs,
+        );
+        let data = &results[0]["structuredContent"]["data"];
+        assert_refused(data["stdout"].as_str().unwrap(), &format!("MCP, {name}"));
+        assert_eq!(
+            listeners.seen(),
+            before,
+            "{name}: a withheld endpoint was reached"
+        );
+    }
 }

@@ -49,9 +49,18 @@ resolve a conflict or replace a value, and every override is reported with what 
   connect with the app's own URL and compare the server's data directory to the supervisor's.
   Other services get liveness only, and are labelled `liveness` rather than `instance`.
 - **Withholding.** Endpoints of unverified services are poisoned (`unverified.stack.invalid`)
-  rather than unset, because apps commonly fall back to `localhost:<default>`; values with no
-  host are removed. `STACK_UNVERIFIED` lists affected services. `--require` turns this into a
-  refusal to run.
+  rather than unset, because apps commonly fall back to `localhost:<default>`. This covers the
+  service's variables whether the provider set them or the command would inherit them from the
+  caller, including caller values that are not valid Unicode; every other inherited variable
+  reaches the command byte for byte. Whatever host a URL names (IPv4, IPv6, DNS alias) is
+  replaced by parsing, keeping credentials, port, path and query. PostgreSQL URIs and keyword
+  strings are parsed the way libpq parses them (no fragments, quoted values, several hosts), and
+  the `host`, `hostaddr` and `service` parameters that would override the host are dropped. Host
+  variables (`PGHOST`, `PGHOSTADDR`, `PGSERVICE`, `*_HOST`) get the invalid host outright, and
+  `PGHOST` is set even when absent so libpq cannot use its default. Empty or malformed endpoints
+  become a URL that names only the invalid host. Only values that name no host (ports, users,
+  databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
+  turns this into a refusal to run.
 - **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Reclaimed by `stack gc` and at the start of every
   `stack up`; there is no background daemon, so expiry takes effect at the next of those.
