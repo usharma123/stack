@@ -9,7 +9,7 @@ Evidence for these decisions is in [eval/REPORT.md](../eval/REPORT.md).
 | Installing tools | mise (provider) |
 | Supervising service processes | Pitchfork via `mise daemons` (provider) |
 | Bundle format, composition, conflict rules, files, distribution, locking | **stack** |
-| Sessions: one record of a running instance, verified endpoints, ownership | **stack** (next) |
+| Sessions: one record of a running instance, verified endpoints, ownership | **stack** |
 | Agent interface: JSON, structured errors, refusing on stale state | **stack** |
 
 Providers sit behind `src/provider/`. A bundle never names a provider, so replacing one must not
@@ -38,6 +38,12 @@ resolve a conflict or replace a value, and every override is reported with what 
   across restarts; pruned when a project directory disappears; `--reassign-ports` after a foreign
   program takes one. Projects may pin ports in `[override.services]`; pins are checked against
   other projects' reservations. Service defaults (5432, 6379) are never used.
+- **Generations.** A session fingerprints the complete composed configuration, bundle lock and
+  assigned ports. `status` reports a change as stale; `exec` withholds service endpoints until
+  `up` stops the previous owned instance and verifies the new configuration. Legacy records
+  without a configuration fingerprint require the same restart. Provider data-version checks
+  remain in force: incompatible version changes fail explicitly and preserve the data, rather
+  than silently reusing the old process or resetting the database.
 - **Verification** happens on every `exec` and `status`, not from the record: supervisor state,
   PID alive, supervisor port equals assigned port, TCP accept, then identity. Postgres and Redis
   connect with the app's own URL and compare the server's data directory to the supervisor's.
@@ -49,7 +55,19 @@ resolve a conflict or replace a value, and every override is reported with what 
 - **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Reclaimed by `stack gc` and at the start of every
   `stack up`; there is no background daemon, so expiry takes effect at the next of those.
-- **Stopping.** `down` succeeds only once recorded PIDs are dead and assigned ports closed.
+  Commands register active executions before releasing the lifecycle lock and renew on
+  completion. GC ignores TTL expiry while a coordinator is alive. An explicit runner-death
+  policy still takes precedence over a surviving command.
+- **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
+  from an older generation. Query and stop failures preserve ownership records. Success requires
+  those processes dead and ports closed.
+- **Concurrent access.** Compile, renew, execution registration and lifecycle operations share
+  a per-project advisory lock released by the kernel on process death. Each JSON write uses a
+  unique temporary file and atomic replacement. The machine session index is authoritative if
+  a crash interrupts updating the project mirror.
+- **MCP execution.** Unix process groups bound command descendants. Output is drained through
+  nonblocking pipes with fixed-size tails; neither a full pipe nor a detached descendant can
+  extend collection beyond command completion or the deadline.
 - **Partial failure.** `up` returns completed steps, whether services may have been started
   (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
 
@@ -58,6 +76,12 @@ resolve a conflict or replace a value, and every override is reported with what 
 `git+<url>?ref=` pins a commit; `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
 a content hash. A bundle's content hash is identical across transports (deterministic archives).
 OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
+
+OCI authorization is scoped to the original registry origin. Bearer token realms must share
+that origin or appear explicitly in `STACK_OCI_AUTH_REALMS`. HTTP is allowed for exact loopback
+hosts or explicit development opt-in; an HTTPS origin can never downgrade to HTTP. Token
+requests do not follow redirects, and upload/registry redirects do not receive another origin's
+authorization header.
 
 ## Not covered yet
 

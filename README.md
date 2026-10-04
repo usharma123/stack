@@ -76,8 +76,13 @@ stack down                             # succeeds only once the processes are co
   (by data directory). Endpoints of unverified services are poisoned (host replaced with
   `unverified.stack.invalid`) so apps with hardcoded fallbacks fail loudly instead of reaching some
   other server. `--require` makes the command refuse to run instead.
-- **Owned lifetimes.** Sessions can lease on a TTL or a runner's PID; `stack gc` (and every
-  `stack up`) reclaims expired ones. `down` reports success only after processes and ports are gone.
+- **Verified generations.** Session records fingerprint the complete compiled configuration and
+  assigned ports. Changed bundles, project overrides, or ports make service checks unavailable
+  until `stack up` restarts and verifies the new generation.
+- **Owned lifetimes.** Sessions can lease on a TTL or a runner's PID. Active commands protect
+  TTL sessions until completion; `stack gc` (and every `stack up`) reclaims expired idle ones.
+  `down` retains ownership records if discovery or cleanup fails, and reports success only after
+  recorded processes and ports are gone.
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe.
 - **Agent-friendly.** `--json` emits one object on stdout; errors have a stable `code`, a `hint`
@@ -97,7 +102,15 @@ stack down                             # succeeds only once the processes are co
 | `stack publish <dir> oci:<registry>/<repo>:<tag>` | Publish a bundle as an OCI artifact |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
-All accept `-C <dir>` and `--json`. Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`.
+All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
+Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
+require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
+`https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
+origins or authentication redirects. HTTPS cannot redirect authentication to HTTP.
+
+MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
+command's process group is terminated on timeout or completion. Detached children cannot keep
+output collection waiting for EOF. Services and sessions are still tested end to end on Linux.
 
 ## Develop
 
