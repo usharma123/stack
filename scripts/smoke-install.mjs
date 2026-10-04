@@ -14,7 +14,10 @@ try {
   assert.match(execFileSync(cli, ['--help'], { encoding: 'utf8' }), /compile/);
   const project = path.join(dir, 'project with spaces');
   mkdirSync(project);
-  writeFileSync(path.join(project, 'stack.toml'), '[env]\nSTACK_SMOKE = "works"\n');
+  const bundle = path.join(dir, 'bundle');
+  mkdirSync(bundle);
+  writeFileSync(path.join(bundle, 'bundle.toml'), '[bundle]\nname = "smoke"\nversion = "1.0.0"\n[env]\nSTACK_SMOKE = "works"\n');
+  writeFileSync(path.join(project, 'stack.toml'), '[[use]]\nbundle = "path:../bundle"\n');
   const env = { ...process.env, STACK_STATE_DIR: path.join(dir, 'state'), XDG_CACHE_HOME: path.join(dir, 'cache') };
   const result = JSON.parse(execFileSync(cli, ['-C', project, 'compile', '--json'], { env, encoding: 'utf8' }));
   assert.equal(result.ok, true);

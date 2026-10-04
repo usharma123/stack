@@ -25,7 +25,8 @@ is shared with releases and does the following:
 
 Actions are pinned to commit SHAs. Builds use Cargo.lock and no shared caches.
 Jobs have timeouts. PR runs can cancel older runs; releases cannot cancel an active
-publication. Set the `CI passed` job as a required branch protection check.
+publication. Release runs queue instead of replacing pending releases. Set the
+`CI passed` job as a required branch protection check.
 The existing `tests/e2e/run.sh` service scenarios remain an additional manual
 check; this pipeline does not claim full service lifecycle coverage on macOS.
 
@@ -70,7 +71,8 @@ provenance.
    git push origin v0.1.1
    ```
 
-`release.yml` repeats all checks before publishing. It accepts only commits on
+`release.yml` repeats all checks before publishing. A manual dispatch is a dry run
+that runs the build and installation gates without publishing. It accepts only commits on
 `origin/main` in `usharma123/stack`, with a tag matching the Rust/npm version.
 Stable versions use `latest`; prereleases use `next`.
 The publish script checks the immutable version first. An existing version is
@@ -83,6 +85,11 @@ reuse the original artifact. Never move a release tag or republish different byt
 under an existing version. A full rebuild may produce different bytes and will
 fail the integrity check; release a new version in that case. Fix authentication
 errors rather than repeatedly publishing. Artifacts expire after 30 days.
+
+GitHub release concurrency uses `queue: max` to retain pending releases. Older
+actionlint versions do not recognize this GitHub-supported field. For those
+versions, use `actionlint -ignore '^unexpected key "queue" for "concurrency" section'`
+to ignore only that schema mismatch.
 
 ## Local packaging check
 
