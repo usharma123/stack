@@ -98,6 +98,13 @@ authorization header.
 The OCI bundle cache is shared by every project on the machine. Installing a digest takes a
 lock beside its cache directory, rechecks it, extracts into a uniquely named staging directory
 and renames only a complete extraction into place; failures remove the staging directory.
+Extraction accepts only regular files and directories and is bounded at 256 MiB of file
+content and 10,000 entries (`bundle_too_large`), since a digest bounds the download, not
+what it expands to. The whole gzip stream is read through that budget before publication, so
+its length and CRC are checked; only zero padding may follow the tar end marker, and nothing
+may follow the single gzip member. Directories are created with default permissions rather
+than their archived modes, and cleanup grants the owner access first, so no mode can leave a
+staging directory behind.
 
 ## Not covered yet
 

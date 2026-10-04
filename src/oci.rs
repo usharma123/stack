@@ -13,10 +13,11 @@ use crate::hash::{is_executable, list_files, sha256_hex};
 use crate::state::FileLock;
 use flate2::{Compression, GzBuilder};
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::rc::Rc;
 use url::Url;
 
 pub const ARTIFACT_TYPE: &str = "application/vnd.stack.bundle.v1";
@@ -24,6 +25,25 @@ pub const LAYER_TYPE: &str = "application/vnd.stack.bundle.layer.v1.tar+gzip";
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const MAX_BLOB: u64 = 256 * 1024 * 1024;
+
+/// How far one bundle layer may expand. Digests bound what is downloaded, not what a
+/// compressed archive expands to.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractLimits {
+    /// Total size of all files.
+    pub bytes: u64,
+    /// Files and directories.
+    pub entries: u64,
+}
+
+/// Policy: 256 MiB of files and 10,000 entries per bundle.
+pub const EXTRACT_LIMITS: ExtractLimits = ExtractLimits {
+    bytes: 256 * 1024 * 1024,
+    entries: 10_000,
+};
+
+/// Tar headers, long names and padding allowed per entry beyond file contents.
+const ENTRY_OVERHEAD: u64 = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reference {
@@ -343,7 +363,7 @@ impl Client {
         let resp = self.send("GET", &url, None, None)?;
         let blob = Self::read_limited(resp)?;
         verify_digest(&blob, layer_digest, "layer")?;
-        install(&blob, dest)
+        install(&blob, dest, EXTRACT_LIMITS)
     }
 
     /// Publish `dir` as a bundle artifact tagged `r.reference`. Returns the manifest digest.
@@ -422,7 +442,7 @@ impl Client {
 /// into place; every failure removes the staging directory. A competing installer that already
 /// published `dest` counts as success. Staging directories left by a crashed installer are
 /// removed by the next one, which is safe because staging only exists while the lock is held.
-pub fn install(blob: &[u8], dest: &Path) -> Result<()> {
+pub fn install(blob: &[u8], dest: &Path, limits: ExtractLimits) -> Result<()> {
     let (parent, name) = match (dest.parent(), dest.file_name()) {
         (Some(parent), Some(name)) => (parent, name.to_string_lossy()),
         _ => {
@@ -453,7 +473,7 @@ pub fn install(blob: &[u8], dest: &Path) -> Result<()> {
             .map_err(|e| io_error(parent.display(), e))?
             .keep(),
     );
-    extract(blob, &staging.0)?;
+    extract(blob, &staging.0, limits)?;
     // Once renamed, nothing is left at the staging path for the guard to remove.
     fs::rename(&staging.0, dest).map_err(|e| io_error(dest.display(), e))
 }
@@ -491,11 +511,140 @@ fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
-fn extract(blob: &[u8], into: &Path) -> Result<()> {
-    // `unpack` refuses entries that escape the destination (absolute paths, `..`).
-    tar::Archive::new(flate2::read::GzDecoder::new(blob))
-        .unpack(into)
-        .map_err(|e| StackError::new("bundle_invalid", format!("cannot extract layer: {e}")))
+/// Unpack only regular files and directories, within `limits`, refusing any entry that would
+/// land outside `into`. The whole gzip stream is then read through the same budget: its length
+/// and CRC must check out, anything after the tar end marker must be zero padding, and nothing
+/// may follow the single gzip member.
+fn extract(blob: &[u8], into: &Path, limits: ExtractLimits) -> Result<()> {
+    let into = into
+        .canonicalize()
+        .map_err(|e| io_error(into.display(), e))?;
+    let exceeded = Rc::new(Cell::new(false));
+    let stream = Budget {
+        inner: flate2::bufread::GzDecoder::new(blob),
+        left: limits.bytes.saturating_add(
+            limits
+                .entries
+                .saturating_add(1)
+                .saturating_mul(ENTRY_OVERHEAD),
+        ),
+        exceeded: exceeded.clone(),
+    };
+    let too_large = |what: String| {
+        StackError::new("bundle_too_large", format!("bundle layer exceeds {what}"))
+            .hint("bundles are limited to 256 MiB of files and 10,000 entries")
+    };
+    let invalid = |e: std::io::Error| {
+        if exceeded.get() {
+            too_large(format!("{} bytes when expanded", limits.bytes))
+        } else {
+            StackError::new("bundle_invalid", format!("cannot extract layer: {e}"))
+        }
+    };
+    let malformed = |what: &str| StackError::new("bundle_invalid", format!("layer {what}"));
+    let mut archive = tar::Archive::new(stream);
+    let (mut bytes, mut entries) = (0u64, 0u64);
+    for entry in archive.entries().map_err(invalid)? {
+        let entry = entry.map_err(invalid)?;
+        entries += 1;
+        if entries > limits.entries {
+            return Err(too_large(format!("{} entries", limits.entries)));
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            continue;
+        }
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(StackError::new(
+                "bundle_invalid",
+                format!("unsupported layer entry type {kind:?}; bundles contain only files"),
+            ));
+        }
+        bytes = bytes
+            .checked_add(entry.size())
+            .filter(|b| *b <= limits.bytes)
+            .ok_or_else(|| too_large(format!("{} bytes when expanded", limits.bytes)))?;
+        let path = entry.path().map_err(invalid)?;
+        let mut relative = std::path::PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::Normal(part) => relative.push(part),
+                std::path::Component::ParentDir => {
+                    return Err(malformed(&format!(
+                        "entry {} escapes the bundle",
+                        path.display()
+                    )))
+                }
+                _ => {}
+            }
+        }
+        if kind.is_dir() {
+            // Created with default permissions, not the archived mode: a directory without
+            // owner access could not be filled, hashed or cleaned up.
+            fs::create_dir_all(into.join(&relative)).map_err(invalid)?;
+            continue;
+        }
+        unpack_in(entry, &into, &invalid)?;
+    }
+    // Tar stops at its end marker; the gzip trailer behind it has not been checked yet.
+    let mut stream = archive.into_inner();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).map_err(invalid)?;
+        if n == 0 {
+            break;
+        }
+        if chunk[..n].iter().any(|b| *b != 0) {
+            return Err(malformed("has data after the end of the archive"));
+        }
+    }
+    if !stream.inner.into_inner().is_empty() {
+        return Err(malformed("has data after the gzip stream"));
+    }
+    Ok(())
+}
+
+fn unpack_in<R: Read>(
+    mut entry: tar::Entry<'_, R>,
+    into: &Path,
+    invalid: &impl Fn(std::io::Error) -> StackError,
+) -> Result<()> {
+    // `unpack_in` strips leading `/` and refuses symlinked parents outside `into`; it skips
+    // entries containing `..`, which `extract` has already rejected rather than dropped.
+    if entry.unpack_in(into).map_err(invalid)? {
+        Ok(())
+    } else {
+        Err(StackError::new(
+            "bundle_invalid",
+            format!(
+                "layer entry {} escapes the bundle",
+                String::from_utf8_lossy(&entry.path_bytes())
+            ),
+        ))
+    }
+}
+
+/// Fails, rather than ending early, once more than `left` decompressed bytes are read.
+struct Budget<R> {
+    inner: R,
+    left: u64,
+    exceeded: Rc<Cell<bool>>,
+}
+
+impl<R: Read> Read for Budget<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        match self.left.checked_sub(n as u64) {
+            Some(left) => {
+                self.left = left;
+                Ok(n)
+            }
+            None => {
+                self.exceeded.set(true);
+                Err(std::io::Error::other("layer exceeds its expansion budget"))
+            }
+        }
+    }
 }
 
 fn parse_url(value: &str) -> Result<Url> {
@@ -713,6 +862,18 @@ mod tests {
         })
     }
 
+    /// Install into a fresh cache directory; return the result and what the directory holds.
+    fn install_into(blob: &[u8], limits: ExtractLimits) -> (Result<()>, Vec<String>) {
+        let cache = tempfile::tempdir().unwrap();
+        let result = install(blob, &cache.path().join("oci-x"), limits);
+        let mut names: Vec<String> = fs::read_dir(cache.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        (result, names)
+    }
+
     fn bundle_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("bin")).unwrap();
@@ -757,21 +918,258 @@ mod tests {
 
         let truncated = &blob[..blob.len() / 2];
         assert_eq!(
-            install(truncated, &dest).unwrap_err().code,
+            install(truncated, &dest, EXTRACT_LIMITS).unwrap_err().code,
             "bundle_invalid"
         );
         assert_eq!(leftovers(), [".oci-x.lock"], "failure left residue");
 
-        install(&blob, &dest).unwrap();
+        install(&blob, &dest, EXTRACT_LIMITS).unwrap();
         assert_eq!(leftovers(), [".oci-x.lock", "oci-x"]);
         let hash = crate::hash::hash_dir(&dest).unwrap();
         assert_eq!(hash, crate::hash::hash_dir(source.path()).unwrap());
         assert!(is_executable(&dest.join("bin/tool")));
 
         // A published tree is never replaced or written into by a later installer.
-        install(&files(&[10]), &dest).unwrap();
+        install(&files(&[10]), &dest, EXTRACT_LIMITS).unwrap();
         assert_eq!(crate::hash::hash_dir(&dest).unwrap(), hash);
         assert_eq!(leftovers(), [".oci-x.lock", "oci-x"]);
+    }
+
+    #[test]
+    fn expansion_is_bounded_in_bytes_at_the_exact_limit() {
+        let limits = ExtractLimits {
+            bytes: 64 * 1024,
+            entries: 100,
+        };
+        // Highly compressible: kilobytes download, the limit is on what they expand to.
+        let at_limit = files(&[64 * 1024]);
+        let over = files(&[64 * 1024 + 1]);
+        assert!(over.len() < 1024);
+        assert_eq!(install_into(&at_limit, limits).1, [".oci-x.lock", "oci-x"]);
+        let (result, left) = install_into(&over, limits);
+        assert_eq!(result.unwrap_err().code, "bundle_too_large");
+        assert_eq!(left, [".oci-x.lock"]);
+
+        // Aggregate across files.
+        let limits = ExtractLimits {
+            bytes: 1200,
+            entries: 100,
+        };
+        assert!(install_into(&files(&[400, 400, 400]), limits).0.is_ok());
+        let (result, left) = install_into(&files(&[400, 400, 401]), limits);
+        assert_eq!(result.unwrap_err().code, "bundle_too_large");
+        assert_eq!(left, [".oci-x.lock"]);
+    }
+
+    #[test]
+    fn expansion_is_bounded_in_entries_at_the_exact_limit() {
+        let limits = ExtractLimits {
+            bytes: 1024,
+            entries: 3,
+        };
+        assert!(install_into(&files(&[1, 1, 1]), limits).0.is_ok());
+        let (result, left) = install_into(&files(&[1, 1, 1, 1]), limits);
+        assert_eq!(result.unwrap_err().code, "bundle_too_large");
+        assert_eq!(left, [".oci-x.lock"]);
+        let empty_files = files(&[0; 4]);
+        assert_eq!(
+            install_into(&empty_files, limits).0.unwrap_err().code,
+            "bundle_too_large"
+        );
+    }
+
+    #[test]
+    fn oversized_tar_metadata_is_bounded_before_it_is_buffered() {
+        // A GNU long name is read into memory before any entry is returned.
+        let blob = tar_gz(|tar| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::GNULongName);
+            header.set_size(200_000);
+            header.set_cksum();
+            tar.append(&header, vec![b'a'; 200_000].as_slice()).unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_size(0);
+            file.set_entry_type(tar::EntryType::Regular);
+            tar.append_data(&mut file, "f", &[][..]).unwrap();
+        });
+        let (result, left) = install_into(
+            &blob,
+            ExtractLimits {
+                bytes: 1024,
+                entries: 4,
+            },
+        );
+        assert_eq!(result.unwrap_err().code, "bundle_too_large");
+        assert_eq!(left, [".oci-x.lock"]);
+    }
+
+    #[test]
+    fn links_devices_and_escaping_paths_are_rejected_without_residue() {
+        let symlink = tar_gz(|tar| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            tar.append_link(&mut header, "link", "/etc/passwd").unwrap();
+        });
+        let escaping = tar_gz(|tar| {
+            let mut header = tar::Header::new_old();
+            header.as_old_mut().name[..9].copy_from_slice(b"../escape");
+            header.set_size(1);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            tar.append(&header, &b"x"[..]).unwrap();
+        });
+        for (blob, reason) in [
+            (symlink, "unsupported layer entry type"),
+            (escaping, "escapes the bundle"),
+            (b"not a gzip stream".to_vec(), "cannot extract layer"),
+        ] {
+            let (result, left) = install_into(&blob, EXTRACT_LIMITS);
+            let err = result.unwrap_err();
+            assert_eq!(err.code, "bundle_invalid");
+            assert!(err.message.contains(reason), "{}", err.message);
+            assert_eq!(left, [".oci-x.lock"]);
+        }
+    }
+
+    fn gzip(raw: &[u8]) -> Vec<u8> {
+        let mut gz = GzBuilder::new().write(Vec::new(), Compression::best());
+        std::io::Write::write_all(&mut gz, raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn tar(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        build(&mut tar);
+        tar.into_inner().unwrap()
+    }
+
+    fn file_entry(tar: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut header, path, data).unwrap();
+    }
+
+    /// A directory entry with `mode`, written raw so any path, including `..`, is kept.
+    fn dir_entry(tar: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32) {
+        let mut header = tar::Header::new_old();
+        header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_size(0);
+        header.set_mode(mode);
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_cksum();
+        tar.append(&header, &[][..]).unwrap();
+    }
+
+    #[test]
+    fn the_gzip_trailer_is_verified_before_publication() {
+        let blob = files(&[10]);
+        let mut bad_crc = blob.clone();
+        let at = bad_crc.len() - 8;
+        bad_crc[at] ^= 0xff;
+        let mut bad_length = blob.clone();
+        let at = bad_length.len() - 1;
+        bad_length[at] ^= 0xff;
+        let mut two_members = blob.clone();
+        two_members.extend(files(&[10]));
+        let mut trailing = blob.clone();
+        trailing.extend(b"junk");
+        for (blob, reason) in [
+            (blob[..blob.len() - 8].to_vec(), "cannot extract layer"),
+            (blob[..blob.len() - 1].to_vec(), "cannot extract layer"),
+            (bad_crc, "cannot extract layer"),
+            (bad_length, "cannot extract layer"),
+            (two_members, "after the gzip stream"),
+            (trailing, "after the gzip stream"),
+        ] {
+            let (result, left) = install_into(&blob, EXTRACT_LIMITS);
+            let err = result.unwrap_err();
+            assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+            assert!(err.message.contains(reason), "{}", err.message);
+            assert_eq!(left, [".oci-x.lock"]);
+        }
+    }
+
+    #[test]
+    fn data_after_the_tar_end_marker_is_bounded_and_must_be_padding() {
+        let limits = ExtractLimits {
+            bytes: 1024,
+            entries: 2,
+        };
+        let archive = tar(|t| file_entry(t, "f", b"x"));
+        let mut padded = archive.clone();
+        padded.extend(vec![0u8; 8192]);
+        assert!(install_into(&gzip(&padded), limits).0.is_ok());
+
+        // Expands far beyond the stream budget after the end marker.
+        let mut expanding = archive.clone();
+        expanding.extend(vec![0u8; 100_000]);
+        let (result, left) = install_into(&gzip(&expanding), limits);
+        assert_eq!(result.unwrap_err().code, "bundle_too_large");
+        assert_eq!(left, [".oci-x.lock"]);
+
+        let mut junk = archive;
+        junk.extend(b"not padding");
+        let (result, left) = install_into(&gzip(&junk), limits);
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("after the end of the archive"),
+            "{}",
+            err.message
+        );
+        assert_eq!(left, [".oci-x.lock"]);
+    }
+
+    #[test]
+    fn restrictive_directory_modes_cannot_block_cleanup_or_reuse() {
+        let cache = tempfile::tempdir().unwrap();
+        let dest = cache.path().join("oci-x");
+        let leftovers = || {
+            let mut names: Vec<String> = fs::read_dir(cache.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        // An unreadable directory, then a path that is rejected after it was seen.
+        let escaping = gzip(&tar(|t| {
+            file_entry(t, "z/f", b"x");
+            dir_entry(t, "z", 0o000);
+            dir_entry(t, "../escape", 0o755);
+        }));
+        let err = install(&escaping, &dest, EXTRACT_LIMITS).unwrap_err();
+        assert!(
+            err.message.contains("escapes the bundle"),
+            "{}",
+            err.message
+        );
+        assert_eq!(leftovers(), [".oci-x.lock"]);
+
+        // The same directory, then a failure while reading the gzip trailer.
+        let mut late = gzip(&tar(|t| {
+            file_entry(t, "z/f", b"x");
+            dir_entry(t, "z", 0o000);
+        }));
+        let at = late.len() - 8;
+        late[at] ^= 0xff;
+        assert_eq!(
+            install(&late, &dest, EXTRACT_LIMITS).unwrap_err().code,
+            "bundle_invalid"
+        );
+        assert_eq!(leftovers(), [".oci-x.lock"]);
+
+        // A published tree stays readable whatever modes its directories were archived with.
+        let valid = gzip(&tar(|t| {
+            file_entry(t, "z/f", b"x");
+            dir_entry(t, "z", 0o000);
+        }));
+        install(&valid, &dest, EXTRACT_LIMITS).unwrap();
+        assert_eq!(leftovers(), [".oci-x.lock", "oci-x"]);
+        assert_eq!(fs::read(dest.join("z/f")).unwrap(), b"x");
+        crate::hash::hash_dir(&dest).unwrap();
     }
 
     #[test]
