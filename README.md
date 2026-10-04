@@ -113,6 +113,19 @@ MCP execution is bounded on Unix: at most 64 KiB of each output stream is retain
 command's process group is terminated on timeout or completion. Detached children cannot keep
 output collection waiting for EOF. Services and sessions are still tested end to end on Linux.
 
+## Install
+
+Install the CLI with:
+
+```sh
+npm install -g @ushawarma/stack
+stack --version
+```
+
+Prebuilt binaries cover macOS 13+ and Linux with glibc 2.39+, on x64 and arm64.
+Node.js 22.14+ is required. See [docs/RELEASING.md](docs/RELEASING.md) for CI checks,
+trusted publishing setup, release tags, and recovery.
+
 ## Develop
 
 ```sh
