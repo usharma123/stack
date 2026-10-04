@@ -12,7 +12,7 @@ use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
 use crate::source::Mode;
-use crate::state::{now, pid_alive, project_key, read_json, write_json};
+use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,7 +35,7 @@ pub struct Ctx {
 
 impl Ctx {
     fn compile(&self, write: bool) -> Result<Report> {
-        project::compile(&Options {
+        project::compile_locked(&Options {
             root: self.root.clone(),
             mode: Mode::Frozen,
             write,
@@ -326,6 +326,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     let reaped = gc(&ctx.state)?;
     steps.ok("gc", json!({ "reaped": reaped.len() }));
 
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
     let report = match ctx.compile(true) {
         Ok(r) => r,
         Err(e) => return Err(steps.fail("compile", e, false)),
@@ -406,6 +407,11 @@ pub struct DownReport {
 
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
 pub fn down(ctx: &Ctx) -> Result<DownReport> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    down_locked(ctx)
+}
+
+fn down_locked(ctx: &Ctx) -> Result<DownReport> {
     let before = mise::daemons(&ctx.root).unwrap_or_default();
     let ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?.values().copied().collect();
     let pids: Vec<(String, u32)> = before
@@ -460,6 +466,7 @@ pub struct StatusReport {
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
 pub fn status(ctx: &Ctx) -> Result<StatusReport> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
     let session = load(ctx)?;
     let report = ctx.compile(false)?;
     let checks = if report.stack.services.is_empty() {
@@ -507,6 +514,7 @@ pub enum Require {
 
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
     let report = ctx.compile(true)?;
     mise::trust(&ctx.root)?;
     let mut env = mise::env(&ctx.root)?;
@@ -572,6 +580,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
 }
 
 pub fn renew(ctx: &Ctx) -> Result<Session> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
     let mut session = load(ctx)?.ok_or_else(|| {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
@@ -602,20 +611,36 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(session) = read_json::<Session>(&path) else { continue };
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let indexed: Session = read_json(&path)?;
+        let ctx = Ctx {
+            root: indexed.project.clone(),
+            cache: PathBuf::new(),
+            state: state.to_path_buf(),
+        };
+        let _guard = project_lock(state, &ctx.root)?;
+        // Re-read after locking: another command may have renewed or replaced this generation.
+        if !path.exists() {
+            continue;
+        }
+        let session: Session = read_json(&path)?;
         if !session.project.exists() {
-            let _ = fs::remove_file(&path);
             out.push(GcEntry {
                 project: session.project,
                 reason: "project directory deleted".into(),
                 stopped: false,
-                error: Some("cannot stop services without the project; see `mise daemons prune`".into()),
+                error: Some(
+                    "cannot stop services without the project; see `mise daemons prune`".into(),
+                ),
             });
             continue;
         }
-        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else { continue };
-        let ctx = Ctx { root: session.project.clone(), cache: PathBuf::new(), state: state.to_path_buf() };
-        let result = down(&ctx);
+        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
+            continue;
+        };
+        let result = down_locked(&ctx);
         out.push(GcEntry {
             project: session.project,
             reason,
@@ -627,15 +652,22 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
 }
 
 fn load(ctx: &Ctx) -> Result<Option<Session>> {
-    if !ctx.session_file().exists() {
+    // The machine index is authoritative. A crash between the two atomic writes can
+    // leave the project copy behind; lifecycle operations always use the indexed generation.
+    let path = if ctx.index_file().exists() {
+        ctx.index_file()
+    } else {
+        ctx.session_file()
+    };
+    if !path.exists() {
         return Ok(None);
     }
-    read_json::<Session>(&ctx.session_file()).map(Some)
+    read_json::<Session>(&path).map(Some)
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
-    write_json(&ctx.session_file(), session)?;
-    write_json(&ctx.index_file(), session)
+    write_json(&ctx.index_file(), session)?;
+    write_json(&ctx.session_file(), session)
 }
 
 fn lock_digest(root: &Path) -> String {

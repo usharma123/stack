@@ -7,8 +7,8 @@ use crate::manifest::{read_bundle, read_project};
 use crate::ports::{self, Request};
 use crate::provider::mise;
 use crate::source::{Mode, Source};
-use serde::Serialize;
 use indexmap::IndexMap;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,20 +58,36 @@ pub fn default_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(dir).join("stack");
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".cache").join("stack")
 }
 
 pub fn compile(opts: &Options) -> Result<Report> {
+    // Inspect must remain read-only, including on a new machine.
+    if !opts.write {
+        return compile_locked(opts);
+    }
+    let _guard = crate::state::project_lock(&opts.state, &opts.root)?;
+    compile_locked(opts)
+}
+
+/// The caller holds the project lock when publishing configuration or changing a session.
+pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
     let project = read_project(&opts.root)?;
     if project.uses.is_empty() {
-        return Err(StackError::new("manifest_invalid", "stack.toml has no [[use]] bundles")
-            .hint("add [[use]]\\nbundle = \"git+https://host/repo?ref=v1\""));
+        return Err(
+            StackError::new("manifest_invalid", "stack.toml has no [[use]] bundles")
+                .hint("add [[use]]\\nbundle = \"git+https://host/repo?ref=v1\""),
+        );
     }
     let previous = lock::read(&opts.root)?;
     if opts.mode == Mode::Frozen && previous.is_none() {
-        return Err(StackError::new("lock_outdated", "stack.lock does not exist")
-            .hint("run `stack compile` and commit stack.lock"));
+        return Err(
+            StackError::new("lock_outdated", "stack.lock does not exist")
+                .hint("run `stack compile` and commit stack.lock"),
+        );
     }
 
     let mut loaded = Vec::new();
@@ -117,8 +133,10 @@ pub fn compile(opts: &Options) -> Result<Report> {
     let new_lock = Lockfile::new(locked);
     let lock_changed = previous.as_ref() != Some(&new_lock);
     if opts.mode == Mode::Frozen && lock_changed {
-        return Err(StackError::new("lock_outdated", "stack.toml and stack.lock disagree")
-            .hint("run `stack compile` and commit stack.lock"));
+        return Err(
+            StackError::new("lock_outdated", "stack.toml and stack.lock disagree")
+                .hint("run `stack compile` and commit stack.lock"),
+        );
     }
 
     let output = mise::output_path(&opts.root);
@@ -126,7 +144,10 @@ pub fn compile(opts: &Options) -> Result<Report> {
         let requests: Vec<Request> = stack
             .services
             .iter()
-            .map(|(name, e)| Request { service: name.clone(), fixed: e.value.fixed_port() })
+            .map(|(name, e)| Request {
+                service: name.clone(),
+                fixed: e.value.fixed_port(),
+            })
             .collect();
         let ports = ports::assign(&opts.state, &opts.root, &requests, opts.reassign_ports)?;
         if lock_changed {
