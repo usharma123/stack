@@ -32,6 +32,11 @@ check; this pipeline does not claim full service lifecycle coverage on macOS.
 
 ## npm account setup
 
+`@ushawarma/stack@0.1.0` was bootstrapped from the fully tested CI artifact.
+Its trusted publisher is configured for the repository and workflow below.
+Version `0.1.1` is prepared for the first OIDC release after this PR is merged.
+
+
 The first package publication needs an authenticated npm maintainer. Once npm
 recognizes the package, configure its trusted publisher in package settings:
 

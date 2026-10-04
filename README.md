@@ -101,7 +101,7 @@ All accept `-C <dir>` and `--json`. Registry credentials: `STACK_OCI_USERNAME` /
 
 ## Install
 
-Once published, install the CLI with:
+Install the CLI with:
 
 ```sh
 npm install -g @ushawarma/stack
