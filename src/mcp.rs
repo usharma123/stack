@@ -7,11 +7,10 @@ use crate::source::Mode;
 use crate::state::default_state_dir;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -28,12 +27,17 @@ pub fn serve() -> std::io::Result<()> {
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                send(&mut stdout, json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } }))?;
+                send(
+                    &mut stdout,
+                    json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } }),
+                )?;
                 continue;
             }
         };
         // Notifications (no id) need no response.
-        let Some(id) = msg.get("id").cloned() else { continue };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        };
         let method = msg["method"].as_str().unwrap_or_default();
         let reply = match method {
             "initialize" => Ok(json!({
@@ -62,7 +66,11 @@ fn send(out: &mut impl Write, v: Value) -> std::io::Result<()> {
 }
 
 fn negotiate(requested: Option<&str>) -> &'static str {
-    PROTOCOL_VERSIONS.iter().find(|v| Some(**v) == requested).copied().unwrap_or(PROTOCOL_VERSIONS[0])
+    PROTOCOL_VERSIONS
+        .iter()
+        .find(|v| Some(**v) == requested)
+        .copied()
+        .unwrap_or(PROTOCOL_VERSIONS[0])
 }
 
 fn schema(props: Value, required: &[&str]) -> Value {
@@ -108,11 +116,18 @@ fn call(params: &Value) -> Value {
 }
 
 fn ctx(args: &Value) -> Result<Ctx> {
-    let dir = args["dir"].as_str().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let dir = args["dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let root = dir
         .canonicalize()
         .map_err(|e| StackError::new("dir_not_found", format!("{}: {e}", dir.display())))?;
-    Ok(Ctx { root, cache: default_cache_dir(), state: default_state_dir() })
+    Ok(Ctx {
+        root,
+        cache: default_cache_dir(),
+        state: default_state_dir(),
+    })
 }
 
 fn to_value<T: Serialize>(v: T) -> Value {
@@ -133,80 +148,89 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
     match name {
         "stack_inspect" => compile(Mode::Frozen, false).map(to_value),
         "stack_compile" => {
-            let mode = if args["update"] == true { Mode::Update } else if args["locked"] == true { Mode::Frozen } else { Mode::UseLock };
+            let mode = if args["update"] == true {
+                Mode::Update
+            } else if args["locked"] == true {
+                Mode::Frozen
+            } else {
+                Mode::UseLock
+            };
             compile(mode, true).map(to_value)
         }
         "stack_up" => {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
             let owner_pid = args["owner_pid"].as_u64().map(|p| p as u32);
-            session::up(ctx, LeaseOptions { ttl_secs, owner_pid }).map(to_value)
+            session::up(
+                ctx,
+                LeaseOptions {
+                    ttl_secs,
+                    owner_pid,
+                },
+            )
+            .map(to_value)
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
         "stack_down" => session::down(ctx).map(to_value),
         "stack_exec" => exec(args, ctx),
-        _ => Err(StackError::new("unknown_tool", format!("no tool named '{name}'"))),
+        _ => Err(StackError::new(
+            "unknown_tool",
+            format!("no tool named '{name}'"),
+        )),
     }
 }
 
 fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
     let command: Vec<String> = args["command"]
         .as_array()
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let require = if args["require_all"] == true {
         Require::All
     } else {
         Require::Only(
-            args["require"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default(),
+            args["require"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
         )
     };
     let plan = session::plan_exec(ctx, &command, &require)?;
-    let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(DEFAULT_EXEC_TIMEOUT));
+    let timeout = Duration::from_secs(
+        args["timeout_secs"]
+            .as_u64()
+            .unwrap_or(DEFAULT_EXEC_TIMEOUT),
+    );
 
-    let mut child = Command::new(&plan.program)
-        .args(&plan.args)
-        .env_clear()
-        .envs(std::env::vars().filter(|(k, _)| !plan.removed.contains(k)))
-        .envs(&plan.env)
-        .current_dir(&ctx.root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display())))?;
-    let read = |mut r: Box<dyn Read + Send>| thread::spawn(move || { let mut b = Vec::new(); let _ = r.read_to_end(&mut b); b });
-    let out = read(Box::new(child.stdout.take().expect("piped")));
-    let err = read(Box::new(child.stderr.take().expect("piped")));
-
-    let start = Instant::now();
-    let (code, timed_out) = loop {
-        if let Some(status) = child.try_wait().map_err(|e| StackError::new("exec_failed", e.to_string()))? {
-            break (status.code(), false);
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            break (None, true);
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let clip = |b: Vec<u8>| {
-        let s = String::from_utf8_lossy(&b).into_owned();
-        if s.len() <= OUTPUT_LIMIT {
-            return s;
-        }
-        let mut cut = s.len() - OUTPUT_LIMIT;
-        while !s.is_char_boundary(cut) {
-            cut += 1;
-        }
-        format!("…[truncated]…{}", &s[cut..])
-    };
+    let output = crate::process::capture(
+        Command::new(&plan.program)
+            .args(&plan.args)
+            .env_clear()
+            .envs(std::env::vars().filter(|(k, _)| !plan.removed.contains(k)))
+            .envs(&plan.env)
+            .current_dir(&ctx.root),
+        timeout,
+        OUTPUT_LIMIT,
+    )
+    .map_err(|e| {
+        StackError::new(
+            "exec_failed",
+            format!("cannot execute {}: {e}", plan.program.display()),
+        )
+    })?;
     Ok(json!({
-        "exit_code": code,
-        "timed_out": timed_out,
-        "stdout": clip(out.join().unwrap_or_default()),
-        "stderr": clip(err.join().unwrap_or_default()),
+        "exit_code": output.exit_code,
+        "timed_out": output.timed_out,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
         "unverified": plan.checks.iter().filter(|c| !c.ready).map(|c| &c.service).collect::<Vec<_>>(),
         "checks": plan.checks,
     }))
@@ -216,13 +240,21 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
 pub fn parse_duration(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-    let n: u64 = num.parse().map_err(|_| StackError::new("usage", format!("invalid duration '{s}'")))?;
+    let n: u64 = num
+        .parse()
+        .map_err(|_| StackError::new("usage", format!("invalid duration '{s}'")))?;
     let mult = match unit {
         "" | "s" => 1,
         "m" => 60,
         "h" => 3600,
         "d" => 86400,
-        _ => return Err(StackError::new("usage", format!("invalid duration unit in '{s}'; use s, m, h or d"))),
+        _ => {
+            return Err(StackError::new(
+                "usage",
+                format!("invalid duration unit in '{s}'; use s, m, h or d"),
+            ))
+        }
     };
-    Ok(n * mult)
+    n.checked_mul(mult)
+        .ok_or_else(|| StackError::new("usage", "duration is too large"))
 }
