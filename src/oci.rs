@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use url::Url;
 
 pub const ARTIFACT_TYPE: &str = "application/vnd.stack.bundle.v1";
 pub const LAYER_TYPE: &str = "application/vnd.stack.bundle.layer.v1.tar+gzip";
@@ -46,38 +47,62 @@ impl Reference {
             match rest.rsplit_once(':') {
                 Some((repo, tag)) if !tag.contains('/') => (repo, tag),
                 _ => {
-                    return Err(StackError::new("ref_required", format!("'{s}' has no tag or digest"))
-                        .hint("pin a tag or digest, e.g. oci:ghcr.io/acme/pybase:1.0.0"))
+                    return Err(StackError::new(
+                        "ref_required",
+                        format!("'{s}' has no tag or digest"),
+                    )
+                    .hint("pin a tag or digest, e.g. oci:ghcr.io/acme/pybase:1.0.0"))
                 }
             }
         };
         if repository.is_empty() || reference.is_empty() {
             return Err(invalid());
         }
-        Ok(Self { registry: registry.into(), repository: repository.into(), reference: reference.into() })
+        Ok(Self {
+            registry: registry.into(),
+            repository: repository.into(),
+            reference: reference.into(),
+        })
     }
 
     fn base(&self) -> String {
-        let plain = self.registry.starts_with("localhost")
-            || self.registry.starts_with("127.0.0.1")
+        let plain = Url::parse(&format!("http://{}", self.registry))
+            .is_ok_and(|url| loopback(&url))
             || std::env::var_os("STACK_OCI_PLAIN_HTTP").is_some();
-        format!("{}://{}/v2/{}", if plain { "http" } else { "https" }, self.registry, self.repository)
+        format!(
+            "{}://{}/v2/{}",
+            if plain { "http" } else { "https" },
+            self.registry,
+            self.repository
+        )
     }
 }
 
 pub struct Client {
     agent: ureq::Agent,
-    token: RefCell<Option<String>>,
+    token: RefCell<Option<(String, String)>>,
+    credential_origin: RefCell<Option<String>>,
 }
 
 impl Default for Client {
     fn default() -> Self {
-        Self { agent: ureq::AgentBuilder::new().redirects(5).build(), token: RefCell::new(None) }
+        Self {
+            // Redirects are handled explicitly so they cannot carry auth to another origin.
+            agent: ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout(std::time::Duration::from_secs(30))
+                .build(),
+            token: RefCell::new(None),
+            credential_origin: RefCell::new(None),
+        }
     }
 }
 
 fn creds() -> Option<(String, String)> {
-    Some((std::env::var("STACK_OCI_USERNAME").ok()?, std::env::var("STACK_OCI_PASSWORD").ok()?))
+    Some((
+        std::env::var("STACK_OCI_USERNAME").ok()?,
+        std::env::var("STACK_OCI_PASSWORD").ok()?,
+    ))
 }
 
 fn basic(user: &str, pass: &str) -> String {
@@ -87,7 +112,11 @@ fn basic(user: &str, pass: &str) -> String {
     let input = format!("{user}:{pass}").into_bytes();
     let mut out = String::from("Basic ");
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -104,8 +133,20 @@ fn oci_err(context: &str, e: ureq::Error) -> StackError {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
-            let code_name = if code == 404 { "oci_not_found" } else if code == 401 || code == 403 { "oci_unauthorized" } else { "oci_failed" };
-            let mut err = StackError::new(code_name, format!("{context}: HTTP {code} {}", body.chars().take(200).collect::<String>()));
+            let code_name = if code == 404 {
+                "oci_not_found"
+            } else if code == 401 || code == 403 {
+                "oci_unauthorized"
+            } else {
+                "oci_failed"
+            };
+            let mut err = StackError::new(
+                code_name,
+                format!(
+                    "{context}: HTTP {code} {}",
+                    body.chars().take(200).collect::<String>()
+                ),
+            );
             if code == 401 || code == 403 {
                 err = err.hint("set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry");
             }
@@ -116,34 +157,75 @@ fn oci_err(context: &str, e: ureq::Error) -> StackError {
 }
 
 impl Client {
-    /// Send a request, answering one auth challenge (Bearer token or Basic) if the registry asks.
-    #[allow(clippy::result_large_err)] // ureq's error type; boxing it buys nothing on this path
-    fn send(&self, method: &str, url: &str, accept: Option<&str>, body: Option<(&[u8], &str)>) -> std::result::Result<ureq::Response, ureq::Error> {
-        let build = || {
-            let mut req = self.agent.request(method, url);
+    /// Authorization belongs to the challenged registry origin, never to upload locations.
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        accept: Option<&str>,
+        body: Option<(&[u8], &str)>,
+    ) -> Result<ureq::Response> {
+        let mut target = parse_url(url)?;
+        let origin = target.origin().ascii_serialization();
+        let registry = self
+            .credential_origin
+            .borrow_mut()
+            .get_or_insert(origin)
+            .clone();
+        let mut redirects = 0;
+        let mut challenged = false;
+        loop {
+            validate_transport(&target, &registry)?;
+            let target_origin = target.origin().ascii_serialization();
+            let mut req = self.agent.request(method, target.as_str());
             if let Some(a) = accept {
                 req = req.set("Accept", a);
             }
-            if let Some(t) = self.token.borrow().as_ref() {
-                req = req.set("Authorization", t);
+            if let Some((origin, token)) = self.token.borrow().as_ref() {
+                if origin == &target_origin {
+                    req = req.set("Authorization", token);
+                }
             }
-            req
-        };
-        let call = |req: ureq::Request| match body {
-            Some((bytes, ct)) => req.set("Content-Type", ct).send_bytes(bytes),
-            None => req.call(),
-        };
-        match call(build()) {
-            Err(ureq::Error::Status(401, resp)) => {
-                let challenge = resp.header("WWW-Authenticate").unwrap_or_default().to_string();
-                self.authenticate(&challenge).map_err(|_| ureq::Error::Status(401, resp))?;
-                call(build())
+            let response = match body {
+                Some((bytes, ct)) => req.set("Content-Type", ct).send_bytes(bytes),
+                None => req.call(),
+            };
+            let resp = match response {
+                Err(ureq::Error::Status(401, resp)) if !challenged => {
+                    let challenge = resp.header("WWW-Authenticate").unwrap_or_default();
+                    self.authenticate(challenge, &target, &registry)?;
+                    challenged = true;
+                    continue;
+                }
+                Err(e) => return Err(oci_err(&format!("{method} {}", target.as_str()), e)),
+                Ok(resp) => resp,
+            };
+            if [301, 302, 303, 307, 308].contains(&resp.status()) {
+                if redirects == 5 {
+                    return Err(StackError::new("oci_failed", "too many registry redirects"));
+                }
+                let location = resp
+                    .header("Location")
+                    .ok_or_else(|| StackError::new("oci_failed", "redirect has no location"))?;
+                target = target
+                    .join(location)
+                    .map_err(|_| StackError::new("oci_failed", "invalid redirect location"))?;
+                redirects += 1;
+                challenged = false;
+                continue;
             }
-            other => other,
+            return Ok(resp);
         }
     }
 
-    fn authenticate(&self, challenge: &str) -> std::result::Result<(), ()> {
+    fn authenticate(&self, challenge: &str, challenged: &Url, registry: &str) -> Result<()> {
+        let target_origin = challenged.origin().ascii_serialization();
+        if target_origin != registry {
+            return Err(StackError::new(
+                "oci_auth_untrusted",
+                "refusing authentication at a redirected origin",
+            ));
+        }
         if let Some(params) = challenge.strip_prefix("Bearer ") {
             let field = |k: &str| {
                 params.split(',').find_map(|p| {
@@ -151,8 +233,20 @@ impl Client {
                     (key == k).then(|| v.trim_matches('"').to_string())
                 })
             };
-            let realm = field("realm").ok_or(())?;
-            let mut req = self.agent.get(&realm);
+            let realm = field("realm")
+                .ok_or_else(|| StackError::new("oci_failed", "Bearer challenge has no realm"))?;
+            let realm = parse_url(&realm)?;
+            validate_transport(&realm, registry)?;
+            let trusted = trusted_realm(
+                &realm,
+                registry,
+                &std::env::var("STACK_OCI_AUTH_REALMS").unwrap_or_default(),
+            );
+            if !trusted {
+                return Err(StackError::new("oci_auth_untrusted", format!("token origin {} is not approved", realm.origin().ascii_serialization()))
+                    .hint("approve the registry's token service origin in STACK_OCI_AUTH_REALMS (comma-separated origins)"));
+            }
+            let mut req = self.agent.get(realm.as_str());
             for k in ["service", "scope"] {
                 if let Some(v) = field(k) {
                     req = req.query(k, &v);
@@ -161,23 +255,45 @@ impl Client {
             if let Some((u, p)) = creds() {
                 req = req.set("Authorization", &basic(&u, &p));
             }
-            let text = req.call().map_err(|_| ())?.into_string().map_err(|_| ())?;
-            let body: Value = serde_json::from_str(&text).map_err(|_| ())?;
-            let token = body.get("token").or_else(|| body.get("access_token")).and_then(Value::as_str).ok_or(())?;
-            *self.token.borrow_mut() = Some(format!("Bearer {token}"));
+            // Auth requests never follow redirects, even to another approved origin.
+            let resp = req.call().map_err(|e| oci_err("authenticate", e))?;
+            if resp.status() != 200 {
+                return Err(StackError::new(
+                    "oci_auth_untrusted",
+                    "token service redirected authentication",
+                ));
+            }
+            let bytes = Self::read_limited(resp)?;
+            let body: Value = serde_json::from_slice(&bytes)
+                .map_err(|_| StackError::new("oci_failed", "invalid token response"))?;
+            let token = body
+                .get("token")
+                .or_else(|| body.get("access_token"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| StackError::new("oci_failed", "token response contains no token"))?;
+            *self.token.borrow_mut() = Some((target_origin, format!("Bearer {token}")));
             Ok(())
         } else if challenge.starts_with("Basic") {
-            let (u, p) = creds().ok_or(())?;
-            *self.token.borrow_mut() = Some(basic(&u, &p));
+            let (u, p) = creds().ok_or_else(|| {
+                StackError::new("oci_unauthorized", "registry requires credentials")
+                    .hint("set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry")
+            })?;
+            *self.token.borrow_mut() = Some((target_origin, basic(&u, &p)));
             Ok(())
         } else {
-            Err(())
+            Err(StackError::new(
+                "oci_unauthorized",
+                "unsupported registry authentication challenge",
+            ))
         }
     }
 
     fn read_limited(resp: ureq::Response) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        resp.into_reader().take(MAX_BLOB + 1).read_to_end(&mut buf).map_err(|e| io_error("registry response", e))?;
+        resp.into_reader()
+            .take(MAX_BLOB + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| io_error("registry response", e))?;
         if buf.len() as u64 > MAX_BLOB {
             return Err(StackError::new("oci_failed", "blob exceeds 256 MiB"));
         }
@@ -190,7 +306,7 @@ impl Client {
             return Ok(r.reference.clone());
         }
         let url = format!("{}/manifests/{}", r.base(), r.reference);
-        let resp = self.send("GET", &url, Some(MANIFEST_TYPE), None).map_err(|e| oci_err(&format!("resolve {}", r.reference), e))?;
+        let resp = self.send("GET", &url, Some(MANIFEST_TYPE), None)?;
         let bytes = Self::read_limited(resp)?;
         Ok(format!("sha256:{}", sha256_hex(&bytes)))
     }
@@ -201,7 +317,7 @@ impl Client {
             return Ok(());
         }
         let url = format!("{}/manifests/{digest}", r.base());
-        let resp = self.send("GET", &url, Some(MANIFEST_TYPE), None).map_err(|e| oci_err("fetch manifest", e))?;
+        let resp = self.send("GET", &url, Some(MANIFEST_TYPE), None)?;
         let bytes = Self::read_limited(resp)?;
         verify_digest(&bytes, digest, "manifest")?;
         let manifest: Value = serde_json::from_slice(&bytes)
@@ -209,11 +325,16 @@ impl Client {
         let layer = manifest["layers"]
             .as_array()
             .and_then(|ls| ls.iter().find(|l| l["mediaType"] == LAYER_TYPE))
-            .ok_or_else(|| StackError::new("bundle_invalid", format!("{digest} is not a stack bundle (no {LAYER_TYPE} layer)")))?;
+            .ok_or_else(|| {
+                StackError::new(
+                    "bundle_invalid",
+                    format!("{digest} is not a stack bundle (no {LAYER_TYPE} layer)"),
+                )
+            })?;
         let layer_digest = layer["digest"].as_str().unwrap_or_default();
 
         let url = format!("{}/blobs/{layer_digest}", r.base());
-        let resp = self.send("GET", &url, None, None).map_err(|e| oci_err("fetch layer", e))?;
+        let resp = self.send("GET", &url, None, None)?;
         let blob = Self::read_limited(resp)?;
         verify_digest(&blob, layer_digest, "layer")?;
 
@@ -228,9 +349,18 @@ impl Client {
     }
 
     /// Publish `dir` as a bundle artifact tagged `r.reference`. Returns the manifest digest.
-    pub fn push(&self, dir: &Path, r: &Reference, title: &str, version: Option<&str>) -> Result<String> {
+    pub fn push(
+        &self,
+        dir: &Path,
+        r: &Reference,
+        title: &str,
+        version: Option<&str>,
+    ) -> Result<String> {
         if r.reference.starts_with("sha256:") {
-            return Err(StackError::new("source_invalid", "publish needs a tag, not a digest"));
+            return Err(StackError::new(
+                "source_invalid",
+                "publish needs a tag, not a digest",
+            ));
         }
         let layer = archive(dir)?;
         let config = b"{}".to_vec();
@@ -251,7 +381,7 @@ impl Client {
         });
         let bytes = serde_json::to_vec(&manifest).expect("manifest serializes");
         let url = format!("{}/manifests/{}", r.base(), r.reference);
-        self.send("PUT", &url, None, Some((&bytes, MANIFEST_TYPE))).map_err(|e| oci_err("push manifest", e))?;
+        self.send("PUT", &url, None, Some((&bytes, MANIFEST_TYPE)))?;
         Ok(format!("sha256:{}", sha256_hex(&bytes)))
     }
 
@@ -262,32 +392,92 @@ impl Client {
             return Ok(digest);
         }
         let start = format!("{}/blobs/uploads/", r.base());
-        let resp = self.send("POST", &start, None, Some((&[], "application/octet-stream"))).map_err(|e| oci_err("start upload", e))?;
-        let location = resp.header("Location").ok_or_else(|| StackError::new("oci_failed", "registry gave no upload location"))?;
-        let location = if location.starts_with('/') {
-            let (scheme_host, _) = r.base().split_once("/v2/").map(|(a, b)| (a.to_string(), b.to_string())).expect("base has /v2/");
-            format!("{scheme_host}{location}")
-        } else {
-            location.to_string()
-        };
-        let sep = if location.contains('?') { '&' } else { '?' };
-        let put = format!("{location}{sep}digest={digest}");
-        self.send("PUT", &put, None, Some((blob, "application/octet-stream"))).map_err(|e| oci_err("upload blob", e))?;
+        let resp = self.send(
+            "POST",
+            &start,
+            None,
+            Some((&[], "application/octet-stream")),
+        )?;
+        let location = resp
+            .header("Location")
+            .ok_or_else(|| StackError::new("oci_failed", "registry gave no upload location"))?;
+        let start_url = parse_url(&start)?;
+        let mut put = start_url
+            .join(location)
+            .map_err(|_| StackError::new("oci_failed", "invalid upload location"))?;
+        validate_transport(&put, &start_url.origin().ascii_serialization())?;
+        put.query_pairs_mut().append_pair("digest", &digest);
+        self.send(
+            "PUT",
+            put.as_str(),
+            None,
+            Some((blob, "application/octet-stream")),
+        )?;
         Ok(digest)
     }
+}
+
+fn parse_url(value: &str) -> Result<Url> {
+    let url =
+        Url::parse(value).map_err(|_| StackError::new("source_invalid", "invalid registry URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(StackError::new(
+            "source_invalid",
+            "registry URL must be HTTP(S) without userinfo or a fragment",
+        ));
+    }
+    Ok(url)
+}
+
+fn loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+fn validate_transport(target: &Url, registry: &str) -> Result<()> {
+    parse_url(target.as_str())?;
+    if target.scheme() == "http"
+        && (registry.starts_with("https:")
+            || (!loopback(target) && std::env::var_os("STACK_OCI_PLAIN_HTTP").is_none()))
+    {
+        return Err(StackError::new(
+            "oci_auth_untrusted",
+            "refusing an insecure registry, token, or upload URL",
+        ));
+    }
+    Ok(())
+}
+
+fn trusted_realm(realm: &Url, registry: &str, approved: &str) -> bool {
+    let origin = realm.origin().ascii_serialization();
+    origin == registry || approved.split(',').any(|v| v.trim() == origin)
 }
 
 fn verify_digest(bytes: &[u8], expected: &str, what: &str) -> Result<()> {
     let actual = format!("sha256:{}", sha256_hex(bytes));
     if actual != expected {
-        return Err(StackError::new("content_hash_mismatch", format!("{what} digest {actual} != {expected}")));
+        return Err(StackError::new(
+            "content_hash_mismatch",
+            format!("{what} digest {actual} != {expected}"),
+        ));
     }
     Ok(())
 }
 
 /// Deterministic tar.gz: sorted paths, zeroed times and owners, only the executable bit kept.
 pub fn archive(dir: &Path) -> Result<Vec<u8>> {
-    let gz = GzBuilder::new().mtime(0).write(Vec::new(), Compression::default());
+    let gz = GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), Compression::default());
     let mut tar = tar::Builder::new(gz);
     tar.mode(tar::HeaderMode::Deterministic);
     for rel in list_files(dir)? {
@@ -300,7 +490,8 @@ pub fn archive(dir: &Path) -> Result<Vec<u8>> {
         header.set_uid(0);
         header.set_gid(0);
         header.set_entry_type(tar::EntryType::Regular);
-        tar.append_data(&mut header, &rel, data.as_slice()).map_err(|e| io_error(rel.display(), e))?;
+        tar.append_data(&mut header, &rel, data.as_slice())
+            .map_err(|e| io_error(rel.display(), e))?;
     }
     let gz = tar.into_inner().map_err(|e| io_error("archive", e))?;
     gz.finish().map_err(|e| io_error("archive", e))
@@ -313,11 +504,45 @@ mod tests {
     #[test]
     fn parses_references() {
         let r = Reference::parse("ghcr.io/acme/pybase:1.0.0").unwrap();
-        assert_eq!((r.registry.as_str(), r.repository.as_str(), r.reference.as_str()), ("ghcr.io", "acme/pybase", "1.0.0"));
+        assert_eq!(
+            (
+                r.registry.as_str(),
+                r.repository.as_str(),
+                r.reference.as_str()
+            ),
+            ("ghcr.io", "acme/pybase", "1.0.0")
+        );
         let r = Reference::parse("localhost:5000/pybase@sha256:abc").unwrap();
-        assert_eq!((r.registry.as_str(), r.reference.as_str()), ("localhost:5000", "sha256:abc"));
-        assert_eq!(Reference::parse("ghcr.io/acme/pybase").unwrap_err().code, "ref_required");
-        assert_eq!(Reference::parse("pybase:1").unwrap_err().code, "source_invalid");
+        assert_eq!(
+            (r.registry.as_str(), r.reference.as_str()),
+            ("localhost:5000", "sha256:abc")
+        );
+        assert_eq!(
+            Reference::parse("ghcr.io/acme/pybase").unwrap_err().code,
+            "ref_required"
+        );
+        assert_eq!(
+            Reference::parse("pybase:1").unwrap_err().code,
+            "source_invalid"
+        );
+    }
+
+    #[test]
+    fn transport_checks_reject_downgrades_and_prefix_lookalikes() {
+        assert!(!loopback(
+            &Url::parse("http://localhost.attacker.example").unwrap()
+        ));
+        assert!(!loopback(
+            &Url::parse("http://127.0.0.1.attacker.example").unwrap()
+        ));
+        assert!(loopback(&Url::parse("http://127.0.0.1:5000").unwrap()));
+        assert!(validate_transport(
+            &Url::parse("http://127.0.0.1/token").unwrap(),
+            "https://registry.example"
+        )
+        .is_err());
+        assert!(parse_url("https://user:secret@registry.example").is_err());
+        assert!(parse_url("file:///tmp/token").is_err());
     }
 
     #[test]
@@ -335,13 +560,22 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir.path().join("bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(
+                dir.path().join("bin/tool"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
         }
         let a = archive(dir.path()).unwrap();
         assert_eq!(a, archive(dir.path()).unwrap());
 
         let out = tempfile::tempdir().unwrap();
-        tar::Archive::new(GzDecoder::new(a.as_slice())).unpack(out.path()).unwrap();
-        assert_eq!(crate::hash::hash_dir(out.path()).unwrap(), crate::hash::hash_dir(dir.path()).unwrap());
+        tar::Archive::new(GzDecoder::new(a.as_slice()))
+            .unpack(out.path())
+            .unwrap();
+        assert_eq!(
+            crate::hash::hash_dir(out.path()).unwrap(),
+            crate::hash::hash_dir(dir.path()).unwrap()
+        );
     }
 }
