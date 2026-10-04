@@ -234,7 +234,7 @@ fn exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExitCode> {
     for var in &plan.removed {
         command.env_remove(var);
     }
-    command.args(&plan.args).envs(&plan.env);
+    command.args(&plan.args).envs(&plan.env).current_dir(&ctx.root);
     let status = command
         .status()
         .map_err(|e| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display())))?;

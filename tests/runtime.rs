@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -99,6 +100,19 @@ esac
         );
         paths
     }
+}
+
+#[test]
+fn cli_exec_runs_in_the_selected_project_directory() {
+    let fixture = Fixture::new();
+    let out = fixture.ok(&["exec", "--", "pwd"]);
+    let actual = Path::new(String::from_utf8_lossy(&out.stdout).trim())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        actual,
+        fixture.dir.path().join("app").canonicalize().unwrap()
+    );
 }
 
 #[test]
