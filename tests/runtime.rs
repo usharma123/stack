@@ -3,8 +3,9 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -190,4 +191,49 @@ fn concurrent_renewals_keep_both_records_valid_and_consistent() {
         .map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap())
         .collect();
     assert_eq!(records[0], records[1]);
+}
+
+#[test]
+fn active_exec_protects_ttl_until_completion_then_the_session_can_expire() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "1s"]);
+    let mut child = fixture
+        .command(&["exec", "--", "sleep", "3"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let session_file = fixture.dir.path().join("app/.stack/session.json");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let session: Value = serde_json::from_slice(&fs::read(&session_file).unwrap()).unwrap();
+        if session["active_executions"]
+            .as_object()
+            .is_some_and(|v| !v.is_empty())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "execution lease was never registered"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_secs(2));
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"],
+        json!([])
+    );
+    assert!(session_file.exists());
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(child.wait().unwrap().success());
+    let session: Value = serde_json::from_slice(&fs::read(&session_file).unwrap()).unwrap();
+    assert_eq!(session["active_executions"], json!({}));
+    thread::sleep(Duration::from_secs(2));
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"][0]["stopped"],
+        true
+    );
+    assert!(!session_file.exists());
 }

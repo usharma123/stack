@@ -69,6 +69,9 @@ pub struct Session {
     /// Complete compiled configuration and ports at launch, including project overrides.
     #[serde(default)]
     pub config_digest: String,
+    /// Coordinators currently executing against this generation. Dead entries are ignored.
+    #[serde(default)]
+    pub active_executions: IndexMap<String, u32>,
     pub started_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
@@ -383,6 +386,16 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
 
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     let previous = load(ctx)?;
+    if previous.as_ref().is_some_and(has_active_executions) {
+        return Err(steps.fail(
+            "session",
+            StackError::new(
+                "session_busy",
+                "commands are still executing in this session",
+            ),
+            false,
+        ));
+    }
     let report = match ctx.compile(true) {
         Ok(r) => r,
         Err(e) => return Err(steps.fail("compile", e, false)),
@@ -461,6 +474,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         project: ctx.root.clone(),
         lock_digest: lock_digest(&ctx.root),
         config_digest: digest,
+        active_executions: IndexMap::new(),
         started_at: stamp,
         lease: (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
             ttl_secs: lease.ttl_secs,
@@ -629,6 +643,8 @@ pub struct ExecPlan {
     /// Variables that must not be inherited from the caller either.
     pub removed: Vec<String>,
     pub checks: Vec<Check>,
+    /// Keeps TTL collection from stopping services until the command finishes.
+    pub execution: Option<ExecutionGuard>,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -729,11 +745,34 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         )
     })?;
 
-    if let Some(session) = session.as_mut().filter(|s| s.config_digest == config_digest(ctx, &report)) {
+    // Reserve execution before releasing the same lock used by GC. This closes the
+    // verify/start race without holding an exclusive lock throughout a long command.
+    let mut execution = None;
+    if let Some(session) = session
+        .as_mut()
+        .filter(|s| s.config_digest == config_digest(ctx, &report))
+    {
         if let Some(lease) = session.lease.as_mut() {
             lease.renewed_at = now();
-            save(ctx, session)?;
         }
+        let token = sha256_hex(format!("{:?}{}", Instant::now(), std::process::id()).as_bytes());
+        session.active_executions.retain(|_, pid| pid_alive(*pid));
+        session
+            .active_executions
+            .insert(token.clone(), std::process::id());
+        if let Err(e) = save(ctx, session) {
+            // A failed project-mirror write must not leave a phantom execution attached
+            // to a long-lived MCP coordinator in the authoritative machine index.
+            session.active_executions.shift_remove(&token);
+            let _ = write_json(&ctx.index_file(), session);
+            return Err(e);
+        }
+        execution = Some(ExecutionGuard {
+            root: ctx.root.clone(),
+            state: ctx.state.clone(),
+            session_id: session.id.clone(),
+            token,
+        });
         env.insert("STACK_SESSION".into(), session.id.clone());
     } else {
         env.shift_remove("STACK_SESSION");
@@ -747,6 +786,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         env,
         removed,
         checks,
+        execution,
     })
 }
 
@@ -813,6 +853,16 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
             continue;
         };
+        // TTL describes idle time; an executing command is not idle. Owner death still
+        // follows the explicit runner policy even if one of its commands has survived.
+        let owner_dead = session
+            .lease
+            .as_ref()
+            .and_then(|l| l.owner_pid)
+            .is_some_and(|p| !pid_alive(p));
+        if !owner_dead && has_active_executions(&session) {
+            continue;
+        }
         let result = down_locked(&ctx);
         out.push(GcEntry {
             project: session.project,
@@ -849,6 +899,13 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(crate::error::io_error(path.display(), e)),
     }
+}
+
+fn has_active_executions(session: &Session) -> bool {
+    session
+        .active_executions
+        .values()
+        .any(|pid| pid_alive(*pid))
 }
 
 fn config_digest(ctx: &Ctx, report: &Report) -> String {
@@ -891,6 +948,41 @@ fn verify_session(
         }
     }
     checks
+}
+
+/// An execution is registered under the lifecycle lock and removed at command completion.
+/// A crashed coordinator is ignored by GC through its PID, without a background heartbeat.
+pub struct ExecutionGuard {
+    root: PathBuf,
+    state: PathBuf,
+    session_id: String,
+    token: String,
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        let ctx = Ctx {
+            root: self.root.clone(),
+            cache: PathBuf::new(),
+            state: self.state.clone(),
+        };
+        let Ok(_guard) = project_lock(&ctx.state, &ctx.root) else {
+            return;
+        };
+        let Ok(Some(mut session)) = load(&ctx) else {
+            return;
+        };
+        if session.id != self.session_id {
+            return;
+        }
+        session.active_executions.shift_remove(&self.token);
+        if let Some(lease) = session.lease.as_mut() {
+            lease.renewed_at = now();
+        }
+        if let Err(e) = save(&ctx, &session) {
+            eprintln!("stack: cannot finish execution lease: {e}");
+        }
+    }
 }
 
 fn lock_digest(root: &Path) -> String {
