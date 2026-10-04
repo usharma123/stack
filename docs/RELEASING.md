@@ -83,7 +83,7 @@ Stable versions use `latest`; prereleases use `next`.
 The publish script checks the immutable version first. An existing version is
 accepted only if its SHA-512 integrity matches the exact packed tarball and it has
 provenance. After publication it retries registry reads and tarball downloads for
-propagation, verifies their integrity, and performs a clean registry installation.
+propagation, waits for the package index used by npm install, verifies integrity, and performs a clean registry installation.
 
 If publication failed or its response was lost, rerun the failed publish job to
 reuse the original artifact. Never move a release tag or republish different bytes

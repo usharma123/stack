@@ -12,10 +12,10 @@ export async function publishPackage(file, { verifyOnly = false, fetchImpl = fet
   const registry = 'https://registry.npmjs.org';
   const url = `${registry}/${encodeURIComponent(manifest.name)}/${manifest.version}`;
   const delay = pause;
-  async function metadata() {
+  async function metadata(endpoint = url) {
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        const response = await fetchImpl(url, { signal: AbortSignal.timeout(15000) });
+        const response = await fetchImpl(endpoint, { signal: AbortSignal.timeout(15000) });
         if (response.status === 404) return null;
         if (response.status === 429 || response.status >= 500) throw new Error(`Registry HTTP ${response.status}`);
         if (!response.ok) throw new TypeError(`Registry HTTP ${response.status}`);
@@ -33,7 +33,7 @@ export async function publishPackage(file, { verifyOnly = false, fetchImpl = fet
     const result = publish(['publish', file, '--access', 'public', '--provenance', '--tag', tag, '--registry', registry, '--ignore-scripts']);
     if (result.status !== 0) console.error('Publish did not report success; checking whether npm accepted the exact tarball.');
   }
-  for (let attempt = 0; attempt < 12; attempt++) {
+  for (let attempt = 0; attempt < 30; attempt++) {
     remote = await metadata();
     if (remote) {
       assert.equal(remote.dist.integrity, integrity, 'Published version differs from this tarball. Never overwrite or skip it.');
@@ -43,14 +43,17 @@ export async function publishPackage(file, { verifyOnly = false, fetchImpl = fet
         if (!response.ok) throw new Error(`Tarball HTTP ${response.status}`);
         const downloaded = Buffer.from(await response.arrayBuffer());
         assert.equal(`sha512-${createHash('sha512').update(downloaded).digest('base64')}`, integrity);
+        const index = await metadata(`${registry}/${encodeURIComponent(manifest.name)}`);
+        if (!index?.versions?.[manifest.version]) throw new Error('Registry package index has not propagated yet');
+        assert.equal(index.versions[manifest.version].dist.integrity, integrity, 'Registry package index differs from this tarball');
         console.log(`Verified ${manifest.name}@${manifest.version}: registry integrity, provenance, and downloadable tarball`);
         return;
       } catch (error) {
         if (error.code === 'ERR_ASSERTION') throw error;
-        if (attempt === 11) throw error;
+        if (attempt === 29) throw error;
       }
     }
-    if (attempt < 11) await delay(10000);
+    if (attempt < 29) await delay(10000);
   }
   throw new Error('Package did not become available. Fix authentication/setup and rerun the publish job using the same artifact.');
 }

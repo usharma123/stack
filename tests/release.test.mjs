@@ -15,6 +15,8 @@ execFileSync('tar', ['-czf', tarball, '-C', dir, 'package']);
 const bytes = readFileSync(tarball);
 const integrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
 const remote = { dist: { integrity, attestations: { provenance: {} }, tarball: 'https://registry.npmjs.org/fixture.tgz' } };
+const index = { versions: { "0.1.0-beta.1": remote } };
+const registryData = url => url.endsWith("/0.1.0-beta.1") ? remote : index;
 const json = value => new Response(JSON.stringify(value));
 const pause = async () => {};
 
@@ -22,7 +24,7 @@ try {
   await test('retry accepts only the same immutable tarball without publishing again', async () => {
     await publishPackage(tarball, {
       pause,
-      fetchImpl: async url => url.endsWith('.tgz') ? new Response(bytes) : json(remote),
+      fetchImpl: async url => url.endsWith('.tgz') ? new Response(bytes) : json(registryData(url)),
       publish: () => assert.fail('already published package must not publish again')
     });
   });
@@ -45,7 +47,7 @@ try {
         if (url.endsWith('.tgz')) return ++downloads === 1 ? new Response('', { status: 404 }) : new Response(bytes);
         if (!published) return new Response('', { status: 404 });
         if (++reads === 1) return new Response('', { status: 503 });
-        return json(remote);
+        return json(registryData(url));
       },
       publish: args => {
         assert.equal(args[args.indexOf('--tag') + 1], 'next');
@@ -55,7 +57,16 @@ try {
     });
     assert.equal(downloads, 2);
   });
+  await test('publication waits for the package index needed by npm install', async () => {
+    let indexReads = 0;
+    await publishPackage(tarball, { pause, fetchImpl: async url => {
+      if (url.endsWith('.tgz')) return new Response(bytes);
+      if (url.endsWith('/0.1.0-beta.1')) return json(remote);
+      return ++indexReads === 1 ? new Response('', { status: 404 }) : json(index);
+    } });
+    assert.equal(indexReads, 2);
+  });
   await test('CDN serving different bytes is rejected', async () => {
-    await assert.rejects(publishPackage(tarball, { pause, fetchImpl: async url => url.endsWith('.tgz') ? new Response('corrupted') : json(remote) }), /Expected values/);
+    await assert.rejects(publishPackage(tarball, { pause, fetchImpl: async url => url.endsWith('.tgz') ? new Response('corrupted') : json(registryData(url)) }), /Expected values/);
   });
 } finally { rmSync(dir, { recursive: true, force: true }); }
