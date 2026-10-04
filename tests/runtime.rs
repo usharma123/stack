@@ -251,3 +251,38 @@ fn active_exec_protects_ttl_until_completion_then_the_session_can_expire() {
     );
     assert!(!session_file.exists());
 }
+
+#[test]
+fn container_mcp_scenario_rejects_a_server_that_only_returns_an_error() {
+    let fixture = Fixture::new();
+    let prefix = format!("{}/", fixture.dir.path().display());
+    let helper = include_str!("e2e/assert.sh").replace("/tmp/", &prefix);
+    fs::write(fixture.dir.path().join("stack-e2e-assert.sh"), helper).unwrap();
+    let fake = fixture.dir.path().join("bin/stack");
+    fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"structuredContent\":{\"ok\":false,\"error\":{\"code\":\"exec_failed\"}}}}'\nexit 1\n").unwrap();
+    fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let script = include_str!("e2e/4-mcp.sh")
+        .replace("/tmp/", &prefix)
+        .replace(
+            "cd ~/appA",
+            &format!("cd '{}'", fixture.dir.path().display()),
+        )
+        .replace("export PATH=/opt/stack:$PATH", "");
+    let out = Command::new("bash")
+        .args(["-c", &script])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.dir.path().join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "broken MCP passed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

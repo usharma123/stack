@@ -1,21 +1,37 @@
-# 5. OCI: publish, consume, digest pinning, retagging, validation before upload.
+#!/usr/bin/env bash
+# Variables in command strings are expanded by the child.
+# shellcheck disable=SC2016
+set -Eeuo pipefail
+# shellcheck source=tests/e2e/assert.sh
+source /tmp/stack-e2e-assert.sh
 export PATH=/opt/stack:$PATH
-echo "### S5: publish bundle to OCI, consume it, pin by digest"
-stack publish /srv/pybase oci:localhost:5000/acme/pybase:1.0.0 --json | jq -c '.data | {name, digest, pinned}'
-rm -rf ~/appC && cp -r /examples/app ~/appC && cd ~/appC && rm -f stack.lock
+stack publish /srv/pybase oci:localhost:5000/acme/pybase:1.0.0 --json >/tmp/publish.json
+assert_json '.ok and .data.name == "pybase" and (.data.digest | test("^sha256:[0-9a-f]{64}$"))' /tmp/publish.json
+first=$(jq -r '.data.digest' /tmp/publish.json)
+cp -r /examples/app ~/appC
+cd ~/appC || exit 1
+rm -f stack.lock
 sed -i 's|path:../bundles/pybase|oci:localhost:5000/acme/pybase:1.0.0|; s|path:../bundles/obs|git+file:///srv/obs?ref=v1|' stack.toml
-stack compile --json | jq -c '[.data.bundles[] | {name, pin: (.digest // .commit), content_hash}]'
-echo "same content as the git-sourced bundle: $(grep -A3 'name = "pybase"' ~/appA/stack.lock | grep content_hash | cut -d'"' -f2 | cut -c1-23) (git) vs $(grep -A4 'name = "pybase"' stack.lock | grep content_hash | cut -d'"' -f2 | cut -c1-23) (oci)"
-stack up --json | jq -c '{ok, checks: [.data.checks[] | {service, port, identity}]}'
-stack exec --require-all -- bash -c 'uv sync -q && uv run pytest -q 2>&1 | tail -1; acme'
-echo "### republish different content under the same tag"
-cp -r /srv/pybase /tmp/pybase2 && rm -rf /tmp/pybase2/.git && sed -i "s/pybase-1.0.0/pybase-1.0.1/" /tmp/pybase2/fixtures/seed.sql
-stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:1.0.0 --json | jq -c '.data.digest'
-echo "locked compile: $(stack compile --json | jq -c '[.data.bundles[0] | .digest[0:19], .moved_from]')"
-echo "--update:       $(stack compile --update --json | jq -c '[.data.bundles[0] | .digest[0:19], (.moved_from // "")[0:19]]')"
-echo "### invalid bundle is rejected before upload"
+stack compile --json >/tmp/oci-compile.json
+assert_json '.ok and (.data.bundles | length == 2)' /tmp/oci-compile.json
+stack -C ~/appA inspect --json >/tmp/git-inspect.json
+jq -se '(.[0].data.bundles | map(select(.name == "pybase")) | .[0].content_hash) == (.[1].data.bundles | map(select(.name == "pybase")) | .[0].content_hash)' /tmp/oci-compile.json /tmp/git-inspect.json >/dev/null
+stack up --json >/tmp/oci-up.json
+assert_json '.ok and all(.data.checks[]; .ready and .identity == "instance")' /tmp/oci-up.json
+stack exec --require-all -- bash -c 'set -euo pipefail; uv sync -q; uv run pytest -q; acme'
+cp -r /srv/pybase /tmp/pybase2
+rm -rf /tmp/pybase2/.git
+sed -i 's/pybase-1.0.0/pybase-1.0.1/' /tmp/pybase2/fixtures/seed.sql
+stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:1.0.0 --json >/tmp/republish.json
+second=$(jq -er '.data.digest' /tmp/republish.json)
+[[ "$first" != "$second" ]] || fail 'changed contents did not change the digest'
+stack compile --json >/tmp/locked.json
+jq -e --arg first "$first" '.ok and .data.bundles[0].digest == $first and .data.bundles[0].moved_from == null' /tmp/locked.json >/dev/null
+stack compile --update --json >/tmp/updated.json
+jq -e --arg first "$first" --arg second "$second" '.ok and .data.bundles[0].digest == $second and .data.bundles[0].moved_from == $first' /tmp/updated.json >/dev/null
 sed -i 's/version = "8"/version = "8"\nport = 6379/' /tmp/pybase2/bundle.toml
-stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:bad --json | jq -c '.error | {code}'
-echo "### missing tag / unknown repo"
-sed -i 's|pybase:1.0.0|nothere:9|' stack.toml; stack compile --json | jq -c '.error | {code, message}'
-git -C ~/appC status >/dev/null 2>&1; stack -C ~/appC down >/dev/null 2>&1 || (cd ~/appC && mise daemons stop >/dev/null 2>&1)
+expect_error bundle_fixed_port stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:bad --json
+sed -i 's|pybase:1.0.0|nothere:9|' stack.toml
+expect_error oci_not_found stack compile --json
+stack down --json >/tmp/down.json
+assert_json '.ok and .data.confirmed' /tmp/down.json
