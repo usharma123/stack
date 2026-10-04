@@ -93,6 +93,10 @@ hosts or the explicit development opt-in `STACK_OCI_PLAIN_HTTP=1` (exactly `1`; 
 requests do not follow redirects, and upload/registry redirects do not receive another origin's
 authorization header.
 
+The OCI bundle cache is shared by every project on the machine. Installing a digest takes a
+lock beside its cache directory, rechecks it, extracts into a uniquely named staging directory
+and renames only a complete extraction into place; failures remove the staging directory.
+
 ## Not covered yet
 
 - macOS: compile/inspect are tested; services and sessions are only tested on Linux.

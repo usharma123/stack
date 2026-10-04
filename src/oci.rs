@@ -10,7 +10,7 @@
 
 use crate::error::{io_error, Result, StackError};
 use crate::hash::{is_executable, list_files, sha256_hex};
-use flate2::read::GzDecoder;
+use crate::state::FileLock;
 use flate2::{Compression, GzBuilder};
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -316,7 +316,8 @@ impl Client {
         Ok(format!("sha256:{}", sha256_hex(&bytes)))
     }
 
-    /// Download the bundle at `digest` and extract it into `dest` (atomically).
+    /// Download the bundle at `digest` and install it at `dest`, which may be shared by other
+    /// projects and processes. See [`install`].
     pub fn pull(&self, r: &Reference, digest: &str, dest: &Path) -> Result<()> {
         if dest.exists() {
             return Ok(());
@@ -342,15 +343,7 @@ impl Client {
         let resp = self.send("GET", &url, None, None)?;
         let blob = Self::read_limited(resp)?;
         verify_digest(&blob, layer_digest, "layer")?;
-
-        let tmp = dest.with_extension("tmp");
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).map_err(|e| io_error(tmp.display(), e))?;
-        // `unpack` refuses entries that escape the destination (absolute paths, `..`).
-        tar::Archive::new(GzDecoder::new(blob.as_slice()))
-            .unpack(&tmp)
-            .map_err(|e| StackError::new("bundle_invalid", format!("cannot extract layer: {e}")))?;
-        fs::rename(&tmp, dest).map_err(|e| io_error(dest.display(), e))
+        install(&blob, dest)
     }
 
     /// Publish `dir` as a bundle artifact tagged `r.reference`. Returns the manifest digest.
@@ -420,6 +413,89 @@ impl Client {
         )?;
         Ok(digest)
     }
+}
+
+/// Extract a verified layer into the shared cache at `dest`, exactly once.
+///
+/// Installers of one destination serialize on a sibling lock file, recheck `dest` under it, and
+/// extract into their own uniquely named staging directory. Only a complete extraction is renamed
+/// into place; every failure removes the staging directory. A competing installer that already
+/// published `dest` counts as success. Staging directories left by a crashed installer are
+/// removed by the next one, which is safe because staging only exists while the lock is held.
+pub fn install(blob: &[u8], dest: &Path) -> Result<()> {
+    let (parent, name) = match (dest.parent(), dest.file_name()) {
+        (Some(parent), Some(name)) => (parent, name.to_string_lossy()),
+        _ => {
+            return Err(StackError::new(
+                "io",
+                format!("invalid cache path {}", dest.display()),
+            ))
+        }
+    };
+    fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
+    let _lock = FileLock::acquire(&parent.join(format!(".{name}.lock")))?;
+    if dest.exists() {
+        return Ok(());
+    }
+    let prefix = format!(".{name}.staging-");
+    for entry in fs::read_dir(parent)
+        .map_err(|e| io_error(parent.display(), e))?
+        .flatten()
+    {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            remove_tree(&entry.path());
+        }
+    }
+    let staging = Staging(
+        tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir_in(parent)
+            .map_err(|e| io_error(parent.display(), e))?
+            .keep(),
+    );
+    extract(blob, &staging.0)?;
+    // Once renamed, nothing is left at the staging path for the guard to remove.
+    fs::rename(&staging.0, dest).map_err(|e| io_error(dest.display(), e))
+}
+
+/// A staging directory, removed with everything in it when dropped (under the install lock).
+struct Staging(std::path::PathBuf);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        remove_tree(&self.0);
+    }
+}
+
+/// Best-effort recursive removal, first granting the owner access to every directory so that
+/// one without write or search permission cannot keep its contents in place.
+fn remove_tree(path: &Path) {
+    fn grant(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let Ok(meta) = fs::symlink_metadata(path) else {
+                return;
+            };
+            if !meta.is_dir() {
+                return;
+            }
+            let mode = meta.permissions().mode() | 0o700;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+            for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+                grant(&entry.path());
+            }
+        }
+    }
+    grant(path);
+    let _ = fs::remove_dir_all(path);
+}
+
+fn extract(blob: &[u8], into: &Path) -> Result<()> {
+    // `unpack` refuses entries that escape the destination (absolute paths, `..`).
+    tar::Archive::new(flate2::read::GzDecoder::new(blob))
+        .unpack(into)
+        .map_err(|e| StackError::new("bundle_invalid", format!("cannot extract layer: {e}")))
 }
 
 fn parse_url(value: &str) -> Result<Url> {
@@ -517,6 +593,7 @@ pub fn archive(dir: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
 
     #[test]
     fn parses_references() {
@@ -612,6 +689,89 @@ mod tests {
     fn basic_auth_encodes() {
         assert_eq!(basic("user", "pass"), "Basic dXNlcjpwYXNz");
         assert_eq!(basic("a", "b"), "Basic YTpi");
+    }
+
+    fn tar_gz(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        build(&mut tar);
+        let raw = tar.into_inner().unwrap();
+        let mut gz = GzBuilder::new().write(Vec::new(), Compression::best());
+        std::io::Write::write_all(&mut gz, &raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn files(sizes: &[usize]) -> Vec<u8> {
+        tar_gz(|tar| {
+            for (i, size) in sizes.iter().enumerate() {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(*size as u64);
+                header.set_mode(0o644);
+                header.set_entry_type(tar::EntryType::Regular);
+                tar.append_data(&mut header, format!("f{i}"), vec![0u8; *size].as_slice())
+                    .unwrap();
+            }
+        })
+    }
+
+    fn bundle_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("bin")).unwrap();
+        fs::write(dir.path().join("bundle.toml"), "[bundle]\nname='x'\n").unwrap();
+        fs::write(dir.path().join("bin/tool"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join("bin/tool"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn install_publishes_only_complete_trees_and_cleans_up_on_failure() {
+        let source = bundle_dir();
+        let blob = archive(source.path()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let dest = cache.path().join("oci-x");
+        // Residue of a crashed installer, including a directory without owner access; staging
+        // only exists while the lock is held.
+        let crashed = cache.path().join(".oci-x.staging-crashed");
+        fs::create_dir_all(crashed.join("z")).unwrap();
+        fs::write(crashed.join("z/partial"), "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(crashed.join("z"), fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let leftovers = || {
+            let mut names: Vec<String> = fs::read_dir(cache.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let truncated = &blob[..blob.len() / 2];
+        assert_eq!(
+            install(truncated, &dest).unwrap_err().code,
+            "bundle_invalid"
+        );
+        assert_eq!(leftovers(), [".oci-x.lock"], "failure left residue");
+
+        install(&blob, &dest).unwrap();
+        assert_eq!(leftovers(), [".oci-x.lock", "oci-x"]);
+        let hash = crate::hash::hash_dir(&dest).unwrap();
+        assert_eq!(hash, crate::hash::hash_dir(source.path()).unwrap());
+        assert!(is_executable(&dest.join("bin/tool")));
+
+        // A published tree is never replaced or written into by a later installer.
+        install(&files(&[10]), &dest).unwrap();
+        assert_eq!(crate::hash::hash_dir(&dest).unwrap(), hash);
+        assert_eq!(leftovers(), [".oci-x.lock", "oci-x"]);
     }
 
     #[test]
