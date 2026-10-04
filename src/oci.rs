@@ -4,7 +4,9 @@
 //! manifest digest in stack.lock, the same way git sources pin a commit.
 //!
 //! Credentials, when a registry needs them: `STACK_OCI_USERNAME` and `STACK_OCI_PASSWORD`.
-//! Plain HTTP is used for `localhost`/`127.0.0.1`, or anywhere with `STACK_OCI_PLAIN_HTTP=1`.
+//! Plain HTTP is used for loopback registries (`localhost`, `127.0.0.0/8`, `::1`). Elsewhere it
+//! requires exactly `STACK_OCI_PLAIN_HTTP=1`; any other value, including `0`, `false` or empty,
+//! keeps HTTPS. An HTTPS registry can never be downgraded to HTTP.
 
 use crate::error::{io_error, Result, StackError};
 use crate::hash::{is_executable, list_files, sha256_hex};
@@ -66,9 +68,12 @@ impl Reference {
     }
 
     fn base(&self) -> String {
-        let plain = Url::parse(&format!("http://{}", self.registry))
-            .is_ok_and(|url| loopback(&url))
-            || std::env::var_os("STACK_OCI_PLAIN_HTTP").is_some();
+        self.base_with(plain_http_opt_in())
+    }
+
+    fn base_with(&self, plain_http: bool) -> String {
+        let plain = plain_http
+            || Url::parse(&format!("http://{}", self.registry)).is_ok_and(|url| loopback(&url));
         format!(
             "{}://{}/v2/{}",
             if plain { "http" } else { "https" },
@@ -443,11 +448,23 @@ fn loopback(url: &Url) -> bool {
     }
 }
 
+/// The development opt-in for plain HTTP to non-loopback hosts: exactly `1`.
+fn plain_http_opt_in() -> bool {
+    parse_plain_http(std::env::var_os("STACK_OCI_PLAIN_HTTP").as_deref())
+}
+
+fn parse_plain_http(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 fn validate_transport(target: &Url, registry: &str) -> Result<()> {
+    validate_transport_with(target, registry, plain_http_opt_in())
+}
+
+fn validate_transport_with(target: &Url, registry: &str, plain_http: bool) -> Result<()> {
     parse_url(target.as_str())?;
     if target.scheme() == "http"
-        && (registry.starts_with("https:")
-            || (!loopback(target) && std::env::var_os("STACK_OCI_PLAIN_HTTP").is_none()))
+        && (registry.starts_with("https:") || (!loopback(target) && !plain_http))
     {
         return Err(StackError::new(
             "oci_auth_untrusted",
@@ -543,6 +560,52 @@ mod tests {
         .is_err());
         assert!(parse_url("https://user:secret@registry.example").is_err());
         assert!(parse_url("file:///tmp/token").is_err());
+    }
+
+    #[test]
+    fn plain_http_requires_exactly_one() {
+        use std::ffi::OsStr;
+        assert!(parse_plain_http(Some(OsStr::new("1"))));
+        for value in ["", "0", "false", "no", "true", "yes", " 1", "01"] {
+            assert!(!parse_plain_http(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert!(!parse_plain_http(None));
+    }
+
+    #[test]
+    fn plain_http_opt_in_governs_references_and_every_transport_check() {
+        let remote = Reference::parse("registry.example/acme/b:1").unwrap();
+        assert_eq!(
+            remote.base_with(false),
+            "https://registry.example/v2/acme/b"
+        );
+        assert_eq!(remote.base_with(true), "http://registry.example/v2/acme/b");
+        for registry in ["localhost:5000", "127.0.0.1:5000", "[::1]:5000"] {
+            let local = Reference::parse(&format!("{registry}/b:1")).unwrap();
+            assert_eq!(local.base_with(false), format!("http://{registry}/v2/b"));
+        }
+        for lookalike in ["localhost.attacker.example", "127.0.0.1.attacker.example"] {
+            let r = Reference::parse(&format!("{lookalike}/b:1")).unwrap();
+            assert!(r.base_with(false).starts_with("https://"), "{lookalike}");
+        }
+
+        let plain_registry = "http://127.0.0.1:5000";
+        let remote_http = Url::parse("http://registry.example/token").unwrap();
+        assert_eq!(
+            validate_transport_with(&remote_http, plain_registry, false)
+                .unwrap_err()
+                .code,
+            "oci_auth_untrusted"
+        );
+        assert!(validate_transport_with(&remote_http, plain_registry, true).is_ok());
+        let local_http = Url::parse("http://localhost:5000/upload").unwrap();
+        assert!(validate_transport_with(&local_http, plain_registry, false).is_ok());
+        let lookalike = Url::parse("http://localhost.attacker.example/token").unwrap();
+        assert!(validate_transport_with(&lookalike, plain_registry, false).is_err());
+        // The opt-in never permits downgrading an HTTPS registry.
+        for target in [&remote_http, &local_http] {
+            assert!(validate_transport_with(target, "https://registry.example", true).is_err());
+        }
     }
 
     #[test]

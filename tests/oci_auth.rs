@@ -55,6 +55,8 @@ impl Server {
             while !done.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit non-blocking mode on BSD and macOS.
+                        stream.set_nonblocking(false).unwrap();
                         let request = read_request(&mut stream);
                         let response = handler(&request);
                         seen.lock().unwrap().push(request.clone());
@@ -254,5 +256,81 @@ fn absolute_upload_locations_do_not_receive_registry_authorization() {
         assert_eq!(request.method, "PUT");
         assert!(!request.headers.contains_key("authorization"));
         assert!(request.path.contains("digest=sha256"));
+    }
+}
+
+/// Each case runs in its own process so the opt-in never leaks between tests.
+fn compile_with_plain_http(
+    registry: &str,
+    plain_http: Option<&str>,
+    approved: Option<&str>,
+) -> Value {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("stack.toml"),
+        format!("[[use]]\nbundle='oci:{registry}/bundle:1'\n"),
+    )
+    .unwrap();
+    let mut command = command(&dir);
+    if let Some(value) = plain_http {
+        command.env("STACK_OCI_PLAIN_HTTP", value);
+    }
+    if let Some(origin) = approved {
+        command.env("STACK_OCI_AUTH_REALMS", origin);
+    }
+    let output = command.arg("compile").output().unwrap();
+    assert!(!output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+const NOT_OPTED_IN: [Option<&str>; 5] = [None, Some(""), Some("0"), Some("false"), Some("yes")];
+
+#[test]
+fn only_an_explicit_opt_in_uses_plain_http_for_remote_registries() {
+    // `.invalid` never resolves, so the error reveals the scheme without any network traffic.
+    for value in NOT_OPTED_IN {
+        let result = compile_with_plain_http("registry.invalid:5000", value, None);
+        let message = result["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("https://registry.invalid:5000/"),
+            "{value:?}: {message}"
+        );
+    }
+    let result = compile_with_plain_http("registry.invalid:5000", Some("1"), None);
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("http://registry.invalid:5000/"),
+        "{message}"
+    );
+}
+
+#[test]
+fn redirects_and_token_realms_to_remote_plain_http_need_the_explicit_opt_in() {
+    let redirect = Server::new(|_| {
+        Response::new(307, "").header("Location", "http://registry.invalid/v2/bundle/manifests/1")
+    });
+    let realm = Server::new(|_| {
+        Response::new(401, "").header(
+            "WWW-Authenticate",
+            "Bearer realm=\"http://auth.invalid/token\"",
+        )
+    });
+    let registries = [
+        redirect.origin.trim_start_matches("http://").to_string(),
+        realm.origin.trim_start_matches("http://").to_string(),
+    ];
+    for registry in &registries {
+        for value in NOT_OPTED_IN {
+            let result = compile_with_plain_http(registry, value, Some("http://auth.invalid"));
+            assert_eq!(
+                result["error"]["code"], "oci_auth_untrusted",
+                "{registry} {value:?}: {result}"
+            );
+        }
+        let result = compile_with_plain_http(registry, Some("1"), Some("http://auth.invalid"));
+        assert_eq!(
+            result["error"]["code"], "oci_unreachable",
+            "{registry}: {result}"
+        );
     }
 }

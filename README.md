@@ -106,7 +106,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
-origins or authentication redirects. HTTPS cannot redirect authentication to HTTP.
+origins or authentication redirects. HTTPS cannot redirect authentication to HTTP. Plain HTTP
+is used only for loopback registries, or elsewhere with exactly `STACK_OCI_PLAIN_HTTP=1`.
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep

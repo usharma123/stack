@@ -88,7 +88,8 @@ OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one determini
 
 OCI authorization is scoped to the original registry origin. Bearer token realms must share
 that origin or appear explicitly in `STACK_OCI_AUTH_REALMS`. HTTP is allowed for exact loopback
-hosts or explicit development opt-in; an HTTPS origin can never downgrade to HTTP. Token
+hosts or the explicit development opt-in `STACK_OCI_PLAIN_HTTP=1` (exactly `1`; empty, `0` or
+`false` keep HTTPS); an HTTPS origin can never downgrade to HTTP. Token
 requests do not follow redirects, and upload/registry redirects do not receive another origin's
 authorization header.
 
