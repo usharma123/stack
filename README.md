@@ -122,7 +122,7 @@ npm install -g @ushawarma/stack
 stack --version
 ```
 
-Prebuilt binaries cover macOS 13+ and Linux with glibc 2.39+, on x64 and arm64.
+Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
 Node.js 22.14+ is required. See [docs/RELEASING.md](docs/RELEASING.md) for CI checks,
 trusted publishing setup, release tags, and recovery.
 

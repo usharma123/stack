@@ -7,6 +7,11 @@ if (platform !== `${process.platform}-${process.arch}`) throw new Error('Artifac
 const version = JSON.parse(readFileSync('npm/package.json')).version;
 const actual = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim();
 if (actual !== `stack ${version}`) throw new Error(`Unexpected binary version: ${actual}`);
+if (platform.startsWith('linux-')) {
+  // npm installs the same binary on every distribution; a dynamic loader would tie it to one libc.
+  const kind = execFileSync('file', ['-b', binary], { encoding: 'utf8' });
+  if (!/statically linked|static-pie linked/.test(kind)) throw new Error(`Linux binary must be statically linked: ${kind.trim()}`);
+}
 const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const sha256 = createHash('sha256').update(readFileSync(binary)).digest('hex');
 mkdirSync(`artifacts/${platform}`, { recursive: true });
