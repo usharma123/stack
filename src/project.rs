@@ -51,6 +51,15 @@ pub struct Report {
     pub written: bool,
 }
 
+/// `stack inspect` previews a project that has no lock yet; once locked it reports drift.
+pub fn inspect_mode(root: &Path) -> Mode {
+    if root.join(lock::LOCK_FILE).exists() {
+        Mode::Frozen
+    } else {
+        Mode::UseLock
+    }
+}
+
 pub fn default_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("STACK_CACHE_DIR") {
         return PathBuf::from(dir);
@@ -76,12 +85,6 @@ pub fn compile(opts: &Options) -> Result<Report> {
 /// The caller holds the project lock when publishing configuration or changing a session.
 pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
     let project = read_project(&opts.root)?;
-    if project.uses.is_empty() {
-        return Err(
-            StackError::new("manifest_invalid", "stack.toml has no [[use]] bundles")
-                .hint("add [[use]]\\nbundle = \"git+https://host/repo?ref=v1\""),
-        );
-    }
     let previous = lock::read(&opts.root)?;
     if opts.mode == Mode::Frozen && previous.is_none() {
         return Err(

@@ -146,7 +146,7 @@ pub fn read_project(root: &Path) -> Result<ProjectManifest> {
     let path = root.join(PROJECT_FILE);
     let text = fs::read_to_string(&path).map_err(|e| {
         StackError::new("manifest_missing", format!("cannot read {}: {e}", path.display()))
-            .hint("create a stack.toml with at least one [[use]] bundle")
+            .hint("create a stack.toml; see README.md for the format")
     })?;
     toml::from_str(&text).map_err(|e| {
         StackError::new("manifest_invalid", format!("{}: {}", path.display(), e.message()))

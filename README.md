@@ -38,7 +38,8 @@ services = ["postgres"]
 bin = ["bin"]          # bundle-shipped CLIs go on PATH
 ```
 
-A project uses bundles from git, an OCI registry, or a local path in `stack.toml`:
+A project uses bundles from git, an OCI registry, or a local path in `stack.toml` (or defines
+everything itself; `[[use]]` is optional):
 
 ```toml
 [[use]]
@@ -109,6 +110,7 @@ stack down                             # succeeds only once the processes are co
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
 
+- `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if an expired session could not be stopped; ownership records

@@ -146,7 +146,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         })
     };
     match name {
-        "stack_inspect" => compile(Mode::Frozen, false).map(to_value),
+        "stack_inspect" => compile(project::inspect_mode(&ctx.root), false).map(to_value),
         "stack_compile" => {
             let mode = if args["update"] == true {
                 Mode::Update

@@ -375,3 +375,32 @@ fn git_bundles_can_live_in_a_repository_subdirectory() {
     fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"{escape}\"\n")).unwrap();
     assert_eq!(sb.compile(&root, Mode::Update).unwrap_err().code, "bundle_not_found");
 }
+
+#[test]
+fn a_project_may_use_no_bundles() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\njq = \"1.7.1\"\n[services.web]\nrun = \"exec ./serve\"\n");
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(report.bundles.is_empty());
+    assert_eq!(report.stack.services["web"].origin, "project");
+}
+
+#[test]
+fn inspect_previews_a_project_before_its_first_compile() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project(&use_git(&base, "v1"));
+    let report = compile(&Options {
+        root: root.clone(),
+        mode: stack::project::inspect_mode(&root),
+        write: false,
+        cache: sb.path("cache"),
+        state: sb.path("state"),
+        reassign_ports: false,
+    })
+    .unwrap();
+    assert!(report.lock_changed);
+    assert_eq!(report.stack.services.len(), 2);
+    assert!(!root.join("stack.lock").exists());
+    assert!(!mise::output_path(&root).exists());
+}

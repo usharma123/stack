@@ -118,7 +118,9 @@ fn main() -> ExitCode {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
             project::compile(&opts(mode, true, *reassign_ports)).map(|r| report(cli.json, &r))
         }
-        Cmd::Inspect => project::compile(&opts(Mode::Frozen, false, false)).map(|r| report(cli.json, &r)),
+        Cmd::Inspect => {
+            project::compile(&opts(project::inspect_mode(&root), false, false)).map(|r| report(cli.json, &r))
+        }
         Cmd::Up { ttl, owner_pid } => ttl
             .as_deref()
             .map(parse_duration)
