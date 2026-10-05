@@ -40,5 +40,10 @@ test('real mise cannot reinterpret locked tools through project, parent, global 
     const python = updated.data.versions.find(v => v.name === 'python');
     assert.match(python.resolved, /^3\.13\.[0-9]+/);
     assert.notEqual(python.resolved, '3.12.9');
+    for (const request of ['prefix:3.13', 'sub-1:3.13']) {
+      writeFileSync(path.join(project, 'stack.toml'), `[tools]\npython="${request}"\n`);
+      const report = JSON.parse(stack('compile', '--update', '--json'));
+      assert.match(report.data.versions.find(v => v.name === 'python').resolved, /^[0-9]+\.[0-9]+\.[0-9]+/);
+    }
   } finally { rmSync(work, { recursive: true, force: true }); }
 });

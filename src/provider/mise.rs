@@ -26,6 +26,9 @@ pub fn preset_tool(preset: &str) -> Option<&'static str> {
     match preset {
         "postgres" => Some("postgres"),
         "redis" => Some("redis"),
+        "cockroachdb" => Some("cockroach"),
+        "nats" => Some("nats-server"),
+        "spicedb" => Some("spicedb"),
         _ => None,
     }
 }
@@ -33,7 +36,7 @@ pub fn preset_tool(preset: &str) -> Option<&'static str> {
 /// Requests that name something other than a release, so no version can be locked.
 pub fn unversioned(request: &str) -> bool {
     let r = request.trim();
-    r == "system" || ["path:", "ref:", "prefix:", "sub-"].iter().any(|p| r.starts_with(p))
+    r == "system" || ["path:", "ref:"].iter().any(|p| r.starts_with(p))
 }
 
 /// Finds the exact release a version request currently means.
@@ -52,6 +55,9 @@ const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 impl Resolver for MiseResolver {
     fn resolve(&self, tool: &str, request: &str) -> Result<String> {
         std::fs::create_dir_all(&self.cwd).map_err(|e| crate::error::io_error(self.cwd.display(), e))?;
+        // `latest` already interprets a bare version as a prefix; it rejects the explicit
+        // `prefix:` spelling that other mise commands accept.
+        let request = request.strip_prefix("prefix:").unwrap_or(request);
         let spec = if request.trim() == "latest" { tool.to_string() } else { format!("{tool}@{request}") };
         let mut command = Command::new("mise");
         configure_command(&mut command, &self.cwd);
@@ -444,10 +450,10 @@ mod tests {
 
     #[test]
     fn unversioned_requests_are_recognised() {
-        for r in ["system", "path:/opt/x", "ref:main", "prefix:3", "sub-1:latest"] {
+        for r in ["system", "path:/opt/x", "ref:main"] {
             assert!(unversioned(r), "{r}");
         }
-        for r in ["3.13", "latest", "lts", "17"] {
+        for r in ["3.13", "latest", "lts", "17", "prefix:3", "sub-1:latest"] {
             assert!(!unversioned(r), "{r}");
         }
     }

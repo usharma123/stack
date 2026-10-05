@@ -30,6 +30,9 @@ impl Upstream {
             ("pitchfork", &["2.29.0"]),
             ("postgres", &["16.4", "17.1", "17.2"]),
             ("redis", &["7.4.1", "8.0.2", "8.2.1"]),
+            ("cockroach", &["25.2.0"]),
+            ("nats-server", &["2.11.0"]),
+            ("spicedb", &["1.45.0"]),
         ] {
             up.publish(tool, versions);
         }
@@ -447,12 +450,12 @@ fn undocumented_service_presets_are_reported() {
     let sb = Sandbox::new();
     let root = sb.project("[services.db]\npreset = \"mysql\"\n[services.q]\npreset = \"nats\"\n");
     let report = sb.compile(&root, Mode::UseLock).unwrap();
-    assert_eq!(report.warnings.len(), 3, "{:?}", report.warnings);
+    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
     assert!(report.warnings[0].starts_with("services.db (project) uses preset 'mysql'"));
     // Presets whose installed tool stack has not verified are never silently claimed pinned.
     assert!(report.warnings[1].contains("services.db (project) uses preset 'mysql'; stack does not know which tool"));
-    assert!(report.warnings[2].contains("services.q (project) uses preset 'nats'; stack does not know which tool"));
-    assert!(report.versions.iter().all(|v| v.kind == "tool"), "{:?}", report.versions);
+    assert_eq!(resolved(&report, "q"), "2.11.0");
+    assert_eq!(sb.compile(&root, Mode::Frozen).unwrap_err().code, "unlocked_service");
 }
 
 #[test]
@@ -464,9 +467,9 @@ fn requests_that_name_no_release_are_reported() {
     let root = sb.path("app");
     fs::write(root.join("stack.toml"), "[tools]\nnode = \"system\"\n[services.db]\npreset = \"postgres\"\n").unwrap();
     let report = sb.compile(&root, Mode::UseLock).unwrap();
-    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     assert!(report.warnings[0].contains("tools.node = \"system\" (project) names no release"));
-    assert!(report.warnings[1].contains("services.db (project) sets no version"));
+    assert_eq!(resolved(&report, "db"), "17.2");
 }
 
 #[test]
@@ -689,4 +692,24 @@ fn exact_release_rules_preserve_provider_specific_and_non_semver_releases() {
     for bad in ["3", "3.13", "latest", "stable", "nightly", "system", "ref:main", "lts-22", "sub-1", "3.*"] {
         assert!(!mise::exact_release("python", bad), "{bad}");
     }
+}
+
+#[test]
+fn every_known_preset_and_omitted_version_gets_a_reusable_exact_pin() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.pg]\npreset='postgres'\n[services.redis]\npreset='redis'\n[services.cr]\npreset='cockroachdb'\n[services.nats]\npreset='nats'\n[services.spice]\npreset='spicedb'\n");
+    let first = sb.compile(&root, Mode::UseLock).unwrap();
+    for (name, version) in [("pg", "17.2"), ("redis", "8.2.1"), ("cr", "25.2.0"), ("nats", "2.11.0"), ("spice", "1.45.0")] {
+        assert_eq!(resolved(&first, name), version);
+    }
+    for (tool, version) in [("postgres", "18.1"), ("redis", "9.0.0"), ("cockroach", "26.0.0"), ("nats-server", "3.0.0"), ("spicedb", "2.0.0")] {
+        sb.upstream.publish(tool, &[version]);
+    }
+    let calls = sb.upstream.calls();
+    let frozen = sb.compile(&root, Mode::Frozen).unwrap();
+    assert_eq!(sb.upstream.calls(), calls);
+    for name in ["pg", "redis", "cr", "nats", "spice"] { assert_eq!(resolved(&frozen, name), resolved(&first, name)); }
+    let updated = sb.compile(&root, Mode::Update).unwrap();
+    assert_eq!(resolved(&updated, "nats"), "3.0.0");
+    assert_eq!(resolved(&updated, "pg"), "18.1");
 }

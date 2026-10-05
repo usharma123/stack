@@ -108,11 +108,8 @@ fn warnings(stack: &Composed) -> Vec<String> {
                 "services.{name} ({}) uses preset '{preset}'; stack does not know which tool it installs, so stack.lock cannot pin its version",
                 e.origin
             ));
-        } else if e.value.version.is_none() {
-            out.push(format!(
-                "services.{name} ({}) sets no version; the preset's default can change between machines. Set `version`",
-                e.origin
-            ));
+        } else if e.value.version.as_deref().is_some_and(mise::unversioned) {
+            out.push(format!("services.{name} ({}) names no release; stack.lock cannot pin it", e.origin));
         }
     }
     out
@@ -327,9 +324,11 @@ fn lock_versions(
         });
     }
     for (name, e) in &stack.services {
-        let (Some(preset), Some(version)) = (e.value.preset.as_deref(), e.value.version.as_ref()) else { continue };
+        let Some(preset) = e.value.preset.as_deref() else { continue };
         if let Some(tool) = mise::preset_tool(preset) {
-            requests.push(VersionRequest { kind: "service", name: name.clone(), tool: Some(tool.into()), requested: version.clone(), origin: e.origin.clone() });
+            requests.push(VersionRequest { kind: "service", name: name.clone(), tool: Some(tool.into()), requested: e.value.version.clone().unwrap_or_else(|| "latest".into()), origin: e.origin.clone() });
+        } else if opts.mode == Mode::Frozen {
+            return Err(StackError::new("unlocked_service", format!("services.{name} uses unsupported preset {preset:?}; locked mode cannot establish its tool or version")));
         }
     }
 
