@@ -79,12 +79,13 @@ provenance.
    git push origin v0.1.2
    ```
 
-`release.yml` runs only when a `v*` tag is pushed. It selects the latest push-triggered
-`ci.yml` run on `main` for that exact commit and requires the run to have completed
+`release.yml` runs only when a `v*` tag is pushed. It selects the latest eligible
+`ci.yml` run for that exact commit and requires the run to have completed
 successfully. It downloads that run's immutable `npm-package` artifact by ID,
 checks the artifact digest, then verifies the tarball's package name, version,
 source commit and all four binary checksums. It does not rebuild or repack.
-PR and manually dispatched runs are not eligible release sources.
+Eligible sources are main push runs and recovery runs manually dispatched on the
+exact release tag. PR runs and dispatches on other refs are excluded.
 
 It accepts only commits on `origin/main` in `usharma123/stack`, with a tag matching
 the Rust/npm version. Only the publish job receives `id-token: write`; selection
@@ -100,13 +101,16 @@ If publication failed or its response was lost, rerun the failed publish job to
 reuse the original artifact. Never move a release tag or republish different bytes
 under an existing version. Artifacts expire after 30 days. If selection fails because main CI is unfinished
 or failed, fix or finish that run before rerunning the release. If its artifact
-expired before publication, rerun the original main push CI run for that commit,
-then rerun release selection. Do not use manual dispatch as the replacement source.
+expired before publication, regenerate it with `gh workflow run ci.yml --ref vX.Y.Z`,
+using the exact release tag. Wait for that complete CI run to pass, then rerun the
+failed release selection job. This works even after GitHub's 30-day workflow-rerun
+window has closed. The release still verifies that the tag's commit belongs to main
+and that the package identity matches; this command does not publish anything.
 
 A rebuild may produce different bytes. For an already published version, retain
 and reuse the selected artifact; if it is unavailable, release a new version.
 Fix authentication errors rather than repeatedly publishing. A newer failed or
-unfinished main run for the commit blocks promotion even if an older run passed.
+unfinished eligible run for the commit blocks promotion even if an older run passed.
 
 GitHub release concurrency uses `queue: max` to retain pending releases. Older
 actionlint versions do not recognize this GitHub-supported field. For those

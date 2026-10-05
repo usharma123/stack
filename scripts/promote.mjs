@@ -8,14 +8,16 @@ import { pathToFileURL } from 'node:url';
 const repository = 'usharma123/stack';
 const platforms = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64'];
 
-export function selectRun(runs, commit) {
-  const candidates = runs.filter(run => run.head_sha === commit && run.head_branch === 'main' &&
-    run.event === 'push' && run.path === '.github/workflows/ci.yml' &&
+export function selectRun(runs, commit, tag) {
+  const candidates = runs.filter(run => run.head_sha === commit &&
+    ((run.head_branch === 'main' && run.event === 'push') ||
+      (tag?.startsWith('v') && run.head_branch === tag && run.event === 'workflow_dispatch')) &&
+    run.path === '.github/workflows/ci.yml' &&
     run.repository?.full_name === repository && run.head_repository?.full_name === repository);
   const run = candidates.sort((a, b) => b.id - a.id)[0];
-  assert.ok(run, 'No main CI run exists for the tagged commit; run main CI before releasing');
+  assert.ok(run, 'No eligible CI run exists for the tagged commit; run main CI or dispatch CI on the release tag');
   assert.ok(run.status === 'completed' && run.conclusion === 'success',
-    'The latest main CI run for this commit must finish successfully before releasing');
+    'The latest eligible CI run for this commit must finish successfully before releasing');
   return run;
 }
 
@@ -23,7 +25,7 @@ export function selectArtifact(artifacts, run, now = Date.now()) {
   const matches = artifacts.filter(artifact => artifact.name === 'npm-package');
   assert.equal(matches.length, 1, 'Expected exactly one npm-package artifact in the selected run');
   const artifact = matches[0];
-  assert.ok(!artifact.expired && Date.parse(artifact.expires_at) > now, 'Tested artifact expired; rerun main CI');
+  assert.ok(!artifact.expired && Date.parse(artifact.expires_at) > now, 'Tested artifact expired; dispatch ci.yml on the exact release tag');
   assert.equal(artifact.workflow_run?.id, run.id, 'Artifact belongs to another run');
   assert.equal(artifact.workflow_run?.head_sha, run.head_sha, 'Artifact belongs to another commit');
   assert.match(artifact.digest ?? '', /^sha256:[a-f0-9]{64}$/, 'Artifact must have a SHA-256 digest');
@@ -59,14 +61,14 @@ function main() {
   if (process.argv[2] === 'select') {
     const api = endpoint => JSON.parse(execFileSync('gh', ['api', '--paginate', '--slurp', endpoint],
       { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
-    const runs = api(`repos/${repository}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${commit}&per_page=100`)
+    const runs = api(`repos/${repository}/actions/workflows/ci.yml/runs?head_sha=${commit}&per_page=100`)
       .flatMap(page => page.workflow_runs);
-    const run = selectRun(runs, commit);
+    const run = selectRun(runs, commit, tag);
     const artifacts = api(`repos/${repository}/actions/runs/${run.id}/artifacts?per_page=100`)
       .flatMap(page => page.artifacts);
     const artifact = selectArtifact(artifacts, run);
     appendFileSync(process.env.GITHUB_OUTPUT, `run-id=${run.id}\nartifact-id=${artifact.id}\n`);
-    const summary = `Promoting main CI run ${run.id}, commit ${commit}, artifact ${artifact.id}, ${artifact.digest}`;
+    const summary = `Promoting tested CI run ${run.id}, commit ${commit}, artifact ${artifact.id}, ${artifact.digest}`;
     console.log(summary);
     if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary + '\n');
   } else if (process.argv[2] === 'verify') {

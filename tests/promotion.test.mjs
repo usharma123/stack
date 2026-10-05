@@ -21,7 +21,7 @@ test('promotion accepts only push CI from main in this repository at the exact c
     { head_sha: 'c'.repeat(40) }, { head_branch: 'feature' }, { event: 'pull_request' },
     { event: 'workflow_dispatch' }, { path: '.github/workflows/other.yml' },
     { repository: { full_name: 'fork/stack' } }, { head_repository: { full_name: 'fork/stack' } }
-  ]) assert.throws(() => selectRun([{ ...run, ...mutation }], commit), /No main CI/);
+  ]) assert.throws(() => selectRun([{ ...run, ...mutation }], commit), /No eligible CI/);
 });
 
 test('latest run must pass; never fall back to an older success', () => {
@@ -81,4 +81,19 @@ test('tarball identity and every platform binary are verified before publication
     delete info.hashes['darwin-arm64']; pack();
     assert.throws(() => verifyPackage(file, expected), /platform set/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// A tag dispatch can regenerate an unpublished artifact after GitHub's rerun window.
+test('exact-tag recovery accepts only successful CI for the release commit', () => {
+  const tag = 'v0.1.3';
+  const recovery = { ...run, id: 100, event: 'workflow_dispatch', head_branch: tag };
+  assert.equal(selectRun([run, recovery], commit, tag), recovery);
+  for (const mutation of [{ head_branch: 'main' }, { head_branch: 'feature' },
+    { head_branch: 'v0.1.2' }, { head_sha: 'wrong' }, { event: 'pull_request' },
+    { head_repository: { full_name: 'fork/stack' } }]) {
+    assert.throws(() => selectRun([{ ...recovery, ...mutation }], commit, tag), /No eligible CI/);
+  }
+  assert.throws(() => selectRun([run, { ...recovery, conclusion: 'failure' }], commit, tag), /must finish successfully/);
+  assert.throws(() => selectRun([run, { ...recovery, status: 'in_progress' }], commit, tag), /must finish successfully/);
+  assert.throws(() => selectRun([recovery], commit), /No eligible CI/);
 });
