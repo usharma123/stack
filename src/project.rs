@@ -49,6 +49,9 @@ pub struct Report {
     pub provider: &'static str,
     pub output: PathBuf,
     pub written: bool,
+    /// Valid but risky choices, such as tools that are not pinned to a version.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `stack inspect` previews a project that has no lock yet; once locked it reports drift.
@@ -58,6 +61,35 @@ pub fn inspect_mode(root: &Path) -> Mode {
     } else {
         Mode::UseLock
     }
+}
+
+/// Presets `mise daemons` documents. Newer mise releases may add more, so others only warn.
+const KNOWN_PRESETS: &[&str] = &["cockroachdb", "nats", "postgres", "redis", "spicedb"];
+
+fn warnings(stack: &Composed) -> Vec<String> {
+    let mut out = unpinned_tools(stack);
+    for (name, e) in &stack.services {
+        if let Some(preset) = e.value.preset.as_deref().filter(|p| !KNOWN_PRESETS.contains(p)) {
+            out.push(format!(
+                "services.{name} ({}) uses preset '{preset}', which mise does not document (known: {}); `stack up` will fail if your mise lacks it",
+                e.origin,
+                KNOWN_PRESETS.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+/// Versions that resolve differently over time, so stack.lock cannot pin them.
+fn unpinned_tools(stack: &Composed) -> Vec<String> {
+    stack
+        .tools
+        .iter()
+        .filter(|(_, e)| matches!(e.value.trim(), "latest" | "lts" | "*" | ""))
+        .map(|(name, e)| {
+            format!("tools.{name} = \"{}\" ({}) is not pinned; installs can change between machines", e.value, e.origin)
+        })
+        .collect()
 }
 
 pub fn default_cache_dir() -> PathBuf {
@@ -162,8 +194,10 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         ports::lookup(&opts.state, &opts.root)?
     };
 
+    let warnings = warnings(&stack);
     Ok(Report {
         bundles: reports,
+        warnings,
         stack,
         ports,
         lock_changed,

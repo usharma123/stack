@@ -117,8 +117,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   are kept so it can be retried. Sessions of deleted projects are listed but cannot be stopped by
   stack (see `mise daemons prune`).
 - `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
+- `compile` warns about tools that are not pinned (`latest`, `lts`), since the lock cannot pin them.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
   Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
+- `compile` also warns about service presets mise does not document (it currently documents
+  cockroachdb, nats, postgres, redis and spicedb).
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload

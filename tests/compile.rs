@@ -383,6 +383,25 @@ fn a_project_may_use_no_bundles() {
     let report = sb.compile(&root, Mode::UseLock).unwrap();
     assert!(report.bundles.is_empty());
     assert_eq!(report.stack.services["web"].origin, "project");
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn undocumented_service_presets_are_reported() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.db]\npreset = \"mysql\"\n[services.q]\npreset = \"nats\"\n");
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].starts_with("services.db (project) uses preset 'mysql'"));
+}
+
+#[test]
+fn unpinned_tools_are_reported() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let report = sb.compile(&sb.project(&use_git(&base, "v1")), Mode::UseLock).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("tools.uv = \"latest\" (bundle:pybase)"));
 }
 
 #[test]

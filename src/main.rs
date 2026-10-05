@@ -233,6 +233,9 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             let replaced = if o.replaced.is_empty() { "nothing".into() } else { o.replaced.join(", ") };
             println!("override {}.{} (replaced: {replaced})", o.kind, o.key);
         }
+        for w in &r.warnings {
+            eprintln!("warning: {w}");
+        }
         if r.written {
             println!("wrote {}{}", r.output.display(), if r.lock_changed { " and stack.lock" } else { "" });
         }
