@@ -106,6 +106,7 @@ stack down                             # succeeds only once the processes are co
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc` | Renew this session's lease / reclaim expired sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
+| `stack doctor` | Check mise, git and tar, and that the project compiles |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
@@ -142,6 +143,8 @@ stack --version
 ```
 
 Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
+Services need [mise](https://mise.jdx.dev) on PATH; stack installs everything else, including
+Pitchfork, through it. Run `stack doctor` to check a machine.
 Node.js 22.14+ is required. See [docs/RELEASING.md](docs/RELEASING.md) for CI checks,
 trusted publishing setup, release tags, and recovery.
 

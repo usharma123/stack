@@ -84,6 +84,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Check that mise, git and tar are usable and the project compiles
+    Doctor,
     /// Serve the stack tools over MCP (stdio)
     Mcp,
 }
@@ -184,6 +186,13 @@ fn main() -> ExitCode {
         }),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
+        }),
+        Cmd::Doctor => stack::doctor::run(&root, &ctx.cache, &ctx.state).map(|checks| {
+            emit(cli.json, &checks, || {
+                for c in &checks {
+                    println!("ok    {:<13} {}", c.name, c.detail);
+                }
+            })
         }),
         Cmd::Mcp => unreachable!("handled above"),
     };

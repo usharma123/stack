@@ -96,6 +96,8 @@ fn tools() -> Value {
           }), &["command"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_gc", "description": "Reclaim sessions with expired leases machine-wide. Fails (gc_incomplete) if any expired session could not be stopped.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed and the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
 
@@ -182,6 +184,8 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
         "stack_down" => session::down(ctx).map(to_value),
+        "stack_gc" => session::gc_checked(&ctx.state).map(to_value),
+        "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_exec" => exec(args, ctx),
         _ => Err(StackError::new(
             "unknown_tool",
