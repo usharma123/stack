@@ -219,7 +219,11 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
             .as_u64()
             .unwrap_or(DEFAULT_EXEC_TIMEOUT),
     );
+    run_captured(ctx, &plan, timeout)
+}
 
+/// Run a planned command with bounded output capture; shared by MCP and `stack exec --json`.
+pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> Result<Value> {
     // Inherit the server's environment as raw bytes, like `stack exec`; `std::env::vars`
     // panics on values that are not Unicode.
     let mut command = Command::new(&plan.program);

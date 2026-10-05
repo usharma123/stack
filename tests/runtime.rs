@@ -896,6 +896,31 @@ fn mcp_rejects_owner_pids_outside_the_supported_range_before_lifecycle_work() {
 }
 
 #[test]
+fn exec_json_reports_the_command_in_one_object_and_keeps_its_exit_code() {
+    let fixture = Fixture::new();
+    let out = fixture
+        .command(&["--json", "exec", "--", "sh", "-c", "echo out; echo err >&2; exit 3"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let result: Value = serde_json::from_slice(&out.stdout).expect("stdout is exactly one JSON object");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["data"]["exit_code"], 3);
+    assert_eq!(result["data"]["stdout"], "out\n");
+    assert_eq!(result["data"]["stderr"], "err\n");
+
+    let out = fixture
+        .command(&["--json", "exec", "--timeout", "1s", "--", "sleep", "10"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(124));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"]["timed_out"], true);
+
+    let out = fixture.command(&["exec", "--timeout", "1s", "--", "true"]).output().unwrap();
+    assert!(!out.status.success(), "--timeout without --json is rejected");
+}
+
+#[test]
 fn argument_errors_honour_json() {
     let fixture = Fixture::new();
     for args in [

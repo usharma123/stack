@@ -12,6 +12,7 @@ use stack::source::Mode;
 use stack::state::default_state_dir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "stack", version, about = "Reusable, agent-safe development stacks")]
@@ -61,6 +62,9 @@ enum Cmd {
         /// Fail unless every service verifies
         #[arg(long, conflicts_with = "require")]
         require_all: bool,
+        /// With --json: stop the command after this long (e.g. 10m). Default: no limit
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
@@ -144,7 +148,7 @@ fn main() -> ExitCode {
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
-        Cmd::Exec { require, require_all, cmd } => {
+        Cmd::Exec { require, require_all, timeout, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -152,7 +156,14 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            exec(&ctx, cmd, &req)
+            if cli.json {
+                exec_json(&ctx, cmd, &req, timeout.as_deref())
+            } else if timeout.is_some() {
+                Err(StackError::new("usage", "--timeout applies only with --json")
+                    .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
+            } else {
+                exec(&ctx, cmd, &req)
+            }
         }
         Cmd::Down => session::down(&ctx).map(|r| emit(cli.json, &r, || println!("stopped {} service(s); confirmed", r.stopped.len()))),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
@@ -242,6 +253,25 @@ fn exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExitCode> {
         .status()
         .map_err(|e| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display())))?;
     Ok(ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8))
+}
+
+/// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
+/// The process exits with the command's code (124 on timeout, like `timeout(1)`).
+fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+    // Large enough to mean "no limit" without overflowing deadline arithmetic.
+    let timeout = match timeout {
+        Some(t) => Duration::from_secs(parse_duration(t)?),
+        None => Duration::from_secs(365 * 24 * 3600),
+    };
+    let plan = session::plan_exec(ctx, cmd, require)?;
+    let result = mcp::run_captured(ctx, &plan, timeout)?;
+    let code = if result["timed_out"] == true {
+        124
+    } else {
+        result["exit_code"].as_i64().unwrap_or(1).clamp(0, 255) as u8
+    };
+    println!("{}", json!({ "ok": true, "data": result }));
+    Ok(ExitCode::from(code))
 }
 
 fn publish(bundle: &Path, target: &str) -> Result<serde_json::Value> {

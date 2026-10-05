@@ -96,13 +96,16 @@ stack down                             # succeeds only once the processes are co
 | `stack inspect` | Show the composed stack, origins and ports; writes nothing |
 | `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
-| `stack exec [--require S \| --require-all] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc` | Renew this session's lease / reclaim expired sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag>` | Publish a bundle as an OCI artifact |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
+
+- `exec --json` captures at most 64 KiB of each stream into the result and exits with the
+  command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
