@@ -54,8 +54,43 @@ jobs:
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: cargo +1.93.1 build --locked
       - run: bash tests/e2e/ci-oci.sh target/debug/stack
+  # The service/session scenarios against real mise + Pitchfork, natively on each OS.
+  # Scenario 5 (OCI) runs where Docker provides a registry; elsewhere it is reported as skipped.
+  services:
+    name: Services (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, platform: linux-x64, mise: linux-x64, mise_sha256: 4312f8fd72a8d6a869cd2aca7444929e2a0ef6f45d2c6f2866a1eacc5bdc2e84, registry: true }
+          - { runner: macos-15, platform: darwin-arm64, mise: macos-arm64, mise_sha256: b3539de1a9823505269481b71d09a9cf86e141c63ebfc6101b3cf561766a83e8, registry: false }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.93.1 --profile minimal
+      - name: Install pinned mise
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/mise.tgz" "https://github.com/jdx/mise/releases/download/v2026.9.18/mise-v2026.9.18-${{ matrix.mise }}.tar.gz"
+          echo "${{ matrix.mise_sha256 }}  $RUNNER_TEMP/mise.tgz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/mise.tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
+      - run: cargo +1.93.1 build --locked
+      - name: Start a local OCI registry
+        if: matrix.registry
+        run: |
+          docker run -d --name stack-e2e-registry -p 127.0.0.1:5000:5000 registry:2.8.3
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:5000/v2/ && break; sleep 1; done
+          echo "STACK_E2E_REGISTRY=localhost:5000" >> "$GITHUB_ENV"
+      - run: bash tests/e2e/native.sh target/debug/stack
+        env:
+          STACK_E2E_RESULTS: ${{ runner.temp }}/e2e-results.jsonl
+      - if: always()
+        run: cat "$RUNNER_TEMP/e2e-results.jsonl" || true
   package:
-    needs: [native, oci]
+    needs: [native, oci, services]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
