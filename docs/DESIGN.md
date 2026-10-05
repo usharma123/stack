@@ -79,6 +79,8 @@ resolve a conflict or replace a value, and every override is reported with what 
 - **MCP execution.** Unix process groups bound command descendants. Output is drained through
   nonblocking pipes with fixed-size tails; neither a full pipe nor a detached descendant can
   extend collection beyond command completion or the deadline.
+- **Projects without services** never query the supervisor: `down`, `status` and `exec` have
+  nothing to reconcile, and `mise daemons` is not configured for them.
 - **Partial failure.** `up` returns completed steps, whether services may have been started
   (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
 

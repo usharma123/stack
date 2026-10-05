@@ -561,13 +561,17 @@ pub fn down(ctx: &Ctx) -> Result<DownReport> {
 }
 
 fn down_locked(ctx: &Ctx) -> Result<DownReport> {
-    // Failure to discover ownership cannot establish that nothing is running.
-    let before = mise::daemons(&ctx.root)?;
     let session = load(ctx)?;
     let mut ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?
         .values()
         .copied()
         .collect();
+    // Services always hold a port reservation from compile, and a session record names any
+    // process stack started. With neither, stack owns nothing and the supervisor (which may
+    // not even be configured for a tools-only project) has nothing to report.
+    let owns_services = !ports.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
+    // Failure to discover ownership cannot establish that nothing is running.
+    let before = if owns_services { mise::daemons(&ctx.root)? } else { Vec::new() };
     let mut pids: Vec<(String, u32)> = before
         .iter()
         .filter_map(|d| d.pid.map(|p| (d.name.clone(), p)))

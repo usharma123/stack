@@ -896,6 +896,19 @@ fn mcp_rejects_owner_pids_outside_the_supported_range_before_lifecycle_work() {
 }
 
 #[test]
+fn tools_only_projects_never_need_the_service_supervisor() {
+    let fixture = Fixture::new();
+    // `mise daemons` is experimental and unconfigured without services; any query would fail.
+    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
+    fixture.ok(&["up"]);
+    fixture.ok(&["status"]);
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.ok(&["down"]);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons"), "supervisor queried:\n{log}");
+}
+
+#[test]
 fn gc_fails_when_an_expired_session_cannot_be_stopped() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "1s"]);
