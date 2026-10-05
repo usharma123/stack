@@ -7,3 +7,13 @@
 /npm/binaries/
 /npm/build-info.json
 /npm/README.md
+
+# Local evaluation output
+/eval/results/
+/eval/*-report.html
+
+# OS metadata and Python caches
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/

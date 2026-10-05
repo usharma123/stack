@@ -1,0 +1,127 @@
+[
+  {
+    "step": "versions",
+    "exit_code": 0,
+    "ms": 264.71
+  },
+  {
+    "step": "appA-compile",
+    "exit_code": 0,
+    "ms": 13.53
+  },
+  {
+    "step": "appA-up",
+    "exit_code": 0,
+    "ms": 13187.69
+  },
+  {
+    "step": "appA-tests",
+    "exit_code": 0,
+    "ms": 5274.09
+  },
+  {
+    "step": "appA-identity",
+    "exit_code": 0,
+    "ms": 178.83
+  },
+  {
+    "step": "appB-compile",
+    "exit_code": 0,
+    "ms": 11.2
+  },
+  {
+    "step": "appB-up",
+    "exit_code": 0,
+    "ms": 1387.08
+  },
+  {
+    "step": "appB-tests",
+    "exit_code": 0,
+    "ms": 3375.46
+  },
+  {
+    "step": "appB-identity",
+    "exit_code": 0,
+    "ms": 170.38
+  },
+  {
+    "step": "exec-0",
+    "exit_code": 0,
+    "ms": 152.81
+  },
+  {
+    "step": "exec-1",
+    "exit_code": 0,
+    "ms": 154.27
+  },
+  {
+    "step": "exec-2",
+    "exit_code": 0,
+    "ms": 155.52
+  },
+  {
+    "step": "exec-3",
+    "exit_code": 0,
+    "ms": 155.95
+  },
+  {
+    "step": "exec-4",
+    "exit_code": 0,
+    "ms": 152.29
+  },
+  {
+    "step": "exec-5",
+    "exit_code": 0,
+    "ms": 189.68
+  },
+  {
+    "step": "exec-6",
+    "exit_code": 0,
+    "ms": 154.08
+  },
+  {
+    "step": "exec-7",
+    "exit_code": 0,
+    "ms": 157.38
+  },
+  {
+    "step": "exec-8",
+    "exit_code": 0,
+    "ms": 150.58
+  },
+  {
+    "step": "exec-9",
+    "exit_code": 0,
+    "ms": 156.16
+  },
+  {
+    "step": "idempotent-up",
+    "exit_code": 0,
+    "ms": 212.05
+  },
+  {
+    "step": "appA-down",
+    "exit_code": 0,
+    "ms": 120.89
+  },
+  {
+    "step": "appB-still-works",
+    "exit_code": 0,
+    "ms": 920.74
+  },
+  {
+    "step": "withheld-env",
+    "exit_code": 0,
+    "ms": 66.42
+  },
+  {
+    "step": "required-refusal",
+    "exit_code": 1,
+    "ms": 58.41
+  },
+  {
+    "step": "appB-down",
+    "exit_code": 0,
+    "ms": 192.57
+  }
+]

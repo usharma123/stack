@@ -1,0 +1,15 @@
+# A project consuming two bundles. Bundles both set LOG_LEVEL, so the
+# project must resolve it explicitly; stack refuses to pick a winner.
+
+[[use]]
+bundle = "path:../bundles/pybase"
+
+[[use]]
+bundle = "path:../bundles/obs"
+
+[tasks.test]
+run = "uv sync -q && uv run pytest -q"
+services = ["postgres", "redis"]
+
+[override.env]
+LOG_LEVEL = "warn"

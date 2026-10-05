@@ -1,0 +1,10 @@
+[bundle]
+name = "obs"
+description = "Observability defaults"
+
+[tools]
+jq = "latest"
+
+[env]
+LOG_LEVEL = "debug"
+OTEL_SERVICE_NAME = "app"

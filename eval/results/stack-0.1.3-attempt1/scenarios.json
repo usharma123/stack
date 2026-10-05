@@ -1,0 +1,27 @@
+[
+  {
+    "scenario": "benchmark",
+    "exit_code": 0,
+    "seconds": 17.132
+  },
+  {
+    "scenario": "1-independent-checkouts",
+    "exit_code": 0,
+    "seconds": 4.062
+  },
+  {
+    "scenario": "2-wrong-instance",
+    "exit_code": 0,
+    "seconds": 3.272
+  },
+  {
+    "scenario": "3-leases",
+    "exit_code": 0,
+    "seconds": 22.419
+  },
+  {
+    "scenario": "4-mcp",
+    "exit_code": 1,
+    "seconds": 1.26
+  }
+]
