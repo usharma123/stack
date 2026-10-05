@@ -86,7 +86,7 @@ resolve a conflict or replace a value, and every override is reported with what 
 
 ## Distribution
 
-`git+<url>?ref=` pins a commit; `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
+`git+<url>?ref=[&dir=<subdir>]` pins a commit (other parameters are rejected); `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
 a content hash. A bundle's content hash is identical across transports (deterministic archives).
 OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
 

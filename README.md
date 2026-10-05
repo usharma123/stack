@@ -47,6 +47,9 @@ bundle = "git+https://github.com/acme/pybase?ref=v1"
 [[use]]
 bundle = "oci:ghcr.io/acme/obs:2.0.0"
 
+[[use]]
+bundle = "git+https://github.com/acme/bundles?ref=v3&dir=node"   # a bundle in a subdirectory
+
 [tasks.test]
 run = "uv sync -q && uv run pytest -q"
 services = ["postgres", "redis"]
@@ -111,6 +114,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `gc` fails with `gc_incomplete` if an expired session could not be stopped; ownership records
   are kept so it can be retried. Sessions of deleted projects are listed but cannot be stopped by
   stack (see `mise daemons prune`).
+- Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
+  Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
