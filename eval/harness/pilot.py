@@ -60,12 +60,12 @@ def isolated_env(work, inherited=None):
     home = work / "h"
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
                XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".local/share"),
-               XDG_STATE_HOME=str(home / ".local/state"), STACK_STATE_DIR=str(work / "state"),
-               STACK_CACHE_DIR=str(work / "cache"), PITCHFORK_STATE_DIR=str(work / "pf"),
-               MISE_DATA_DIR=str(work / "mise/data"), MISE_CACHE_DIR=str(work / "mise/cache"),
-               MISE_STATE_DIR=str(work / "mise/state"), MISE_CONFIG_DIR=str(work / "mise/config"),
-               MISE_GLOBAL_CONFIG_FILE=str(work / "mise/config/config.toml"),
-               MISE_SYSTEM_CONFIG_FILE=str(work / "mise/config/system.toml"),
+               XDG_STATE_HOME=str(home / ".local/state"), STACK_STATE_DIR=str(home / ".local/state/stack"),
+               STACK_CACHE_DIR=str(home / ".cache/stack"), PITCHFORK_STATE_DIR=str(work / "pf"),
+               MISE_DATA_DIR=str(home / ".local/share/mise"), MISE_CACHE_DIR=str(home / ".cache/mise"),
+               MISE_STATE_DIR=str(home / ".local/state/mise"), MISE_CONFIG_DIR=str(home / ".config/mise"),
+               MISE_GLOBAL_CONFIG_FILE=str(home / ".config/mise/config.toml"),
+               MISE_SYSTEM_CONFIG_FILE=str(home / ".config/mise/system.toml"),
                MISE_CEILING_PATHS=str(work), MISE_YES="1", NO_COLOR="1")
     return env
 
@@ -294,8 +294,18 @@ def main():
             subprocess.run([run.stack, "-C", str(app), "down", "--json"], env=run.env, capture_output=True, timeout=120)
         apps = sorted(run.work.glob("*/p*"))
         if apps:
-            subprocess.run(["mise", "exec", "--", "pitchfork", "supervisor", "stop"], cwd=apps[0], env=run.env,
-                           capture_output=True, timeout=60)
+            found = subprocess.run(["mise", "which", "pitchfork"], cwd=apps[0], env=run.env,
+                                   capture_output=True, text=True, timeout=60)
+            if found.returncode == 0 and found.stdout.strip():
+                supervisor = pathlib.Path(found.stdout.strip()).resolve()
+                try:
+                    supervisor.relative_to(run.work)
+                except ValueError:
+                    run.event(step="cleanup", error="refused supervisor binary outside isolated work directory")
+                else:
+                    subprocess.run([str(supervisor), "supervisor", "stop"],
+                                   env=dict(run.env, PITCHFORK_STATE_DIR=str(run.work / "pf")),
+                                   capture_output=True, timeout=60)
         run.events.close()
 
     phases = {}

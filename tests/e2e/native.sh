@@ -45,7 +45,13 @@ cleanup() {
   for app in "$work"/w/*/; do
     [ -f "$app/stack.toml" ] && "$binary" -C "$app" down --json >/dev/null 2>&1 || true
   done
-  (cd "$work/w/appA" 2>/dev/null && mise exec -- pitchfork supervisor stop >/dev/null 2>&1) || true
+  local supervisor
+  supervisor=$(cd "$work/w/appA" 2>/dev/null && mise which pitchfork 2>/dev/null) || supervisor=
+  # Invoke the isolated binary directly with its explicit state directory. `mise exec`
+  # would evaluate project env again while choosing the supervisor to stop.
+  case "$supervisor" in
+    "$work"/*) PITCHFORK_STATE_DIR="$work/pf" "$supervisor" supervisor stop >/dev/null 2>&1 || true ;;
+  esac
   if [ "$status" -eq 0 ] && [ -z "${STACK_E2E_KEEP:-}" ]; then rm -rf "$work"; else echo "work dir kept: $work" >&2; fi
   exit "$status"
 }

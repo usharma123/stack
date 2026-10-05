@@ -19,6 +19,8 @@ assert all('/sentinel' not in v for v in env.values())
 assert env['PATH'] == '/usr/bin'
 assert env['PITCHFORK_STATE_DIR'] == '/tmp/isolated/pf'
 assert 'MISE_CONFIG_FILE' not in env
+for key in ['STACK_STATE_DIR','STACK_CACHE_DIR','MISE_DATA_DIR','MISE_CACHE_DIR','MISE_STATE_DIR']:
+    assert env[key].startswith('/tmp/isolated/h/'), key
 `]);
 });
 
