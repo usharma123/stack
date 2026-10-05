@@ -896,6 +896,27 @@ fn mcp_rejects_owner_pids_outside_the_supported_range_before_lifecycle_work() {
 }
 
 #[test]
+fn gc_fails_when_an_expired_session_cannot_be_stopped() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "1s"]);
+    let paths = fixture.session_paths();
+    let mut session: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+    session["services"] = json!({ "worker": { "port":0, "pid":std::process::id(), "identity":"liveness", "verified_at":0 } });
+    for path in &paths {
+        fs::write(path, session.to_string()).unwrap();
+    }
+    fs::write(fixture.dir.path().join("fail-stop"), "").unwrap();
+    thread::sleep(Duration::from_secs(2));
+    let out = fixture.command(&["gc", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "gc_incomplete");
+    assert_eq!(result["error"]["details"][0]["stopped"], false);
+    assert!(paths.iter().all(|p| p.exists()), "ownership kept for a retry");
+}
+
+#[test]
 fn exec_json_reports_the_command_in_one_object_and_keeps_its_exit_code() {
     let fixture = Fixture::new();
     let out = fixture

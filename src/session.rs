@@ -1212,6 +1212,22 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
     Ok(out)
 }
 
+/// Like [`gc`], but fails when an expired session it tried to stop is still running. Sessions
+/// of deleted projects are reported (stack cannot stop them) without failing.
+pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
+    let entries = gc(state)?;
+    let failed = entries.iter().filter(|e| !e.stopped && e.project.exists()).count();
+    if failed == 0 {
+        return Ok(entries);
+    }
+    Err(StackError::new(
+        "gc_incomplete",
+        format!("{failed} expired session(s) could not be stopped"),
+    )
+    .hint("retry `stack gc`, or run `stack down` in the listed project")
+    .details(entries.iter().map(|e| serde_json::to_value(e).expect("gc entry serializes")).collect()))
+}
+
 fn load(ctx: &Ctx) -> Result<Option<Session>> {
     // The machine index is authoritative. A crash between the two atomic writes can
     // leave the project copy behind; lifecycle operations always use the indexed generation.

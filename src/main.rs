@@ -167,7 +167,7 @@ fn main() -> ExitCode {
         }
         Cmd::Down => session::down(&ctx).map(|r| emit(cli.json, &r, || println!("stopped {} service(s); confirmed", r.stopped.len()))),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc => session::gc(&ctx.state).map(|r| {
+        Cmd::Gc => session::gc_checked(&ctx.state).map(|r| {
             emit(cli.json, &r, || {
                 for e in &r {
                     println!("{}: {} ({})", e.project.display(), e.reason, if e.stopped { "stopped" } else { "not stopped" });

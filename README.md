@@ -85,8 +85,10 @@ stack down                             # succeeds only once the processes are co
   recorded processes and ports are gone.
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe.
-- **Agent-friendly.** `--json` emits one object on stdout; errors have a stable `code`, a `hint`
-  and `details`. `stack mcp` serves the same contract over MCP. Git never prompts.
+- **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
+  `exec` (whose output is captured into the object); errors have a stable `code`, a `hint` and
+  `details`. A command that could not do its job reports `ok: false`. `stack mcp` serves the same
+  contract over MCP. Git never prompts.
 
 ## Commands
 
@@ -106,6 +108,9 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
+- `gc` fails with `gc_incomplete` if an expired session could not be stopped; ownership records
+  are kept so it can be retried. Sessions of deleted projects are listed but cannot be stopped by
+  stack (see `mise daemons prune`).
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
