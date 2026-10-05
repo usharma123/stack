@@ -34,7 +34,9 @@ check; this pipeline does not claim full service lifecycle coverage on macOS.
 
 `@ushawarma/stack@0.1.0` was bootstrapped from the fully tested CI artifact.
 Its trusted publisher is configured for the repository and workflow below.
-Version `0.1.1` is prepared for the first OIDC release after this PR is merged.
+The `v0.1.1` tag records a failed publication caused by a relative tarball path.
+It remains unchanged. Version `0.1.2` includes the path fix and is prepared for
+the first OIDC release.
 
 
 The first package publication needs an authenticated npm maintainer. Once npm
@@ -72,8 +74,8 @@ provenance.
 3. Create and push an annotated tag matching the version:
 
    ```sh
-   git tag -a v0.1.1 -m 'Release 0.1.1'
-   git push origin v0.1.1
+   git tag -a v0.1.2 -m 'Release 0.1.2'
+   git push origin v0.1.2
    ```
 
 `release.yml` runs only when a `v*` tag is pushed and repeats all checks before
