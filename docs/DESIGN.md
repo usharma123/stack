@@ -110,7 +110,8 @@ staging directory behind.
 
 ## Not covered yet
 
-- macOS: compile/inspect are tested; services and sessions are only tested on Linux.
+- macOS: compile/inspect are tested automatically; services and sessions have been verified by
+  hand (Postgres, Redis, custom services) but the automated end-to-end suite runs on Linux only.
 - Identity checks exist for Postgres and Redis presets only; other services are liveness-only.
 - OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
 - Expired leases are reclaimed lazily (next `gc`/`up`), not by a background process.

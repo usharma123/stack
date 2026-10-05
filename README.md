@@ -121,8 +121,15 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `compile` warns about tools that are not pinned (`latest`, `lts`), since the lock cannot pin them.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
   Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
+- `up` and `exec` mark the generated mise config as trusted, so `run` commands from the bundles
+  you use execute without mise's trust prompt. Review bundles as you would any dependency.
 - `compile` also warns about service presets mise does not document (it currently documents
   cockroachdb, nats, postgres, redis and spicedb).
+- For a custom service, connect with `http://127.0.0.1:$<NAME>_PORT`. mise also sets
+  `<NAME>_URL` to a Pitchfork proxy hostname (`https://<name>.<project>.localhost`), which only
+  answers when Pitchfork's proxy is running.
+- A custom service's `run` should `exec` its server (`run = "exec python3 -m http.server $PORT"`),
+  so the supervisor stops the server itself rather than a wrapping shell.
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
