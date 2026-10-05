@@ -365,6 +365,20 @@ pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
         .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons --json` output: {e}")))
 }
 
+/// `env` and `daemons` at once. Both only read provider state for the same configuration, so
+/// they run concurrently; errors are reported in the order the two used to run.
+pub fn env_and_daemons(root: &Path) -> Result<(IndexMap<String, String>, Vec<DaemonStatus>)> {
+    let (env, daemons) = std::thread::scope(|scope| {
+        let statuses = scope.spawn(|| daemons(root));
+        let env = env(root);
+        let statuses = statuses
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (env, statuses)
+    });
+    Ok((env?, daemons?))
+}
+
 /// The Pitchfork binary mise runs for this project, so stopping does not need the project.
 pub fn which_pitchfork(root: &Path) -> Option<PathBuf> {
     let out = mise(root, &["which", "pitchfork"]).ok()?;

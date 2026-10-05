@@ -13,13 +13,14 @@ use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json};
+use crate::timing::Timings;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -177,46 +178,93 @@ pub struct Check {
 
 // ---- verification --------------------------------------------------------------------------
 
+/// Services verified at once. A check mostly waits on a socket or a client process, so a few
+/// threads hide that latency; the bound keeps a large stack from spawning every client at once.
+const VERIFY_CONCURRENCY: usize = 8;
+
+/// Check every service now. Services are independent, so they are checked concurrently; the
+/// result keeps manifest order.
 fn verify_all(
     root: &Path,
     report: &Report,
     env: &IndexMap<String, String>,
     statuses: &[DaemonStatus],
+    timings: &Timings,
 ) -> Vec<Check> {
     let inherited = inherited_env();
-    report
+    let check = |&(name, service): &(&String, &Service)| {
+        let port = report.ports.get(name).copied();
+        let status = statuses.iter().find(|d| d.name == *name);
+        let mut check = Check {
+            service: name.clone(),
+            ready: false,
+            port,
+            pid: status.and_then(|s| s.pid),
+            identity: None,
+            reason: None,
+            withheld: Vec::new(),
+            checked_at: now(),
+            data_dir: status.and_then(|s| s.data_dir.clone()),
+            provider_id: status.and_then(|s| s.id.clone()),
+        };
+        let token = report.identities.get(name).map(String::as_str);
+        let started = Instant::now();
+        let verified = verify_one(root, service, port, status, env, token);
+        if timings.enabled() {
+            timings.record(&format!("verify.{name}"), started.elapsed());
+        }
+        match verified {
+            Ok(identity) => {
+                check.ready = true;
+                check.identity = Some(identity);
+            }
+            Err(reason) => {
+                check.reason = Some(reason);
+                check.withheld = binding_vars(name, service, port, env, &inherited);
+            }
+        }
+        check
+    };
+    let services: Vec<(&String, &Service)> = report
         .stack
         .services
         .iter()
-        .map(|(name, entry)| {
-            let port = report.ports.get(name).copied();
-            let status = statuses.iter().find(|d| d.name == *name);
-            let mut check = Check {
-                service: name.clone(),
-                ready: false,
-                port,
-                pid: status.and_then(|s| s.pid),
-                identity: None,
-                reason: None,
-                withheld: Vec::new(),
-                checked_at: now(),
-                data_dir: status.and_then(|s| s.data_dir.clone()),
-                provider_id: status.and_then(|s| s.id.clone()),
-            };
-            let token = report.identities.get(name).map(String::as_str);
-            match verify_one(root, &entry.value, port, status, env, token) {
-                Ok(identity) => {
-                    check.ready = true;
-                    check.identity = Some(identity);
-                }
-                Err(reason) => {
-                    check.reason = Some(reason);
-                    check.withheld = binding_vars(name, &entry.value, port, env, &inherited);
-                }
-            }
-            check
-        })
-        .collect()
+        .map(|(name, entry)| (name, &entry.value))
+        .collect();
+    concurrently(&services, VERIFY_CONCURRENCY, check)
+}
+
+/// `items.iter().map(f).collect()`, run on up to `limit` scoped threads. Results keep the order
+/// of `items`; a panic in `f` is propagated to the caller.
+fn concurrently<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = items.len().min(limit);
+    if workers <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break mine };
+                        mine.push((i, f(item)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| {
+                h.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    done.sort_unstable_by_key(|&(i, _)| i);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 fn verify_one(
@@ -341,7 +389,12 @@ fn same_path(a: &str, b: &str) -> bool {
     !a.is_empty() && canon(a) == canon(b)
 }
 
-/// Run a client binary from the stack's PATH with a hard deadline.
+/// Bytes of client output kept. The probes print one short line; more is not an answer.
+const PROBE_OUTPUT_LIMIT: usize = 16 * 1024;
+
+/// Run a client binary from the stack's PATH with a hard deadline. Like identity probes, it runs
+/// in its own process group, which is killed at the deadline or on completion, and its output is
+/// bounded.
 fn run_probe(
     env: &IndexMap<String, String>,
     bin: &str,
@@ -349,40 +402,28 @@ fn run_probe(
 ) -> std::result::Result<String, String> {
     let path = which_in(env.get("PATH").map(String::as_str), bin)
         .ok_or_else(|| format!("{bin} not found on the stack's PATH"))?;
-    let mut child = Command::new(path)
-        .args(args)
-        .envs(env)
-        .env("PGCONNECT_TIMEOUT", "3")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut command = Command::new(path);
+    command.args(args).envs(env).env("PGCONNECT_TIMEOUT", "3");
+    let out = crate::process::capture(&mut command, PROBE_TIMEOUT, PROBE_OUTPUT_LIMIT)
         .map_err(|e| format!("cannot run {bin}: {e}"))?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(25)),
-            _ => {
-                let _ = child.kill();
-                return Err(format!(
-                    "{bin} did not answer within {}s",
-                    PROBE_TIMEOUT.as_secs()
-                ));
-            }
-        }
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("{bin}: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    if out.timed_out {
         return Err(format!(
-            "{bin} failed: {}",
-            err.lines().next().unwrap_or("").trim()
+            "{bin} did not answer within {}s",
+            PROBE_TIMEOUT.as_secs()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    if out.exit_code != Some(0) {
+        return Err(format!(
+            "{bin} failed: {}",
+            out.stderr.lines().next().unwrap_or("").trim()
+        ));
+    }
+    if out.stdout_truncated {
+        return Err(format!(
+            "{bin} printed more than {PROBE_OUTPUT_LIMIT} bytes"
+        ));
+    }
+    Ok(out.stdout)
 }
 
 pub fn which_in(path: Option<&str>, bin: &str) -> Option<PathBuf> {
@@ -641,12 +682,13 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps.ok("start", json!(null));
 
         let deadline = Instant::now() + READY_TIMEOUT;
+        let timings = Timings::new("up_verify");
         loop {
             let statuses =
                 mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
             record_launch_observations(ctx, &statuses).map_err(|e| steps.clone().fail("record_observed", e, true))?;
             let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
-            checks = verify_all(&ctx.root, &report, &env, &statuses);
+            checks = verify_all(&ctx.root, &report, &env, &statuses, &timings);
             if checks.iter().all(|c| c.ready) {
                 break;
             }
@@ -895,9 +937,15 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let checks = if report.stack.services.is_empty() {
         Vec::new()
     } else {
-        let env = mise::env(&ctx.root)?;
-        let statuses = mise::daemons(&ctx.root)?;
-        verify_session(ctx, &report, &env, &statuses, session.as_ref())
+        let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
+        verify_session(
+            ctx,
+            &report,
+            &env,
+            &statuses,
+            session.as_ref(),
+            &Timings::new("status"),
+        )
     };
     Ok(StatusReport {
         lease_expired: session
@@ -1227,21 +1275,24 @@ pub enum Require {
 
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
+    let mut timings = Timings::new("exec");
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    timings.mark("lock");
     let mut session = load(ctx)?;
     let report = ctx.compile(true)?;
+    timings.mark("compile");
     mise::trust(&ctx.root)?;
-    let mut env = mise::env(&ctx.root)?;
-    let checks = if report.stack.services.is_empty() {
-        Vec::new()
+    timings.mark("trust");
+    let (mut env, checks) = if report.stack.services.is_empty() {
+        let env = mise::env(&ctx.root)?;
+        timings.mark("env");
+        (env, Vec::new())
     } else {
-        verify_session(
-            ctx,
-            &report,
-            &env,
-            &mise::daemons(&ctx.root)?,
-            session.as_ref(),
-        )
+        let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
+        timings.mark("env_daemons");
+        let checks = verify_session(ctx, &report, &env, &statuses, session.as_ref(), &timings);
+        timings.mark("verify");
+        (env, checks)
     };
 
     let required: Vec<&String> = match require {
@@ -1352,6 +1403,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         removed.push("STACK_SESSION".into());
     }
     env.insert("STACK_PROJECT".into(), ctx.root.to_string_lossy().into());
+    timings.mark("reserve");
 
     Ok(ExecPlan {
         program,
@@ -1600,8 +1652,9 @@ fn verify_session(
     env: &IndexMap<String, String>,
     statuses: &[DaemonStatus],
     session: Option<&Session>,
+    timings: &Timings,
 ) -> Vec<Check> {
-    let mut checks = verify_all(&ctx.root, report, env, statuses);
+    let mut checks = verify_all(&ctx.root, report, env, statuses, timings);
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
         Some(s) if s.launching => Some("`stack up` did not finish verifying this launch; run `stack up`"),
@@ -1643,6 +1696,7 @@ pub struct ExecutionGuard {
 
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
+        let _timings = Timings::new("release");
         let ctx = Ctx {
             root: self.root.clone(),
             cache: PathBuf::new(),
@@ -2027,5 +2081,85 @@ mod tests {
         service.preset = Some("redis".into());
         let vars = binding_vars("cache", &service, None, &env, &map(&[("CACHE_URL", "x")]));
         assert_eq!(vars, ["REDIS_URL", "CACHE_URL"]);
+    }
+
+    #[test]
+    fn concurrently_keeps_the_order_of_its_items() {
+        let items: Vec<u64> = (0..20).collect();
+        // Later items finish first, so completion order differs from item order.
+        let out = concurrently(&items, 4, |&i| {
+            std::thread::sleep(Duration::from_millis(20 - i));
+            i * 10
+        });
+        assert_eq!(out, items.iter().map(|i| i * 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn concurrently_never_exceeds_its_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (running, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        concurrently(&[(); 9], 3, |_| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::yield_now();
+            running.fetch_sub(1, Ordering::SeqCst);
+        });
+        let peak = peak.into_inner();
+        // Scheduling may serialize the workers; only the upper bound is promised.
+        assert!(peak <= 3, "peak concurrency {peak} exceeds limit 3");
+    }
+
+    #[test]
+    #[should_panic(expected = "probe bug")]
+    fn concurrently_propagates_a_worker_panic() {
+        concurrently(&[1, 2, 3], 3, |&i| {
+            if i == 2 {
+                panic!("probe bug");
+            }
+        });
+    }
+
+    /// Environment whose PATH holds only a fake client named `bin` running `script`.
+    #[cfg(unix)]
+    fn fake_client(bin: &str, script: &str) -> (tempfile::TempDir, IndexMap<String, String>) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(bin);
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/bin:/usr/bin", dir.path().display());
+        let env = IndexMap::from([("PATH".to_string(), path)]);
+        (dir, env)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_probe_returns_client_output() {
+        let (_dir, env) = fake_client("psql", r#"echo "$PGCONNECT_TIMEOUT $1""#);
+        assert_eq!(run_probe(&env, "psql", &["arg"]).unwrap(), "3 arg\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_probe_reports_the_first_stderr_line_of_a_failed_client() {
+        let (_dir, env) = fake_client(
+            "psql",
+            "echo 'psql: error: refused' >&2; echo more >&2; exit 2",
+        );
+        assert_eq!(
+            run_probe(&env, "psql", &[]).unwrap_err(),
+            "psql failed: psql: error: refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_probe_rejects_oversized_output_instead_of_reading_its_tail() {
+        let (_dir, env) = fake_client(
+            "redis-cli",
+            "head -c 100000 /dev/zero; echo; echo /expected/dir",
+        );
+        let err = run_probe(&env, "redis-cli", &[]).unwrap_err();
+        assert!(err.contains("printed more than"), "{err}");
     }
 }
