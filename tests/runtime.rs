@@ -909,6 +909,20 @@ fn tools_only_projects_never_need_the_service_supervisor() {
 }
 
 #[test]
+fn repeated_up_of_an_unchanged_generation_keeps_the_session_id() {
+    let fixture = Fixture::new();
+    let id = |out: Output| serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"]["session"]["id"].clone();
+    let first = id(fixture.ok(&["up", "--json"]));
+    assert_eq!(id(fixture.ok(&["up", "--json"])), first);
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n",
+    )
+    .unwrap();
+    assert_ne!(id(fixture.ok(&["up", "--json"])), first);
+}
+
+#[test]
 fn gc_fails_when_an_expired_session_cannot_be_stopped() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "1s"]);

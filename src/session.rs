@@ -502,22 +502,19 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     }
 
     let stamp = now();
+    // The same verified generation, still running: keep its identity so earlier callers'
+    // records stay valid.
+    let reused = previous
+        .as_ref()
+        .filter(|p| p.config_digest == digest && !restart && checks_match(p, &checks))
+        .map(|p| (p.id.clone(), p.started_at));
     let session = Session {
-        id: sha256_hex(
-            format!(
-                "{}{:?}{}",
-                ctx.root.display(),
-                Instant::now(),
-                std::process::id()
-            )
-            .as_bytes(),
-        )[..12]
-            .to_string(),
+        id: reused.as_ref().map_or_else(|| new_session_id(ctx), |(id, _)| id.clone()),
         project: ctx.root.clone(),
         lock_digest: lock_digest(&ctx.root),
         config_digest: digest,
         active_executions: IndexMap::new(),
-        started_at: stamp,
+        started_at: reused.map_or(stamp, |(_, started)| started),
         lease: (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
             ttl_secs: lease.ttl_secs,
             owner_pid: lease.owner_pid,
@@ -546,6 +543,22 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps: steps.0,
         reaped,
     })
+}
+
+fn new_session_id(ctx: &Ctx) -> String {
+    sha256_hex(format!("{}{:?}{}", ctx.root.display(), Instant::now(), std::process::id()).as_bytes())[..12]
+        .to_string()
+}
+
+/// Every service is the same process the previous record verified.
+fn checks_match(previous: &Session, checks: &[Check]) -> bool {
+    previous.services.len() == checks.len()
+        && checks.iter().all(|c| {
+            previous
+                .services
+                .get(&c.service)
+                .is_some_and(|r| r.pid == c.pid && Some(r.port) == c.port)
+        })
 }
 
 #[derive(Debug, Serialize)]
