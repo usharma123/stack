@@ -110,11 +110,45 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Same answer as `kill -0 <pid>`: the process exists and may be signalled by us.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn pid_alive(pid: u32) -> bool {
+    // 0 and values that wrap negative would address process groups, not one process.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs only the existence and permission checks; nothing is delivered.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+#[cfg(not(unix))]
 pub fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_alive_sees_this_process() {
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn pid_alive_rejects_ids_that_would_address_process_groups() {
+        assert!(!pid_alive(0) && !pid_alive(u32::MAX));
+    }
+
+    #[test]
+    fn pid_alive_is_false_for_a_reaped_child() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid));
+    }
 }
