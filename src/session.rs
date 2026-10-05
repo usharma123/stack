@@ -42,6 +42,7 @@ impl Ctx {
             cache: self.cache.clone(),
             state: self.state.clone(),
             reassign_ports: false,
+            resolver: None,
         })
     }
 

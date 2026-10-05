@@ -46,6 +46,10 @@ impl Fixture {
             r#"#!/bin/sh
 echo "$*" >>"$REVIEW_FIXTURE/mise.log"
 case "$1 $2" in
+  'latest '*)
+    if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
+    v=${2#*@}; if test "$v" = "$2"; then v=1.0.0; fi
+    echo "$v" ;;
   'env --json') cat "$REVIEW_FIXTURE/env.json" ;;
   'daemons --json')
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
@@ -1058,4 +1062,29 @@ fn startup_time_does_not_consume_the_idle_ttl() {
     assert!(status["data"].get("lease_expired").is_none(), "{status}");
     let gc: Value = serde_json::from_slice(&fixture.ok(&["gc", "--json"]).stdout).unwrap();
     assert_eq!(gc["data"], json!([]));
+}
+#[test]
+fn mise_resolution_with_no_matching_release_fails_before_writing_anything() {
+    let fixture = Fixture::new();
+    let app = fixture.dir.path().join("app");
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n[tools]\njq='1.7'\n").unwrap();
+    let out = fixture.ok(&["compile", "--json"]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["data"]["versions"][0]["resolved"], "1.7");
+    let lock = fs::read(app.join("stack.lock")).unwrap();
+    // `mise latest` exits 0 with empty output when nothing matches the prefix.
+    fs::write(fixture.dir.path().join("latest-empty"), "").unwrap();
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n[tools]\njq='9.9'\n").unwrap();
+    let out = fixture.command(&["compile", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err["error"]["code"], "resolve_failed", "{err}");
+    assert!(err["error"]["details"][0]["error"].as_str().unwrap().contains("no release matches"), "{err}");
+    assert_eq!(fs::read(app.join("stack.lock")).unwrap(), lock);
+    // Status and exec never resolve: with a stale request they refuse instead.
+    let log = fixture.dir.path().join("mise.log");
+    fs::remove_file(&log).unwrap();
+    let out = fixture.command(&["exec", "--json", "--", "true"]).output().unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "lock_outdated");
+    assert!(!fs::read_to_string(&log).unwrap_or_default().contains("latest"));
 }

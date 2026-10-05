@@ -3,12 +3,66 @@
 use stack::error::StackError;
 use stack::lock;
 use stack::project::{compile, Options, Report};
-use stack::provider::mise;
+use stack::provider::mise::{self, Resolver};
 use stack::source::Mode;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+
+/// A controlled upstream: the releases each tool has published so far. Resolution picks the
+/// highest release matching a prefix, as `mise latest` does, and every call is counted.
+#[derive(Default)]
+struct Upstream {
+    releases: Mutex<BTreeMap<String, Vec<String>>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl Upstream {
+    fn new() -> Arc<Self> {
+        let up = Arc::new(Self::default());
+        for (tool, versions) in [
+            ("python", &["3.12.9", "3.13.1", "3.13.2"][..]),
+            ("uv", &["0.11.0", "0.12.1"]),
+            ("jq", &["1.7.1", "1.8.0"]),
+            ("pitchfork", &["2.29.0"]),
+            ("postgres", &["16.4", "17.1", "17.2"]),
+            ("redis", &["7.4.1", "8.0.2", "8.2.1"]),
+        ] {
+            up.publish(tool, versions);
+        }
+        up
+    }
+
+    fn publish(&self, tool: &str, versions: &[&str]) {
+        let mut releases = self.releases.lock().unwrap();
+        releases.entry(tool.into()).or_default().extend(versions.iter().map(|v| v.to_string()));
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+fn numeric(v: &str) -> Vec<u64> {
+    v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+impl Resolver for Upstream {
+    fn resolve(&self, tool: &str, request: &str) -> Result<String, StackError> {
+        self.calls.lock().unwrap().push(format!("{tool}@{request}"));
+        let releases = self.releases.lock().unwrap();
+        let fail = |why: &str| StackError::new("resolve_failed", format!("cannot resolve {tool}@{request}: {why}"));
+        let all = releases.get(tool).ok_or_else(|| fail("not found in registry"))?;
+        all.iter()
+            .filter(|v| request == "latest" || *v == request || v.starts_with(&format!("{request}.")))
+            .max_by_key(|v| numeric(v))
+            .cloned()
+            .ok_or_else(|| fail("no release matches"))
+    }
+}
 
 const PYBASE: &str = r#"
 [bundle]
@@ -53,11 +107,24 @@ LOG_LEVEL = "debug"
 
 struct Sandbox {
     tmp: TempDir,
+    upstream: Arc<Upstream>,
 }
 
 impl Sandbox {
     fn new() -> Self {
-        Self { tmp: TempDir::new().unwrap() }
+        Self { tmp: TempDir::new().unwrap(), upstream: Upstream::new() }
+    }
+
+    fn options(&self, root: &Path, mode: Mode, write: bool) -> Options {
+        Options {
+            root: root.to_path_buf(),
+            mode,
+            write,
+            cache: self.path("cache"),
+            state: self.path("state"),
+            reassign_ports: false,
+            resolver: Some(self.upstream.clone()),
+        }
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -86,14 +153,7 @@ impl Sandbox {
     }
 
     fn compile(&self, root: &Path, mode: Mode) -> Result<Report, StackError> {
-        compile(&Options {
-            root: root.to_path_buf(),
-            mode,
-            write: true,
-            cache: self.path("cache"),
-            state: self.path("state"),
-            reassign_ports: false,
-        })
+        compile(&self.options(root, mode, true))
     }
 }
 
@@ -142,6 +202,10 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
     for expected in [
         "experimental = true",
         "pitchfork = \"2.29.0\"",
+        "python = \"3.13.2\"",
+        "uv = \"0.12.1\"",
+        "version = \"17.2\"",
+        "version = \"8.2.1\"",
         "[daemons.postgres]",
         "preset = \"postgres\"",
         "daemons = [\"postgres\"]",
@@ -328,15 +392,7 @@ fn inspect_writes_nothing() {
     sb.compile(&root, Mode::UseLock).unwrap();
     fs::remove_file(mise::output_path(&root)).unwrap();
 
-    let report = compile(&Options {
-        root: root.clone(),
-        mode: Mode::Frozen,
-        write: false,
-        cache: sb.path("cache"),
-        state: sb.path("state"),
-        reassign_ports: false,
-    })
-    .unwrap();
+    let report = compile(&sb.options(&root, Mode::Frozen, false)).unwrap();
     assert_eq!(report.stack.services.len(), 2);
     assert!(!mise::output_path(&root).exists());
 }
@@ -391,17 +447,26 @@ fn undocumented_service_presets_are_reported() {
     let sb = Sandbox::new();
     let root = sb.project("[services.db]\npreset = \"mysql\"\n[services.q]\npreset = \"nats\"\n");
     let report = sb.compile(&root, Mode::UseLock).unwrap();
-    assert_eq!(report.warnings.len(), 1);
+    assert_eq!(report.warnings.len(), 3, "{:?}", report.warnings);
     assert!(report.warnings[0].starts_with("services.db (project) uses preset 'mysql'"));
+    // Presets whose installed tool stack has not verified are never silently claimed pinned.
+    assert!(report.warnings[1].contains("services.db (project) uses preset 'mysql'; stack does not know which tool"));
+    assert!(report.warnings[2].contains("services.q (project) uses preset 'nats'; stack does not know which tool"));
+    assert!(report.versions.iter().all(|v| v.kind == "tool"), "{:?}", report.versions);
 }
 
 #[test]
-fn unpinned_tools_are_reported() {
+fn requests_that_name_no_release_are_reported() {
     let sb = Sandbox::new();
     let base = sb.bundle("pybase", PYBASE);
     let report = sb.compile(&sb.project(&use_git(&base, "v1")), Mode::UseLock).unwrap();
-    assert_eq!(report.warnings.len(), 1);
-    assert!(report.warnings[0].contains("tools.uv = \"latest\" (bundle:pybase)"));
+    assert!(report.warnings.is_empty(), "`latest` is pinned by the lock now: {:?}", report.warnings);
+    let root = sb.path("app");
+    fs::write(root.join("stack.toml"), "[tools]\nnode = \"system\"\n[services.db]\npreset = \"postgres\"\n").unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("tools.node = \"system\" (project) names no release"));
+    assert!(report.warnings[1].contains("services.db (project) sets no version"));
 }
 
 #[test]
@@ -409,17 +474,161 @@ fn inspect_previews_a_project_before_its_first_compile() {
     let sb = Sandbox::new();
     let base = sb.bundle("pybase", PYBASE);
     let root = sb.project(&use_git(&base, "v1"));
-    let report = compile(&Options {
-        root: root.clone(),
-        mode: stack::project::inspect_mode(&root),
-        write: false,
-        cache: sb.path("cache"),
-        state: sb.path("state"),
-        reassign_ports: false,
-    })
-    .unwrap();
+    let calls = sb.upstream.calls();
+    let report = compile(&sb.options(&root, stack::project::inspect_mode(&root), false)).unwrap();
+    assert_eq!(sb.upstream.calls(), calls, "inspect never resolves versions");
+    assert!(report.versions.iter().all(|v| v.resolved.is_none()), "{:?}", report.versions);
     assert!(report.lock_changed);
     assert_eq!(report.stack.services.len(), 2);
     assert!(!root.join("stack.lock").exists());
     assert!(!mise::output_path(&root).exists());
+}
+
+fn lock_text(root: &Path) -> String {
+    fs::read_to_string(root.join("stack.lock")).unwrap()
+}
+
+fn resolved(report: &Report, name: &str) -> String {
+    report.versions.iter().find(|v| v.name == name).and_then(|v| v.resolved.clone()).unwrap()
+}
+
+#[test]
+fn exact_tool_and_service_versions_survive_upstream_releases_and_a_fresh_cache() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project(&use_git(&base, "v1"));
+    let first = sb.compile(&root, Mode::UseLock).unwrap();
+    for (name, version) in [("python", "3.13.2"), ("uv", "0.12.1"), ("pitchfork", "2.29.0"), ("postgres", "17.2"), ("redis", "8.2.1")] {
+        assert_eq!(resolved(&first, name), version, "{name}");
+    }
+    let locked = lock::read(&root).unwrap().unwrap();
+    assert_eq!(locked.version, 2);
+    let pg = locked.service("postgres").unwrap();
+    assert_eq!((pg.tool.as_deref(), pg.requested.as_str(), pg.resolved.as_str()), (Some("postgres"), "17", "17.2"));
+    assert_eq!(locked.tool("pitchfork").unwrap().resolved, "2.29.0", "provider tools are locked too");
+    let pinned = lock_text(&root);
+    let config = fs::read_to_string(mise::output_path(&root)).unwrap();
+
+    // Upstream publishes newer releases that match every request.
+    for (tool, v) in [("python", "3.13.9"), ("uv", "0.13.0"), ("postgres", "17.9"), ("redis", "8.4.0")] {
+        sb.upstream.publish(tool, &[v]);
+    }
+    // A fresh machine: empty bundle cache, no generated config.
+    fs::remove_dir_all(sb.path("cache")).unwrap();
+    fs::remove_file(mise::output_path(&root)).unwrap();
+    let calls = sb.upstream.calls();
+    for mode in [Mode::UseLock, Mode::Frozen] {
+        let again = sb.compile(&root, mode).unwrap();
+        assert!(!again.lock_changed, "{mode:?}");
+        assert_eq!(resolved(&again, "python"), "3.13.2");
+    }
+    assert_eq!(sb.upstream.calls(), calls, "unchanged requests are never re-resolved");
+    assert_eq!(lock_text(&root), pinned);
+    assert_eq!(fs::read_to_string(mise::output_path(&root)).unwrap(), config, "identical provider config");
+
+    // Only an explicit update moves pins, and it reports each move.
+    let updated = sb.compile(&root, Mode::Update).unwrap();
+    assert!(updated.lock_changed);
+    for (name, from, to) in [("python", "3.13.2", "3.13.9"), ("uv", "0.12.1", "0.13.0"), ("postgres", "17.2", "17.9"), ("redis", "8.2.1", "8.4.0")] {
+        let v = updated.versions.iter().find(|v| v.name == name).unwrap();
+        assert_eq!((v.resolved.as_deref(), v.moved_from.as_deref()), (Some(to), Some(from)), "{name}");
+    }
+    let pitchfork = updated.versions.iter().find(|v| v.name == "pitchfork").unwrap();
+    assert_eq!(pitchfork.moved_from, None);
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    assert!(rendered.contains("python = \"3.13.9\"") && rendered.contains("version = \"17.9\""), "{rendered}");
+}
+
+#[test]
+fn changed_requests_resolve_on_compile_and_are_stale_in_locked_mode() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\npython = \"3.13\"\njq = \"1.7\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    sb.upstream.publish("python", &["3.13.5"]);
+    fs::write(root.join("stack.toml"), "[tools]\npython = \"3.12\"\njq = \"1.7\"\n").unwrap();
+    let pinned = lock_text(&root);
+
+    let err = sb.compile(&root, Mode::Frozen).unwrap_err();
+    assert_eq!(err.code, "lock_outdated");
+    assert_eq!(err.details[0]["name"], "python");
+    assert_eq!(err.details[0]["locked"], "3.13");
+    assert_eq!(lock_text(&root), pinned, "locked mode never writes");
+
+    let calls = sb.upstream.calls();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(sb.upstream.calls(), calls + 1, "only the changed request resolves");
+    let python = report.versions.iter().find(|v| v.name == "python").unwrap();
+    assert_eq!((python.resolved.as_deref(), python.moved_from.as_deref()), (Some("3.12.9"), Some("3.13.2")));
+    assert_eq!(resolved(&report, "jq"), "1.7.1", "unchanged pin kept despite a newer 1.x");
+
+    // A removed tool is a stale pin in locked mode.
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let with_jq = lock_text(&root);
+    fs::write(root.join("stack.toml"), "[tools]\npython = \"3.12\"\n").unwrap();
+    assert_eq!(sb.compile(&root, Mode::Frozen).unwrap_err().code, "lock_outdated");
+    assert_eq!(lock_text(&root), with_jq);
+    assert!(sb.compile(&root, Mode::UseLock).unwrap().lock_changed);
+    assert!(lock::read(&root).unwrap().unwrap().tool("jq").is_none());
+}
+
+#[test]
+fn failed_resolution_changes_nothing_and_reports_every_request() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\npython = \"3.13\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let pinned = lock_text(&root);
+    let config = fs::read_to_string(mise::output_path(&root)).unwrap();
+    fs::write(root.join("stack.toml"), "[tools]\npython = \"3.99\"\nnosuchtool = \"1\"\n").unwrap();
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "resolve_failed");
+    assert_eq!(err.details.len(), 2, "{:?}", err.details);
+    assert_eq!(lock_text(&root), pinned);
+    assert_eq!(fs::read_to_string(mise::output_path(&root)).unwrap(), config);
+}
+
+#[test]
+fn legacy_locks_keep_bundle_pins_and_migrate_only_through_compile() {
+    let sb = Sandbox::new();
+    let repo = sb.bundle("pybase", PYBASE);
+    let v1 = git(&repo, &["rev-parse", "HEAD"]);
+    let root = sb.project(&use_git(&repo, "v1"));
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let hash = lock::read(&root).unwrap().unwrap().bundles[0].content_hash.clone();
+    // What stack 0.1.3 wrote: bundle pins only.
+    fs::write(
+        root.join("stack.lock"),
+        format!("version = 1\n\n[[bundle]]\nsource = \"git+file://{}?ref=v1\"\nname = \"pybase\"\ncommit = \"{v1}\"\ncontent_hash = \"{hash}\"\n", repo.display()),
+    )
+    .unwrap();
+    let legacy = lock_text(&root);
+    // The tag moves upstream; migration must not follow it.
+    fs::write(repo.join("fixtures/seed.sql"), "select 2;\n").unwrap();
+    commit_all(&repo, "v2");
+    git(&repo, &["tag", "-f", "v1"]);
+
+    let err = sb.compile(&root, Mode::Frozen).unwrap_err();
+    assert_eq!(err.code, "lock_outdated");
+    assert!(err.message.contains("version 1"), "{}", err.message);
+    let inspect = compile(&sb.options(&root, stack::project::inspect_mode(&root), false)).unwrap_err();
+    assert_eq!(inspect.code, "lock_outdated");
+    assert_eq!(lock_text(&root), legacy, "locked operations never migrate");
+
+    let migrated = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(migrated.lock_changed);
+    let lock = lock::read(&root).unwrap().unwrap();
+    assert_eq!(lock.version, 2);
+    assert_eq!(lock.bundles[0].commit.as_deref(), Some(v1.as_str()), "bundle pin kept");
+    assert_eq!(lock.bundles[0].content_hash, hash);
+    assert_eq!(lock.tool("python").unwrap().resolved, "3.13.2");
+    sb.compile(&root, Mode::Frozen).unwrap();
+}
+
+#[test]
+fn unsupported_or_inconsistent_lock_versions_are_rejected() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\njq = \"1.7\"\n");
+    fs::write(root.join("stack.lock"), "version = 3\n").unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
+    fs::write(root.join("stack.lock"), "version = 1\n[[tool]]\nname = \"jq\"\nrequested = \"1.7\"\nresolved = \"1.7.1\"\n").unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
 }

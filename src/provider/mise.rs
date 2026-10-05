@@ -13,8 +13,94 @@ pub fn output_path(root: &Path) -> PathBuf {
     root.join(".config/mise/conf.d/stack.toml")
 }
 
-/// `ports` are this checkout's assigned ports; every service gets a concrete one.
-pub fn render(stack: &Composed, ports: &IndexMap<String, u16>) -> String {
+/// Exact versions rendered in place of the composed requests.
+#[derive(Debug, Default)]
+pub struct Versions {
+    pub tools: IndexMap<String, String>,
+    pub services: IndexMap<String, String>,
+}
+
+/// The provider tool a service preset installs, for presets whose mapping stack has verified
+/// against mise (a `postgres` preset with `version = "17"` installs `postgres@17`).
+pub fn preset_tool(preset: &str) -> Option<&'static str> {
+    match preset {
+        "postgres" => Some("postgres"),
+        "redis" => Some("redis"),
+        _ => None,
+    }
+}
+
+/// Requests that name something other than a release, so no version can be locked.
+pub fn unversioned(request: &str) -> bool {
+    let r = request.trim();
+    r == "system" || ["path:", "ref:", "prefix:", "sub-"].iter().any(|p| r.starts_with(p))
+}
+
+/// Finds the exact release a version request currently means.
+pub trait Resolver: Send + Sync {
+    fn resolve(&self, tool: &str, request: &str) -> Result<String>;
+}
+
+/// `mise latest <tool>@<request>`, run outside any project so project configuration cannot
+/// change which release a request means.
+pub struct MiseResolver {
+    pub cwd: PathBuf,
+}
+
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl Resolver for MiseResolver {
+    fn resolve(&self, tool: &str, request: &str) -> Result<String> {
+        std::fs::create_dir_all(&self.cwd).map_err(|e| crate::error::io_error(self.cwd.display(), e))?;
+        let spec = if request.trim() == "latest" { tool.to_string() } else { format!("{tool}@{request}") };
+        let mut command = Command::new("mise");
+        command
+            .args(["latest", &spec])
+            .current_dir(&self.cwd)
+            .env("MISE_YES", "1")
+            .env("NO_COLOR", "1");
+        let out = crate::process::capture(&mut command, RESOLVE_TIMEOUT, 16 * 1024).map_err(|e| {
+            StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
+                .hint("install mise: https://mise.jdx.dev")
+        })?;
+        let fail = |why: String| {
+            StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
+                .hint("check the tool name and version; `mise ls-remote <tool>` lists releases")
+        };
+        if out.timed_out {
+            return Err(fail(format!("mise did not answer within {}s", RESOLVE_TIMEOUT.as_secs())));
+        }
+        if out.exit_code != Some(0) {
+            let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("mise failed");
+            return Err(fail(err.to_string()));
+        }
+        parse_resolved(&out.stdout).ok_or_else(|| {
+            // mise exits 0 with no output when no release matches the prefix.
+            fail(if out.stdout.trim().is_empty() {
+                "no release matches".to_string()
+            } else {
+                format!("unexpected output {:?}", out.stdout.trim())
+            })
+        })
+    }
+}
+
+/// One version on one line; anything else is not an answer stack can lock.
+pub fn parse_resolved(stdout: &str) -> Option<String> {
+    let lines: Vec<&str> = stdout.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    match lines.as_slice() {
+        [v] if v.len() <= 128 && !v.contains(char::is_whitespace) && *v != "latest" => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// `ports` are this checkout's assigned ports; every service gets a concrete one. `versions`
+/// replace composed version requests with the exact versions stack.lock records.
+pub fn render(
+    stack: &Composed,
+    ports: &IndexMap<String, u16>,
+    versions: &Versions,
+) -> String {
     let mut doc = Table::new();
     let has_services = !stack.services.is_empty();
 
@@ -27,10 +113,14 @@ pub fn render(stack: &Composed, ports: &IndexMap<String, u16>) -> String {
     let mut tools: Table = stack
         .tools
         .iter()
-        .map(|(k, e)| (k.clone(), Value::String(e.value.clone())))
+        .map(|(k, e)| {
+            let version = versions.tools.get(k).unwrap_or(&e.value);
+            (k.clone(), Value::String(version.clone()))
+        })
         .collect();
     if has_services && !tools.contains_key("pitchfork") {
-        tools.insert("pitchfork".into(), Value::String(PITCHFORK_VERSION.into()));
+        let version = versions.tools.get("pitchfork").map_or(PITCHFORK_VERSION, String::as_str);
+        tools.insert("pitchfork".into(), Value::String(version.into()));
     }
     if !tools.is_empty() {
         doc.insert("tools".into(), Value::Table(tools));
@@ -63,7 +153,8 @@ pub fn render(stack: &Composed, ports: &IndexMap<String, u16>) -> String {
                 let mut t = Table::new();
                 let s = &e.value;
                 put(&mut t, "preset", s.preset.clone().map(Value::String));
-                put(&mut t, "version", s.version.clone().map(Value::String));
+                let version = versions.services.get(name).or(s.version.as_ref());
+                put(&mut t, "version", version.cloned().map(Value::String));
                 put(&mut t, "run", s.run.clone().map(Value::String));
                 put(&mut t, "ready_cmd", s.ready_cmd.clone().map(Value::String));
                 put(&mut t, "ready_port", s.ready_port.map(|p| Value::Integer(p.into())));
@@ -198,4 +289,28 @@ pub fn start(root: &Path) -> Result<()> {
 
 pub fn stop(root: &Path) -> Result<()> {
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_versions_are_one_exact_line() {
+        assert_eq!(parse_resolved("3.13.16\n").as_deref(), Some("3.13.16"));
+        assert_eq!(parse_resolved("\n  17.11  \n").as_deref(), Some("17.11"));
+        for bad in ["", "\n", "latest\n", "3.13.1\n3.13.2\n", "a b\n"] {
+            assert_eq!(parse_resolved(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn unversioned_requests_are_recognised() {
+        for r in ["system", "path:/opt/x", "ref:main", "prefix:3", "sub-1:latest"] {
+            assert!(unversioned(r), "{r}");
+        }
+        for r in ["3.13", "latest", "lts", "17"] {
+            assert!(!unversioned(r), "{r}");
+        }
+    }
 }

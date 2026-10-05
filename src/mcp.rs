@@ -82,7 +82,7 @@ fn schema(props: Value, required: &[&str]) -> Value {
 fn tools() -> Value {
     json!([
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_compile", "description": "Resolve bundles, update stack.lock and the generated provider config.",
+        { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock.",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
@@ -145,6 +145,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             cache: ctx.cache.clone(),
             state: ctx.state.clone(),
             reassign_ports: false,
+            resolver: None,
         })
     };
     match name {

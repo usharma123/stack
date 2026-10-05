@@ -40,6 +40,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             cache: cache.to_path_buf(),
             state: state.to_path_buf(),
             reassign_ports: false,
+            resolver: None,
         });
         checks.push(match compiled {
             Ok(r) => Check {

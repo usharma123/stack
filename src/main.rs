@@ -113,6 +113,7 @@ fn main() -> ExitCode {
         cache: ctx.cache.clone(),
         state: ctx.state.clone(),
         reassign_ports,
+        resolver: None,
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
@@ -235,6 +236,11 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
         }
         let s = &r.stack;
         println!("{} tools, {} env, {} services, {} tasks", s.tools.len(), s.env.len(), s.services.len(), s.tasks.len());
+        for v in &r.versions {
+            let resolved = v.resolved.as_deref().unwrap_or("(not locked yet)");
+            let moved = v.moved_from.as_deref().map(|m| format!("  (moved from {m})")).unwrap_or_default();
+            println!("{} {} {} -> {resolved}{moved}", v.kind, v.name, v.requested);
+        }
         for (name, port) in &r.ports {
             println!("port {name} = {port}");
         }
