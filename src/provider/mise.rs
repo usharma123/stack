@@ -211,6 +211,9 @@ use std::process::{Command, Output, Stdio};
 /// One supervised service as Pitchfork reports it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonStatus {
+    /// Qualified supervisor id (`<namespace>/<name>`); valid without the project directory.
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub status: String,
     #[serde(default)]
@@ -287,6 +290,68 @@ pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
     let out = checked(root, &["daemons", "--json"], "provider_failed")?;
     serde_json::from_slice(&out.stdout)
         .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons --json` output: {e}")))
+}
+
+/// The Pitchfork binary mise runs for this project, so stopping does not need the project.
+pub fn which_pitchfork(root: &Path) -> Option<PathBuf> {
+    let out = mise(root, &["which", "pitchfork"]).ok()?;
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    (out.status.success() && path.is_absolute() && path.is_file()).then_some(path)
+}
+
+/// What Pitchfork reports about one qualified daemon id.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Supervised {
+    NotFound,
+    Found { status: String, pid: Option<u32>, port: Option<u16> },
+}
+
+const SUPERVISOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn pitchfork(bin: &Path, state_dir: &Path, args: &[&str]) -> std::result::Result<crate::process::Captured, String> {
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .env("PITCHFORK_STATE_DIR", state_dir)
+        .env("NO_COLOR", "1");
+    let out = crate::process::capture(&mut command, SUPERVISOR_TIMEOUT, 64 * 1024)
+        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    if out.timed_out {
+        return Err(format!("pitchfork {} did not answer within {}s", args.join(" "), SUPERVISOR_TIMEOUT.as_secs()));
+    }
+    Ok(out)
+}
+
+/// `pitchfork status --json <id>` against the recorded supervisor state directory.
+pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Supervised, String> {
+    let out = pitchfork(bin, state_dir, &["status", "--json", id])?;
+    if out.exit_code != Some(0) {
+        if out.stderr.contains("not found") {
+            return Ok(Supervised::NotFound);
+        }
+        let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+        return Err(format!("pitchfork status {id}: {err}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&out.stdout)
+        .map_err(|e| format!("unexpected `pitchfork status --json` output: {e}"))?;
+    if v["id"].as_str() != Some(id) {
+        return Err(format!("pitchfork status {id} described '{}'", v["id"]));
+    }
+    Ok(Supervised::Found {
+        status: v["status"].as_str().unwrap_or_default().to_string(),
+        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+        port: v["active_port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+    })
+}
+
+/// Ask the supervisor to stop one daemon by qualified id. It signals the process it tracks.
+pub fn stop_supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<(), String> {
+    let out = pitchfork(bin, state_dir, &["stop", id])?;
+    if out.exit_code == Some(0) {
+        return Ok(());
+    }
+    let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+    Err(format!("pitchfork stop {id}: {err}"))
 }
 
 pub fn start(root: &Path) -> Result<()> {

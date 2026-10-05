@@ -81,6 +81,22 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     pub services: IndexMap<String, ServiceRecord>,
+    /// How to reach the supervisor without the project directory, so services can still be
+    /// stopped after the project is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderRecord>,
+    /// Device and inode of the project directory at launch. A directory recreated at the same
+    /// path is a different project and never inherits this session's authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir_id: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRecord {
+    /// The Pitchfork binary mise used for this project.
+    pub pitchfork: PathBuf,
+    /// Pitchfork's effective state directory (socket and daemon state).
+    pub state_dir: PathBuf,
 }
 
 /// When a session may be reclaimed. With neither field set it lives until `stack down`.
@@ -118,6 +134,9 @@ pub struct ServiceRecord {
     pub data_dir: Option<String>,
     pub identity: Identity,
     pub verified_at: u64,
+    /// The supervisor's qualified id for this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 /// How strongly a service was verified.
@@ -148,6 +167,8 @@ pub struct Check {
     pub checked_at: u64,
     #[serde(skip)]
     data_dir: Option<String>,
+    #[serde(skip)]
+    provider_id: Option<String>,
 }
 
 // ---- verification --------------------------------------------------------------------------
@@ -176,6 +197,7 @@ fn verify_all(
                 withheld: Vec::new(),
                 checked_at: now(),
                 data_dir: status.and_then(|s| s.data_dir.clone()),
+                provider_id: status.and_then(|s| s.id.clone()),
             };
             let token = report.identities.get(name).map(String::as_str);
             match verify_one(root, &entry.value, port, status, env, token) {
@@ -518,9 +540,11 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     }
     // Pitchfork refuses a socket path longer than `sun_path`, but only once it starts, after
     // every download. Check the path it will use first, with the env mise will give it.
+    let mut socket = None;
     if !report.stack.services.is_empty() {
         match preflight_socket(ctx) {
-            Ok((_, detail)) => {
+            Ok((path, detail)) => {
+                socket = path;
                 steps.ok("preflight", detail);
             }
             Err(e) => return Err(steps.fail("preflight", e, false)),
@@ -530,6 +554,12 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         return Err(steps.fail("install", e, false));
     }
     steps.ok("install", json!(null));
+    // Recorded before anything starts, so a deleted project's services can still be found.
+    let provider = socket.and_then(|socket| {
+        let state_dir = socket.path.parent()?.parent()?.to_path_buf();
+        Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
+    });
+    let project_dir_id = dir_id(&ctx.root);
 
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
@@ -568,10 +598,12 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                     .ports
                     .iter()
                     .map(|(name, port)| {
-                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0 };
+                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0, provider_id: None };
                         (name.clone(), record)
                     })
                     .collect(),
+                provider: provider.clone(),
+                project_dir_id,
             };
             save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         }
@@ -590,6 +622,16 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                 break;
             }
             if Instant::now() >= deadline {
+                // Keep what the supervisor reported, so cleanup can reconcile these processes.
+                if let Ok(Some(mut launch)) = load(ctx).map(|s| s.filter(|s| s.launching)) {
+                    for c in &checks {
+                        if let Some(record) = launch.services.get_mut(&c.service) {
+                            record.pid = c.pid.or(record.pid);
+                            record.provider_id = c.provider_id.clone().or(record.provider_id.take());
+                        }
+                    }
+                    let _ = save(ctx, &launch);
+                }
                 let failed: Vec<Value> = checks
                     .iter()
                     .filter(|c| !c.ready)
@@ -642,10 +684,13 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                         data_dir: c.data_dir.clone(),
                         identity: c.identity.unwrap_or(Identity::Liveness),
                         verified_at: c.checked_at,
+                        provider_id: c.provider_id.clone(),
                     },
                 )
             })
             .collect(),
+        provider: if report.stack.services.is_empty() { None } else { provider },
+        project_dir_id,
     };
     save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
     Ok(UpReport {
@@ -667,6 +712,20 @@ fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
         }
         Ok(socket) => Err(socket.error()),
         Err(note) => Ok((None, json!({ "socket": null, "note": note }))),
+    }
+}
+
+/// Device and inode of a directory, identifying it beyond its path.
+pub fn dir_id(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -1293,6 +1352,9 @@ pub struct GcEntry {
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Per-service outcomes for a gone project.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<Value>,
 }
 
 /// Reclaim sessions whose lease expired or whose project directory is gone.
@@ -1319,20 +1381,6 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
             continue;
         }
         let session: Session = read_json(&path)?;
-        if !session.project.exists() {
-            out.push(GcEntry {
-                project: session.project,
-                reason: "project directory deleted".into(),
-                stopped: false,
-                error: Some(
-                    "cannot stop services without the project; see `mise daemons prune`".into(),
-                ),
-            });
-            continue;
-        }
-        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
-            continue;
-        };
         // TTL describes idle time; an executing command is not idle. Owner death still
         // follows the explicit runner policy even if one of its commands has survived.
         let owner_dead = session
@@ -1340,7 +1388,17 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
             .as_ref()
             .and_then(|l| l.owner_pid)
             .is_some_and(|p| !pid_alive(p));
-        if !owner_dead && has_active_executions(&session) {
+        let busy = !owner_dead && has_active_executions(&session);
+        if let Some(reason) = project_gone(&session) {
+            if !busy {
+                out.push(reclaim_gone(&path, session, reason));
+            }
+            continue;
+        }
+        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
+            continue;
+        };
+        if busy {
             continue;
         }
         let result = down_locked(&ctx);
@@ -1349,24 +1407,118 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
             reason,
             stopped: result.is_ok(),
             error: result.err().map(|e| e.to_string()),
+            services: Vec::new(),
         });
     }
     Ok(out)
 }
 
-/// Like [`gc`], but fails when an expired session it tried to stop is still running. Sessions
-/// of deleted projects are reported (stack cannot stop them) without failing.
+/// Why a session's project no longer exists: deleted, or replaced by another directory at the
+/// same path (which must never inherit the authority to stop this session's services).
+fn project_gone(session: &Session) -> Option<&'static str> {
+    if !session.project.exists() {
+        return Some("project directory deleted");
+    }
+    match (session.project_dir_id, dir_id(&session.project)) {
+        (Some(recorded), Some(current)) if recorded != current => Some("project directory replaced"),
+        _ => None,
+    }
+}
+
+/// Stop a gone project's services through the supervisor, by the qualified ids recorded at
+/// launch. The project's configuration is gone, so nothing is recreated or re-read from it.
+/// A process is stopped only when the supervisor still tracks it under the recorded id with
+/// the recorded PID and port; anything uncertain keeps the record and fails the entry.
+fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
+    let mut services = Vec::new();
+    let mut problems = Vec::new();
+    for (name, record) in &session.services {
+        match reconcile_gone(session.provider.as_ref(), record) {
+            Ok(outcome) => services.push(json!({ "service": name, "outcome": outcome })),
+            Err(why) => {
+                services.push(json!({ "service": name, "error": why }));
+                problems.push(format!("{name}: {why}"));
+            }
+        }
+    }
+    if problems.is_empty() {
+        if let Err(e) = remove_if_exists(index) {
+            problems.push(e.to_string());
+        }
+    }
+    GcEntry {
+        project: session.project,
+        reason: reason.into(),
+        stopped: problems.is_empty(),
+        error: (!problems.is_empty()).then(|| problems.join("; ")),
+        services,
+    }
+}
+
+fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord) -> std::result::Result<String, String> {
+    let alive = record.pid.is_some_and(pid_alive);
+    let listening = record.port != 0 && accepting(record.port);
+    if !alive && !listening && record.provider_id.is_none() {
+        return Ok("not running".into());
+    }
+    let (Some(provider), Some(id)) = (provider, record.provider_id.as_deref()) else {
+        return Err(match record.pid {
+            Some(pid) if alive => format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
+            _ => format!("port {} is accepting connections, but no supervisor id was recorded to confirm ownership; not signalled", record.port),
+        });
+    };
+    match mise::supervised(&provider.pitchfork, &provider.state_dir, id)? {
+        mise::Supervised::NotFound => match record.pid {
+            Some(pid) if alive => Err(format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled")),
+            _ if listening => Ok(format!("port {} is held by a process the supervisor does not track; left alone", record.port)),
+            _ => Ok("not running".into()),
+        },
+        mise::Supervised::Found { status, pid, port } => {
+            let running = status == "running" && pid.is_some_and(pid_alive);
+            if !running {
+                return match record.pid {
+                    Some(p) if alive => Err(format!("the supervisor reports {id} {status}, but recorded pid {p} is alive (possibly reused); not signalled")),
+                    _ => Ok(format!("not running (supervisor reports {status})")),
+                };
+            }
+            let Some(recorded) = record.pid else {
+                return Err(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
+            };
+            if pid != Some(recorded) {
+                return Err(format!(
+                    "{id} now runs pid {}, not the recorded pid {recorded} (restarted, or the path was reused); not signalled",
+                    pid.unwrap_or(0)
+                ));
+            }
+            if port.is_some_and(|p| p != record.port) {
+                return Err(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
+            }
+            mise::stop_supervised(&provider.pitchfork, &provider.state_dir, id)?;
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while pid_alive(recorded) {
+                if Instant::now() >= deadline {
+                    return Err(format!("pid {recorded} survived `pitchfork stop {id}`"));
+                }
+                sleep(Duration::from_millis(100));
+            }
+            Ok(format!("stopped pid {recorded} through the supervisor"))
+        }
+    }
+}
+
+/// Like [`gc`], but fails when any session it tried to reclaim is still running or could not
+/// be confirmed stopped. Ownership records are kept for a retry.
 pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
     let entries = gc(state)?;
-    let failed = entries.iter().filter(|e| !e.stopped && e.project.exists()).count();
+    let failed = entries.iter().filter(|e| !e.stopped).count();
     if failed == 0 {
         return Ok(entries);
     }
     Err(StackError::new(
         "gc_incomplete",
-        format!("{failed} expired session(s) could not be stopped"),
+        format!("{failed} session(s) could not be confirmed stopped"),
     )
-    .hint("retry `stack gc`, or run `stack down` in the listed project")
+    .hint("retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed")
     .details(entries.iter().map(|e| serde_json::to_value(e).expect("gc entry serializes")).collect()))
 }
 
@@ -1381,7 +1533,18 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
     if !path.exists() {
         return Ok(None);
     }
-    read_json::<Session>(&path).map(Some)
+    let session = read_json::<Session>(&path)?;
+    // A different directory now at this path must not adopt (or stop) the old one's services.
+    if let (Some(recorded), Some(current)) = (session.project_dir_id, dir_id(&ctx.root)) {
+        if recorded != current {
+            return Err(StackError::new(
+                "session_conflict",
+                "a session recorded for a previous directory at this path still owns services",
+            )
+            .hint("run `stack gc` to reclaim them through the supervisor; it reports anything it cannot confirm"));
+        }
+    }
+    Ok(Some(session))
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {

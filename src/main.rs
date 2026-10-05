@@ -73,7 +73,18 @@ enum Cmd {
     /// Renew this project's session lease
     Renew,
     /// Reclaim sessions with expired leases or deleted projects (machine-wide)
-    Gc,
+    Gc {
+        /// Keep running in the foreground and collect every --interval (for a supervisor such as
+        /// systemd or launchd; stack installs no service). With --json, one object per pass
+        #[arg(long)]
+        watch: bool,
+        /// Time between passes with --watch (default 60s, at least 1s)
+        #[arg(long, value_name = "DURATION", requires = "watch")]
+        interval: Option<String>,
+        /// Stop after this many passes with --watch (default: run until terminated)
+        #[arg(long, value_name = "N", requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
+        max_passes: Option<u64>,
+    },
     /// Publish a bundle directory to an OCI registry
     Publish {
         /// Directory containing bundle.toml
@@ -175,15 +186,9 @@ fn main() -> ExitCode {
         }
         Cmd::Down => session::down(&ctx).map(|r| emit(cli.json, &r, || println!("stopped {} service(s); confirmed", r.stopped.len()))),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc => session::gc_checked(&ctx.state).map(|r| {
-            emit(cli.json, &r, || {
-                for e in &r {
-                    println!("{}: {} ({})", e.project.display(), e.reason, if e.stopped { "stopped" } else { "not stopped" });
-                }
-                if r.is_empty() {
-                    println!("nothing to reclaim");
-                }
-            })
+        Cmd::Gc { watch: true, interval, max_passes } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes),
+        Cmd::Gc { .. } => session::gc_checked(&ctx.state).map(|r| {
+            emit(cli.json, &r, || print_gc(&r))
         }),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
@@ -200,6 +205,53 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => fail(cli.json, e),
+    }
+}
+
+fn print_gc(entries: &[session::GcEntry]) {
+    for e in entries {
+        println!("{}: {} ({})", e.project.display(), e.reason, if e.stopped { "stopped" } else { "not stopped" });
+        if let Some(error) = &e.error {
+            println!("  {error}");
+        }
+    }
+    if entries.is_empty() {
+        println!("nothing to reclaim");
+    }
+}
+
+/// Foreground periodic collection. Each pass is reported as it completes (one JSON object per
+/// line with --json). A failing pass is reported and retried at the next interval; the exit
+/// code after --max-passes reflects the last pass.
+fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>) -> Result<ExitCode> {
+    let interval = interval.map(parse_duration).transpose()?.unwrap_or(60);
+    if interval == 0 {
+        return Err(StackError::new("usage", "--interval must be at least 1s"));
+    }
+    let mut pass = 0u64;
+    loop {
+        pass += 1;
+        let result = session::gc_checked(state);
+        let ok = result.is_ok();
+        if as_json {
+            let line = match &result {
+                Ok(entries) => json!({ "ok": true, "data": { "pass": pass, "at": stack::state::now(), "reclaimed": entries } }),
+                Err(e) => json!({ "ok": false, "error": e, "pass": pass, "at": stack::state::now() }),
+            };
+            println!("{line}");
+        } else {
+            match &result {
+                Ok(entries) if entries.is_empty() => {}
+                Ok(entries) => print_gc(entries),
+                Err(e) => eprintln!("error[{}]: {}", e.code, e.message),
+            }
+        }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        if max_passes.is_some_and(|max| pass >= max) {
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+        }
+        std::thread::sleep(Duration::from_secs(interval));
     }
 }
 

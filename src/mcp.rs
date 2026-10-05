@@ -96,7 +96,7 @@ fn tools() -> Value {
           }), &["command"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_gc", "description": "Reclaim sessions with expired leases machine-wide. Fails (gc_incomplete) if any expired session could not be stopped.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
