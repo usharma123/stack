@@ -75,7 +75,7 @@ impl Resolver for MiseResolver {
             let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("mise failed");
             return Err(fail(err.to_string()));
         }
-        parse_resolved(&out.stdout).ok_or_else(|| {
+        parse_resolved(&out.stdout).filter(|v| exact_release(tool, v)).ok_or_else(|| {
             // mise exits 0 with no output when no release matches the prefix.
             fail(if out.stdout.trim().is_empty() {
                 "no release matches".to_string()
@@ -93,6 +93,28 @@ pub fn parse_resolved(stdout: &str) -> Option<String> {
         [v] if v.len() <= 128 && !v.contains(char::is_whitespace) && *v != "latest" => Some(v.to_string()),
         _ => None,
     }
+}
+
+/// Offline validation of release pins. Known providers have different release shapes:
+/// PostgreSQL and jq use two numeric components, while Python/Node/Redis require three.
+/// Other backends may use calendar or named releases, but never floating selectors.
+pub fn exact_release(tool: &str, version: &str) -> bool {
+    if version.is_empty() || version.len() > 128
+        || !version.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+        || !version.bytes().any(|b| b.is_ascii_digit())
+        || version.starts_with("sub-") || version.starts_with("lts-")
+    {
+        return false;
+    }
+    let name = tool.rsplit([':', '/']).next().unwrap_or(tool);
+    let components = match name {
+        "python" | "node" | "nodejs" | "ruby" | "rust" | "uv" | "redis" | "pitchfork"
+        | "cockroach" | "nats-server" | "spicedb" => 3,
+        "postgres" | "postgresql" | "jq" | "go" => 2,
+        _ => return !version.bytes().all(|b| b.is_ascii_digit()) || version.len() >= 8,
+    };
+    let numeric = version.trim_start_matches(|c: char| !c.is_ascii_digit());
+    numeric.split('.').take(components).filter(|part| part.starts_with(|c: char| c.is_ascii_digit())).count() == components
 }
 
 /// `ports` are this checkout's assigned ports; every service gets a concrete one. `versions`

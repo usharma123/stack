@@ -348,6 +348,14 @@ fn lock_versions(
     for r in requests {
         let prior = previous.and_then(|l| if r.kind == "tool" { l.tool(&r.name) } else { l.service(&r.name) });
         let same = prior.filter(|p| p.requested == r.requested && p.tool == r.tool);
+        if !mise::unversioned(&r.requested) && opts.mode != Mode::Update {
+            if let Some(pin) = same {
+                if !mise::exact_release(r.tool.as_deref().unwrap_or(&r.name), &pin.resolved) {
+                    return Err(StackError::new("lock_invalid", format!("{}.{} has non-exact resolved version {:?}", r.kind, r.name, pin.resolved))
+                        .hint("run `stack compile --update` to regenerate exact release pins"));
+                }
+            }
+        }
         let mut moved_from = None;
         let resolved: Option<(String, Option<String>)> = if mise::unversioned(&r.requested) {
             Some((r.requested.clone(), None))
@@ -365,9 +373,13 @@ fn lock_versions(
             None
         } else {
             match resolver.resolve(r.tool.as_deref().unwrap_or(&r.name), &r.requested) {
-                Ok(v) => {
+                Ok(v) if mise::exact_release(r.tool.as_deref().unwrap_or(&r.name), &v) => {
                     moved_from = prior.map(|p| p.resolved.clone()).filter(|p| *p != v);
                     Some((v, Some(platform())))
+                }
+                Ok(v) => {
+                    failed.push(serde_json::json!({ "kind": r.kind, "name": r.name, "requested": r.requested, "error": format!("resolver returned non-exact release {v:?}") }));
+                    continue;
                 }
                 Err(e) => {
                     failed.push(serde_json::json!({ "kind": r.kind, "name": r.name, "requested": r.requested, "code": e.code, "error": e.message }));

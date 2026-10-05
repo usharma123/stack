@@ -49,6 +49,7 @@ case "$1 $2" in
   'latest '*)
     if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
     v=${2#*@}; if test "$v" = "$2"; then v=1.0.0; fi
+    case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; esac
     echo "$v" ;;
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
   'env --json') cat "$REVIEW_FIXTURE/env.json" ;;

@@ -659,3 +659,34 @@ fn identity_probes_are_validated() {
     fs::copy(root.join("stack.toml"), other.join("stack.toml")).unwrap();
     assert_ne!(sb.compile(&other, Mode::UseLock).unwrap().identities["w"], report.identities["w"]);
 }
+
+#[test]
+fn damaged_release_pins_fail_offline_without_rewriting_outputs() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\npython='3.13'\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let original = fs::read_to_string(root.join("stack.lock")).unwrap();
+    let provider = fs::read(mise::output_path(&root)).unwrap();
+    let calls = sb.upstream.calls();
+    for bad in ["latest", "3.13", "system", "path:/tmp/foreign", "", "lts", "prefix:3", "sub-1:latest"] {
+        let damaged = original.replace("resolved = \"3.13.2\"", &format!("resolved = {bad:?}"));
+        fs::write(root.join("stack.lock"), &damaged).unwrap();
+        for mode in [Mode::Frozen, Mode::UseLock] {
+            assert_eq!(sb.compile(&root, mode).unwrap_err().code, "lock_invalid", "{bad}");
+        }
+        assert_eq!(fs::read_to_string(root.join("stack.lock")).unwrap(), damaged);
+        assert_eq!(fs::read(mise::output_path(&root)).unwrap(), provider);
+        assert_eq!(sb.upstream.calls(), calls);
+    }
+}
+
+#[test]
+fn exact_release_rules_preserve_provider_specific_and_non_semver_releases() {
+    for (tool, release) in [("python", "3.13.16"), ("python", "3.14.0rc1"), ("postgres", "17.11"),
+        ("jq", "1.7"), ("go", "1.20"), ("java", "temurin-21.0.4+7"), ("github:vendor/tool", "20260918")] {
+        assert!(mise::exact_release(tool, release), "{tool}@{release}");
+    }
+    for bad in ["3", "3.13", "latest", "stable", "nightly", "system", "ref:main", "lts-22", "sub-1", "3.*"] {
+        assert!(!mise::exact_release("python", bad), "{bad}");
+    }
+}
