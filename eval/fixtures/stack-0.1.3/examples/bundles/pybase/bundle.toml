@@ -1,0 +1,29 @@
+[bundle]
+name = "pybase"
+version = "1.0.0"
+description = "Python 3.13 + uv with Postgres and Redis"
+
+[tools]
+python = "3.13"
+uv = "latest"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+LOG_LEVEL = "info"
+
+[services.postgres]
+preset = "postgres"
+version = "17"
+
+[services.redis]
+preset = "redis"
+version = "8"
+
+# Supporting files resolve against the bundle, wherever it is materialized.
+[tasks.seed]
+description = "Load the bundle's fixture data"
+run = "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -q -f {{bundle_dir}}/fixtures/seed.sql && psql \"$DATABASE_URL\" -Atc 'select v from seed_marker'"
+services = ["postgres"]
+
+[paths]
+bin = ["bin"]

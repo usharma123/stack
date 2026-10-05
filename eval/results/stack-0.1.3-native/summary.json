@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "platform": "darwin-arm64",
+  "version": "0.1.3",
+  "commit": "a1358335984610926384c58d9a83bd383301d647",
+  "exec_median_ms": 154.895,
+  "service_pids_gone": true
+}

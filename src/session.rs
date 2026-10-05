@@ -42,6 +42,7 @@ impl Ctx {
             cache: self.cache.clone(),
             state: self.state.clone(),
             reassign_ports: false,
+            resolver: None,
         })
     }
 
@@ -80,6 +81,26 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     pub services: IndexMap<String, ServiceRecord>,
+    /// How to reach the supervisor without the project directory, so services can still be
+    /// stopped after the project is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderRecord>,
+    /// Device and inode of the project directory at launch. A directory recreated at the same
+    /// path is a different project and never inherits this session's authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir_id: Option<(u64, u64)>,
+    /// Creation time distinguishes directories when the filesystem reuses an inode.
+    /// Older records and filesystems without birth times retain device/inode checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir_created: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRecord {
+    /// The Pitchfork binary mise used for this project.
+    pub pitchfork: PathBuf,
+    /// Pitchfork's effective state directory (socket and daemon state).
+    pub state_dir: PathBuf,
 }
 
 /// When a session may be reclaimed. With neither field set it lives until `stack down`.
@@ -117,6 +138,9 @@ pub struct ServiceRecord {
     pub data_dir: Option<String>,
     pub identity: Identity,
     pub verified_at: u64,
+    /// The supervisor's qualified id for this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 /// How strongly a service was verified.
@@ -147,11 +171,14 @@ pub struct Check {
     pub checked_at: u64,
     #[serde(skip)]
     data_dir: Option<String>,
+    #[serde(skip)]
+    provider_id: Option<String>,
 }
 
 // ---- verification --------------------------------------------------------------------------
 
 fn verify_all(
+    root: &Path,
     report: &Report,
     env: &IndexMap<String, String>,
     statuses: &[DaemonStatus],
@@ -174,8 +201,10 @@ fn verify_all(
                 withheld: Vec::new(),
                 checked_at: now(),
                 data_dir: status.and_then(|s| s.data_dir.clone()),
+                provider_id: status.and_then(|s| s.id.clone()),
             };
-            match verify_one(&entry.value, port, status, env) {
+            let token = report.identities.get(name).map(String::as_str);
+            match verify_one(root, &entry.value, port, status, env, token) {
                 Ok(identity) => {
                     check.ready = true;
                     check.identity = Some(identity);
@@ -191,10 +220,12 @@ fn verify_all(
 }
 
 fn verify_one(
+    root: &Path,
     service: &Service,
     port: Option<u16>,
     status: Option<&DaemonStatus>,
     env: &IndexMap<String, String>,
+    token: Option<&str>,
 ) -> std::result::Result<Identity, String> {
     let port = port.ok_or("no port assigned; run `stack compile`")?;
     let status = status.ok_or("not started")?;
@@ -218,7 +249,15 @@ fn verify_one(
     let (var, bin) = match service.preset.as_deref() {
         Some("postgres") => ("DATABASE_URL", "psql"),
         Some("redis") => ("REDIS_URL", "redis-cli"),
-        _ => return Ok(Identity::Liveness),
+        _ => {
+            return match &service.identity {
+                Some(probe) => {
+                    let token = token.ok_or("no instance token assigned; run `stack compile`")?;
+                    run_identity_probe(root, probe, env, token).map(|()| Identity::Instance)
+                }
+                None => Ok(Identity::Liveness),
+            }
+        }
     };
     let url = env.get(var).ok_or_else(|| format!("{var} is not set"))?;
     let expected = status
@@ -241,6 +280,59 @@ fn verify_one(
         Err(format!(
             "{var} reaches a different server (data dir '{reported}', expected '{expected}')"
         ))
+    }
+}
+
+/// Bytes of probe output kept; an identity is one short line, so more is malformed.
+const IDENTITY_OUTPUT_LIMIT: usize = 4096;
+
+/// Run a bundle's identity probe and require it to print exactly this instance's token.
+/// The probe gets the app's environment without any instance token, so it can only learn the
+/// token from the service. Its process group is killed at the deadline or on completion, and
+/// its output is bounded.
+fn run_identity_probe(
+    root: &Path,
+    probe: &crate::manifest::IdentityProbe,
+    env: &IndexMap<String, String>,
+    token: &str,
+) -> std::result::Result<(), String> {
+    let timeout = Duration::from_secs(probe.timeout_secs());
+    let mut command = Command::new("sh");
+    command.args(["-c", &probe.command]).current_dir(root);
+    mise::configure_command(&mut command, root);
+    command.envs(env.iter().filter(|(k, _)| !k.starts_with("STACK_IDENTITY_")));
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("STACK_IDENTITY_")) {
+            command.env_remove(&key);
+        }
+    }
+    let out = crate::process::capture(&mut command, timeout, IDENTITY_OUTPUT_LIMIT)
+        .map_err(|e| format!("cannot run identity probe: {e}"))?;
+    if out.timed_out {
+        return Err(format!("identity probe did not answer within {}s", timeout.as_secs()));
+    }
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("");
+        let code = out.exit_code.map_or("a signal".to_string(), |c| c.to_string());
+        return Err(format!("identity probe exited with {code}: {}", truncate(err, 200)));
+    }
+    if out.stdout_truncated {
+        return Err(format!("identity probe printed more than {IDENTITY_OUTPUT_LIMIT} bytes"));
+    }
+    match out.stdout.trim() {
+        "" => Err("identity probe printed no identity".into()),
+        reported if reported == token => Ok(()),
+        reported => Err(format!(
+            "identity probe reached a different instance (reported '{}')",
+            truncate(reported, 80)
+        )),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
     }
 }
 
@@ -422,6 +514,20 @@ pub struct UpReport {
     pub reaped: Vec<GcEntry>,
 }
 
+/// Preserve every observed launch identity before further provider calls can fail.
+fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()> {
+    let Some(mut launch) = load(ctx)?.filter(|session| session.launching) else { return Ok(()) };
+    for daemon in statuses {
+        if let Some(record) = launch.services.get_mut(&daemon.name) {
+            if daemon.port != Some(record.port) { continue; }
+            record.provider_id = daemon.id.clone().or(record.provider_id.take());
+            record.pid = daemon.pid.filter(|pid| (1..=MAX_OWNER_PID).contains(pid)).or(record.pid);
+            record.data_dir = daemon.data_dir.clone().or(record.data_dir.take());
+        }
+    }
+    save(ctx, &launch)
+}
+
 pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     if let Some(pid) = lease.owner_pid {
         owner_pid(pid.into())?;
@@ -448,10 +554,32 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     };
     steps.ok("compile", json!({ "ports": report.ports }));
 
-    if let Err(e) = mise::trust(&ctx.root).and_then(|_| mise::install(&ctx.root)) {
+    if let Err(e) = mise::trust(&ctx.root) {
+        return Err(steps.fail("install", e, false));
+    }
+    // Pitchfork refuses a socket path longer than `sun_path`, but only once it starts, after
+    // every download. Check the path it will use first, with the env mise will give it.
+    let mut socket = None;
+    if !report.stack.services.is_empty() {
+        match preflight_socket(ctx) {
+            Ok((path, detail)) => {
+                socket = path;
+                steps.ok("preflight", detail);
+            }
+            Err(e) => return Err(steps.fail("preflight", e, false)),
+        }
+    }
+    if let Err(e) = mise::install(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
     steps.ok("install", json!(null));
+    // Recorded before anything starts, so a deleted project's services can still be found.
+    let provider = socket.and_then(|socket| {
+        let state_dir = socket.path.parent()?.parent()?.to_path_buf();
+        Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
+    });
+    let project_dir_id = dir_id(&ctx.root);
+    let project_dir_created = dir_created(&ctx.root);
 
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
@@ -490,24 +618,35 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                     .ports
                     .iter()
                     .map(|(name, port)| {
-                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0 };
+                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0, provider_id: None };
                         (name.clone(), record)
                     })
                     .collect(),
+                provider: provider.clone(),
+                project_dir_id,
+                project_dir_created,
             };
             save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         }
-        if let Err(e) = mise::start(&ctx.root) {
-            return Err(steps.fail("start", e, true));
+        // Capture qualified IDs before launch when available, including interrupted starts.
+        let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        if let Err(start_error) = mise::start(&ctx.root) {
+            let observed = mise::daemons(&ctx.root).and_then(|statuses| record_launch_observations(ctx, &statuses));
+            if let Err(error) = observed {
+                return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
+            }
+            return Err(steps.fail("start", start_error, true));
         }
         steps.ok("start", json!(null));
 
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
             let statuses =
                 mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
-            checks = verify_all(&report, &env, &statuses);
+            record_launch_observations(ctx, &statuses).map_err(|e| steps.clone().fail("record_observed", e, true))?;
+            let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
+            checks = verify_all(&ctx.root, &report, &env, &statuses);
             if checks.iter().all(|c| c.ready) {
                 break;
             }
@@ -564,10 +703,14 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                         data_dir: c.data_dir.clone(),
                         identity: c.identity.unwrap_or(Identity::Liveness),
                         verified_at: c.checked_at,
+                        provider_id: c.provider_id.clone(),
                     },
                 )
             })
             .collect(),
+        provider: if report.stack.services.is_empty() { None } else { provider },
+        project_dir_id,
+        project_dir_created,
     };
     save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
     Ok(UpReport {
@@ -576,6 +719,48 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps: steps.0,
         reaped,
     })
+}
+
+/// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
+fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
+    let effective = mise::env(&ctx.root)?;
+    let env = mise::SocketEnv::effective(&ctx.root, &effective);
+    match mise::socket_path(&env, mise::socket_capacity()) {
+        Ok(socket) if socket.fits() => {
+            let detail = json!({ "socket": socket });
+            Ok((Some(socket), detail))
+        }
+        Ok(socket) => Err(socket.error()),
+        Err(note) => Ok((None, json!({ "socket": null, "note": note }))),
+    }
+}
+
+/// Device and inode of a directory, identifying it beyond its path.
+pub fn dir_id(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.created().ok()
+}
+
+fn project_replaced(session: &Session, path: &Path) -> bool {
+    if let (Some(recorded), Some(current)) = (session.project_dir_id, dir_id(path)) {
+        if recorded != current {
+            return true;
+        }
+    }
+    // Once recorded, losing the birth time also prevents adoption of the old session.
+    session.project_dir_created.is_some_and(|recorded| Some(recorded) != dir_created(path))
 }
 
 fn new_session_id(ctx: &Ctx) -> String {
@@ -1090,7 +1275,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     // be some other server. Poison host-bearing values so connections fail loudly instead.
     // A variable only the caller set is still inherited by the command, so it is withheld too.
     let inherited = inherited_env();
-    let mut removed: Vec<String> = Vec::new();
+    let mut removed = mise::inherited_config_keys();
     let mut seen: Vec<&String> = Vec::new();
     for check in &checks {
         let preset = report
@@ -1201,6 +1386,9 @@ pub struct GcEntry {
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Per-service outcomes for a gone project.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<Value>,
 }
 
 /// Reclaim sessions whose lease expired or whose project directory is gone.
@@ -1227,20 +1415,6 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
             continue;
         }
         let session: Session = read_json(&path)?;
-        if !session.project.exists() {
-            out.push(GcEntry {
-                project: session.project,
-                reason: "project directory deleted".into(),
-                stopped: false,
-                error: Some(
-                    "cannot stop services without the project; see `mise daemons prune`".into(),
-                ),
-            });
-            continue;
-        }
-        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
-            continue;
-        };
         // TTL describes idle time; an executing command is not idle. Owner death still
         // follows the explicit runner policy even if one of its commands has survived.
         let owner_dead = session
@@ -1248,7 +1422,17 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
             .as_ref()
             .and_then(|l| l.owner_pid)
             .is_some_and(|p| !pid_alive(p));
-        if !owner_dead && has_active_executions(&session) {
+        let busy = !owner_dead && has_active_executions(&session);
+        if let Some(reason) = project_gone(&session) {
+            if !busy {
+                out.push(reclaim_gone(&path, session, reason));
+            }
+            continue;
+        }
+        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
+            continue;
+        };
+        if busy {
             continue;
         }
         let result = down_locked(&ctx);
@@ -1257,24 +1441,103 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
             reason,
             stopped: result.is_ok(),
             error: result.err().map(|e| e.to_string()),
+            services: Vec::new(),
         });
     }
     Ok(out)
 }
 
-/// Like [`gc`], but fails when an expired session it tried to stop is still running. Sessions
-/// of deleted projects are reported (stack cannot stop them) without failing.
+/// Why a session's project no longer exists: deleted, or replaced by another directory at the
+/// same path (which must never inherit the authority to stop this session's services).
+fn project_gone(session: &Session) -> Option<&'static str> {
+    if !session.project.exists() {
+        return Some("project directory deleted");
+    }
+    project_replaced(session, &session.project).then_some("project directory replaced")
+}
+
+/// Reconcile a gone project without signalling a daemon whose identity can be replaced.
+/// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
+/// their ownership record. Only confirmed terminal state permits releasing the record.
+fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
+    let mut services = Vec::new();
+    let mut problems = Vec::new();
+    for (name, record) in &session.services {
+        match reconcile_gone(session.provider.as_ref(), record, session.launching) {
+            Ok(outcome) => services.push(json!({ "service": name, "outcome": outcome })),
+            Err(why) => {
+                services.push(json!({ "service": name, "error": why }));
+                problems.push(format!("{name}: {why}"));
+            }
+        }
+    }
+    if problems.is_empty() {
+        if let Err(e) = remove_if_exists(index) {
+            problems.push(e.to_string());
+        }
+    }
+    GcEntry {
+        project: session.project,
+        reason: reason.into(),
+        stopped: problems.is_empty(),
+        error: (!problems.is_empty()).then(|| problems.join("; ")),
+        services,
+    }
+}
+
+fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, launching: bool) -> std::result::Result<String, String> {
+    let alive = record.pid.is_some_and(pid_alive);
+    let listening = record.port != 0 && accepting(record.port);
+    let (Some(provider), Some(id)) = (provider, record.provider_id.as_deref()) else {
+        return Err(match record.pid {
+            Some(pid) if alive => format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
+            _ => "no supervisor identity was recorded; terminal state cannot be confirmed; record retained".into(),
+        });
+    };
+    match mise::supervised(&provider.pitchfork, &provider.state_dir, id)? {
+        mise::Supervised::NotFound => match record.pid {
+            _ if launching => Err("startup was interrupted or failed; absence of a daemon now does not prove that startup cannot still register it; record retained".into()),
+            Some(pid) if alive => Err(format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled")),
+            _ if listening => Ok(format!("port {} is held by a process the supervisor does not track; left alone", record.port)),
+            _ => Ok("not running".into()),
+        },
+        mise::Supervised::Found { status, pid, port } => {
+            if status == "stopped" && !alive && !pid.is_some_and(pid_alive) && !launching {
+                return Ok("not running (supervisor confirms stopped)".into());
+            }
+            if status != "running" || !pid.is_some_and(pid_alive) {
+                return Err(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
+            }
+            let Some(recorded) = record.pid else {
+                return Err(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
+            };
+            if pid != Some(recorded) {
+                return Err(format!(
+                    "{id} now runs pid {}, not the recorded pid {recorded} (restarted, or the path was reused); not signalled",
+                    pid.unwrap_or(0)
+                ));
+            }
+            if port != Some(record.port) {
+                return Err(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
+            }
+            Err(format!("{id} matches pid {recorded}, but Pitchfork cannot atomically validate and stop that generation; not signalled. Stop the service explicitly and retry GC"))
+        }
+    }
+}
+
+/// Like [`gc`], but fails when any session it tried to reclaim is still running or could not
+/// be confirmed stopped. Ownership records are kept for a retry.
 pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
     let entries = gc(state)?;
-    let failed = entries.iter().filter(|e| !e.stopped && e.project.exists()).count();
+    let failed = entries.iter().filter(|e| !e.stopped).count();
     if failed == 0 {
         return Ok(entries);
     }
     Err(StackError::new(
         "gc_incomplete",
-        format!("{failed} expired session(s) could not be stopped"),
+        format!("{failed} session(s) could not be confirmed stopped"),
     )
-    .hint("retry `stack gc`, or run `stack down` in the listed project")
+    .hint("retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed")
     .details(entries.iter().map(|e| serde_json::to_value(e).expect("gc entry serializes")).collect()))
 }
 
@@ -1289,7 +1552,16 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
     if !path.exists() {
         return Ok(None);
     }
-    read_json::<Session>(&path).map(Some)
+    let session = read_json::<Session>(&path)?;
+    // A different directory now at this path must not adopt (or stop) the old one's services.
+    if project_replaced(&session, &ctx.root) {
+        return Err(StackError::new(
+            "session_conflict",
+            "a session recorded for a previous directory at this path still owns services",
+        )
+        .hint("run `stack gc` to reclaim them through the supervisor; it reports anything it cannot confirm"));
+    }
+    Ok(Some(session))
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
@@ -1313,8 +1585,12 @@ fn has_active_executions(session: &Session) -> bool {
 }
 
 fn config_digest(ctx: &Ctx, report: &Report) -> String {
-    let config =
+    let mut config =
         json!({ "lock": lock_digest(&ctx.root), "stack": report.stack, "ports": report.ports });
+    // Only when a service has a probe, so records written before probes existed stay current.
+    if !report.identities.is_empty() {
+        config["identities"] = json!(report.identities);
+    }
     sha256_hex(config.to_string().as_bytes())
 }
 
@@ -1325,7 +1601,7 @@ fn verify_session(
     statuses: &[DaemonStatus],
     session: Option<&Session>,
 ) -> Vec<Check> {
-    let mut checks = verify_all(report, env, statuses);
+    let mut checks = verify_all(&ctx.root, report, env, statuses);
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
         Some(s) if s.launching => Some("`stack up` did not finish verifying this launch; run `stack up`"),
@@ -1730,6 +2006,7 @@ mod tests {
             ready_cmd: None,
             ready_port: None,
             port: None,
+            identity: None,
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [

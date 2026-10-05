@@ -1,0 +1,17 @@
+[
+  {
+    "step": "versions",
+    "exit_code": 0,
+    "ms": 429.15
+  },
+  {
+    "step": "appA-compile",
+    "exit_code": 0,
+    "ms": 20.7
+  },
+  {
+    "step": "appA-up",
+    "exit_code": 1,
+    "ms": 8366.35
+  }
+]

@@ -4,14 +4,23 @@ use std::fs;
 use std::path::Path;
 
 pub const LOCK_FILE: &str = "stack.lock";
-const LOCK_VERSION: u32 = 1;
+/// Version 2 adds exact tool and service versions. Version 1 locks are read for migration:
+/// `stack compile` rewrites them, and every locked operation refuses them.
+const LOCK_VERSION: u32 = 2;
+const LEGACY_VERSION: u32 = 1;
 
-/// Exactly which bundle contents a project was compiled from.
+/// Exactly which bundle contents and tool versions a project was compiled from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lockfile {
     pub version: u32,
     #[serde(default, rename = "bundle")]
     pub bundles: Vec<LockedBundle>,
+    /// Every requested tool, including tools stack adds for its provider (pitchfork).
+    #[serde(default, rename = "tool", skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<LockedVersion>,
+    /// Preset services whose version stack resolves.
+    #[serde(default, rename = "service", skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<LockedVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,16 +37,50 @@ pub struct LockedBundle {
     pub content_hash: String,
 }
 
+/// One version request and the exact version it resolved to. An exact version names a
+/// release; it is not a checksum of the artifact the provider downloads for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LockedVersion {
+    /// Tool name (`python`, `npm:prettier`) or service name (`postgres`).
+    pub name: String,
+    /// For services: the provider tool the preset installs (`postgres`, `redis`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The version as composed from bundles and the project, e.g. `3.13` or `latest`.
+    pub requested: String,
+    /// The exact version rendered into the provider config and installed.
+    pub resolved: String,
+    /// The platform the resolution ran on. One version applies to every platform; a release
+    /// a platform lacks fails at install rather than resolving differently per machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_on: Option<String>,
+}
+
 impl Lockfile {
-    pub fn new(bundles: Vec<LockedBundle>) -> Self {
+    pub fn new(bundles: Vec<LockedBundle>, tools: Vec<LockedVersion>, services: Vec<LockedVersion>) -> Self {
         Self {
             version: LOCK_VERSION,
             bundles,
+            tools,
+            services,
         }
     }
 
     pub fn find(&self, source: &str) -> Option<&LockedBundle> {
         self.bundles.iter().find(|b| b.source == source)
+    }
+
+    pub fn tool(&self, name: &str) -> Option<&LockedVersion> {
+        self.tools.iter().find(|t| t.name == name)
+    }
+
+    pub fn service(&self, name: &str) -> Option<&LockedVersion> {
+        self.services.iter().find(|t| t.name == name)
+    }
+
+    /// A version 1 lock: bundle pins only, no exact versions.
+    pub fn is_legacy(&self) -> bool {
+        self.version == LEGACY_VERSION
     }
 }
 
@@ -49,10 +92,17 @@ pub fn read(root: &Path) -> Result<Option<Lockfile>> {
     let text = fs::read_to_string(&path).map_err(|e| io_error(path.display(), e))?;
     let lock: Lockfile = toml::from_str(&text)
         .map_err(|e| StackError::new("lock_invalid", format!("{LOCK_FILE}: {}", e.message())))?;
-    if lock.version != LOCK_VERSION {
+    if lock.version != LOCK_VERSION && lock.version != LEGACY_VERSION {
         return Err(StackError::new(
             "lock_invalid",
             format!("unsupported {LOCK_FILE} version {}", lock.version),
+        )
+        .hint("this stack.lock was written by a newer stack; upgrade stack"));
+    }
+    if lock.is_legacy() && (!lock.tools.is_empty() || !lock.services.is_empty()) {
+        return Err(StackError::new(
+            "lock_invalid",
+            format!("{LOCK_FILE} version 1 cannot contain tool or service versions"),
         ));
     }
     Ok(Some(lock))

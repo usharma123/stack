@@ -1,0 +1,15 @@
+{
+  "eval/harness/stack-lock.py": "b29406ffe2636a67d69d6549b92eecda58fe4b6fa67d152f63aaab545cc9cc57",
+  "eval/harness/stack.sh": "80b94ef1423c43ace803b586b54abde42566e05b049074ff1c31c64d03342a12",
+  "eval/harness/stack-native.py": "c0aa58d1faa0b640ed5ba4f593cff1520283d52f33a86b2c7d97b4fbe732d166",
+  "eval/harness/run-stack.py": "3519ebee42faceaa77192ddc2c1eab04dcff1faec972ab8632d2ecb34634bc2d",
+  "tests/e2e/5-oci.sh": "67a97d1d56c18c8829eaef95943f4b9eb6f8ad4b4a863cb791acd54d3fc2a3e9",
+  "tests/e2e/6-configuration-generation.sh": "ab6536d55a4bc5e01d83a4cf3a4896972f26dbc99c221c978763e91cba74f581",
+  "tests/e2e/4-mcp.sh": "d803135aead4a9245211ff62768bfb4fb69f58cc6585a6682bc343a228cf8265",
+  "tests/e2e/3-leases.sh": "7b27e62d334f8e1a2ec1473bf5453d815646bee96ba5459341f14d444a3d622f",
+  "tests/e2e/run.sh": "499c6f9eac625284337325bd4af1f0fd2f42b8a0242f8279c5b0e055430476b0",
+  "tests/e2e/2-wrong-instance.sh": "893d4e7f392545628c5e69421c70e8ef94b9aea4d571c9584febc9dfa874063c",
+  "tests/e2e/ci-oci.sh": "2883bee58ef7a786d338474491b30e64c938508b1f44087c6aa8c3d478a0d82a",
+  "tests/e2e/1-independent-checkouts.sh": "8094ae18c934d24a50020738655bffb75280af445bd25d75d88ac89142c2983e",
+  "tests/e2e/assert.sh": "7f900f407d4db7803430c53f5ff79495dafa4fcbd59fced7e487b2fea7f0260c"
+}

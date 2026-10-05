@@ -1,0 +1,17 @@
+[bundle]
+name = "webid"
+version = "1.0.0"
+description = "A custom HTTP service with an instance identity probe"
+
+[tools]
+python = "3.13"
+
+# `exec` so the supervisor stops the server itself. Pitchfork sets PORT; stack gives the
+# service its instance token as STACK_IDENTITY_WEB.
+[services.web]
+run = "exec python3 {{bundle_dir}}/server.py"
+
+# Asked through the app's own connection settings (WEB_PORT); must print the token exactly.
+[services.web.identity]
+command = "python3 {{bundle_dir}}/probe.py"
+timeout = "5s"

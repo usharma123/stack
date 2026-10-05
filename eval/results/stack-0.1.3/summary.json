@@ -1,0 +1,93 @@
+{
+  "version": "0.1.3",
+  "verdict": "Close to the core local-development vision; ready for a controlled pilot, not broad agent-safe completeness.",
+  "linux": {
+    "compile_cold_ms": 9,
+    "startup_cold_ms": 11167,
+    "compile_warm_ms": 6,
+    "startup_new_project_cached_tools_ms": 1207,
+    "exec_verified_median_ms": 82.0,
+    "exec_verified_range_ms": [
+      81,
+      84
+    ],
+    "exec_unverified_median_ms": 25.0,
+    "exec_sample_count_per_mode": 10,
+    "six_e2e_scenarios_passed": true
+  },
+  "native_macos": {
+    "ok": true,
+    "platform": "darwin-arm64",
+    "version": "0.1.3",
+    "commit": "a1358335984610926384c58d9a83bd383301d647",
+    "exec_median_ms": 154.895,
+    "service_pids_gone": true
+  },
+  "git_lock": {
+    "ok": true,
+    "fresh_cache_preserved_pin": true,
+    "explicit_update_reported_move": true
+  },
+  "proven": [
+    "Reusable bundle files: seed SQL and bundled acme CLI work in both checkouts on Linux and macOS.",
+    "Different Postgres and Redis ports/data directories, independently stopped checkouts, real pytest connections.",
+    "Linux foreign-server refusal including libpq overrides; macOS poisoned endpoint and required-service refusal.",
+    "Explicit conflict rejection; install_failed errors for impossible version and unknown package.",
+    "Linux TTL renewal/expiry, active-exec protection, owner death cleanup, zero service leftovers in asserted scenarios.",
+    "MCP lifecycle, real fixture tests, structured errors, process timeout and next request.",
+    "Local OCI distribution, digest locking after tag moves, explicit update and publication conflict handling.",
+    "Generation changes invalidate endpoints; incompatible Redis version fails without losing data; original version recovers.",
+    "Git tag moves cannot change a locked bundle even in a fresh empty cache."
+  ],
+  "remaining": [
+    "Tool versions are not fully immutable: Python 3.13, Postgres 17, Redis 8 are ranges, uv and jq use latest. Bundle commit/content pins do not freeze all tools.",
+    "Custom services get liveness-only checks; Postgres and Redis have instance identity verification.",
+    "Lease reclamation requires next gc/up; deleted-project sessions cannot be stopped by Stack.",
+    "Native macOS lifecycle smoke passed, but full six-scenario automation still Linux-only; x64 not exercised here.",
+    "Cold setup and warm setup are each single observations per platform; no randomized repeated speed study.",
+    "Original competitor figures are historical 2026-10-02 observations, not rerun head-to-head. Different setup semantics and resolved versions prohibit claiming speedup ratios.",
+    "No real multi-agent task-completion/productivity evaluation, remote/cloud backend or large concurrency stress in this run.",
+    "OCI exercised local anonymous registry, not hosted/private credential-helper workflows."
+  ],
+  "observed_issues": [
+    {
+      "kind": "test maintenance",
+      "detail": "Existing MCP E2E asserted 7 tools while release has 9. First run failed; changed assertion to exact 9 tool names and reran all six successfully."
+    },
+    {
+      "kind": "benchmark correction",
+      "detail": "First attempt bad_pkg/bad_version returned lock_outdated before reaching installs. Added compile and asserted install_failed; final run valid. First attempt retained."
+    },
+    {
+      "kind": "provider path limit",
+      "detail": "Initial isolated native HOME produced 118-byte Pitchfork socket path, exceeding macOS 104-byte limit. Stack returned structured start_failed. Short isolated /tmp path passed. This is a temporary-state path constraint, not evidence that ordinary project paths fail."
+    }
+  ],
+  "improvement_priorities": [
+    {
+      "priority": 1,
+      "action": "Resolve and lock exact provider/tool versions, including eliminating latest from examples.",
+      "acceptance": "A clean cache reproduces identical tool/service versions after upstream releases."
+    },
+    {
+      "priority": 2,
+      "action": "Run the full service/session E2E suite on native macOS in CI and check provider socket path length in doctor.",
+      "acceptance": "Repeat Linux contracts on macOS; diagnose long state paths before downloads/start."
+    },
+    {
+      "priority": 3,
+      "action": "Add reusable identity probes for custom services.",
+      "acceptance": "A foreign healthy service cannot satisfy an instance check for supported custom bundles."
+    },
+    {
+      "priority": 4,
+      "action": "Make cleanup independent of project-directory survival and define automatic lease expiry behavior.",
+      "acceptance": "Delete a project or lose the runner and reclaim only its owned services without next project startup."
+    },
+    {
+      "priority": 5,
+      "action": "Run a real concurrent-agent pilot with measured wrong-instance incidents, orphan rates, task completion and latency distributions.",
+      "acceptance": "Repeated fresh/cached runs and controlled failures across multiple agents and projects."
+    }
+  ]
+}

@@ -3,7 +3,7 @@ name = "obs"
 description = "Observability defaults"
 
 [tools]
-jq = "latest"
+jq = "1.8.2"
 
 [env]
 LOG_LEVEL = "debug"

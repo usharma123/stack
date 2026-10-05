@@ -1,0 +1,183 @@
+{
+  "source_commit": "a1358335984610926384c58d9a83bd383301d647",
+  "source_dirty": true,
+  "release_binary": false,
+  "mise": "2026.9.18",
+  "runs": [
+    {
+      "run": "native1",
+      "platform": "macOS arm64",
+      "source_stage": "before session_conflict guard",
+      "scenarios": [
+        {
+          "scenario": "1-independent-checkouts",
+          "result": "passed",
+          "seconds": 27
+        },
+        {
+          "scenario": "2-wrong-instance",
+          "result": "passed",
+          "seconds": 5
+        },
+        {
+          "scenario": "3-leases",
+          "result": "passed",
+          "seconds": 28
+        },
+        {
+          "scenario": "4-mcp",
+          "result": "passed",
+          "seconds": 3
+        },
+        {
+          "scenario": "5-oci",
+          "result": "skipped",
+          "reason": "no OCI registry"
+        },
+        {
+          "scenario": "6-configuration-generation",
+          "result": "passed",
+          "seconds": 7
+        },
+        {
+          "scenario": "7-deleted-project",
+          "result": "passed",
+          "seconds": 2
+        },
+        {
+          "scenario": "8-identity-probe",
+          "result": "passed",
+          "seconds": 97
+        }
+      ]
+    },
+    {
+      "run": "native2",
+      "platform": "macOS arm64",
+      "source_stage": "before session_conflict guard",
+      "scenarios": [
+        {
+          "scenario": "1-independent-checkouts",
+          "result": "passed",
+          "seconds": 24
+        },
+        {
+          "scenario": "2-wrong-instance",
+          "result": "passed",
+          "seconds": 5
+        },
+        {
+          "scenario": "3-leases",
+          "result": "passed",
+          "seconds": 28
+        },
+        {
+          "scenario": "4-mcp",
+          "result": "passed",
+          "seconds": 3
+        },
+        {
+          "scenario": "5-oci",
+          "result": "passed",
+          "seconds": 7
+        },
+        {
+          "scenario": "6-configuration-generation",
+          "result": "passed",
+          "seconds": 6
+        },
+        {
+          "scenario": "7-deleted-project",
+          "result": "passed",
+          "seconds": 2
+        },
+        {
+          "scenario": "8-identity-probe",
+          "result": "passed",
+          "seconds": 98
+        }
+      ]
+    },
+    {
+      "run": "native-final",
+      "platform": "macOS arm64",
+      "source_stage": "final",
+      "scenarios": [
+        {
+          "scenario": "1-independent-checkouts",
+          "result": "passed",
+          "seconds": 23
+        },
+        {
+          "scenario": "2-wrong-instance",
+          "result": "passed",
+          "seconds": 4
+        },
+        {
+          "scenario": "3-leases",
+          "result": "passed",
+          "seconds": 29
+        },
+        {
+          "scenario": "4-mcp",
+          "result": "passed",
+          "seconds": 3
+        },
+        {
+          "scenario": "5-oci",
+          "result": "passed",
+          "seconds": 6
+        },
+        {
+          "scenario": "6-configuration-generation",
+          "result": "passed",
+          "seconds": 6
+        },
+        {
+          "scenario": "7-deleted-project",
+          "result": "passed",
+          "seconds": 2
+        },
+        {
+          "scenario": "8-identity-probe",
+          "result": "passed",
+          "seconds": 97
+        }
+      ]
+    },
+    {
+      "run": "docker1",
+      "platform": "Ubuntu 24.04 arm64 in Docker",
+      "source_stage": "before session_conflict guard",
+      "result": "passed",
+      "scenarios_passed": 8,
+      "failure": null
+    },
+    {
+      "run": "docker-final",
+      "platform": "Ubuntu 24.04 arm64 in Docker",
+      "source_stage": "final",
+      "result": "failed",
+      "scenarios_passed": 1,
+      "failure": {
+        "scenario": "2-wrong-instance",
+        "code": "start_failed",
+        "reason": "Pitchfork reported Redis port 42037 occupied while Postgres started. Ephemeral-port overlap is a separately reproduced possible mechanism, not a proven diagnosis of this run."
+      }
+    },
+    {
+      "run": "docker-final2",
+      "platform": "Ubuntu 24.04 arm64 in Docker",
+      "source_stage": "final",
+      "result": "passed",
+      "scenarios_passed": 8,
+      "failure": null
+    }
+  ],
+  "limits": [
+    "Implementation-time results from the uncommitted eval-followup tree, not released 0.1.3.",
+    "Raw output is retained locally and ignored by Git.",
+    "The docker-final failure remains unresolved; docker-final2 passed with unchanged code.",
+    "A subsequent independent review requested changes on R1-R8; these passing observations do not establish merge readiness."
+  ]
+}

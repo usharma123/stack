@@ -46,8 +46,20 @@ impl Fixture {
             r#"#!/bin/sh
 echo "$*" >>"$REVIEW_FIXTURE/mise.log"
 case "$1 $2" in
-  'env --json') cat "$REVIEW_FIXTURE/env.json" ;;
+  'latest '*)
+    if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
+    v=${2#*@}; if test "$v" = "$2"; then v=1.0.0; fi
+    case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; esac
+    echo "$v" ;;
+  'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
+  'env --json')
+    if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
+    cat "$REVIEW_FIXTURE/env.json" ;;
   'daemons --json')
+    if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
+      if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
+      touch "$REVIEW_FIXTURE/query-observed"
+    fi
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     cat "$REVIEW_FIXTURE/daemons.json" ;;
   'daemons start')
@@ -58,21 +70,45 @@ case "$1 $2" in
     fi
     if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
   'daemons stop')
-    if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi ;;
+    if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
+    if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi ;;
 esac
 "#,
         )
         .unwrap();
         fs::set_permissions(mise, fs::Permissions::from_mode(0o755)).unwrap();
+        // The supervisor as stack reaches it without a project: answers from files the test
+        // controls, and "stops" a daemon by killing the PID it was told it tracks.
+        let pitchfork = dir.path().join("bin/pitchfork");
+        fs::write(
+            &pitchfork,
+            r#"#!/bin/sh
+echo "$PITCHFORK_STATE_DIR $*" >>"$REVIEW_FIXTURE/pitchfork.log"
+case "$1" in
+  status)
+    if test -f "$REVIEW_FIXTURE/pf-status.json"; then cat "$REVIEW_FIXTURE/pf-status.json"; exit 0; fi
+    echo "Error: Daemon $3 not found" >&2; exit 1 ;;
+  stop)
+    if test -f "$REVIEW_FIXTURE/pf-fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
+    kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(pitchfork, fs::Permissions::from_mode(0o755)).unwrap();
         let fixture = Self { dir };
         fixture.ok(&["compile"]);
         fixture
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_at(&self.dir.path().join("app"), args)
+    }
+
+    fn command_at(&self, dir: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stack"));
         command
-            .args(["-C", self.dir.path().join("app").to_str().unwrap()])
+            .args(["-C", dir.to_str().unwrap()])
             .args(args)
             .env(
                 "PATH",
@@ -263,29 +299,17 @@ fn active_exec_protects_ttl_until_completion_then_the_session_can_expire() {
 #[test]
 fn container_mcp_scenario_rejects_a_server_that_only_returns_an_error() {
     let fixture = Fixture::new();
-    let prefix = format!("{}/", fixture.dir.path().display());
-    let helper = include_str!("e2e/assert.sh").replace("/tmp/", &prefix);
-    fs::write(fixture.dir.path().join("stack-e2e-assert.sh"), helper).unwrap();
+    fs::create_dir(fixture.dir.path().join("appA")).unwrap();
     let fake = fixture.dir.path().join("bin/stack");
     fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"structuredContent\":{\"ok\":false,\"error\":{\"code\":\"exec_failed\"}}}}'\nexit 1\n").unwrap();
     fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
-    let script = include_str!("e2e/4-mcp.sh")
-        .replace("/tmp/", &prefix)
-        .replace(
-            "cd ~/appA",
-            &format!("cd '{}'", fixture.dir.path().display()),
-        )
-        .replace("export PATH=/opt/stack:$PATH", "");
+    let e2e = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e");
     let out = Command::new("bash")
-        .args(["-c", &script])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                fixture.dir.path().join("bin").display(),
-                std::env::var("PATH").unwrap()
-            ),
-        )
+        .arg(e2e.join("4-mcp.sh"))
+        .env("STACK_E2E_ASSERT", e2e.join("assert.sh"))
+        .env("STACK_E2E_TMP", fixture.dir.path())
+        .env("STACK_E2E_WORK", fixture.dir.path())
+        .env("STACK_E2E_BIN", fixture.dir.path().join("bin"))
         .output()
         .unwrap();
     assert!(
@@ -1058,4 +1082,605 @@ fn startup_time_does_not_consume_the_idle_ttl() {
     assert!(status["data"].get("lease_expired").is_none(), "{status}");
     let gc: Value = serde_json::from_slice(&fixture.ok(&["gc", "--json"]).stdout).unwrap();
     assert_eq!(gc["data"], json!([]));
+}
+
+#[test]
+fn mise_resolution_with_no_matching_release_fails_before_writing_anything() {
+    let fixture = Fixture::new();
+    let app = fixture.dir.path().join("app");
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n[tools]\njq='1.7'\n").unwrap();
+    let out = fixture.ok(&["compile", "--json"]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["data"]["versions"][0]["resolved"], "1.7");
+    let lock = fs::read(app.join("stack.lock")).unwrap();
+    // `mise latest` exits 0 with empty output when nothing matches the prefix.
+    fs::write(fixture.dir.path().join("latest-empty"), "").unwrap();
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n[tools]\njq='9.9'\n").unwrap();
+    let out = fixture.command(&["compile", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err["error"]["code"], "resolve_failed", "{err}");
+    assert!(err["error"]["details"][0]["error"].as_str().unwrap().contains("no release matches"), "{err}");
+    assert_eq!(fs::read(app.join("stack.lock")).unwrap(), lock);
+    // Status and exec never resolve: with a stale request they refuse instead.
+    let log = fixture.dir.path().join("mise.log");
+    fs::remove_file(&log).unwrap();
+    let out = fixture.command(&["exec", "--json", "--", "true"]).output().unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "lock_outdated");
+    assert!(!fs::read_to_string(&log).unwrap_or_default().contains("latest"));
+}
+
+#[test]
+fn a_long_supervisor_socket_path_fails_before_install_and_doctor_reports_it() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
+    let suffix = "/sock/main.sock".len();
+    // One byte over, made of two-byte characters so a character count would pass it.
+    let long = |extra: usize| format!("/tmp/{}", "é".repeat((limit - suffix - 5 + extra) / 2) + &"x".repeat((limit - suffix - 5 + extra) % 2));
+    let log = fixture.dir.path().join("mise.log");
+    for (via_config, value) in [(true, long(1)), (false, long(1))] {
+        let _ = fs::remove_file(&log);
+        let mut command = fixture.command(&["up", "--json"]);
+        if via_config {
+            fixture.set_env(&[("PITCHFORK_STATE_DIR", value.clone())]);
+        } else {
+            fixture.set_env(&[]);
+            command.env("PITCHFORK_STATE_DIR", &value);
+        }
+        let out = command.output().unwrap();
+        assert!(!out.status.success());
+        let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(err["error"]["code"], "socket_path_too_long", "{err}");
+        assert_eq!(err["error"]["details"][0]["bytes"], limit + 1, "{err}");
+        let steps = &err["error"]["details"][1]["steps"];
+        assert_eq!(steps.as_array().unwrap().last().unwrap()["step"], "preflight", "{err}");
+        assert_eq!(err["error"]["details"][1]["changed"], false);
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("install") && !calls.contains("daemons start"), "{calls}");
+
+        let out = fixture.command(&["doctor", "--json"]).env("PITCHFORK_STATE_DIR", &value).output().unwrap();
+        let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "pitchfork_socket").cloned();
+        assert_eq!(check.unwrap()["ok"], false, "{doctor}");
+    }
+    // Exactly at the limit is accepted, as Pitchfork accepts it.
+    fixture.set_env(&[]);
+    let out = fixture.command(&["doctor", "--json"]).env("PITCHFORK_STATE_DIR", long(0)).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let checks = doctor["data"].as_array().or(doctor["error"]["details"].as_array()).unwrap().clone();
+    let check = checks.iter().find(|c| c["name"] == "pitchfork_socket").unwrap();
+    assert_eq!(check["ok"], true, "{doctor}");
+    assert!(check["detail"].as_str().unwrap().contains(&format!("({limit} of {limit} bytes")), "{doctor}");
+}
+
+/// A TCP "service" whose answer the test controls: each connection gets the current reply
+/// after the current delay, then is closed.
+struct Responder {
+    reply: std::sync::Arc<std::sync::Mutex<(Vec<u8>, Duration)>>,
+}
+
+impl Responder {
+    fn start(port: u16) -> Self {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let reply = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Duration::ZERO)));
+        let shared = reply.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (bytes, delay) = shared.lock().unwrap().clone();
+                thread::spawn(move || {
+                    use std::io::Write;
+                    thread::sleep(delay);
+                    let _ = stream.write_all(&bytes);
+                });
+            }
+        });
+        Self { reply }
+    }
+
+    fn set(&self, bytes: impl Into<Vec<u8>>, delay: Duration) {
+        *self.reply.lock().unwrap() = (bytes.into(), delay);
+    }
+}
+
+const PROBED_WEB: &str = r#"[bundle]
+name='test'
+[services.web]
+run='true'
+[services.web.identity]
+command = 'python3 {{bundle_dir}}/probe.py & echo $! >> "$REVIEW_FIXTURE/probe-pids"; wait $!'
+timeout = '2s'
+"#;
+
+const PROBE_PY: &str = r#"import os, socket, sys
+s = socket.create_connection(("127.0.0.1", int(os.environ["WEB_PORT"])), timeout=30)
+data = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+sys.stdout.write(data.decode("utf-8", "replace"))
+assert "STACK_IDENTITY_WEB" not in os.environ
+"#;
+
+fn web_status(fixture: &Fixture) -> Value {
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"]["checks"][0].clone()
+}
+
+#[test]
+fn identity_probes_accept_only_this_checkouts_instance() {
+    let fixture = Fixture::with_bundle(PROBED_WEB);
+    fs::write(fixture.dir.path().join("bundle/probe.py"), PROBE_PY).unwrap();
+    fixture.ok(&["compile"]);
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+    let config: toml::Table = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap().parse().unwrap();
+    let token = config["env"]["STACK_IDENTITY_WEB"].as_str().unwrap().to_string();
+    assert!(token.starts_with("stack-") && token.len() > 30, "{token}");
+    assert!(!config["daemons"]["web"].as_table().unwrap().contains_key("identity"), "probe is not provider config");
+    fixture.set_env(&[("WEB_PORT", port.to_string()), ("STACK_IDENTITY_WEB", token.clone())]);
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
+    )
+    .unwrap();
+
+    // The correct instance verifies as an instance, not merely as alive.
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let responder = Responder::start(port);
+    responder.set(token.clone(), Duration::ZERO);
+    let out = up.wait_with_output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["data"]["checks"][0]["identity"], "instance", "{result}");
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+
+    let refused = |reply: Vec<u8>, delay: Duration, reason: &str| {
+        responder.set(reply, delay);
+        let start = Instant::now();
+        let check = web_status(&fixture);
+        assert!(start.elapsed() < Duration::from_secs(8), "probe was not bounded: {:?}", start.elapsed());
+        assert_eq!(check["ready"], false, "{check}");
+        assert!(check["reason"].as_str().unwrap().contains(reason), "{reason}: {check}");
+        let out = fixture.command(&["exec", "--json", "--require", "web", "--", "true"]).output().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "service_unavailable");
+        let out = fixture.ok(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]);
+        assert_eq!(printed(&String::from_utf8_lossy(&out.stdout))["STACK_UNVERIFIED"], "web");
+    };
+    // A healthy server that is some other instance.
+    refused(b"stack-0123456789abcdef0123456789abcdef".to_vec(), Duration::ZERO, "reached a different instance");
+    // Missing and malformed output.
+    refused(Vec::new(), Duration::ZERO, "printed no identity");
+    refused(format!("{token}\nextra").into_bytes(), Duration::ZERO, "reached a different instance");
+    refused(format!("prefix {token}").into_bytes(), Duration::ZERO, "reached a different instance");
+    // Output flooding stays bounded and is rejected even when it ends with the token.
+    let mut flood = vec![b'a'; 200_000];
+    flood.extend_from_slice(token.as_bytes());
+    refused(flood, Duration::ZERO, "more than 4096 bytes");
+    // A probe that hangs is killed with its descendants at the deadline.
+    let _ = fs::remove_file(fixture.dir.path().join("probe-pids"));
+    refused(token.clone().into_bytes(), Duration::from_secs(20), "did not answer within 2s");
+    let pids = fs::read_to_string(fixture.dir.path().join("probe-pids")).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    for pid in pids.split_whitespace() {
+        let alive = Command::new("kill").args(["-0", pid]).stderr(Stdio::null()).status().unwrap().success();
+        assert!(!alive, "probe descendant {pid} survived its deadline");
+    }
+
+    // Back to the right answer: verified again.
+    responder.set(token.clone(), Duration::ZERO);
+    assert_eq!(web_status(&fixture)["identity"], "instance");
+
+    // A new token is a new generation: the running process cannot be this one any more.
+    fs::remove_file(fixture.dir.path().join("state/identities.json")).unwrap();
+    fixture.ok(&["compile"]);
+    let config: toml::Table = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap().parse().unwrap();
+    assert_ne!(config["env"]["STACK_IDENTITY_WEB"].as_str().unwrap(), token);
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["data"]["stale"], true, "{status}");
+    assert_eq!(status["data"]["checks"][0]["ready"], false);
+}
+
+#[test]
+fn services_without_probes_stay_liveness_only() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+    let config = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    assert!(!config.contains("STACK_IDENTITY"), "{config}");
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
+    )
+    .unwrap();
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    while !fixture.dir.path().join("started").exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let result: Value = serde_json::from_slice(&up.wait_with_output().unwrap().stdout).unwrap();
+    assert_eq!(result["data"]["checks"][0]["identity"], "liveness", "{result}");
+}
+
+/// A detached process standing in for a supervised service. Its parent exits at once, so it is
+/// reaped as soon as it is killed and its PID reads as gone; it is killed when dropped.
+struct Detached(u32);
+
+impl Detached {
+    fn spawn() -> Self {
+        let out = Command::new("sh").args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"]).output().unwrap();
+        Self(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap())
+    }
+
+    fn alive(&self) -> bool {
+        alive(self.0)
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").arg(self.0.to_string()).stderr(Stdio::null()).status();
+    }
+}
+
+fn alive(pid: u32) -> bool {
+    Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().unwrap().success()
+}
+
+const WEB: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\n";
+const WEB_ID: &str = "app-0123456789abcdef/web";
+
+struct Running {
+    service: Detached,
+    port: u16,
+    listener: Option<std::net::TcpListener>,
+}
+
+impl Fixture {
+    /// `stack up` of one supervised service that is really running and listening.
+    fn start_web(&self, up_args: &[&str]) -> Running {
+        let inspect: Value = serde_json::from_slice(&self.ok(&["inspect", "--json"]).stdout).unwrap();
+        let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+        let service = Detached::spawn();
+        fs::write(
+            self.dir.path().join("daemons-started.json"),
+            json!([{ "id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
+        )
+        .unwrap();
+        let mut args = vec!["up", "--json"];
+        args.extend_from_slice(up_args);
+        let up = self.command(&args).stdout(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.dir.path().join("started").exists() {
+            assert!(Instant::now() < deadline, "provider start never ran");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let out = up.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        Running { service, port, listener: Some(listener) }
+    }
+
+    /// What the supervisor says it tracks under the recorded id, and what `stop` kills.
+    fn supervisor_tracks(&self, pid: u32, port: u16) {
+        fs::write(
+            self.dir.path().join("pf-status.json"),
+            json!({ "id": WEB_ID, "status": "running", "pid": pid, "active_port": port }).to_string(),
+        )
+        .unwrap();
+        fs::write(self.dir.path().join("pf-tracked-pid"), pid.to_string()).unwrap();
+    }
+
+    /// Machine-wide gc, run from outside the project.
+    fn gc(&self, extra: &[&str]) -> (bool, Value) {
+        let mut args = vec!["gc", "--json"];
+        args.extend_from_slice(extra);
+        let out = self.command_at(self.dir.path(), &args).output().unwrap();
+        (out.status.success(), serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
+    }
+
+    fn index_files(&self) -> usize {
+        fs::read_dir(self.dir.path().join("state/sessions")).map_or(0, |d| d.count())
+    }
+
+    fn pitchfork_log(&self) -> String {
+        fs::read_to_string(self.dir.path().join("pitchfork.log")).unwrap_or_default()
+    }
+}
+
+#[test]
+fn deleted_projects_are_retained_until_the_supervisor_confirms_terminal_cleanup() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    let index: Value = serde_json::from_slice(&fs::read(fs::read_dir(fixture.dir.path().join("state/sessions")).unwrap().next().unwrap().unwrap().path()).unwrap()).unwrap();
+    assert_eq!(index["services"]["web"]["provider_id"], WEB_ID);
+    let state_dir = index["provider"]["state_dir"].as_str().unwrap().to_string();
+    assert!(index["provider"]["pitchfork"].as_str().unwrap().ends_with("bin/pitchfork"));
+    assert!(index["project_dir_id"].is_array());
+
+    fixture.supervisor_tracks(running.service.0, running.port);
+    let app = fixture.dir.path().join("app");
+    fs::remove_dir_all(&app).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    let entry = &result["error"]["details"][0];
+    assert_eq!(entry["reason"], "project directory deleted");
+    assert_eq!(entry["stopped"], false, "{result}");
+    assert!(running.service.alive(), "GC must not issue a racy stop by daemon name");
+    assert_eq!(fixture.index_files(), 1);
+    assert!(!app.exists(), "cleanup recreated the deleted project");
+    let log = fixture.pitchfork_log();
+    assert!(log.contains(&format!("{state_dir} status --json {WEB_ID}")), "{log}");
+    assert!(!log.contains(" stop "), "{log}");
+    drop(running);
+    thread::sleep(Duration::from_millis(100));
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "stopped" }).to_string()).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    assert_eq!(fixture.index_files(), 0);
+    assert_eq!(fixture.gc(&[]).1["data"], json!([]));
+}
+
+#[test]
+fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+    let other = Detached::spawn();
+    for case in ["different pid", "not tracked", "stopped but recorded pid alive", "different port", "missing port", "replacement after status", "query fails"] {
+        let _ = fs::remove_file(fixture.dir.path().join("pf-status.json"));
+        match case {
+            "different pid" => fixture.supervisor_tracks(other.0, running.port),
+            "not tracked" => {}
+            "stopped but recorded pid alive" => fs::write(
+                fixture.dir.path().join("pf-status.json"),
+                json!({ "id": WEB_ID, "status": "stopped", "pid": null }).to_string(),
+            )
+            .unwrap(),
+            "different port" => fixture.supervisor_tracks(running.service.0, running.port.wrapping_add(1)),
+            "replacement after status" => fixture.supervisor_tracks(running.service.0, running.port),
+            "missing port" => fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "running", "pid": running.service.0 }).to_string()).unwrap(),
+            _ => fs::write(fixture.dir.path().join("pf-status.json"), "not json").unwrap(),
+        }
+        // `stop` would kill whatever the supervisor names; it must never be asked.
+        fs::write(fixture.dir.path().join("pf-tracked-pid"), other.0.to_string()).unwrap();
+        let (ok, result) = fixture.gc(&[]);
+        assert!(!ok, "{case}: {result}");
+        assert_eq!(result["error"]["code"], "gc_incomplete", "{case}: {result}");
+        assert_eq!(result["error"]["details"][0]["stopped"], false, "{case}");
+        assert!(running.service.alive() && other.alive(), "{case}: a process was signalled");
+        assert_eq!(fixture.index_files(), 1, "{case}: ownership record dropped");
+        assert!(!fixture.pitchfork_log().contains(" stop "), "{case}: {}", fixture.pitchfork_log());
+    }
+}
+
+#[test]
+fn a_foreign_process_on_a_dead_services_port_is_left_alone() {
+    let fixture = Fixture::with_bundle(WEB);
+    let mut running = fixture.start_web(&[]);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+    // Our service died; some unrelated program now listens on its port.
+    let port = running.port;
+    drop(running.listener.take());
+    drop(running.service);
+    thread::sleep(Duration::from_millis(100));
+    let _foreign = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    assert!(result["data"][0]["services"][0]["outcome"].as_str().unwrap().contains("left alone"), "{result}");
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+    assert_eq!(fixture.index_files(), 0);
+}
+
+#[test]
+fn a_reused_directory_inode_does_not_inherit_the_old_sessions_authority() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    let other = Detached::spawn();
+    fixture.supervisor_tracks(other.0, running.port);
+    for path in fixture.session_paths() {
+        let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // Model a prior directory with this same device/inode, but an older birth time.
+        let created = session["project_dir_created"]["secs_since_epoch"].as_u64().unwrap();
+        session["project_dir_created"]["secs_since_epoch"] = json!(created - 1);
+        fs::write(path, serde_json::to_vec(&session).unwrap()).unwrap();
+    }
+    for args in [&["up", "--json"][..], &["down", "--json"], &["status", "--json"], &["exec", "--json", "--", "true"]] {
+        let out = fixture.command(args).output().unwrap();
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "session_conflict", "{args:?}: {result}");
+    }
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    assert_eq!(result["error"]["details"][0]["reason"], "project directory replaced", "{result}");
+    assert!(other.alive() && running.service.alive());
+    assert_eq!(fixture.index_files(), 1);
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+}
+
+#[test]
+fn sessions_without_directory_birth_times_remain_readable() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    for path in fixture.session_paths() {
+        let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        session.as_object_mut().unwrap().remove("project_dir_created");
+        fs::write(path, serde_json::to_vec(&session).unwrap()).unwrap();
+    }
+    fixture.ok(&["status"]);
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&["--ttl", "1s"]);
+    let app = fixture.dir.path().join("app");
+    // Same path, different directory: another checkout now lives here.
+    fs::remove_dir_all(&app).unwrap();
+    fs::create_dir(&app).unwrap();
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n").unwrap();
+    let other = Detached::spawn();
+    fixture.supervisor_tracks(other.0, running.port);
+    let log = fixture.dir.path().join("mise.log");
+    let _ = fs::remove_file(&log);
+    thread::sleep(Duration::from_secs(2));
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    assert_eq!(result["error"]["details"][0]["reason"], "project directory replaced", "{result}");
+    assert!(other.alive() && running.service.alive());
+    // The new directory cannot adopt or stop the old session's services either.
+    fixture.ok(&["compile"]);
+    for args in [&["up", "--json"][..], &["down", "--json"], &["status", "--json"], &["exec", "--json", "--", "true"]] {
+        let out = fixture.command(args).output().unwrap();
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "session_conflict", "{args:?}: {result}");
+    }
+    assert!(other.alive() && running.service.alive());
+    assert!(!fs::read_to_string(&log).unwrap_or_default().contains("daemons stop"));
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+    // Even matching metadata cannot authorize a separate stop-by-name request.
+    fixture.supervisor_tracks(running.service.0, running.port);
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    assert!(running.service.alive() && other.alive());
+    assert_eq!(fixture.index_files(), 1);
+}
+
+#[test]
+fn nonterminal_supervisor_states_keep_ownership_even_when_the_recorded_pid_is_dead() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+    drop(running);
+    thread::sleep(Duration::from_millis(100));
+    for status in ["starting", "stopping", "errored", "unknown", "", "running"] {
+        fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": status }).to_string()).unwrap();
+        let (ok, result) = fixture.gc(&[]);
+        assert!(!ok, "{status}: {result}");
+        assert_eq!(fixture.index_files(), 1, "{status}");
+        assert!(!fixture.pitchfork_log().contains(" stop "));
+    }
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID }).to_string()).unwrap();
+    assert!(!fixture.gc(&[]).0);
+    assert_eq!(fixture.index_files(), 1);
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "stopped" }).to_string()).unwrap();
+    assert!(fixture.gc(&[]).0);
+    assert_eq!(fixture.index_files(), 0);
+}
+
+#[test]
+fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    fixture.supervisor_tracks(running.service.0, running.port);
+    let mut child = fixture.command(&["exec", "--", "sleep", "3"]).stdout(Stdio::null()).spawn().unwrap();
+    let session_file = fixture.dir.path().join("app/.stack/session.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fs::read_to_string(&session_file).is_ok_and(|s| s.contains("active_executions\": {\n    \"")) {
+        assert!(Instant::now() < deadline, "execution never registered");
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok && result["data"] == json!([]), "{result}");
+    assert!(running.service.alive(), "stopped under an active command");
+    child.wait().unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok && result["error"]["code"] == "gc_incomplete", "{result}");
+    assert!(running.service.alive());
+    assert_eq!(fixture.index_files(), 1);
+}
+
+#[test]
+fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&["--ttl", "2s"]);
+    // Renewed throughout: the watcher must not reclaim it.
+    let watcher = fixture
+        .command_at(fixture.dir.path(), &["gc", "--watch", "--interval", "1s", "--max-passes", "4", "--json"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..8 {
+        fixture.ok(&["renew"]);
+        thread::sleep(Duration::from_millis(500));
+    }
+    let out = watcher.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let passes: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(passes.len(), 4, "one JSON object per pass");
+    assert!(passes.iter().all(|p| p["ok"] == true && p["data"]["reclaimed"] == json!([])), "{passes:?}");
+    assert_eq!(fixture.index_files(), 1);
+
+    // Left idle, it expires and is collected by the next pass, with no `stack up`.
+    let mut running = running;
+    drop(running.listener.take());
+    fixture.supervisor_tracks(running.service.0, running.port);
+    let out = fixture
+        .command_at(fixture.dir.path(), &["gc", "--watch", "--interval", "1s", "--max-passes", "4", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let reclaimed: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .flat_map(|l| serde_json::from_str::<Value>(l).unwrap()["data"]["reclaimed"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(reclaimed.len(), 1, "{reclaimed:?}");
+    assert_eq!(reclaimed[0]["stopped"], true);
+    assert!(reclaimed[0]["reason"].as_str().unwrap().contains("lease expired"));
+    assert_eq!(fixture.index_files(), 0);
+    assert!(!running.service.alive());
+
+    let out = fixture.command_at(fixture.dir.path(), &["gc", "--interval", "1s"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "--interval requires --watch");
+}
+
+#[test]
+fn configured_home_cannot_hide_an_overlong_supervisor_socket() {
+    let fixture = Fixture::with_bundle(WEB);
+    let long = format!("/tmp/{}", "x".repeat(120));
+    fixture.set_env(&[("HOME", long.clone())]);
+    let out = fixture.command(&["up", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "socket_path_too_long", "{result}");
+    let calls = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!calls.contains("install") && !calls.contains("daemons start"), "{calls}");
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[env]\nHOME={long:?}\n")).unwrap();
+    let out = fixture.command(&["doctor", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(result["error"]["details"].as_array().unwrap().iter().any(|c| c["name"] == "pitchfork_socket" && c["ok"] == false), "{result}");
+}
+
+#[test]
+fn every_partial_start_failure_preserves_observed_ownership() {
+    for failure in ["fail-start", "fail-env-after-start", "fail-query-after-one"] {
+        let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.other]\nrun='false'\n");
+        let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+        let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+        let other_port = inspect["data"]["ports"]["other"].as_u64().unwrap() as u16;
+        let service = Detached::spawn();
+        fs::write(fixture.dir.path().join("daemons-started.json"), json!([
+            {"id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port},
+            {"id": "app-0123456789abcdef/other", "name": "other", "status": "errored", "port": other_port}
+        ]).to_string()).unwrap();
+        fs::write(fixture.dir.path().join(failure), "").unwrap();
+        let out = fixture.command(&["up", "--json"]).output().unwrap();
+        assert!(!out.status.success(), "{failure}");
+        for file in fixture.session_paths() {
+            let record: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+            assert_eq!(record["launching"], true, "{failure}: {record}");
+            assert_eq!(record["services"]["web"]["pid"], service.0, "{failure}: {record}");
+            assert_eq!(record["services"]["web"]["provider_id"], WEB_ID, "{failure}: {record}");
+            assert_eq!(record["services"]["other"]["provider_id"], "app-0123456789abcdef/other", "{failure}: {record}");
+        }
+    }
 }

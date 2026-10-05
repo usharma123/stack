@@ -10,6 +10,8 @@ pub struct Captured {
     pub timed_out: bool,
     pub stdout: String,
     pub stderr: String,
+    /// More than `limit` bytes were written; `stdout` holds only the tail.
+    pub stdout_truncated: bool,
 }
 
 struct Tail {
@@ -154,6 +156,7 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
     Ok(Captured {
         exit_code,
         timed_out,
+        stdout_truncated: out.truncated,
         stdout: out.text(),
         stderr: err.text(),
     })

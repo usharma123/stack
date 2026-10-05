@@ -1,0 +1,167 @@
+<img src="assets/icon.svg" width="64" height="64" alt="">
+
+# stack
+
+Reusable, agent-safe development stacks.
+
+Pick your tools and services, publish them as a **bundle** in a git repo, and use that bundle from any
+project. Each project gets its own pinned, independent instance. stack composes bundles and generates
+config for existing tools ([mise](https://mise.jdx.dev) installs tools; Pitchfork, via `mise daemons`,
+runs services) instead of replacing them.
+
+> Status: early prototype, tested end to end on Linux against real mise + Pitchfork and an OCI
+> registry. See [docs/DESIGN.md](docs/DESIGN.md) for what is and isn't covered yet.
+
+## Quick look
+
+A bundle is a git repo with a `bundle.toml` and whatever files it needs:
+
+```toml
+# bundle.toml
+[bundle]
+name = "pybase"
+version = "1.0.0"
+
+[tools]
+python = "3.13"
+uv = "latest"
+
+[services.postgres]
+preset = "postgres"
+version = "17"
+
+[tasks.seed]
+run = "psql \"$DATABASE_URL\" -f {{bundle_dir}}/fixtures/seed.sql"
+services = ["postgres"]
+
+[paths]
+bin = ["bin"]          # bundle-shipped CLIs go on PATH
+```
+
+A project uses bundles from git, an OCI registry, or a local path in `stack.toml` (or defines
+everything itself; `[[use]]` is optional):
+
+```toml
+[[use]]
+bundle = "git+https://github.com/acme/pybase?ref=v1"
+
+[[use]]
+bundle = "oci:ghcr.io/acme/obs:2.0.0"
+
+[[use]]
+bundle = "git+https://github.com/acme/bundles?ref=v3&dir=node"   # a bundle in a subdirectory
+
+[tasks.test]
+run = "uv sync -q && uv run pytest -q"
+services = ["postgres", "redis"]
+
+[override.env]
+LOG_LEVEL = "warn"     # both bundles set LOG_LEVEL; the project must choose
+```
+
+```sh
+stack compile                          # resolve, lock, assign ports, write .config/mise/conf.d/stack.toml
+stack up --ttl 30m                     # start services, verify each is *this* instance, record a session
+stack exec --require postgres -- pytest
+stack down                             # succeeds only once the processes are confirmed gone
+```
+
+## Guarantees
+
+- **Pinned by commit.** `stack.lock` records each bundle's commit and content hash. Moving a tag
+  upstream changes nothing until `stack compile --update`, which reports what moved.
+- **No silent conflicts.** If two layers define the same key differently, compile fails with every
+  conflict listed. Only `[override.*]` resolves one, and the output records what it replaced.
+- **Bundles carry files.** `{{bundle_dir}}` and `paths.bin` resolve to the bundle's own files.
+- **Instance values stay out of bundles.** Bundles cannot pin ports. Each checkout gets its own
+  ports from a machine-wide registry (40000-49999, never service defaults), stable across restarts.
+- **Never the wrong instance.** Before every `exec`, each service is checked live. Postgres and
+  Redis are confirmed over the app's own `DATABASE_URL`/`REDIS_URL` to be this checkout's server
+  (by data directory). Endpoints of unverified services are poisoned (host replaced with
+  `unverified.stack.invalid`) so apps with hardcoded fallbacks fail loudly instead of reaching some
+  other server. `--require` makes the command refuse to run instead.
+- **Verified generations.** Session records fingerprint the complete compiled configuration and
+  assigned ports. Changed bundles, project overrides, or ports make service checks unavailable
+  until `stack up` restarts and verifies the new generation.
+- **Owned lifetimes.** Sessions can lease on a TTL or a runner's PID. Active commands protect
+  TTL sessions until completion; `stack gc` (and every `stack up`) reclaims expired idle ones.
+  `down` retains ownership records if discovery or cleanup fails, and reports success only after
+  recorded processes and ports are gone.
+- **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
+  retrying is safe.
+- **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
+  `exec` (whose output is captured into the object); errors have a stable `code`, a `hint` and
+  `details`. A command that could not do its job reports `ok: false`. `stack mcp` serves the same
+  contract over MCP. Git never prompts.
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `stack compile [--update \| --locked] [--reassign-ports]` | Resolve, lock, assign ports, write provider config |
+| `stack inspect` | Show the composed stack, origins and ports; writes nothing |
+| `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
+| `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
+| `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack down` | Stop services and confirm they are gone |
+| `stack renew` / `stack gc` | Renew this session's lease / reclaim expired sessions machine-wide |
+| `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
+| `stack doctor` | Check mise, git and tar, and that the project compiles |
+| `stack mcp` | MCP server (stdio) exposing the same operations |
+
+All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
+
+- `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
+- `exec --json` captures at most 64 KiB of each stream into the result and exits with the
+  command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
+- `gc` fails with `gc_incomplete` if an expired session could not be stopped; ownership records
+  are kept so it can be retried. Sessions of deleted projects are listed but cannot be stopped by
+  stack (see `mise daemons prune`).
+- `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
+- `compile` warns about tools that are not pinned (`latest`, `lts`), since the lock cannot pin them.
+- Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
+  Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
+- `up` and `exec` mark the generated mise config as trusted, so `run` commands from the bundles
+  you use execute without mise's trust prompt. Review bundles as you would any dependency.
+- `compile` also warns about service presets mise does not document (it currently documents
+  cockroachdb, nats, postgres, redis and spicedb).
+- For a custom service, connect with `http://127.0.0.1:$<NAME>_PORT`. mise also sets
+  `<NAME>_URL` to a Pitchfork proxy hostname (`https://<name>.<project>.localhost`), which only
+  answers when Pitchfork's proxy is running.
+- A custom service's `run` should `exec` its server (`run = "exec python3 -m http.server $PORT"`),
+  so the supervisor stops the server itself rather than a wrapping shell.
+Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
+require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
+`https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
+origins or authentication redirects. HTTPS cannot redirect authentication to HTTP. Plain HTTP
+is used only for loopback registries, or elsewhere with exactly `STACK_OCI_PLAIN_HTTP=1`.
+
+MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
+command's process group is terminated on timeout or completion. Detached children cannot keep
+output collection waiting for EOF. Services and sessions are still tested end to end on Linux.
+
+## Install
+
+Install the CLI with:
+
+```sh
+npm install -g @ushawarma/stack
+stack --version
+```
+
+Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
+Services need [mise](https://mise.jdx.dev) on PATH; stack installs everything else, including
+Pitchfork, through it. Run `stack doctor` to check a machine.
+Node.js 22.14+ is required. See [docs/RELEASING.md](docs/RELEASING.md) for CI checks,
+trusted publishing setup, release tags, and recovery.
+
+## Develop
+
+```sh
+cargo test                       # unit + integration tests (real git repos in temp dirs)
+cargo run -- -C examples/app inspect
+tests/e2e/run.sh                 # Docker: real mise + Pitchfork + OCI registry, all scenarios
+```
+
+`eval/` holds the competitor evaluation (Flox, devbox, devenv, mise) that shaped this design:
+[eval/REPORT.md](eval/REPORT.md).

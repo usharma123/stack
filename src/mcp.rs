@@ -82,7 +82,7 @@ fn schema(props: Value, required: &[&str]) -> Value {
 fn tools() -> Value {
     json!([
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_compile", "description": "Resolve bundles, update stack.lock and the generated provider config.",
+        { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock.",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
@@ -96,8 +96,8 @@ fn tools() -> Value {
           }), &["command"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_gc", "description": "Reclaim sessions with expired leases machine-wide. Fails (gc_incomplete) if any expired session could not be stopped.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed and the project compiles.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
 
@@ -145,6 +145,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             cache: ctx.cache.clone(),
             state: ctx.state.clone(),
             reassign_ports: false,
+            resolver: None,
         })
     };
     match name {

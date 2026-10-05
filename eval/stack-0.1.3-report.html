@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stack 0.1.3 evaluation: does the release approach its vision?</title>
+<meta name="description" content="Fresh measurements of the published Stack 0.1.3 npm release on Linux arm64 and native macOS arm64, compared against the project vision.">
+<style>
+:root {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --ink: #1d2126;
+  --ink-2: #4a525c;
+  --ink-3: #6b737d;
+  --line: #e2e2dd;
+  --line-2: #d0d0ca;
+  --accent: #2f5d8a;
+  --accent-soft: #e8eff6;
+  --ok: #2e6b3f;
+  --ok-soft: #e6f2e9;
+  --part: #8a5a00;
+  --part-soft: #fbf1dc;
+  --gap: #9a3324;
+  --gap-soft: #f8e7e4;
+  --none: #5b6470;
+  --none-soft: #eceef0;
+  --hist: #7a6a52;
+  --hist-soft: #f3efe7;
+  --series-1: #2f5d8a;
+  --series-2: #c06b2c;
+  --series-3: #8aa3bd;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181c;
+    --surface: #1c2025;
+    --ink: #e6e8eb;
+    --ink-2: #b7bdc5;
+    --ink-3: #8f97a1;
+    --line: #2c3239;
+    --line-2: #3a414a;
+    --accent: #8db7e0;
+    --accent-soft: #1f2e3d;
+    --ok: #86c79a;
+    --ok-soft: #1d3125;
+    --part: #e3b55c;
+    --part-soft: #3a2e15;
+    --gap: #f0a093;
+    --gap-soft: #3d2420;
+    --none: #aab2bc;
+    --none-soft: #2a3038;
+    --hist: #cbb894;
+    --hist-soft: #2b2720;
+    --series-1: #8db7e0;
+    --series-2: #e79a5f;
+    --series-3: #5d7894;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+code { background: var(--none-soft); padding: 0.08em 0.35em; border-radius: 4px; overflow-wrap: anywhere; }
+.skip { position: absolute; left: -9999px; top: 0; }
+.skip:focus { left: 1rem; top: 1rem; background: var(--surface); padding: 0.5rem 0.8rem; z-index: 10; }
+
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+header.top { background: var(--surface); border-bottom: 1px solid var(--line); }
+header.top .wrap { padding-top: 36px; padding-bottom: 28px; }
+.eyebrow { font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; margin: 0 0 8px; }
+h1 { font-size: clamp(1.6rem, 3.6vw, 2.3rem); line-height: 1.2; margin: 0 0 12px; letter-spacing: -0.01em; }
+h2 { font-size: 1.4rem; margin: 0 0 6px; letter-spacing: -0.005em; }
+h3 { font-size: 1.05rem; margin: 22px 0 8px; }
+.lede { color: var(--ink-2); max-width: 62ch; margin: 0 0 18px; font-size: 1.05rem; }
+.idgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px 22px; margin: 0; }
+.idgrid div { min-width: 0; }
+.idgrid dt { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; }
+.idgrid dd { margin: 2px 0 0; font-size: 0.93rem; overflow-wrap: anywhere; }
+
+nav.toc { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }
+nav.toc ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: thin; }
+nav.toc a { display: block; padding: 10px 10px; font-size: 0.86rem; color: var(--ink-2); text-decoration: none; white-space: nowrap; border-bottom: 2px solid transparent; }
+nav.toc a:hover, nav.toc a.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+main section { padding: 40px 0 8px; scroll-margin-top: 44px; }
+.sub { color: var(--ink-2); margin: 0 0 18px; max-width: 72ch; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 22px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+
+.verdict { border-left: 5px solid var(--accent); display: grid; gap: 14px; }
+.verdict .headline { font-size: 1.22rem; font-weight: 650; line-height: 1.35; margin: 0; }
+.vrow { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.vbox { border-radius: 8px; padding: 12px 14px; border: 1px solid var(--line); }
+.vbox strong { display: block; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+.vbox p { margin: 0; font-size: 0.94rem; color: var(--ink-2); }
+.vbox.ok { background: var(--ok-soft); } .vbox.ok strong { color: var(--ok); }
+.vbox.part { background: var(--part-soft); } .vbox.part strong { color: var(--part); }
+.vbox.gap { background: var(--gap-soft); } .vbox.gap strong { color: var(--gap); }
+.note { font-size: 0.88rem; color: var(--ink-3); margin: 10px 0 0; }
+
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }
+@media (max-width: 720px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 380px) { .tiles { grid-template-columns: 1fr; } }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+.tile .k { font-size: 0.78rem; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+.tile .v { font-size: 1.65rem; font-weight: 650; font-variant-numeric: tabular-nums; margin: 4px 0 2px; letter-spacing: -0.01em; }
+.tile .v small { font-size: 0.95rem; font-weight: 500; color: var(--ink-2); }
+.tile .d { font-size: 0.84rem; color: var(--ink-2); }
+
+.badge { display: inline-block; font-size: 0.74rem; font-weight: 650; padding: 2px 8px; border-radius: 999px; white-space: nowrap; letter-spacing: 0.02em; border: 1px solid transparent; }
+.b-ok { background: var(--ok-soft); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+.b-part { background: var(--part-soft); color: var(--part); border-color: color-mix(in srgb, var(--part) 30%, transparent); }
+.b-gap { background: var(--gap-soft); color: var(--gap); border-color: color-mix(in srgb, var(--gap) 30%, transparent); }
+.b-none { background: var(--none-soft); color: var(--none); border-color: color-mix(in srgb, var(--none) 30%, transparent); }
+.b-hist { background: var(--hist-soft); color: var(--hist); border: 1px dashed var(--hist); }
+.b-fresh { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+caption { text-align: left; padding: 12px 14px 4px; font-weight: 600; color: var(--ink-2); font-size: 0.88rem; }
+th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-3); font-weight: 650; background: color-mix(in srgb, var(--bg) 60%, var(--surface)); white-space: nowrap; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tbody th { font-weight: 600; }
+.ev { font-size: 0.82rem; }
+.ev a { white-space: nowrap; }
+
+.hist-zone { background: var(--hist-soft); border: 1.5px dashed var(--hist); border-radius: var(--radius); padding: 18px 20px; }
+.hist-zone .tablewrap { background: var(--surface); }
+.hist-zone h2 { color: var(--ink); }
+.hist-flag { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+
+.chart { width: 100%; height: auto; display: block; }
+.chart text { fill: var(--ink-2); font: 12px var(--sans); }
+.chart .axis line, .chart .axis path { stroke: var(--line-2); }
+.chart .grid line { stroke: var(--line); }
+.chart .lbl { fill: var(--ink); font-weight: 600; }
+.chart .val { fill: var(--ink); font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.84rem; color: var(--ink-2); margin: 6px 0 0; padding: 0; list-style: none; }
+.legend span.sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.figcap { font-size: 0.85rem; color: var(--ink-3); margin-top: 8px; }
+figure { margin: 0; }
+
+.compare { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.cmp { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+.cmp > div { padding: 12px 16px; min-width: 0; }
+.cmp .then { background: var(--hist-soft); border-right: 1.5px dashed var(--hist); }
+.cmp .now { background: var(--surface); }
+.cmp .tag { margin-bottom: 6px; }
+.cmp p { margin: 0; font-size: 0.92rem; }
+.cmp .ev { margin-top: 6px; color: var(--ink-3); }
+@media (max-width: 640px) {
+  .cmp { grid-template-columns: 1fr; }
+  .cmp .then { border-right: 0; border-bottom: 1.5px dashed var(--hist); }
+}
+
+ol.prio { list-style: none; counter-reset: p; margin: 0; padding: 0; display: grid; gap: 10px; }
+ol.prio li { counter-increment: p; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px 14px 58px; position: relative; }
+ol.prio li::before { content: counter(p); position: absolute; left: 16px; top: 13px; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: var(--surface); font-weight: 700; display: grid; place-items: center; font-size: 0.9rem; }
+ol.prio h3 { margin: 0 0 4px; font-size: 1rem; }
+ol.prio p { margin: 4px 0 0; font-size: 0.92rem; color: var(--ink-2); }
+ol.prio .acc { color: var(--ink); }
+ol.prio .acc b { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-3); }
+
+ul.clean { margin: 0; padding-left: 1.15em; }
+ul.clean li { margin: 4px 0; }
+.issue { border-left: 4px solid var(--part); }
+.issue h3 { margin-top: 0; }
+.issue p { margin: 6px 0; font-size: 0.93rem; }
+
+pre { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; overflow-x: auto; font: 0.84rem/1.55 var(--mono); margin: 0; }
+pre .c { color: var(--ink-3); }
+.copy { float: right; font: 600 0.78rem var(--sans); background: var(--accent-soft); color: var(--accent); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+.links { columns: 2 260px; column-gap: 28px; margin: 0; padding: 0; list-style: none; font-size: 0.9rem; }
+.links li { break-inside: avoid; margin: 0 0 6px; }
+.links .what { color: var(--ink-3); }
+footer { color: var(--ink-3); font-size: 0.85rem; padding: 36px 0 48px; border-top: 1px solid var(--line); margin-top: 40px; }
+@media (max-width: 520px) {
+  .wrap { padding: 0 14px; }
+  .card { padding: 16px; }
+  th, td { padding: 8px 10px; }
+  .tile .v { font-size: 1.4rem; }
+}
+@media print {
+  nav.toc, .copy { display: none; }
+  body { background: #fff; }
+  section { break-inside: avoid-page; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <p class="eyebrow">Release evaluation · fresh measurements · run 2026-10-05 UTC</p>
+    <h1>Stack 0.1.3: does the release approach its vision?</h1>
+    <p class="lede">Measured against the published npm package, not the working tree. Real Postgres and Redis, the shared <code>eval/fixture</code> app, bundled seed SQL and CLI, on Linux arm64 and native macOS arm64.</p>
+    <dl class="idgrid">
+      <div><dt>Package</dt><dd><code>@ushawarma/stack@0.1.3</code> (npm)</dd></div>
+      <div><dt>Exact commit</dt><dd><code>a1358335984610926384c58d9a83bd383301d647</code></dd></div>
+      <div><dt>Platforms run</dt><dd>Linux arm64 (Docker, <code>ev-mise</code> image) and native macOS 15.7.2 arm64</dd></div>
+      <div><dt>Providers</dt><dd>mise 2026.9.18, Pitchfork 2.29.0</dd></div>
+      <div><dt>Binary integrity</dt><dd>linux-arm64 and darwin-arm64 SHA-256 matched <code>build-info.json</code> before running</dd></div>
+    </dl>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Sections">
+  <div class="wrap">
+    <ul>
+      <li><a href="#verdict">Verdict</a></li>
+      <li><a href="#vision">Vision scorecard</a></li>
+      <li><a href="#measure">Measurements</a></li>
+      <li><a href="#scenarios">Scenarios</a></li>
+      <li><a href="#improved">Demonstrated improvements</a></li>
+      <li><a href="#issues">Corrections</a></li>
+      <li><a href="#gaps">Remaining gaps</a></li>
+      <li><a href="#next">Next improvements</a></li>
+      <li><a href="#history">Historical baseline</a></li>
+      <li><a href="#repro">Reproduce</a></li>
+    </ul>
+  </div>
+</nav>
+
+<main id="main" class="wrap">
+
+<!-- VERDICT -->
+<section id="verdict" aria-labelledby="h-verdict">
+  <h2 id="h-verdict">Verdict</h2>
+  <div class="card verdict">
+    <p class="headline">The core local bundle and session vision is demonstrated for Postgres and Redis. 0.1.3 is a credible base for a controlled pilot. The broader agent-safe product is not complete.</p>
+    <div class="vrow">
+      <div class="vbox ok"><strong>Demonstrated</strong><p>Reusable bundles with files, per-checkout ports and data, live instance verification, endpoint poisoning and refusal, structured errors, MCP, commit and digest pinning, confirmed shutdown.</p></div>
+      <div class="vbox part"><strong>Partial</strong><p>Tool versions are ranges or <code>latest</code>. Custom services are liveness-only. Leases reclaim lazily. macOS has a lifecycle smoke test, not the full suite.</p></div>
+      <div class="vbox gap"><strong>Not evaluated</strong><p>Real multi-agent work, concurrency stress, remote backends, hosted or private OCI auth, x64 hardware, repeated timing studies.</p></div>
+    </div>
+    <p class="note">No completion percentage is given: the vision has no agreed weighting, and several areas were not exercised at all. Status labels below are qualitative and each links to evidence.</p>
+  </div>
+</section>
+
+<!-- VISION SCORECARD -->
+<section id="vision" aria-labelledby="h-vision">
+  <h2 id="h-vision">Vision scorecard</h2>
+  <p class="sub">Each row is a guarantee from <a href="../README.md#guarantees">README.md</a> or a runtime contract from <a href="fixtures/stack-0.1.3/source/docs/DESIGN.md">docs/DESIGN.md</a>, judged only on this run's evidence.</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th scope="col">Vision claim</th><th scope="col">Status</th><th scope="col">What this run showed</th><th scope="col">Evidence</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Bundles pinned by commit or digest</th><td><span class="badge b-ok">Demonstrated</span></td><td>Moved Git tag left a locked bundle on its commit in a fresh empty cache (macOS). <code>compile --update</code> reported <code>moved_from</code>. OCI digest held after tag moves (Linux).</td><td class="ev"><a href="results/stack-0.1.3-lock/fresh-cache-locked.json">lock</a> · <a href="results/stack-0.1.3-lock/updated.json">update</a> · <a href="results/stack-0.1.3/scenarios.json">5-oci</a></td></tr>
+        <tr><th scope="row">Reproducible tool versions</th><td><span class="badge b-gap">Gap</span></td><td>Only Pitchfork was exact (2.29.0). Python <code>3.13</code> resolved 3.13.16, Postgres <code>17</code> 17.11, Redis <code>8</code> 8.10.2; uv and jq used <code>latest</code> (0.12.23, 1.8.2).</td><td class="ev"><a href="results/stack-0.1.3/versions.json">versions</a></td></tr>
+        <tr><th scope="row">No silent conflicts</th><td><span class="badge b-ok">Demonstrated</span></td><td>Conflicting <code>LOG_LEVEL</code> from two bundles failed compile with <code>conflict</code>, naming both layers and suggesting <code>[override.env]</code>.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">summary</a></td></tr>
+        <tr><th scope="row">Bundles carry files</th><td><span class="badge b-ok">Demonstrated</span></td><td>Seed SQL via <code>{{bundle_dir}}</code> and the bundled <code>acme</code> CLI on PATH worked in both checkouts on Linux and macOS.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">Linux</a> · <a href="results/stack-0.1.3-native/steps.json">macOS</a></td></tr>
+        <tr><th scope="row">Independent instance per checkout</th><td><span class="badge b-ok">Demonstrated</span></td><td>Two checkouts got different Postgres and Redis ports and data directories; real pytest passed in each; stopping one left the other working.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">1-checkouts</a> · <a href="results/stack-0.1.3-native/steps.json">macOS</a></td></tr>
+        <tr><th scope="row">Never the wrong instance (Postgres, Redis)</th><td><span class="badge b-ok">Demonstrated</span></td><td>Linux: foreign server refused, including libpq host overrides. macOS: <code>show data_directory</code> matched the session; unverified endpoint poisoned to <code>unverified.stack.invalid</code>; <code>--require-all</code> refused with <code>service_unavailable</code>.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">wrong-instance</a> · <a href="results/stack-0.1.3/summary.json">libpq</a> · <a href="results/stack-0.1.3-native/steps.json">refusal</a></td></tr>
+        <tr><th scope="row">Never the wrong instance (custom services)</th><td><span class="badge b-part">Partial</span></td><td>By design, custom services get liveness checks only, labelled <code>liveness</code>. A healthy foreign process could satisfy them.</td><td class="ev"><a href="fixtures/stack-0.1.3/source/docs/DESIGN.md">DESIGN.md</a></td></tr>
+        <tr><th scope="row">Verified generations</th><td><span class="badge b-ok">Demonstrated</span></td><td>Config changes withheld endpoints until <code>up</code>; an incompatible Redis version failed without losing data; the original version recovered.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">6-generation</a></td></tr>
+        <tr><th scope="row">Owned lifetimes</th><td><span class="badge b-part">Partial</span></td><td>TTL renewal and expiry, active-exec protection and owner-death cleanup passed on Linux, with zero leftovers. Reclamation still waits for the next <code>gc</code> or <code>up</code>; sessions of deleted projects cannot be stopped by Stack.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">3-leases</a> · <a href="results/stack-0.1.3/summary.json">leftovers</a></td></tr>
+        <tr><th scope="row">Honest failures</th><td><span class="badge b-ok">Demonstrated</span></td><td>Impossible version and unknown package returned <code>install_failed</code> with steps, <code>retry_safe</code> and <code>changed</code>. The macOS socket failure also returned structured <code>start_failed</code>.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">bad_version</a> · <a href="results/stack-0.1.3/summary.json">bad_pkg</a></td></tr>
+        <tr><th scope="row">Agent interface (JSON, MCP)</th><td><span class="badge b-ok">Demonstrated</span></td><td>MCP lists exactly nine tools, runs the real fixture tests, returns structured errors, and a timeout kills descendants while the next request still works.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">4-mcp</a> · <a href="results/stack-0.1.3/summary.json">timeout</a></td></tr>
+        <tr><th scope="row">Distribution (Git, OCI)</th><td><span class="badge b-part">Partial</span></td><td>Local Git and a local anonymous OCI registry worked, including publish conflict handling. Hosted and private registries with credential helpers were not tested.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">publish</a> · <a href="results/stack-0.1.3/summary.json">republish</a></td></tr>
+        <tr><th scope="row">Cross-platform</th><td><span class="badge b-part">Partial</span></td><td>Full six-suite E2E on Linux arm64. Native macOS arm64 lifecycle smoke only. x64 binaries hash-listed but not run.</td><td class="ev"><a href="results/stack-0.1.3-native/steps.json">macOS steps</a></td></tr>
+        <tr><th scope="row">Safe for many concurrent agents</th><td><span class="badge b-none">Not evaluated</span></td><td>No real multi-agent task, productivity measure or concurrency stress was run.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">summary</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- MEASUREMENTS -->
+<section id="measure" aria-labelledby="h-measure">
+  <h2 id="h-measure">Measurements <span class="badge b-fresh">Fresh 0.1.3</span></h2>
+  <p class="sub">Setup times are single observations. Tool caches were fresh per successful platform run, but host and network caches were not controlled, and downloading the Stack npm package and installing mise itself are excluded. Tool and service installs triggered by stack up are included. Linux and macOS timings come from different harnesses, so cross-platform differences are indicative only.</p>
+
+  <div class="tiles" role="list">
+    <div class="tile" role="listitem"><div class="k">Linux cold up</div><div class="v">11.167<small> s</small></div><div class="d">Tool install, 2 services, identity checks</div></div>
+    <div class="tile" role="listitem"><div class="k">Linux new project, cached tools</div><div class="v">1.207<small> s</small></div><div class="d">Second checkout, own instances</div></div>
+    <div class="tile" role="listitem"><div class="k">Linux verified exec</div><div class="v">82<small> ms median</small></div><div class="d">10 samples, range 81 to 84 ms</div></div>
+    <div class="tile" role="listitem"><div class="k">macOS cold up</div><div class="v">13.188<small> s</small></div><div class="d">Native arm64, isolated HOME</div></div>
+    <div class="tile" role="listitem"><div class="k">macOS new project, cached tools</div><div class="v">1.387<small> s</small></div><div class="d">Second checkout</div></div>
+    <div class="tile" role="listitem"><div class="k">macOS verified exec</div><div class="v">154.895<small> ms median</small></div><div class="d">10 samples, range 150.58 to 189.68 ms</div></div>
+  </div>
+
+  <div class="grid2">
+    <figure class="card">
+      <h3 style="margin-top:0">Setup time by platform</h3>
+      <div id="chart-setup" role="img" aria-label="Bar chart. Linux cold up 11.167 seconds, warm new project 1.207 seconds. macOS cold up 13.188 seconds, warm new project 1.387 seconds. Single observations."></div>
+      <ul class="legend" aria-hidden="true">
+        <li><span class="sw" style="background:var(--series-1)"></span>Linux arm64</li>
+        <li><span class="sw" style="background:var(--series-2)"></span>macOS arm64</li>
+      </ul>
+      <figcaption class="figcap">One observation per bar. Cold includes provider tool installs into a fresh tool cache.</figcaption>
+    </figure>
+    <figure class="card">
+      <h3 style="margin-top:0">Per-command <code>exec</code> overhead</h3>
+      <div id="chart-exec" role="img" aria-label="Dot plot of 10 samples each. Linux verified exec 81 to 84 milliseconds, median 82. Linux unverified exec 23 to 45 milliseconds, median 25. macOS verified exec 150.58 to 189.68 milliseconds, median 154.895."></div>
+      <figcaption class="figcap">Each dot is one run of <code>stack exec ... -- true</code>. Verified runs use <code>--require-all</code> and check both services live before running. Line marks the median.</figcaption>
+    </figure>
+  </div>
+
+  <h3>Linux benchmark timings</h3>
+  <div class="tablewrap">
+    <table>
+      <caption>From <a href="results/stack-0.1.3/stack.tsv">stack.tsv</a>; all steps exit 0 as expected</caption>
+      <thead><tr><th scope="col">Step</th><th scope="col" class="num">ms</th><th scope="col">Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>compile_cold</code></td><td class="num">9</td><td>Resolve, lock, assign ports, write mise config</td></tr>
+        <tr><td><code>setup_cold</code></td><td class="num">11,167</td><td><code>stack up --json</code>, all checks <code>instance</code></td></tr>
+        <tr><td><code>tests</code></td><td class="num">1,394</td><td>Fixture pytest against real Postgres and Redis</td></tr>
+        <tr><td><code>bundle_files</code></td><td class="num">115</td><td>Seed SQL and bundled CLI</td></tr>
+        <tr><td><code>svc_start_again</code></td><td class="num">103</td><td>Idempotent <code>up</code></td></tr>
+        <tr><td><code>svc_status_json</code></td><td class="num">73</td><td>Live verification via <code>status</code></td></tr>
+        <tr><td><code>compile_warm</code> / <code>setup_warm</code></td><td class="num">6 / 1,207</td><td>Second checkout with cached tools</td></tr>
+        <tr><td><code>second_tests</code></td><td class="num">574</td><td>Second checkout pytest</td></tr>
+        <tr><td><code>independent_stop</code></td><td class="num">314</td><td>Stop one checkout, other unaffected</td></tr>
+        <tr><td><code>svc_stop</code></td><td class="num">114</td><td><code>down</code> with confirmed exit</td></tr>
+        <tr><td><code>leftovers</code></td><td class="num">4</td><td>Process count after stop: <code>count=0</code></td></tr>
+        <tr><td><code>conflict_rejected</code></td><td class="num">3</td><td>Expected <code>conflict</code> error</td></tr>
+        <tr><td><code>bad_version</code> / <code>bad_pkg</code></td><td class="num">383 / 72</td><td>Expected <code>install_failed</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- SCENARIOS -->
+<section id="scenarios" aria-labelledby="h-scen">
+  <h2 id="h-scen">Scenario results <span class="badge b-fresh">Fresh 0.1.3</span></h2>
+  <div class="grid2">
+    <div>
+      <h3 style="margin-top:0">Linux arm64: benchmark plus six E2E suites</h3>
+      <div class="tablewrap">
+        <table>
+          <caption>From <a href="results/stack-0.1.3/scenarios.json">scenarios.json</a></caption>
+          <thead><tr><th scope="col">Suite</th><th scope="col">Result</th><th scope="col" class="num">s</th><th scope="col">Evidence</th></tr></thead>
+          <tbody>
+            <tr><td>benchmark</td><td><span class="badge b-ok">Pass</span></td><td class="num">17.044</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+            <tr><td>1 independent checkouts</td><td><span class="badge b-ok">Pass</span></td><td class="num">3.761</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+            <tr><td>2 wrong instance</td><td><span class="badge b-ok">Pass</span></td><td class="num">2.803</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+            <tr><td>3 leases</td><td><span class="badge b-ok">Pass</span></td><td class="num">21.906</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+            <tr><td>4 MCP</td><td><span class="badge b-ok">Pass</span></td><td class="num">2.802</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+            <tr><td>5 OCI</td><td><span class="badge b-ok">Pass</span></td><td class="num">2.000</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+            <tr><td>6 configuration generation</td><td><span class="badge b-ok">Pass</span></td><td class="num">3.689</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">summary</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h3 style="margin-top:0">Native macOS arm64: lifecycle smoke</h3>
+      <div class="tablewrap">
+        <table>
+          <caption>From <a href="results/stack-0.1.3-native/steps.json">steps.json</a>; every step met its expected exit code</caption>
+          <thead><tr><th scope="col">Step</th><th scope="col" class="num">ms</th><th scope="col">Check</th></tr></thead>
+          <tbody>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appA up</a></td><td class="num">13,187.69</td><td>Cold, both <code>instance</code></td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appA tests</a></td><td class="num">5,274.09</td><td>pytest, seed, <code>acme</code></td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appA identity</a></td><td class="num">178.83</td><td>Data dir equals session</td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appB up</a></td><td class="num">1,387.08</td><td>Different ports</td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appB tests</a></td><td class="num">3,375.46</td><td>pytest, seed, <code>acme</code></td></tr>
+            <tr><td>exec x10</td><td class="num">150.58 to 189.68</td><td><code>--require-all</code></td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">idempotent up</a></td><td class="num">212.05</td><td>Second <code>up</code> succeeds</td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appA down</a></td><td class="num">120.89</td><td><code>confirmed: true</code></td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appB still works</a></td><td class="num">920.74</td><td>3 passed</td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">withheld env</a></td><td class="num">66.42</td><td>Endpoint poisoned</td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">required refusal</a></td><td class="num">58.41</td><td>Exit 1, <code>service_unavailable</code></td></tr>
+            <tr><td><a href="results/stack-0.1.3-native/steps.json">appB down</a></td><td class="num">192.57</td><td>All service PIDs gone</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <h3>Fresh-cache Git pin (native macOS binary)</h3>
+  <div class="tablewrap">
+    <table>
+      <caption>From <a href="results/stack-0.1.3-lock/summary.json">stack-0.1.3-lock/summary.json</a></caption>
+      <thead><tr><th scope="col">Step</th><th scope="col">Bundle commit</th><th scope="col">Result</th></tr></thead>
+      <tbody>
+        <tr><td><a href="results/stack-0.1.3-lock/first.json">First compile at tag v1</a></td><td><code>a64307a</code></td><td><code>MARKER=v1</code></td></tr>
+        <tr><td><a href="results/stack-0.1.3-lock/fresh-cache-locked.json">Tag moved, fresh empty cache</a></td><td><code>a64307a</code></td><td><span class="badge b-ok">Pin preserved</span> <code>lock_changed: false</code></td></tr>
+        <tr><td><a href="results/stack-0.1.3-lock/updated.json">Explicit <code>compile --update</code></a></td><td><code>7e9d6a1</code></td><td><span class="badge b-ok">Move reported</span> <code>moved_from: a64307a</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- DEMONSTRATED IMPROVEMENTS -->
+<section id="improved" aria-labelledby="h-imp">
+  <h2 id="h-imp">Improvements already demonstrated</h2>
+  <p class="sub">Each pair sets a failure mode recorded in the <span class="badge b-hist">Historical 2026-10-02</span> competitor baseline against what <span class="badge b-fresh">Fresh 0.1.3</span> showed on the same class of problem. These are behaviour comparisons, not timings, and not results from an earlier Stack version (none were measured).</p>
+  <div class="compare">
+    <div class="cmp">
+      <div class="then"><div class="tag"><span class="badge b-hist">Historical</span></div><p>devenv gave a second project Postgres on 5433, but <code>DATABASE_URL</code> still pointed at 5432. Its tests passed against the first project's database.</p></div>
+      <div class="now"><div class="tag"><span class="badge b-fresh">Fresh 0.1.3</span></div><p>Each checkout gets its own ports and data directory, and Postgres reports the session's own <code>data_directory</code> over the app's URL.</p><p class="ev"><a href="results/stack-0.1.3/scenarios.json">1-checkouts</a> · <a href="results/stack-0.1.3-native/steps.json">macOS identity</a></p></div>
+    </div>
+    <div class="cmp">
+      <div class="then"><div class="tag"><span class="badge b-hist">Historical</span></div><p><code>mise exec -- pytest</code> passed against a foreign instance when mise's daemon was stopped, and a plain copy hit the primary's database.</p></div>
+      <div class="now"><div class="tag"><span class="badge b-fresh">Fresh 0.1.3</span></div><p>Unverified endpoints are poisoned to <code>unverified.stack.invalid</code>, including libpq host overrides, so fallbacks fail loudly. <code>--require</code> refuses to run.</p><p class="ev"><a href="results/stack-0.1.3/summary.json">wrong-instance</a> · <a href="results/stack-0.1.3/summary.json">libpq</a></p></div>
+    </div>
+    <div class="cmp">
+      <div class="then"><div class="tag"><span class="badge b-hist">Historical</span></div><p>mise rejected <code>[daemons]</code> in includes, so each consumer copied 14 lines; a bundled CLI resolved against the consumer and was not on PATH.</p></div>
+      <div class="now"><div class="tag"><span class="badge b-fresh">Fresh 0.1.3</span></div><p>Services, seed SQL and the bundled <code>acme</code> CLI come from the bundle and work in both checkouts on both platforms.</p><p class="ev"><a href="results/stack-0.1.3/summary.json">bundle_files</a></p></div>
+    </div>
+    <div class="cmp">
+      <div class="then"><div class="tag"><span class="badge b-hist">Historical</span></div><p>mise resolved a conflicting <code>LOG_LEVEL</code> silently (later wins). Flox reported but accepted a conflicting Postgres service.</p></div>
+      <div class="now"><div class="tag"><span class="badge b-fresh">Fresh 0.1.3</span></div><p>Compile fails with <code>conflict</code>, names both bundles and points to <code>[override.env]</code>.</p><p class="ev"><a href="results/stack-0.1.3/summary.json">conflict</a></p></div>
+    </div>
+    <div class="cmp">
+      <div class="then"><div class="tag"><span class="badge b-hist">Historical</span></div><p>After retagging <code>v1</code>, a fresh machine got v2 from the same mise config; <code>mise.lock</code> recorded no bundle commit.</p></div>
+      <div class="now"><div class="tag"><span class="badge b-fresh">Fresh 0.1.3</span></div><p>A fresh empty cache kept the locked commit; only an explicit <code>--update</code> moved it, and reported the move.</p><p class="ev"><a href="results/stack-0.1.3-lock/fresh-cache-locked.json">locked</a> · <a href="results/stack-0.1.3-lock/updated.json">updated</a></p></div>
+    </div>
+    <div class="cmp">
+      <div class="then"><div class="tag"><span class="badge b-hist">Historical</span></div><p>Flox and devbox returned 0 when services failed to start; devbox <code>stop</code> printed success while 7 processes lived.</p></div>
+      <div class="now"><div class="tag"><span class="badge b-fresh">Fresh 0.1.3</span></div><p>Failures return <code>ok: false</code> with steps and <code>retry_safe</code>; <code>down</code> reports <code>confirmed</code> only after PIDs are gone, with zero leftovers. A supervisor-kill test was not part of this run.</p><p class="ev"><a href="results/stack-0.1.3-native-attempt1/steps.json">start_failed</a> · <a href="results/stack-0.1.3/summary.json">leftovers</a></p></div>
+    </div>
+  </div>
+</section>
+
+<!-- CORRECTIONS -->
+<section id="issues" aria-labelledby="h-iss">
+  <h2 id="h-iss">Corrections and observed issues</h2>
+  <p class="sub">First-attempt summaries are published at <a href="results/stack-0.1.3-attempt1/">stack-0.1.3-attempt1</a> and <a href="results/stack-0.1.3-native-attempt1/">stack-0.1.3-native-attempt1</a>. Final results above come from the corrected runs. Raw logs are preserved locally and excluded from Git.</p>
+  <div class="grid3">
+    <div class="card issue">
+      <h3>Outdated MCP test assertion</h3>
+      <p><span class="badge b-none">Test maintenance</span></p>
+      <p>The existing E2E asserted 7 MCP tools; 0.1.3 ships 9 (adding <code>stack_doctor</code> and <code>stack_gc</code>). Suite 4 failed in the first attempt. The assertion now checks the exact nine tool names, and all six suites passed on rerun.</p>
+      <p class="ev"><a href="results/stack-0.1.3-attempt1/scenarios.json">attempt 1 summary</a> · <a href="results/stack-0.1.3-attempt1/scenarios.json">attempt 1 scenarios</a></p>
+    </div>
+    <div class="card issue">
+      <h3>Invalid-package benchmark</h3>
+      <p><span class="badge b-none">Benchmark correction</span></p>
+      <p>In the first attempt, <code>bad_pkg</code> and <code>bad_version</code> ran without a compile and stopped at <code>lock_outdated</code>, never reaching install. The harness now compiles first and asserts <code>install_failed</code>. The 3 ms first-attempt timings are invalid.</p>
+      <p class="ev"><a href="results/stack-0.1.3-attempt1/scenarios.json">attempt 1</a> · <a href="results/stack-0.1.3/summary.json">final</a></p>
+    </div>
+    <div class="card issue">
+      <h3>macOS socket path limit</h3>
+      <p><span class="badge b-part">Provider constraint</span></p>
+      <p>The first native run put isolated state under a deep artifacts path. Pitchfork's socket path was 118 bytes against the macOS 104-byte cap. Stack returned structured <code>start_failed</code> with <code>retry_safe: true</code>. A short <code>/tmp</code> state path passed. This concerns the provider state directory, not evidence that ordinary long project paths fail.</p>
+      <p class="ev"><a href="results/stack-0.1.3-native-attempt1/steps.json">attempt 1 up</a> · <a href="results/stack-0.1.3-native-attempt1/steps.json">steps</a></p>
+    </div>
+  </div>
+</section>
+
+<!-- GAPS -->
+<section id="gaps" aria-labelledby="h-gaps">
+  <h2 id="h-gaps">Remaining gaps</h2>
+  <div class="card">
+    <ul class="clean">
+      <li><strong>Tools not immutable.</strong> Python 3.13, Postgres 17 and Redis 8 are ranges; uv and jq use <code>latest</code>. Bundle commit and content pins do not freeze tools.</li>
+      <li><strong>Custom service identity.</strong> Only Postgres and Redis presets get instance verification; others are liveness-only.</li>
+      <li><strong>Cleanup depends on later activity.</strong> Expired leases wait for the next <code>gc</code> or <code>up</code>. Sessions of deleted projects cannot be stopped by Stack.</li>
+      <li><strong>macOS coverage.</strong> Native lifecycle smoke passed; the six-suite automation is still Linux-only. x64 was not exercised.</li>
+      <li><strong>Timing rigor.</strong> Cold and warm setup are single observations per platform; no randomized repeated study.</li>
+      <li><strong>Scale and real use.</strong> No multi-agent task-completion or productivity evaluation, remote or cloud backend, or large concurrency stress.</li>
+      <li><strong>OCI scope.</strong> Local anonymous registry only; hosted and private credential-helper workflows untested.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- NEXT -->
+<section id="next" aria-labelledby="h-next">
+  <h2 id="h-next">Next recommended improvements</h2>
+  <p class="sub">Not yet built or measured. Ordered by how directly each closes a gap in the vision.</p>
+  <ol class="prio">
+    <li><h3>Exact tool pins</h3><p>Resolve and lock exact provider and tool versions, and remove <code>latest</code> from examples.</p><p class="acc"><b>Acceptance</b> A clean cache reproduces identical tool and service versions after upstream releases.</p></li>
+    <li><h3>Full macOS CI and an early socket diagnostic</h3><p>Run the complete service and session E2E suite on native macOS in CI. Have <code>doctor</code> check the provider socket path length.</p><p class="acc"><b>Acceptance</b> Linux contracts repeat on macOS; long state paths are diagnosed before downloads or start.</p></li>
+    <li><h3>Extensible identity probes</h3><p>Add reusable identity probes for custom services.</p><p class="acc"><b>Acceptance</b> A foreign healthy service cannot satisfy an instance check for supported custom bundles.</p></li>
+    <li><h3>Deleted-project and automatic cleanup</h3><p>Make cleanup independent of project-directory survival and define automatic lease expiry.</p><p class="acc"><b>Acceptance</b> Delete a project or lose the runner, and only its owned services are reclaimed without another project starting.</p></li>
+    <li><h3>Measured multi-agent pilot</h3><p>Run real concurrent agents across projects with controlled failures.</p><p class="acc"><b>Acceptance</b> Repeated fresh and cached runs report wrong-instance incidents, orphan rates, task completion and latency distributions.</p></li>
+  </ol>
+</section>
+
+<!-- HISTORY -->
+<section id="history" aria-labelledby="h-hist">
+  <div class="hist-zone">
+    <div class="hist-flag"><span class="badge b-hist">Historical · 2026-10-02 · not rerun</span></div>
+    <h2 id="h-hist">Competitor baseline (context only)</h2>
+    <p class="sub">From <a href="REPORT.md">eval/REPORT.md</a> and <a href="results/">eval/results/*.tsv</a>. Same fixture shape and mise 2026.9.18, but a different harness, different setup semantics and different resolved versions. Stack figures are kept out of this table on purpose: no speedup ratio is claimed.</p>
+    <div class="tablewrap">
+      <table>
+        <caption>Scorecard figures as published on 2026-10-02</caption>
+        <thead><tr><th scope="col"></th><th scope="col" class="num">Flox 1.17.0</th><th scope="col" class="num">devbox 0.18.4</th><th scope="col" class="num">devenv 2.3.1</th><th scope="col" class="num">mise 2026.9.18</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Cold setup (tools + services)</th><td class="num">24.9 s</td><td class="num">93.1 s</td><td class="num">48.0 s</td><td class="num">21.7 s</td></tr>
+          <tr><th scope="row">Warm setup, new project dir</th><td class="num">1.4 s</td><td class="num">3.5 s</td><td class="num">4.4 s</td><td class="num">0.02 s</td></tr>
+          <tr><th scope="row">Per-command exec overhead</th><td class="num">0.25 s</td><td class="num">1.8 s</td><td class="num">0.12 s</td><td class="num">0.01 s</td></tr>
+          <tr><th scope="row">Second project, same ports</th><td>Services die, reports success</td><td>Crash-loop, reports success</td><td>New port, env still old port</td><td>Fails with log hint</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Why these do not compare directly: the main mise run had no service management (services were DIY, see the Pitchfork addendum in REPORT.md); the competitor exec figures time a plain command without service identity checks; Stack's <code>up</code> includes identity verification of two services. Raw logs: <a href="results/logs/">eval/results/logs/</a>.</p>
+  </div>
+</section>
+
+<!-- REPRO -->
+<section id="repro" aria-labelledby="h-repro">
+  <h2 id="h-repro">Reproduce and result data</h2>
+  <p class="sub">Usage is documented in each harness docstring. The harnesses run the published package and verify binary hashes; they never build the working tree. Use new result directories to avoid overwriting the recorded runs.</p>
+  <div class="card" style="padding:0;border:0;background:none">
+    <button class="copy" type="button" data-copy="cmds">Copy</button>
+    <pre id="cmds"><span class="c"># Fetch the exact published release</span>
+npm pack @ushawarma/stack@0.1.3
+mkdir -p /tmp/stack-pkg && tar -xzf ushawarma-stack-0.1.3.tgz -C /tmp/stack-pkg
+PKG=/tmp/stack-pkg/package
+
+<span class="c"># Linux arm64 benchmark + six E2E suites (needs ev-mise and registry:2 Docker images)</span>
+python3 eval/harness/run-stack.py "$PKG" eval/results/repro-linux
+
+<span class="c"># Native macOS arm64 smoke; WORK_DIR must not exist and should be short (socket path cap)</span>
+python3 eval/harness/stack-native.py "$PKG" "$(command -v mise)" /tmp/stack-native-repro eval/results/repro-native
+
+<span class="c"># Git tag move with a fresh empty cache</span>
+python3 eval/harness/stack-lock.py "$PKG/binaries/darwin-arm64/stack" eval/results/repro-lock</pre>
+  </div>
+
+  <h3>Evidence index</h3>
+  <p class="note">This report links to concise result data. Raw command logs, process dumps and MCP transcripts stay local and are ignored by Git.</p>
+  <ul class="links">
+    <li><a href="results/stack-0.1.3/versions.json">versions.json</a> <span class="what">resolved provider and tool versions</span></li>
+    <li><a href="results/stack-0.1.3/summary.json">stack-0.1.3/summary.json</a> <span class="what">authoritative metrics, gaps, priorities</span></li>
+    <li><a href="results/stack-0.1.3/metadata.json">metadata.json</a> <span class="what">commit, platform, binary hashes, image</span></li>
+    <li><a href="results/stack-0.1.3/package.json">package.json</a> <span class="what">npm pack manifest and integrity</span></li>
+    <li><a href="results/stack-0.1.3/harness-sha256.json">harness-sha256.json</a> <span class="what">hashes of harness and E2E scripts</span></li>
+    <li><a href="results/stack-0.1.3/stack.tsv">stack.tsv</a> <span class="what">Linux step timings</span></li>
+    <li><a href="results/stack-0.1.3/scenarios.json">scenarios.json</a> <span class="what">suite exit codes and durations</span></li>
+    <li><a href="results/stack-0.1.3-native/summary.json">stack-0.1.3-native/summary.json</a> <span class="what">native result</span></li>
+    <li><a href="results/stack-0.1.3-native/steps.json">stack-0.1.3-native/steps.json</a> <span class="what">native step timings</span></li>
+    <li><a href="results/stack-0.1.3-lock/summary.json">stack-0.1.3-lock/summary.json</a> <span class="what">Git pin result</span></li>
+    <li><a href="results/stack-0.1.3-attempt1/">stack-0.1.3-attempt1/</a> <span class="what">first Linux attempt</span></li>
+    <li><a href="results/stack-0.1.3-native-attempt1/">stack-0.1.3-native-attempt1/</a> <span class="what">first native attempt</span></li>
+    <li><a href="harness/run-stack.py">harness/run-stack.py</a> · <a href="harness/stack.sh">stack.sh</a> · <a href="harness/stack-native.py">stack-native.py</a> · <a href="harness/stack-lock.py">stack-lock.py</a></li>
+    <li><a href="fixtures/stack-0.1.3/source/README.md">README.md</a> · <a href="fixtures/stack-0.1.3/source/docs/DESIGN.md">docs/DESIGN.md</a> <span class="what">vision</span></li>
+    <li><a href="REPORT.md">REPORT.md</a> <span class="what">historical baseline</span></li>
+  </ul>
+
+  <h3>Published binary hashes (SHA-256)</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th scope="col">Platform</th><th scope="col">Hash</th><th scope="col">Run here</th></tr></thead>
+      <tbody>
+        <tr><td>linux-arm64</td><td class="mono" style="overflow-wrap:anywhere">cd73e067768a3f34abbc3a5daacee4a0cd845b513455716c14cf5a35b7c236b5</td><td><span class="badge b-ok">Checked, run</span></td></tr>
+        <tr><td>darwin-arm64</td><td class="mono" style="overflow-wrap:anywhere">d924c2bc91785e92005d52bdfdd477bd233bbdcc2b00e687d14e90b00b0e3a5e</td><td><span class="badge b-ok">Checked, run</span></td></tr>
+        <tr><td>linux-x64</td><td class="mono" style="overflow-wrap:anywhere">456cf1ba078e1b52e5af0a3fe5f0482050822cab6d991a2d19e048918ed51653</td><td><span class="badge b-none">Not run</span></td></tr>
+        <tr><td>darwin-x64</td><td class="mono" style="overflow-wrap:anywhere">41f87bba28a49e9dfec1d795364e117e2ec9274b4f90a957e6cc730c14df1e67</td><td><span class="badge b-none">Not run</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    Generated from the evidence files linked above. Fresh measurements: Stack 0.1.3, run 2026-10-05 UTC. Historical baseline: 2026-10-02, not rerun. Status labels are qualitative judgments of this run, not completion scores.
+  </div>
+</footer>
+
+<script>
+(function () {
+  var NS = "http://www.w3.org/2000/svg";
+  function el(name, attrs, text) {
+    var n = document.createElementNS(NS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function css(v) { return "var(" + v + ")"; }
+
+  // Setup chart: grouped horizontal bars
+  function setupChart() {
+    var host = document.getElementById("chart-setup");
+    var rows = [
+      { label: "Cold up", vals: [11.167, 13.188] },
+      { label: "New project, cached tools", vals: [1.207, 1.387] }
+    ];
+    var colors = [css("--series-1"), css("--series-2")];
+    var names = ["Linux", "macOS"];
+    var W = 520, left = 10, right = 60, top = 8, barH = 20, gap = 4, groupGap = 30, labelH = 18;
+    var max = 14, plotW = W - left - right;
+    var H = top + rows.length * (labelH + 2 * barH + gap + groupGap) + 18;
+    var svg = el("svg", { viewBox: "0 0 " + W + " " + H, class: "chart", "aria-hidden": "true", focusable: "false" });
+    var g = el("g", { class: "grid" });
+    for (var t = 0; t <= max; t += 2) {
+      var x = left + plotW * t / max;
+      g.appendChild(el("line", { x1: x, x2: x, y1: top, y2: H - 18 }));
+      svg.appendChild(el("text", { x: x, y: H - 4, "text-anchor": "middle" }, t + " s"));
+    }
+    svg.insertBefore(g, svg.firstChild);
+    var y = top;
+    rows.forEach(function (r) {
+      svg.appendChild(el("text", { x: left, y: y + 13, class: "lbl" }, r.label));
+      y += labelH;
+      r.vals.forEach(function (v, i) {
+        var w = Math.max(2, plotW * v / max);
+        var rect = el("rect", { x: left, y: y, width: w, height: barH, rx: 3, fill: colors[i] });
+        rect.appendChild(el("title", {}, names[i] + " " + r.label + ": " + v.toFixed(3) + " s"));
+        svg.appendChild(rect);
+        svg.appendChild(el("text", { x: left + w + 6, y: y + 14, class: "val" }, v.toFixed(3) + " s"));
+        y += barH + gap;
+      });
+      y += groupGap - gap;
+    });
+    host.appendChild(svg);
+  }
+
+  // Exec chart: dot strip with median line
+  function execChart() {
+    var host = document.getElementById("chart-exec");
+    var series = [
+      { label: "Linux unverified", color: css("--series-3"), med: 25, pts: [25, 36, 30, 28, 45, 23, 25, 23, 23, 24] },
+      { label: "Linux verified", color: css("--series-1"), med: 82, pts: [84, 81, 81, 83, 83, 82, 82, 82, 81, 81] },
+      { label: "macOS verified", color: css("--series-2"), med: 154.895, pts: [152.81, 154.27, 155.52, 155.95, 152.29, 189.68, 154.08, 157.38, 150.58, 156.16] }
+    ];
+    var W = 520, left = 118, right = 20, top = 10, rowH = 46, max = 200;
+    var plotW = W - left - right;
+    var H = top + series.length * rowH + 24;
+    var svg = el("svg", { viewBox: "0 0 " + W + " " + H, class: "chart", "aria-hidden": "true", focusable: "false" });
+    var g = el("g", { class: "grid" });
+    for (var t = 0; t <= max; t += 50) {
+      var x = left + plotW * t / max;
+      g.appendChild(el("line", { x1: x, x2: x, y1: top, y2: H - 22 }));
+      svg.appendChild(el("text", { x: x, y: H - 6, "text-anchor": "middle" }, t + " ms"));
+    }
+    svg.appendChild(g);
+    series.forEach(function (s, i) {
+      var cy = top + i * rowH + rowH / 2;
+      svg.appendChild(el("text", { x: left - 10, y: cy - 2, "text-anchor": "end", class: "lbl" }, s.label));
+      svg.appendChild(el("text", { x: left - 10, y: cy + 13, "text-anchor": "end" }, "median " + s.med + " ms"));
+      var sorted = s.pts.slice().sort(function (a, b) { return a - b; });
+      sorted.forEach(function (p, j) {
+        var jitter = ((j % 3) - 1) * 5;
+        var c = el("circle", { cx: left + plotW * p / max, cy: cy + jitter, r: 4.5, fill: s.color, "fill-opacity": 0.75, stroke: s.color });
+        c.appendChild(el("title", {}, s.label + ": " + p + " ms"));
+        svg.appendChild(c);
+      });
+      var mx = left + plotW * s.med / max;
+      svg.appendChild(el("line", { x1: mx, x2: mx, y1: cy - 14, y2: cy + 14, stroke: css("--ink"), "stroke-width": 2 }));
+    });
+    host.appendChild(svg);
+  }
+
+  setupChart();
+  execChart();
+
+  // Copy button
+  document.querySelectorAll("[data-copy]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = document.getElementById(b.getAttribute("data-copy")).innerText;
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).then(function () {
+          b.textContent = "Copied";
+          setTimeout(function () { b.textContent = "Copy"; }, 1500);
+        });
+      }
+    });
+  });
+
+  // Highlight current section in nav
+  var links = Array.prototype.slice.call(document.querySelectorAll("nav.toc a"));
+  if ("IntersectionObserver" in window) {
+    var map = {};
+    links.forEach(function (a) { map[a.getAttribute("href").slice(1)] = a; });
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting && map[e.target.id]) {
+          links.forEach(function (l) { l.classList.remove("active"); l.removeAttribute("aria-current"); });
+          map[e.target.id].classList.add("active");
+          map[e.target.id].setAttribute("aria-current", "true");
+        }
+      });
+    }, { rootMargin: "-45% 0px -50% 0px" });
+    document.querySelectorAll("main section[id]").forEach(function (s) { io.observe(s); });
+  }
+})();
+</script>
+</body>
+</html>

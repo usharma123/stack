@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Stand-in for an internal CLI shipped inside a bundle.
+echo "acme cli from bundle (LOG_LEVEL=$LOG_LEVEL)"

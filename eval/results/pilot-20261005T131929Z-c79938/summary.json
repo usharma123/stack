@@ -1,0 +1,369 @@
+{
+  "run_id": "20261005T131929Z-c79938",
+  "kind": "scripted_concurrency",
+  "agent_productivity": "not measured; see docs/pilot-protocol.md",
+  "stack_version": "stack 0.1.3",
+  "source_commit": "a1358335984610926384c58d9a83bd383301d647",
+  "source_dirty": true,
+  "platform": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.12.9",
+    "cpus": 14
+  },
+  "finished_utc": "2026-10-05T13:20:09Z",
+  "projects_concurrent": 3,
+  "rounds_per_phase": 2,
+  "phases": {
+    "cached": {
+      "tasks_attempted": 6,
+      "tasks_succeeded": 6,
+      "wrong_instance_incidents": 0,
+      "orphaned_service_processes": 0,
+      "controlled_failures": {
+        "injected": 2,
+        "handled": 1,
+        "by_kind": [
+          "runner_death",
+          "service_kill"
+        ]
+      },
+      "latency_ms": {
+        "up": {
+          "n": 6,
+          "p50": 945.9,
+          "p90": 1487.9,
+          "max": 1494.1,
+          "mean": 1215.1
+        },
+        "task": {
+          "n": 6,
+          "p50": 761.6,
+          "p90": 4653.7,
+          "max": 4787.7,
+          "mean": 2692.4
+        },
+        "exec_verified": {
+          "n": 30,
+          "p50": 165.9,
+          "p90": 179.3,
+          "max": 180.5,
+          "mean": 166.5
+        },
+        "round_wall": {
+          "n": 2,
+          "p50": 3597.8,
+          "p90": 9539.8,
+          "max": 9539.8,
+          "mean": 6568.8
+        }
+      }
+    },
+    "fresh": {
+      "tasks_attempted": 6,
+      "tasks_succeeded": 6,
+      "wrong_instance_incidents": 0,
+      "orphaned_service_processes": 0,
+      "controlled_failures": {
+        "injected": 2,
+        "handled": 1,
+        "by_kind": [
+          "runner_death",
+          "service_kill"
+        ]
+      },
+      "latency_ms": {
+        "up": {
+          "n": 6,
+          "p50": 969.5,
+          "p90": 12327.5,
+          "max": 12332.2,
+          "mean": 6646.1
+        },
+        "task": {
+          "n": 6,
+          "p50": 841.1,
+          "p90": 5694.0,
+          "max": 5795.7,
+          "mean": 3274.0
+        },
+        "exec_verified": {
+          "n": 30,
+          "p50": 161.9,
+          "p90": 176.5,
+          "max": 208.6,
+          "mean": 164.8
+        },
+        "round_wall": {
+          "n": 2,
+          "p50": 3855.3,
+          "p90": 21329.0,
+          "max": 21329.0,
+          "mean": 12592.1
+        }
+      }
+    }
+  },
+  "results": [
+    {
+      "phase": "fresh",
+      "round": 0,
+      "project": "p0",
+      "failure": "service_kill",
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        157.1,
+        161.8,
+        208.6,
+        158.7,
+        163.6
+      ],
+      "notes": [
+        "service_kill: NOT refused ({'ok': False, 'error': {'code': 'unparseable_output'}})"
+      ],
+      "up_ms": 12327.5,
+      "task_ms": 5689.9,
+      "failure_handled": false,
+      "recovered": true,
+      "round_wall_ms": 21329.0
+    },
+    {
+      "phase": "fresh",
+      "round": 0,
+      "project": "p1",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        147.2,
+        173.4,
+        151.7,
+        158.3,
+        175.2
+      ],
+      "notes": [],
+      "up_ms": 12324.0,
+      "task_ms": 5795.7,
+      "round_wall_ms": 21329.0
+    },
+    {
+      "phase": "fresh",
+      "round": 0,
+      "project": "p2",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        169.6,
+        163.7,
+        154.8,
+        155.9,
+        162.1
+      ],
+      "notes": [],
+      "up_ms": 12332.2,
+      "task_ms": 5694.0,
+      "round_wall_ms": 21329.0
+    },
+    {
+      "phase": "fresh",
+      "round": 1,
+      "project": "p0",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        158.7,
+        161.9,
+        159.7,
+        181.5,
+        150.7
+      ],
+      "notes": [],
+      "up_ms": 969.5,
+      "task_ms": 794.3,
+      "round_wall_ms": 3855.3
+    },
+    {
+      "phase": "fresh",
+      "round": 1,
+      "project": "p1",
+      "failure": "runner_death",
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        176.0,
+        152.8,
+        174.1,
+        165.8,
+        176.5
+      ],
+      "notes": [
+        "runner_death: reclaimed by gc"
+      ],
+      "up_ms": 964.8,
+      "task_ms": 841.1,
+      "failure_handled": true,
+      "round_wall_ms": 3855.3
+    },
+    {
+      "phase": "fresh",
+      "round": 1,
+      "project": "p2",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        165.7,
+        149.9,
+        185.4,
+        163.3,
+        160.5
+      ],
+      "notes": [],
+      "up_ms": 958.6,
+      "task_ms": 829.1,
+      "round_wall_ms": 3855.3
+    },
+    {
+      "phase": "cached",
+      "round": 0,
+      "project": "p0",
+      "failure": "service_kill",
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        161.6,
+        160.9,
+        170.2,
+        172.8,
+        157.9
+      ],
+      "notes": [
+        "service_kill: NOT refused ({'ok': False, 'error': {'code': 'unparseable_output'}})"
+      ],
+      "up_ms": 1494.1,
+      "task_ms": 4653.7,
+      "failure_handled": false,
+      "recovered": true,
+      "round_wall_ms": 9539.8
+    },
+    {
+      "phase": "cached",
+      "round": 0,
+      "project": "p1",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        165.9,
+        170.3,
+        176.3,
+        169.4,
+        158.0
+      ],
+      "notes": [],
+      "up_ms": 1477.8,
+      "task_ms": 4787.7,
+      "round_wall_ms": 9539.8
+    },
+    {
+      "phase": "cached",
+      "round": 0,
+      "project": "p2",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        156.5,
+        149.0,
+        180.5,
+        158.7,
+        180.2
+      ],
+      "notes": [],
+      "up_ms": 1487.9,
+      "task_ms": 4463.0,
+      "round_wall_ms": 9539.8
+    },
+    {
+      "phase": "cached",
+      "round": 1,
+      "project": "p0",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        156.4,
+        175.4,
+        179.3,
+        144.1,
+        169.9
+      ],
+      "notes": [],
+      "up_ms": 945.9,
+      "task_ms": 739.5,
+      "round_wall_ms": 3597.8
+    },
+    {
+      "phase": "cached",
+      "round": 1,
+      "project": "p1",
+      "failure": "runner_death",
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        163.3,
+        163.0,
+        176.8,
+        172.1,
+        164.3
+      ],
+      "notes": [
+        "runner_death: reclaimed by gc"
+      ],
+      "up_ms": 941.6,
+      "task_ms": 761.6,
+      "failure_handled": true,
+      "round_wall_ms": 3597.8
+    },
+    {
+      "phase": "cached",
+      "round": 1,
+      "project": "p2",
+      "failure": null,
+      "task_ok": true,
+      "wrong_instance": 0,
+      "orphans": 0,
+      "exec_ms": [
+        159.8,
+        171.7,
+        161.1,
+        179.8,
+        169.2
+      ],
+      "notes": [],
+      "up_ms": 943.5,
+      "task_ms": 748.9,
+      "round_wall_ms": 3597.8
+    }
+  ],
+  "limits": [
+    "Scripted workers, not agents: task success measures stack's lifecycle under concurrency, not agent productivity.",
+    "One machine, one run; latencies are samples from this run, not a performance study.",
+    "Fresh means an empty isolated HOME (no mise installs or downloads), not an empty network cache upstream."
+  ]
+}

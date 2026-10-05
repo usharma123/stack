@@ -60,6 +60,48 @@ pub struct Service {
     /// `"auto"` (default) or a fixed port. Fixed ports belong to projects, not bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<toml::Value>,
+    /// Opt-in instance check for services without a built-in one. Without it a service is
+    /// verified for liveness only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityProbe>,
+}
+
+/// A command that asks the running service, through the app's own connection settings, which
+/// instance it is. It must print exactly the instance token stack gave this checkout's service
+/// (`$STACK_IDENTITY_<NAME>` in the service's environment), and nothing else.
+///
+/// Probes are trusted code from the bundle, like `run`; they are bounded, not sandboxed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityProbe {
+    /// Run with `sh -c` in the project directory, with the stack's env minus identity tokens.
+    pub command: String,
+    /// Default 5s, at most 30s. The command's process group is killed at the deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+pub const IDENTITY_TIMEOUT_DEFAULT: u64 = 5;
+pub const IDENTITY_TIMEOUT_MAX: u64 = 30;
+
+impl IdentityProbe {
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout
+            .as_deref()
+            .and_then(|t| crate::mcp::parse_duration(t).ok())
+            .unwrap_or(IDENTITY_TIMEOUT_DEFAULT)
+    }
+}
+
+/// The variable through which a service learns its instance token.
+pub fn identity_var(service: &str) -> String {
+    format!(
+        "STACK_IDENTITY_{}",
+        service
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect::<String>()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +160,31 @@ impl Service {
                 "invalid_service",
                 format!("service '{name}' in {origin} must set exactly one of `preset` or `run`"),
             ));
+        }
+        if let Some(probe) = &self.identity {
+            if matches!(self.preset.as_deref(), Some("postgres" | "redis")) {
+                return Err(StackError::new(
+                    "invalid_service",
+                    format!("service '{name}' in {origin} sets `identity`, but its preset already has a built-in instance check"),
+                ));
+            }
+            if probe.command.trim().is_empty() {
+                return Err(StackError::new(
+                    "invalid_service",
+                    format!("service '{name}' in {origin} has an empty identity command"),
+                ));
+            }
+            if let Some(t) = &probe.timeout {
+                let secs = crate::mcp::parse_duration(t).map_err(|e| {
+                    StackError::new("invalid_service", format!("service '{name}' in {origin}: identity timeout: {}", e.message))
+                })?;
+                if !(1..=IDENTITY_TIMEOUT_MAX).contains(&secs) {
+                    return Err(StackError::new(
+                        "invalid_service",
+                        format!("service '{name}' in {origin}: identity timeout must be 1s to {IDENTITY_TIMEOUT_MAX}s"),
+                    ));
+                }
+            }
         }
         match &self.port {
             None => {}
