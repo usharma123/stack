@@ -1,0 +1,28 @@
+{
+  "run_id": "20261005T131929Z-c79938",
+  "kind": "scripted_concurrency",
+  "agent_productivity": "not measured; see docs/pilot-protocol.md",
+  "started_utc": "2026-10-05T13:19:29Z",
+  "args": {
+    "stack": "target/release/stack",
+    "projects": 3,
+    "rounds": 2,
+    "phases": "fresh,cached",
+    "failures": "service_kill,runner_death",
+    "exec_samples": 5,
+    "out": null
+  },
+  "stack_version": "stack 0.1.3",
+  "stack_binary_sha256": "567d891a58c87726f725bf508dffc7c147b501163de5b819279e8142c2feda13",
+  "source_commit": "a1358335984610926384c58d9a83bd383301d647",
+  "source_dirty": true,
+  "mise_version": "2026.9.18 macos-arm64 (2026-09-30)",
+  "platform": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "python": "3.12.9",
+    "cpus": 14
+  },
+  "isolated_home": "/private/tmp/spl.gbkzov6t/h"
+}
