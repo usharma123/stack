@@ -1,0 +1,537 @@
+{
+  "method": "Read-only inspection of two existing installations and codesign --verify --strict. No provider commands, services or measurements run.",
+  "tools": {
+    "postgres": {
+      "receipts": [
+        {
+          "path": "/private/tmp/sp/w/mise/data/installs/postgres/17.11/.mise-bins/postgres",
+          "sha256": "70e4d41aadc461af00b4dd56a945b412b53df9677e9eefd246ff22c23d711cbc",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/sp/w/mise/data/installs/postgres/17.11/bin/postgres",
+            "sha256": "42f9b0e1d6b532462280b466a241fe4278acefdc72b1b0f530bf265bbc3cd22e",
+            "normalized_sha256": "6ed15e59d691654182124059dcbbd5b56de555eded3d98845656f92e58ee7af6",
+            "normalization": {
+              "literal_install_prefix": "/tmp/sp/w/mise/data/installs/postgres/17.11",
+              "paths": [
+                {
+                  "offset": 6256618,
+                  "padded_end": 6256890,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/etc/krb5.keytab",
+                  "normalized_path": "<INSTALL_PREFIX>/etc/krb5.keytab"
+                },
+                {
+                  "offset": 6312117,
+                  "padded_end": 6312388,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/zoneinfo",
+                  "normalized_path": "<INSTALL_PREFIX>/share/zoneinfo"
+                },
+                {
+                  "offset": 6314951,
+                  "padded_end": 6319366,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11' '--with-libraries=/tmp/sp/w/mise/data/installs/postgres/17.11/lib' '--with-includes=/tmp/sp/w/mise/data/installs/postgres/17.11/include' '--enable-thread-safety' '--with-gssapi' '--with-icu' '--with-ldap' '--with-libxml' '--with-libxslt' '--with-lz4' '--with-zstd' '--with-openssl' '--with-uuid=e2fs' '--with-system-tzdata=/tmp/sp/w/mise/data/installs/postgres/17.11/share/zoneinfo' 'PG_SYSROOT=undefined' 'build_alias=x86_64-apple-darwin13.4.0' 'host_alias=arm64-apple-darwin20.0.0' 'CC=arm64-apple-darwin20.0.0-clang' 'CFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -isystem /tmp/sp/w/mise/data/installs/postgres/17.11/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=/tmp/sp/w/mise/data/installs/postgres/17.11=/usr/local/src/conda-prefix' 'LDFLAGS=-Wl,-headerpad_max_install_names -Wl,-dead_strip_dylibs -Wl,-rpath,/tmp/sp/w/mise/data/installs/postgres/17.11/lib -L/tmp/sp/w/mise/data/installs/postgres/17.11/lib -fuse-ld=lld' 'CPPFLAGS=-D_FORTIFY_SOURCE=2 -DNDEBUG -isystem /tmp/sp/w/mise/data/installs/postgres/17.11/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0' 'CXX=arm64-apple-darwin20.0.0-clang++' 'CXXFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -stdlib=libc++ -fvisibility-inlines-hidden -fmessage-length=0 -isystem /tmp/sp/w/mise/data/installs/postgres/17.11/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=/tmp/sp/w/mise/data/installs/postgres/17.11=/usr/local/src/conda-prefix' 'CLANG=arm64-apple-darwin20.0.0-clang' 'CPP=arm64-apple-darwin20.0.0-clang-cpp' 'PKG_CONFIG_PATH=/tmp/sp/w/mise/data/installs/postgres/17.11/lib/pkgconfig'",
+                  "normalized_path": "<INSTALL_PREFIX>' '--with-libraries=<INSTALL_PREFIX>/lib' '--with-includes=<INSTALL_PREFIX>/include' '--enable-thread-safety' '--with-gssapi' '--with-icu' '--with-ldap' '--with-libxml' '--with-libxslt' '--with-lz4' '--with-zstd' '--with-openssl' '--with-uuid=e2fs' '--with-system-tzdata=<INSTALL_PREFIX>/share/zoneinfo' 'PG_SYSROOT=undefined' 'build_alias=x86_64-apple-darwin13.4.0' 'host_alias=arm64-apple-darwin20.0.0' 'CC=arm64-apple-darwin20.0.0-clang' 'CFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -isystem <INSTALL_PREFIX>/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=<INSTALL_PREFIX>=/usr/local/src/conda-prefix' 'LDFLAGS=-Wl,-headerpad_max_install_names -Wl,-dead_strip_dylibs -Wl,-rpath,<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -fuse-ld=lld' 'CPPFLAGS=-D_FORTIFY_SOURCE=2 -DNDEBUG -isystem <INSTALL_PREFIX>/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0' 'CXX=arm64-apple-darwin20.0.0-clang++' 'CXXFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -stdlib=libc++ -fvisibility-inlines-hidden -fmessage-length=0 -isystem <INSTALL_PREFIX>/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=<INSTALL_PREFIX>=/usr/local/src/conda-prefix' 'CLANG=arm64-apple-darwin20.0.0-clang' 'CPP=arm64-apple-darwin20.0.0-clang-cpp' 'PKG_CONFIG_PATH=<INSTALL_PREFIX>/lib/pkgconfig'"
+                },
+                {
+                  "offset": 6319444,
+                  "padded_end": 6321364,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0 -I/tmp/sp/w/mise/data/installs/postgres/17.11/include -I/tmp/sp/w/mise/data/installs/postgres/17.11/include/libxml2 -I/tmp/sp/w/mise/data/installs/postgres/17.11/include -I/tmp/sp/w/mise/data/installs/postgres/17.11/include -I/tmp/sp/w/mise/data/installs/postgres/17.11/include -I/tmp/sp/w/mise/data/installs/postgres/17.11/include",
+                  "normalized_path": "<INSTALL_PREFIX>/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0 -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include/libxml2 -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include"
+                },
+                {
+                  "offset": 6321819,
+                  "padded_end": 6322520,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=/tmp/sp/w/mise/data/installs/postgres/17.11=/usr/local/src/conda-prefix",
+                  "normalized_path": "<INSTALL_PREFIX>/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=<INSTALL_PREFIX>=/usr/local/src/conda-prefix"
+                },
+                {
+                  "offset": 6322605,
+                  "padded_end": 6324188,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/lib -L/tmp/sp/w/mise/data/installs/postgres/17.11/lib -fuse-ld=lld -L/tmp/sp/w/mise/data/installs/postgres/17.11/lib -L/tmp/sp/w/mise/data/installs/postgres/17.11/lib -L/tmp/sp/w/mise/data/installs/postgres/17.11/lib -L/tmp/sp/w/mise/data/installs/postgres/17.11/lib",
+                  "normalized_path": "<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -fuse-ld=lld -L<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib"
+                },
+                {
+                  "offset": 6328886,
+                  "padded_end": 6329148,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share",
+                  "normalized_path": "<INSTALL_PREFIX>/share"
+                },
+                {
+                  "offset": 6329148,
+                  "padded_end": 6329408,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/bin",
+                  "normalized_path": "<INSTALL_PREFIX>/bin"
+                },
+                {
+                  "offset": 6329408,
+                  "padded_end": 6329668,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/etc",
+                  "normalized_path": "<INSTALL_PREFIX>/etc"
+                },
+                {
+                  "offset": 6329668,
+                  "padded_end": 6329932,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/include",
+                  "normalized_path": "<INSTALL_PREFIX>/include"
+                },
+                {
+                  "offset": 6329932,
+                  "padded_end": 6330203,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/include/server",
+                  "normalized_path": "<INSTALL_PREFIX>/include/server"
+                },
+                {
+                  "offset": 6330203,
+                  "padded_end": 6330463,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/lib",
+                  "normalized_path": "<INSTALL_PREFIX>/lib"
+                },
+                {
+                  "offset": 6330463,
+                  "padded_end": 6330732,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/locale",
+                  "normalized_path": "<INSTALL_PREFIX>/share/locale"
+                },
+                {
+                  "offset": 6330732,
+                  "padded_end": 6330999,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/doc/",
+                  "normalized_path": "<INSTALL_PREFIX>/share/doc/"
+                },
+                {
+                  "offset": 6330999,
+                  "padded_end": 6331265,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/man",
+                  "normalized_path": "<INSTALL_PREFIX>/share/man"
+                }
+              ],
+              "verified_ad_hoc_signature": true,
+              "signature_page_digest_ranges": [
+                [
+                  8899054,
+                  69536
+                ]
+              ]
+            }
+          },
+          "wrapper": {
+            "normalized_sha256": "115e9a7c591a0afe9436f4a290f56aeb5213fbae5875cb566f4021b21e123b10",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/postgres' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/tmp/sp/w/mise/data/installs/postgres/17.11",
+              "resolved_install_prefix": "/private/tmp/sp/w/mise/data/installs/postgres/17.11",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {
+              "etc/conda/activate.d/libxml2-split_activate.sh": "631478a9cfbd337b86ee1df94497c21821cd561312c94892d156e43f499cf5c4"
+            }
+          }
+        },
+        {
+          "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/.mise-bins/postgres",
+          "sha256": "c8acb9eb605abf9aceb78dbad8c619f6c47417bfbc5b01f648cf090f2003a560",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/bin/postgres",
+            "sha256": "6656ff29efea827e687cb408ac1f36c787120a1c7cc2b99e192320641121ce31",
+            "normalized_sha256": "6ed15e59d691654182124059dcbbd5b56de555eded3d98845656f92e58ee7af6",
+            "normalization": {
+              "literal_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11",
+              "paths": [
+                {
+                  "offset": 6256618,
+                  "padded_end": 6256890,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/etc/krb5.keytab",
+                  "normalized_path": "<INSTALL_PREFIX>/etc/krb5.keytab"
+                },
+                {
+                  "offset": 6312117,
+                  "padded_end": 6312388,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/zoneinfo",
+                  "normalized_path": "<INSTALL_PREFIX>/share/zoneinfo"
+                },
+                {
+                  "offset": 6314951,
+                  "padded_end": 6319366,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11' '--with-libraries=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib' '--with-includes=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include' '--enable-thread-safety' '--with-gssapi' '--with-icu' '--with-ldap' '--with-libxml' '--with-libxslt' '--with-lz4' '--with-zstd' '--with-openssl' '--with-uuid=e2fs' '--with-system-tzdata=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/zoneinfo' 'PG_SYSROOT=undefined' 'build_alias=x86_64-apple-darwin13.4.0' 'host_alias=arm64-apple-darwin20.0.0' 'CC=arm64-apple-darwin20.0.0-clang' 'CFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -isystem /private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11=/usr/local/src/conda-prefix' 'LDFLAGS=-Wl,-headerpad_max_install_names -Wl,-dead_strip_dylibs -Wl,-rpath,/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -L/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -fuse-ld=lld' 'CPPFLAGS=-D_FORTIFY_SOURCE=2 -DNDEBUG -isystem /private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0' 'CXX=arm64-apple-darwin20.0.0-clang++' 'CXXFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -stdlib=libc++ -fvisibility-inlines-hidden -fmessage-length=0 -isystem /private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11=/usr/local/src/conda-prefix' 'CLANG=arm64-apple-darwin20.0.0-clang' 'CPP=arm64-apple-darwin20.0.0-clang-cpp' 'PKG_CONFIG_PATH=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib/pkgconfig'",
+                  "normalized_path": "<INSTALL_PREFIX>' '--with-libraries=<INSTALL_PREFIX>/lib' '--with-includes=<INSTALL_PREFIX>/include' '--enable-thread-safety' '--with-gssapi' '--with-icu' '--with-ldap' '--with-libxml' '--with-libxslt' '--with-lz4' '--with-zstd' '--with-openssl' '--with-uuid=e2fs' '--with-system-tzdata=<INSTALL_PREFIX>/share/zoneinfo' 'PG_SYSROOT=undefined' 'build_alias=x86_64-apple-darwin13.4.0' 'host_alias=arm64-apple-darwin20.0.0' 'CC=arm64-apple-darwin20.0.0-clang' 'CFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -isystem <INSTALL_PREFIX>/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=<INSTALL_PREFIX>=/usr/local/src/conda-prefix' 'LDFLAGS=-Wl,-headerpad_max_install_names -Wl,-dead_strip_dylibs -Wl,-rpath,<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -fuse-ld=lld' 'CPPFLAGS=-D_FORTIFY_SOURCE=2 -DNDEBUG -isystem <INSTALL_PREFIX>/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0' 'CXX=arm64-apple-darwin20.0.0-clang++' 'CXXFLAGS=-ftree-vectorize -fPIC -fstack-protector-strong -O2 -pipe -stdlib=libc++ -fvisibility-inlines-hidden -fmessage-length=0 -isystem <INSTALL_PREFIX>/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=<INSTALL_PREFIX>=/usr/local/src/conda-prefix' 'CLANG=arm64-apple-darwin20.0.0-clang' 'CPP=arm64-apple-darwin20.0.0-clang-cpp' 'PKG_CONFIG_PATH=<INSTALL_PREFIX>/lib/pkgconfig'"
+                },
+                {
+                  "offset": 6319444,
+                  "padded_end": 6321364,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0 -I/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -I/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include/libxml2 -I/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -I/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -I/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -I/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include",
+                  "normalized_path": "<INSTALL_PREFIX>/include -mmacosx-version-min=11.0 -mmacosx-version-min=11.0 -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include/libxml2 -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include -I<INSTALL_PREFIX>/include"
+                },
+                {
+                  "offset": 6321819,
+                  "padded_end": 6322520,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11=/usr/local/src/conda-prefix",
+                  "normalized_path": "<INSTALL_PREFIX>/include -fdebug-prefix-map=/Users/runner/miniforge3/conda-bld/postgresql-split_1788541317554/work=/usr/local/src/conda/postgresql-split-17.11 -fdebug-prefix-map=<INSTALL_PREFIX>=/usr/local/src/conda-prefix"
+                },
+                {
+                  "offset": 6322605,
+                  "padded_end": 6324188,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -L/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -fuse-ld=lld -L/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -L/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -L/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib -L/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib",
+                  "normalized_path": "<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -fuse-ld=lld -L<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib -L<INSTALL_PREFIX>/lib"
+                },
+                {
+                  "offset": 6328886,
+                  "padded_end": 6329148,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share",
+                  "normalized_path": "<INSTALL_PREFIX>/share"
+                },
+                {
+                  "offset": 6329148,
+                  "padded_end": 6329408,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/bin",
+                  "normalized_path": "<INSTALL_PREFIX>/bin"
+                },
+                {
+                  "offset": 6329408,
+                  "padded_end": 6329668,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/etc",
+                  "normalized_path": "<INSTALL_PREFIX>/etc"
+                },
+                {
+                  "offset": 6329668,
+                  "padded_end": 6329932,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include",
+                  "normalized_path": "<INSTALL_PREFIX>/include"
+                },
+                {
+                  "offset": 6329932,
+                  "padded_end": 6330203,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include/server",
+                  "normalized_path": "<INSTALL_PREFIX>/include/server"
+                },
+                {
+                  "offset": 6330203,
+                  "padded_end": 6330463,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib",
+                  "normalized_path": "<INSTALL_PREFIX>/lib"
+                },
+                {
+                  "offset": 6330463,
+                  "padded_end": 6330732,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/locale",
+                  "normalized_path": "<INSTALL_PREFIX>/share/locale"
+                },
+                {
+                  "offset": 6330732,
+                  "padded_end": 6330999,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/doc/",
+                  "normalized_path": "<INSTALL_PREFIX>/share/doc/"
+                },
+                {
+                  "offset": 6330999,
+                  "padded_end": 6331265,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/man",
+                  "normalized_path": "<INSTALL_PREFIX>/share/man"
+                }
+              ],
+              "verified_ad_hoc_signature": true,
+              "signature_page_digest_ranges": [
+                [
+                  8899054,
+                  69536
+                ]
+              ]
+            }
+          },
+          "wrapper": {
+            "normalized_sha256": "115e9a7c591a0afe9436f4a290f56aeb5213fbae5875cb566f4021b21e123b10",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/postgres' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11",
+              "resolved_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {
+              "etc/conda/activate.d/libxml2-split_activate.sh": "631478a9cfbd337b86ee1df94497c21821cd561312c94892d156e43f499cf5c4"
+            }
+          }
+        }
+      ],
+      "raw_wrapper_hashes_equal": false,
+      "provider_identities_equal": true
+    },
+    "psql": {
+      "receipts": [
+        {
+          "path": "/private/tmp/sp/w/mise/data/installs/postgres/17.11/.mise-bins/psql",
+          "sha256": "f3d3ce4c8535f7339d54f36cbd98004f44ac52161ecfd5096e9264705265eb02",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/sp/w/mise/data/installs/postgres/17.11/bin/psql",
+            "sha256": "e03c7e78bfe6629962f334d02a7c2f8260bfad2fad4239922f9a066e24e8fcb2",
+            "normalized_sha256": "2d890cdb340946ddb622f39ee623304e30d9d583ba591d25011ffb2a5330ffe3",
+            "normalization": {
+              "literal_install_prefix": "/tmp/sp/w/mise/data/installs/postgres/17.11",
+              "paths": [
+                {
+                  "offset": 551698,
+                  "padded_end": 551960,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share",
+                  "normalized_path": "<INSTALL_PREFIX>/share"
+                },
+                {
+                  "offset": 551960,
+                  "padded_end": 552220,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/bin",
+                  "normalized_path": "<INSTALL_PREFIX>/bin"
+                },
+                {
+                  "offset": 552220,
+                  "padded_end": 552480,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/etc",
+                  "normalized_path": "<INSTALL_PREFIX>/etc"
+                },
+                {
+                  "offset": 552480,
+                  "padded_end": 552744,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/include",
+                  "normalized_path": "<INSTALL_PREFIX>/include"
+                },
+                {
+                  "offset": 552744,
+                  "padded_end": 553015,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/include/server",
+                  "normalized_path": "<INSTALL_PREFIX>/include/server"
+                },
+                {
+                  "offset": 553015,
+                  "padded_end": 553275,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/lib",
+                  "normalized_path": "<INSTALL_PREFIX>/lib"
+                },
+                {
+                  "offset": 553275,
+                  "padded_end": 553544,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/locale",
+                  "normalized_path": "<INSTALL_PREFIX>/share/locale"
+                },
+                {
+                  "offset": 553544,
+                  "padded_end": 553811,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/doc/",
+                  "normalized_path": "<INSTALL_PREFIX>/share/doc/"
+                },
+                {
+                  "offset": 553811,
+                  "padded_end": 554077,
+                  "literal_path": "/tmp/sp/w/mise/data/installs/postgres/17.11/share/man",
+                  "normalized_path": "<INSTALL_PREFIX>/share/man"
+                }
+              ],
+              "verified_ad_hoc_signature": true,
+              "signature_page_digest_ranges": [
+                [
+                  723866,
+                  5664
+                ]
+              ]
+            }
+          },
+          "wrapper": {
+            "normalized_sha256": "f3a89d1c0ef280312a4706647afd276d873f3d561732558cf2d16298e67e9a22",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/psql' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/tmp/sp/w/mise/data/installs/postgres/17.11",
+              "resolved_install_prefix": "/private/tmp/sp/w/mise/data/installs/postgres/17.11",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {
+              "etc/conda/activate.d/libxml2-split_activate.sh": "631478a9cfbd337b86ee1df94497c21821cd561312c94892d156e43f499cf5c4"
+            }
+          }
+        },
+        {
+          "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/.mise-bins/psql",
+          "sha256": "612e9888f21e86582df84a08c2a49e1ba4d442f0963565488113ae3a470c5823",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/bin/psql",
+            "sha256": "f13f42aa4af967228e12d9a7c843e4bfe66a79289c087a6f6e3afb3cc5ca64d7",
+            "normalized_sha256": "2d890cdb340946ddb622f39ee623304e30d9d583ba591d25011ffb2a5330ffe3",
+            "normalization": {
+              "literal_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11",
+              "paths": [
+                {
+                  "offset": 551698,
+                  "padded_end": 551960,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share",
+                  "normalized_path": "<INSTALL_PREFIX>/share"
+                },
+                {
+                  "offset": 551960,
+                  "padded_end": 552220,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/bin",
+                  "normalized_path": "<INSTALL_PREFIX>/bin"
+                },
+                {
+                  "offset": 552220,
+                  "padded_end": 552480,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/etc",
+                  "normalized_path": "<INSTALL_PREFIX>/etc"
+                },
+                {
+                  "offset": 552480,
+                  "padded_end": 552744,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include",
+                  "normalized_path": "<INSTALL_PREFIX>/include"
+                },
+                {
+                  "offset": 552744,
+                  "padded_end": 553015,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/include/server",
+                  "normalized_path": "<INSTALL_PREFIX>/include/server"
+                },
+                {
+                  "offset": 553015,
+                  "padded_end": 553275,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/lib",
+                  "normalized_path": "<INSTALL_PREFIX>/lib"
+                },
+                {
+                  "offset": 553275,
+                  "padded_end": 553544,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/locale",
+                  "normalized_path": "<INSTALL_PREFIX>/share/locale"
+                },
+                {
+                  "offset": 553544,
+                  "padded_end": 553811,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/doc/",
+                  "normalized_path": "<INSTALL_PREFIX>/share/doc/"
+                },
+                {
+                  "offset": 553811,
+                  "padded_end": 554077,
+                  "literal_path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11/share/man",
+                  "normalized_path": "<INSTALL_PREFIX>/share/man"
+                }
+              ],
+              "verified_ad_hoc_signature": true,
+              "signature_page_digest_ranges": [
+                [
+                  723866,
+                  5664
+                ]
+              ]
+            }
+          },
+          "wrapper": {
+            "normalized_sha256": "f3a89d1c0ef280312a4706647afd276d873f3d561732558cf2d16298e67e9a22",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/psql' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11",
+              "resolved_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/postgres/17.11",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {
+              "etc/conda/activate.d/libxml2-split_activate.sh": "631478a9cfbd337b86ee1df94497c21821cd561312c94892d156e43f499cf5c4"
+            }
+          }
+        }
+      ],
+      "raw_wrapper_hashes_equal": false,
+      "provider_identities_equal": true
+    },
+    "redis-server": {
+      "receipts": [
+        {
+          "path": "/private/tmp/sp/w/mise/data/installs/redis/8.10.2/.mise-bins/redis-server",
+          "sha256": "35bce3bc2578f2b4f5c15f2e2c6546888d1e7954bec15102659f9941cf188476",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/sp/w/mise/data/installs/redis/8.10.2/bin/redis-server",
+            "sha256": "9b42f010b7d24296656b2d5045a3de3b475d1d0315ac0664a7becf1f1e681efb"
+          },
+          "wrapper": {
+            "normalized_sha256": "01cb1e4f0cd171d76f71eb31865e6d5734e57afc6af13f7908a2242d6b1b144c",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/redis-server' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/tmp/sp/w/mise/data/installs/redis/8.10.2",
+              "resolved_install_prefix": "/private/tmp/sp/w/mise/data/installs/redis/8.10.2",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {}
+          }
+        },
+        {
+          "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2/.mise-bins/redis-server",
+          "sha256": "e2f0424842438be9c78691651cdf6ec99beb8150a33f1f97f0029c43eb283027",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2/bin/redis-server",
+            "sha256": "9b42f010b7d24296656b2d5045a3de3b475d1d0315ac0664a7becf1f1e681efb"
+          },
+          "wrapper": {
+            "normalized_sha256": "01cb1e4f0cd171d76f71eb31865e6d5734e57afc6af13f7908a2242d6b1b144c",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/redis-server' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2",
+              "resolved_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {}
+          }
+        }
+      ],
+      "raw_wrapper_hashes_equal": false,
+      "provider_identities_equal": true
+    },
+    "redis-cli": {
+      "receipts": [
+        {
+          "path": "/private/tmp/sp/w/mise/data/installs/redis/8.10.2/.mise-bins/redis-cli",
+          "sha256": "9a4c87d674e1792161ce7a8b2e341abcbf57c76bd5a6146fcc7fa10d19a8b7b1",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/sp/w/mise/data/installs/redis/8.10.2/bin/redis-cli",
+            "sha256": "7f89aff3ab0c17918a06c42cc3089f6f88a4f921c56e054f6f46243213d63e4f"
+          },
+          "wrapper": {
+            "normalized_sha256": "b545d4854f08e138c66d2e5801442c6f29f1ca730c7343019f02360a5dbe49e1",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/redis-cli' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/tmp/sp/w/mise/data/installs/redis/8.10.2",
+              "resolved_install_prefix": "/private/tmp/sp/w/mise/data/installs/redis/8.10.2",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {}
+          }
+        },
+        {
+          "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2/.mise-bins/redis-cli",
+          "sha256": "72b55687c2713f89390288d0e2451e85ffce7f2ab05cc0050b925748e4f6a049",
+          "kind": "mise-conda-wrapper",
+          "underlying": {
+            "path": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2/bin/redis-cli",
+            "sha256": "7f89aff3ab0c17918a06c42cc3089f6f88a4f921c56e054f6f46243213d63e4f"
+          },
+          "wrapper": {
+            "normalized_sha256": "b545d4854f08e138c66d2e5801442c6f29f1ca730c7343019f02360a5dbe49e1",
+            "normalized_text": "#!/bin/sh\nexport CONDA_PREFIX='<INSTALL_PREFIX>'\nexport CONDA_DEFAULT_ENV='<INSTALL_PREFIX>'\nexport CONDA_SHLVL=1\nexport PATH=\"$CONDA_PREFIX/bin${PATH:+:$PATH}\"\nfor _mise_conda_script in \"$CONDA_PREFIX\"/etc/conda/activate.d/*.sh; do\n\tif [ -f \"$_mise_conda_script\" ]; then\n\t\t. \"$_mise_conda_script\" || exit $?\n\tfi\ndone\nunset _mise_conda_script\nexec '<INSTALL_PREFIX>/bin/redis-cli' \"$@\"\n",
+            "normalization": {
+              "literal_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2",
+              "resolved_install_prefix": "/private/tmp/stack-eval-013-native/home/.local/share/mise/installs/redis/8.10.2",
+              "replacement": "<INSTALL_PREFIX>",
+              "occurrences": 3
+            },
+            "activation_sha256": {}
+          }
+        }
+      ],
+      "raw_wrapper_hashes_equal": false,
+      "provider_identities_equal": true
+    }
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "kind": "historical_context_only",
+  "release": "0.1.4",
+  "source_commit": "2e4eea4293a4001ce98a5fd374b83a1476b8ec52",
+  "original_summary": "eval/results/latest-2026-10-05/summary.json",
+  "original_summary_sha256": "3798d0ce1d7b0e62cf39120b71098a3ad05038524322805a54b31d46f35c38df",
+  "original_report_sha256": "10827b52615741f9640195fe513527f7b62c0cc4dccc1558f7d77f0905fd4744",
+  "build_info": {
+    "commit": "2e4eea4293a4001ce98a5fd374b83a1476b8ec52",
+    "version": "0.1.4",
+    "hashes": {
+      "linux-x64": "9983552f855251fcf0c6c1700e4aee587d07c17c469d4f7a456199bf8aebb500",
+      "linux-arm64": "72198480b588d0765f413367bc0de19079a08afc380ab4ff87acf267b5ae73ca",
+      "darwin-x64": "12b3e0db70f19862c716e1b5276cac130c887e69fa2ba1e92894efa526a02b42",
+      "darwin-arm64": "20cd8b1410cce21c9767ed09a474dd7f2de15c2c236e8cf6610354afd862aec4"
+    }
+  },
+  "command_entry": {
+    "stack": {
+      "n": 15,
+      "median_ms": 150.60000000000002,
+      "min_ms": 143.0,
+      "max_ms": 168.6
+    },
+    "mise": {
+      "n": 15,
+      "median_ms": 61.699999999999996,
+      "min_ms": 56.2,
+      "max_ms": 68.6
+    },
+    "flox": {
+      "n": 15,
+      "median_ms": 95.4,
+      "min_ms": 84.7,
+      "max_ms": 104.4
+    },
+    "devbox": {
+      "n": 15,
+      "median_ms": 110.0,
+      "min_ms": 90.6,
+      "max_ms": 331.9
+    },
+    "devenv-latest": {
+      "n": 15,
+      "median_ms": 111.5,
+      "min_ms": 104.89999999999999,
+      "max_ms": 132.6
+    },
+    "nix": {
+      "n": 15,
+      "median_ms": 884.3,
+      "min_ms": 842.0999999999999,
+      "max_ms": 958.0
+    },
+    "compose": {
+      "n": 15,
+      "median_ms": 60.5,
+      "min_ms": 39.9,
+      "max_ms": 73.80000000000001
+    },
+    "pixi": {
+      "n": 15,
+      "median_ms": 99.7,
+      "min_ms": 88.6,
+      "max_ms": 111.9
+    }
+  },
+  "limits": [
+    "Historical command-entry timings include Docker exec transport and are not direct-host paired samples.",
+    "Setup combines unequal install/startup steps, so setup timings must not be ranked.",
+    "Configured mise, Flox, Devbox and devenv recipes isolated correctly. Default recipe mistakes are not fundamental product defects.",
+    "Nix measured a toolchain shell. Compose used private networks without the Python fixture. Pixi used explicit manual service lifecycle.",
+    "No unsupported win-everywhere claim; these descriptive receipts do not prove candidate improvements."
+  ]
+}
