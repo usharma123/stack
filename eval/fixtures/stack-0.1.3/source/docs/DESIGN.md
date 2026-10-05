@@ -20,8 +20,7 @@ change what a bundle means.
 - **Bundle**: a versioned, shareable definition in a git repo (`bundle.toml` plus files): tools,
   env, services, tasks, bin paths. Contains no machine-specific values.
 - **Project**: `stack.toml` lists bundles, adds its own definitions, and resolves conflicts in
-  `[override.*]`. `stack.lock` pins each bundle by commit and content hash, and each tool and
-  resolvable preset service by requested and exact version.
+  `[override.*]`. `stack.lock` pins each bundle by commit and content hash.
 - **Session**: one running instance of a project on this machine (`.stack/session.json`, indexed
   in the machine state dir): assigned ports, supervisor PIDs, data directories, verification
   results with timestamps, and an optional lease. It records what stack started; it is never
@@ -32,34 +31,6 @@ change what a bundle means.
 Layers apply in order: bundles (in `[[use]]` order), then the project. A key defined by two
 layers must have equal values, otherwise it is a conflict. `[override.*]` is the only way to
 resolve a conflict or replace a value, and every override is reported with what it replaced.
-
-## Versions
-
-`stack.lock` version 2 records `[[tool]]` and `[[service]]` entries: `name`, `requested` (as
-composed), `resolved` (an exact release), `resolved_on` (the platform that resolved it) and, for
-services, the provider `tool` the preset installs. Resolution is `mise latest <tool>@<request>`,
-run outside any project so project configuration cannot change what a request means; empty
-output (mise's answer when no release matches) is an error, not a version.
-
-- Ordinary `compile` keeps a pin while its request is unchanged and resolves only new or changed
-  requests; removed requests drop out. `--update` resolves every request and reports `moved_from`.
-- Locked mode (`compile --locked`, `inspect` once a lock exists, `up`, `exec`, `status`) never
-  resolves: a missing, stale or extra pin is `lock_outdated`. `inspect` and `doctor` without a
-  lock report `resolved: null` rather than contacting a release source.
-- Resolution failures (`resolve_failed`) leave stack.lock and the provider config untouched.
-- One exact version applies to every platform. If a platform lacks that release, installing
-  fails there (`install_failed`); stack does not resolve differently per machine.
-- Provider tools stack adds (Pitchfork) are locked like any other tool.
-- Postgres and Redis presets map to the mise tools `postgres` and `redis` (verified against mise
-  2026.9.18: `version = "17"` installs `postgres@17`). Other presets, and presets without a
-  `version`, are not locked and compile warns.
-- Version 1 locks are read for migration only. `compile` rewrites them as version 2 keeping every
-  bundle pin; locked operations refuse them. Moving a running session from a range to its exact
-  release is a configuration change, so the next `up` restarts it. Within a major version
-  (`17` → `17.11`, `8` → `8.10.2`) mise's presets reuse existing data; this was checked on macOS
-  with mise 2026.9.18.
-- An exact version is not an artifact checksum: the same version string could in principle be
-  served as different bytes. mise's own lockfile checksums are not used yet.
 
 ## Runtime contract
 
@@ -76,12 +47,7 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Verification** happens on every `exec` and `status`, not from the record: supervisor state,
   PID alive, supervisor port equals assigned port, TCP accept, then identity. Postgres and Redis
   connect with the app's own URL and compare the server's data directory to the supervisor's.
-  A service with an `identity` probe is `instance` only when the probe, run with the app's
-  environment minus every `STACK_IDENTITY_*` variable, prints exactly the checkout's token for
-  it. The token is random per checkout and service, kept in machine state like ports, given to
-  the service as `STACK_IDENTITY_<NAME>`, and part of the configuration fingerprint. The probe is
-  bounded (deadline, 4 KiB of output, process-group kill). Services without a probe get liveness
-  only, labelled `liveness` rather than `instance`. Probes are trusted bundle code, not a sandbox.
+  Other services get liveness only, and are labelled `liveness` rather than `instance`.
 - **Withholding.** Endpoints of unverified services are poisoned (`unverified.stack.invalid`)
   rather than unset, because apps commonly fall back to `localhost:<default>`. This covers the
   service's variables whether the provider set them or the command would inherit them from the
@@ -98,31 +64,14 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
   `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.
-  Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
-  `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
-  chooses. stack installs no background service.
+  Reclaimed by `stack gc` and at the start of every `stack up`; there is no background daemon,
+  so expiry takes effect at the next of those.
   Commands register active executions before releasing the lifecycle lock and renew on
   completion. GC ignores TTL expiry while a coordinator is alive. An explicit runner-death
   policy still takes precedence over a surviving command.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
   those processes dead and ports closed.
-- **Deleted projects.** At `up` the machine index records each daemon's qualified Pitchfork id,
-  the Pitchfork binary, its effective state directory, and the project directory's device and
-  inode. When the directory is gone, or a different directory now has its path, GC asks Pitchfork
-  (`pitchfork status --json <id>`, which reads its state without starting a supervisor) and asks
-  it to stop a daemon only if it runs the recorded PID on the recorded port. Stale PIDs, PIDs the
-  supervisor no longer tracks, a different PID under the same id (a reused path), query or stop
-  failures all keep the record and fail with `gc_incomplete`. A foreign process on a port whose
-  recorded process is gone is left alone. Nothing is recreated in the project directory; data
-  directories are kept. Sessions recorded before this (no ids) can only be reclaimed when nothing
-  of theirs is still running. Until GC reclaims such a session, lifecycle commands in a new
-  directory at the same path fail with `session_conflict` instead of adopting or stopping it.
-- **Supervisor socket.** Pitchfork's socket is `<state dir>/sock/main.sock`, where the state
-  directory is `PITCHFORK_STATE_DIR` (from the provider config's env, which mise passes to
-  Pitchfork, else stack's own), else an absolute `XDG_STATE_HOME/pitchfork` on Linux only, else
-  `$HOME/.local/state/pitchfork` (Pitchfork 2.29.0 `src/env.rs`). It must fit `sun_path` (104
-  bytes on macOS, 108 on Linux). `doctor` reports it and `up` checks it before installing.
 - **Concurrent access.** Compile, renew, execution registration and lifecycle operations share
   a per-project advisory lock released by the kernel on process death. Each JSON write uses a
   unique temporary file and atomic replacement. The machine session index is authoritative if
@@ -161,13 +110,9 @@ staging directory behind.
 
 ## Not covered yet
 
-- The end-to-end suite runs natively on macOS and Linux (`tests/e2e/native.sh`) and in Docker;
-  CI defines a job for each OS, but a workflow definition is not evidence that it has passed.
-  x64 macOS is not exercised by the service scenarios.
-- Identity probes are opt-in; services without one, and presets other than Postgres and Redis,
-  are liveness-only.
-- Exact versions are release names, not artifact checksums.
+- macOS: compile/inspect are tested automatically; services and sessions have been verified by
+  hand (Postgres, Redis, custom services) but the automated end-to-end suite runs on Linux only.
+- Identity checks exist for Postgres and Redis presets only; other services are liveness-only.
 - OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
-- Unattended expiry needs `stack gc --watch` running under a supervisor of your choice.
-- Deleted-project cleanup depends on what was recorded at launch; it refuses rather than guesses.
-- Agent productivity has not been measured; see [pilot-protocol.md](pilot-protocol.md).
+- Expired leases are reclaimed lazily (next `gc`/`up`), not by a background process.
+- Sessions for deleted project directories can't be stopped by stack (see `mise daemons prune`).

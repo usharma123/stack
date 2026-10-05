@@ -257,7 +257,7 @@ footer { color: var(--ink-3); font-size: 0.85rem; padding: 36px 0 48px; border-t
 <!-- VISION SCORECARD -->
 <section id="vision" aria-labelledby="h-vision">
   <h2 id="h-vision">Vision scorecard</h2>
-  <p class="sub">Each row is a guarantee from <a href="../README.md#guarantees">README.md</a> or a runtime contract from <a href="../docs/DESIGN.md">docs/DESIGN.md</a>, judged only on this run's evidence.</p>
+  <p class="sub">Each row is a guarantee from <a href="../README.md#guarantees">README.md</a> or a runtime contract from <a href="fixtures/stack-0.1.3/source/docs/DESIGN.md">docs/DESIGN.md</a>, judged only on this run's evidence.</p>
   <div class="tablewrap">
     <table>
       <thead><tr><th scope="col">Vision claim</th><th scope="col">Status</th><th scope="col">What this run showed</th><th scope="col">Evidence</th></tr></thead>
@@ -268,7 +268,7 @@ footer { color: var(--ink-3); font-size: 0.85rem; padding: 36px 0 48px; border-t
         <tr><th scope="row">Bundles carry files</th><td><span class="badge b-ok">Demonstrated</span></td><td>Seed SQL via <code>{{bundle_dir}}</code> and the bundled <code>acme</code> CLI on PATH worked in both checkouts on Linux and macOS.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">Linux</a> · <a href="results/stack-0.1.3-native/steps.json">macOS</a></td></tr>
         <tr><th scope="row">Independent instance per checkout</th><td><span class="badge b-ok">Demonstrated</span></td><td>Two checkouts got different Postgres and Redis ports and data directories; real pytest passed in each; stopping one left the other working.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">1-checkouts</a> · <a href="results/stack-0.1.3-native/steps.json">macOS</a></td></tr>
         <tr><th scope="row">Never the wrong instance (Postgres, Redis)</th><td><span class="badge b-ok">Demonstrated</span></td><td>Linux: foreign server refused, including libpq host overrides. macOS: <code>show data_directory</code> matched the session; unverified endpoint poisoned to <code>unverified.stack.invalid</code>; <code>--require-all</code> refused with <code>service_unavailable</code>.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">wrong-instance</a> · <a href="results/stack-0.1.3/summary.json">libpq</a> · <a href="results/stack-0.1.3-native/steps.json">refusal</a></td></tr>
-        <tr><th scope="row">Never the wrong instance (custom services)</th><td><span class="badge b-part">Partial</span></td><td>By design, custom services get liveness checks only, labelled <code>liveness</code>. A healthy foreign process could satisfy them.</td><td class="ev"><a href="../docs/DESIGN.md">DESIGN.md</a></td></tr>
+        <tr><th scope="row">Never the wrong instance (custom services)</th><td><span class="badge b-part">Partial</span></td><td>By design, custom services get liveness checks only, labelled <code>liveness</code>. A healthy foreign process could satisfy them.</td><td class="ev"><a href="fixtures/stack-0.1.3/source/docs/DESIGN.md">DESIGN.md</a></td></tr>
         <tr><th scope="row">Verified generations</th><td><span class="badge b-ok">Demonstrated</span></td><td>Config changes withheld endpoints until <code>up</code>; an incompatible Redis version failed without losing data; the original version recovered.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">6-generation</a></td></tr>
         <tr><th scope="row">Owned lifetimes</th><td><span class="badge b-part">Partial</span></td><td>TTL renewal and expiry, active-exec protection and owner-death cleanup passed on Linux, with zero leftovers. Reclamation still waits for the next <code>gc</code> or <code>up</code>; sessions of deleted projects cannot be stopped by Stack.</td><td class="ev"><a href="results/stack-0.1.3/scenarios.json">3-leases</a> · <a href="results/stack-0.1.3/summary.json">leftovers</a></td></tr>
         <tr><th scope="row">Honest failures</th><td><span class="badge b-ok">Demonstrated</span></td><td>Impossible version and unknown package returned <code>install_failed</code> with steps, <code>retry_safe</code> and <code>changed</code>. The macOS socket failure also returned structured <code>start_failed</code>.</td><td class="ev"><a href="results/stack-0.1.3/summary.json">bad_version</a> · <a href="results/stack-0.1.3/summary.json">bad_pkg</a></td></tr>
@@ -542,7 +542,7 @@ python3 eval/harness/stack-lock.py "$PKG/binaries/darwin-arm64/stack" eval/resul
     <li><a href="results/stack-0.1.3-attempt1/">stack-0.1.3-attempt1/</a> <span class="what">first Linux attempt</span></li>
     <li><a href="results/stack-0.1.3-native-attempt1/">stack-0.1.3-native-attempt1/</a> <span class="what">first native attempt</span></li>
     <li><a href="harness/run-stack.py">harness/run-stack.py</a> · <a href="harness/stack.sh">stack.sh</a> · <a href="harness/stack-native.py">stack-native.py</a> · <a href="harness/stack-lock.py">stack-lock.py</a></li>
-    <li><a href="../README.md">README.md</a> · <a href="../docs/DESIGN.md">docs/DESIGN.md</a> <span class="what">vision</span></li>
+    <li><a href="fixtures/stack-0.1.3/source/README.md">README.md</a> · <a href="fixtures/stack-0.1.3/source/docs/DESIGN.md">docs/DESIGN.md</a> <span class="what">vision</span></li>
     <li><a href="REPORT.md">REPORT.md</a> <span class="what">historical baseline</span></li>
   </ul>
 
