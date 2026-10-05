@@ -514,6 +514,20 @@ pub struct UpReport {
     pub reaped: Vec<GcEntry>,
 }
 
+/// Preserve every observed launch identity before further provider calls can fail.
+fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()> {
+    let Some(mut launch) = load(ctx)?.filter(|session| session.launching) else { return Ok(()) };
+    for daemon in statuses {
+        if let Some(record) = launch.services.get_mut(&daemon.name) {
+            if daemon.port != Some(record.port) { continue; }
+            record.provider_id = daemon.id.clone().or(record.provider_id.take());
+            record.pid = daemon.pid.filter(|pid| (1..=MAX_OWNER_PID).contains(pid)).or(record.pid);
+            record.data_dir = daemon.data_dir.clone().or(record.data_dir.take());
+        }
+    }
+    save(ctx, &launch)
+}
+
 pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     if let Some(pid) = lease.owner_pid {
         owner_pid(pid.into())?;
@@ -614,31 +628,29 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             };
             save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         }
-        if let Err(e) = mise::start(&ctx.root) {
-            return Err(steps.fail("start", e, true));
+        // Capture qualified IDs before launch when available, including interrupted starts.
+        let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        if let Err(start_error) = mise::start(&ctx.root) {
+            let observed = mise::daemons(&ctx.root).and_then(|statuses| record_launch_observations(ctx, &statuses));
+            if let Err(error) = observed {
+                return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
+            }
+            return Err(steps.fail("start", start_error, true));
         }
         steps.ok("start", json!(null));
 
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
             let statuses =
                 mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
+            record_launch_observations(ctx, &statuses).map_err(|e| steps.clone().fail("record_observed", e, true))?;
+            let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
             checks = verify_all(&ctx.root, &report, &env, &statuses);
             if checks.iter().all(|c| c.ready) {
                 break;
             }
             if Instant::now() >= deadline {
-                // Keep what the supervisor reported, so cleanup can reconcile these processes.
-                if let Ok(Some(mut launch)) = load(ctx).map(|s| s.filter(|s| s.launching)) {
-                    for c in &checks {
-                        if let Some(record) = launch.services.get_mut(&c.service) {
-                            record.pid = c.pid.or(record.pid);
-                            record.provider_id = c.provider_id.clone().or(record.provider_id.take());
-                        }
-                    }
-                    let _ = save(ctx, &launch);
-                }
                 let failed: Vec<Value> = checks
                     .iter()
                     .filter(|c| !c.ready)

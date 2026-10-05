@@ -52,8 +52,14 @@ case "$1 $2" in
     case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; esac
     echo "$v" ;;
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
-  'env --json') cat "$REVIEW_FIXTURE/env.json" ;;
+  'env --json')
+    if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
+    cat "$REVIEW_FIXTURE/env.json" ;;
   'daemons --json')
+    if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
+      if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
+      touch "$REVIEW_FIXTURE/query-observed"
+    fi
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     cat "$REVIEW_FIXTURE/daemons.json" ;;
   'daemons start')
@@ -1642,4 +1648,29 @@ fn configured_home_cannot_hide_an_overlong_supervisor_socket() {
     let out = fixture.command(&["doctor", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(result["error"]["details"].as_array().unwrap().iter().any(|c| c["name"] == "pitchfork_socket" && c["ok"] == false), "{result}");
+}
+
+#[test]
+fn every_partial_start_failure_preserves_observed_ownership() {
+    for failure in ["fail-start", "fail-env-after-start", "fail-query-after-one"] {
+        let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.other]\nrun='false'\n");
+        let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+        let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+        let other_port = inspect["data"]["ports"]["other"].as_u64().unwrap() as u16;
+        let service = Detached::spawn();
+        fs::write(fixture.dir.path().join("daemons-started.json"), json!([
+            {"id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port},
+            {"id": "app-0123456789abcdef/other", "name": "other", "status": "errored", "port": other_port}
+        ]).to_string()).unwrap();
+        fs::write(fixture.dir.path().join(failure), "").unwrap();
+        let out = fixture.command(&["up", "--json"]).output().unwrap();
+        assert!(!out.status.success(), "{failure}");
+        for file in fixture.session_paths() {
+            let record: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+            assert_eq!(record["launching"], true, "{failure}: {record}");
+            assert_eq!(record["services"]["web"]["pid"], service.0, "{failure}: {record}");
+            assert_eq!(record["services"]["web"]["provider_id"], WEB_ID, "{failure}: {record}");
+            assert_eq!(record["services"]["other"]["provider_id"], "app-0123456789abcdef/other", "{failure}: {record}");
+        }
+    }
 }
