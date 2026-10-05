@@ -89,6 +89,10 @@ pub struct Session {
     /// path is a different project and never inherits this session's authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir_id: Option<(u64, u64)>,
+    /// Creation time distinguishes directories when the filesystem reuses an inode.
+    /// Older records and filesystems without birth times retain device/inode checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir_created: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -560,6 +564,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
     });
     let project_dir_id = dir_id(&ctx.root);
+    let project_dir_created = dir_created(&ctx.root);
 
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
@@ -604,6 +609,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                     .collect(),
                 provider: provider.clone(),
                 project_dir_id,
+                project_dir_created,
             };
             save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         }
@@ -691,6 +697,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             .collect(),
         provider: if report.stack.services.is_empty() { None } else { provider },
         project_dir_id,
+        project_dir_created,
     };
     save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
     Ok(UpReport {
@@ -727,6 +734,20 @@ pub fn dir_id(path: &Path) -> Option<(u64, u64)> {
         let _ = path;
         None
     }
+}
+
+fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.created().ok()
+}
+
+fn project_replaced(session: &Session, path: &Path) -> bool {
+    if let (Some(recorded), Some(current)) = (session.project_dir_id, dir_id(path)) {
+        if recorded != current {
+            return true;
+        }
+    }
+    // Once recorded, losing the birth time also prevents adoption of the old session.
+    session.project_dir_created.is_some_and(|recorded| Some(recorded) != dir_created(path))
 }
 
 fn new_session_id(ctx: &Ctx) -> String {
@@ -1419,10 +1440,7 @@ fn project_gone(session: &Session) -> Option<&'static str> {
     if !session.project.exists() {
         return Some("project directory deleted");
     }
-    match (session.project_dir_id, dir_id(&session.project)) {
-        (Some(recorded), Some(current)) if recorded != current => Some("project directory replaced"),
-        _ => None,
-    }
+    project_replaced(session, &session.project).then_some("project directory replaced")
 }
 
 /// Stop a gone project's services through the supervisor, by the qualified ids recorded at
@@ -1535,14 +1553,12 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
     }
     let session = read_json::<Session>(&path)?;
     // A different directory now at this path must not adopt (or stop) the old one's services.
-    if let (Some(recorded), Some(current)) = (session.project_dir_id, dir_id(&ctx.root)) {
-        if recorded != current {
-            return Err(StackError::new(
-                "session_conflict",
-                "a session recorded for a previous directory at this path still owns services",
-            )
-            .hint("run `stack gc` to reclaim them through the supervisor; it reports anything it cannot confirm"));
-        }
+    if project_replaced(&session, &ctx.root) {
+        return Err(StackError::new(
+            "session_conflict",
+            "a session recorded for a previous directory at this path still owns services",
+        )
+        .hint("run `stack gc` to reclaim them through the supervisor; it reports anything it cannot confirm"));
     }
     Ok(Some(session))
 }

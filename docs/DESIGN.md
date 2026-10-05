@@ -109,7 +109,9 @@ output (mise's answer when no release matches) is an error, not a version.
   those processes dead and ports closed.
 - **Deleted projects.** At `up` the machine index records each daemon's qualified Pitchfork id,
   the Pitchfork binary, its effective state directory, and the project directory's device and
-  inode. When the directory is gone, or a different directory now has its path, GC asks Pitchfork
+  inode, plus its creation time when the filesystem exposes it. Creation time detects inode
+  reuse after deletion; older records and filesystems without creation times retain device/inode
+  checks. When the directory is gone, or a different directory now has its path, GC asks Pitchfork
   (`pitchfork status --json <id>`, which reads its state without starting a supervisor) and asks
   it to stop a daemon only if it runs the recorded PID on the recorded port. Stale PIDs, PIDs the
   supervisor no longer tracks, a different PID under the same id (a reused path), query or stop

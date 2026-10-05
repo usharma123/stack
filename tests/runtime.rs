@@ -1466,6 +1466,46 @@ fn a_foreign_process_on_a_dead_services_port_is_left_alone() {
 }
 
 #[test]
+fn a_reused_directory_inode_does_not_inherit_the_old_sessions_authority() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    let other = Detached::spawn();
+    fixture.supervisor_tracks(other.0, running.port);
+    for path in fixture.session_paths() {
+        let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // Model a prior directory with this same device/inode, but an older birth time.
+        let created = session["project_dir_created"]["secs_since_epoch"].as_u64().unwrap();
+        session["project_dir_created"]["secs_since_epoch"] = json!(created - 1);
+        fs::write(path, serde_json::to_vec(&session).unwrap()).unwrap();
+    }
+    for args in [&["up", "--json"][..], &["down", "--json"], &["status", "--json"], &["exec", "--json", "--", "true"]] {
+        let out = fixture.command(args).output().unwrap();
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "session_conflict", "{args:?}: {result}");
+    }
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    assert_eq!(result["error"]["details"][0]["reason"], "project directory replaced", "{result}");
+    assert!(other.alive() && running.service.alive());
+    assert_eq!(fixture.index_files(), 1);
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+}
+
+#[test]
+fn sessions_without_directory_birth_times_remain_readable() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    for path in fixture.session_paths() {
+        let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        session.as_object_mut().unwrap().remove("project_dir_created");
+        fs::write(path, serde_json::to_vec(&session).unwrap()).unwrap();
+    }
+    fixture.ok(&["status"]);
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
 fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&["--ttl", "1s"]);
