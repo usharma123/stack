@@ -894,3 +894,38 @@ fn mcp_rejects_owner_pids_outside_the_supported_range_before_lifecycle_work() {
         assert!(!out.status.success(), "--owner-pid {bad} was accepted");
     }
 }
+
+#[test]
+fn argument_errors_honour_json() {
+    let fixture = Fixture::new();
+    for args in [
+        &["--json", "up", "--owner-pid", "0"][..],
+        &["--json", "no-such-command"],
+        &["exec", "--json"],
+    ] {
+        let out = fixture.command(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let result: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)));
+        assert_eq!(result["error"]["code"], "usage", "{args:?}");
+    }
+    // After `--`, `--json` belongs to the command, so stack's own error stays text.
+    let out = fixture.command(&["exec", "--bogus", "--", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_arguments_never_crash_usage_errors() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new();
+    let out = fixture
+        .command(&[])
+        .arg(std::ffi::OsStr::from_bytes(b"--invalid-\xff"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "usage");
+}

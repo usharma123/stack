@@ -82,7 +82,10 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return usage_error(e),
+    };
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
             Ok(()) => ExitCode::SUCCESS,
@@ -259,6 +262,29 @@ fn publish(bundle: &Path, target: &str) -> Result<serde_json::Value> {
         "reference": target,
         "pinned": format!("oci:{}/{}@{digest}", reference.registry, reference.repository),
     }))
+}
+
+/// Argument errors honour `--json` too; help and version output are not errors.
+fn usage_error(e: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
+        e.exit();
+    }
+    // `--json` after `--` belongs to the command being run, not to stack.
+    // Compared as OS strings: arguments need not be Unicode, and this must not panic on them.
+    let as_json = std::env::args_os().skip(1).take_while(|a| a != "--").any(|a| a == "--json");
+    if !as_json {
+        e.exit();
+    }
+    let rendered = e.render().to_string();
+    let message = rendered
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("error: ")
+        .to_string();
+    fail(true, StackError::new("usage", message).hint("run `stack --help` for usage"));
+    ExitCode::from(2)
 }
 
 fn fail(as_json: bool, e: StackError) -> ExitCode {
