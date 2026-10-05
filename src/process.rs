@@ -93,16 +93,49 @@ fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn drain(pipe: &mut impl Read, tail: &mut Tail) -> io::Result<()> {
+/// Read what is available without blocking. Returns `false` once the pipe reached EOF.
+fn drain(pipe: &mut impl Read, tail: &mut Tail) -> io::Result<bool> {
     let mut buffer = [0; 8192];
     // Yield to deadline checks even when a child writes continuously.
     for _ in 0..16 {
         match pipe.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => return Ok(false),
             Ok(n) => tail.append(&buffer[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Longest wait between exit checks while a pipe is still open. Descendants that inherited the
+/// pipes keep them open after the command exits; this bounds how late that exit is noticed.
+const EXIT_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Block until a pipe in `fds` has data or EOF, or `wait` elapses. Signals end the wait early;
+/// the caller re-checks state either way.
+#[cfg(unix)]
+fn wait_readable(fds: &[std::os::fd::RawFd], wait: Duration) -> io::Result<()> {
+    let mut polled: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    // Round up so a sub-millisecond remainder cannot become a busy loop.
+    let millis = wait
+        .as_micros()
+        .div_ceil(1000)
+        .clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: `polled` is a live, correctly sized array of pollfd for the duration of the call.
+    let ready = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, millis) };
+    if ready < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     }
     Ok(())
@@ -111,14 +144,19 @@ fn drain(pipe: &mut impl Read, tail: &mut Tail) -> io::Result<()> {
 /// Capture at most `limit` bytes per stream, draining pipes while the process runs.
 /// Descendants in the command's group are stopped on completion or timeout. Nonblocking
 /// reads also keep detached descendants from extending the response deadline.
+///
+/// Waiting is driven by pipe readiness: a command that exits (closing its pipes) is noticed
+/// immediately rather than at the next fixed polling tick.
 #[cfg(unix)]
 pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Captured> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let start = Instant::now();
     let mut child = OwnedChild {
         child: command.spawn()?,
         terminated: false,
@@ -137,22 +175,47 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
     nonblocking(&stderr)?;
     let mut out = Tail::new(limit);
     let mut err = Tail::new(limit);
-    let start = Instant::now();
+    let (mut out_open, mut err_open) = (true, true);
+    // After both pipes close the command is normally exiting; reap it with a short backoff.
+    let mut reap_backoff = Duration::from_micros(250);
     let (exit_code, timed_out) = loop {
-        drain(&mut stdout, &mut out)?;
-        drain(&mut stderr, &mut err)?;
+        if out_open {
+            out_open = drain(&mut stdout, &mut out)?;
+        }
+        if err_open {
+            err_open = drain(&mut stderr, &mut err)?;
+        }
         if let Some(status) = child.child.try_wait()? {
             break (status.code(), false);
         }
-        if start.elapsed() >= timeout {
+        let Some(remaining) = timeout
+            .checked_sub(start.elapsed())
+            .filter(|r| !r.is_zero())
+        else {
             break (None, true);
+        };
+        let open: Vec<_> = [
+            (out_open, stdout.as_raw_fd()),
+            (err_open, stderr.as_raw_fd()),
+        ]
+        .into_iter()
+        .filter_map(|(open, fd)| open.then_some(fd))
+        .collect();
+        if open.is_empty() {
+            std::thread::sleep(reap_backoff.min(remaining));
+            reap_backoff = (reap_backoff * 2).min(EXIT_CHECK_INTERVAL);
+        } else {
+            wait_readable(&open, EXIT_CHECK_INTERVAL.min(remaining))?;
         }
-        std::thread::sleep(Duration::from_millis(10));
     };
     child.terminate();
     // These reads never wait for EOF. A detached child cannot keep the server blocked.
-    drain(&mut stdout, &mut out)?;
-    drain(&mut stderr, &mut err)?;
+    if out_open {
+        drain(&mut stdout, &mut out)?;
+    }
+    if err_open {
+        drain(&mut stderr, &mut err)?;
+    }
     Ok(Captured {
         exit_code,
         timed_out,
@@ -218,5 +281,38 @@ mod tests {
         assert!(out.stdout.ends_with("stdout-end"));
         assert!(out.stderr.ends_with("stderr-end"));
         assert!(out.stdout.len() < 4200 && out.stderr.len() < 4200);
+    }
+
+    #[test]
+    fn output_and_exit_code_of_a_short_command_are_complete() {
+        let out = capture(
+            Command::new("sh").args([
+                "-c",
+                "for i in 1 2 3; do echo $i; done; echo err >&2; exit 3",
+            ]),
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            (out.exit_code, out.stdout.as_str(), out.stderr.as_str()),
+            (Some(3), "1\n2\n3\n", "err\n")
+        );
+    }
+
+    #[test]
+    fn timeout_still_applies_after_a_command_closes_its_pipes() {
+        let start = Instant::now();
+        let out = capture(
+            Command::new("sh").args(["-c", "exec >/dev/null 2>&1; sleep 20"]),
+            Duration::from_millis(200),
+            1024,
+        )
+        .unwrap();
+        assert!(
+            out.timed_out && start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }
