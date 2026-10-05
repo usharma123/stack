@@ -21,6 +21,18 @@ work=$(mktemp -d /tmp/se2e.XXXXXX)
 work=$(cd "$work" && pwd -P)
 mkdir -p "$work/bin" "$work/h" "$work/srv" "$work/w" "$work/t"
 ln -s "$binary" "$work/bin/stack"
+# Provider selectors and state overrides outrank HOME/XDG. Never inherit the caller's
+# supervisor or machine-wide Stack registry, including during EXIT cleanup.
+for variable in $(compgen -e); do
+  case "$variable" in
+    MISE_*|__MISE*|PITCHFORK_*|STACK_STATE_DIR|STACK_CACHE_DIR) unset "$variable" ;;
+  esac
+done
+export STACK_STATE_DIR="$work/state" STACK_CACHE_DIR="$work/cache" PITCHFORK_STATE_DIR="$work/pf"
+export MISE_DATA_DIR="$work/mise/data" MISE_CACHE_DIR="$work/mise/cache" \
+  MISE_STATE_DIR="$work/mise/state" MISE_CONFIG_DIR="$work/mise/config"
+export MISE_GLOBAL_CONFIG_FILE="$work/mise/config/config.toml" \
+  MISE_SYSTEM_CONFIG_FILE="$work/mise/config/system.toml" MISE_CEILING_PATHS="$work"
 export HOME="$work/h" XDG_CONFIG_HOME="$work/h/.config" XDG_CACHE_HOME="$work/h/.cache" \
   XDG_DATA_HOME="$work/h/.local/share" XDG_STATE_HOME="$work/h/.local/state"
 export STACK_E2E_EXAMPLES="$root/examples" STACK_E2E_SRV="$work/srv" STACK_E2E_WORK="$work/w" \

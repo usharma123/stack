@@ -52,6 +52,24 @@ def alive(pid):
     return bool(out) and not out.startswith("Z")
 
 
+def isolated_env(work, inherited=None):
+    """Keep authentication/PATH, but discard all inherited provider selectors and state."""
+    env = {k: v for k, v in (os.environ if inherited is None else inherited).items()
+           if not k.startswith(("MISE_", "__MISE", "PITCHFORK_"))
+           and k not in {"STACK_STATE_DIR", "STACK_CACHE_DIR"}}
+    home = work / "h"
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+               XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".local/share"),
+               XDG_STATE_HOME=str(home / ".local/state"), STACK_STATE_DIR=str(work / "state"),
+               STACK_CACHE_DIR=str(work / "cache"), PITCHFORK_STATE_DIR=str(work / "pf"),
+               MISE_DATA_DIR=str(work / "mise/data"), MISE_CACHE_DIR=str(work / "mise/cache"),
+               MISE_STATE_DIR=str(work / "mise/state"), MISE_CONFIG_DIR=str(work / "mise/config"),
+               MISE_GLOBAL_CONFIG_FILE=str(work / "mise/config/config.toml"),
+               MISE_SYSTEM_CONFIG_FILE=str(work / "mise/config/system.toml"),
+               MISE_CEILING_PATHS=str(work), MISE_YES="1", NO_COLOR="1")
+    return env
+
+
 class Run:
     def __init__(self, args):
         self.args = args
@@ -64,10 +82,7 @@ class Run:
         self.stack = str(pathlib.Path(args.stack).resolve())
         self.work = pathlib.Path(tempfile.mkdtemp(prefix="spl.", dir="/tmp")).resolve()
         self.home = self.work / "h"
-        self.env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
-                        XDG_CACHE_HOME=str(self.home / ".cache"), XDG_DATA_HOME=str(self.home / ".local/share"),
-                        XDG_STATE_HOME=str(self.home / ".local/state"), MISE_YES="1", NO_COLOR="1")
-        self.env.pop("PITCHFORK_STATE_DIR", None)
+        self.env = isolated_env(self.work)
         self.seq = 0
 
     def event(self, **fields):
