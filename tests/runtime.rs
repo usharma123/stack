@@ -51,10 +51,12 @@ case "$1 $2" in
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     cat "$REVIEW_FIXTURE/daemons.json" ;;
   'daemons start')
+    if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
     if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
       cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
       touch "$REVIEW_FIXTURE/started"
-    fi ;;
+    fi
+    if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi ;;
 esac
@@ -988,6 +990,33 @@ fn argument_errors_honour_json() {
     assert!(out.stdout.is_empty());
 }
 
+#[test]
+fn a_failed_start_keeps_ownership_even_after_the_service_is_removed() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id() }]).to_string(),
+    )
+    .unwrap();
+    fs::write(fixture.dir.path().join("fail-start"), "").unwrap();
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "start_failed");
+
+    // The launch record withholds the service: nothing verified it.
+    let status: Value = serde_json::from_slice(&fixture.command(&["status", "--json"]).output().unwrap().stdout).unwrap();
+    assert_eq!(status["data"]["checks"][0]["ready"], false);
+
+    // Dropping the service also drops its port reservation; the launch record still names it.
+    fs::write(fixture.dir.path().join("bundle/bundle.toml"), "[bundle]\nname='test'\n").unwrap();
+    fixture.ok(&["compile"]);
+    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert!(!out.status.success(), "down confirmed cleanup without asking the supervisor");
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "provider_failed");
+    assert!(fixture.session_paths().iter().all(|p| p.exists()));
+}
+
 #[cfg(unix)]
 #[test]
 fn non_unicode_arguments_never_crash_usage_errors() {
@@ -1001,4 +1030,32 @@ fn non_unicode_arguments_never_crash_usage_errors() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "usage");
+}
+
+#[test]
+fn startup_time_does_not_consume_the_idle_ttl() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
+    )
+    .unwrap();
+    fs::write(fixture.dir.path().join("slow-start"), "3").unwrap();
+    let up = fixture.command(&["up", "--ttl", "2s", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    // Startup took longer than the TTL; the lease must start from verification, not launch.
+    let status: Value = serde_json::from_slice(&fixture.command(&["status", "--json"]).output().unwrap().stdout).unwrap();
+    assert!(status["data"].get("lease_expired").is_none(), "{status}");
+    let gc: Value = serde_json::from_slice(&fixture.ok(&["gc", "--json"]).stdout).unwrap();
+    assert_eq!(gc["data"], json!([]));
 }

@@ -73,6 +73,10 @@ pub struct Session {
     #[serde(default)]
     pub active_executions: IndexMap<String, u32>,
     pub started_at: u64,
+    /// Written before services start, so a failed or interrupted `up` still records what it may
+    /// have launched. Cleared once every service verifies.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub launching: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     pub services: IndexMap<String, ServiceRecord>,
@@ -461,8 +465,38 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps.ok("stop_previous", json!(null));
     }
 
+    let stamp = now();
+    let lease = (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
+        ttl_secs: lease.ttl_secs,
+        owner_pid: lease.owner_pid,
+        renewed_at: stamp,
+    });
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
+        // Ownership is recorded before anything starts. If start or verification fails, or the
+        // service is later removed from the configuration, `down` still knows what to reconcile.
+        let unverified = previous.as_ref().map_or(true, |p| p.launching || p.config_digest != digest);
+        if unverified {
+            let launch = Session {
+                id: new_session_id(ctx),
+                project: ctx.root.clone(),
+                lock_digest: lock_digest(&ctx.root),
+                config_digest: digest.clone(),
+                active_executions: IndexMap::new(),
+                started_at: stamp,
+                launching: true,
+                lease: lease.clone(),
+                services: report
+                    .ports
+                    .iter()
+                    .map(|(name, port)| {
+                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0 };
+                        (name.clone(), record)
+                    })
+                    .collect(),
+            };
+            save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        }
         if let Err(e) = mise::start(&ctx.root) {
             return Err(steps.fail("start", e, true));
         }
@@ -501,12 +535,14 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         );
     }
 
+    // Startup and verification are not idle time: the lease starts once services are verified.
     let stamp = now();
+    let lease = lease.map(|l| Lease { renewed_at: stamp, ..l });
     // The same verified generation, still running: keep its identity so earlier callers'
     // records stay valid.
     let reused = previous
         .as_ref()
-        .filter(|p| p.config_digest == digest && !restart && checks_match(p, &checks))
+        .filter(|p| !p.launching && p.config_digest == digest && !restart && checks_match(p, &checks))
         .map(|p| (p.id.clone(), p.started_at));
     let session = Session {
         id: reused.as_ref().map_or_else(|| new_session_id(ctx), |(id, _)| id.clone()),
@@ -515,11 +551,8 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         config_digest: digest,
         active_executions: IndexMap::new(),
         started_at: reused.map_or(stamp, |(_, started)| started),
-        lease: (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
-            ttl_secs: lease.ttl_secs,
-            owner_pid: lease.owner_pid,
-            renewed_at: stamp,
-        }),
+        launching: false,
+        lease,
         services: checks
             .iter()
             .map(|c| {
@@ -579,7 +612,7 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
         .values()
         .copied()
         .collect();
-    // Services always hold a port reservation from compile, and a session record names any
+    // Services always hold a port reservation from compile, and a launch record names any
     // process stack started. With neither, stack owns nothing and the supervisor (which may
     // not even be configured for a tools-only project) has nothing to report.
     let owns_services = !ports.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
@@ -1105,7 +1138,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     let mut execution = None;
     if let Some(session) = session
         .as_mut()
-        .filter(|s| s.config_digest == config_digest(ctx, &report))
+        .filter(|s| !s.launching && s.config_digest == config_digest(ctx, &report))
     {
         if let Some(lease) = session.lease.as_mut() {
             lease.renewed_at = now();
@@ -1295,6 +1328,7 @@ fn verify_session(
     let mut checks = verify_all(report, env, statuses);
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
+        Some(s) if s.launching => Some("`stack up` did not finish verifying this launch; run `stack up`"),
         Some(s) if s.config_digest != config_digest(ctx, report) => {
             Some("session configuration changed; run `stack up` to restart and verify it")
         }
