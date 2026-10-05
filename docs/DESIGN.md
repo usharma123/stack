@@ -50,9 +50,14 @@ output (mise's answer when no release matches) is an error, not a version.
 - One exact version applies to every platform. If a platform lacks that release, installing
   fails there (`install_failed`); stack does not resolve differently per machine.
 - Provider tools stack adds (Pitchfork) are locked like any other tool.
-- Postgres and Redis presets map to the mise tools `postgres` and `redis` (verified against mise
-  2026.9.18: `version = "17"` installs `postgres@17`). Other presets, and presets without a
-  `version`, are not locked and compile warns.
+- Preset mappings from mise 2026.9.18 are postgres → postgres, redis → redis,
+  cockroachdb → cockroach, nats → nats-server and spicedb → spicedb. An omitted service
+  version becomes a `latest` request, resolved and pinned once. Unknown presets fail in
+  locked mode. Nonrelease requests remain explicitly warned exceptions.
+- Reused release pins are validated offline with provider-specific version shapes. Floating,
+  empty and nonrelease values cannot replace an exact pin. `--update` can repair invalid pins.
+- Stack isolates mise config selection for resolution, installation, daemons and nested exec.
+  Only its generated file is loaded; parent/global/project aliases are excluded.
 - Version 1 locks are read for migration only. `compile` rewrites them as version 2 keeping every
   bundle pin; locked operations refuse them. Moving a running session from a range to its exact
   release is a configuration change, so the next `up` restarts it. Within a major version

@@ -1,6 +1,7 @@
 # Evaluation follow-up, Astra review round 1
 
-Verdict: **request changes**.
+Historical verdict: **request changes**. The subsequent fixes and current limitations are
+recorded in [the resolution notes](eval-followup-review-resolution.md).
 
 Reviewed the working tree on `eval-followup` against `a1358335984610926384c58d9a83bd383301d647`, including new implementation files, the acceptance plan, implementation record, historical summary, E2E logs and pilot evidence. At the end of review HEAD was `48cccefcac373c85735c740c311fce162201c078`, an evaluation-preservation commit. Its historical fixtures/results and the existing nine-tool MCP assertion are not implementation regressions. I made no product edits, commits, pushes, merges or releases.
 

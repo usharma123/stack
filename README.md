@@ -72,7 +72,7 @@ stack down                             # succeeds only once the processes are co
 - **Pinned by commit.** `stack.lock` records each bundle's commit and content hash. Moving a tag
   upstream changes nothing until `stack compile --update`, which reports what moved.
 - **Exact versions.** `stack.lock` also records, for every tool (including Pitchfork, which
-  stack adds) and every Postgres/Redis preset service, the requested version and the exact
+  stack adds) and every supported preset service, the requested version and the exact
   release it resolved to (`3.13` → `3.13.16`, `latest` → `0.12.23`). The provider config uses
   the exact release, so a fresh machine installs the same versions after upstream releases.
   `compile` resolves only new or changed requests, `--update` re-resolves all of them and
@@ -147,9 +147,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   (Linux) bytes, and fails with `socket_path_too_long` otherwise. On macOS Pitchfork ignores
   `XDG_STATE_HOME`; set `PITCHFORK_STATE_DIR` to a short directory instead.
 - `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
-- `compile` warns about requests that name no release (`system`, `path:`, `ref:`) and preset
-  services without a `version` or whose installed tool stack does not know, since the lock
-  cannot pin those.
+- Supported presets are postgres, redis, cockroachdb, nats and spicedb. Omitted service
+  versions resolve `latest` once and get an exact pin. `prefix:` and `sub-` selectors resolve
+  to releases too. Unknown presets fail in locked mode (`unlocked_service`).
+- Requests that name no release (`system`, `path:`, `ref:`) remain explicitly nonreproducible
+  and produce warnings for both tools and services. Damaged release pins fail with `lock_invalid`.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
   Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
 - `up` and `exec` mark the generated mise config as trusted, so `run` commands from the bundles
