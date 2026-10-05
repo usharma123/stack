@@ -449,7 +449,20 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     };
     steps.ok("compile", json!({ "ports": report.ports }));
 
-    if let Err(e) = mise::trust(&ctx.root).and_then(|_| mise::install(&ctx.root)) {
+    if let Err(e) = mise::trust(&ctx.root) {
+        return Err(steps.fail("install", e, false));
+    }
+    // Pitchfork refuses a socket path longer than `sun_path`, but only once it starts, after
+    // every download. Check the path it will use first, with the env mise will give it.
+    if !report.stack.services.is_empty() {
+        match preflight_socket(ctx) {
+            Ok((_, detail)) => {
+                steps.ok("preflight", detail);
+            }
+            Err(e) => return Err(steps.fail("preflight", e, false)),
+        }
+    }
+    if let Err(e) = mise::install(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
     steps.ok("install", json!(null));
@@ -577,6 +590,20 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps: steps.0,
         reaped,
     })
+}
+
+/// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
+fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
+    let configured = mise::env(&ctx.root)?.shift_remove("PITCHFORK_STATE_DIR");
+    let env = mise::SocketEnv::current(configured);
+    match mise::socket_path(&env, mise::socket_capacity()) {
+        Ok(socket) if socket.fits() => {
+            let detail = json!({ "socket": socket });
+            Ok((Some(socket), detail))
+        }
+        Ok(socket) => Err(socket.error()),
+        Err(note) => Ok((None, json!({ "socket": null, "note": note }))),
+    }
 }
 
 fn new_session_id(ctx: &Ctx) -> String {

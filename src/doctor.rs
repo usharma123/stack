@@ -32,6 +32,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
         ));
     }
     checks.push(writable(state));
+    let mut configured = None;
     if root.join(crate::manifest::PROJECT_FILE).exists() {
         let compiled = project::compile(&Options {
             root: root.to_path_buf(),
@@ -42,6 +43,9 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             reassign_ports: false,
             resolver: None,
         });
+        if let Ok(r) = &compiled {
+            configured = r.stack.env.get("PITCHFORK_STATE_DIR").map(|e| e.value.clone());
+        }
         checks.push(match compiled {
             Ok(r) => Check {
                 name: "project",
@@ -57,6 +61,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             Err(e) => Check { name: "project", ok: false, detail: e.to_string(), hint: None },
         });
     }
+    checks.push(socket(configured));
     let failed = checks.iter().filter(|c| !c.ok).count();
     if failed == 0 {
         return Ok(checks);
@@ -95,5 +100,28 @@ fn writable(state: &Path) -> Check {
             Err(e) => format!("{}: {e}", state.display()),
         },
         hint: (!ok).then_some("set STACK_STATE_DIR to a writable directory"),
+    }
+}
+
+/// Pitchfork's supervisor socket must fit `sun_path`; a long state directory fails `stack up`
+/// only after every download. Reads the project's own `[env]` value when it sets one.
+fn socket(configured: Option<String>) -> Check {
+    use crate::provider::mise;
+    if configured.as_deref().is_some_and(|v| v.contains("{{")) {
+        return Check {
+            name: "pitchfork_socket",
+            ok: true,
+            detail: "PITCHFORK_STATE_DIR is a template in the project's env; `stack up` checks the rendered value".into(),
+            hint: None,
+        };
+    }
+    match mise::socket_path(&mise::SocketEnv::current(configured), mise::socket_capacity()) {
+        Ok(s) => Check {
+            name: "pitchfork_socket",
+            ok: s.fits(),
+            detail: format!("{} ({} of {} bytes, from {})", s.path.display(), s.bytes, s.limit, s.source),
+            hint: (!s.fits()).then_some("set PITCHFORK_STATE_DIR to a shorter absolute directory, e.g. /tmp/pitchfork-$USER"),
+        },
+        Err(note) => Check { name: "pitchfork_socket", ok: true, detail: note, hint: None },
     }
 }

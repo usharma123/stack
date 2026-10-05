@@ -314,3 +314,180 @@ mod tests {
         }
     }
 }
+
+// ---- supervisor socket ---------------------------------------------------------------------
+
+/// Where Pitchfork will put its supervisor socket, and whether it fits the platform's
+/// `sockaddr_un.sun_path`. Pitchfork refuses to start otherwise, after tools are installed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SocketPath {
+    pub path: PathBuf,
+    pub bytes: usize,
+    pub limit: usize,
+    /// Which setting decided the location.
+    pub source: &'static str,
+}
+
+impl SocketPath {
+    pub fn fits(&self) -> bool {
+        self.bytes <= self.limit
+    }
+
+    pub fn error(&self) -> StackError {
+        StackError::new(
+            "socket_path_too_long",
+            format!(
+                "Pitchfork's supervisor socket {} is {} bytes; this platform allows {}",
+                self.path.display(),
+                self.bytes,
+                self.limit
+            ),
+        )
+        .hint("set PITCHFORK_STATE_DIR to a shorter absolute directory, e.g. PITCHFORK_STATE_DIR=/tmp/pitchfork-$USER")
+        .with_detail(serde_json::to_value(self).expect("socket path serializes"))
+    }
+}
+
+/// Bytes `sockaddr_un.sun_path` holds: 104 on macOS and the BSDs, 108 on Linux. Pitchfork
+/// makes the same check before binding.
+#[cfg(unix)]
+pub fn socket_capacity() -> usize {
+    // SAFETY: `sockaddr_un` is plain data; all-zero bytes are a valid value.
+    let sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sun.sun_path.len()
+}
+
+/// The environment Pitchfork resolves its state directory from.
+pub struct SocketEnv {
+    /// `PITCHFORK_STATE_DIR` as the provider config sets it; mise passes config `[env]` to
+    /// Pitchfork, so it takes precedence over stack's own environment.
+    pub configured: Option<String>,
+    pub state_dir: Option<std::ffi::OsString>,
+    pub home: Option<std::ffi::OsString>,
+    pub xdg_state_home: Option<std::ffi::OsString>,
+    pub root: bool,
+    /// Pitchfork reads `XDG_STATE_HOME` only where the `dirs` crate does: not on macOS.
+    pub xdg: bool,
+}
+
+impl SocketEnv {
+    pub fn current(configured: Option<String>) -> Self {
+        Self {
+            configured,
+            state_dir: std::env::var_os("PITCHFORK_STATE_DIR"),
+            home: std::env::var_os("HOME"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+            #[cfg(unix)]
+            // SAFETY: geteuid has no preconditions.
+            root: unsafe { libc::geteuid() } == 0,
+            #[cfg(not(unix))]
+            root: false,
+            xdg: !cfg!(target_os = "macos"),
+        }
+    }
+}
+
+/// Pitchfork 2.29.0's rule (`src/env.rs`, `src/ipc/mod.rs`): `$PITCHFORK_STATE_DIR` (a leading
+/// `~` expanded, and only if it is valid Unicode), else the XDG state directory on Linux when
+/// `XDG_STATE_HOME` is absolute, else `$HOME/.local/state`, then `/pitchfork/sock/main.sock`.
+/// `Err` explains why the path cannot be predicted (root uses `SUDO_USER`'s home).
+pub fn socket_path(env: &SocketEnv, limit: usize) -> std::result::Result<SocketPath, String> {
+    if env.root {
+        return Err("running as root: Pitchfork derives its state directory from SUDO_USER; not checked".into());
+    }
+    let home = || {
+        env.home
+            .as_ref()
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set; cannot predict Pitchfork's state directory".to_string())
+    };
+    let expand = |value: &str| -> std::result::Result<PathBuf, String> {
+        match value.strip_prefix('~') {
+            Some("") => home(),
+            Some(rest) if rest.starts_with('/') => Ok(home()?.join(&rest[1..])),
+            _ => Ok(PathBuf::from(value)),
+        }
+    };
+    let (state, source) = if let Some(dir) = &env.configured {
+        (expand(dir)?, "PITCHFORK_STATE_DIR in the provider config [env]")
+    } else if let Some(dir) = env.state_dir.as_ref().and_then(|d| d.to_str()) {
+        (expand(dir)?, "PITCHFORK_STATE_DIR")
+    } else if let Some(xdg) = env.xdg_state_home.as_ref().map(PathBuf::from).filter(|p| env.xdg && p.is_absolute()) {
+        (xdg.join("pitchfork"), "XDG_STATE_HOME")
+    } else {
+        (home()?.join(".local/state/pitchfork"), "HOME")
+    };
+    let path = state.join("sock").join("main.sock");
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.as_os_str().len();
+    Ok(SocketPath { path, bytes, limit, source })
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    fn env(home: &str) -> SocketEnv {
+        SocketEnv { configured: None, state_dir: None, home: Some(home.into()), xdg_state_home: None, root: false, xdg: true }
+    }
+
+    #[test]
+    fn socket_path_follows_pitchfork_precedence() {
+        let mut e = env("/home/u");
+        assert_eq!(socket_path(&e, 108).unwrap().path, PathBuf::from("/home/u/.local/state/pitchfork/sock/main.sock"));
+        e.xdg_state_home = Some("relative/state".into());
+        assert_eq!(socket_path(&e, 108).unwrap().source, "HOME", "relative XDG paths are ignored");
+        e.xdg_state_home = Some("/x".into());
+        assert_eq!(socket_path(&e, 108).unwrap().path, PathBuf::from("/x/pitchfork/sock/main.sock"));
+        e.xdg = false; // macOS
+        assert_eq!(socket_path(&e, 104).unwrap().source, "HOME");
+        e.state_dir = Some("~/pf".into());
+        assert_eq!(socket_path(&e, 104).unwrap().path, PathBuf::from("/home/u/pf/sock/main.sock"));
+        e.configured = Some("/c".into());
+        let p = socket_path(&e, 104).unwrap();
+        assert_eq!((p.path, p.source), (PathBuf::from("/c/sock/main.sock"), "PITCHFORK_STATE_DIR in the provider config [env]"));
+        e.root = true;
+        assert!(socket_path(&e, 104).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_unicode_state_dirs_are_ignored_as_pitchfork_does() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut e = env("/h");
+        e.state_dir = Some(std::ffi::OsString::from_vec(b"/bad\xff".to_vec()));
+        assert_eq!(socket_path(&e, 104).unwrap().source, "HOME");
+    }
+
+    #[test]
+    fn length_is_counted_in_bytes_at_the_exact_boundary() {
+        let suffix = "/sock/main.sock".len();
+        for limit in [104usize, 108] {
+            let mut e = env("/h");
+            // 'é' is two bytes: a path of `limit` bytes fits, one more byte does not.
+            let fill = |n: usize| format!("/{}", "é".repeat(n / 2) + &"a".repeat(n % 2));
+            e.state_dir = Some(fill(limit - suffix - 1).into());
+            let at = socket_path(&e, limit).unwrap();
+            assert_eq!(at.bytes, limit);
+            assert!(at.fits());
+            e.state_dir = Some(fill(limit - suffix).into());
+            let over = socket_path(&e, limit).unwrap();
+            assert_eq!(over.bytes, limit + 1);
+            assert!(!over.fits());
+            assert!(over.path.to_str().unwrap().chars().count() < limit, "characters undercount bytes");
+            assert_eq!(over.error().code, "socket_path_too_long");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capacity_matches_the_platform() {
+        assert_eq!(socket_capacity(), if cfg!(target_os = "macos") { 104 } else { 108 });
+    }
+}

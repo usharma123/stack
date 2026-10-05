@@ -1088,3 +1088,46 @@ fn mise_resolution_with_no_matching_release_fails_before_writing_anything() {
     assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "lock_outdated");
     assert!(!fs::read_to_string(&log).unwrap_or_default().contains("latest"));
 }
+
+#[test]
+fn a_long_supervisor_socket_path_fails_before_install_and_doctor_reports_it() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
+    let suffix = "/sock/main.sock".len();
+    // One byte over, made of two-byte characters so a character count would pass it.
+    let long = |extra: usize| format!("/tmp/{}", "é".repeat((limit - suffix - 5 + extra) / 2) + &"x".repeat((limit - suffix - 5 + extra) % 2));
+    let log = fixture.dir.path().join("mise.log");
+    for (via_config, value) in [(true, long(1)), (false, long(1))] {
+        let _ = fs::remove_file(&log);
+        let mut command = fixture.command(&["up", "--json"]);
+        if via_config {
+            fixture.set_env(&[("PITCHFORK_STATE_DIR", value.clone())]);
+        } else {
+            fixture.set_env(&[]);
+            command.env("PITCHFORK_STATE_DIR", &value);
+        }
+        let out = command.output().unwrap();
+        assert!(!out.status.success());
+        let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(err["error"]["code"], "socket_path_too_long", "{err}");
+        assert_eq!(err["error"]["details"][0]["bytes"], limit + 1, "{err}");
+        let steps = &err["error"]["details"][1]["steps"];
+        assert_eq!(steps.as_array().unwrap().last().unwrap()["step"], "preflight", "{err}");
+        assert_eq!(err["error"]["details"][1]["changed"], false);
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("install") && !calls.contains("daemons start"), "{calls}");
+
+        let out = fixture.command(&["doctor", "--json"]).env("PITCHFORK_STATE_DIR", &value).output().unwrap();
+        let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "pitchfork_socket").cloned();
+        assert_eq!(check.unwrap()["ok"], false, "{doctor}");
+    }
+    // Exactly at the limit is accepted, as Pitchfork accepts it.
+    fixture.set_env(&[]);
+    let out = fixture.command(&["doctor", "--json"]).env("PITCHFORK_STATE_DIR", long(0)).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let checks = doctor["data"].as_array().or(doctor["error"]["details"].as_array()).unwrap().clone();
+    let check = checks.iter().find(|c| c["name"] == "pitchfork_socket").unwrap();
+    assert_eq!(check["ok"], true, "{doctor}");
+    assert!(check["detail"].as_str().unwrap().contains(&format!("({limit} of {limit} bytes")), "{doctor}");
+}
