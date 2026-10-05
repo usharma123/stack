@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -27,6 +27,26 @@ try {
       fetchImpl: async url => url.endsWith('.tgz') ? new Response(bytes) : json(registryData(url)),
       publish: () => assert.fail('already published package must not publish again')
     });
+  });
+  await test('relative dist tarball paths are passed to npm as absolute file paths', async () => {
+    const originalCwd = process.cwd();
+    mkdirSync(path.join(dir, 'dist'));
+    copyFileSync(tarball, path.join(dir, 'dist', 'package.tgz'));
+    let published = false;
+    try {
+      process.chdir(dir);
+      await publishPackage('dist/package.tgz', {
+        pause,
+        fetchImpl: async url => url.endsWith('.tgz') ? new Response(bytes) : published ? json(registryData(url)) : new Response('', { status: 404 }),
+        publish: args => {
+          assert.equal(realpathSync(args[1]), realpathSync(path.join(dir, 'dist', 'package.tgz')));
+          assert.equal(path.isAbsolute(args[1]), true);
+          published = true;
+          return { status: 0 };
+        }
+      });
+    } finally { process.chdir(originalCwd); }
+    assert.equal(published, true);
   });
   await test('existing different bytes fail before publication', async () => {
     await assert.rejects(publishPackage(tarball, { pause, fetchImpl: async () => json({ dist: { ...remote.dist, integrity: 'wrong' } }), publish: () => assert.fail('must not publish') }), /differs/);

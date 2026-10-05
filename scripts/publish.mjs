@@ -4,8 +4,11 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
+import path from 'node:path';
 
 export async function publishPackage(file, { verifyOnly = false, fetchImpl = fetch, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), publish = args => spawnSync('npm', args, { stdio: 'inherit', timeout: 180000 }) } = {}) {
+  // A bare two-part relative path is npm's GitHub repository shorthand.
+  file = path.resolve(file);
   const manifest = JSON.parse(execFileSync('tar', ['-xOf', file, 'package/package.json'], { encoding: 'utf8' }));
   const integrity = `sha512-${createHash('sha512').update(readFileSync(file)).digest('base64')}`;
   const tag = manifest.version.includes('-') ? 'next' : 'latest';
@@ -55,7 +58,7 @@ export async function publishPackage(file, { verifyOnly = false, fetchImpl = fet
     }
     if (attempt < 29) await delay(10000);
   }
-  throw new Error('Package did not become available. Fix authentication/setup and rerun the publish job using the same artifact.');
+  throw new Error('Package did not become available. Fix the publish error and rerun the publish job using the same artifact.');
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await publishPackage(process.argv[2], { verifyOnly: process.argv.includes("--verify-only") });
