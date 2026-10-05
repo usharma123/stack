@@ -1627,3 +1627,19 @@ fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one
     let out = fixture.command_at(fixture.dir.path(), &["gc", "--interval", "1s"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "--interval requires --watch");
 }
+
+#[test]
+fn configured_home_cannot_hide_an_overlong_supervisor_socket() {
+    let fixture = Fixture::with_bundle(WEB);
+    let long = format!("/tmp/{}", "x".repeat(120));
+    fixture.set_env(&[("HOME", long.clone())]);
+    let out = fixture.command(&["up", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "socket_path_too_long", "{result}");
+    let calls = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!calls.contains("install") && !calls.contains("daemons start"), "{calls}");
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[env]\nHOME={long:?}\n")).unwrap();
+    let out = fixture.command(&["doctor", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(result["error"]["details"].as_array().unwrap().iter().any(|c| c["name"] == "pitchfork_socket" && c["ok"] == false), "{result}");
+}

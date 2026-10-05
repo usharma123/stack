@@ -711,8 +711,8 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
 
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
 fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
-    let configured = mise::env(&ctx.root)?.shift_remove("PITCHFORK_STATE_DIR");
-    let env = mise::SocketEnv::current(configured);
+    let effective = mise::env(&ctx.root)?;
+    let env = mise::SocketEnv::effective(&ctx.root, &effective);
     match mise::socket_path(&env, mise::socket_capacity()) {
         Ok(socket) if socket.fits() => {
             let detail = json!({ "socket": socket });

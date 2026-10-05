@@ -500,6 +500,7 @@ pub struct SocketEnv {
     /// `PITCHFORK_STATE_DIR` as the provider config sets it; mise passes config `[env]` to
     /// Pitchfork, so it takes precedence over stack's own environment.
     pub configured: Option<String>,
+    pub cwd: Option<PathBuf>,
     pub state_dir: Option<std::ffi::OsString>,
     pub home: Option<std::ffi::OsString>,
     pub xdg_state_home: Option<std::ffi::OsString>,
@@ -512,6 +513,7 @@ impl SocketEnv {
     pub fn current(configured: Option<String>) -> Self {
         Self {
             configured,
+            cwd: std::env::current_dir().ok(),
             state_dir: std::env::var_os("PITCHFORK_STATE_DIR"),
             home: std::env::var_os("HOME"),
             xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
@@ -523,6 +525,16 @@ impl SocketEnv {
             xdg: !cfg!(target_os = "macos"),
         }
     }
+
+    /// Overlay every location input with the environment that mise actually supplies.
+    pub fn effective(root: &Path, env: &IndexMap<String, String>) -> Self {
+        let mut socket = Self::current(env.get("PITCHFORK_STATE_DIR").cloned());
+        socket.cwd = Some(root.to_path_buf());
+        if let Some(home) = env.get("HOME") { socket.home = Some(home.into()); }
+        if let Some(xdg) = env.get("XDG_STATE_HOME") { socket.xdg_state_home = Some(xdg.into()); }
+        socket
+    }
+
 }
 
 /// Pitchfork 2.29.0's rule (`src/env.rs`, `src/ipc/mod.rs`): `$PITCHFORK_STATE_DIR` (a leading
@@ -530,9 +542,6 @@ impl SocketEnv {
 /// `XDG_STATE_HOME` is absolute, else `$HOME/.local/state`, then `/pitchfork/sock/main.sock`.
 /// `Err` explains why the path cannot be predicted (root uses `SUDO_USER`'s home).
 pub fn socket_path(env: &SocketEnv, limit: usize) -> std::result::Result<SocketPath, String> {
-    if env.root {
-        return Err("running as root: Pitchfork derives its state directory from SUDO_USER; not checked".into());
-    }
     let home = || {
         env.home
             .as_ref()
@@ -551,10 +560,17 @@ pub fn socket_path(env: &SocketEnv, limit: usize) -> std::result::Result<SocketP
         (expand(dir)?, "PITCHFORK_STATE_DIR in the provider config [env]")
     } else if let Some(dir) = env.state_dir.as_ref().and_then(|d| d.to_str()) {
         (expand(dir)?, "PITCHFORK_STATE_DIR")
+    } else if env.root {
+        return Err("running as root without PITCHFORK_STATE_DIR: the SUDO_USER fallback is not checked".into());
     } else if let Some(xdg) = env.xdg_state_home.as_ref().map(PathBuf::from).filter(|p| env.xdg && p.is_absolute()) {
         (xdg.join("pitchfork"), "XDG_STATE_HOME")
     } else {
         (home()?.join(".local/state/pitchfork"), "HOME")
+    };
+    let state = if state.is_absolute() { state } else {
+        env.cwd.as_ref().filter(|cwd| cwd.is_absolute())
+            .ok_or_else(|| "cannot resolve relative Pitchfork state without an absolute provider directory".to_string())?
+            .join(state)
     };
     let path = state.join("sock").join("main.sock");
     #[cfg(unix)]
@@ -572,7 +588,7 @@ mod socket_tests {
     use super::*;
 
     fn env(home: &str) -> SocketEnv {
-        SocketEnv { configured: None, state_dir: None, home: Some(home.into()), xdg_state_home: None, root: false, xdg: true }
+        SocketEnv { configured: None, cwd: Some("/project".into()), state_dir: None, home: Some(home.into()), xdg_state_home: None, root: false, xdg: true }
     }
 
     #[test]
@@ -591,7 +607,28 @@ mod socket_tests {
         let p = socket_path(&e, 104).unwrap();
         assert_eq!((p.path, p.source), (PathBuf::from("/c/sock/main.sock"), "PITCHFORK_STATE_DIR in the provider config [env]"));
         e.root = true;
+        assert_eq!(socket_path(&e, 104).unwrap().path, PathBuf::from("/c/sock/main.sock"));
+        e.configured = None;
+        e.state_dir = None;
         assert!(socket_path(&e, 104).is_err());
+    }
+
+    #[test]
+    fn effective_environment_and_relative_paths_use_the_provider_directory() {
+        let mut e = env("/caller");
+        e.home = Some("/effective".into());
+        e.state_dir = Some("~/pf".into());
+        assert_eq!(socket_path(&e, 108).unwrap().path, PathBuf::from("/effective/pf/sock/main.sock"));
+        e.state_dir = Some("relative/pf".into());
+        assert_eq!(socket_path(&e, 108).unwrap().path, PathBuf::from("/project/relative/pf/sock/main.sock"));
+        e.state_dir = None;
+        e.xdg_state_home = Some("/effective-state".into());
+        assert_eq!(socket_path(&e, 108).unwrap().path, PathBuf::from("/effective-state/pitchfork/sock/main.sock"));
+        let inputs = [("HOME".into(), "/configured-home".into()), ("XDG_STATE_HOME".into(), "/configured-state".into())].into_iter().collect();
+        let effective = SocketEnv::effective(Path::new("/application"), &inputs);
+        assert_eq!(effective.home, Some("/configured-home".into()));
+        assert_eq!(effective.xdg_state_home, Some("/configured-state".into()));
+        assert_eq!(effective.cwd, Some("/application".into()));
     }
 
     #[test]

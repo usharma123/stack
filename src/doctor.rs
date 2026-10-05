@@ -32,7 +32,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
         ));
     }
     checks.push(writable(state));
-    let mut configured = None;
+    let mut configured = indexmap::IndexMap::new();
     if root.join(crate::manifest::PROJECT_FILE).exists() {
         let compiled = project::compile(&Options {
             root: root.to_path_buf(),
@@ -44,7 +44,9 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             resolver: None,
         });
         if let Ok(r) = &compiled {
-            configured = r.stack.env.get("PITCHFORK_STATE_DIR").map(|e| e.value.clone());
+            for key in ["PITCHFORK_STATE_DIR", "HOME", "XDG_STATE_HOME"] {
+                if let Some(entry) = r.stack.env.get(key) { configured.insert(key.into(), entry.value.clone()); }
+            }
         }
         checks.push(match compiled {
             Ok(r) => Check {
@@ -61,7 +63,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             Err(e) => Check { name: "project", ok: false, detail: e.to_string(), hint: None },
         });
     }
-    checks.push(socket(configured));
+    checks.push(socket(root, configured));
     let failed = checks.iter().filter(|c| !c.ok).count();
     if failed == 0 {
         return Ok(checks);
@@ -105,17 +107,17 @@ fn writable(state: &Path) -> Check {
 
 /// Pitchfork's supervisor socket must fit `sun_path`; a long state directory fails `stack up`
 /// only after every download. Reads the project's own `[env]` value when it sets one.
-fn socket(configured: Option<String>) -> Check {
+fn socket(root: &Path, configured: indexmap::IndexMap<String, String>) -> Check {
     use crate::provider::mise;
-    if configured.as_deref().is_some_and(|v| v.contains("{{")) {
+    if configured.values().any(|v| v.contains("{{")) {
         return Check {
             name: "pitchfork_socket",
             ok: true,
-            detail: "PITCHFORK_STATE_DIR is a template in the project's env; `stack up` checks the rendered value".into(),
+            detail: "Socket location uses a template; not checked here. `stack up` checks the rendered environment".into(),
             hint: None,
         };
     }
-    match mise::socket_path(&mise::SocketEnv::current(configured), mise::socket_capacity()) {
+    match mise::socket_path(&mise::SocketEnv::effective(root, &configured), mise::socket_capacity()) {
         Ok(s) => Check {
             name: "pitchfork_socket",
             ok: s.fits(),
