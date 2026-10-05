@@ -78,6 +78,8 @@ jobs:
           tar -xzf "$RUNNER_TEMP/mise.tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
       - run: cargo +1.93.1 build --locked
+      - name: Verify real mise configuration isolation
+        run: STACK_TEST_MISE="$(command -v mise)" STACK_TEST_BINARY="$PWD/target/debug/stack" node --test tests/provider-boundary.test.mjs
       - name: Start a local OCI registry
         if: matrix.registry
         run: |

@@ -309,6 +309,9 @@ fn lock_versions(
     previous: Option<&Lockfile>,
     opts: &Options,
 ) -> Result<(Vec<LockedVersion>, Vec<LockedVersion>, Vec<VersionReport>)> {
+    if let Some((key, _)) = stack.env.iter().find(|(key, _)| key.starts_with("MISE_") || key.starts_with("__MISE")) {
+        return Err(StackError::new("invalid_env", format!("env.{key} changes Stack's isolated provider configuration; use tools, services or tasks instead")));
+    }
     let mut requests: Vec<VersionRequest> = stack
         .tools
         .iter()

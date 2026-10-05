@@ -220,3 +220,9 @@ python3 eval/harness/pilot.py --stack target/release/stack   # scripted concurre
 
 `eval/` holds the competitor evaluation (Flox, devbox, devenv, mise) that shaped this design:
 [eval/REPORT.md](eval/REPORT.md).
+
+Stack provider commands use only the generated Stack mise configuration. Project, parent
+and global mise aliases cannot reinterpret locked releases. Put application variables and
+tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected.
+`stack exec` carries this same boundary into nested mise commands. Direct mise invocations
+outside `stack exec` still follow mise's normal configuration rules.

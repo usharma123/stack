@@ -54,7 +54,8 @@ impl Resolver for MiseResolver {
         std::fs::create_dir_all(&self.cwd).map_err(|e| crate::error::io_error(self.cwd.display(), e))?;
         let spec = if request.trim() == "latest" { tool.to_string() } else { format!("{tool}@{request}") };
         let mut command = Command::new("mise");
-        command
+        configure_command(&mut command, &self.cwd);
+        command.env("MISE_NO_CONFIG", "1")
             .args(["latest", &spec])
             .current_dir(&self.cwd)
             .env("MISE_YES", "1")
@@ -224,9 +225,50 @@ pub struct DaemonStatus {
     pub data_dir: Option<String>,
 }
 
+/// Inherited provider settings may redefine aliases, backends or the config search path.
+/// Keep storage and network credentials, but reserve configuration selection to Stack.
+fn config_key(key: &str) -> bool {
+    (key.starts_with("MISE_") && !matches!(key,
+        "MISE_DATA_DIR" | "MISE_CACHE_DIR" | "MISE_STATE_DIR" | "MISE_GITHUB_TOKEN"))
+        || key.starts_with("__MISE")
+}
+
+pub fn inherited_config_keys() -> Vec<String> {
+    std::env::vars_os().filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| config_key(key)).collect()
+}
+
+/// One boundary for resolution, install, supervisor operations and nested mise commands.
+pub fn config_env(root: &Path) -> IndexMap<String, String> {
+    let isolated = root.join(".stack/provider-config");
+    [
+        ("MISE_CONFIG_DIR", isolated.clone()),
+        ("MISE_SYSTEM_CONFIG_DIR", isolated.clone()),
+        ("MISE_GLOBAL_CONFIG_FILE", isolated.join("global.toml")),
+        ("MISE_SYSTEM_CONFIG_FILE", isolated.join("system.toml")),
+        ("MISE_CEILING_PATHS", root.parent().unwrap_or(root).to_path_buf()),
+    ].into_iter().map(|(key, value)| (key.into(), value.to_string_lossy().into_owned()))
+        .chain([
+            ("MISE_OVERRIDE_CONFIG_FILENAMES".into(), ".config/mise/conf.d/stack.toml".into()),
+            ("MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES".into(), "none".into()),
+            ("MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS".into(), "".into()),
+            ("MISE_ENV".into(), "".into()),
+            ("MISE_AUTO_ENV".into(), "false".into()),
+            ("MISE_YES".into(), "1".into()),
+        ]).collect()
+}
+
+pub fn configure_command(command: &mut Command, root: &Path) {
+    for key in inherited_config_keys() {
+        command.env_remove(key);
+    }
+    command.envs(config_env(root));
+}
+
 fn mise(root: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("mise")
-        .args(args)
+    let mut command = Command::new("mise");
+    configure_command(&mut command, root);
+    command.args(args)
         .current_dir(root)
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1")
@@ -282,8 +324,11 @@ pub fn install(root: &Path) -> Result<()> {
 /// The environment mise would give a command: tools on PATH, env, service connection vars.
 pub fn env(root: &Path) -> Result<IndexMap<String, String>> {
     let out = checked(root, &["env", "--json"], "provider_failed")?;
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise env --json` output: {e}")))
+    let mut env: IndexMap<String, String> = serde_json::from_slice(&out.stdout)
+        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise env --json` output: {e}")))?;
+    env.retain(|key, _| !config_key(key));
+    env.extend(config_env(root));
+    Ok(env)
 }
 
 pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {

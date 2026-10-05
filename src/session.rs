@@ -299,6 +299,7 @@ fn run_identity_probe(
     let timeout = Duration::from_secs(probe.timeout_secs());
     let mut command = Command::new("sh");
     command.args(["-c", &probe.command]).current_dir(root);
+    mise::configure_command(&mut command, root);
     command.envs(env.iter().filter(|(k, _)| !k.starts_with("STACK_IDENTITY_")));
     for (key, _) in std::env::vars_os() {
         if key.to_str().is_some_and(|k| k.starts_with("STACK_IDENTITY_")) {
@@ -1262,7 +1263,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     // be some other server. Poison host-bearing values so connections fail loudly instead.
     // A variable only the caller set is still inherited by the command, so it is withheld too.
     let inherited = inherited_env();
-    let mut removed: Vec<String> = Vec::new();
+    let mut removed = mise::inherited_config_keys();
     let mut seen: Vec<&String> = Vec::new();
     for check in &checks {
         let preset = report
