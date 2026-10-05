@@ -69,26 +69,26 @@ def identity(tool,app): return text(tool+'/identity-'+app+'.stdout').splitlines(
 checked=[]
 for tool in ['stack','mise-configured','flox-configured','devbox-configured','devenv-configured','devenv-latest-dynamic']:
     r=steps(tool)
-    assert identity(tool,'A')!=identity(tool,'B'),tool
+    require(identity(tool, 'A') != identity(tool, 'B'), tool)
     for case in ['readiness','tests','tests-B','B-after-A-stop','stop-A','stop-B']:
-        assert r[case]['code']==0,(tool,case)
+        require(r[case]['code'] == 0, (tool, case))
     checked.append(tool+' separate database and independent shutdown')
 for tool in ['mise','flox','devbox','devenv','devenv-latest']:
     r=steps(tool)
-    assert identity(tool,'A')==identity(tool,'B'),tool
-    assert r['tests']['code']==r['tests-B']['code']==0,tool
-    assert r['B-after-A-stop']['code']!=0,tool
+    require(identity(tool, 'A') == identity(tool, 'B'), tool)
+    require(r['tests']['code'] == r['tests-B']['code'] == 0, tool)
+    require(r['B-after-A-stop']['code'] != 0, tool)
     checked.append(tool+' original recipe reached A from B')
-assert text('stack/post-stop-env.stdout').count('unverified.stack.invalid')==2
+require(text('stack/post-stop-env.stdout').count('unverified.stack.invalid') == 2, 'stack post-stop endpoints are not poisoned')
 for case in ['start','start-B']:
     a=j('stack/'+case+'.stdout')
-    assert a['ok'] and all(c['ready'] and c['identity']=='instance' for c in a['data']['checks'])
+    require(a['ok'] and all((c['ready'] and c['identity'] == 'instance' for c in a['data']['checks'])), 'stack readiness identity failed')
 for i in [0,1]:
-    assert text('compose/get-pg-'+str(i)+'.stdout')==text('compose/get-redis-'+str(i)+'.stdout')
-assert text('compose/get-pg-0.stdout')!=text('compose/get-pg-1.stdout')
-assert text('compose/B-survives.stdout')==text('compose/get-pg-1.stdout')
+    require(text('compose/get-pg-' + str(i) + '.stdout') == text('compose/get-redis-' + str(i) + '.stdout'), 'Compose PostgreSQL/Redis markers differ')
+require(text('compose/get-pg-0.stdout') != text('compose/get-pg-1.stdout'), 'Compose projects share a marker')
+require(text('compose/B-survives.stdout') == text('compose/get-pg-1.stdout'), 'Compose B marker changed after A stopped')
 successful_steps('compose', COMPOSE_STEPS)
-assert text('pixi/appA-identity.stdout')!=text('pixi/appB-identity.stdout')
+require(text('pixi/appA-identity.stdout') != text('pixi/appB-identity.stdout'), 'Pixi projects share a database')
 successful_steps('pixi', PIXI_STEPS)
 checked.extend(['Compose distinct PostgreSQL/Redis markers and independent shutdown','Pixi explicit service configuration and independent shutdown'])
 linux=named_rows(j('release-e2e/scenarios.json'), 'scenario', 'Linux scenarios', SCENARIOS)
@@ -98,7 +98,7 @@ native=named_rows([json.loads(line) for line in text('native-scenarios.jsonl').s
                   'scenario', 'native scenarios', SCENARIOS)
 for name, row in native.items():
     require(row.get('result') == 'passed', 'native scenario failed: ' + name)
-assert j('git-lock/summary.json')['ok']
+require(j('git-lock/summary.json')['ok'], 'moved-tag lock failed')
 contracts=named_rows(j('contract/summary.json'), 'case', 'CLI contracts', CONTRACTS)
 for name, (exit_code, error_code) in CONTRACTS.items():
     row = contracts[name]
@@ -117,12 +117,12 @@ for name, (exit_code, error_code) in CONTRACTS.items():
     require(isinstance(error.get('message'), str) and bool(error['message'].strip()),
             name + ': missing JSON error message')
 pilot=j('pilot/summary.json')
-assert pilot['projects_concurrent']==4 and pilot['rounds_per_phase']==2
-assert set(pilot['phases'])=={'fresh','cached'}
+require(pilot['projects_concurrent'] == 4 and pilot['rounds_per_phase'] == 2, 'unexpected pilot size')
+require(set(pilot['phases']) == {'fresh', 'cached'}, 'unexpected pilot phases')
 for name,p in pilot['phases'].items():
-    assert p['tasks_succeeded']==p['tasks_attempted']==8,(name,p)
-    assert p['wrong_instance_incidents']==p['orphaned_service_processes']==0,(name,p)
-    assert p['controlled_failures']['handled']==p['controlled_failures']['injected'],(name,p)
+    require(p['tasks_succeeded'] == p['tasks_attempted'] == 8, (name, p))
+    require(p['wrong_instance_incidents'] == p['orphaned_service_processes'] == 0, (name, p))
+    require(p['controlled_failures']['handled'] == p['controlled_failures']['injected'], (name, p))
 checked.extend(['8 Linux published-binary scenarios','8 native macOS published-binary scenarios','Moved tag with fresh bundle cache','4 CLI failure contracts','16 scripted tasks, no wrong instances or orphans, all injected failures handled'])
 # Read-only verification: keep existing saved receipts unchanged.
 print(json.dumps({'ok':True,'claims_checked':checked},indent=2))

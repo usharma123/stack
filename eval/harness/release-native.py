@@ -15,7 +15,8 @@ base=Path(sys.argv[1]).resolve()
 binary,info=released_binary(base)
 if any((base/name).exists() for name in ('native-outcomes.json','native-scenarios.jsonl','native-progress.log','git-lock','pilot')):
     raise SystemExit('refusing to overwrite native receipts; use a new results directory')
-assert info['commit']==subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+if not (info['commit']==subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()):
+    raise SystemExit("published artifact identity mismatch")
 registry='cmp-native-reg-'+uuid.uuid4().hex[:8]
 env=dict(os.environ,PATH=str(host_tools(base))+os.pathsep+os.environ['PATH'])
 outcomes=[]

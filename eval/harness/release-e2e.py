@@ -13,9 +13,11 @@ base=Path(sys.argv[1]).resolve()
 out=base/'release-e2e'
 out.mkdir(exist_ok=False)
 info=json.loads((base/'package/package/build-info.json').read_text())
-assert info['commit']==subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+if not (info['commit']==subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()):
+    raise SystemExit("published artifact identity mismatch")
 binary=base/'package/package/binaries/linux-arm64/stack'
-assert hashlib.sha256(binary.read_bytes()).hexdigest()==info['hashes']['linux-arm64']
+if not (hashlib.sha256(binary.read_bytes()).hexdigest()==info['hashes']['linux-arm64']):
+    raise SystemExit("published artifact identity mismatch")
 name='cmp-e2e-'+uuid.uuid4().hex[:8]
 registry=name+'-reg'
 records=[]

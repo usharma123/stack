@@ -25,8 +25,9 @@ with tempfile.TemporaryDirectory(prefix='scontract-',dir='/tmp') as work:
         (out/(name+'.stdout')).write_text(p.stdout)
         (out/(name+'.stderr')).write_text(p.stderr)
         body=json.loads(p.stdout)
-        assert p.returncode!=0 and not body['ok'] and body['error']['code']==code,(name,p.returncode,p.stdout,p.stderr)
-        rows.append({'case':name,'exit_code':p.returncode,'error_code':code,'single_json_object':True})
+        if not isinstance(body, dict) or p.returncode==0 or body.get('ok') is not False or not isinstance(body.get('error'), dict) or body['error'].get('code')!=code:
+            raise SystemExit(f'{name}: unexpected result {p.returncode} {p.stdout!r} {p.stderr!r}')
+        rows.append({'case':name,'exit_code':p.returncode,'error_code':body['error']['code'],'single_json_object':True})
     check('invalid-subcommand',['not-a-command'],'usage')
     (w/'stack.toml').write_text('[tools]\nnode = "99.0.0"\n')
     check('impossible-version',['compile'],'resolve_failed')

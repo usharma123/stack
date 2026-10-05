@@ -34,6 +34,7 @@ def benchmark(tool):
     name = 'comparison-' + tool + '-' + uuid.uuid4().hex[:7]
     image = 'ev-' + ('mise' if tool == 'stack' else tool)
     records = []
+    metadata = dict(valid=False, completed=False, failed_steps=[])
 
     def run(label, command, timeout=600, user='agent'):
         start = time.monotonic()
@@ -45,6 +46,10 @@ def benchmark(tool):
             code, stdout, stderr = 124, e.stdout or b'', e.stderr or b''
         record = dict(step=label, code=code, seconds=round(time.monotonic()-start, 4), command=command)
         records.append(record)
+        if code:
+            metadata['failed_steps'].append(label)
+        metadata['valid'] = metadata['completed'] and not metadata['failed_steps']
+        (out / 'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
         (out / (label+'.stdout')).write_bytes(stdout)
         (out / (label+'.stderr')).write_bytes(stderr)
         (out / 'steps.json').write_text(json.dumps(records, indent=2)+'\n')
@@ -55,7 +60,7 @@ def benchmark(tool):
         subprocess.run(['docker', 'run', '-d', '--init', '--name', name,
                         '-v', str(ROOT)+':/repo:ro', '-v', str(OUT)+':/bench:ro', image], check=True,
                        stdout=subprocess.DEVNULL)
-        metadata = dict(image=subprocess.check_output(['docker','image','inspect',image,'--format','{{.Id}}'],text=True).strip(),
+        metadata.update(image=subprocess.check_output(['docker','image','inspect',image,'--format','{{.Id}}'],text=True).strip(),
                         started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
                         harness_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip())
         (out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
@@ -66,7 +71,8 @@ def benchmark(tool):
         if tool == 'stack':
             info=json.loads((OUT/'package/package/build-info.json').read_text())
             binary=OUT/'package/package/binaries/linux-arm64/stack'
-            assert hashlib.sha256(binary.read_bytes()).hexdigest()==info['hashes']['linux-arm64']
+            if hashlib.sha256(binary.read_bytes()).hexdigest()!=info['hashes']['linux-arm64']:
+                raise SystemExit('published artifact hash mismatch')
         if tool == 'devenv':
             upgrade = 'nix profile add --profile /nix/var/nix/profiles/default --priority 4 --accept-flake-config github:cachix/devenv/v2.4.0#devenv' if latest_devenv else 'nix profile upgrade --profile /nix/var/nix/profiles/default devenv'
             code,_=run('upgrade', upgrade, user='root', timeout=900)
@@ -117,10 +123,10 @@ def benchmark(tool):
             run('start',cmd('appA',start))
             # Probe inside the environment, with shell expansion occurring there.
             probe='bash /repo/eval/configs/readiness.sh'
-            run('readiness',cmd('appA',enter(probe)),timeout=120)
+            readiness_code,_=run('readiness',cmd('appA',enter(probe)),timeout=120)
             run('tests',cmd('appA',enter('set -e; uv sync -q; uv run pytest -q')))
             run('identity-A',cmd('appA',enter('printf "DATABASE_URL=%s REDIS_URL=%s\n" "$DATABASE_URL" "$REDIS_URL"; psql "$DATABASE_URL" -Atc "show data_directory"')))
-            if tool=='stack':
+            if tool=='stack' and readiness_code==0:
                 for i in range(15): run(f'exec-required-{i:02}',cmd('appA','stack exec --require-all -- true'))
             run('start-again',cmd('appA',start if tool!='flox' else 'flox activate --start-services -- true'))
         setup('appB')
@@ -143,7 +149,10 @@ def benchmark(tool):
             run('post-stop-env',cmd('appA',enter('printf "DATABASE_URL=%s REDIS_URL=%s\n" "$DATABASE_URL" "$REDIS_URL"')))
             run('leftovers','ps -eo pid,ppid,stat,comm,args')
         run('locks','find /srv -maxdepth 4 -type f \\( -name "*lock*" -o -name "*toml" -o -name "devenv.yaml" \\) -print -exec cat {} \\;')
+        metadata['completed'] = True
     finally:
+        metadata['valid'] = metadata['completed'] and not metadata['failed_steps']
+        (out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
         subprocess.run(['docker','rm','-f',name],stdout=subprocess.DEVNULL)
 
 for tool in sys.argv[2:]: benchmark(tool)

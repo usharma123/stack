@@ -31,7 +31,10 @@ records=[]
 def run(label,body,timeout=600):
     command='export PATH=/bench/bin/linux:$PATH; '+body
     t=time.monotonic()
-    p=subprocess.run(['docker','exec','-u','agent',name,'bash','-c',command],stdin=subprocess.DEVNULL,capture_output=True,timeout=timeout)
+    try:
+        p=subprocess.run(['docker','exec','-u','agent',name,'bash','-c',command],stdin=subprocess.DEVNULL,capture_output=True,timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        p=subprocess.CompletedProcess(error.cmd, 124, error.stdout or b'', error.stderr or b'')
     records.append(dict(step=label,code=p.returncode,seconds=round(time.monotonic()-t,4),command=command))
     (out/(label+'.stdout')).write_bytes(p.stdout)
     (out/(label+'.stderr')).write_bytes(p.stderr)
@@ -41,6 +44,10 @@ def run(label,body,timeout=600):
 def env(app,body):
     pg,redis=(45432,46379) if app=='appA' else (45433,46380)
     return f'cd /home/agent/{app}; export UV_PYTHON_DOWNLOADS=never PGDATA=$PWD/pgdata PGHOST=127.0.0.1 PGPORT={pg} DATABASE_URL=postgresql://postgres@127.0.0.1:{pg}/postgres REDIS_URL=redis://127.0.0.1:{redis}/0; pixi run bash -c '+shlex.quote(body)
+def require(condition, context):
+    if not condition:
+        raise RuntimeError(context)
+
 try:
     subprocess.run(['docker','run','-d','--init','--name',name,'-v',str(base)+':/bench:ro','-v',str(root/'eval/fixture')+':/fixture:ro','ev-base','sleep','infinity'],check=True,stdout=subprocess.DEVNULL)
     run('version','pixi --version')
@@ -51,13 +58,13 @@ try:
             raise SystemExit('Pixi package solve/install blocked; see raw stderr')
         redis=46379 if app=='appA' else 46380
         p=run(app+'-start',env(app,f'set -e; initdb -D "$PGDATA" -U postgres --auth=trust; pg_ctl -D "$PGDATA" -l "$PWD/postgres.log" -w -o "-p $PGPORT -k /tmp -c listen_addresses=127.0.0.1" start; redis-server --port {redis} --daemonize yes --save "" --appendonly no --pidfile "$PWD/redis.pid" --logfile "$PWD/redis.log"'))
-        assert p.returncode==0
-        assert run(app+'-tests',env(app,'set -e; uv sync -q; uv run pytest -q')).returncode==0
+        require(p.returncode==0, "Pixi receipt check failed")
+        require(run(app+'-tests',env(app,'set -e; uv sync -q; uv run pytest -q')).returncode==0, "Pixi receipt check failed")
         run(app+'-identity',env(app,'psql "$DATABASE_URL" -Atc "show data_directory"'))
     run('resolved-versions',env('appA','python --version; uv --version; postgres --version; redis-server --version'))
     for i in range(15): run('exec-'+str(i),env('appA','true'))
-    run('stop-A',env('appA','pg_ctl -D "$PGDATA" -m fast -w stop; redis-cli -u "$REDIS_URL" shutdown'))
-    assert run('B-survives',env('appB','uv run pytest -q')).returncode==0
+    require(run('stop-A',env('appA','set -e; pg_ctl -D "$PGDATA" -m fast -w stop; redis-cli -u "$REDIS_URL" shutdown')).returncode==0, 'stop-A failed')
+    require(run('B-survives',env('appB','uv run pytest -q')).returncode==0, "Pixi receipt check failed")
     run('stop-B',env('appB','pg_ctl -D "$PGDATA" -m fast -w stop; redis-cli -u "$REDIS_URL" shutdown'))
     run('lock','cat /home/agent/appA/pixi.lock')
 finally:

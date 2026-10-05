@@ -36,21 +36,25 @@ def run(label,project,args,timeout=180):
     (out/'steps.json').write_text(json.dumps(records,indent=2)+'\n')
     print(label,p.returncode,records[-1]['seconds'],flush=True)
     return p
+def require(condition, context):
+    if not condition:
+        raise RuntimeError(context)
+
 try:
     run('version',projects[0],['version'])
     run('pull',projects[0],['pull'])
     for i,project in enumerate(projects):
-        assert run('up-'+str(i),project,['up','-d','--wait']).returncode==0
-        assert run('set-pg-'+str(i),project,['exec','-T','postgres','psql','-U','postgres','-c',
-               "CREATE TABLE marker (v text); INSERT INTO marker VALUES ('"+project+"');"]).returncode==0
-        assert run('set-redis-'+str(i),project,['exec','-T','redis','redis-cli','set','marker',project]).returncode==0
+        require(run('up-'+str(i),project,['up','-d','--wait']).returncode==0, "Compose receipt check failed")
+        require(run('set-pg-'+str(i),project,['exec','-T','postgres','psql','-U','postgres','-c',
+               "CREATE TABLE marker (v text); INSERT INTO marker VALUES ('"+project+"');"]).returncode==0, 'set-pg failed')
+        require(run('set-redis-'+str(i),project,['exec','-T','redis','redis-cli','set','marker',project]).returncode==0, "Compose receipt check failed")
     for i,project in enumerate(projects):
-        assert run('get-pg-'+str(i),project,['exec','-T','postgres','psql','-U','postgres','-Atc','select v from marker']).stdout.decode().strip()==project
-        assert run('get-redis-'+str(i),project,['exec','-T','redis','redis-cli','get','marker']).stdout.decode().strip()==project
+        require(run('get-pg-'+str(i),project,['exec','-T','postgres','psql','-U','postgres','-Atc','select v from marker']).stdout.decode().strip()==project, "Compose receipt check failed")
+        require(run('get-redis-'+str(i),project,['exec','-T','redis','redis-cli','get','marker']).stdout.decode().strip()==project, "Compose receipt check failed")
     for i in range(15): run('exec-'+str(i),projects[0],['exec','-T','postgres','true'])
-    run('up-again',projects[0],['up','-d','--wait'])
-    run('down-A',projects[0],['down','-v'])
-    assert run('B-survives',projects[1],['exec','-T','postgres','psql','-U','postgres','-Atc','select v from marker']).stdout.decode().strip()==projects[1]
+    require(run('up-again',projects[0],['up','-d','--wait']).returncode==0, "Compose lifecycle step failed")
+    require(run('down-A',projects[0],['down','-v']).returncode==0, "Compose lifecycle step failed")
+    require(run('B-survives',projects[1],['exec','-T','postgres','psql','-U','postgres','-Atc','select v from marker']).stdout.decode().strip()==projects[1], "Compose receipt check failed")
     run('state',projects[1],['ps','--format','json'])
 finally:
     cleanup_errors=[]
@@ -61,6 +65,6 @@ finally:
         except Exception as error:
             cleanup_errors.append(str(error))
     p=subprocess.run(['docker','ps','-a','--format','{{.Names}}'],capture_output=True,text=True)
-    assert p.returncode==0 and not any(project in p.stdout for project in projects)
+    require(p.returncode==0 and not any(project in p.stdout for project in projects), "Compose receipt check failed")
     if cleanup_errors:
         raise RuntimeError('; '.join(cleanup_errors))
