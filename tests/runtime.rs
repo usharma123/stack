@@ -1131,3 +1131,159 @@ fn a_long_supervisor_socket_path_fails_before_install_and_doctor_reports_it() {
     assert_eq!(check["ok"], true, "{doctor}");
     assert!(check["detail"].as_str().unwrap().contains(&format!("({limit} of {limit} bytes")), "{doctor}");
 }
+
+/// A TCP "service" whose answer the test controls: each connection gets the current reply
+/// after the current delay, then is closed.
+struct Responder {
+    reply: std::sync::Arc<std::sync::Mutex<(Vec<u8>, Duration)>>,
+}
+
+impl Responder {
+    fn start(port: u16) -> Self {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let reply = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Duration::ZERO)));
+        let shared = reply.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (bytes, delay) = shared.lock().unwrap().clone();
+                thread::spawn(move || {
+                    use std::io::Write;
+                    thread::sleep(delay);
+                    let _ = stream.write_all(&bytes);
+                });
+            }
+        });
+        Self { reply }
+    }
+
+    fn set(&self, bytes: impl Into<Vec<u8>>, delay: Duration) {
+        *self.reply.lock().unwrap() = (bytes.into(), delay);
+    }
+}
+
+const PROBED_WEB: &str = r#"[bundle]
+name='test'
+[services.web]
+run='true'
+[services.web.identity]
+command = 'python3 {{bundle_dir}}/probe.py & echo $! >> "$REVIEW_FIXTURE/probe-pids"; wait $!'
+timeout = '2s'
+"#;
+
+const PROBE_PY: &str = r#"import os, socket, sys
+s = socket.create_connection(("127.0.0.1", int(os.environ["WEB_PORT"])), timeout=30)
+data = b""
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    data += chunk
+sys.stdout.write(data.decode("utf-8", "replace"))
+assert "STACK_IDENTITY_WEB" not in os.environ
+"#;
+
+fn web_status(fixture: &Fixture) -> Value {
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"]["checks"][0].clone()
+}
+
+#[test]
+fn identity_probes_accept_only_this_checkouts_instance() {
+    let fixture = Fixture::with_bundle(PROBED_WEB);
+    fs::write(fixture.dir.path().join("bundle/probe.py"), PROBE_PY).unwrap();
+    fixture.ok(&["compile"]);
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+    let config: toml::Table = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap().parse().unwrap();
+    let token = config["env"]["STACK_IDENTITY_WEB"].as_str().unwrap().to_string();
+    assert!(token.starts_with("stack-") && token.len() > 30, "{token}");
+    assert!(!config["daemons"]["web"].as_table().unwrap().contains_key("identity"), "probe is not provider config");
+    fixture.set_env(&[("WEB_PORT", port.to_string()), ("STACK_IDENTITY_WEB", token.clone())]);
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
+    )
+    .unwrap();
+
+    // The correct instance verifies as an instance, not merely as alive.
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let responder = Responder::start(port);
+    responder.set(token.clone(), Duration::ZERO);
+    let out = up.wait_with_output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["data"]["checks"][0]["identity"], "instance", "{result}");
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+
+    let refused = |reply: Vec<u8>, delay: Duration, reason: &str| {
+        responder.set(reply, delay);
+        let start = Instant::now();
+        let check = web_status(&fixture);
+        assert!(start.elapsed() < Duration::from_secs(8), "probe was not bounded: {:?}", start.elapsed());
+        assert_eq!(check["ready"], false, "{check}");
+        assert!(check["reason"].as_str().unwrap().contains(reason), "{reason}: {check}");
+        let out = fixture.command(&["exec", "--json", "--require", "web", "--", "true"]).output().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "service_unavailable");
+        let out = fixture.ok(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]);
+        assert_eq!(printed(&String::from_utf8_lossy(&out.stdout))["STACK_UNVERIFIED"], "web");
+    };
+    // A healthy server that is some other instance.
+    refused(b"stack-0123456789abcdef0123456789abcdef".to_vec(), Duration::ZERO, "reached a different instance");
+    // Missing and malformed output.
+    refused(Vec::new(), Duration::ZERO, "printed no identity");
+    refused(format!("{token}\nextra").into_bytes(), Duration::ZERO, "reached a different instance");
+    refused(format!("prefix {token}").into_bytes(), Duration::ZERO, "reached a different instance");
+    // Output flooding stays bounded and is rejected even when it ends with the token.
+    let mut flood = vec![b'a'; 200_000];
+    flood.extend_from_slice(token.as_bytes());
+    refused(flood, Duration::ZERO, "more than 4096 bytes");
+    // A probe that hangs is killed with its descendants at the deadline.
+    let _ = fs::remove_file(fixture.dir.path().join("probe-pids"));
+    refused(token.clone().into_bytes(), Duration::from_secs(20), "did not answer within 2s");
+    let pids = fs::read_to_string(fixture.dir.path().join("probe-pids")).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    for pid in pids.split_whitespace() {
+        let alive = Command::new("kill").args(["-0", pid]).stderr(Stdio::null()).status().unwrap().success();
+        assert!(!alive, "probe descendant {pid} survived its deadline");
+    }
+
+    // Back to the right answer: verified again.
+    responder.set(token.clone(), Duration::ZERO);
+    assert_eq!(web_status(&fixture)["identity"], "instance");
+
+    // A new token is a new generation: the running process cannot be this one any more.
+    fs::remove_file(fixture.dir.path().join("state/identities.json")).unwrap();
+    fixture.ok(&["compile"]);
+    let config: toml::Table = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap().parse().unwrap();
+    assert_ne!(config["env"]["STACK_IDENTITY_WEB"].as_str().unwrap(), token);
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["data"]["stale"], true, "{status}");
+    assert_eq!(status["data"]["checks"][0]["ready"], false);
+}
+
+#[test]
+fn services_without_probes_stay_liveness_only() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+    let config = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    assert!(!config.contains("STACK_IDENTITY"), "{config}");
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
+    )
+    .unwrap();
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    while !fixture.dir.path().join("started").exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let result: Value = serde_json::from_slice(&up.wait_with_output().unwrap().stdout).unwrap();
+    assert_eq!(result["data"]["checks"][0]["identity"], "liveness", "{result}");
+}

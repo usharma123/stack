@@ -71,6 +71,9 @@ impl LoadedBundle {
             }
             service.run.as_mut().map(expand);
             service.ready_cmd.as_mut().map(expand);
+            if let Some(probe) = service.identity.as_mut() {
+                expand(&mut probe.command);
+            }
         }
         for bin in &manifest.paths.bin {
             let path = dir.join(bin);

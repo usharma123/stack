@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod error;
 pub mod git;
 pub mod hash;
+pub mod identity;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;

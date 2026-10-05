@@ -632,3 +632,30 @@ fn unsupported_or_inconsistent_lock_versions_are_rejected() {
     fs::write(root.join("stack.lock"), "version = 1\n[[tool]]\nname = \"jq\"\nrequested = \"1.7\"\nresolved = \"1.7.1\"\n").unwrap();
     assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
 }
+
+#[test]
+fn identity_probes_are_validated() {
+    let sb = Sandbox::new();
+    let root = sb.project("");
+    for (toml, code) in [
+        ("[services.db]\npreset='postgres'\nversion='17'\n[services.db.identity]\ncommand='true'\n", "invalid_service"),
+        ("[services.w]\nrun='x'\n[services.w.identity]\ncommand='  '\n", "invalid_service"),
+        ("[services.w]\nrun='x'\n[services.w.identity]\ncommand='p'\ntimeout='31s'\n", "invalid_service"),
+        ("[services.w]\nrun='x'\n[services.w.identity]\ncommand='p'\ntimeout='0s'\n", "invalid_service"),
+        ("[services.w]\nrun='x'\n[services.w.identity]\ncommand='p'\nexpect='x'\n", "manifest_invalid"),
+        ("[services.a-b]\nrun='x'\n[services.a-b.identity]\ncommand='p'\n[services.a_b]\nrun='x'\n[services.a_b.identity]\ncommand='p'\n", "invalid_service"),
+        ("[env]\nSTACK_IDENTITY_W='forged'\n[services.w]\nrun='x'\n[services.w.identity]\ncommand='p'\n", "invalid_env"),
+    ] {
+        fs::write(root.join("stack.toml"), toml).unwrap();
+        assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, code, "{toml}");
+    }
+    fs::write(root.join("stack.toml"), "[services.w]\nrun='x'\n[services.w.identity]\ncommand='p'\ntimeout='30s'\n").unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.identities.len(), 1);
+    // Tokens are per checkout and stable across compiles.
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().identities, report.identities);
+    let other = sb.path("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::copy(root.join("stack.toml"), other.join("stack.toml")).unwrap();
+    assert_ne!(sb.compile(&other, Mode::UseLock).unwrap().identities["w"], report.identities["w"]);
+}

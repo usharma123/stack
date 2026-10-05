@@ -153,6 +153,7 @@ pub struct Check {
 // ---- verification --------------------------------------------------------------------------
 
 fn verify_all(
+    root: &Path,
     report: &Report,
     env: &IndexMap<String, String>,
     statuses: &[DaemonStatus],
@@ -176,7 +177,8 @@ fn verify_all(
                 checked_at: now(),
                 data_dir: status.and_then(|s| s.data_dir.clone()),
             };
-            match verify_one(&entry.value, port, status, env) {
+            let token = report.identities.get(name).map(String::as_str);
+            match verify_one(root, &entry.value, port, status, env, token) {
                 Ok(identity) => {
                     check.ready = true;
                     check.identity = Some(identity);
@@ -192,10 +194,12 @@ fn verify_all(
 }
 
 fn verify_one(
+    root: &Path,
     service: &Service,
     port: Option<u16>,
     status: Option<&DaemonStatus>,
     env: &IndexMap<String, String>,
+    token: Option<&str>,
 ) -> std::result::Result<Identity, String> {
     let port = port.ok_or("no port assigned; run `stack compile`")?;
     let status = status.ok_or("not started")?;
@@ -219,7 +223,15 @@ fn verify_one(
     let (var, bin) = match service.preset.as_deref() {
         Some("postgres") => ("DATABASE_URL", "psql"),
         Some("redis") => ("REDIS_URL", "redis-cli"),
-        _ => return Ok(Identity::Liveness),
+        _ => {
+            return match &service.identity {
+                Some(probe) => {
+                    let token = token.ok_or("no instance token assigned; run `stack compile`")?;
+                    run_identity_probe(root, probe, env, token).map(|()| Identity::Instance)
+                }
+                None => Ok(Identity::Liveness),
+            }
+        }
     };
     let url = env.get(var).ok_or_else(|| format!("{var} is not set"))?;
     let expected = status
@@ -242,6 +254,58 @@ fn verify_one(
         Err(format!(
             "{var} reaches a different server (data dir '{reported}', expected '{expected}')"
         ))
+    }
+}
+
+/// Bytes of probe output kept; an identity is one short line, so more is malformed.
+const IDENTITY_OUTPUT_LIMIT: usize = 4096;
+
+/// Run a bundle's identity probe and require it to print exactly this instance's token.
+/// The probe gets the app's environment without any instance token, so it can only learn the
+/// token from the service. Its process group is killed at the deadline or on completion, and
+/// its output is bounded.
+fn run_identity_probe(
+    root: &Path,
+    probe: &crate::manifest::IdentityProbe,
+    env: &IndexMap<String, String>,
+    token: &str,
+) -> std::result::Result<(), String> {
+    let timeout = Duration::from_secs(probe.timeout_secs());
+    let mut command = Command::new("sh");
+    command.args(["-c", &probe.command]).current_dir(root);
+    command.envs(env.iter().filter(|(k, _)| !k.starts_with("STACK_IDENTITY_")));
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("STACK_IDENTITY_")) {
+            command.env_remove(&key);
+        }
+    }
+    let out = crate::process::capture(&mut command, timeout, IDENTITY_OUTPUT_LIMIT)
+        .map_err(|e| format!("cannot run identity probe: {e}"))?;
+    if out.timed_out {
+        return Err(format!("identity probe did not answer within {}s", timeout.as_secs()));
+    }
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("");
+        let code = out.exit_code.map_or("a signal".to_string(), |c| c.to_string());
+        return Err(format!("identity probe exited with {code}: {}", truncate(err, 200)));
+    }
+    if out.stdout_truncated {
+        return Err(format!("identity probe printed more than {IDENTITY_OUTPUT_LIMIT} bytes"));
+    }
+    match out.stdout.trim() {
+        "" => Err("identity probe printed no identity".into()),
+        reported if reported == token => Ok(()),
+        reported => Err(format!(
+            "identity probe reached a different instance (reported '{}')",
+            truncate(reported, 80)
+        )),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
     }
 }
 
@@ -521,7 +585,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
             let statuses =
                 mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
-            checks = verify_all(&report, &env, &statuses);
+            checks = verify_all(&ctx.root, &report, &env, &statuses);
             if checks.iter().all(|c| c.ready) {
                 break;
             }
@@ -1341,8 +1405,12 @@ fn has_active_executions(session: &Session) -> bool {
 }
 
 fn config_digest(ctx: &Ctx, report: &Report) -> String {
-    let config =
+    let mut config =
         json!({ "lock": lock_digest(&ctx.root), "stack": report.stack, "ports": report.ports });
+    // Only when a service has a probe, so records written before probes existed stay current.
+    if !report.identities.is_empty() {
+        config["identities"] = json!(report.identities);
+    }
     sha256_hex(config.to_string().as_bytes())
 }
 
@@ -1353,7 +1421,7 @@ fn verify_session(
     statuses: &[DaemonStatus],
     session: Option<&Session>,
 ) -> Vec<Check> {
-    let mut checks = verify_all(report, env, statuses);
+    let mut checks = verify_all(&ctx.root, report, env, statuses);
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
         Some(s) if s.launching => Some("`stack up` did not finish verifying this launch; run `stack up`"),
@@ -1758,6 +1826,7 @@ mod tests {
             ready_cmd: None,
             ready_port: None,
             port: None,
+            identity: None,
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [

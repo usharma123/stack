@@ -96,10 +96,13 @@ pub fn parse_resolved(stdout: &str) -> Option<String> {
 
 /// `ports` are this checkout's assigned ports; every service gets a concrete one. `versions`
 /// replace composed version requests with the exact versions stack.lock records.
+/// `identities` are instance tokens, exported as `STACK_IDENTITY_<NAME>` for the service to
+/// report back to its identity probe.
 pub fn render(
     stack: &Composed,
     ports: &IndexMap<String, u16>,
     versions: &Versions,
+    identities: &IndexMap<String, String>,
 ) -> String {
     let mut doc = Table::new();
     let has_services = !stack.services.is_empty();
@@ -131,6 +134,9 @@ pub fn render(
         .iter()
         .map(|(k, e)| (k.clone(), Value::String(e.value.clone())))
         .collect();
+    for (service, token) in identities {
+        env.insert(crate::manifest::identity_var(service), Value::String(token.clone()));
+    }
     if !stack.bin_paths.is_empty() {
         let paths = stack
             .bin_paths

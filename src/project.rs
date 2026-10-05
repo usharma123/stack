@@ -68,6 +68,9 @@ pub struct Report {
     pub ports: IndexMap<String, u16>,
     /// Requested and exact versions of every tool and resolvable preset service.
     pub versions: Vec<VersionReport>,
+    /// Instance tokens of services with identity probes. Machine-specific, like ports.
+    #[serde(skip)]
+    pub identities: IndexMap<String, String>,
     pub lock_changed: bool,
     pub provider: &'static str,
     pub output: PathBuf,
@@ -207,6 +210,7 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
     }
 
     let stack = compose(&loaded, &project)?;
+    let probed = probed_services(&stack)?;
     let (tools, services, versions) = lock_versions(&stack, previous.as_ref(), opts)?;
     let new_lock = Lockfile::new(locked, tools.clone(), services.clone());
     let lock_changed = previous.as_ref() != Some(&new_lock);
@@ -218,7 +222,7 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
     }
 
     let output = mise::output_path(&opts.root);
-    let ports = if opts.write {
+    let (ports, identities) = if opts.write {
         let requests: Vec<Request> = stack
             .services
             .iter()
@@ -235,10 +239,13 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
             tools: tools.iter().map(|t| (t.name.clone(), t.resolved.clone())).collect(),
             services: services.iter().map(|t| (t.name.clone(), t.resolved.clone())).collect(),
         };
-        write_if_changed(&output, &mise::render(&stack, &ports, &exact))?;
-        ports
+        let identities = crate::identity::assign(&opts.state, &opts.root, &probed)?;
+        write_if_changed(&output, &mise::render(&stack, &ports, &exact, &identities))?;
+        (ports, identities)
     } else {
-        ports::lookup(&opts.state, &opts.root)?
+        let mut identities = crate::identity::lookup(&opts.state, &opts.root)?;
+        identities.retain(|service, _| probed.contains(service));
+        (ports::lookup(&opts.state, &opts.root)?, identities)
     };
 
     let warnings = warnings(&stack);
@@ -248,11 +255,34 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         stack,
         ports,
         versions,
+        identities,
         lock_changed,
         provider: "mise",
         output,
         written: opts.write,
     })
+}
+
+/// Services with identity probes. Their token variables must not collide with each other or
+/// with variables the stack defines, or a service could be handed another's token.
+fn probed_services(stack: &Composed) -> Result<Vec<String>> {
+    let mut seen: IndexMap<String, &String> = IndexMap::new();
+    for (name, _) in stack.services.iter().filter(|(_, e)| e.value.identity.is_some()) {
+        let var = crate::manifest::identity_var(name);
+        if let Some(other) = seen.insert(var.clone(), name) {
+            return Err(StackError::new(
+                "invalid_service",
+                format!("services '{other}' and '{name}' would share the identity variable {var}; rename one"),
+            ));
+        }
+    }
+    if let Some((var, e)) = stack.env.iter().find(|(k, _)| k.starts_with("STACK_IDENTITY_")) {
+        return Err(StackError::new(
+            "invalid_env",
+            format!("env.{var} ({}) uses the STACK_IDENTITY_ prefix, which stack reserves for instance tokens", e.origin),
+        ));
+    }
+    Ok(seen.into_values().cloned().collect())
 }
 
 /// The platform a resolution ran on, recorded for reviewers of stack.lock.
