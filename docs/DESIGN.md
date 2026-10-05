@@ -79,12 +79,14 @@ resolve a conflict or replace a value, and every override is reported with what 
 - **MCP execution.** Unix process groups bound command descendants. Output is drained through
   nonblocking pipes with fixed-size tails; neither a full pipe nor a detached descendant can
   extend collection beyond command completion or the deadline.
+- **Projects without services** never query the supervisor: `down`, `status` and `exec` have
+  nothing to reconcile, and `mise daemons` is not configured for them.
 - **Partial failure.** `up` returns completed steps, whether services may have been started
   (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
 
 ## Distribution
 
-`git+<url>?ref=` pins a commit; `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
+`git+<url>?ref=[&dir=<subdir>]` pins a commit (other parameters are rejected); `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
 a content hash. A bundle's content hash is identical across transports (deterministic archives).
 OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
 
@@ -108,7 +110,8 @@ staging directory behind.
 
 ## Not covered yet
 
-- macOS: compile/inspect are tested; services and sessions are only tested on Linux.
+- macOS: compile/inspect are tested automatically; services and sessions have been verified by
+  hand (Postgres, Redis, custom services) but the automated end-to-end suite runs on Linux only.
 - Identity checks exist for Postgres and Redis presets only; other services are liveness-only.
 - OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
 - Expired leases are reclaimed lazily (next `gc`/`up`), not by a background process.

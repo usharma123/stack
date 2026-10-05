@@ -340,3 +340,86 @@ fn inspect_writes_nothing() {
     assert_eq!(report.stack.services.len(), 2);
     assert!(!mise::output_path(&root).exists());
 }
+
+#[test]
+fn git_bundles_can_live_in_a_repository_subdirectory() {
+    let sb = Sandbox::new();
+    let repo = sb.path("bundles/mono");
+    fs::create_dir_all(repo.join("bundles/obs")).unwrap();
+    fs::write(repo.join("README"), "not a bundle\n").unwrap();
+    fs::write(repo.join("bundles/obs/bundle.toml"), OBS).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit_all(&repo, "v1");
+    let spec = format!("git+file://{}?ref=main&dir=bundles/obs", repo.display());
+    let root = sb.project(&format!("[[use]]\nbundle = \"{spec}\"\n"));
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.bundles[0].name, "obs");
+    assert!(report.bundles[0].dir.ends_with("bundles/obs"));
+
+    // Same content through a path source hashes identically.
+    let path_root = sb.path("by-path");
+    fs::create_dir_all(&path_root).unwrap();
+    fs::write(path_root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", repo.join("bundles/obs").display())).unwrap();
+    assert_eq!(sb.compile(&path_root, Mode::UseLock).unwrap().bundles[0].content_hash, report.bundles[0].content_hash);
+
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"{spec}x\"\n")).unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "bundle_not_found");
+
+    // A symlinked directory cannot point the bundle outside the checkout.
+    let outside = sb.path("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("bundle.toml"), OBS).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("escape")).unwrap();
+    commit_all(&repo, "symlink");
+    let escape = format!("git+file://{}?ref=main&dir=escape", repo.display());
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"{escape}\"\n")).unwrap();
+    assert_eq!(sb.compile(&root, Mode::Update).unwrap_err().code, "bundle_not_found");
+}
+
+#[test]
+fn a_project_may_use_no_bundles() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\njq = \"1.7.1\"\n[services.web]\nrun = \"exec ./serve\"\n");
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(report.bundles.is_empty());
+    assert_eq!(report.stack.services["web"].origin, "project");
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn undocumented_service_presets_are_reported() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.db]\npreset = \"mysql\"\n[services.q]\npreset = \"nats\"\n");
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].starts_with("services.db (project) uses preset 'mysql'"));
+}
+
+#[test]
+fn unpinned_tools_are_reported() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let report = sb.compile(&sb.project(&use_git(&base, "v1")), Mode::UseLock).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("tools.uv = \"latest\" (bundle:pybase)"));
+}
+
+#[test]
+fn inspect_previews_a_project_before_its_first_compile() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project(&use_git(&base, "v1"));
+    let report = compile(&Options {
+        root: root.clone(),
+        mode: stack::project::inspect_mode(&root),
+        write: false,
+        cache: sb.path("cache"),
+        state: sb.path("state"),
+        reassign_ports: false,
+    })
+    .unwrap();
+    assert!(report.lock_changed);
+    assert_eq!(report.stack.services.len(), 2);
+    assert!(!root.join("stack.lock").exists());
+    assert!(!mise::output_path(&root).exists());
+}

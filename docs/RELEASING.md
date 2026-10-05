@@ -2,8 +2,8 @@
 
 Stack ships as `@ushawarma/stack`, with the `stack` command. The npm tarball
 contains four native binaries: macOS x64/arm64 and Linux x64/arm64. Installation
-needs Node.js 22.14 or later, macOS 13 or later, or Linux with glibc 2.39 or later.
-Windows and Alpine/musl are unsupported. Rust is not needed to install the package.
+needs Node.js 22.14 or later, and macOS 13 or later or any Linux distribution (the Linux
+binaries are statically linked with musl). Windows is unsupported. Rust is not needed to install the package.
 Mise and its service dependencies are still required for the commands that use them.
 
 A single package keeps publication atomic. Its larger download includes all four

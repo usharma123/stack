@@ -1,6 +1,7 @@
 //! stack: compose reusable development bundles and run them through existing providers.
 
 pub mod compose;
+pub mod doctor;
 pub mod error;
 pub mod git;
 pub mod hash;

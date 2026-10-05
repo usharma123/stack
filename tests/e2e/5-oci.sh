@@ -22,7 +22,8 @@ stack exec --require-all -- bash -c 'set -euo pipefail; uv sync -q; uv run pytes
 cp -r /srv/pybase /tmp/pybase2
 rm -rf /tmp/pybase2/.git
 sed -i 's/pybase-1.0.0/pybase-1.0.1/' /tmp/pybase2/fixtures/seed.sql
-stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:1.0.0 --json >/tmp/republish.json
+expect_error tag_exists stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:1.0.0 --json
+stack publish /tmp/pybase2 oci:localhost:5000/acme/pybase:1.0.0 --force --json >/tmp/republish.json
 second=$(jq -er '.data.digest' /tmp/republish.json)
 [[ "$first" != "$second" ]] || fail 'changed contents did not change the digest'
 stack compile --json >/tmp/locked.json

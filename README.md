@@ -38,7 +38,8 @@ services = ["postgres"]
 bin = ["bin"]          # bundle-shipped CLIs go on PATH
 ```
 
-A project uses bundles from git, an OCI registry, or a local path in `stack.toml`:
+A project uses bundles from git, an OCI registry, or a local path in `stack.toml` (or defines
+everything itself; `[[use]]` is optional):
 
 ```toml
 [[use]]
@@ -46,6 +47,9 @@ bundle = "git+https://github.com/acme/pybase?ref=v1"
 
 [[use]]
 bundle = "oci:ghcr.io/acme/obs:2.0.0"
+
+[[use]]
+bundle = "git+https://github.com/acme/bundles?ref=v3&dir=node"   # a bundle in a subdirectory
 
 [tasks.test]
 run = "uv sync -q && uv run pytest -q"
@@ -85,8 +89,10 @@ stack down                             # succeeds only once the processes are co
   recorded processes and ports are gone.
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe.
-- **Agent-friendly.** `--json` emits one object on stdout; errors have a stable `code`, a `hint`
-  and `details`. `stack mcp` serves the same contract over MCP. Git never prompts.
+- **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
+  `exec` (whose output is captured into the object); errors have a stable `code`, a `hint` and
+  `details`. A command that could not do its job reports `ok: false`. `stack mcp` serves the same
+  contract over MCP. Git never prompts.
 
 ## Commands
 
@@ -96,13 +102,34 @@ stack down                             # succeeds only once the processes are co
 | `stack inspect` | Show the composed stack, origins and ports; writes nothing |
 | `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
-| `stack exec [--require S \| --require-all] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc` | Renew this session's lease / reclaim expired sessions machine-wide |
-| `stack publish <dir> oci:<registry>/<repo>:<tag>` | Publish a bundle as an OCI artifact |
+| `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
+| `stack doctor` | Check mise, git and tar, and that the project compiles |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
+
+- `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
+- `exec --json` captures at most 64 KiB of each stream into the result and exits with the
+  command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
+- `gc` fails with `gc_incomplete` if an expired session could not be stopped; ownership records
+  are kept so it can be retried. Sessions of deleted projects are listed but cannot be stopped by
+  stack (see `mise daemons prune`).
+- `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
+- `compile` warns about tools that are not pinned (`latest`, `lts`), since the lock cannot pin them.
+- Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
+  Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
+- `up` and `exec` mark the generated mise config as trusted, so `run` commands from the bundles
+  you use execute without mise's trust prompt. Review bundles as you would any dependency.
+- `compile` also warns about service presets mise does not document (it currently documents
+  cockroachdb, nats, postgres, redis and spicedb).
+- For a custom service, connect with `http://127.0.0.1:$<NAME>_PORT`. mise also sets
+  `<NAME>_URL` to a Pitchfork proxy hostname (`https://<name>.<project>.localhost`), which only
+  answers when Pitchfork's proxy is running.
+- A custom service's `run` should `exec` its server (`run = "exec python3 -m http.server $PORT"`),
+  so the supervisor stops the server itself rather than a wrapping shell.
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins
 require explicit approval in `STACK_OCI_AUTH_REALMS`, a comma-separated list such as
 `https://auth.docker.io`. Credentials and authorization headers are never forwarded to external upload
@@ -122,7 +149,9 @@ npm install -g @ushawarma/stack
 stack --version
 ```
 
-Prebuilt binaries cover macOS 13+ and Linux with glibc 2.39+, on x64 and arm64.
+Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
+Services need [mise](https://mise.jdx.dev) on PATH; stack installs everything else, including
+Pitchfork, through it. Run `stack doctor` to check a machine.
 Node.js 22.14+ is required. See [docs/RELEASING.md](docs/RELEASING.md) for CI checks,
 trusted publishing setup, release tags, and recovery.
 

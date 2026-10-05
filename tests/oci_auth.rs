@@ -227,7 +227,8 @@ fn absolute_upload_locations_do_not_receive_registry_authorization() {
         if !request.headers.contains_key("authorization") {
             return Response::new(401, "").header("WWW-Authenticate", "Basic realm=\"registry\"");
         }
-        if request.method == "HEAD" {
+        // No blob or tag exists yet, so publish neither skips an upload nor refuses to move a tag.
+        if request.method == "HEAD" || request.method == "GET" {
             Response::new(404, "")
         } else if request.method == "POST" {
             Response::new(202, "").header("Location", &location)

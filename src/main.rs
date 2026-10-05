@@ -12,6 +12,7 @@ use stack::source::Mode;
 use stack::state::default_state_dir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "stack", version, about = "Reusable, agent-safe development stacks")]
@@ -61,6 +62,9 @@ enum Cmd {
         /// Fail unless every service verifies
         #[arg(long, conflicts_with = "require")]
         require_all: bool,
+        /// With --json: stop the command after this long (e.g. 10m). Default: no limit
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
@@ -76,13 +80,21 @@ enum Cmd {
         bundle: PathBuf,
         /// Target, e.g. oci:ghcr.io/acme/pybase:1.0.0
         target: String,
+        /// Move the tag even if it already points to different content
+        #[arg(long)]
+        force: bool,
     },
+    /// Check that mise, git and tar are usable and the project compiles
+    Doctor,
     /// Serve the stack tools over MCP (stdio)
     Mcp,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return usage_error(e),
+    };
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
             Ok(()) => ExitCode::SUCCESS,
@@ -108,7 +120,9 @@ fn main() -> ExitCode {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
             project::compile(&opts(mode, true, *reassign_ports)).map(|r| report(cli.json, &r))
         }
-        Cmd::Inspect => project::compile(&opts(Mode::Frozen, false, false)).map(|r| report(cli.json, &r)),
+        Cmd::Inspect => {
+            project::compile(&opts(project::inspect_mode(&root), false, false)).map(|r| report(cli.json, &r))
+        }
         Cmd::Up { ttl, owner_pid } => ttl
             .as_deref()
             .map(parse_duration)
@@ -141,7 +155,7 @@ fn main() -> ExitCode {
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
-        Cmd::Exec { require, require_all, cmd } => {
+        Cmd::Exec { require, require_all, timeout, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -149,11 +163,18 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            exec(&ctx, cmd, &req)
+            if cli.json {
+                exec_json(&ctx, cmd, &req, timeout.as_deref())
+            } else if timeout.is_some() {
+                Err(StackError::new("usage", "--timeout applies only with --json")
+                    .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
+            } else {
+                exec(&ctx, cmd, &req)
+            }
         }
         Cmd::Down => session::down(&ctx).map(|r| emit(cli.json, &r, || println!("stopped {} service(s); confirmed", r.stopped.len()))),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc => session::gc(&ctx.state).map(|r| {
+        Cmd::Gc => session::gc_checked(&ctx.state).map(|r| {
             emit(cli.json, &r, || {
                 for e in &r {
                     println!("{}: {} ({})", e.project.display(), e.reason, if e.stopped { "stopped" } else { "not stopped" });
@@ -163,8 +184,15 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Publish { bundle, target } => publish(bundle, target).map(|r| {
+        Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
+        }),
+        Cmd::Doctor => stack::doctor::run(&root, &ctx.cache, &ctx.state).map(|checks| {
+            emit(cli.json, &checks, || {
+                for c in &checks {
+                    println!("ok    {:<13} {}", c.name, c.detail);
+                }
+            })
         }),
         Cmd::Mcp => unreachable!("handled above"),
     };
@@ -214,6 +242,9 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             let replaced = if o.replaced.is_empty() { "nothing".into() } else { o.replaced.join(", ") };
             println!("override {}.{} (replaced: {replaced})", o.kind, o.key);
         }
+        for w in &r.warnings {
+            eprintln!("warning: {w}");
+        }
         if r.written {
             println!("wrote {}{}", r.output.display(), if r.lock_changed { " and stack.lock" } else { "" });
         }
@@ -241,7 +272,26 @@ fn exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExitCode> {
     Ok(ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8))
 }
 
-fn publish(bundle: &Path, target: &str) -> Result<serde_json::Value> {
+/// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
+/// The process exits with the command's code (124 on timeout, like `timeout(1)`).
+fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+    // Large enough to mean "no limit" without overflowing deadline arithmetic.
+    let timeout = match timeout {
+        Some(t) => Duration::from_secs(parse_duration(t)?),
+        None => Duration::from_secs(365 * 24 * 3600),
+    };
+    let plan = session::plan_exec(ctx, cmd, require)?;
+    let result = mcp::run_captured(ctx, &plan, timeout)?;
+    let code = if result["timed_out"] == true {
+        124
+    } else {
+        result["exit_code"].as_i64().unwrap_or(1).clamp(0, 255) as u8
+    };
+    println!("{}", json!({ "ok": true, "data": result }));
+    Ok(ExitCode::from(code))
+}
+
+fn publish(bundle: &Path, target: &str, force: bool) -> Result<serde_json::Value> {
     let dir = bundle
         .canonicalize()
         .map_err(|e| StackError::new("bundle_not_found", format!("{}: {e}", bundle.display())))?;
@@ -252,13 +302,36 @@ fn publish(bundle: &Path, target: &str) -> Result<serde_json::Value> {
     let manifest = read_bundle(&dir, &dir.display().to_string())?;
     let (name, version) = (manifest.bundle.name.clone(), manifest.bundle.version.clone());
     LoadedBundle::new(manifest, dir.clone())?; // same validation as consumers apply
-    let digest = oci::Client::default().push(&dir, &reference, &name, version.as_deref())?;
+    let digest = oci::Client::default().push(&dir, &reference, &name, version.as_deref(), force)?;
     Ok(json!({
         "name": name,
         "digest": digest,
         "reference": target,
         "pinned": format!("oci:{}/{}@{digest}", reference.registry, reference.repository),
     }))
+}
+
+/// Argument errors honour `--json` too; help and version output are not errors.
+fn usage_error(e: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
+        e.exit();
+    }
+    // `--json` after `--` belongs to the command being run, not to stack.
+    // Compared as OS strings: arguments need not be Unicode, and this must not panic on them.
+    let as_json = std::env::args_os().skip(1).take_while(|a| a != "--").any(|a| a == "--json");
+    if !as_json {
+        e.exit();
+    }
+    let rendered = e.render().to_string();
+    let message = rendered
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("error: ")
+        .to_string();
+    fail(true, StackError::new("usage", message).hint("run `stack --help` for usage"));
+    ExitCode::from(2)
 }
 
 fn fail(as_json: bool, e: StackError) -> ExitCode {

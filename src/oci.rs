@@ -373,6 +373,7 @@ impl Client {
         r: &Reference,
         title: &str,
         version: Option<&str>,
+        force: bool,
     ) -> Result<String> {
         if r.reference.starts_with("sha256:") {
             return Err(StackError::new(
@@ -382,9 +383,32 @@ impl Client {
         }
         let layer = archive(dir)?;
         let config = b"{}".to_vec();
-        let layer_digest = self.upload(r, &layer)?;
-        let config_digest = self.upload(r, &config)?;
+        let manifest = Self::manifest(&layer, &config, title, version);
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+        // Consumers that resolved this tag earlier pinned its old digest; silently moving it
+        // makes `compile --update` change their bundle. Republishing identical content is fine.
+        if !force {
+            match self.resolve(r) {
+                Ok(existing) if existing != digest => {
+                    return Err(StackError::new(
+                        "tag_exists",
+                        format!("{}:{} already points to {existing}", r.repository, r.reference),
+                    )
+                    .hint("publish a new tag, or pass --force to move this one"));
+                }
+                Ok(_) => {}
+                Err(e) if e.code == "oci_not_found" => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.upload(r, &layer)?;
+        self.upload(r, &config)?;
+        let url = format!("{}/manifests/{}", r.base(), r.reference);
+        self.send("PUT", &url, None, Some((&manifest, MANIFEST_TYPE)))?;
+        Ok(digest)
+    }
 
+    fn manifest(layer: &[u8], config: &[u8], title: &str, version: Option<&str>) -> Vec<u8> {
         let mut annotations = json!({ "org.opencontainers.image.title": title });
         if let Some(v) = version {
             annotations["org.opencontainers.image.version"] = json!(v);
@@ -393,14 +417,11 @@ impl Client {
             "schemaVersion": 2,
             "mediaType": MANIFEST_TYPE,
             "artifactType": ARTIFACT_TYPE,
-            "config": { "mediaType": EMPTY_TYPE, "digest": config_digest, "size": config.len() },
-            "layers": [{ "mediaType": LAYER_TYPE, "digest": layer_digest, "size": layer.len() }],
+            "config": { "mediaType": EMPTY_TYPE, "digest": format!("sha256:{}", sha256_hex(config)), "size": config.len() },
+            "layers": [{ "mediaType": LAYER_TYPE, "digest": format!("sha256:{}", sha256_hex(layer)), "size": layer.len() }],
             "annotations": annotations,
         });
-        let bytes = serde_json::to_vec(&manifest).expect("manifest serializes");
-        let url = format!("{}/manifests/{}", r.base(), r.reference);
-        self.send("PUT", &url, None, Some((&bytes, MANIFEST_TYPE)))?;
-        Ok(format!("sha256:{}", sha256_hex(&bytes)))
+        serde_json::to_vec(&manifest).expect("manifest serializes")
     }
 
     fn upload(&self, r: &Reference, blob: &[u8]) -> Result<String> {

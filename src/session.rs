@@ -73,6 +73,10 @@ pub struct Session {
     #[serde(default)]
     pub active_executions: IndexMap<String, u32>,
     pub started_at: u64,
+    /// Written before services start, so a failed or interrupted `up` still records what it may
+    /// have launched. Cleared once every service verifies.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub launching: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     pub services: IndexMap<String, ServiceRecord>,
@@ -461,8 +465,38 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps.ok("stop_previous", json!(null));
     }
 
+    let stamp = now();
+    let lease = (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
+        ttl_secs: lease.ttl_secs,
+        owner_pid: lease.owner_pid,
+        renewed_at: stamp,
+    });
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
+        // Ownership is recorded before anything starts. If start or verification fails, or the
+        // service is later removed from the configuration, `down` still knows what to reconcile.
+        let unverified = previous.as_ref().map_or(true, |p| p.launching || p.config_digest != digest);
+        if unverified {
+            let launch = Session {
+                id: new_session_id(ctx),
+                project: ctx.root.clone(),
+                lock_digest: lock_digest(&ctx.root),
+                config_digest: digest.clone(),
+                active_executions: IndexMap::new(),
+                started_at: stamp,
+                launching: true,
+                lease: lease.clone(),
+                services: report
+                    .ports
+                    .iter()
+                    .map(|(name, port)| {
+                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0 };
+                        (name.clone(), record)
+                    })
+                    .collect(),
+            };
+            save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        }
         if let Err(e) = mise::start(&ctx.root) {
             return Err(steps.fail("start", e, true));
         }
@@ -501,28 +535,24 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         );
     }
 
+    // Startup and verification are not idle time: the lease starts once services are verified.
     let stamp = now();
+    let lease = lease.map(|l| Lease { renewed_at: stamp, ..l });
+    // The same verified generation, still running: keep its identity so earlier callers'
+    // records stay valid.
+    let reused = previous
+        .as_ref()
+        .filter(|p| !p.launching && p.config_digest == digest && !restart && checks_match(p, &checks))
+        .map(|p| (p.id.clone(), p.started_at));
     let session = Session {
-        id: sha256_hex(
-            format!(
-                "{}{:?}{}",
-                ctx.root.display(),
-                Instant::now(),
-                std::process::id()
-            )
-            .as_bytes(),
-        )[..12]
-            .to_string(),
+        id: reused.as_ref().map_or_else(|| new_session_id(ctx), |(id, _)| id.clone()),
         project: ctx.root.clone(),
         lock_digest: lock_digest(&ctx.root),
         config_digest: digest,
         active_executions: IndexMap::new(),
-        started_at: stamp,
-        lease: (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
-            ttl_secs: lease.ttl_secs,
-            owner_pid: lease.owner_pid,
-            renewed_at: stamp,
-        }),
+        started_at: reused.map_or(stamp, |(_, started)| started),
+        launching: false,
+        lease,
         services: checks
             .iter()
             .map(|c| {
@@ -548,6 +578,22 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     })
 }
 
+fn new_session_id(ctx: &Ctx) -> String {
+    sha256_hex(format!("{}{:?}{}", ctx.root.display(), Instant::now(), std::process::id()).as_bytes())[..12]
+        .to_string()
+}
+
+/// Every service is the same process the previous record verified.
+fn checks_match(previous: &Session, checks: &[Check]) -> bool {
+    previous.services.len() == checks.len()
+        && checks.iter().all(|c| {
+            previous
+                .services
+                .get(&c.service)
+                .is_some_and(|r| r.pid == c.pid && Some(r.port) == c.port)
+        })
+}
+
 #[derive(Debug, Serialize)]
 pub struct DownReport {
     pub stopped: Vec<Value>,
@@ -561,13 +607,17 @@ pub fn down(ctx: &Ctx) -> Result<DownReport> {
 }
 
 fn down_locked(ctx: &Ctx) -> Result<DownReport> {
-    // Failure to discover ownership cannot establish that nothing is running.
-    let before = mise::daemons(&ctx.root)?;
     let session = load(ctx)?;
     let mut ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?
         .values()
         .copied()
         .collect();
+    // Services always hold a port reservation from compile, and a launch record names any
+    // process stack started. With neither, stack owns nothing and the supervisor (which may
+    // not even be configured for a tools-only project) has nothing to report.
+    let owns_services = !ports.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
+    // Failure to discover ownership cannot establish that nothing is running.
+    let before = if owns_services { mise::daemons(&ctx.root)? } else { Vec::new() };
     let mut pids: Vec<(String, u32)> = before
         .iter()
         .filter_map(|d| d.pid.map(|p| (d.name.clone(), p)))
@@ -945,7 +995,7 @@ fn libpq_quote(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-fn percent_decode(s: &str) -> Vec<u8> {
+pub(crate) fn percent_decode(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1088,7 +1138,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     let mut execution = None;
     if let Some(session) = session
         .as_mut()
-        .filter(|s| s.config_digest == config_digest(ctx, &report))
+        .filter(|s| !s.launching && s.config_digest == config_digest(ctx, &report))
     {
         if let Some(lease) = session.lease.as_mut() {
             lease.renewed_at = now();
@@ -1212,6 +1262,22 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
     Ok(out)
 }
 
+/// Like [`gc`], but fails when an expired session it tried to stop is still running. Sessions
+/// of deleted projects are reported (stack cannot stop them) without failing.
+pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
+    let entries = gc(state)?;
+    let failed = entries.iter().filter(|e| !e.stopped && e.project.exists()).count();
+    if failed == 0 {
+        return Ok(entries);
+    }
+    Err(StackError::new(
+        "gc_incomplete",
+        format!("{failed} expired session(s) could not be stopped"),
+    )
+    .hint("retry `stack gc`, or run `stack down` in the listed project")
+    .details(entries.iter().map(|e| serde_json::to_value(e).expect("gc entry serializes")).collect()))
+}
+
 fn load(ctx: &Ctx) -> Result<Option<Session>> {
     // The machine index is authoritative. A crash between the two atomic writes can
     // leave the project copy behind; lifecycle operations always use the indexed generation.
@@ -1262,6 +1328,7 @@ fn verify_session(
     let mut checks = verify_all(report, env, statuses);
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
+        Some(s) if s.launching => Some("`stack up` did not finish verifying this launch; run `stack up`"),
         Some(s) if s.config_digest != config_digest(ctx, report) => {
             Some("session configuration changed; run `stack up` to restart and verify it")
         }

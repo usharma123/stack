@@ -25,6 +25,8 @@ printf '[bundle]\nname = "ci-test"\nversion = "1.0.0"\n[env]\nCI_VALUE = "first"
 ref="oci:localhost:$port/ci/bundle:1.0.0"
 "$binary" publish "$work/bundle" "$ref" --json > "$work/publish.json"
 jq -e '.ok == true and (.data.digest | startswith("sha256:"))' "$work/publish.json" >/dev/null
+# Republishing identical content to the same tag is a no-op, not a tag move.
+"$binary" publish "$work/bundle" "$ref" --json | jq -e --slurpfile p "$work/publish.json" '.ok == true and .data.digest == $p[0].data.digest' >/dev/null
 printf '[[use]]\nbundle = "%s"\n' "$ref" > "$work/project/stack.toml"
 "$binary" -C "$work/project" compile --json > "$work/first.json"
 jq -e '.ok == true' "$work/first.json" >/dev/null
@@ -33,7 +35,13 @@ cp "$work/project/stack.lock" "$work/original.lock"
 cmp "$work/original.lock" "$work/project/stack.lock"
 sed 's/first/second/' "$work/bundle/bundle.toml" > "$work/bundle/new.toml"
 mv "$work/bundle/new.toml" "$work/bundle/bundle.toml"
-"$binary" publish "$work/bundle" "$ref" --json | jq -e '.ok == true' >/dev/null
+# Moving an existing tag to different content needs --force.
+if "$binary" publish "$work/bundle" "$ref" --json > "$work/moved.json"; then
+  echo 'publish moved an existing tag without --force' >&2
+  exit 1
+fi
+jq -e '.ok == false and .error.code == "tag_exists"' "$work/moved.json" >/dev/null
+"$binary" publish "$work/bundle" "$ref" --force --json | jq -e '.ok == true' >/dev/null
 "$binary" -C "$work/project" compile --locked --json | jq -e '.ok == true' >/dev/null
 cmp "$work/original.lock" "$work/project/stack.lock"
 "$binary" -C "$work/project" compile --update --json | jq -e '.ok == true' >/dev/null

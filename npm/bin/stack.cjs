@@ -10,10 +10,6 @@ if (!['darwin-x64', 'darwin-arm64', 'linux-x64', 'linux-arm64'].includes(platfor
   console.error(`stack: unsupported platform ${platform}. Build from source: https://github.com/usharma123/stack`);
   process.exit(1);
 }
-if (process.platform === 'linux' && !process.report.getReport().header.glibcVersionRuntime) {
-  console.error('stack: Linux requires glibc 2.39 or newer. Alpine/musl is not supported by this package.');
-  process.exit(1);
-}
 if (!fs.existsSync(binary)) {
   console.error(`stack: missing packaged binary for ${platform}. Reinstall @ushawarma/stack.`);
   process.exit(1);

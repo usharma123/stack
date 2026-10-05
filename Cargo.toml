@@ -27,3 +27,6 @@ tempfile = { version = "3", default-features = false }
 toml = { version = "0.8", features = ["preserve_order"] }
 ureq = "2"
 url = "2"
+
+[profile.release]
+strip = true
