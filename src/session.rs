@@ -1456,15 +1456,14 @@ fn project_gone(session: &Session) -> Option<&'static str> {
     project_replaced(session, &session.project).then_some("project directory replaced")
 }
 
-/// Stop a gone project's services through the supervisor, by the qualified ids recorded at
-/// launch. The project's configuration is gone, so nothing is recreated or re-read from it.
-/// A process is stopped only when the supervisor still tracks it under the recorded id with
-/// the recorded PID and port; anything uncertain keeps the record and fails the entry.
+/// Reconcile a gone project without signalling a daemon whose identity can be replaced.
+/// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
+/// their ownership record. Only confirmed terminal state permits releasing the record.
 fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
-        match reconcile_gone(session.provider.as_ref(), record) {
+        match reconcile_gone(session.provider.as_ref(), record, session.launching) {
             Ok(outcome) => services.push(json!({ "service": name, "outcome": outcome })),
             Err(why) => {
                 services.push(json!({ "service": name, "error": why }));
@@ -1486,31 +1485,28 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
     }
 }
 
-fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord) -> std::result::Result<String, String> {
+fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, launching: bool) -> std::result::Result<String, String> {
     let alive = record.pid.is_some_and(pid_alive);
     let listening = record.port != 0 && accepting(record.port);
-    if !alive && !listening && record.provider_id.is_none() {
-        return Ok("not running".into());
-    }
     let (Some(provider), Some(id)) = (provider, record.provider_id.as_deref()) else {
         return Err(match record.pid {
             Some(pid) if alive => format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
-            _ => format!("port {} is accepting connections, but no supervisor id was recorded to confirm ownership; not signalled", record.port),
+            _ => "no supervisor identity was recorded; terminal state cannot be confirmed; record retained".into(),
         });
     };
     match mise::supervised(&provider.pitchfork, &provider.state_dir, id)? {
         mise::Supervised::NotFound => match record.pid {
+            _ if launching => Err("startup was interrupted or failed; absence of a daemon now does not prove that startup cannot still register it; record retained".into()),
             Some(pid) if alive => Err(format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled")),
             _ if listening => Ok(format!("port {} is held by a process the supervisor does not track; left alone", record.port)),
             _ => Ok("not running".into()),
         },
         mise::Supervised::Found { status, pid, port } => {
-            let running = status == "running" && pid.is_some_and(pid_alive);
-            if !running {
-                return match record.pid {
-                    Some(p) if alive => Err(format!("the supervisor reports {id} {status}, but recorded pid {p} is alive (possibly reused); not signalled")),
-                    _ => Ok(format!("not running (supervisor reports {status})")),
-                };
+            if status == "stopped" && !alive && !pid.is_some_and(pid_alive) && !launching {
+                return Ok("not running (supervisor confirms stopped)".into());
+            }
+            if status != "running" || !pid.is_some_and(pid_alive) {
+                return Err(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
             }
             let Some(recorded) = record.pid else {
                 return Err(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
@@ -1521,18 +1517,10 @@ fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord) -> 
                     pid.unwrap_or(0)
                 ));
             }
-            if port.is_some_and(|p| p != record.port) {
+            if port != Some(record.port) {
                 return Err(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
             }
-            mise::stop_supervised(&provider.pitchfork, &provider.state_dir, id)?;
-            let deadline = Instant::now() + STOP_TIMEOUT;
-            while pid_alive(recorded) {
-                if Instant::now() >= deadline {
-                    return Err(format!("pid {recorded} survived `pitchfork stop {id}`"));
-                }
-                sleep(Duration::from_millis(100));
-            }
-            Ok(format!("stopped pid {recorded} through the supervisor"))
+            Err(format!("{id} matches pid {recorded}, but Pitchfork cannot atomically validate and stop that generation; not signalled. Stop the service explicitly and retry GC"))
         }
     }
 }

@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 # shellcheck source=tests/e2e/assert.sh
 source "${STACK_E2E_ASSERT:-/tmp/stack-e2e-assert.sh}"
-echo 'Services of a deleted project are stopped through the supervisor, without the project'
+echo 'Gone-project GC preserves live services until explicit cleanup confirms shutdown'
 cp -r "$EX/app" "$W/appE"
 cd "$W/appE" || exit 1
 rm -f stack.lock
@@ -15,11 +15,21 @@ assert_json '.ok and (.data.session.provider.state_dir | length > 0) and all(.da
 pids=$(recorded_pids "$T/up-appE.json")
 [[ -n "$pids" ]] || fail 'no service PIDs recorded'
 cd "$W" || exit 1
-rm -rf "$W/appE"
-stack -C "$W" gc --json >"$T/gc-deleted.json"
-assert_json '.ok and (.data | map(select(.reason == "project directory deleted")) | length == 1 and .[0].stopped and all(.[0].services[]; .outcome | test("stopped pid")))' "$T/gc-deleted.json"
+# Make the checkout unavailable without losing its identity, so the test can restore it
+# for an explicit down. Unit tests also cover actual directory deletion and replacement.
+mv "$W/appE" "$W/appE-held"
+restore_checkout() { [[ ! -e "$W/appE-held" ]] || mv "$W/appE-held" "$W/appE"; }
+trap restore_checkout EXIT
+if stack -C "$W" gc --json >"$T/gc-deleted.json"; then fail 'GC accepted an unsafe stop-by-name'; fi
+assert_json '.ok == false and .error.code == "gc_incomplete" and any(.error.details[]; .reason == "project directory deleted" and .stopped == false)' "$T/gc-deleted.json"
+for pid in $pids; do kill -0 "$pid" || fail "GC signalled live pid $pid"; done
+[[ ! -e "$W/appE" ]] || fail 'cleanup recreated the unavailable project'
+restore_checkout
+trap - EXIT
+stack -C "$W/appE" down --json >"$T/down-appE.json"
+assert_json '.ok and .data.confirmed' "$T/down-appE.json"
 # shellcheck disable=SC2086
 assert_dead $pids
-[[ ! -e "$W/appE" ]] || fail 'cleanup recreated the deleted project'
+rm -rf "$W/appE"
 stack -C "$W" gc --json >"$T/gc-again.json"
 assert_json '.ok and (.data | length == 0)' "$T/gc-again.json"

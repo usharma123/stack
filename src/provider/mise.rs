@@ -417,16 +417,6 @@ pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result
     })
 }
 
-/// Ask the supervisor to stop one daemon by qualified id. It signals the process it tracks.
-pub fn stop_supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<(), String> {
-    let out = pitchfork(bin, state_dir, &["stop", id])?;
-    if out.exit_code == Some(0) {
-        return Ok(());
-    }
-    let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
-    Err(format!("pitchfork stop {id}: {err}"))
-}
-
 pub fn start(root: &Path) -> Result<()> {
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }

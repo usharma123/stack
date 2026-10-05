@@ -112,14 +112,15 @@ output (mise's answer when no release matches) is an error, not a version.
   inode, plus its creation time when the filesystem exposes it. Creation time detects inode
   reuse after deletion; older records and filesystems without creation times retain device/inode
   checks. When the directory is gone, or a different directory now has its path, GC asks Pitchfork
-  (`pitchfork status --json <id>`, which reads its state without starting a supervisor) and asks
-  it to stop a daemon only if it runs the recorded PID on the recorded port. Stale PIDs, PIDs the
-  supervisor no longer tracks, a different PID under the same id (a reused path), query or stop
-  failures all keep the record and fail with `gc_incomplete`. A foreign process on a port whose
-  recorded process is gone is left alone. Nothing is recreated in the project directory; data
-  directories are kept. Sessions recorded before this (no ids) can only be reclaimed when nothing
-  of theirs is still running. Until GC reclaims such a session, lifecycle commands in a new
-  directory at the same path fail with `session_conflict` instead of adopting or stopping it.
+  (`pitchfork status --json <id>`, which reads its state without starting a supervisor).
+  Pitchfork does not provide atomic compare-and-stop, so GC never issues a separate stop by
+  daemon name for a gone project, even when PID and port match. Live, unknown, transitional,
+  retrying and incomplete-launch states retain the record and return `gc_incomplete`.
+  A confirmed stopped daemon with no live recorded PID, or a missing daemon after a completed
+  launch and dead recorded PID, permits release. Unrelated listeners remain untouched.
+  Use `stack down` before deleting a checkout; otherwise identify and stop the intended
+  supervisor daemon explicitly before retrying GC. Nothing is recreated, and data is kept.
+  While ownership remains unresolved, a new directory at the old path gets `session_conflict`.
 - **Supervisor socket.** Pitchfork's socket is `<state dir>/sock/main.sock`, where the state
   directory is `PITCHFORK_STATE_DIR` (from the provider config's env, which mise passes to
   Pitchfork, else stack's own), else an absolute `XDG_STATE_HOME/pitchfork` on Linux only, else

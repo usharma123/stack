@@ -1396,7 +1396,7 @@ impl Fixture {
 }
 
 #[test]
-fn a_deleted_projects_services_are_stopped_through_the_supervisor() {
+fn deleted_projects_are_retained_until_the_supervisor_confirms_terminal_cleanup() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
     let index: Value = serde_json::from_slice(&fs::read(fs::read_dir(fixture.dir.path().join("state/sessions")).unwrap().next().unwrap().unwrap().path()).unwrap()).unwrap();
@@ -1409,18 +1409,23 @@ fn a_deleted_projects_services_are_stopped_through_the_supervisor() {
     let app = fixture.dir.path().join("app");
     fs::remove_dir_all(&app).unwrap();
     let (ok, result) = fixture.gc(&[]);
-    assert!(ok, "{result}");
-    let entry = &result["data"][0];
+    assert!(!ok, "{result}");
+    let entry = &result["error"]["details"][0];
     assert_eq!(entry["reason"], "project directory deleted");
-    assert_eq!(entry["stopped"], true, "{result}");
-    assert!(entry["services"][0]["outcome"].as_str().unwrap().contains("stopped pid"), "{result}");
-    assert!(!running.service.alive(), "the owned service survived");
-    assert_eq!(fixture.index_files(), 0, "ownership record released once confirmed");
-    assert!(!app.exists(), "the deleted project was recreated");
+    assert_eq!(entry["stopped"], false, "{result}");
+    assert!(running.service.alive(), "GC must not issue a racy stop by daemon name");
+    assert_eq!(fixture.index_files(), 1);
+    assert!(!app.exists(), "cleanup recreated the deleted project");
     let log = fixture.pitchfork_log();
     assert!(log.contains(&format!("{state_dir} status --json {WEB_ID}")), "{log}");
-    assert!(log.contains(&format!("{state_dir} stop {WEB_ID}")), "{log}");
-    assert_eq!(fixture.gc(&[]).1["data"], json!([]), "nothing left to reclaim");
+    assert!(!log.contains(" stop "), "{log}");
+    drop(running);
+    thread::sleep(Duration::from_millis(100));
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "stopped" }).to_string()).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    assert_eq!(fixture.index_files(), 0);
+    assert_eq!(fixture.gc(&[]).1["data"], json!([]));
 }
 
 #[test]
@@ -1429,7 +1434,7 @@ fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
     let running = fixture.start_web(&[]);
     fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
     let other = Detached::spawn();
-    for case in ["different pid", "not tracked", "stopped but recorded pid alive", "different port", "query fails"] {
+    for case in ["different pid", "not tracked", "stopped but recorded pid alive", "different port", "missing port", "replacement after status", "query fails"] {
         let _ = fs::remove_file(fixture.dir.path().join("pf-status.json"));
         match case {
             "different pid" => fixture.supervisor_tracks(other.0, running.port),
@@ -1440,6 +1445,8 @@ fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
             )
             .unwrap(),
             "different port" => fixture.supervisor_tracks(running.service.0, running.port.wrapping_add(1)),
+            "replacement after status" => fixture.supervisor_tracks(running.service.0, running.port),
+            "missing port" => fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "running", "pid": running.service.0 }).to_string()).unwrap(),
             _ => fs::write(fixture.dir.path().join("pf-status.json"), "not json").unwrap(),
         }
         // `stop` would kill whatever the supervisor names; it must never be asked.
@@ -1540,31 +1547,33 @@ fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
     assert!(other.alive() && running.service.alive());
     assert!(!fs::read_to_string(&log).unwrap_or_default().contains("daemons stop"));
     assert!(!fixture.pitchfork_log().contains(" stop "));
-    // Once the supervisor confirms the recorded process, gc reclaims it and the path is free.
+    // Even matching metadata cannot authorize a separate stop-by-name request.
     fixture.supervisor_tracks(running.service.0, running.port);
     let (ok, result) = fixture.gc(&[]);
-    assert!(ok, "{result}");
-    assert!(!running.service.alive() && other.alive());
-    let out = fixture.command(&["status", "--json"]).output().unwrap();
-    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!((status["ok"].clone(), status["data"]["session"].clone()), (json!(true), Value::Null), "{status}");
+    assert!(!ok, "{result}");
+    assert!(running.service.alive() && other.alive());
+    assert_eq!(fixture.index_files(), 1);
 }
 
 #[test]
-fn a_failed_supervisor_stop_keeps_ownership_for_a_retry() {
+fn nonterminal_supervisor_states_keep_ownership_even_when_the_recorded_pid_is_dead() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
-    fixture.supervisor_tracks(running.service.0, running.port);
     fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
-    fs::write(fixture.dir.path().join("pf-fail-stop"), "").unwrap();
-    let (ok, result) = fixture.gc(&[]);
-    assert!(!ok);
-    assert!(result["error"]["details"][0]["error"].as_str().unwrap().contains("cannot stop"), "{result}");
+    drop(running);
+    thread::sleep(Duration::from_millis(100));
+    for status in ["starting", "stopping", "errored", "unknown", "", "running"] {
+        fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": status }).to_string()).unwrap();
+        let (ok, result) = fixture.gc(&[]);
+        assert!(!ok, "{status}: {result}");
+        assert_eq!(fixture.index_files(), 1, "{status}");
+        assert!(!fixture.pitchfork_log().contains(" stop "));
+    }
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID }).to_string()).unwrap();
+    assert!(!fixture.gc(&[]).0);
     assert_eq!(fixture.index_files(), 1);
-    fs::remove_file(fixture.dir.path().join("pf-fail-stop")).unwrap();
-    let (ok, result) = fixture.gc(&[]);
-    assert!(ok, "{result}");
-    assert!(!running.service.alive());
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "stopped" }).to_string()).unwrap();
+    assert!(fixture.gc(&[]).0);
     assert_eq!(fixture.index_files(), 0);
 }
 
@@ -1586,8 +1595,9 @@ fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
     assert!(running.service.alive(), "stopped under an active command");
     child.wait().unwrap();
     let (ok, result) = fixture.gc(&[]);
-    assert!(ok && result["data"][0]["stopped"] == true, "{result}");
-    assert!(!running.service.alive());
+    assert!(!ok && result["error"]["code"] == "gc_incomplete", "{result}");
+    assert!(running.service.alive());
+    assert_eq!(fixture.index_files(), 1);
 }
 
 #[test]

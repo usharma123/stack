@@ -95,10 +95,10 @@ stack down                             # succeeds only once the processes are co
 - **Owned lifetimes.** Sessions can lease on a TTL or a runner's PID. Active commands protect
   TTL sessions until completion; `stack gc` (and every `stack up`) reclaims expired idle ones,
   and `stack gc --watch` does so periodically in the foreground for a supervisor you choose.
-  Services of a deleted project are stopped through the supervisor using what was recorded at
-  launch, and only when it still runs the recorded process. `down` and `gc` retain ownership
-  records if discovery or cleanup fails, and report success only after recorded processes are
-  gone.
+  For deleted or replaced projects, GC retains live or uncertain services and reports
+  `gc_incomplete`: Pitchfork cannot atomically validate and stop a recorded generation.
+  Stop the original checkout with `stack down` before deleting it. GC releases gone-project
+  records only after shutdown is confirmed; it never signals a replacement service.
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe.
 - **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
@@ -128,9 +128,10 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;
   ownership records are kept so it can be retried. For a deleted (or replaced) project directory
-  it asks Pitchfork, by the daemon ids recorded at launch, what it runs, and stops a daemon only
-  when its PID and port are the recorded ones. It never signals a PID itself and never recreates
-  the project. Data directories are kept (`mise daemons prune` removes them).
+  it queries Pitchfork using the recorded daemon IDs but never issues a stop-by-name request.
+  Even matching PID/port metadata cannot make that separate request safe from replacement.
+  Inspect the intended daemon and stop it explicitly, then retry GC. Unknown, starting,
+  stopping and retrying states retain the record. Data directories are kept.
 - `gc --watch` runs until terminated (or `--max-passes N`), one pass every `--interval`; with
   `--json` it prints one object per pass. stack installs no background service: run it under
   systemd, launchd or your agent runner if you want unattended expiry.
