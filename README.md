@@ -104,7 +104,7 @@ stack down                             # succeeds only once the processes are co
 | `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc` | Renew this session's lease / reclaim expired sessions machine-wide |
-| `stack publish <dir> oci:<registry>/<repo>:<tag>` | Publish a bundle as an OCI artifact |
+| `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
@@ -114,6 +114,7 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `gc` fails with `gc_incomplete` if an expired session could not be stopped; ownership records
   are kept so it can be retried. Sessions of deleted projects are listed but cannot be stopped by
   stack (see `mise daemons prune`).
+- `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
   Values are percent-decoded once, so `dir=a%26b` names the directory `a&b`.
 Registry credentials: `STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`. External token-service origins

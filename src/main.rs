@@ -80,6 +80,9 @@ enum Cmd {
         bundle: PathBuf,
         /// Target, e.g. oci:ghcr.io/acme/pybase:1.0.0
         target: String,
+        /// Move the tag even if it already points to different content
+        #[arg(long)]
+        force: bool,
     },
     /// Serve the stack tools over MCP (stdio)
     Mcp,
@@ -177,7 +180,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Publish { bundle, target } => publish(bundle, target).map(|r| {
+        Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
         }),
         Cmd::Mcp => unreachable!("handled above"),
@@ -274,7 +277,7 @@ fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<&str>
     Ok(ExitCode::from(code))
 }
 
-fn publish(bundle: &Path, target: &str) -> Result<serde_json::Value> {
+fn publish(bundle: &Path, target: &str, force: bool) -> Result<serde_json::Value> {
     let dir = bundle
         .canonicalize()
         .map_err(|e| StackError::new("bundle_not_found", format!("{}: {e}", bundle.display())))?;
@@ -285,7 +288,7 @@ fn publish(bundle: &Path, target: &str) -> Result<serde_json::Value> {
     let manifest = read_bundle(&dir, &dir.display().to_string())?;
     let (name, version) = (manifest.bundle.name.clone(), manifest.bundle.version.clone());
     LoadedBundle::new(manifest, dir.clone())?; // same validation as consumers apply
-    let digest = oci::Client::default().push(&dir, &reference, &name, version.as_deref())?;
+    let digest = oci::Client::default().push(&dir, &reference, &name, version.as_deref(), force)?;
     Ok(json!({
         "name": name,
         "digest": digest,
