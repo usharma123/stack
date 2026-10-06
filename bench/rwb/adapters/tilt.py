@@ -7,9 +7,18 @@ gate; `docker_compose(..., wait=True)` makes resources ready only after their he
 pass. Tilt has no exec command for Compose services, so app commands use the same Compose
 binary Tilt is pinned to (`compose exec`), into a toolchain container that bind-mounts the
 checkout at its own absolute path.
+
+Host processes: Tilt is invoked by its private absolute path, and it runs the private Compose
+binary with `--project-name rwb-<run id>-<checkout>` (a failed `tilt ci` can exit while its
+`compose ... events --json` reader survives with PPID 1). adapters/tilt/owned_processes.py
+attributes processes by exact executable path + this run's project as the first argument (Tilt
+itself only when the tools dir is run-owned; undecidable rows fail cleanup visibly), and host cleanup terminates exactly those PIDs after re-checking
+their start time and argv, waits, then lists them as leftovers so the work dir is never removed
+while one is alive. No pattern/group kill and no stored PID is ever signalled.
 """
 import os
 import posixpath
+import sys
 
 from .base import Adapter, q
 
@@ -137,6 +146,9 @@ class TiltAdapter(Adapter):
         return [f"mkdir -p {q(self.uv_cache())}",
                 f"printf '%s' {q(lines)} > {q(co.path)}/tilt.local.env"]
 
+    def tilt(self, args):
+        return f"{q(self.tools())}/tilt {args}"  # absolute: argv[0] identifies the private binary
+
     def _in(self, co, body):
         return f"set -e; cd {q(co.path)} && . ./tilt.local.env && {body}"
 
@@ -153,10 +165,10 @@ class TiltAdapter(Adapter):
     def setup(self, co):
         # Tilt has no install step: it evaluates the Tiltfile (and Compose model) here, and
         # pulls/builds images inside `tilt ci` (cold in A's start, cached for B).
-        return self._in(co, "tilt alpha tiltfile-result")
+        return self._in(co, self.tilt("alpha tiltfile-result"))
 
     def start(self, co):
-        return self._in(co, "tilt ci --port 0 --timeout 900s </dev/null")
+        return self._in(co, self.tilt("ci --port 0 --timeout 900s </dev/null"))
 
     def ready(self, co):
         # Explicit health receipt: the Docker health state Compose --wait gated on.
@@ -171,10 +183,10 @@ class TiltAdapter(Adapter):
         return self._in(co, self.compose("ps --all --format json"))
 
     def stop(self, co):
-        return self._in(co, "tilt down")  # Compose down without --volumes: data volumes kept
+        return self._in(co, self.tilt("down"))  # Compose down without --volumes: data volumes kept
 
     def cleanup(self, co):
-        return self._in(co, "tilt down --delete-volumes")
+        return self._in(co, self.tilt("down --delete-volumes"))
 
     def enter(self, co, body):
         return self._in(co, self.compose(f"exec -T app bash -c {q(body)}"))
@@ -212,10 +224,18 @@ class TiltAdapter(Adapter):
         return (f"docker ps --filter label=rwb.run={self.run_id} --filter label=rwb.service=1 "
                 "--format '{{.ID}} {{.Names}} {{.Status}}'")
 
-    def supervisor_processes(self):
-        return f"set -o pipefail; ps -axo pid=,stat=,args= | awk -v t={q(self.tools() + '/tilt')} 'index($0, t) && !/awk/'"
+    def owned_processes(self, action):
+        """Body listing (or terminating, then listing survivors of) this run's private Tilt
+        and Compose processes; exit 1 if any remain after terminate, 2 if ps failed or a Compose
+        row naming this run's project is ambiguous (listed as `ambiguous`, never signalled)."""
+        tilt_owned = " --tilt-owned" if not self.options.get("tools_dir") else ""
+        return (f"{q(sys.executable)} -I {q(self.src + '/adapters/tilt/owned_processes.py')} {action} "
+                f"--tools {q(self.tools())} --project-prefix {q(f'rwb-{self.run_id}-')}{tilt_owned}")
 
-    def host_resources(self):
+    def supervisor_processes(self):
+        return self.owned_processes("list")
+
+    def docker_resources(self):
         prefix = f"rwb-{self.run_id}-"
         return "\n".join([
             "set -eo pipefail",
@@ -225,5 +245,18 @@ class TiltAdapter(Adapter):
             f"docker images --format '{{{{.Repository}}}}:{{{{.Tag}}}} {{{{.ID}}}}' | awk 'index($0, \"{prefix}\") == 1 {{print \"image \" $0}}'",
         ])
 
+    def host_resources(self):
+        # Live owned processes are leftovers too: teardown keeps the work dir while one remains.
+        return "\n".join([self.docker_resources(), self.owned_processes("list")])
+
     def cleanup_host(self):
-        return remove_owned(self.host_resources())
+        # Processes first (a live Tilt could recreate containers); Docker removal still runs
+        # when termination fails, and the body then exits non-zero.
+        return "\n".join([
+            "rwb_proc=0",
+            f"{self.owned_processes('terminate')} || rwb_proc=$?",
+            # A plain subshell statement: under `|| ...` bash would ignore remove_owned's set -e.
+            f"(\n{remove_owned(self.docker_resources())}\n)",
+            "rwb_docker=$?",
+            '[ "$rwb_docker" = 0 ] || exit "$rwb_docker"',
+            'exit "$rwb_proc"'])
