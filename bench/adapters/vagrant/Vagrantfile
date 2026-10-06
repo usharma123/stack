@@ -1,0 +1,67 @@
+# Vagrant's built-in Docker provider: three machines per checkout, no box and no VM
+# (force_host_vm = false on Docker Desktop). See bench/research/vagrant.md.
+# RWB_* values come from the checkout's uncommitted vagrant.local.env.
+require "json"
+
+pins = JSON.parse(File.read(File.join(__dir__, "images.lock.json")))
+id = ENV.fetch("RWB_INSTANCE")
+run = ENV.fetch("RWB_RUN")
+src = ENV.fetch("RWB_SRC")
+uv_cache = ENV.fetch("RWB_UV_CACHE")
+raise "bad instance #{id}" unless id.match?(/\Arwb-[a-z0-9-]+\z/)
+%w[python uv postgres redis].each { |k| raise "images.lock.json lacks #{k}" unless pins[k].is_a?(String) }
+
+# The network and named volumes are created by vagrant-resources.sh (benchmark glue).
+net = "#{id}-net"
+owned = ["--label", "rwb.run=#{run}", "--label", "rwb.instance=#{id}"]
+
+Vagrant.configure("2") do |config|
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  config.vm.define "pg" do |m|
+    m.vm.provider "docker" do |d|
+      d.image = pins.fetch("postgres")
+      d.name = "#{id}-pg"
+      d.force_host_vm = false
+      d.has_ssh = false
+      d.stop_timeout = 30
+      d.env = { "POSTGRES_USER" => "postgres", "POSTGRES_PASSWORD" => "bench", "POSTGRES_DB" => "postgres" }
+      d.create_args = owned + ["--label", "rwb.service=1", "--network", net, "--network-alias", "pg",
+                               "--mount", "type=volume,source=#{id}-pgdata,target=/var/lib/postgresql/data"]
+    end
+  end
+
+  config.vm.define "redis" do |m|
+    m.vm.provider "docker" do |d|
+      d.image = pins.fetch("redis")
+      d.name = "#{id}-redis"
+      d.force_host_vm = false
+      d.has_ssh = false
+      d.stop_timeout = 30
+      d.cmd = ["redis-server", "--dir", "/data", "--appendonly", "yes", "--appendfsync", "always"]
+      d.create_args = owned + ["--label", "rwb.service=1", "--network", net, "--network-alias", "redis",
+                               "--mount", "type=volume,source=#{id}-redisdata,target=/data"]
+    end
+  end
+
+  config.vm.define "app", primary: true do |m|
+    # Bind the checkout at its own absolute path so the app runs this checkout's source.
+    m.vm.synced_folder ".", src
+    m.vm.synced_folder uv_cache, "/uv-cache"
+    m.vm.provider "docker" do |d|
+      d.build_dir = "."
+      d.build_args = ["-t", "#{id}-app", "--label", "rwb.run=#{run}",
+                      "--build-arg", "PYTHON_IMAGE=#{pins.fetch('python')}",
+                      "--build-arg", "UV_IMAGE=#{pins.fetch('uv')}"]
+      d.name = "#{id}-app"
+      d.force_host_vm = false
+      d.has_ssh = false
+      d.stop_timeout = 5
+      d.create_args = owned + ["--network", net, "--init", "--workdir", src]
+      d.env = { "DATABASE_URL" => "postgresql://postgres:bench@pg:5432/postgres",
+                "REDIS_URL" => "redis://redis:6379/0",
+                "UV_CACHE_DIR" => "/uv-cache", "UV_LINK_MODE" => "copy",
+                "UV_PYTHON_DOWNLOADS" => "never" }
+    end
+  end
+end
