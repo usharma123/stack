@@ -1,0 +1,29 @@
+# mise + Pitchfork recipe (bench/research/mise.md). Daemon presets supervise PostgreSQL and
+# Redis; per-checkout ports live in the uncommitted mise.local.toml written by the harness.
+min_version = "2026.10.3"
+
+[settings]
+experimental = true
+lockfile = true
+
+[tools]
+python = "3.13.16"
+uv = "0.12.23"
+pitchfork = "2.29.0"
+postgres = "17.11"
+redis = "8.10.2"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+
+[daemons.postgres]
+preset = "postgres"
+version = "17.11"
+port = "auto"
+data_dir = ".data/postgres"
+
+[daemons.redis]
+preset = "redis"
+version = "8.10.2"
+port = "auto"
+data_dir = ".data/redis"

@@ -1,0 +1,13 @@
+# Machine-local endpoint configuration (uncommitted). The whole daemon declaration must be
+# repeated: a higher-precedence table replaces the original.
+[daemons.postgres]
+preset = "postgres"
+version = "17.11"
+port = @PGPORT@
+data_dir = ".data/postgres"
+
+[daemons.redis]
+preset = "redis"
+version = "8.10.2"
+port = @REDISPORT@
+data_dir = ".data/redis"
