@@ -290,7 +290,9 @@ class PlannedBodies(unittest.TestCase):
                     if re.search(rf"\b(devcontainer|devpod|ddev|lando) ", body):
                         self.assertIn(adapter.env().strip(), body)
             cleanup = adapter.cleanup_host()
-            self.assertIn(f" remove {RUN} ", cleanup)
+            # Lando owns names with the normalized run id; the others with the raw run id.
+            self.assertIn(f" remove {adapter.owner_token} ", cleanup)
+            self.assertEqual(adapter.owner_token, RUN if cls is not LandoAdapter else RUN.replace("-", ""))
             for name in "abcde":
                 self.assertIn(adapter.project(name), cleanup)
 
@@ -335,11 +337,17 @@ FAKE_DOCKER = textwrap.dedent('''\
         return [i for i in items if key in i["labels"] and (not value or i["labels"][key] == value)]
     def arg(name):
         return [args[i + 1] for i, a in enumerate(args) if a == name]
+    for fail in filter(None, os.environ.get("RWB_FAKE_FAIL", "").split("|")):
+        if " ".join(args).startswith(fail):
+            sys.exit("Cannot connect to the Docker daemon (simulated)")
     cmd = args[0]
     if cmd == "ps":
         items = state["containers"]
         for flt in arg("--filter"):
-            items = label_filter(items, flt) if flt.startswith("label=") else items
+            if flt.startswith("label="):
+                items = label_filter(items, flt)
+            elif flt.startswith("volume="):
+                items = [c for c in items if flt[len("volume="):] in c.get("volumes", [])]
         fmt = (arg("--format") or [""])[0]
         for c in items:
             if "-q" in args:
@@ -370,10 +378,15 @@ FAKE_DOCKER = textwrap.dedent('''\
     elif cmd == "image" and args[1] == "ls":
         for ref in state["images"]:
             print(ref)
+    elif cmd in ("network", "volume") and args[1] == "inspect":
+        found = [x for x in state[cmd + "s"] if args[2] in (x.get("id"), x["name"])]
+        if not found:
+            sys.exit(f"Error: No such {cmd}: {args[2]}")
+        print(json.dumps([dict(Name=found[0]["name"], Containers={})]))
     elif cmd == "rm":
         state["containers"] = [c for c in state["containers"] if c["id"] != args[-1]]; save()
     elif cmd == "network" and args[1] == "rm":
-        state["networks"] = [n for n in state["networks"] if n["id"] != args[2]]; save()
+        state["networks"] = [n for n in state["networks"] if args[2] not in (n["id"], n["name"])]; save()
     elif cmd == "volume" and args[1] == "rm":
         state["volumes"] = [v for v in state["volumes"] if v["name"] != args[2]]; save()
     elif cmd == "image" and args[1] == "rm":
@@ -453,6 +466,207 @@ class ComposeReceiptScript(unittest.TestCase):
         self.assertEqual(state["images"], ["postgres:17.6-alpine", "cit-observability-c-api:latest"])
         self.assertEqual(self.receipt("resources", RUN, f"rwb-{RUN}-a").stdout, "")
         self.assertEqual(self.receipt("running", RUN, f"rwb-{RUN}-a").stdout, "")
+
+
+class LandoOwnershipReceipts(unittest.TestCase):
+    """Astra P1: Lando's normalized project names must pass the receipt ownership guard."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        tmp = Path(self.tmp.name)
+        self.docker = tmp / "docker"
+        self.docker.write_text(FAKE_DOCKER)
+        self.docker.chmod(self.docker.stat().st_mode | stat.S_IXUSR)
+        self.state = tmp / "state.json"
+        self.lando = make(LandoAdapter)
+        mine, other = self.lando.project("a"), "cit-observability-c"
+        self.mine = mine
+        self.state.write_text(json.dumps(dict(
+            containers=[dict(id="c1", status="running", volumes=[f"{mine}_data_database"],
+                             labels={"com.docker.compose.project": mine, "com.docker.compose.service": "database"}),
+                        dict(id="u1", status="running", labels={"com.docker.compose.project": other,
+                                                                "com.docker.compose.service": "postgres"})],
+            volumes=[dict(name=f"{mine}_data_database", labels={"com.docker.compose.project": mine}),
+                     dict(name=f"{other}_data", labels={"com.docker.compose.project": other})],
+            networks=[dict(id="n1", name=f"{mine}_default", labels={"com.docker.compose.project": mine}),
+                      dict(id="n2", name=f"{other}_default", labels={"com.docker.compose.project": other})],
+            images=[f"{mine}-appserver:latest", f"{other}-api:latest"])))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_receipt_lines(self, body):
+        """Execute only the generated compose_receipt invocations of a body (never real Docker)."""
+        lines = [l.strip() for l in body.splitlines() if "compose_receipt.py" in l]
+        self.assertTrue(lines, body)
+        env = dict(os.environ, RWB_DOCKER=str(self.docker), RWB_FAKE_STATE=str(self.state))
+        return [subprocess.run(["bash", "-c", l], capture_output=True, text=True, env=env) for l in lines]
+
+    def test_normalized_token_is_used_and_accepted(self):
+        token = self.lando.owner_token
+        self.assertNotIn("-", token)
+        self.assertEqual(self.lando.project("a"), f"rwb{token}a")
+        for body in (self.lando.service_processes(), self.lando.host_resources()):
+            for proc in self.run_receipt_lines(body):
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+        listed = self.run_receipt_lines(self.lando.host_resources())[0].stdout
+        self.assertIn(self.mine, listed)
+        self.assertNotIn("cit-observability", listed)
+
+    def test_fallback_removal_touches_only_owned_resources(self):
+        removal = [l for l in self.lando.cleanup_host().splitlines() if " remove " in l]
+        for proc in self.run_receipt_lines("\n".join(removal)):
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        state = json.loads(self.state.read_text())
+        self.assertEqual([c["id"] for c in state["containers"]], ["u1"])
+        self.assertEqual([v["name"] for v in state["volumes"]], ["cit-observability-c_data"])
+        self.assertEqual([n["id"] for n in state["networks"]], ["n2"])
+        self.assertEqual(state["images"], ["cit-observability-c-api:latest"])
+
+    def test_other_run_and_short_tokens_still_refused(self):
+        env = dict(os.environ, RWB_DOCKER=str(self.docker), RWB_FAKE_STATE=str(self.state))
+        for args in (("remove", self.lando.owner_token, "rwbotherrun999999a"),
+                     ("remove", "abc12", "rwbabc12a")):
+            proc = subprocess.run([sys.executable, "-I", str(RECEIPT), *args], capture_output=True, text=True, env=env)
+            self.assertNotEqual(proc.returncode, 0, args)
+        self.assertEqual(len(json.loads(self.state.read_text())["containers"]), 2)
+
+
+class FullCleanupBody(unittest.TestCase):
+    """Astra R3 P2: run the whole generated cleanup_host body (native teardown, owned-resource
+    receipt removal, shared-infra cleanup) against the fake Docker CLI. Removal and shared
+    cleanup must both be attempted, and either failing must fail the body."""
+
+    SHARED = {LandoAdapter: [("networks", "lando_bridge_network")],
+              DdevAdapter: [("networks", "ddev_default"), ("volumes", "ddev-global-cache")]}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.docker = self.dir / "docker"
+        self.docker.write_text(FAKE_DOCKER)
+        self.docker.chmod(self.docker.stat().st_mode | stat.S_IXUSR)
+        self.state = self.dir / "state.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def adapter(self, cls):
+        adapter = cls({"tools_dir": str(self.dir / "tools")}, None, RUN)
+        adapter.root = str(self.dir / "w")
+        Path(adapter.state).mkdir(parents=True, exist_ok=True)
+        # Snapshot as preflight records it: the shared infra did not exist before this run.
+        Path(adapter.state, "shared-infra.json").write_text(json.dumps(
+            {f"{k[:-1]}:{n}": dict(existed_before=False) for k, n in self.SHARED[cls]}))
+        mine, other = adapter.project("a"), "cit-observability-c"
+        world = dict(
+            containers=[dict(id="owned", status="running", volumes=[f"{mine}_data"],
+                             labels={"com.docker.compose.project": mine, "com.docker.compose.service": "postgres"}),
+                        dict(id="foreign", status="running", volumes=[f"{other}_data"],
+                             labels={"com.docker.compose.project": other, "com.docker.compose.service": "postgres"})],
+            volumes=[dict(name=f"{mine}_data", labels={"com.docker.compose.project": mine}),
+                     dict(name=f"{other}_data", labels={"com.docker.compose.project": other})],
+            networks=[dict(id="n1", name=f"{mine}_default", labels={"com.docker.compose.project": mine}),
+                      dict(id="n2", name=f"{other}_default", labels={"com.docker.compose.project": other})],
+            images=[f"{mine}-app:latest", f"{other}-api:latest"])
+        for kind, name in self.SHARED[cls]:
+            world[kind].append(dict(id=f"shared-{name}", name=name, labels={}))
+        self.state.write_text(json.dumps(world))
+        return adapter
+
+    def run_cleanup(self, adapter, fail="", docker=None):
+        env = dict(os.environ, RWB_DOCKER=str(docker or self.docker), RWB_FAKE_STATE=str(self.state),
+                   RWB_FAKE_FAIL=fail)
+        return subprocess.run(["/bin/bash", "-c", adapter.cleanup_host()], cwd=self.dir,
+                              capture_output=True, text=True, env=env)
+
+    def left(self):
+        state = json.loads(self.state.read_text())
+        return dict(containers=[c["id"] for c in state["containers"]],
+                    volumes=[v["name"] for v in state["volumes"]],
+                    networks=[n["name"] for n in state["networks"]], images=state["images"])
+
+    def assert_foreign_kept(self):
+        left = self.left()
+        self.assertIn("foreign", left["containers"])
+        self.assertIn("cit-observability-c_data", left["volumes"])
+        self.assertIn("cit-observability-c_default", left["networks"])
+        self.assertIn("cit-observability-c-api:latest", left["images"])
+
+    def shared_names(self, cls):
+        return [n for _, n in self.SHARED[cls]]
+
+    def test_both_succeed(self):
+        for cls in self.SHARED:
+            with self.subTest(adapter=cls.name):
+                proc = self.run_cleanup(self.adapter(cls))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.left(), dict(
+                    containers=["foreign"], volumes=["cit-observability-c_data"],
+                    networks=["cit-observability-c_default"], images=["cit-observability-c-api:latest"]))
+
+    def test_owned_query_failure_fails_cleanup_but_shared_cleanup_runs(self):
+        for cls in self.SHARED:
+            with self.subTest(adapter=cls.name):
+                adapter = self.adapter(cls)
+                proc = self.run_cleanup(adapter, fail="ps -a -q --no-trunc")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("owned-resource removal failed", proc.stderr)
+                left = self.left()
+                self.assertIn("owned", left["containers"])
+                for name in self.shared_names(cls):
+                    self.assertNotIn(name, left["networks"] + left["volumes"], "shared cleanup must still run")
+                self.assert_foreign_kept()
+
+    def test_refused_removal_leaves_owned_running_and_fails_cleanup(self):
+        refusing = self.dir / "docker-refuse"
+        refusing.write_text(FAKE_DOCKER.replace(
+            'cmd = args[0]\n', 'cmd = args[0]\nif cmd == "rm":\n    sys.exit("simulated removal refusal")\n', 1))
+        refusing.chmod(refusing.stat().st_mode | stat.S_IXUSR)
+        for cls in self.SHARED:
+            with self.subTest(adapter=cls.name):
+                proc = self.run_cleanup(self.adapter(cls), docker=refusing)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("remaining container owned", proc.stdout)
+                self.assertEqual(self.left()["containers"], ["owned", "foreign"])
+                self.assert_foreign_kept()
+
+    def test_shared_cleanup_failure_fails_cleanup_after_removal(self):
+        for cls in self.SHARED:
+            with self.subTest(adapter=cls.name):
+                # `network rm` of the run-created shared network fails (owned networks are
+                # removed by id with tolerated exit codes, so only shared cleanup sees this).
+                proc = self.run_cleanup(self.adapter(cls), fail="network rm lando_bridge_network|network rm ddev_default")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("shared-infra cleanup failed", proc.stderr)
+                self.assertNotIn("owned-resource removal failed", proc.stderr)
+                left = self.left()
+                self.assertEqual(left["containers"], ["foreign"])
+                self.assertIn("lando_bridge_network" if cls is LandoAdapter else "ddev_default", left["networks"])
+                self.assert_foreign_kept()
+
+    def test_native_teardown_failure_stays_best_effort(self):
+        for cls in self.SHARED:
+            with self.subTest(adapter=cls.name):
+                adapter = self.adapter(cls)
+                marker = ".lando.local.yml" if cls is LandoAdapter else ".ddev/config.local.yaml"
+                path = Path(adapter.workdir(), "a", marker)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("")
+                # The private tool dir has no lando/ddev binary, so native teardown fails.
+                proc = self.run_cleanup(adapter)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("native teardown of a failed", proc.stderr)
+                self.assertEqual(self.left()["containers"], ["foreign"])
+                self.assert_foreign_kept()
+
+    def test_devcontainers_without_shared_infra_fails_on_removal_failure(self):
+        adapter = make(DevcontainersAdapter)
+        adapter.root = str(self.dir / "w")
+        self.state.write_text(json.dumps(dict(containers=[], volumes=[], networks=[], images=[])))
+        self.assertEqual(self.run_cleanup(adapter).returncode, 0)
+        proc = self.run_cleanup(adapter, fail="volume ls")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

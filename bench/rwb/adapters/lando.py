@@ -79,9 +79,14 @@ class LandoAdapter(ContainerAdapter):
                     image_notes="Debian images (Lando v3 service scripts need bash): python full bookworm, "
                                 "Bitnami PostgreSQL 17.6.0, Redis 8.10.2 trixie; Redis AOF appendfsync=everysec (plugin default)")
 
+    @property
+    def owner_token(self):
+        # Lando strips non-alphanumerics from app names, so owned names carry the normalized
+        # run id; the receipt guard must match that exact token (raw run_id is kept elsewhere).
+        return re.sub(r"[^a-z0-9]", "", self.run_id.lower())
+
     def project(self, name):
-        # Lando strips non-alphanumerics from app names; keep the run id's characters.
-        return "rwb" + re.sub(r"[^a-z0-9]", "", self.run_id.lower()) + name
+        return "rwb" + self.owner_token + name
 
     def env(self):
         return super().env() + f"export LANDO_CORE_USERCONFROOT={q(self.state)}/lando NO_COLOR=1; "

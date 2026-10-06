@@ -77,6 +77,11 @@ class ContainerAdapter(Adapter):
         """Run-owned tool state (global config, CLI data). Never the user's own state."""
         return f"{self.workdir()}/_state"
 
+    @property
+    def owner_token(self):
+        """Token every owned project/resource name contains (compose_receipt `_owned` guard)."""
+        return self.run_id
+
     def project(self, name):
         """Run-owned per-checkout name, used for the Compose project."""
         return f"rwb-{self.run_id}-{name}"
@@ -118,7 +123,7 @@ class ContainerAdapter(Adapter):
         return dict(
             host_docker_daemon="docker info must succeed; checkouts must be visible to the daemon (Docker Desktop file sharing covers the temp dir)",
             private_state=f"{self.state} only; user tool state is never read or written",
-            owned_names=f"every project/volume/image contains run id {self.run_id}",
+            owned_names=f"every project/volume/image contains ownership token {self.owner_token}",
             core_hooks_required=self.core_hooks_required(),
         )
 
@@ -197,28 +202,33 @@ class ContainerAdapter(Adapter):
 
     def service_processes(self):
         """Running containers of this run's projects (the services are containers here)."""
-        return self.env() + self.receipt("running", self.run_id, *self.all_selectors())
+        return self.env() + self.receipt("running", self.owner_token, *self.all_selectors())
 
     def supervisor_processes(self):
         """Host processes started from this adapter's private tool directory."""
         return f"ps -axo pid=,args= | grep -F -- {q(self.tools)} | grep -v -e 'grep -F' || true"
 
     def host_resources(self):
-        return self.env() + self.receipt("resources", self.run_id, *self.all_selectors())
+        return self.env() + self.receipt("resources", self.owner_token, *self.all_selectors())
 
     def native_teardown(self, name):
         """Best-effort native teardown for checkout `name` if it was prepared (shell line)."""
         return ""
 
     def cleanup_host(self):
-        lines = []
+        """Native teardown is best-effort (owned-resource removal backstops it). Receipt
+        removal and shared-infra cleanup always both run; either failing fails the body."""
+        lines = ["rwb_cleanup_failed=0"]
         for name in "abcde":
             line = self.native_teardown(name)
             if line:
                 lines.append(f"( {line} ) || echo 'native teardown of {name} failed; removing owned resources' >&2")
-        lines.append(self.receipt("remove", self.run_id, *self.all_selectors()))
+        lines.append(self.receipt("remove", self.owner_token, *self.all_selectors())
+                     + " || { echo 'owned-resource removal failed' >&2; rwb_cleanup_failed=1; }")
         if self.shared_infra:
-            lines.append(self.receipt("shared-cleanup", f"{self.state}/shared-infra.json"))
+            lines.append(self.receipt("shared-cleanup", f"{self.state}/shared-infra.json")
+                         + " || { echo 'shared-infra cleanup failed' >&2; rwb_cleanup_failed=1; }")
+        lines.append('[ "$rwb_cleanup_failed" = 0 ]')
         return self.env() + "\n".join(lines)
 
 
