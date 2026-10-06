@@ -1,0 +1,12 @@
+# Tilt on its local Docker Compose backend (no Kubernetes) for the shared app task.
+# The checkout's uncommitted tilt.local.env exports RWB_PROJECT (unique per run and checkout).
+project = os.getenv('RWB_PROJECT', '')
+if not project:
+    fail('RWB_PROJECT is required (source tilt.local.env)')
+
+# Shared image cache is outside this benchmark's lifecycle; never prune it.
+docker_prune_settings(disable=True)
+
+# wait=True passes Compose's --wait, so a resource is ready only once its healthcheck
+# passes. Compose depends_on entries become Tilt resource dependencies.
+docker_compose('compose.yaml', project_name=project, wait=True)
