@@ -231,6 +231,81 @@ def relevant(text, pattern):
     return bool(pattern) and re.search(pattern, text or "", re.IGNORECASE) is not None
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+# Wording of a resolver/registry/package manager refusing a request. Docker's pre-pull
+# "Unable to find image 'x' locally" is progress, not a refusal, and is deliberately absent.
+BAD_CONFIG_REFUSAL = (
+    r"not[ _-]?found|no manifest|manifest unknown|\bmissing\b|"
+    r"could ?n[o']t (?:be )?(?:find|resolve|locate|solve)|cannot (?:be )?(?:find|resolve|locate|solve)|"
+    r"can't (?:find|resolve)|unable to (?:resolve|locate|solve)|failed to (?:resolve|solve)|"
+    r"could not be resolved|resolve_?error|resolve_failed|"
+    r"no (?:release|version|candidates?|match(?:ing|es)?|interpreter found|such (?:package|attribute|version|image|tag))|"
+    r"does ?n[o']t exist|unsatisfiable|invalid (?:version|tag|reference)|connection refused")
+
+# Environment prerequisites that fail before any registry/resolver can judge the request:
+# credential helpers, registry auth/rate limits, DNS/TLS/proxy/remote network faults.
+# Dials to loopback are excluded: an unreachable local endpoint can itself be the bad config.
+BAD_CONFIG_PREREQUISITE = (
+    r"error getting credentials|credential[s]?[ -]?helper|docker-credential-|credsstore|"
+    r"unauthorized|authentication required|toomanyrequests|rate limit|"
+    r"no such host|name resolution|could ?n[o']t resolve host|temporary failure|"
+    r"i/o timeout|tls handshake|x509:|certificate (?:verify failed|signed by unknown)|"
+    r"network is unreachable|no route to host|connection reset|proxyconnect|unable to download|"
+    r"dial tcp:? (?!127\.|\[::1\]|localhost)")
+
+# A refusal phrase that is grammatically unfinished at end of line, so the tool wrapped its
+# object onto the next line (Pixi: "No candidates were found for\n      postgresql 99.99.99.*.").
+# Only these phrases may borrow the tag from a continuation; a complete diagnostic never does.
+BAD_CONFIG_UNFINISHED = r"\bno candidates? (?:were |was )?found for\s*$"
+
+# The continuation itself must be just "<package> <version>": an indented package name, then a
+# version-like token, then nothing but closing punctuation. A fresh progress/argv/log record
+# ("Pulling postgres:99", 'Command: [...]', "INFO ...", a timestamp) is never a continuation.
+BAD_CONFIG_CONTINUATION = (
+    r"^\s+(?![\d\[\"'(])"
+    r"(?!(?:pull(?:ing|ed)?|download(?:ing|ed)?|image|processing|command|step|"
+    r"error|warn(?:ing)?|info|debug|trace|fatal)\b)"
+    r"[A-Za-z][\w.+/-]*(?:\s+|==?|@)v?\d[\w.*+-]*[.,;]?$")
+
+
+def bad_config_evidence(streams, tag, refusal=BAD_CONFIG_REFUSAL, prerequisite=BAD_CONFIG_PREREQUISITE):
+    """Classify one refused step's output for the invalid-version scenario.
+
+    Returns ("intended", line), ("prerequisite", line) or (None, "").
+    A line is intended evidence only when refusal wording and the requested tag occur on the
+    same line, or the line ends in a recognized unfinished refusal phrase (BAD_CONFIG_UNFINISHED)
+    and the tag is on the next line's indented "<package> <version>" continuation. The tag
+    in progress/argv/config echo text alone never counts. A prerequisite line (credentials,
+    network) is never intended evidence even if it names the tag. Each stream's LAST such
+    diagnostic is its terminal one; any terminal prerequisite blocks the scenario."""
+    if not tag:
+        return None, ""
+    terminal = []
+    for text in streams:
+        lines = [ANSI.sub("", line).rstrip() for line in (text or "").splitlines()]
+        last = None
+        for i, line in enumerate(lines):
+            if re.search(prerequisite, line, re.IGNORECASE):
+                last = ("prerequisite", line.strip())
+                continue
+            if not re.search(refusal, line, re.IGNORECASE):
+                continue
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            wrapped = bool(re.search(BAD_CONFIG_UNFINISHED, line, re.IGNORECASE)
+                           and re.search(BAD_CONFIG_CONTINUATION, nxt, re.IGNORECASE)
+                           and not re.search(prerequisite, nxt, re.IGNORECASE))
+            if re.search(tag, line, re.IGNORECASE) or (wrapped and re.search(tag, nxt, re.IGNORECASE)):
+                last = ("intended", (line.strip() + (" " + nxt.strip() if wrapped else "")).strip())
+        if last:
+            terminal.append(last)
+    for kind in ("prerequisite", "intended"):
+        hit = next((t for t in terminal if t[0] == kind), None)
+        if hit:
+            return hit
+    return None, ""
+
+
 def conflict_pattern(port):
     """Default evidence that a failure is about the occupied port, not something else: an
     address-in-use error, or conflict wording within a short distance of the port number.

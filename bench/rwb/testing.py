@@ -177,9 +177,11 @@ class FakeTransport:
             out = "45999\n"
         err = ""
         if label == "d-setup-invalid":
-            # A well-behaved tool names the bad request; echo the breaking recipe as the tool would.
+            # A well-behaved tool's refusal line names the bad request: refuse each line of the
+            # breaking recipe, so every adapter's own tag pattern sits on a refusal line.
             breaker = self.world.scenario.ad.break_config(self.world.scenario.co["d"]) if self.world.scenario else ""
-            err = f"error: cannot resolve postgres@99.99.99 (image postgres:99.99.99 not found)\n{breaker}\n"
+            err = "error: cannot resolve postgres@99.99.99 (image postgres:99.99.99 not found)\n" + "".join(
+                f"error: requested version not found: {line}\n" for line in breaker.splitlines())
         elif label.endswith("-instance-identity") and co and code == 0 and not out:
             name = co.group(1)
             out = json.dumps(dict(checkout=name, containers=[f"ctr-{name}-{self.world.generation.get(name, 0)}"])) + "\n"

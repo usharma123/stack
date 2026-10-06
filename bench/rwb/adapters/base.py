@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import shlex
 
+from ..verify import BAD_CONFIG_PREREQUISITE, BAD_CONFIG_REFUSAL
+
 BENCH = Path(__file__).resolve().parents[2]
 q = shlex.quote
 
@@ -117,7 +119,11 @@ class Adapter:
     entry_auto_resumes = False
     # Output evidence that checkout D's setup/start refused the deliberately bad version
     # (an unrelated nonzero exit is never counted as the intended rejection).
+    # The requested tag alone is not enough: it must sit on a terminal refusal line matching
+    # bad_config_refusal, and credential/network lines (bad_config_prerequisite) block instead.
     bad_config_pattern = r"99\.99\.99|postgresql_99"
+    bad_config_refusal = BAD_CONFIG_REFUSAL
+    bad_config_prerequisite = BAD_CONFIG_PREREQUISITE
 
     def __init__(self, options=None, variant=None, run_id="dryrun"):
         self.options = options or {}

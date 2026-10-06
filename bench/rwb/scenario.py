@@ -480,10 +480,15 @@ class Scenario:
         after = self.run("d-procs-after", "verify", self.ad.service_processes())
         steps = [r for r in (setup, start) if r is not None]
         kinds = [verify.refusal(r.code, r.timed_out) for r in steps]
-        # The refusal must be the intended one: its output names the bad version/package.
+        # The refusal must be the intended one: a terminal refusal line naming the bad
+        # version/package. The tag in progress/argv text, or behind a credential/network
+        # failure, is not evidence that the tool or registry rejected it.
         pattern = self.ad.bad_config_pattern
-        intended = any(k == "refused" and verify.relevant(r.stdout + "\n" + r.stderr, pattern)
-                       for k, r in zip(kinds, steps))
+        found = [verify.bad_config_evidence((r.stdout, r.stderr), pattern, self.ad.bad_config_refusal,
+                                            self.ad.bad_config_prerequisite)
+                 for k, r in zip(kinds, steps) if k == "refused"]
+        prerequisite = next((line for kind, line in found if kind == "prerequisite"), None)
+        intended = prerequisite is None and any(kind == "intended" for kind, _ in found)
         leaked = len(after.stdout.splitlines()) > len(before.stdout.splitlines())
         if start is not None:
             self.started.add("d")
@@ -491,6 +496,11 @@ class Scenario:
         codes = f"setup exit {setup.code}" + (f", start exit {start.code}" if start else "")
         if "infra" in kinds or not (before.ok and after.ok):
             self.add("bad_config", "blocked", self.mode("lockfile"), f"infrastructure fault: {codes}", evidence)
+            return
+        if prerequisite is not None:
+            self.add("bad_config", "blocked", self.mode("lockfile"),
+                     f"{codes}: environment prerequisite failed before the intended refusal: {prerequisite[:200]}",
+                     evidence)
             return
         if "refused" in kinds and not intended:
             # Something failed, but not because of the bad version: no evidence either way.
