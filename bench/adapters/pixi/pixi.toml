@@ -1,0 +1,27 @@
+# Pixi 0.81.0 recipe (bench/research/pixi.md). Pixi resolves and locks Python, PostgreSQL,
+# Redis (conda-forge) and the app's PyPI dependencies natively (one pixi.lock, no uv).
+# Service lifecycle is project scripting: tasks call the benchmark's _shared/rwb-services.sh.
+# Single platform: this lane measures linux-aarch64 only (a multi-platform lock solves more).
+[workspace]
+name = "rwbapp"
+channels = ["conda-forge"]
+platforms = ["linux-aarch64"]
+requires-pixi = "==0.81.0"
+
+[dependencies]
+python = "3.13.15.*"
+postgresql = "17.11.*"
+redis-server = "8.10.2.*"
+
+# Same top-level pins as fixtures/app/pyproject.toml; Pixi resolves the transitive set.
+[pypi-dependencies]
+psycopg = { version = "==3.3.6", extras = ["binary"] }
+redis = "==8.1.0"
+pytest = "==9.1.1"
+
+[tasks]
+# Run an arbitrary command (RWB_BODY) in the environment with the checkout's endpoints.
+rwb = "bash rwb-pixi-run.sh"
+up = "bash rwb-services.sh up"
+down = "bash rwb-services.sh down"
+services-status = "bash rwb-services.sh status"
