@@ -22,9 +22,19 @@ OWNER_LABEL = "rwb.owner=stack-realworld-bench"
 NAME = re.compile(r"^rwb-[a-z0-9-]+$")
 
 # Body runs in a subshell so `exit` inside it is captured. $$ is the session id because
-# the wrapper runs under `setsid -w`; the harness kills that group on timeout.
+# the wrapper runs under `setsid -w`; the harness kills that group on timeout. $2 is the
+# transport-chosen per-step registration directory: the executing user creates it exclusively
+# (mode 0700, no -p, so an existing directory or symlink is rejected) and the body never runs
+# unless its PID was recorded there. Root and agent steps therefore never share a directory.
 WRAPPER = r'''
-mkdir -p /tmp/rwb-pids && echo $$ > "/tmp/rwb-pids/$2"
+(
+  umask 077
+  mkdir -m 700 -- "$2" || exit 1
+  printf '%s\n' "$$" > "$2/pid" || exit 1
+) || {
+  echo 'RWB-TRANSPORT-ERROR: pid registration failed' >&2
+  exit 126
+}
 __rwb_s=${EPOCHREALTIME/./}
 ( eval "$1" )
 __rwb_rc=$?
@@ -33,6 +43,37 @@ if [ -n "$__rwb_s" ]; then
   printf '\n@@RWB-INNER %s000 %s000 %s\n' "$__rwb_s" "$__rwb_e" "$__rwb_rc" >&2
 fi
 exit $__rwb_rc
+'''
+
+# Timeout cleanup for one step, given that step's exact registration directory as $1. Only a
+# single numeric PID >= 2 (no leading zero) is accepted, so a missing, empty or malformed file
+# can never become `kill -- -0`/`-1` or a glob. A group that already exited is reported, not
+# treated as an error; Linux does not reuse a PID while it is still a live process-group id.
+TIMEOUT_KILL = r'''
+d=$1
+f="$d/pid"
+if [ -L "$d" ] || [ ! -d "$d" ] || [ -L "$f" ] || [ ! -f "$f" ] || [ ! -r "$f" ]; then
+  echo "RWB-TIMEOUT-CLEANUP: no pid registration at $f" >&2
+  exit 3
+fi
+p=$(< "$f")
+case "$p" in
+  ''|0*|*[!0-9]*) echo "RWB-TIMEOUT-CLEANUP: malformed pid in $f" >&2; exit 4 ;;
+esac
+if [ "${#p}" -gt 9 ] || [ "$p" -lt 2 ]; then
+  echo "RWB-TIMEOUT-CLEANUP: invalid pid $p in $f" >&2
+  exit 4
+fi
+if ! kill -0 -- "-$p" 2>/dev/null; then
+  echo "RWB-TIMEOUT-CLEANUP: process group $p already exited"
+  exit 0
+fi
+if kill -KILL -- "-$p"; then
+  echo "RWB-TIMEOUT-CLEANUP: killed process group $p"
+  exit 0
+fi
+echo "RWB-TIMEOUT-CLEANUP: could not kill process group $p" >&2
+exit 5
 '''
 
 
@@ -73,6 +114,7 @@ class Runner:
 
 class DockerTransport:
     kind = "docker-exec"
+    PID_ROOT = "/tmp"
 
     def __init__(self, recorder, run_id, tool, image, mounts, user="agent", runner=None,
                  docker="docker", resources=()):
@@ -110,20 +152,31 @@ class DockerTransport:
         self.created = True
         return result
 
+    def pid_dir(self, seq):
+        """Exact per-step registration directory directly under /tmp: owned container name + seq."""
+        return f"{self.PID_ROOT}/rwb-pid-{self.name}-{int(seq)}"
+
     def exec(self, label, phase, body, timeout=600, user=None):
         if not self.created:
             raise RuntimeError("container not started")
         seq = self.recorder.next_seq()
+        pid_dir = self.pid_dir(seq)
         argv = [self.docker, "exec", "-u", user or self.user, "-w", "/tmp", self.name,
-                "setsid", "-w", "bash", "-c", WRAPPER, "rwb", body, str(seq)]
+                "setsid", "-w", "bash", "-c", WRAPPER, "rwb", body, pid_dir]
         started = utc()
         code, out, err, timed_out, ns = self.run(argv, timeout)
+        extra = dict(body=body)
         if timed_out:
-            # Kill only this step's process group inside our own container.
-            self.run([self.docker, "exec", "-u", "root", self.name, "bash", "-c",
-                      f'kill -KILL -- -"$(cat /tmp/rwb-pids/{seq})"'], 30)
+            # Kill only this step's process group inside our own container, read from this
+            # step's exact registration path; the outcome stays on the (still timed-out) step.
+            kill = [self.docker, "exec", "-u", "root", self.name, "bash", "-c", TIMEOUT_KILL,
+                    "rwb-timeout", pid_dir]
+            k_code, k_out, k_err, k_timed_out, _ = self.run(kill, 30)
+            extra["timeout_cleanup"] = dict(argv=kill, exit=k_code, timed_out=k_timed_out,
+                                            stdout=k_out.decode(errors="replace"),
+                                            stderr=k_err.decode(errors="replace"))
         return self.recorder.write(seq, label, phase, argv, self.kind, code, ns, out, err, timed_out,
-                                   started, dict(body=body))
+                                   started, extra)
 
     def copy_out(self, path, dest):
         """Copy a path out of our own container (artifact collection); None if absent."""
@@ -175,10 +228,17 @@ class HostTransport:
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
         return self.exec("artifact-copy", "cleanup", f"cp -R {_q(path)} {_q(str(dest))}", timeout=300)
 
+    def pid_dir(self, seq):
+        """Exact per-step registration directory inside the run-owned workdir."""
+        return str(self.workdir / "pids" / str(int(seq)))
+
     def exec(self, label, phase, body, timeout=600, user=None):
+        pids = self.workdir / "pids"
+        if pids.is_symlink():
+            raise RuntimeError(f"{pids} is a symlink; refusing to register PIDs through it")
+        pids.mkdir(mode=0o700, exist_ok=True)
         seq = self.recorder.next_seq()
-        argv = [self.bash, "-c", WRAPPER.replace('/tmp/rwb-pids', str(self.workdir / "pids")),
-                "rwb", body, str(seq)]
+        argv = [self.bash, "-c", WRAPPER, "rwb", body, self.pid_dir(seq)]
         started = utc()
         code, out, err, timed_out, ns = self.run(argv, timeout, env=self.env, cwd=str(self.workdir))
         return self.recorder.write(seq, label, phase, argv, self.kind, code, ns, out, err,

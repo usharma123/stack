@@ -849,7 +849,7 @@ class TransportSafetyTest(unittest.TestCase):
         self.assertTrue(r.timed_out)
         kill = runner.calls[-1]
         self.assertEqual(kill[:6], ["docker", "exec", "-u", "root", "rwb-toy-run1", "bash"])
-        self.assertIn(f"/tmp/rwb-pids/{r.seq}", kill[-1])
+        self.assertEqual(kill[-1], f"/tmp/rwb-pid-rwb-toy-run1-{r.seq}")
 
     def test_no_global_docker_operations(self):
         tx, runner = self.make("stack-realworld-bench run1")
