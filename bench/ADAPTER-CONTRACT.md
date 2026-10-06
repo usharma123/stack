@@ -1,6 +1,6 @@
 # Adapter contract (stable v1)
 
-Status: stable as of 2026-10-06, core owner Opus implementation agent. Changes to
+Status: stable v1 as of 2026-10-06, with additive hooks below (2026-10-06, core owner), core owner Opus implementation agent. Changes to
 `rwb/adapters/base.py`, `rwb/scenario.py`, `rwb/verify.py`, `rwb/transport.py`, the
 registry, or `fixtures/app` go through the core owner. If an adapter needs a new hook, note
 it in your handoff file; do not edit core modules.
@@ -65,6 +65,17 @@ it. Quote checkout paths with `q()` (`shlex.quote`).
 | `app_source_path(co)` | | where the app process sees co's code (container mount path); `None` skips the path check |
 | `host_env(workdir)`, `cleanup_host()`, `host_resources()` | host | env for host commands; remove / list every resource named with `self.run_id` (e.g. `rwb-<run id>-a`) |
 | `cleanup(co)` | | final scoped teardown, default `stop` |
+| `setup_scope`, `prepare_scope`, `start_scope`, `cache_note` | | strings recorded in meta/summary: what setup/prepare/start cover and the starting cache state. `first_task` starts from a prepared checkout; tool work in `prepare` is excluded from it and reported as `prepare.<co>` |
+| `bad_config_pattern` | | regex the D failure output must match (the bad version/endpoint); an unrelated nonzero exit is `blocked`, never `pass` |
+| `conflict_pattern(port)` | | regex an occupied-port start/readiness failure must match (default: address-in-use, or conflict words near the port; the bare port number is not enough) |
+| `conflict_logs(co)` | | body printing the tool's own service logs/status after a failed scripted readiness in E; only these (or the wait output) can prove detection |
+| `port_map(co)` | | NAT receipt `{"pg":{"published","target"},"redis":{...},"evidence"}` from Docker inspection; required when URL port != server port. Declared but empty/invalid = fail |
+| `occupy(port, pidfile, tag)` / `release(pidfile, tag, port)` | | benchmark listener with run-unique pid file and argv tag; must win the bind; release signals only a pid still running the tag. Legacy `occupy(port, pidfile)` overrides are owner-checked by port |
+| `stop_keeps_data_endpoints` | | shared-server tools: stop decided by stop + `stopped_probe`; after-stop reachability recorded as `stop.a.data_endpoints` (observed) |
+| `entry_auto_resumes` | | entries that restart a stopped project (DDEV): no after-stop app call is made; stop + `stopped_probe` decide |
+| `frozen_setup_starts_services` | | declare when C's frozen setup starts services so C is cleaned up (inferred if the body embeds `start(co)`) |
+| `artifacts(co)` / `diagnostics(co)` | | checkout paths copied, and bodies run, before any teardown; failures never skip teardown |
+| provisioning exit 77 + `RWB-BLOCKED: <reason>` | | prerequisite missing: `provision` and every main check `blocked`, no timings, run stays valid |
 
 `Checkout` fields: `name` (`a`..`e`), `path`, `pg_port`, `redis_port`, `token`, `instance`.
 

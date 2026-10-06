@@ -11,6 +11,7 @@ the host Docker daemon). Only outer_ns exists.
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -33,6 +34,9 @@ if [ -n "$__rwb_s" ]; then
 fi
 exit $__rwb_rc
 '''
+
+
+_q = shlex.quote
 
 
 class OwnershipError(RuntimeError):
@@ -121,6 +125,14 @@ class DockerTransport:
         return self.recorder.write(seq, label, phase, argv, self.kind, code, ns, out, err, timed_out,
                                    started, dict(body=body))
 
+    def copy_out(self, path, dest):
+        """Copy a path out of our own container (artifact collection); None if absent."""
+        probe = self.exec("artifact-probe", "cleanup", f"test -e {_q(path)}", timeout=30)
+        if not probe.ok:
+            return None
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        return self._docker("artifact-copy", "cleanup", ["cp", f"{self.name}:{path}", str(dest)], timeout=300)
+
     def verify_owned(self):
         """Refuse to touch a container unless it carries this run's labels."""
         code, out, _, _, _ = self.run([self.docker, "inspect", "--format",
@@ -155,6 +167,13 @@ class HostTransport:
     def __init__(self, recorder, workdir, env=None, runner=None, bash="bash"):
         self.recorder, self.workdir, self.env, self.bash = recorder, Path(workdir), env, bash
         self.run = runner or Runner()
+
+    def copy_out(self, path, dest):
+        """Copy a host path (inside the run-owned workdir) into the results; None if absent."""
+        if not Path(path).exists():
+            return None
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        return self.exec("artifact-copy", "cleanup", f"cp -R {_q(path)} {_q(str(dest))}", timeout=300)
 
     def exec(self, label, phase, body, timeout=600, user=None):
         seq = self.recorder.next_seq()

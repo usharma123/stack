@@ -12,6 +12,16 @@ import shlex
 BENCH = Path(__file__).resolve().parents[2]
 q = shlex.quote
 
+# Portable SHA-256 (GNU coreutils in Linux images, `shasum` on a macOS host transport).
+SHA256_FN = ('rwb_sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; '
+             'else shasum -a 256 "$@"; fi; }')
+
+
+def sha256_check(expected, path):
+    """Shell lines failing unless the file at path has the expected SHA-256 (any host)."""
+    return (f'{SHA256_FN}; __rwb_h=$(rwb_sha256 {path} | cut -d" " -f1) && '
+            f'if [ "$__rwb_h" != {q(expected)} ]; then echo "sha256 mismatch for {path}: $__rwb_h" >&2; exit 1; fi')
+
 # Capabilities compared across tools. Values: native | scripted | unsupported.
 FEATURES = {
     "lockfile": "Committed lock reproduces exact tool versions",
@@ -75,6 +85,29 @@ class Adapter:
     # The canonical in-container location of the read-only bench tree.
     src = "/rwb/src"
     timeouts = dict(setup=1800, start=300, step=300)
+    # What this adapter's setup() covers. Setup commands differ in scope between tools (Stack
+    # `compile` only resolves; tools install at `up`), so the bare setup timing is never a
+    # cross-tool comparison; the end-to-end first-task timing is. Recorded in meta/summary.
+    setup_scope = ""
+    # Cache/image state the run starts from (e.g. a prebuilt image with a warm Nix store).
+    # "first checkout" means first in this run, not a universal cold install.
+    cache_note = "image caches not cleared; first-checkout timings may include preseeded caches"
+    # What prepare() does besides benchmark glue (fixture copy, config copy, source token).
+    # first_task starts from a PREPARED checkout, so tool operations listed here (e.g. native
+    # worktree creation) are excluded from it; their time is reported as prepare.<co>.
+    prepare_scope = "benchmark glue only: fixture + tool config copy, source token"
+    # What start() covers when it is more than launching processes (e.g. a PTY driver plus
+    # readiness wait): reported with ready.<co> so it is not read as bare start latency.
+    start_scope = ""
+    # isola-style tools: stop ends the checkout's processes, but its data endpoints stay
+    # reachable by design (shared servers), so the app is not required to fail after stop.
+    stop_keeps_data_endpoints = False
+    # DDEV-style entries that restart a stopped project: the after-stop app call is skipped
+    # and stop is decided by the stop exit plus stopped_probe() alone.
+    entry_auto_resumes = False
+    # Output evidence that checkout D's setup/start refused the deliberately bad version
+    # (an unrelated nonzero exit is never counted as the intended rejection).
+    bad_config_pattern = r"99\.99\.99|postgresql_99"
 
     def __init__(self, options=None, variant=None, run_id="dryrun"):
         self.options = options or {}
@@ -215,6 +248,36 @@ class Adapter:
         assign ports themselves. None: the configured co.pg_port is used."""
         return None
 
+    def artifacts(self, co):
+        """Checkout-relative paths (files or directories, e.g. service logs) copied into the
+        result directory at the end of the run, before teardown. Missing paths are skipped."""
+        return ()
+
+    def diagnostics(self, co):
+        """[(name, body)] run for each started checkout before teardown (e.g. `compose logs`).
+        Output is kept as raw step logs; exit codes never change an outcome."""
+        return []
+
+    def conflict_logs(self, co):
+        """Optional body printing the tool's own service logs/status after a failed scripted
+        readiness in the occupied-port case (e.g. `flox services logs`). A readiness failure
+        counts as detection only if this output (or the wait's) names the conflict."""
+        return None
+
+    def port_map(self, co):
+        """Optional body printing a JSON port-mapping receipt, for tools whose app reaches
+        services through NAT (a host app on a Docker published port). Shape:
+        {"pg": {"published": P, "target": T}, "redis": {...}, "evidence": "<container id>"}
+        built from `docker inspect`/`docker port` of the checkout's own containers. Without
+        it, the URL port must equal the port the server reports. Run after each identity."""
+        return None
+
+    def conflict_pattern(self, port):
+        """Regex that a start/readiness failure's output must match to count as detecting
+        the occupied port (default: the port number or an address-in-use message)."""
+        from rwb.verify import conflict_pattern
+        return conflict_pattern(port)
+
     def stopped_probe(self, co, identity):
         """Body that exits 0 once co's services are gone. Default: its URL ports refuse.
         Shared-server (database boundary) or container adapters override this."""
@@ -225,10 +288,34 @@ class Adapter:
         return (f"for i in $(seq 1 150); do (exec 3<>/dev/tcp/127.0.0.1/{int(port)}) 2>/dev/null || exit 0; "
                 f"sleep 0.2; done; echo 'port {int(port)} still accepting' >&2; exit 1")
 
-    def occupy(self, port, pidfile):
-        """Start a benchmark-owned listener on port (bad-startup scenario)."""
-        return (f"setsid nohup nc -lk 127.0.0.1 {int(port)} >/dev/null 2>&1 < /dev/null & echo $! > {q(pidfile)}; "
-                f"for i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/{int(port)}) 2>/dev/null && exit 0; sleep 0.1; done; exit 1")
+    def occupy(self, port, pidfile, tag):
+        """Start a benchmark-owned listener on port (bad-startup scenario). Its argv[0] is the
+        run-unique tag so cleanup can confirm ownership before signalling the recorded pid."""
+        listener = (f"if command -v nc >/dev/null 2>&1; then exec -a {q(tag)} nc -lk 127.0.0.1 {int(port)}; "
+                    f"else exec -a {q(tag)} python3 -c 'import socket,sys,time; s=socket.socket(); "
+                    f"s.bind((\"127.0.0.1\", int(sys.argv[1]))); s.listen(16); time.sleep(86400)' {int(port)}; fi")
+        return (f"set -e; mkdir -p \"$(dirname {q(pidfile)})\"; test ! -e {q(pidfile)}; "
+                f"launch=nohup; command -v setsid >/dev/null 2>&1 && launch=setsid; "
+                f"$launch bash -c {q(listener)} >/dev/null 2>&1 < /dev/null & echo $! > {q(pidfile)}; set +e; "
+                f"for i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/{int(port)}) 2>/dev/null && break; sleep 0.1; done; "
+                # The port answering is not enough (someone else may hold it): our listener must
+                # still be alive, i.e. it won the bind.
+                f"sleep 0.3; kill -0 \"$(cat {q(pidfile)})\" 2>/dev/null && "
+                f"(exec 3<>/dev/tcp/127.0.0.1/{int(port)}) 2>/dev/null || "
+                f"{{ echo 'benchmark listener did not take port {int(port)}' >&2; exit 1; }}")
+
+    def release(self, pidfile, tag, port=None):
+        """Stop the listener recorded in pidfile only if that pid still runs our tagged argv.
+
+        `port` (legacy adapters whose occupy() takes no tag): the pid's argv must instead name
+        that port; the pid file itself is run-unique, so a reused pid is still refused."""
+        owned = f"{q(tag)}|{q(tag)}\\ *" + (f"|*\\ {int(port)}|*\\ {int(port)}\\ *" if port else "")
+        return (f"test -f {q(pidfile)} || exit 0; pid=$(cat {q(pidfile)}); "
+                f"args=$(ps -o args= -p \"$pid\" 2>/dev/null) || {{ rm -f {q(pidfile)}; echo \"listener $pid already gone\"; exit 0; }}; "
+                f"case \"$args\" in {owned}) ;; *) echo \"pid $pid is not our listener ($args); not signalled\"; rm -f {q(pidfile)}; exit 0;; esac; "
+                f"kill \"$pid\"; for i in $(seq 1 50); do kill -0 \"$pid\" 2>/dev/null || break; sleep 0.1; done; "
+                f"if kill -0 \"$pid\" 2>/dev/null; then echo \"listener $pid survived SIGTERM\" >&2; exit 1; fi; "
+                f"rm -f {q(pidfile)}; echo \"released listener $pid\"")
 
     # ---- application commands, identical for every tool ------------------------------
     def app_dir(self, co):

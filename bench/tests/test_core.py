@@ -3,6 +3,7 @@
 python3 -m unittest discover -s bench/tests -v
 """
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -193,7 +194,7 @@ class ScenarioTest(unittest.TestCase):
         self.assertFalse(any(v["status"] == "fail" for v in out.values()))
 
     def test_tool_failure_is_result_not_error(self):
-        out, _ = run_fake(Toy(), lambda w: w.fail.add("a-setup-cold"))
+        out, _ = run_fake(Toy(), lambda w: w.fail.add("a-setup"))
         self.assertEqual(out["setup.a"]["status"], "fail")
         self.assertNotIn("error", {v["status"] for v in out.values()})
 
@@ -304,7 +305,7 @@ class ScenarioTest(unittest.TestCase):
             out, tx = run_fake(Toy(), lambda w, co=co: w.codes.update({f"{co}-prepare": (1, False)}))
             self.assertEqual(out[f"prepare.{co}"]["status"], "fail", co)
             self.assertEqual(out[check]["status"], "blocked", co)
-            self.assertFalse(any(c[0] == f"{co}-setup-cold" or c[0] == f"{co}-setup-warm" for c in tx.calls), co)
+            self.assertFalse(any(c[0] == f"{co}-setup" for c in tx.calls), co)
 
     def test_r1_9_missing_container_receipt_fails_isolation(self):
         class Containers(Toy):
@@ -330,6 +331,368 @@ class ScenarioTest(unittest.TestCase):
             o.add("x", "pass")
         with self.assertRaises(ValueError):
             o.add("y", "great")
+
+
+class ParentFindingsTest(unittest.TestCase):
+    """Parent findings after Astra round 1 (IMPLEMENTATION.md, "Parent findings P1-P4")."""
+
+    def test_p1_nat_port_requires_valid_mapping_receipt(self):
+        nat = ident(port=5432, rport=6379)
+        nat["urls"] = dict(database="postgresql://u@127.0.0.1:55001/d", redis="redis://127.0.0.1:56001/0")
+        self.assertTrue(verify.identity_problems(nat))                      # no receipt: rejected
+        good = dict(pg=dict(published=55001, target=5432), redis=dict(published=56001, target=6379),
+                    evidence="container 1234abcd")
+        self.assertEqual(verify.identity_problems(nat, port_map=good), [])
+        wrong = dict(good, pg=dict(published=55002, target=5432))         # maps a different port
+        self.assertTrue(verify.identity_problems(nat, port_map=wrong))
+        for broken in (None, "exit 1", {}, dict(good, evidence=""), dict(good, redis=dict(published="56001", target=6379))):
+            self.assertTrue(verify.identity_problems(nat, port_map=broken if broken is not None else {}), broken)
+
+    def test_p1_scenario_runs_port_map_and_fails_closed(self):
+        class Nat(Toy):
+            def port_map(self, co): return f"inspect {co.name}"
+        def fault(r):
+            if r.label == "a-port-map":
+                r.code, r.stdout = 1, ""
+        out, tx = run_fake(Nat(), ScenarioTest.inject(fault))
+        self.assertIn("a-port-map", [c[0] for c in tx.calls])
+        self.assertEqual(out["start.a"]["status"], "fail")
+
+    def test_p1_declared_port_map_without_receipt_fails_even_if_ports_match(self):
+        class Nat(Toy):
+            def port_map(self, co): return f"inspect {co.name}"
+        out, _ = run_fake(Nat())
+        self.assertEqual(out["start.a"]["status"], "pass")          # fake prints a valid receipt
+        def silent(r):
+            if r.label == "a-port-map":
+                r.stdout = ""
+        out, _ = run_fake(Nat(), ScenarioTest.inject(silent))
+        self.assertEqual(out["start.a"]["status"], "fail")
+        self.assertIn("port map", out["start.a"]["detail"])
+
+    def test_p1_nat_lane_with_real_mapping_passes_full_scenario(self):
+        """URL port != server port, proven by a valid Docker mapping: every checkpoint passes."""
+        import json as _json
+        class Nat(Toy):
+            def port_map(self, co): return f"docker inspect {co.name}"
+        def nat(r):
+            if r.label.endswith("-identity") or r.label.endswith("-check") or "after-a-stop" in r.label:
+                try:
+                    p = _json.loads(r.stdout)
+                except ValueError:
+                    return
+                res = p.get("result") or {}
+                if "urls" in res:
+                    res["urls"]["database"] = res["urls"]["database"].replace(f":{res['pg']['port']}/", f":{res['pg']['port'] + 10000}/")
+                    res["urls"]["redis"] = res["urls"]["redis"].replace(f":{res['redis']['port']}/", f":{res['redis']['port'] + 10000}/")
+                    r.stdout = _json.dumps(p)
+            if r.label.endswith("-port-map") and r.stdout:
+                m = _json.loads(r.stdout)
+                m["pg"]["published"] += 10000
+                m["redis"]["published"] += 10000
+                r.stdout = _json.dumps(m)
+        out, _ = run_fake(Nat(), ScenarioTest.inject(nat))
+        self.assertEqual(out["start.a"]["status"], "pass", out["start.a"]["detail"])
+        self.assertEqual(out["isolation"]["status"], "pass")
+        def wrong_target(r):
+            nat(r)
+            if r.label == "a-port-map":
+                m = _json.loads(r.stdout)
+                m["pg"]["target"] += 1
+                r.stdout = _json.dumps(m)
+        out, _ = run_fake(Nat(), ScenarioTest.inject(wrong_target))
+        self.assertEqual(out["start.a"]["status"], "fail")
+
+    def test_p2_listener_pidfile_is_run_unique_and_released_by_owner_check(self):
+        out, tx = run_fake(Toy())
+        occupy = next(b for label, _, b in tx.calls if label == "e-occupy-port")
+        release = next(b for label, _, b in tx.calls if label == "release-listener")
+        self.assertNotIn("/tmp/rwb-squat-45999.pid", occupy)
+        self.assertIn("rwb-squat-dryrun-e", occupy)
+        self.assertIn("ps -o args=", release)
+
+    def test_p2_legacy_occupy_override_still_owner_checked_by_port(self):
+        class Legacy(Toy):
+            def occupy(self, port, pidfile): return f"listen {port} {pidfile}"
+        out, tx = run_fake(Legacy())
+        release = next(b for label, _, b in tx.calls if label == "release-listener")
+        self.assertIn(str(Toy().checkout("e", 4).pg_port), release)
+        self.assertNotIn("error", {v["status"] for v in out.values()})
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("ps"), "needs bash and ps")
+    def test_p2_release_never_signals_a_foreign_pid(self):
+        import subprocess
+        foreign = subprocess.Popen(["bash", "-c", "exec -a someone-else sleep 30"], start_new_session=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pidfile = f"{tmp}/p.pid"
+                Path(pidfile).write_text(str(foreign.pid))
+                body = Toy().release(pidfile, "rwb-squat-run1-e")
+                r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0)
+                self.assertIn("not our listener", r.stdout)
+                self.assertIsNone(foreign.poll())              # still alive
+        finally:
+            foreign.kill()
+            foreign.wait()
+
+    @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs a sha256 tool")
+    def test_p3_hash_helpers_work_without_sha256sum(self):
+        import hashlib
+        import subprocess
+        from rwb.adapters.base import SHA256_FN, sha256_check
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "lock"
+            target.write_bytes(b"pinned\n")
+            digest = hashlib.sha256(b"pinned\n").hexdigest()
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            for tool in ("shasum", "cut", "perl"):   # macOS-like PATH: no sha256sum
+                if shutil.which(tool):
+                    (bindir / tool).symlink_to(shutil.which(tool))
+            if not (bindir / "shasum").exists():
+                self.skipTest("no shasum on this host")
+            env = {"PATH": str(bindir)}
+            bash = shutil.which("bash")
+            r = subprocess.run([bash, "-c", f"{SHA256_FN}; rwb_sha256 {target}"], env=env, capture_output=True, text=True)
+            self.assertEqual(r.stdout.split()[0], digest, r.stderr)
+            ok = subprocess.run([bash, "-c", sha256_check(digest, str(target))], env=env, capture_output=True)
+            bad = subprocess.run([bash, "-c", sha256_check("0" * 64, str(target))], env=env, capture_output=True)
+            self.assertEqual((ok.returncode, bad.returncode != 0), (0, True))
+
+    def test_p4_bad_config_unrelated_failure_is_not_a_pass(self):
+        out, _ = run_fake(Toy(), lambda w: w.outputs.update({"d-setup-invalid": ("", "network unreachable\n")}))
+        self.assertEqual(out["bad_config"]["status"], "blocked")
+        out, _ = run_fake(Toy())
+        self.assertEqual(out["bad_config"]["status"], "pass")
+
+    def test_p4_occupied_port_needs_conflict_diagnostic(self):
+        unrelated = lambda w: (w.codes.update({"e-start": (1, False)}),
+                               w.outputs.update({"e-start": ("", "cannot resolve postgres@99.99.99\n")}))
+        out, _ = run_fake(Toy(), unrelated)
+        self.assertEqual(out["occupied_port"]["status"], "fail")
+        self.assertIn("without-conflict-diagnostic", out["occupied_port"]["detail"])
+        port = Toy().checkout("e", 4).pg_port
+        named = lambda w: (w.codes.update({"e-start": (1, False)}),
+                           w.outputs.update({"e-start": ("", f"port {port} is already in use\n")}))
+        out, _ = run_fake(Toy(), named)
+        self.assertEqual(out["occupied_port"]["status"], "pass")
+        silent_ready = lambda w: (w.codes.update({"e-ready": (1, False)}), w.outputs.update({"e-ready": ("", "")}))
+        out, _ = run_fake(Toy(), silent_ready)
+        self.assertEqual(out["occupied_port"]["status"], "fail")
+
+    def test_p4_port_listed_in_an_unrelated_failure_is_not_a_conflict_diagnostic(self):
+        # smoke-stack-5 seq 66: `stack up` failed at stop_previous; its receipt lists the planned
+        # port in compile details. That must not read as detecting the occupied port.
+        receipt = ('{"ok":false,"error":{"code":"stop_failed","message":"mise daemons stop failed","details":'
+                   '[{"output":"mise ERROR no matching project daemons"},{"steps":[{"step":"compile","status":"ok",'
+                   '"detail":{"ports":{"postgres":43560,"redis":48122}}}]}]}}')
+        self.assertFalse(verify.relevant(receipt, verify.conflict_pattern(43560)))
+        self.assertTrue(verify.relevant("could not bind IPv4 address: Address already in use",
+                                        verify.conflict_pattern(43560)))
+
+    def test_p4_scripted_readiness_timeout_needs_conflict_evidence(self):
+        class Scripted(Toy):
+            def ready(self, co): return None
+            def conflict_logs(self, co): return "tool logs"
+        port = Scripted().checkout("e", 4).pg_port
+        def unreachable(w):
+            w.share_with["e"] = "zz"  # e's app reaches nothing
+        out, _ = run_fake(Scripted(), unreachable)
+        self.assertEqual(out["occupied_port"]["status"], "fail")
+        def logged(w):
+            unreachable(w)
+            w.outputs["e-conflict-logs"] = (f"FATAL: could not bind IPv4 address 127.0.0.1:{port}: Address already in use", "")
+        out, _ = run_fake(Scripted(), logged)
+        self.assertEqual(out["occupied_port"]["status"], "pass")
+        self.assertEqual(out["occupied_port"]["detail"], "detected-at-readiness")
+
+    def test_first_task_timing_only_when_verified(self):
+        rec, world = FakeRecorder(), FakeWorld()
+        sc = Scenario(Toy(), FakeTransport(rec, Toy(), world), rec, repeats=1, warmups=0)
+        world.scenario = sc
+        sc.execute()
+        task = sc.timings["first_task.a"]
+        self.assertTrue(task["ok"])
+        labels = {r.label for r in rec.results if r.seq in task["steps"]}
+        self.assertTrue({"a-setup", "a-start", "a-deps", "a-migrate", "a-crud", "a-pytest"} <= labels)
+        self.assertFalse(labels & {"a-lock-hash", "a-tool-versions", "a-migrate-again"})
+        self.assertIn("setup.first_checkout", sc.timings)
+        self.assertNotIn("setup.cold", sc.timings)
+        rec, world = FakeRecorder(), FakeWorld()
+        sc = Scenario(Toy(), FakeTransport(rec, Toy(), world), rec, repeats=1, warmups=0)
+        world.scenario = sc
+        world.fail.add("a-pytest")
+        sc.execute()
+        self.assertFalse(sc.timings["first_task.a"]["ok"])
+
+    def test_frozen_copy_needs_nonempty_matching_version_lines(self):
+        def empty(r):
+            if r.label == "c-tool-versions":
+                r.stdout = ""
+        out, _ = run_fake(Toy(), ScenarioTest.inject(empty))
+        self.assertEqual(out["lock.frozen_copy"]["status"], "fail")
+        def other_path(r):
+            if r.label == "c-tool-versions":
+                r.stdout = "/nix/store/other-python3-env/bin/python3\nPython 3.13.16\n"
+        out, _ = run_fake(Toy(), ScenarioTest.inject(other_path))
+        self.assertEqual(out["lock.frozen_copy"]["status"], "pass")
+        self.assertIn("paths differ", out["lock.frozen_copy"]["detail"])
+
+    def test_c_cleaned_only_when_frozen_setup_starts_services(self):
+        _, tx = run_fake(Toy())
+        self.assertNotIn("c-cleanup", [c[0] for c in tx.calls])
+        class Starts(Toy):
+            def frozen_setup(self, co): return f"toy setup --locked {co.name} && {self.start(co)}"
+        _, tx = run_fake(Starts())
+        self.assertIn("c-cleanup", [c[0] for c in tx.calls])
+
+    def test_first_task_starts_from_prepared_checkout_with_declared_scope(self):
+        class PrepareCreates(Toy):
+            prepare_scope = "native worktree creation"
+        class SetupCreates(Toy):
+            prepare_scope = "fixture repository only; worktree created inside setup"
+        for cls in (PrepareCreates, SetupCreates):
+            rec, world = FakeRecorder(), FakeWorld()
+            sc = Scenario(cls(), FakeTransport(rec, cls(), world), rec, repeats=1, warmups=0)
+            world.scenario = sc
+            sc.execute()
+            task = sc.timings["first_task.a"]
+            labels = {r.label for r in rec.results if r.seq in task["steps"]}
+            self.assertNotIn("a-prepare", labels)
+            self.assertIn("a-setup", labels)
+            self.assertEqual(task["starts_from"], "prepared checkout")
+            self.assertEqual(task["excluded_prepare"], cls.prepare_scope)
+            self.assertIsInstance(sc.timings["prepare.a"], int)
+
+    def test_stop_keeps_data_endpoints_hook(self):
+        class Shared(Toy):
+            stop_keeps_data_endpoints = True
+        def reachable(r):
+            if r.label == "a-after-stop":
+                r.code = 0
+        out, _ = run_fake(Shared(), ScenarioTest.inject(reachable))
+        self.assertEqual(out["stop.a"]["status"], "pass")
+        out, _ = run_fake(Toy(), ScenarioTest.inject(reachable))
+        self.assertEqual(out["stop.a"]["status"], "fail")
+
+    def test_provision_exit_77_is_blocked_everywhere(self):
+        from rwb.scenario import ProvisionBlocked
+        class Gated(Toy):
+            def provision(self): return [("provision-x", "probe", None)]
+        rec, world = FakeRecorder(), FakeWorld()
+        sc = Scenario(Gated(), FakeTransport(rec, Gated(), world), rec, repeats=1, warmups=0)
+        world.scenario = sc
+        world.codes["provision-x"] = (77, False)
+        world.outputs["provision-x"] = ("", "RWB-BLOCKED: no verified digest\n")
+        with self.assertRaises(ProvisionBlocked) as ctx:
+            sc.execute()
+        self.assertIn("no verified digest", str(ctx.exception))
+        sc.block_all(str(ctx.exception))
+        statuses = {o["check"]: o["status"] for o in sc.out.as_list()}
+        self.assertEqual(statuses["provision"], "blocked")
+        self.assertTrue(all(v == "blocked" for v in statuses.values()))
+        self.assertNotIn("a-setup", [r.label for r in rec.results])
+
+
+class TeardownTest(unittest.TestCase):
+    """Artifacts are copied before teardown; no copy/diagnostic failure can skip teardown."""
+
+    class Logged(Toy):
+        transport = "host"
+        def artifacts(self, co): return ("svc.log",)
+        def diagnostics(self, co): return [("logs", "toy logs")]
+        def cleanup_host(self): return "toy host cleanup"
+
+    def scenario(self, raises=False):
+        import run
+        adapter = self.Logged()
+        adapter.root = "/tmp/rwb-teardown"
+        rec, world = FakeRecorder(), FakeWorld()
+        tx = FakeTransport(rec, adapter, world)
+        sc = Scenario(adapter, tx, rec, repeats=1, warmups=0)
+        world.scenario = sc
+        sc.execute()
+        world.files = {f"{sc.co[c].path}/svc.log" for c in "abcde"}
+        world.copy_raises = raises
+        meta = {}
+        problems = run.teardown(sc, adapter, tx, Path(tempfile.mkdtemp()), meta)
+        return tx, meta, problems
+
+    def test_artifact_copied_before_its_checkout_is_cleaned(self):
+        tx, meta, problems = self.scenario()
+        labels = [c[0] for c in tx.calls]
+        first_cleanup = next(i for i, l in enumerate(labels) if l.endswith("-cleanup"))
+        copies = [i for i, l in enumerate(labels) if l == "artifact-copy"]
+        self.assertTrue(copies and max(copies) < first_cleanup)
+        self.assertLess(labels.index("a-diag-logs"), min(copies))
+        self.assertTrue(any(a["checkout"] == "a" and a["ok"] for a in meta["artifacts"]))
+        self.assertEqual(problems, [])
+
+    def test_copy_failure_never_skips_teardown(self):
+        tx, meta, problems = self.scenario(raises=True)
+        labels = [c[0] for c in tx.calls]
+        self.assertIn("a-cleanup", labels)
+        self.assertIn("host-cleanup", labels)
+        self.assertTrue(any("artifact copy raised" in e for e in meta["artifact_errors"]))
+
+
+class HookBehaviourTest(unittest.TestCase):
+    def test_entry_auto_resumes_never_calls_app_after_stop(self):
+        class Resumes(Toy):
+            entry_auto_resumes = True
+        def guard(r):
+            if r.label == "a-after-stop":
+                raise AssertionError("after-stop entry would restart the project")
+        out, tx = run_fake(Resumes(), ScenarioTest.inject(guard))
+        self.assertEqual(out["stop.a"]["status"], "pass")
+        self.assertNotIn("a-after-stop", [c[0] for c in tx.calls])
+        for label, code in (("a-stop", (1, False)), ("a-stopped-probe", (1, False))):
+            out, _ = run_fake(Resumes(), lambda w, l=label, c=code: w.codes.update({l: c}))
+            self.assertEqual(out["stop.a"]["status"], "fail", label)
+        out, _ = run_fake(Resumes(), lambda w: w.codes.update({"a-stopped-probe": (124, True)}))
+        self.assertEqual(out["stop.a"]["status"], "blocked")
+
+    def test_declared_frozen_start_tracks_c_even_without_start_substring(self):
+        class Helper(Toy):
+            frozen_setup_starts_services = True
+            def frozen_setup(self, co): return f"helper-that-starts {co.name}"
+        _, tx = run_fake(Helper())
+        self.assertIn("c-cleanup", [c[0] for c in tx.calls])
+        _, tx = run_fake(Helper(), lambda w: w.codes.update({"c-frozen-setup": (1, False)}))
+        self.assertIn("c-cleanup", [c[0] for c in tx.calls])
+
+
+class RosterTest(unittest.TestCase):
+    FROZEN = ("stack", "mise", "flox", "devbox", "devenv", "nix", "pixi", "compose",
+              "devcontainers", "devpod", "ddev", "lando", "process-compose", "services-flake", "pkgx",
+              "dnvr", "guix", "workz", "worktrunk", "git-grove", "isola", "berth", "branchbox",
+              "tilt", "organist", "vagrant")
+
+    def test_all_26_frozen_adapters_import_and_run_the_contract(self):
+        """SCOPE.md: Stack + 25. available() silently skips missing modules; this does not."""
+        self.assertEqual(len(self.FROZEN), 26)
+        self.assertEqual(set(registry.ADAPTERS), set(self.FROZEN))
+        loaded = {name: registry.load(name)[0] for name in self.FROZEN}  # ImportError fails here
+        self.assertEqual(set(registry.available()), set(self.FROZEN))
+        for name, cls in loaded.items():
+            for variant in cls.variants:
+                adapter = cls({}, variant, "roster")
+                if adapter.transport == "host":
+                    adapter.root = "/tmp/rwb-roster"
+                out, _ = run_fake(adapter)
+                self.assertIn("cleanup.processes", out, name)
+
+
+class SummaryTest(unittest.TestCase):
+    def test_blocked_run_shows_no_timings(self):
+        import run
+        meta = dict(title="T", tool="t", variant="d", run_id="r", valid=True, completed=True, transport="docker",
+                    isolation_boundary="service-instance", errors=[], blocked="provision-x: no digest",
+                    measurement="blocked-prerequisite", timings={})
+        text = run.render_summary(meta, [dict(check="provision", status="blocked", mode="n/a", detail="x")])
+        self.assertIn("BLOCKED", text)
+        self.assertNotIn("first_task", text)
 
 
 class FakeRunner:
@@ -428,6 +791,13 @@ class AdapterContractTest(unittest.TestCase):
                         self.assertTrue((adapter.config_dir() / rel).is_file(), rel)
                     out, tx = run_fake(adapter)
                     self.assertNotIn("error", {v["status"] for v in out.values()})
+                    # A well-behaved fake tool must carry every lane through every checkpoint.
+                    bad = {k: (v["status"], v["detail"][:120]) for k, v in out.items()
+                           if v["status"] in ("fail", "blocked")}
+                    self.assertEqual(bad, {})
+                    for check in ("isolation", "repeat.entry", "stop.a", "lock.frozen_copy", "bad_config",
+                                  "occupied_port", "cleanup.processes"):
+                        self.assertIn(check, out)
                     for label, _, body in tx.calls:
                         self.assertIsInstance(body, str, label)
                         for forbidden in ("docker system prune", "pkill", "killall", "--all-projects"):

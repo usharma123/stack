@@ -32,12 +32,22 @@ class FakeWorld:
         self.codes = {}             # label -> (exit code, timed_out) forced for that step
         self.no_hash = set()        # checkouts whose lock-hash step prints nothing
         self.mutators = []          # callables(StepResult) applied to every result (fault injection)
+        self.outputs = {}           # label -> (stdout, stderr) printed by that step
+        self.files = set()          # artifact paths that exist (removed by that checkout's cleanup)
+        self.copy_raises = False    # artifact copy raises (teardown must still run)
 
     def token(self, co):
         return self.scenario.co[co].token if self.scenario else f"tok-{co}"
 
-    def path(self, co):
+    def checkout_path(self, co):
         return self.scenario.co[co].path if self.scenario else f"/w/{co}"
+
+    def path(self, co):
+        """Where co's code is seen by the app (container lanes: their container path)."""
+        if not self.scenario:
+            return f"/w/{co}"
+        seen = self.scenario.ad.app_source_path(self.scenario.co[co])
+        return seen if seen is not None else self.scenario.co[co].path
 
     def identity(self, co):
         target = self.share_with.get(co, co)
@@ -104,6 +114,15 @@ class FakeTransport:
         self.calls = []
         self.created = True
 
+    def copy_out(self, path, dest):
+        self.calls.append(("artifact-copy", "cleanup", path))
+        if self.world.copy_raises:
+            raise RuntimeError("copy failed")
+        if path not in self.world.files:
+            return None
+        self.recorder.seq += 1
+        return StepResult(self.recorder.seq, "artifact-copy", "cleanup", 0, 1)
+
     def exec(self, label, phase, body, timeout=600, user=None):
         self.calls.append((label, phase, body))
         seq = self.recorder.next_seq()
@@ -129,9 +148,12 @@ class FakeTransport:
                 self.world.generation[name] = self.world.generation.get(name, 0) + 1
         elif co and (label.endswith("-stop") or label.endswith("-cleanup")):
             self.world.running.pop(co.group(1), None)
+            if label.endswith("-cleanup"):  # teardown may delete the checkout's files
+                prefix = self.world.checkout_path(co.group(1)) + "/"
+                self.world.files = {f for f in self.world.files if not f.startswith(prefix)}
         elif label.endswith("-lock-hash"):
             name = co.group(1)
-            path = self.world.path(name)
+            path = self.world.checkout_path(name)
             digest = "changed" if (name == "c" and self.world.lock_changes) else "same"
             if name not in self.world.no_hash:
                 out = "".join(f"{digest}  {path}/{rel}\n" for rel in self.adapter.lock_files)
@@ -140,9 +162,30 @@ class FakeTransport:
         elif label.endswith("-stopped-probe"):
             name = co.group(1)
             code = 1 if name in self.world.running else 0
+        elif label.endswith("-port-map") and co:
+            # NAT receipt as Docker would report it for this checkout's own containers.
+            ident = self.world.identity(co.group(1))
+            if ident is not None:
+                from .verify import url_port
+                out = json.dumps(dict(
+                    pg=dict(published=url_port(ident["urls"]["database"]), target=ident["pg"]["port"]),
+                    redis=dict(published=url_port(ident["urls"]["redis"]), target=ident["redis"]["port"]),
+                    evidence=f"fake-containers-{co.group(1)}")) + "\n"
+        elif label.endswith("-tool-versions"):
+            out = f"{self.world.checkout_path(co.group(1)) if co else '/w'}/.venv/bin/python3\nPython 3.13.16\n"
         elif label == "e-planned-port":
             out = "45999\n"
-        result = StepResult(seq, label, phase, code, 1_000_000, 900_000, out, "", timed_out)
+        err = ""
+        if label == "d-setup-invalid":
+            # A well-behaved tool names the bad request; echo the breaking recipe as the tool would.
+            breaker = self.world.scenario.ad.break_config(self.world.scenario.co["d"]) if self.world.scenario else ""
+            err = f"error: cannot resolve postgres@99.99.99 (image postgres:99.99.99 not found)\n{breaker}\n"
+        elif label.endswith("-instance-identity") and co and code == 0 and not out:
+            name = co.group(1)
+            out = json.dumps(dict(checkout=name, containers=[f"ctr-{name}-{self.world.generation.get(name, 0)}"])) + "\n"
+        if label in self.world.outputs:
+            out, err = self.world.outputs[label]
+        result = StepResult(seq, label, phase, code, 1_000_000, 900_000, out, err, timed_out)
         for mutate in self.world.mutators:
             mutate(result)
         self.recorder.results.append(result)

@@ -1,5 +1,6 @@
 """Pure checks over the fixture app's JSON receipts. No I/O, so tests cover them directly."""
 import posixpath
+import re
 from urllib.parse import urlsplit
 
 
@@ -71,9 +72,32 @@ def app_result(payload, command, code=0, timed_out=False):
     return result
 
 
-def identity_problems(identity, token=None, path=None):
+def port_map_problems(receipt):
+    """Validate an adapter's port-mapping receipt (see Adapter.port_map). Returns problems.
+
+    Shape: {"pg": {"published": int, "target": int}, "redis": {...}, "evidence": str}.
+    `evidence` names what produced the mapping (for example a Docker container ID read
+    with `docker inspect`); the raw command output stays in the step log."""
+    if not isinstance(receipt, dict):
+        return ["port map receipt missing or not a JSON object"]
+    problems = []
+    if not (isinstance(receipt.get("evidence"), str) and receipt["evidence"].strip()):
+        problems.append("port map receipt has no evidence")
+    for svc in ("pg", "redis"):
+        entry = receipt.get(svc)
+        if not (isinstance(entry, dict) and all(isinstance(entry.get(k), int) and not isinstance(entry.get(k), bool)
+                                                 and 0 < entry[k] < 65536 for k in ("published", "target"))):
+            problems.append(f"port map receipt has no valid {svc} published/target ports")
+    return problems
+
+
+def identity_problems(identity, token=None, path=None, port_map=None):
     """The app reached servers on the ports its URLs name, tool-declared paths match, and
-    the running code is this checkout's (source token, and module path when known)."""
+    the running code is this checkout's (source token, and module path when known).
+
+    URL port != server port is accepted only through a validated `port_map` receipt (a
+    proven NAT mapping, e.g. a Docker published port) whose published port equals the URL
+    port and whose target equals the port the server reports. Never inferred."""
     problems = []
     source = identity.get("source") or {}
     if token is not None and source.get("token") != token:
@@ -82,10 +106,22 @@ def identity_problems(identity, token=None, path=None):
         problems.append(f"running module {source.get('module')} is outside checkout {path}")
     urls = identity.get("urls", {})
     pg, redis = identity.get("pg", {}), identity.get("redis", {})
-    if url_port(urls.get("database", "")) not in (None, pg.get("port")):
-        problems.append(f"postgres answered on {pg.get('port')}, URL names {url_port(urls['database'])}")
-    if url_port(urls.get("redis", "")) not in (None, redis.get("port")):
-        problems.append(f"redis answered on {redis.get('port')}, URL names {url_port(urls['redis'])}")
+    if port_map is not None:
+        map_problems = port_map_problems(port_map)
+        problems += map_problems
+        if map_problems:
+            port_map = None
+    for svc, key, server in (("pg", "database", pg), ("redis", "redis", redis)):
+        url = url_port(urls.get(key, ""))
+        name = "postgres" if svc == "pg" else "redis"
+        if port_map is not None:
+            mapped = port_map[svc]
+            if url not in (None, mapped["published"]):
+                problems.append(f"{name} URL names {url}, but the mapped published port is {mapped['published']}")
+            if server.get("port") != mapped["target"]:
+                problems.append(f"{name} answered on {server.get('port')}, but the mapping targets {mapped['target']}")
+        elif url not in (None, server.get("port")):
+            problems.append(f"{name} answered on {server.get('port')}, URL names {url} (no port-mapping receipt)")
     declared = identity.get("declared", {})
     if declared.get("PGDATA") and _norm(declared["PGDATA"]) != _norm(pg.get("data_directory")):
         problems.append(f"PGDATA {declared['PGDATA']} != server data_directory {pg.get('data_directory')}")
@@ -188,22 +224,44 @@ def unchanged_instance(before, after):
     return problems
 
 
-def classify_conflict(start, ready, identity, squatted_ports):
+def relevant(text, pattern):
+    """True when a failure's output carries the intended diagnostic (case-insensitive)."""
+    return bool(pattern) and re.search(pattern, text or "", re.IGNORECASE) is not None
+
+
+def conflict_pattern(port):
+    """Default evidence that a failure is about the occupied port, not something else: an
+    address-in-use error, or conflict wording within a short distance of the port number.
+    The bare port number is NOT enough (receipts often list the planned ports)."""
+    p = rf"(?<!\d){int(port)}(?!\d)"
+    words = r"(in use|busy|occupied|taken|unavailable|conflict|held by|already (bound|listening))"
+    return (r"address already in use|addrinuse|could not bind|cannot bind|bind\(?\)?[^\n]{0,20}(failed|denied)|"
+            rf"{p}[^\n]{{0,60}}{words}|{words}[^\n]{{0,60}}{p}")
+
+
+def classify_conflict(start, ready, identity, squatted_ports, start_relevant=True, ready_relevant=True):
     """Occupied-port startup. Good: refused, detected, or relocated to a working own instance.
 
     start/ready: (exit code, timed_out) or None for ready when no readiness step ran.
-    Timeouts and missing commands are infrastructure faults: never a good outcome."""
+    *_relevant: whether that step's output names the conflict (see conflict_pattern).
+    Timeouts and missing commands are infrastructure faults, and a refusal whose output is
+    about something else (a resolve error, a crash) is not evidence of conflict detection:
+    neither is ever a good outcome."""
     kind = refusal(*start)
     if kind == "infra":
         return f"start-infra-fault (exit {start[0]})", False
     if kind == "refused":
-        return "refused-at-start", True
+        if start_relevant:
+            return "refused-at-start", True
+        return f"start-failed-without-conflict-diagnostic (exit {start[0]})", False
     if ready is not None:
         kind = refusal(*ready)
         if kind == "infra":
             return f"readiness-infra-fault (exit {ready[0]})", False
         if kind == "refused":
-            return "detected-at-readiness", True
+            if ready_relevant:
+                return "detected-at-readiness", True
+            return f"readiness-failed-without-conflict-diagnostic (exit {ready[0]})", False
     if identity is None:
         return "reported-ready-but-unreachable", False
     if identity["pg"].get("port") in squatted_ports or identity["redis"].get("port") in squatted_ports:
