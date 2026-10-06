@@ -1,0 +1,7 @@
+# Private DDEV global configuration for one benchmark run (DDEV_XDG_CONFIG_HOME). It never
+# replaces the user's ~/.ddev. The shared router and SSH agent are omitted so the run starts
+# no host-wide DDEV containers and binds no fixed host ports (web gets ephemeral ports).
+omit_containers: [ddev-router, ddev-ssh-agent]
+instrumentation_opt_in: false
+performance_mode: none
+fail_on_hook_fail: true

@@ -1,0 +1,15 @@
+# Committed DDEV project. The benchmark gives each checkout its own project name in the
+# machine-local .ddev/config.local.yaml (DDEV merges config.*.yaml), before first start.
+name: rwbddev
+type: php
+docroot: ""
+database:
+  type: postgres
+  version: "17"
+# DDEV's native PostgreSQL build customizes a Debian image with apt, so the base is the
+# Debian variant of the common PostgreSQL 17.6 pin. The digest is pinned through BASE_IMAGE
+# in docker-compose.workload.yaml (a digest here would break DDEV's derived image name).
+dbimage: postgres:17.6-bookworm
+omit_containers: [ddev-ssh-agent]
+performance_mode: none
+disable_upload_dirs_warning: true
