@@ -5,6 +5,8 @@
   python3 bench/run.py --tool flox --dry-run          # print the planned bodies, run nothing
 
 One tool per invocation; the parent serializes runs. The output directory must not exist.
+Every run is diagnostic (meta.reportable stays false); final timings come only from a
+parent-declared session manifest checked by bench/report.py.
 """
 import argparse
 import hashlib
@@ -85,16 +87,18 @@ def main(argv=None):
         tx = HostTransport(rec, workdir, env=adapter.host_env(workdir))
 
     meta = dict(run_id=run_id, tool=adapter.name, variant=adapter.variant, title=adapter.title,
-                started_utc=utc(), valid=False, completed=False,
+                started_utc=utc(), started_unix_ns=time.time_ns(), valid=False, completed=False,
                 host=dict(system=platform.system(), machine=platform.machine(), release=platform.release(),
                           python=platform.python_version()),
                 harness=dict(commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain", "--", ".")),
                              files=tree_hashes(BENCH / "rwb") | {"run.py": sha256(BENCH / "run.py")}),
                 fixture=tree_hashes(BENCH / "fixtures" / "app"),
+                shared_glue=tree_hashes(BENCH / "adapters" / "_shared"),
                 config=tree_hashes(adapter.config_dir()) if adapter.config_dir().exists() else {},
                 features={k: adapter.features[k] for k in FEATURES},
                 isolation_boundary=adapter.isolation_boundary, transport=adapter.transport,
                 image=adapter.image, options=options, repeats=args.repeats, warmups=args.warmups,
+                keep=args.keep, resources=dict(cpus=args.cpus, memory=args.memory),
                 pins=getattr(adapter, "pins", {}), errors=[],
                 setup_scope=adapter.setup_scope or "not declared",
                 prepare_scope=adapter.prepare_scope, start_scope=adapter.start_scope,
@@ -127,17 +131,19 @@ def main(argv=None):
         scenario.add("harness", "error", detail=f"{type(error).__name__}: {error}")
     finally:
         cleanup_problems = teardown(scenario, adapter, tx, out, meta, keep=args.keep)
-        meta.update(cleanup_problems=cleanup_problems, finished_utc=utc(),
+        meta.update(cleanup_problems=cleanup_problems, finished_utc=utc(), finished_unix_ns=time.time_ns(),
                     timings=scenario.timings, isolation=getattr(scenario, "isolation_receipt", None))
         meta["valid"] = meta["completed"] and scenario.out.valid() and not cleanup_problems and not meta["errors"]
         # valid: the evidence is trustworthy (no harness error, clean teardown). It says nothing
         # about the tool passing. measurement: whether the run can carry any timing at all.
-        # Every run of this harness is diagnostic until the parent serializes reportable runs.
+        # Every run of this harness is diagnostic; only a manifest-selected report (report.py)
+        # can carry final timings. Blocked/invalid runs publish none (raw receipts stay in steps.jsonl).
         if meta.get("blocked"):
             meta["measurement"] = "blocked-prerequisite: no checks executed, no timings"
             meta["timings"] = {}
         elif not meta["valid"]:
             meta["measurement"] = "invalid: harness error, interruption or unclean teardown; no timings usable"
+            meta["timings"] = {}
         else:
             meta["measurement"] = "diagnostic: timings recorded per check; only passing checks' samples count"
         meta["reportable"] = False
@@ -207,6 +213,10 @@ def render_summary(meta, outcomes):
     lines += ["| check | status | mode | detail |", "|---|---|---|---|"]
     for o in outcomes:
         lines.append(f"| {o['check']} | {o['status']} | {o['mode']} | {o['detail'].replace('|', '/')[:200]} |")
+    if meta.get("blocked") or not meta.get("valid"):
+        # Independent of meta["timings"]: an older or edited meta may still carry numbers.
+        lines += ["", "No timings: the run is blocked or invalid. Raw command receipts remain in steps.jsonl."]
+        return "\n".join(lines) + "\n"
     timings = meta.get("timings") or {}
     tasks = {k: v for k, v in timings.items() if k.startswith("first_task.")}
     if tasks:

@@ -41,9 +41,57 @@ python3 bench/run.py --tool stack --out bench/results/<new-dir> \
   --option stack_sha256=<sha256> --repeats 20 --warmups 3
 ```
 
-Run one tool per invocation, and never run two at once: the parent serializes reportable
-runs. The output directory must not exist yet. `--keep` leaves the container for diagnosis;
-remove it afterwards only after checking its `rwb.run` label.
+Run one tool per invocation, and never run two at once. The output directory must not exist
+yet. `--keep` leaves the container for diagnosis; remove it afterwards only after checking its
+`rwb.run` label. A kept run can never carry final timings.
+
+## Final measurement report
+
+Every `run.py` output is diagnostic, whatever its repeat count or exit code: `meta.reportable`
+stays `false` and is never edited. Final numbers come only from `report.py`, which checks a
+session manifest the parent writes and emits a separate report directory.
+
+```sh
+python3 bench/report.py template --session-id <id> --out <manifest.json>   # current hashes, reviews null
+python3 bench/report.py attempt --run bench/results/<session>/<tool>         # hashes of one run, to paste
+python3 bench/report.py --manifest <manifest.json> --out <new-report-dir> [--require-complete]
+```
+
+Manifest (`rwb-measurement-manifest/1`; relative paths resolve against the repository root):
+
+- `session`: `id`, `purpose: final-measurement`, `plan_created_utc`, the ordered 26-entry
+  `roster` (`entry`, `tool`, `variant`), `sample_policy` (`repeats`, `warmups`),
+  `timing_policy`, `serialization_declaration`, and `review` (null until a real review exists).
+- `protocol`: reviewed `harness` commit and file hashes, `fixture`, `shared_glue`
+  (`adapters/_shared`), per-tool `lanes` (`config` hashes, `version_contains` strings expected
+  in the `tool-version` receipt, `deviations`, optional `transport`/`image_id`), `platform`
+  (optional exact `host`), `resources` (`cpus`, `memory`) and `cache_policy`.
+- `attempts`, in execution order: `tool`, `variant`, `state` (`selected`, `excluded`, `blocked`
+  or `untested`), `path`, `run_id`, `reason`, `result_review`, and `hashes` (meta, outcomes,
+  steps and a digest of the whole run directory). Stack attempts also need `stack`:
+  `source_revision` or `source_fingerprint`, `binary_sha256`, and `build_receipt`
+  (`path`, `sha256`). Each tool has at most one non-excluded attempt; reruns stay as
+  `excluded` with their reason.
+
+The report keeps a row for each of the 26 entries: a missing lane is `missing`, and a blocked
+or invalid run shows its evidence without a number. Only `first_task.a`, `first_task.b`,
+`repeat.entry` and `repeat.app_read` can be reported. A metric is reported only when:
+
+- the session and the attempt name a review;
+- every hash matches, every receipt parses, and every cited step and raw log exists;
+- tool, variant, run id, harness bytes, fixture, glue, config, sample policy and resources
+  match the declaration, the tool-version output contains the declared strings, and `keep` is false;
+- the run is complete, valid and not blocked, with every main outcome present;
+- the run started after the plan was created and does not overlap any other declared attempt;
+- for `first_task.<co>`, the six gates of that checkout pass, and the step receipts succeed,
+  match the declared task and sum to the recorded time;
+- for `repeat.*`, the check passes, isolation and both checkouts' gates pass, and every warmup
+  and sample receipt exists and succeeds. App reads are reparsed and must return `keeper-a`.
+  The p50/p95 values are recomputed from the receipts, and warmups never count.
+
+Everything else is listed under `omitted` with its reason. A failure in one check removes only
+the metrics that depend on it. The report describes one host, image/cache state, transport and
+recipe. It has no rank, score or confidence claim.
 
 ## Reading a run
 
@@ -51,9 +99,10 @@ remove it afterwards only after checking its `rwb.run` label.
 - `outcomes.json`: one record per check, with `status`, `mode` and the evidence step numbers.
 - `steps.jsonl` and `logs/`: every command's argv, exit code, timings and raw stdout/stderr.
 - `artifacts/`: service and tool logs copied before teardown.
-- `meta.json`: versions, pins, config and fixture hashes, image ID, feature modes,
-  setup/prepare/start scopes, cache state, `valid`, `measurement`, and `reportable` (always
-  false here).
+- `meta.json`: versions, pins, config, fixture and shared-glue hashes, image ID, feature modes,
+  setup/prepare/start scopes, cache state, `keep`, requested `resources`, the run interval
+  (`started_unix_ns`/`finished_unix_ns`, next to the human UTC labels), `valid`, `measurement`,
+  and `reportable` (always false here).
 
 Statuses:
 
@@ -67,7 +116,8 @@ Statuses:
 | `error` | Harness fault. The run is invalid |
 
 `valid` means the evidence is trustworthy and teardown was clean. It does not mean the tool
-passed. A blocked or invalid run carries no timings.
+passed. A blocked or invalid run publishes no timings in `meta.json` or `summary.md`; its raw
+command timings stay in `steps.jsonl` as diagnostics.
 
 ## Timing boundaries (do not rank across tools by a single command)
 
@@ -116,6 +166,8 @@ passed. A blocked or invalid run carries no timings.
   - Nix and Pixi service lifecycles (`adapters/_shared/rwb-services.sh`)
   - the activation holder that keeps Flox services alive
   - the Devbox initdb and stop confirmation
-- All results so far come from Linux containers on an Apple Silicon host. They are not
-  native macOS results.
+- All results so far come from Linux containers on an Apple Silicon host. Most lanes run inside
+  one container through `docker exec`. The Compose lane is the exception: `docker compose` runs
+  on the macOS host (host transport), while its services and app run in Linux containers. None
+  of these are native macOS results. Each run records its `transport`.
 - Smoke runs used 2 samples and 1 warmup and are diagnostic only.
