@@ -1,0 +1,434 @@
+"""The common real-world workload, identical for every adapter. See bench/README.md.
+
+Every check produces an Outcome with the step evidence (seq numbers) that decided it.
+Tool failures are results (`fail`); only harness faults are `error`. A capability the
+adapter declares `unsupported` is recorded as such and its dependent checks are skipped.
+"""
+import hashlib
+import secrets
+
+from . import verify
+from .outcomes import Outcomes
+from .stats import summarize_ns
+
+CHECKOUTS = ("a", "b", "c", "d", "e")
+
+
+class Scenario:
+    def __init__(self, adapter, transport, recorder, repeats=20, warmups=3, only=None):
+        self.ad, self.tx, self.rec = adapter, transport, recorder
+        self.repeats, self.warmups = repeats, warmups
+        self.only = set(only or ())
+        self.out = Outcomes()
+        self.co = {name: adapter.checkout(name, i, secrets.token_hex(8)) for i, name in enumerate(CHECKOUTS)}
+        self.ids = {}           # checkout -> identity receipt
+        self.instances = {}     # checkout -> adapter instance receipt
+        self.started = set()    # checkouts whose services may be running (for cleanup)
+        self.timings = {}
+        self.locks = {}
+
+    # ---- primitives ---------------------------------------------------------------
+    def run(self, label, phase, body, timeout=None):
+        return self.tx.exec(label, phase, body, timeout=timeout or self.ad.timeouts["step"])
+
+    def feature(self, key):
+        return self.ad.features[key]
+
+    def mode(self, key):
+        mode = self.feature(key)
+        return "n/a" if mode == "unsupported" else mode
+
+    def skipped(self, check):
+        """True (and recorded) when the adapter declares check not applicable: nothing runs."""
+        if check in self.ad.not_applicable:
+            self.out.add(check, "not_applicable", "n/a", self.ad.not_applicable[check])
+            return True
+        return False
+
+    def add(self, check, status, mode="n/a", detail="", evidence=()):
+        if check in self.ad.not_applicable and status not in ("error",):
+            return self.out.add(check, "not_applicable", mode, self.ad.not_applicable[check], evidence)
+        return self.out.add(check, status, mode, detail, evidence)
+
+    def app(self, co, label, phase, args, timeout=None):
+        result = self.run(label, phase, self.ad.app(self.co[co], args), timeout)
+        payload = result.json()
+        command = args.split()[0]
+        try:
+            return result, verify.app_result(payload, command)
+        except ValueError as error:
+            result.extra["app_error"] = str(error)
+            return result, None
+
+    def identify(self, co, label, phase="verify", wait=False):
+        """App identity receipt for checkout co, with URL/path/source-token problems."""
+        args = f"wait --timeout {self.ad.timeouts.get('ready', 90)}" if wait else "identity"
+        result, ident = self.app(co, label, phase, args, timeout=self.ad.timeouts["start"])
+        problems = ["no identity receipt: " + result.extra.get("app_error", "")] if ident is None else \
+            verify.identity_problems(ident, self.co[co].token, self.ad.app_source_path(self.co[co]))
+        if ident is not None:
+            body = self.ad.instance_identity(self.co[co])
+            if body:
+                extra = self.run(f"{co}-instance-identity", "verify", body)
+                self.instances[co] = extra.json() if extra.ok else None
+        return result, ident, problems
+
+    def hash_locks(self, co, label):
+        files = " ".join(f"{self.co[co].path}/{rel}" for rel in self.ad.lock_files)
+        # Missing files print nothing and are reported as missing by the caller.
+        if not files:
+            return None, {}
+        result = self.run(label, "verify", "if command -v sha256sum >/dev/null; then sha256sum "
+                          f"{files}; else shasum -a 256 {files}; fi")
+        hashes = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                hashes[parts[1][len(self.co[co].path) + 1:]] = parts[0]
+        return result, hashes
+
+    # ---- the workload ---------------------------------------------------------------
+    def execute(self):
+        a = self.co["a"]
+        self.provision_and_versions()
+        for name in ("a", "b"):
+            self.run(f"{name}-prepare", "meta", self.ad.prepare(self.co[name]) if name == "a"
+                     else self.ad.prepare(self.co[name], lock_from=a))
+            if name == "a":
+                if not self.bring_up("a", cold=True):
+                    return self.out
+                self.workload("a")
+                self.repeat_start("a")
+                # B is a teammate's checkout of the same commit: A's lock is committed into it.
+            else:
+                if self.bring_up("b", cold=False):
+                    self.workload("b")
+        self.isolation()
+        self.repeats_phase()
+        self.status_receipt()
+        self.stop_restart()
+        self.frozen_copy()
+        self.bad_config()
+        self.occupied_port()
+        return self.out
+
+    def provision_and_versions(self):
+        for label, body, user in self.ad.provision():
+            result = self.tx.exec(label, "meta", body, timeout=self.ad.timeouts["setup"], user=user)
+            if not result.ok:
+                raise ProvisionError(f"provisioning step {label} failed (exit {result.code})")
+        self.run("tool-version", "meta", self.ad.versions())
+
+    def bring_up(self, co, cold):
+        c = self.co[co]
+        phase_label = "cold" if cold else "warm"
+        setup = self.run(f"{co}-setup-{phase_label}", "setup", self.ad.setup(c), self.ad.timeouts["setup"])
+        self.timings[f"setup.{phase_label}"] = setup.outer_ns if setup.ok else None
+        self.add(f"setup.{co}", "pass" if setup.ok else "fail", self.mode("lockfile"),
+                 "" if setup.ok else f"exit {setup.code}", [setup])
+        if not setup.ok:
+            return False
+        if cold:
+            hashed, self.locks["a"] = self.hash_locks("a", "a-lock-hash")
+            if self.ad.lock_files:
+                ok = len(self.locks["a"]) == len(self.ad.lock_files)
+                self.add("lock.created", "pass" if ok else "fail", self.mode("lockfile"),
+                         "" if ok else "lock file(s) missing after setup", [hashed])
+            else:
+                self.add("lock.created", "unsupported", "n/a", "adapter declares no lock files")
+        return self.start_and_identify(co, f"{co}-start", record_as=f"start.{co}", deps=phase_label)
+
+    def install_deps(self, co, phase_label):
+        c = self.co[co]
+        deps = self.run(f"{co}-deps", "setup", self.ad.deps(c), self.ad.timeouts["setup"])
+        self.timings[f"deps.{phase_label}"] = deps.outer_ns if deps.ok else None
+        self.add(f"deps.{co}", "pass" if deps.ok else "fail", "native", "" if deps.ok else f"exit {deps.code}", [deps])
+        self.run(f"{co}-tool-versions", "meta", self.ad.tool_versions(c))
+        return deps.ok
+
+    def start_and_identify(self, co, label, record_as, deps=None):
+        """start -> native readiness -> (first time: app deps) -> identity.
+
+        Deps follow start because some tools (Stack) install their locked tools at `up`."""
+        c = self.co[co]
+        evidence = []
+        if self.feature("services") == "unsupported":
+            self.add(record_as, "unsupported", "n/a", "adapter declares no service lifecycle")
+            return False
+        start = self.run(label, "lifecycle", self.ad.start(c), self.ad.timeouts["start"])
+        evidence.append(start)
+        self.started.add(co)
+        if not start.ok:
+            self.add(record_as, "fail", self.mode("services"), f"start exit {start.code}", evidence)
+            return False
+        ready_body = self.ad.ready(c)
+        if ready_body:
+            ready = self.run(f"{label}-ready", "lifecycle", ready_body, self.ad.timeouts["start"])
+            evidence.append(ready)
+            if not ready.ok:
+                self.add(record_as, "fail", self.mode("readiness"), f"native readiness exit {ready.code}", evidence)
+                return False
+        if deps and not self.install_deps(co, deps):
+            self.add(record_as, "blocked", self.mode("services"), "app dependencies failed", evidence)
+            return False
+        if ready_body or self.ad.start_waits_ready:
+            # Native readiness claims usable services: the first identity must succeed without retries.
+            result, ident, problems = self.identify(co, f"{label}-identity")
+        else:
+            result, ident, problems = self.identify(co, f"{label}-identity", wait=True)
+        evidence.append(result)
+        self.timings[f"ready.{co}"] = sum(r.outer_ns for r in evidence)
+        if ident is None or problems:
+            self.add(record_as, "fail", self.mode("readiness"), "; ".join(problems), evidence)
+            return False
+        self.ids[co] = ident
+        self.add(record_as, "pass", self.mode("services"),
+                 f"readiness={self.feature('readiness')} pg={ident['pg']['port']} redis={ident['redis']['port']}",
+                 evidence)
+        return True
+
+    def workload(self, co):
+        steps = []
+        r, migrated = self.app(co, f"{co}-migrate", "workload", "migrate")
+        steps.append(r)
+        ok = migrated is not None and migrated["applied"] == ["0001", "0002"]
+        r2, again = self.app(co, f"{co}-migrate-again", "workload", "migrate")
+        steps.append(r2)
+        self.add(f"migrate.{co}", "pass" if ok and again is not None and again["applied"] == [] else "fail",
+                 "native", "" if ok else f"migrate receipt {migrated}", steps[-2:])
+        results = []
+        for args in (f"mark --checkout {co}", f"crud --checkout {co}", f"cache --checkout {co}"):
+            r, res = self.app(co, f"{co}-{args.split()[0]}", "workload", args)
+            results.append((r, res))
+        crud_ok = all(res is not None for _, res in results)
+        self.add(f"crud_cache.{co}", "pass" if crud_ok else "fail", "native",
+                 "; ".join(r.extra.get("app_error", "") for r, res in results if res is None), [r for r, _ in results])
+        tests = self.run(f"{co}-pytest", "workload", self.ad.pytest(self.co[co]))
+        self.add(f"tests.{co}", "pass" if tests.ok else "fail", "native", "" if tests.ok else f"exit {tests.code}", [tests])
+
+    def repeat_start(self, co):
+        """Starting again while running must reuse, not duplicate or replace, the services."""
+        if co not in self.ids:
+            return
+        again = self.run(f"{co}-start-again", "lifecycle", self.ad.start(self.co[co]), self.ad.timeouts["start"])
+        result, ident, problems = self.identify(co, f"{co}-start-again-identity", wait=True)
+        if ident is None:
+            self.add("start.repeat", "fail", self.mode("services"), "; ".join(problems), [again, result])
+            return
+        problems += verify.unchanged_instance(self.ids[co], ident)
+        detail = f"start exit {again.code}" + ("; " + "; ".join(problems) if problems else "")
+        self.add("start.repeat", "fail" if problems else "pass", self.mode("services"), detail, [again, result])
+
+    def isolation(self):
+        if not ("a" in self.ids and "b" in self.ids):
+            self.add("isolation", "blocked", detail="A or B did not reach a verified identity")
+            return
+        ra, ca = self.app("a", "a-check", "verify", "check --checkout a --forbid b")
+        rb, cb = self.app("b", "b-check", "verify", "check --checkout b --forbid a")
+        problems = []
+        for r, c, name in ((ra, ca, "a"), (rb, cb, "b")):
+            if c is None:
+                problems.append(f"{name}: {r.extra.get('app_error')}")
+        extra = (self.instances.get("a"), self.instances.get("b")) if self.ad.instance_identity(self.co["a"]) else None
+        boundary = self.ad.isolation_boundary
+        problems += verify.distinct_instances(self.ids["a"], self.ids["b"], boundary, extra)
+        receipt = dict(boundary=boundary, a=verify.isolation_key(self.ids["a"], boundary),
+                       b=verify.isolation_key(self.ids["b"], boundary))
+        self.isolation_receipt = receipt
+        detail = "; ".join(problems) or f"boundary={boundary}"
+        self.add("isolation", "fail" if problems else "pass", self.mode("per_checkout_data"), detail, [ra, rb])
+
+    def repeats_phase(self):
+        if "a" not in self.ids:
+            self.add("repeat.entry", "blocked", detail="A not running")
+            self.add("repeat.app_read", "blocked", detail="A not running")
+            return
+        a = self.co["a"]
+        for key, body in (("repeat.entry", self.ad.enter(a, "true")),
+                          ("repeat.app_read", self.ad.app(a, "read --checkout a"))):
+            samples, failed = [], []
+            for i in range(self.warmups + self.repeats):
+                warm = i < self.warmups
+                r = self.run(f"{key}-{'warmup' if warm else 'sample'}-{i:03d}", "warm", body)
+                if key == "repeat.app_read" and r.ok:
+                    payload = r.json() or {}
+                    if not (payload.get("ok") and payload["result"]["item"]["sku"] == "keeper-a"):
+                        r.code = 1  # semantic failure even though the process exited 0
+                if not warm:
+                    samples.append((r.ok, r.outer_ns, r.inner_ns, r.seq))
+                    if not r.ok:
+                        failed.append(r.seq)
+            self.timings[key] = dict(outer=summarize_ns([(ok, o) for ok, o, _, _ in samples]),
+                                     inner=summarize_ns([(ok, i) for ok, _, i, _ in samples]),
+                                     warmups=self.warmups, transport=self.tx.kind)
+            self.add(key, "fail" if failed else "pass", "native",
+                     f"{len(failed)} of {len(samples)} samples failed" if failed else "", [s[3] for s in samples])
+
+    def status_receipt(self):
+        body = self.ad.status(self.co["a"])
+        if body is None:
+            self.add("status", "unsupported", "n/a", "no status command")
+            return
+        r = self.run("a-status", "lifecycle", body)
+        self.add("status", "observed", self.mode("structured_status"), f"exit {r.code}", [r])
+
+    def stop_restart(self):
+        a, b = self.co["a"], self.co["b"]
+        if "a" not in self.ids:
+            for check in ("stop.a", "b.survives", "restart.a", "persist.pg", "persist.redis"):
+                self.add(check, "blocked", detail="A not running")
+            return
+        self.app("a", "a-persist", "lifecycle", "persist --checkout a")
+        stop = self.run("a-stop", "lifecycle", self.ad.stop(a), self.ad.timeouts["start"])
+        gone = self.run("a-stopped-probe", "verify", self.ad.stopped_probe(a, self.ids["a"]), 60)
+        refused, _ = self.app("a", "a-after-stop", "verify", "identity", timeout=60)
+        # A stopped tool must not let the app silently reach anything: identity must fail.
+        ok = stop.ok and gone.ok and not refused.ok
+        self.add("stop.a", "pass" if ok else "fail", self.mode("stop_confirmation"),
+                 f"stop exit {stop.code}, probe exit {gone.code}, app after stop exit {refused.code}",
+                 [stop, gone, refused])
+        if "b" in self.ids:
+            rb, cb = self.app("b", "b-after-a-stop", "verify", "check --checkout b --forbid a")
+            self.add("b.survives", "pass" if cb is not None else "fail", "n/a",
+                     rb.extra.get("app_error", ""), [rb])
+        else:
+            self.add("b.survives", "blocked", detail="B not running")
+        before = self.ids.pop("a")
+        if not self.start_and_identify("a", "a-restart", "restart.a"):
+            for check in ("persist.pg", "persist.redis"):
+                self.add(check, "blocked", detail="restart failed")
+            return
+        r, persisted = self.app("a", "a-persisted", "verify", "persisted --checkout a")
+        problems = verify.restart_changes(before, self.ids["a"], self.ad.isolation_boundary)
+        pg_ok = persisted is not None and persisted["pg_keeper"] and not problems
+        self.add("persist.pg", "pass" if pg_ok else "fail", "native",
+                 "; ".join(problems) or r.extra.get("app_error", ""), [r])
+        redis_policy = {k: self.ids["a"]["redis"].get(k) for k in ("appendonly", "appendfsync", "save", "dir")}
+        result = r.json() or {}
+        durable = (result.get("result") or {}).get("redis_durable")
+        self.add("persist.redis", "pass" if durable else "fail", "native", f"policy={redis_policy}", [r])
+        rc, cache = self.app("a", "a-cache-after-restart", "verify", "cache --checkout a")
+        self.add("cache.after_restart", "pass" if cache is not None else "fail", "native",
+                 rc.extra.get("app_error", ""), [rc])
+
+    def frozen_copy(self):
+        c = self.co["c"]
+        if self.skipped("lock.frozen_copy"):
+            return
+        if self.ad.frozen_setup(c) is None:
+            self.add("lock.frozen_copy", "unsupported", "n/a", "no frozen/locked setup mode")
+            return
+        if "a" not in self.locks:
+            self.add("lock.frozen_copy", "blocked", detail="A's lock was not produced")
+            return
+        self.run("c-prepare", "meta", self.ad.prepare(c, lock_from=self.co["a"]))
+        r = self.run("c-frozen-setup", "setup", self.ad.frozen_setup(c), self.ad.timeouts["setup"])
+        hashed, after = self.hash_locks("c", "c-lock-hash")
+        same = after == self.locks["a"]
+        versions = self.run("c-tool-versions", "verify", self.ad.tool_versions(c))
+        a_versions = next((x for x in self.rec.results if x.label == "a-tool-versions"), None)
+        same_versions = a_versions is not None and _strip_paths(a_versions.stdout, self.co["a"].path) == \
+            _strip_paths(versions.stdout, c.path)
+        ok = r.ok and same and versions.ok and same_versions
+        detail = f"setup exit {r.code}; lock {'unchanged' if same else 'CHANGED'}; versions {'match' if same_versions else 'differ'}"
+        self.add("lock.frozen_copy", "pass" if ok else "fail", self.mode("frozen_setup"), detail,
+                 [r, hashed, versions])
+
+    def bad_config(self):
+        d = self.co["d"]
+        if self.skipped("bad_config"):
+            return
+        try:
+            breaker = self.ad.break_config(d)
+        except NotImplementedError:
+            self.add("bad_config", "unsupported", "n/a", "adapter has no invalid-version recipe")
+            return
+        self.run("d-prepare", "meta", self.ad.prepare(d) + "\n" + breaker)
+        before = self.run("d-procs-before", "verify", self.ad.service_processes())
+        setup = self.run("d-setup-invalid", "failure", self.ad.setup(d), self.ad.timeouts["setup"])
+        start_body = self.ad.start(d) if setup.ok and self.feature("services") != "unsupported" else None
+        start = self.run("d-start-invalid", "failure", start_body, self.ad.timeouts["start"]) if start_body else None
+        after = self.run("d-procs-after", "verify", self.ad.service_processes())
+        refused = not setup.ok or (start is not None and not start.ok)
+        leaked = len(after.stdout.splitlines()) > len(before.stdout.splitlines())
+        if start is not None:
+            self.started.add("d")
+        ok = refused and not leaked
+        self.add("bad_config", "pass" if ok else "fail", self.mode("lockfile"),
+                 f"setup exit {setup.code}" + (f", start exit {start.code}" if start else "") +
+                 (", new service processes left running" if leaked else ""),
+                 [r for r in (before, setup, start, after) if r is not None])
+
+    def occupied_port(self):
+        """Bad startup: the port this checkout would use is held by a foreign listener."""
+        e = self.co["e"]
+        if self.skipped("occupied_port"):
+            return
+        if self.feature("services") == "unsupported":
+            self.add("occupied_port", "unsupported", "n/a", "no service lifecycle")
+            return
+        self.run("e-prepare", "meta", self.ad.prepare(e, lock_from=self.co["a"] if self.locks.get("a") else None))
+        setup = self.run("e-setup", "setup", self.ad.setup(e), self.ad.timeouts["setup"])
+        port_body = self.ad.planned_pg_port(e)
+        planned = e.pg_port
+        if port_body:
+            r = self.run("e-planned-port", "verify", port_body)
+            try:
+                planned = int(r.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                self.add("occupied_port", "blocked", detail="could not learn the planned port", evidence=[r])
+                return
+        squat = self.run("e-occupy-port", "failure", self.ad.occupy(planned, f"/tmp/rwb-squat-{planned}.pid"))
+        if not (setup.ok and squat.ok):
+            self.add("occupied_port", "blocked", detail="setup or squatter failed", evidence=[setup, squat])
+            return
+        start = self.run("e-start", "failure", self.ad.start(e), self.ad.timeouts["start"])
+        self.started.add("e")
+        ready_ok = None
+        evidence = [squat, start]
+        if start.ok and self.ad.ready(e):
+            ready = self.run("e-ready", "failure", self.ad.ready(e), self.ad.timeouts["start"])
+            ready_ok = ready.ok
+            evidence.append(ready)
+        ident = None
+        if start.ok and ready_ok is not False:
+            evidence.append(self.run("e-deps", "setup", self.ad.deps(e), self.ad.timeouts["setup"]))
+            wait = ready_ok is None
+            result, ident, _ = self.identify("e", "e-identity", phase="failure", wait=wait)
+            evidence.append(result)
+            if wait:
+                ready_ok = ident is not None
+        label, good = verify.classify_conflict(start.ok, ready_ok, ident, {planned})
+        self.add("occupied_port", "pass" if good else "fail", self.mode("readiness"), label, evidence)
+        self.run("e-release-port", "cleanup", f"kill $(cat /tmp/rwb-squat-{planned}.pid) 2>/dev/null; true")
+
+    # ---- cleanup (always runs) ------------------------------------------------------
+    def cleanup(self):
+        problems = []
+        for name in reversed(CHECKOUTS):
+            if name in self.started:
+                body = self.ad.cleanup(self.co[name])
+                if body:
+                    r = self.run(f"{name}-cleanup", "cleanup", body, self.ad.timeouts["start"])
+                    if not r.ok:
+                        problems.append(f"{name} cleanup exit {r.code}")
+        leftovers = self.run("leftover-processes", "cleanup", self.ad.service_processes())
+        lines = [line for line in leftovers.stdout.splitlines() if line.strip()]
+        self.add("cleanup.processes", "fail" if lines else "pass", self.mode("stop_confirmation"),
+                 f"{len(lines)} service processes remain" if lines else "", [leftovers])
+        supervisors = self.run("leftover-supervisors", "cleanup", self.ad.supervisor_processes())
+        names = [line.split(None, 3)[-1][:80] for line in supervisors.stdout.splitlines() if line.strip()]
+        self.add("cleanup.supervisors", "observed", "n/a", "; ".join(names) or "none", [supervisors])
+        return problems
+
+
+class ProvisionError(RuntimeError):
+    pass
+
+
+def _strip_paths(text, path):
+    return text.replace(path, "<checkout>")
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode()).hexdigest()
