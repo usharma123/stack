@@ -1,0 +1,7 @@
+{
+  "name": "rwb-git-grove-tool",
+  "private": true,
+  "dependencies": {
+    "@gitgrove/cli": "0.1.0-alpha.1.8"
+  }
+}

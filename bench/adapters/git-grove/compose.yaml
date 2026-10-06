@@ -1,0 +1,50 @@
+# Benchmark-owned Compose project started by GitGrove's custom-shell provider (bin/start.sh).
+# GitGrove writes COMPOSE_PROJECT_NAME, DB_PORT and REDIS_PORT into .env.worktree and passes
+# the pinned image references through from .env.example. The app runs inside the project
+# network; DB/Redis host ports are published only for verification receipts.
+services:
+  postgres:
+    image: ${RWB_POSTGRES_IMAGE:?}
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: app
+    ports: ["127.0.0.1:${DB_PORT:?}:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: [CMD-SHELL, "PGPASSWORD=bench psql -h 127.0.0.1 -U bench -d app -Atc 'select 1' >/dev/null"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 120s
+      start_interval: 1s
+  redis:
+    image: ${RWB_REDIS_IMAGE:?}
+    command: [redis-server, --appendonly, "yes", --appendfsync, always]
+    ports: ["127.0.0.1:${REDIS_PORT:?}:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: [CMD-SHELL, "redis-cli ping | grep -qx PONG"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 120s
+      start_interval: 1s
+  app:
+    # Built by the benchmark setup step (`docker build -t <project>-app`); `up` reuses it.
+    image: ${COMPOSE_PROJECT_NAME:?}-app
+    build:
+      context: .
+      args:
+        RWB_PYTHON_IMAGE: ${RWB_PYTHON_IMAGE:?}
+        RWB_UV_IMAGE: ${RWB_UV_IMAGE:?}
+    init: true
+    environment:
+      DATABASE_URL: postgresql://bench:bench@postgres:5432/app
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+volumes:
+  pgdata: {}
+  redisdata: {}
