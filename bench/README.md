@@ -6,6 +6,10 @@ simultaneous checkouts. Each tool uses its documented workflow. Glue that the to
 provide is checked in under `adapters/<tool>/`, and the feature is declared `scripted`.
 There is no combined score or rank.
 
+The [reviewed 2026-10-06 session](measurements/final-20261006-reviewed-1/README.md)
+contains all 26 coverage rows, 96 eligible metrics, known failures and restorable raw evidence.
+Use its review for the final per-lane transports and realized versions.
+
 Plan, checks and the status log: `IMPLEMENTATION.md`. Adapter API: `ADAPTER-CONTRACT.md`.
 Per-tool research: `research/`. Reviews: `reviews/`.
 
@@ -18,8 +22,8 @@ Per-tool research: `research/`. Reviews: `reviews/`.
 - Outbound HTTPS from the containers (port 443 only): GitHub releases, nixpkgs/cachix
   substitutes, conda-forge, PyPI and Docker Hub.
 - Stack: a Linux ARM64 `stack` binary built from the checkout under test, passed with
-  `--option stack_binary=... --option stack_sha256=...`. See `research/HANDOFF.md` for the
-  build command and the hash of the current build.
+  `--option stack_binary=... --option stack_sha256=...`. See `provenance/stack-20261006/` for the
+  build receipts and verified binary hash.
 - Tools that are not in an image are provisioned per run into run-owned locations and checked
   against pinned hashes. Provisioning is recorded but never timed:
   - mise 2026.10.3 (Stack and mise lanes)

@@ -1,0 +1,273 @@
+{
+  "authorization": "User explicitly authorizes this sole executor to resume frozen26tool measurement; parent promises no workers or builds during resumption.",
+  "creation_utc": "2026-10-06T17:54:36Z",
+  "historical_helper_sha256": "4c681191020c70925b35abf6baad53d8b4d7bbf229e49e2c59a7e872d2982f25",
+  "historical_independent_helper_sha256": "b1d94c4171ee09a9a849626dffa84a0894cc929ef1b0356758e00dd57b7e74c1",
+  "interruption": {
+    "cancel_time": "not observed by this executor",
+    "clean_baseline": "bench/measurements/final-20261006-reviewed-1/evidence/resume-20261006-clean-baseline.json",
+    "excluded_attempt": {
+      "classification": "interrupted",
+      "hashes": {
+        "meta.json": "fd9a3baa169f5546fccaadccc5c5af0235243eaec84e31ccf744c9932a9bf48e",
+        "outcomes.json": null,
+        "steps.jsonl": "b8dd5995cac80cf310d84782866ca0af4f3c7a3bd7dc9a53c064bfd7268a5cd2",
+        "tree": "a8b249ec4396ec6225831fa2b1f04070ceb90b858a0626621909ce2f4204ce41"
+      },
+      "path": "bench/results/final-20261006-reviewed-1/dnvr",
+      "reason": "Prior task cancelled during repeat.app_read after sample 009. Executor absent on fresh resumption snapshot; completed/outcomes/final interval absent. Partial raw receipts preserved unchanged. Exact owned container captured and removed after fresh identity confirmation; dnvr retried at dnvr-retry-1. Never timing eligible.",
+      "result_review": null,
+      "review_status": "pending",
+      "run_id": "20261006t174831-ed019a",
+      "state": "excluded",
+      "tool": "dnvr",
+      "variant": "default"
+    },
+    "last_receipt_utc": "2026-10-06T17:50:25Z",
+    "resumption_snapshot": "bench/measurements/final-20261006-reviewed-1/evidence/resume-20261006-initial.json",
+    "run_id": "20261006t174831-ed019a",
+    "started_utc": "2026-10-06T17:48:31Z"
+  },
+  "original_plan": {
+    "creation_utc": "2026-10-06T17:19:10Z",
+    "path": "bench/measurements/final-20261006-reviewed-1/plan.json",
+    "sha256": "d051730e7b85f9c83eb842abbfa64bf8d76a358195487d8b9aac10b78ff4e74e"
+  },
+  "remaining_ordered_attempts": [
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "dnvr",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/dnvr-retry-1",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "dnvr",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/dnvr-retry-1",
+      "tool": "dnvr",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "guix",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/guix",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3",
+        "--option",
+        "guix_binary_sha256=a5d58b1d0294cad6adb1f2aff627d37feb5db763fdffbceb8551f2b12123cf39",
+        "--option",
+        "guix_binary_url=https://mirrors.kernel.org/gnu/guix/guix-binary-1.5.0.aarch64-linux.tar.xz"
+      ],
+      "entry": "GNU Guix",
+      "options": {
+        "guix_binary_sha256": "a5d58b1d0294cad6adb1f2aff627d37feb5db763fdffbceb8551f2b12123cf39",
+        "guix_binary_url": "https://mirrors.kernel.org/gnu/guix/guix-binary-1.5.0.aarch64-linux.tar.xz"
+      },
+      "path": "bench/results/final-20261006-reviewed-1/guix",
+      "tool": "guix",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "workz",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/workz",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "workz (rohansx)",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/workz",
+      "tool": "workz",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "worktrunk",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/worktrunk",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "Worktrunk",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/worktrunk",
+      "tool": "worktrunk",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "git-grove",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/git-grove",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "GitGrove",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/git-grove",
+      "tool": "git-grove",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "isola",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/isola",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "isola",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/isola",
+      "tool": "isola",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "berth",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/berth",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "Berth",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/berth",
+      "tool": "berth",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "branchbox",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/branchbox",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "BranchBox",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/branchbox",
+      "tool": "branchbox",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "tilt",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/tilt",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "Tilt",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/tilt",
+      "tool": "tilt",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "organist",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/organist",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "Organist",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/organist",
+      "tool": "organist",
+      "variant": "default"
+    },
+    {
+      "argv": [
+        "/Users/utsavsharma/miniconda3/bin/python3",
+        "-B",
+        "bench/run.py",
+        "--tool",
+        "vagrant",
+        "--out",
+        "bench/results/final-20261006-reviewed-1/vagrant",
+        "--repeats",
+        "20",
+        "--warmups",
+        "3"
+      ],
+      "entry": "Vagrant",
+      "options": {},
+      "path": "bench/results/final-20261006-reviewed-1/vagrant",
+      "tool": "vagrant",
+      "variant": "default"
+    }
+  ],
+  "result_review": "pending",
+  "resume_helper_sha256": "8ed1b9329c0d52f2767512eb98e82be0d8bc115a9d3608a8b21ff97248dc2ea4",
+  "sample_policy": {
+    "repeats": 20,
+    "warmups": 3
+  },
+  "schema": "rwb-resume-supplement/1",
+  "serialization": "Eleven fresh run.py invocations serially in remaining original roster order, beginning dnvr retry. 20 repeats, 3 warmups, keep=false. Existing 15 completed attempts unchanged. No claim of uninterrupted execution or whole-host idleness across cancellation/resumption. Original preexisting services remain running."
+}

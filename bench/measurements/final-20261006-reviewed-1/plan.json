@@ -1,0 +1,1527 @@
+{
+  "attempts": [],
+  "protocol": {
+    "baseline": {
+      "integrity_path": "bench/measurements/final-20261006-reviewed-1/evidence/baseline-integrity.json",
+      "integrity_sha256": "596c1d980c77abab6810ce39570efeacd0a8906351b4138683ddfba429c887f8",
+      "path": "bench/measurements/final-20261006-reviewed-1/evidence/baseline.json",
+      "sha256": "9307d260afe1c486a601fadf0a4154bb9813a5a8b31cf2c51ccdaf5ed38f6aab"
+    },
+    "cache_policy": "No global cache purge. Prebuilt ev-* images and shared Docker layers/build caches warmed by prior diagnostics; reusable host CLI/download caches retained. Each run has fresh owned checkout/container state. No universal cold-install claims; recipe setup cache notes and realized image IDs retained.",
+    "fixture": {
+      ".pytest_cache/.gitignore": "3ed731b65d06150c138e2dadb0be0697550888a6b47eb8c45ecc9adba8b8e9bd",
+      ".pytest_cache/CACHEDIR.TAG": "37dc88ef9a0abeddbe81053a6dd8fdfb13afb613045ea1eb4a5c815a74a3bde4",
+      ".pytest_cache/README.md": "73fd6fccdd802c419a6b2d983d6c3173b7da97558ac4b589edec2dfe443db9ad",
+      ".pytest_cache/v/cache/lastfailed": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      ".pytest_cache/v/cache/nodeids": "f6960af9e70ebf0b397128442af853c5e02fbf6909173abbfd07a8846544a612",
+      "migrations/0001_items.sql": "ccd38aab957ea2bc977306d7adf434bd6b347c42e31dabf7cddec74b3a2ee9fe",
+      "migrations/0002_item_tags.sql": "7e9fc70a65254adc32a94c09f087a72316268d386dfbc622bdb2ea3446e25c53",
+      "pyproject.toml": "e3547372c0d7321cdb3872e061964ccab91c51242158a5b6d0da4d634bfbbcda",
+      "rwbapp/__init__.py": "814d4fb3ee9e89be949490926eecd392f466fe6651725c21265abc401b000ec4",
+      "rwbapp/__main__.py": "1c5e82f0b6ac259be1623baddf9777ec430b755b9d9d0509a77877f9702d8b23",
+      "rwbapp/core.py": "46761cc4240918143932c00acc1cb8bd56707369022272c03a7e6b3c42213534",
+      "tests/test_app.py": "5a2d27763e53ea5537caa834ba30032c7b55077d881e98950345066e03931545",
+      "uv.lock": "f1238f30ac738b082fbc3624705cf354b44d3af630599b896b8439527e52648d"
+    },
+    "harness": {
+      "commit": "ee96b465dc30d6a59933c6d99b499f55194104fc",
+      "files": {
+        "__init__.py": "a129557add0b62e7fdc4d1ee7904a644350dcf6ea9d4df173bf746eb1c1eb71a",
+        "adapters/__init__.py": "19765a3a59b98095942da6d75b212db50cd42fba947196d6aefa09c1c6fbd580",
+        "adapters/agent_env_common.py": "3a580122487c972da27670d2db88e5b5211915e971851767eb6d95e6eac399ca",
+        "adapters/base.py": "b4462a9b7ac54425d2d877ee8d2679ef963951d6797704e19bf0a04db4c5775e",
+        "adapters/berth.py": "36fd41abcd229bbe4c17b34f99bff11e8cfb2e0d3052cb6f9d34d95a1bc6a738",
+        "adapters/branchbox.py": "d8bf759fa54e25a468e1e6dc7889b8f7eaadc23fb900fef3898783386327ed1d",
+        "adapters/common.py": "eb09d57249efcc17d5c15794e708a3ac03f69b3f6a96c83dfd2941f6b3131083",
+        "adapters/compose.py": "c7a39c6e0759f891b3f4e6a32d1302800e01827d0ac1869874261be66290ff47",
+        "adapters/ddev.py": "c1c3c128a5884679aeb147c4f717100d8d7120278b5334fd8a828f619c882211",
+        "adapters/devbox.py": "55ce14d0664e27127ba595e5c5a2fe30ac133a53ca03c2e60c70d714108b5491",
+        "adapters/devcontainers.py": "4222337ed672c3864b016a802c5d71b575456ed195bc4e086993a0e93b612965",
+        "adapters/devenv.py": "03f4fcb854679597d6e2a3c4980429f51793209660a68021f133fcac07c4aac0",
+        "adapters/devpod.py": "e8e3a4fb24c3dc4d0c3893b58a994a8f534878af85173b090e117c60da80b779",
+        "adapters/dnvr.py": "412f36f9258b870d9e3562cfde2b86c327457a3f1bfb65a08594c03c7917a81c",
+        "adapters/flox.py": "73b0b4faead558f8af3985262fb2dd3b8d74684034848d15bbf353c6c59c6bac",
+        "adapters/git_grove.py": "ee21232280df95b7897e9e063000c120ae792e6c5f62c39e49587fbb90d5ed02",
+        "adapters/guix.py": "7730659e3de1846f177fbd81a40e143b33ad2beadb77c64c2afd6c11fbcf11b3",
+        "adapters/isola.py": "e757a09afc8c29480c016c2782b8ecd19ba4cad8bc33ebfe98c12a8e5e4f238d",
+        "adapters/lando.py": "0312832e8780e20bb3a5fd7a5d45f1a42f3392cb9871d970a531a56f1c826fe2",
+        "adapters/mise.py": "976138d66e189ad4e991e24ac9334569efc0b154019c81dadb498a5ec49447ff",
+        "adapters/nix.py": "056861586c510612417a653fc8fe340f9e3765e62e6ee3d3f188a138844e8ce4",
+        "adapters/organist.py": "9695335efb28c9ca2285b09e1ff2afe72804290200e1fc784196e55f25be1f80",
+        "adapters/pixi.py": "6042d7605a27b76e6097fdae8e2663168eb66dc52723dbcdd1e76425ecf401db",
+        "adapters/pkgx.py": "df72533be1bc087b874fb5c827dc40cb36bf68bec244e4c90d20402f96b5534c",
+        "adapters/process_compose.py": "eba3b4b58d5d097e96e592adf0efc8e32276d292c619633125a8c170e26bef5d",
+        "adapters/registry.py": "6a4501017953629aada3d296f754885232d8a0ff1a5a85cee10a17fe401813d7",
+        "adapters/services_flake.py": "1aee8c6f249559dae395b892703d6b1718a41af797e5b7c70ad36680941ee19c",
+        "adapters/stack.py": "9a6de306e068e6109c1db81842cd07b62f13f87a73f2aa98100d6bf7be204cb5",
+        "adapters/tilt.py": "5383054065974a33c28160041cae9b65948b9e912cad64797e3f24b0bb426136",
+        "adapters/vagrant.py": "ba90da50e33dcbed2c8f8b575ddab79a88f2f2ff1b60f7fafed1fdb59403e126",
+        "adapters/worktree_common.py": "9a175e0617e36d09409aade2f72fc6408ef2345f2855857b931f37f09723b221",
+        "adapters/worktrunk.py": "0437feae392f7e83f0a9be828078e136d6e24546542869b130ea6dc9ee047f70",
+        "adapters/workz.py": "6f73ae72f4380e379413c18c62e1f7320cb34564e3214abf4e6198c2b68573fa",
+        "outcomes.py": "205430c823ad8127568701e913ac67c27dfb8fc749a9c131fbf813dcff4c98b5",
+        "record.py": "a914f61b737d706c8f8a9ac70424b4f54fc0ae979ff2669d4e29072baca2cb66",
+        "run.py": "06632638aef07b72ed0ba30a1ddfeb3143ce1d8c9627812bb3fe280d8009924d",
+        "scenario.py": "a4e2c00016164775dc9064e412723f95995c88817daa73c1b44b2d95878508c3",
+        "stats.py": "5a9be58d3090877df570695c1395f574ca4725e537f00ead6575640007af1ffe",
+        "testing.py": "41079e92a3c0e4d936a0f5b559b221ce78c4106dfba933e82b4679cc346f628e",
+        "transport.py": "15e690cc72e65a566364f1d9f1b4c26ed6f99806e11cfa1c270dc24b6fb5b528",
+        "verify.py": "b02793fb279e334315c2ae243015e373982ad3a4f9e4128544c3058456c9a3c8"
+      }
+    },
+    "lanes": {
+      "berth": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "Dockerfile": "f0580a4609b7ed78a9864a2101a1c880daa44f7f4c6b83b4b1b4901e39400232",
+          "berth.yml": "97cfd12416925ac00434f8e388a6bd8ca497ee85e3221378f68bdae7f4ede621",
+          "compose.yaml": "8a79eb48b00bf457106cd36a26dad1780d7aafb8d6844f15e3a214cfc4b72189",
+          "gitignore": "7b3cde33c2d09a1bdec030c0570d844d76af1b6988e706d71417cda5cd3ac951"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "berth": "0.1.0",
+          "berth_commit": "3b93287584dcc5c7c26298a62379d8ce001400ff",
+          "images": {
+            "postgres": "postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+            "python": "python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641",
+            "redis": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+            "uv": "ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21"
+          },
+          "runtime": {
+            "postgres": "17.11",
+            "python": "3.13.16",
+            "redis": "8.10.2",
+            "uv": "0.12.23"
+          }
+        },
+        "prior_options_receipt": "bench/results/smoke-berth-1/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "berth 0.1.0"
+        ]
+      },
+      "branchbox": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "devcontainer/Dockerfile": "d9925629fa0a9f8dcd2f2c2da23e992f9e0b8a84c898fd221ac40859a2c0e908",
+          "devcontainer/compose.yaml": "e3299a187ba3b058952bd6fdebd17f164a00e7576efa375a5a6fd46d01ae552a",
+          "devcontainer/devcontainer.json": "6e97ec54413df92b1dfc296960583d376f1d67f306774c4d37cbfd2c84131dca",
+          "gitignore": "47c62c1a9d938d1f222b8b2a26c3d2f5845a7110252b89b2e9cbd3f16a466086"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "archives": {
+            "arm64": "3446e7462b9a42724034695e3cb3163d263aa792a3d97acac95d155aa1c22392",
+            "x86_64": "9d5550c0763a1e44940eaca8efd379279a36bdde3944ebec0e416b545d310ce8"
+          },
+          "branchbox": "0.13.4",
+          "branchbox_commit": "a00b3ee9a0acce000ee8f478dc0d6a8a24b3c7df",
+          "images": {
+            "postgres": "postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+            "python": "python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641",
+            "redis": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+            "uv": "ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21"
+          },
+          "runtime": {
+            "postgres": "17.11",
+            "python": "3.13.16",
+            "redis": "8.10.2",
+            "uv": "0.12.23"
+          }
+        },
+        "prior_options_receipt": "bench/results/smoke-branchbox-1/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "branchbox 0.13.4"
+        ]
+      },
+      "compose": {
+        "cache_note": "host Docker image/build cache not cleared (base images may already be present); B reuses A's layers on the same daemon",
+        "config": {
+          ".dockerignore": "b4bd2ddef59c7898d6739fe2925e4af976e28d613dc29938cdf9df4dda912e4a",
+          "Dockerfile": "591567555f2d5b879207a2a337179ab6d20c647cb5c9d1740ad32e98b3363af2",
+          "compose.yaml": "b427290424663dd40164e02b77f89038581810b29745b005074d7b152cf4bf4a"
+        },
+        "deviations": [
+          "host Docker Desktop daemon; images digest-pinned in compose.yaml/Dockerfile"
+        ],
+        "image": null,
+        "options": {},
+        "pins": {
+          "compose": "5.6.0",
+          "compose_sha256": "bd714a42b46e51757fc1121085b3096b9064e3f80d3ca5a991e33f44df4f43c9",
+          "note": "host Docker Desktop daemon; images digest-pinned in compose.yaml/Dockerfile",
+          "postgres": "17.11-alpine",
+          "projects": [
+            "rwb-plan-a",
+            "rwb-plan-b",
+            "rwb-plan-c",
+            "rwb-plan-d",
+            "rwb-plan-e"
+          ],
+          "python": "3.13.16",
+          "redis": "8.10.2-alpine",
+          "uv": "0.12.23"
+        },
+        "prior_options_receipt": "bench/results/smoke-compose-1/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "Docker Compose version v5.6.0"
+        ]
+      },
+      "ddev": {
+        "cache_note": "host Docker image cache and the pinned CLI download are reused across runs; A pulls/builds only images missing from the host cache, B reuses A's",
+        "config": {
+          ".ddev/app/Dockerfile": "fdb7044328e521a53ddadb93665e89ded7fb4a242657088e154340270c78d0e4",
+          ".ddev/config.yaml": "2188d21299ab5d3e147cf13f0db57fb291a2ede5907eb8f666ecfa9b832cfc02",
+          ".ddev/docker-compose.workload.yaml": "2ee1338d159898c5fa40b379a02330d6e426f0317daeda32c5119b0d0b1e7f49",
+          "docker_client_config.py": "95edf0682c74eb194f6933a36db04ec61a5b45abacdf66dbbfaa7c93832ef74a",
+          "global_config.yaml": "6b8b8764fd8e659a03f578dbe561c83daa290d37c752324a85a748a1308d1297"
+        },
+        "deviations": [
+          "PostgreSQL 17.6 on Debian bookworm (DDEV customizes it with apt, so the derived image is not byte-frozen); web container ddev/ddev-webserver as chosen by DDEV"
+        ],
+        "image": null,
+        "options": {},
+        "pins": {
+          "asset_hash_source": "release checksums.txt",
+          "assets": {
+            "darwin-amd64": "05aa309c0e8cd7a14696da93e99efd7b91ec7a1994dd8218674fbfad283aa832",
+            "darwin-arm64": "af68d362bf006d86e582ccd4f7e40926ba19a451b394cb375f93971272fb41ea",
+            "linux-amd64": "65fb822f0d2874220c8f9a6b2dfec095d37c0fdc555e34dc5b0e5f4177beeb93",
+            "linux-arm64": "41b1412c83e7e2ae04887f02a9b4bf6d441c6f662773d97979e9fe23acf93c0a"
+          },
+          "entry_auto_resumes": true,
+          "image_notes": "PostgreSQL 17.6 on Debian bookworm (DDEV customizes it with apt, so the derived image is not byte-frozen); web container ddev/ddev-webserver as chosen by DDEV",
+          "images": {
+            "postgres": "postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3",
+            "python": "python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641",
+            "redis": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+            "uv": "ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21"
+          },
+          "receipt_sha256": "56ed1793c3dbd4631f930b402aea0e9fae182c5335af483ff05b9b34d6fee0c4",
+          "source_commit": "5da91aeb9ebab0b0e66171c450b72099308d332c",
+          "validity": {
+            "core_hooks_required": [
+              "frozen_copy: add C to Scenario.started (setup/start create containers); host cleanup_host covers it until then",
+              "stop.a: honour entry_auto_resumes; the after-stop app call through the tool entry restarts the project"
+            ],
+            "docker_client_config": "/home/agent/rwb/_state/docker-config: user's persisted current context, no credsStore/auths (anonymous public pulls); preflight fails closed if it resolves a different daemon endpoint; DOCKER_HOST/CONTEXT/TLS* env overrides and TLS/SkipTLSVerify contexts are rejected before any docker call; every later body (receipts, cleanup) exits 77 before any docker call unless /home/agent/rwb/_state/docker-selection.json seals the validated endpoint and unchanged private config",
+            "host_docker_daemon": "docker info must succeed; checkouts must be visible to the daemon (Docker Desktop file sharing covers the temp dir)",
+            "owned_names": "every project/volume/image contains ownership token plan",
+            "private_state": "/home/agent/rwb/_state only; user tool state is never read or written"
+          },
+          "version": "1.25.4"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/ddev/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "ddev version v1.25.4"
+        ]
+      },
+      "devbox": {
+        "cache_note": "ev-devbox image: its Nix store may already hold some packages (preseeded at image build)",
+        "config": {
+          "bench-devbox/initdb.sh": "a8219e6e186adb83d9685e2267fc492ec82bf58109954b2b1d27b4afc3d5de1c",
+          "devbox.json": "f25e9ec76c6831b49a6452d44dacd815771f67d0318ad37554c72db7b6e53ce7"
+        },
+        "deviations": [],
+        "image": "ev-devbox",
+        "image_id": "sha256:d03da616d6cc65beac75b6e3f0a5dbfcf8a40203e26b9d531b78251c49324cca",
+        "options": {},
+        "pins": {
+          "devbox": "0.18.4",
+          "postgresql": "17.10",
+          "python": "3.13.15",
+          "redis": "8.10.2",
+          "uv": "0.12.22"
+        },
+        "prior_options_receipt": "bench/results/smoke-devbox-1/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "0.18.4"
+        ]
+      },
+      "devcontainers": {
+        "cache_note": "host Docker image cache and the pinned CLI download are reused across runs; A pulls/builds only images missing from the host cache, B reuses A's",
+        "config": {
+          ".devcontainer/Dockerfile": "8697bb081f64f5a4ed1f4d02c7b036fb4d9d600ced239e4db84cadb27c379cf5",
+          ".devcontainer/compose.yaml": "e68b2e96681a150f54ab9d10f667ccb9ad1754a46271a12dfa50f2685638bb68",
+          ".devcontainer/devcontainer.json": "3ce2eb74ba577b255c43ad0522aae6b596ff935803098e2e47fa9d4b26c245da",
+          "cli/package-lock.json": "418c6fc1331280cac50450529407c964fd089ec2f468221dd2dbb5b91ffb653d",
+          "cli/package.json": "968c318bf4eb17ad5a89fd8263f07d4f02550a20c865a5af0945ea200250dfe3",
+          "compose_receipt.py": "56ed1793c3dbd4631f930b402aea0e9fae182c5335af483ff05b9b34d6fee0c4"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "entry_auto_resumes": false,
+          "images": {
+            "postgres": "postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+            "python": "python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641",
+            "redis": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+            "uv": "ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21"
+          },
+          "npm_integrity": "sha512-LzaoOGKQ/Zql6PsiZ4hVIYVZagzWkD65aG/1ou5/Kly5Y1PtjLg1yn7qu+LZCzVoAl6DZZ/pbz8qOO4RLNlqMg==",
+          "npm_package": "@devcontainers/cli",
+          "package_lock_sha256": "418c6fc1331280cac50450529407c964fd089ec2f468221dd2dbb5b91ffb653d",
+          "receipt_sha256": "56ed1793c3dbd4631f930b402aea0e9fae182c5335af483ff05b9b34d6fee0c4",
+          "source_commit": "5dc7533314b5ba7ec3875c30143dfe1aec644870",
+          "validity": {
+            "core_hooks_required": [
+              "frozen_copy: add C to Scenario.started (setup/start create containers); host cleanup_host covers it until then"
+            ],
+            "host_docker_daemon": "docker info must succeed; checkouts must be visible to the daemon (Docker Desktop file sharing covers the temp dir)",
+            "owned_names": "every project/volume/image contains ownership token plan",
+            "private_state": "/home/agent/rwb/_state only; user tool state is never read or written"
+          },
+          "version": "0.89.0"
+        },
+        "prior_options_receipt": "bench/results/smoke-devcontainers-2/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "0.89.0"
+        ]
+      },
+      "devenv": {
+        "cache_note": "ev-devenv image (Determinate Nix 3.23.0, devenv 2.3.1 preinstalled): Nix store as built; the 2.4.0 CLI is provisioned untimed; A's substitutes are reused by B (same store)",
+        "config": {
+          "devenv.nix": "5a5cc53427dd6aa567af5ce42366089d39d9c7815063ec50d0d3f23f1dfc624d",
+          "devenv.yaml": "ae8bec3d1272710826c4d7b55e0f979e9eaab2683374fb61ecc41fb85687645b"
+        },
+        "deviations": [
+          "nixpkgs 151fa4e8 (shared Nix lanes) instead of the research recipe's addf7cf5 (devenv's own lock: Python 3.13.9/PG 17.7/Redis 8.2.2) for version parity"
+        ],
+        "image": "ev-devenv",
+        "image_id": "sha256:98ecc336b9695bf5dc2bb64db08c607933ea8ad3cd110168afa236893e4135c1",
+        "options": {},
+        "pins": {
+          "devenv": "2.4.0",
+          "devenv_rev": "b904dcb51fe48c30db250038241507f60752f222",
+          "deviation": "nixpkgs 151fa4e8 (shared Nix lanes) instead of the research recipe's addf7cf5 (devenv's own lock: Python 3.13.9/PG 17.7/Redis 8.2.2) for version parity",
+          "nixpkgs": "151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4"
+        },
+        "prior_options_receipt": "bench/results/smoke-devenv-1/meta.json",
+        "transport": "docker",
+        "version_contains": []
+      },
+      "devpod": {
+        "cache_note": "host Docker image cache and the pinned CLI download are reused across runs; A pulls/builds only images missing from the host cache, B reuses A's",
+        "config": {
+          ".devcontainer/Dockerfile": "8697bb081f64f5a4ed1f4d02c7b036fb4d9d600ced239e4db84cadb27c379cf5",
+          ".devcontainer/compose.yaml": "1d23781761b6076d8abf16b73c95c13b098c53b6b764e29cbbf24c42b6945390",
+          ".devcontainer/devcontainer.json": "3ce2eb74ba577b255c43ad0522aae6b596ff935803098e2e47fa9d4b26c245da",
+          "provider-docker.yaml": "6c44a13b398dd2b9cc17dcf3604de7b87d0b9b5e715e068214c0ff20ed323cb2"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "agent": "DevPod injects its linux agent into the app container (downloaded from the release by DevPod)",
+          "asset_hash_source": "observed (no publisher checksum)",
+          "assets": {
+            "darwin-amd64": "1205fc8626d9daa011479ded3ce7271359714f0d011acfcf739adf90901a6ee8",
+            "darwin-arm64": "0c50934f4199732ff37e89708bc5c028ecda75d854a151cb2644e4ba39f4d7f7",
+            "linux-amd64": "cc50bce09229d5a6d448ac1d4494327f4b8f7a20321e5fcee3bfec1aef0d20c5",
+            "linux-arm64": "9226161e0c9f5a45d0f8d1778f940498e787b650f0e0fcf3c29f1f67e7a3f272"
+          },
+          "entry_auto_resumes": true,
+          "images": {
+            "postgres": "postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+            "python": "python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641",
+            "redis": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+            "uv": "ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21"
+          },
+          "provider": "bench/adapters/devpod/provider-docker.yaml (docker provider at the release commit)",
+          "receipt_sha256": "56ed1793c3dbd4631f930b402aea0e9fae182c5335af483ff05b9b34d6fee0c4",
+          "source_commit": "33d20ff8806a3fee86d8f56ed50db6108b945fc2",
+          "validity": {
+            "core_hooks_required": [
+              "frozen_copy: add C to Scenario.started (setup/start create containers); host cleanup_host covers it until then",
+              "stop.a: honour entry_auto_resumes; the after-stop app call through the tool entry restarts the project"
+            ],
+            "host_docker_daemon": "docker info must succeed; checkouts must be visible to the daemon (Docker Desktop file sharing covers the temp dir)",
+            "owned_names": "every project/volume/image contains ownership token plan",
+            "private_state": "/home/agent/rwb/_state only; user tool state is never read or written"
+          },
+          "version": "0.6.15"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/devpod/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "v0.6.150c50934f4199732ff37e89708bc5c028ecda75d854a151cb2644e4ba39f4d7f7 devpod-d"
+        ]
+      },
+      "dnvr": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "dnvr/flake.nix": "3812229c9976cb077affcd2836cbe5792dad17bcac7a69b728ed5d86e10a6276",
+          "rwb-dnvr.sh": "8b93ca6aae8d402e7c27b70b637396a671165a9a34965354d7e7e1596bf9b128"
+        },
+        "deviations": [],
+        "image": "ev-nix",
+        "image_id": "sha256:fbf87c18aced2d3c969df40d15b137943429882f4283fe256c2f481a7af17c6a",
+        "options": {},
+        "pins": {
+          "dnvr": "a66c2bbabb67293812a5c39855ab0ecf6af21d41",
+          "dnvr_own_nixpkgs": "062346a6d85bc4b49dfaa61c986e9c5be21217d1 (overridden by follows)",
+          "nixpkgs": "151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4",
+          "postgresql": "17.11",
+          "python": "3.13.15",
+          "redis": "8.10.2",
+          "uv": "0.12.22"
+        },
+        "prior_options_receipt": "bench/results/smoke-dnvr-2/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "nix (Determinate Nix 3.23.0) 2.35.2"
+        ]
+      },
+      "flox": {
+        "cache_note": "ev-flox image: its Nix store may already hold some packages (preseeded at image build)",
+        "config": {
+          ".flox/env/manifest.toml": "ef3a5d98148183999292da53fe16c46551782e4d70c7e64311b29f8f865bd703"
+        },
+        "deviations": [],
+        "image": "ev-flox",
+        "image_id": "sha256:61613637e02c263efc9a16e13f76c823a8d9210a3e920449bbe85207d95c5e66",
+        "options": {},
+        "pins": {
+          "flox": "1.17.0"
+        },
+        "prior_options_receipt": "bench/results/smoke-flox-4/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "1.17.0-g486737b"
+        ]
+      },
+      "git-grove": {
+        "cache_note": "host Docker image cache and the run-private uv cache are not cleared; service images may already be present on the host",
+        "config": {
+          "Dockerfile": "d8aebcbac48f9e924b88e4885e4ff542349e0eba266fdc28e5e98e0874ab47b5",
+          "bin/start.sh": "e7ae90c4dc7ad9bb4ac9d5290922945b677fa6a9a577a9ff95184a37573546e0",
+          "bin/stop.sh": "949d0a6e5eaff5a63fc357770cc7efc6c4dc11802b61560372660776bdc125e1",
+          "compose.yaml": "8be035f9f0aa25cccda919672bb9bb075b206060343c48263593f82c648d2409",
+          "dockerignore": "a020c74dc8702e631cadb075674e66dbc61bb026d0cf4404d634f106e2ca6419",
+          "env.example": "240547b9ce896232ff958c1ffd29951919ea19bc049c6a370cc1606de6662064",
+          "gitignore": "b7f0cc2698158dba1fadc521cb101535f06cda4c4dc9b38412e04a113f73f94a",
+          "grove-config.json": "e35bdf75a7a02e1216301688179a832c6c743c1a1311614da686b7a81d76f57f",
+          "tool/package-lock.json": "1b0a5f6fc92d594c025ba7b869da8fdb994c1a0d0483a4754ab207d4b667cb34",
+          "tool/package.json": "a38b57deb2414e1b5c2a6e1f440557b2b00628a5f8221b0f8b9d633d7810d073"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "docker_config_source": "/Users/utsavsharma/.docker",
+          "git_grove": "0.1.0-alpha.1.8",
+          "git_grove_cli_sha256": "b8cd71e6d268fc6578da93d8da293728085900e80978dd316e5e53654a426b12",
+          "git_grove_integrity": "sha512-szaFvkSzi+a8JK8R1Ui+Yvv9u/6xnAAEw1Kvk61z+qRtOr+zlZD57Nr6yLzc+R21pZOhYm3X2WyD00TEaGC0mQ==",
+          "git_grove_track": "npm published",
+          "host_programs": {
+            "docker": "/opt/homebrew/Cellar/docker/28.1.1/bin/docker",
+            "docker-credential-desktop": "/Applications/Docker.app/Contents/Resources/bin/docker-credential-desktop",
+            "git": "/opt/homebrew/Cellar/git/2.51.2/bin/git",
+            "node": "/opt/homebrew/Cellar/node@24/24.16.0/bin/node",
+            "npm": "/opt/homebrew/Cellar/node@24/24.16.0/lib/node_modules/npm/bin/npm-cli.js"
+          },
+          "platform": "darwin-arm64 host",
+          "postgres_image": "postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+          "python": "3.13.16",
+          "python_sha256": "9e01f63bbb08576cd9c8bc2d0564d098cb30c8453a0cd4bcf6aef458f6d2a147",
+          "redis_image": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+          "uv": "0.12.23",
+          "uv_sha256": "50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/git-grove/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "  v0.1.0-alpha.1.8"
+        ]
+      },
+      "guix": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "channels.scm": "464b90f574f2b99a993c8eb39104b6be3cc921b3040fd8df187a63ae64b4a3f8",
+          "manifest.scm": "62380470f505452ebcb9780fc22c299c28349066d2d177da8bdd8f1ad562f8c8",
+          "provision.sh": "9a257c7dbb19ed5c92ce78914c3ac3ec89657c4d57b05bba55c101fdf03a6781"
+        },
+        "deviations": [
+          "PostgreSQL 16 and Redis 7 instead of 17 and 8"
+        ],
+        "image": "ev-base",
+        "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+        "options": {
+          "guix_binary_sha256": "a5d58b1d0294cad6adb1f2aff627d37feb5db763fdffbceb8551f2b12123cf39",
+          "guix_binary_url": "https://mirrors.kernel.org/gnu/guix/guix-binary-1.5.0.aarch64-linux.tar.xz"
+        },
+        "pins": {
+          "binary_sha256": "a5d58b1d0294cad6adb1f2aff627d37feb5db763fdffbceb8551f2b12123cf39",
+          "binary_url": "https://mirrors.kernel.org/gnu/guix/guix-binary-1.5.0.aarch64-linux.tar.xz",
+          "channel": "71d010188f039817c465985e46e185445fda6946",
+          "daemon_flags": "none",
+          "deviation": "PostgreSQL 16 and Redis 7 instead of 17 and 8",
+          "guix_release": "1.5.0",
+          "postgresql": "16.14",
+          "python": "3.13.13",
+          "redis": "7.2.6",
+          "uv": "0.10.12"
+        },
+        "prior_options_receipt": "bench/results/smoke-guix-1/meta.json",
+        "transport": "docker",
+        "version_contains": []
+      },
+      "isola": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "gitignore": "f0212b6452df2ac1ab1094bb02cbe284b48e03c00c994de00409a68484ab54db",
+          "isola.toml": "2869341b26b12117c88d02f4d2b551c3fca5075d5aac94bc4722d972d7e8d439",
+          "receipt.py": "85ec7929e9baa65344f361104b9de103055aa293c72b8c0a24a66776d034e46a",
+          "shared-servers.sh": "da3e46c93ed7f14578bf05fb71b69a5be277633593858423b5d48824791ea6b8",
+          "toolchain.toml": "8fc793ed6c047eda4cc854291a2f5f224de8b2f2b19e3c756afd27005e019c1c"
+        },
+        "deviations": [],
+        "image": "ev-base",
+        "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+        "options": {},
+        "pins": {
+          "isola": "0.4.1",
+          "isola_archive_sha256": "c2494bcf45405d74a79e6e74d7283e106b77dbbb41477955c3776b95d4fea92d",
+          "isola_commit": "af852ae57c6d107e09daaacf8d744cc09e18fbd0",
+          "isola_toml_sha256": "2869341b26b12117c88d02f4d2b551c3fca5075d5aac94bc4722d972d7e8d439",
+          "mise": "2026.10.3",
+          "project": "rwb-isola-plan",
+          "shared": {
+            "pg_port": 25440,
+            "redis_port": 26390
+          },
+          "toolchain": {
+            "postgres": "17.11",
+            "python": "3.13.16",
+            "redis": "8.10.2",
+            "uv": "0.12.23"
+          }
+        },
+        "prior_options_receipt": "bench/results/smoke-isola-1/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "isola 0.4.1 (commit: af852ae57c6d107e09daaacf8d744cc09e18fbd0, built: 2026-09-09"
+        ]
+      },
+      "lando": {
+        "cache_note": "host Docker image cache and the pinned CLI download are reused across runs; A pulls/builds only images missing from the host cache, B reuses A's",
+        "config": {
+          ".lando.yml": "fe228c4ac2a8d41b66bf96ebbae765ff2cbbf6c6794c4581b8f074e74b361b3f",
+          ".lando/uv-requirements.txt": "915ad3822b8729fe99c27228507f5d481b4d8804de0d3a43f8601d1dd74a9fab",
+          "check_config.py": "a944323e69a528fedf2c6bb10abc747078520037bb1cfef8e9de6bb9ee3d838b",
+          "config.yml": "609854be27ce1ec794e6792edfd048718b472dc0e1e22ea76282fa6eb8d49d36"
+        },
+        "deviations": [
+          "Debian images (Lando v3 service scripts need bash): python full bookworm, Bitnami PostgreSQL 17.6.0, Redis 8.10.2 trixie; Redis AOF appendfsync=everysec (plugin default)"
+        ],
+        "image": null,
+        "options": {},
+        "pins": {
+          "asset_hash_source": "release sha256sum.txt",
+          "assets": {
+            "darwin-amd64": "16969dc627d1594a40ac62b8362f657b59309af1563a82057d58cc769bc70718",
+            "darwin-arm64": "8dd9b6306a05816c3d8cdb2f4c4b9fd6d9df76490992fb0f2e331a894fd92b95",
+            "linux-amd64": "7a868b71efffb1f8ecc5cc3377bcbeea9926618a082c5138ba19803b9bba5011",
+            "linux-arm64": "5709cf237ccd7a23768b920b00e20cbf2067b184d2572f0945bb2ecf09be67a8"
+          },
+          "entry_auto_resumes": false,
+          "image_notes": "Debian images (Lando v3 service scripts need bash): python full bookworm, Bitnami PostgreSQL 17.6.0, Redis 8.10.2 trixie; Redis AOF appendfsync=everysec (plugin default)",
+          "images": {
+            "postgres": "bitnamilegacy/postgresql:17.6.0-debian-12-r4@sha256:926356130b77d5742d8ce605b258d35db9b62f2f8fd1601f9dbaef0c8a710a8d",
+            "python": "python:3.13.16-bookworm@sha256:d79ba8693551488516799bfce4566d8cbcccb87c9d9dfaef5e3915f1451e1326",
+            "redis": "redis:8.10.2-trixie@sha256:c94085d298b738be22c9ccdc0ac3761fa6649df7dd82ad1d42367f3cb9714935",
+            "uv": "uv==0.12.23 wheel from PyPI, hash-locked in .lando/uv-requirements.txt"
+          },
+          "orchestrator": "docker-compose 2.40.3",
+          "orchestrator_assets": {
+            "darwin-amd64": "53528ecff0182546d92d7cc3f50dc78f9b387c3da68b4a3fd0cf2c48dab77133",
+            "darwin-arm64": "8cd7eb5f95bacb536cc407111662e2c205d67d9abfea5dcb8400be8418db60d1",
+            "linux-amd64": "dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372",
+            "linux-arm64": "d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137"
+          },
+          "plugins": [
+            "@lando/python@1.4.3",
+            "@lando/postgres@1.6.0",
+            "@lando/redis@1.3.0"
+          ],
+          "receipt_sha256": "56ed1793c3dbd4631f930b402aea0e9fae182c5335af483ff05b9b34d6fee0c4",
+          "source_commit": "7a87f80576c5cdb5c7d616108bc9aff81150d463",
+          "validity": {
+            "autosetup": "setup.skipInstallCa, buildEngine/buildx/orchestrator/installPlugins=false; verified by check_config.py before start",
+            "core_hooks_required": [
+              "frozen_copy: add C to Scenario.started (setup/start create containers); host cleanup_host covers it until then"
+            ],
+            "docker_client_config": "HOME=/home/agent/rwb/_state/home (Lando strips DOCKER_*): its .docker holds the user's persisted current context only, no credsStore/auths (anonymous public pulls); preflight fails closed on a different daemon endpoint, on DOCKER_HOST/CONTEXT/TLS* env overrides, on TLS/SkipTLSVerify contexts, and unless the endpoint is the unix socket /var/run/docker.sock that Lando's engine uses; every later body (receipts, cleanup) exits 77 before any docker/lando call unless /home/agent/rwb/_state/docker-selection.json seals that validated selection",
+            "host_docker_daemon": "docker info must succeed; checkouts must be visible to the daemon (Docker Desktop file sharing covers the temp dir)",
+            "owned_names": "every project/volume/image contains ownership token plan",
+            "private_home": "Lando's /user mount and .ssh key scan use /home/agent/rwb/_state/home (holds private .docker metadata and the .ssh Lando creates), not the user's home: no host SSH key files in containers; SSH_AUTH_SOCK is still inherited, so agent access is not guaranteed off",
+            "private_state": "/home/agent/rwb/_state only; user tool state is never read or written"
+          },
+          "version": "3.26.9"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/lando/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "v3.26.9"
+        ]
+      },
+      "mise": {
+        "cache_note": "fresh ev-base container: no mise cache; A downloads, B reuses (same container)",
+        "config": {
+          "mise.local.toml.in": "bfeae6907a350c77a0cc3483e6f29eaf2bd8fc2e5d8d34d42f31f3ffdb195114",
+          "mise.toml": "bb4e0284856ff2ce28de5d48cba33ba77eff877e56d26df631dabe7dc46bc594"
+        },
+        "deviations": [],
+        "image": "ev-base",
+        "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+        "options": {},
+        "pins": {
+          "mise": "2026.10.3",
+          "pitchfork": "2.29.0",
+          "postgres": "17.11",
+          "python": "3.13.16",
+          "redis": "8.10.2",
+          "uv": "0.12.23"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/mise/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "2026.10.3 linux-arm64 (2026-10-05)"
+        ]
+      },
+      "nix": {
+        "cache_note": "ev-nix image (Determinate Nix 3.23.0 / Nix 2.35.2): store as built, may hold some paths; A's substitutes are reused by B (same store)",
+        "config": {
+          "nix/flake.nix": "853ee70810dec208d5b117378a56d45f2f89bc2e2bb933b4f3312deb6654211c"
+        },
+        "deviations": [],
+        "image": "ev-nix",
+        "image_id": "sha256:fbf87c18aced2d3c969df40d15b137943429882f4283fe256c2f481a7af17c6a",
+        "options": {},
+        "pins": {
+          "nixpkgs": "151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4",
+          "postgresql": "17.11",
+          "python": "3.13.15",
+          "redis": "8.10.2",
+          "uv": "0.12.22"
+        },
+        "prior_options_receipt": "bench/results/smoke-nix-1/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "nix (Determinate Nix 3.23.0) 2.35.2"
+        ]
+      },
+      "organist": {
+        "cache_note": "ev-nix image's Nix store as built; substitutes fetched in A are reused by B (same store)",
+        "config": {
+          "flake.nix": "abfd2f92981582e78e1af01feb409fe63284953578298390e56a9035e06aa79e",
+          "organist-holder.sh": "af74bd9d0426323caecf26a0f1ee5d10162c48bf3c7395a47c59b6ad4169cb8b",
+          "organist-services.sh": "6bd7c79310b921b3b77982f01fb28c793082173894446db78a9581135b5d1083",
+          "project.ncl": "fb1d8cd3301bc3d06f698bcf93d546cfdacf7f34d811eda1c77b8f4f47eeab7a"
+        },
+        "deviations": [],
+        "image": "ev-nix",
+        "image_id": "sha256:fbf87c18aced2d3c969df40d15b137943429882f4283fe256c2f481a7af17c6a",
+        "options": {},
+        "pins": {
+          "nix_config": "lazy-trees = false",
+          "nixpkgs": "github:NixOS/nixpkgs/151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4",
+          "organist": "github:nickel-lang/organist/a7e4e638cade5e7c4f36a129b80d91bf3538088e (main; no current release)",
+          "runner": "honcho (from organist's services module)"
+        },
+        "prior_options_receipt": "bench/results/smoke-organist-1/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "nix (Determinate Nix 3.23.0) 2.35.2"
+        ]
+      },
+      "pixi": {
+        "cache_note": "fresh ev-base container: empty Pixi/rattler cache; A downloads, B reuses (same container)",
+        "config": {
+          "pixi.toml": "efd81f1383a069660f3399da00d3b6895445a9e41a7dbb376582649fd4539050",
+          "rwb-pixi-run.sh": "78856e7113f69f26fba5662687892352efc6baa688db44b44956150bf2b95ed9"
+        },
+        "deviations": [
+          "Python 3.13.15 (conda-forge has no 3.13.16 for linux-aarch64); PyPI set resolved by Pixi, not fixtures/app/uv.lock"
+        ],
+        "image": "ev-base",
+        "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+        "options": {},
+        "pins": {
+          "deviation": "Python 3.13.15 (conda-forge has no 3.13.16 for linux-aarch64); PyPI set resolved by Pixi, not fixtures/app/uv.lock",
+          "pixi": "0.81.0",
+          "pixi_tgz_sha256": "9f8d2113fe9dc01788a65f5c2acec34fa56b1193461a5c3e9a775d6d2d621bcb",
+          "postgresql": "17.11",
+          "psycopg": "3.3.6",
+          "pytest": "9.1.1",
+          "python": "3.13.15",
+          "redis": "8.10.2",
+          "redis_py": "8.1.0"
+        },
+        "prior_options_receipt": "bench/results/smoke-pixi-1/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "pixi 0.81.0"
+        ]
+      },
+      "pkgx": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "pkgx.yaml": "c9069916a0199607524ed44c9202fdddbece2bd7c54831b5ea3bb06962768e98"
+        },
+        "deviations": [],
+        "image": "ev-base",
+        "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+        "options": {},
+        "pins": {
+          "dev": "1.8.1",
+          "pantry": "2df061bd184985428bc17aba4a8a8c1e2fd39781",
+          "pkgx": "2.11.0",
+          "pkgx_txz_sha256": "fb4b9c2beb7264027e0cf99d9b60464425c84005951a10f63b38529b763b40d4",
+          "postgresql": "17.2",
+          "python": "3.13.15",
+          "redis": "8.10.0",
+          "uv": "0.12.22"
+        },
+        "prior_options_receipt": "bench/results/smoke-pkgx-1/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "pkgx 2.11.0"
+        ]
+      },
+      "process-compose": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "process-compose.yaml": "e1694397152f5cab3cb4348319a217c72b5be3ea8001f8f87823d70f2439c53a",
+          "rwb-pc.sh": "5d39924bc8f7bbee356b209c539701bf308438cb7d3e42ed6e2470a08e071aee",
+          "toolchain/flake.nix": "b1fbd4044e23956e1bd56408f9f4d054cca9790adffb5b4e0b7ebe69d9209df3"
+        },
+        "deviations": [],
+        "image": "ev-nix",
+        "image_id": "sha256:fbf87c18aced2d3c969df40d15b137943429882f4283fe256c2f481a7af17c6a",
+        "options": {},
+        "pins": {
+          "nixpkgs": "151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4",
+          "postgresql": "17.11",
+          "process_compose": "1.122.0",
+          "process_compose_tgz_sha256": "52fa7d5a2d5e0db470faec5976204fc215ed7e3d13689e930cf522becfb63778",
+          "python": "3.13.15",
+          "redis": "8.10.2",
+          "uv": "0.12.22"
+        },
+        "prior_options_receipt": "bench/results/smoke-process-compose-2/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "Process Compose"
+        ]
+      },
+      "services-flake": {
+        "cache_note": "image caches not cleared; first-checkout timings may include preseeded caches",
+        "config": {
+          "rwb-sf.sh": "d20ba91ecd26c7f6f369594d944f87aaed472b3ef97803043020f5714dd7b24c",
+          "services/flake.nix": "a0aee7d4c4bdfdfa5ed285704d11698002739a43d15f77f7d9e4bb9ccd8917c3"
+        },
+        "deviations": [],
+        "image": "ev-nix",
+        "image_id": "sha256:fbf87c18aced2d3c969df40d15b137943429882f4283fe256c2f481a7af17c6a",
+        "options": {},
+        "pins": {
+          "flake_parts": "024633cd702b10285db5cb19b40ad48d2399ba60",
+          "nixpkgs": "151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4",
+          "postgresql": "17.11",
+          "process_compose": "1.122.0 (nixpkgs)",
+          "process_compose_flake": "464ff6880737f063c3f0d3d2c7781fda9190868f",
+          "python": "3.13.15",
+          "redis": "8.10.2",
+          "services_flake": "0ba7183cab54ffbd0be70cb95694f024701afd2b",
+          "uv": "0.12.22"
+        },
+        "prior_options_receipt": "bench/results/smoke-services-flake-2/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "nix (Determinate Nix 3.23.0) 2.35.2"
+        ]
+      },
+      "stack": {
+        "cache_note": "fresh ev-base container: no mise/Stack tool cache; downloads in A's `up`, reused by B (same container); pinned mise installed at provision (not timed)",
+        "config": {
+          "stack.toml": "48104e65fa199b21a08ef720a31c8def9dd4c2440998c229768c35fdfc4866a5"
+        },
+        "deviations": [],
+        "image": "ev-base",
+        "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+        "options": {
+          "stack_binary": "/tmp/stack-bench-build/target/release/stack",
+          "stack_sha256": "1d338d2cd92c4ee898037c9ee39dfbccb7c1e3dabae8180fbf65662ac015ce20"
+        },
+        "pins": {
+          "mise": "2026.10.3",
+          "stack_binary": "/tmp/stack-bench-build/target/release/stack",
+          "stack_sha256": "1d338d2cd92c4ee898037c9ee39dfbccb7c1e3dabae8180fbf65662ac015ce20"
+        },
+        "prior_options_receipt": "bench/results/smoke-stack-6/meta.json",
+        "transport": "docker",
+        "version_contains": [
+          "stack 0.1.4"
+        ]
+      },
+      "tilt": {
+        "cache_note": "host Docker image/build cache not cleared; uv cache is run-owned and shared by the run's checkouts (A fills it, B is warm)",
+        "config": {
+          ".dockerignore": "08bb7a70af4ae5a9c15226f499f2e76055ebd521550f87eb102a1316cdb9df38",
+          "Dockerfile": "e488a136804f5afe1d6905d8ed0d62d162da9b9006fa609a108a0f50b80c0227",
+          "Tiltfile": "94a48dd2bf13995486507a256625670273a792947e7a6e8597a4a33241dbfab1",
+          "compose.yaml": "478f44c93aa08944e634a26caaf15c1e83071936c3ed3ee0ae1a54fec6e1fc70",
+          "owned_processes.py": "08cf8b3fc51139203f0030eb111a0c382f2c75744a906dba0039a6e0aefb3ad5"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "docker_compose": "5.6.0",
+          "docker_compose_sha256": "bd714a42b46e51757fc1121085b3096b9064e3f80d3ca5a991e33f44df4f43c9",
+          "images": {
+            "postgres": "postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+            "python": "python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641",
+            "redis": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+            "uv": "ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21"
+          },
+          "tilt": "0.37.8",
+          "tilt_archive_sha256": "2d396b13c479f74deb19cb2161a3f0858f6e03f26f15f8d3b3be982d09ff4484",
+          "tilt_sha256": "190255a6e64023b4cfe7a2bbecb34b41113d8c5db7d74f74555b8827e38cfb79",
+          "uv_lock": "fixtures/app/uv.lock (uv sync --frozen)"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/tilt/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "v0.37.8, built 2026-10-01"
+        ]
+      },
+      "vagrant": {
+        "cache_note": "host Docker image/build cache not cleared; uv cache is run-owned and shared by the run's checkouts (A fills it, B is warm)",
+        "config": {
+          ".dockerignore": "08bb7a70af4ae5a9c15226f499f2e76055ebd521550f87eb102a1316cdb9df38",
+          "Dockerfile": "0524de3c77420894c81fcd3d03fafec2b568d3824e775739c8a3d1286dd5bd48",
+          "Vagrantfile": "4266ae768c0d0fc00730f3aeadba6ee12740a20066c8aef9fb97c2ac5c141a95",
+          "images.lock.json": "e4db8bb345c38c94fd50807c2bb8b3236584da3324bde89d096969b8cd6d5405",
+          "vagrant-resources.sh": "42fd4c5f4b205cb0b0e9ba658f3339ed09b5075013a339309dc9bb415632ec67"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "images": "adapters/vagrant/images.lock.json",
+          "provider": "docker (force_host_vm=false)",
+          "uv_lock": "fixtures/app/uv.lock (uv sync --frozen)",
+          "vagrant": "2.4.9",
+          "vagrant_dmg_sha256": "8de08bd435ef8ae0fc5fbd6acefa9c68e62fb898c5ae0fbdacd26853bea9d4d6",
+          "vagrant_launcher_sha256": "102bbe8336c246c3a647c2374d5ed9ecad42c8cd7fb886ee7f8aec4d14290d41"
+        },
+        "prior_options_receipt": "bench/results/final-affected-diagnostics-20261006T165911Z/vagrant/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "Vagrant 2.4.9"
+        ]
+      },
+      "worktrunk": {
+        "cache_note": "host Docker image cache and the run-private uv cache are not cleared; service images may already be present on the host",
+        "config": {
+          "compose.yaml": "62595685960eaa8230fc4329f8e45f964f48fb29408724a47c286a6cb7eca04f",
+          "gitignore": "57a8ad0e62346f7b0f2e261d59a7b90f1310043424bcb9d229208f183f1940d9",
+          "python-version": "2d82946ffb2ecf549699ebb86ecbbe663bbc19d53c49c681a1a425f003f80ddb",
+          "wt.toml": "f622831cd7daad812031c84416f68d9f81364ba0c738271c53ed5fefba0d7603"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "docker_config_source": "/Users/utsavsharma/.docker",
+          "host_programs": {
+            "docker": "/opt/homebrew/Cellar/docker/28.1.1/bin/docker",
+            "docker-credential-desktop": "/Applications/Docker.app/Contents/Resources/bin/docker-credential-desktop",
+            "git": "/opt/homebrew/Cellar/git/2.51.2/bin/git"
+          },
+          "platform": "darwin-arm64 host",
+          "postgres_image": "postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+          "python": "3.13.16",
+          "python_sha256": "9e01f63bbb08576cd9c8bc2d0564d098cb30c8453a0cd4bcf6aef458f6d2a147",
+          "redis_image": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+          "uv": "0.12.23",
+          "uv_sha256": "50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544",
+          "worktrunk": "0.80.0",
+          "worktrunk_archive_sha256": "8a2bb053c4bc80dea7d9ce6c221ff038d10a3d2dca2dc8f60d1b1a094fa783a9",
+          "worktrunk_binary_sha256": "0708ca37fc39f9fa48edc1af500a2ff3664ec0155f63909425b02994f29f0fd1"
+        },
+        "prior_options_receipt": "bench/results/smoke-worktrunk-1/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "wt v0.80.0"
+        ]
+      },
+      "workz": {
+        "cache_note": "host Docker image cache and the run-private uv cache are not cleared; service images may already be present on the host",
+        "config": {
+          "compose.yaml": "da4c8bf2b073961241e166161429a9335ca9323bd70241151852aa6309522aff",
+          "gitignore": "2fc6447dc93ff52531f69df25d4dfdd9275810716c8ef16dba392eb4bedac45d",
+          "python-version": "2d82946ffb2ecf549699ebb86ecbbe663bbc19d53c49c681a1a425f003f80ddb",
+          "rwb-workz-env.sh": "ed553b8bd65a23bb2b87adcdf0a8865937b6121428333ea18c00408483060975",
+          "workz.toml": "a8613130617cd2db6a726cc31dbb24a2e716e8fab2ff45cf2a817e56a9a24f59"
+        },
+        "deviations": [],
+        "image": null,
+        "options": {},
+        "pins": {
+          "docker_config_source": "/Users/utsavsharma/.docker",
+          "host_programs": {
+            "docker": "/opt/homebrew/Cellar/docker/28.1.1/bin/docker",
+            "docker-credential-desktop": "/Applications/Docker.app/Contents/Resources/bin/docker-credential-desktop",
+            "git": "/opt/homebrew/Cellar/git/2.51.2/bin/git"
+          },
+          "platform": "darwin-arm64 host",
+          "postgres_image": "postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+          "python": "3.13.16",
+          "python_sha256": "9e01f63bbb08576cd9c8bc2d0564d098cb30c8453a0cd4bcf6aef458f6d2a147",
+          "redis_image": "redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
+          "uv": "0.12.23",
+          "uv_sha256": "50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544",
+          "workz": "0.11.0",
+          "workz_archive_sha256": "a0a203b6d4f76dd00198d101163c644529553cb7eb33c261fa4fa15ae405d195",
+          "workz_binary_sha256": "72994c049c43989e4ec868dd3741389548f70aa15342acd34cd88349c5feef97",
+          "workz_track": "published stable"
+        },
+        "prior_options_receipt": "bench/results/smoke-workz-1/meta.json",
+        "transport": "host",
+        "version_contains": [
+          "workz 0.11.0"
+        ]
+      }
+    },
+    "platform": {
+      "host": {
+        "machine": "arm64",
+        "python": "3.12.9",
+        "release": "24.6.0",
+        "system": "Darwin"
+      },
+      "note": "macOS host, Docker Desktop Linux ARM64 workloads for docker lanes; host lanes as their committed recipes declare"
+    },
+    "reporter_sha256": "f7bacbb250635017cbfcf67711e2ebea430f45babf0379c83f7c9df4dcf9f434",
+    "resources": {
+      "cpus": null,
+      "memory": null
+    },
+    "shared_glue": {
+      "rwb-env.sh": "b3855e88af12fc9a0e92a8105d8ef260cc703656e56203d20aca1653b647664c",
+      "rwb-services.sh": "e7572678db45619ab0927b6539ea7ff39e0c78f16edc71e09364e212223e5b7d"
+    },
+    "source_approvals": [
+      {
+        "path": "bench/reviews/round-3-report.md",
+        "sha256": "62976edf592b410492e1113e4a88419f5251a2b5f4cd01893549660506cbc47e"
+      },
+      {
+        "path": "bench/reviews/round-4-core.md",
+        "sha256": "e9f452d57b1c2d615e0c807d66043f1e7b5299a9c5211ab4553dd30e65ab7467"
+      },
+      {
+        "path": "bench/reviews/round-5-adapters.md",
+        "sha256": "ce9498a5ee9606e6d0d1608591c9ac54670b9210ff39d6a409a1943ecf500998"
+      },
+      {
+        "path": "bench/reviews/round-2-bad-config.md",
+        "sha256": "98c01f02ed7e32621c4ed758261ded438f936af2ebbf5d6fab7a277a2124d1ba"
+      },
+      {
+        "path": "bench/reviews/round-2-ddev-lando-bootstrap.md",
+        "sha256": "638007cbe1f8040e24b21a77420ee0d8ffb731725d4516a1196cc653bd1196f4"
+      },
+      {
+        "path": "bench/reviews/round-2-gitgrove-init.md",
+        "sha256": "d3358ae20b5ae7e154c7c17bc7b436e93ba086fc9139a146b72bed502cb6a81f"
+      },
+      {
+        "path": "bench/reviews/round-3-tilt-process.md",
+        "sha256": "dcd3ebff83ea743bbb1465c9b1976694ad77c53e2664a90da324db6cecec20b1"
+      },
+      {
+        "path": "bench/reviews/round-1-native-transport.md",
+        "sha256": "c374251ae445edfff5043c3f79d9e4d1457f3c5d60ceaab29f93bafced908ebf"
+      },
+      {
+        "path": "bench/reviews/round-1-devpod-autoresume.md",
+        "sha256": "d7b9f53819fd1d64095a5dd613ecc69e2b4ef0194b68959bdf324a6e96b371b0"
+      }
+    ],
+    "stack": {
+      "binary_path": "/tmp/stack-bench-build/target/release/stack",
+      "binary_sha256": "1d338d2cd92c4ee898037c9ee39dfbccb7c1e3dabae8180fbf65662ac015ce20",
+      "build_receipt": {
+        "path": "bench/provenance/stack-20261006/original-stack-build-thread-receipts.json",
+        "sha256": "dd06255cd6097860b32c62d3b6eb8f5f6277508f47f81b8eba603eafe4f39868"
+      },
+      "source_revision": "06c351acc6a0744d918dc571c063ff1f6c300700"
+    }
+  },
+  "schema": "rwb-measurement-manifest/1",
+  "session": {
+    "id": "final-20261006-reviewed-1",
+    "keep": false,
+    "plan_created_utc": "2026-10-06T17:19:10Z",
+    "purpose": "final-measurement",
+    "result_review": "pending",
+    "review": null,
+    "roster": [
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "stack",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/stack",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3",
+          "--option",
+          "stack_sha256=1d338d2cd92c4ee898037c9ee39dfbccb7c1e3dabae8180fbf65662ac015ce20",
+          "--option",
+          "stack_binary=/tmp/stack-bench-build/target/release/stack"
+        ],
+        "entry": "Stack",
+        "options": {
+          "stack_binary": "/tmp/stack-bench-build/target/release/stack",
+          "stack_sha256": "1d338d2cd92c4ee898037c9ee39dfbccb7c1e3dabae8180fbf65662ac015ce20"
+        },
+        "path": "bench/results/final-20261006-reviewed-1/stack",
+        "tool": "stack",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "mise",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/mise",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "mise / Pitchfork",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/mise",
+        "tool": "mise",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "flox",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/flox",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Flox",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/flox",
+        "tool": "flox",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "devbox",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/devbox",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Devbox",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/devbox",
+        "tool": "devbox",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "devenv",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/devenv",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "devenv",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/devenv",
+        "tool": "devenv",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "nix",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/nix",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Nix",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/nix",
+        "tool": "nix",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "pixi",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/pixi",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Pixi",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/pixi",
+        "tool": "pixi",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "compose",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/compose",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Docker Compose",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/compose",
+        "tool": "compose",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "devcontainers",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/devcontainers",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Dev Containers",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/devcontainers",
+        "tool": "devcontainers",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "devpod",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/devpod",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "DevPod",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/devpod",
+        "tool": "devpod",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "ddev",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/ddev",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "DDEV",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/ddev",
+        "tool": "ddev",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "lando",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/lando",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Lando",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/lando",
+        "tool": "lando",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "process-compose",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/process-compose",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Process Compose",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/process-compose",
+        "tool": "process-compose",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "services-flake",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/services-flake",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "services-flake",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/services-flake",
+        "tool": "services-flake",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "pkgx",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/pkgx",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "pkgx / dev",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/pkgx",
+        "tool": "pkgx",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "dnvr",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/dnvr",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "dnvr",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/dnvr",
+        "tool": "dnvr",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "guix",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/guix",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3",
+          "--option",
+          "guix_binary_sha256=a5d58b1d0294cad6adb1f2aff627d37feb5db763fdffbceb8551f2b12123cf39",
+          "--option",
+          "guix_binary_url=https://mirrors.kernel.org/gnu/guix/guix-binary-1.5.0.aarch64-linux.tar.xz"
+        ],
+        "entry": "GNU Guix",
+        "options": {
+          "guix_binary_sha256": "a5d58b1d0294cad6adb1f2aff627d37feb5db763fdffbceb8551f2b12123cf39",
+          "guix_binary_url": "https://mirrors.kernel.org/gnu/guix/guix-binary-1.5.0.aarch64-linux.tar.xz"
+        },
+        "path": "bench/results/final-20261006-reviewed-1/guix",
+        "tool": "guix",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "workz",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/workz",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "workz (rohansx)",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/workz",
+        "tool": "workz",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "worktrunk",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/worktrunk",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Worktrunk",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/worktrunk",
+        "tool": "worktrunk",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "git-grove",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/git-grove",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "GitGrove",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/git-grove",
+        "tool": "git-grove",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "isola",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/isola",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "isola",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/isola",
+        "tool": "isola",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "berth",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/berth",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Berth",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/berth",
+        "tool": "berth",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "branchbox",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/branchbox",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "BranchBox",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/branchbox",
+        "tool": "branchbox",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "tilt",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/tilt",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Tilt",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/tilt",
+        "tool": "tilt",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "organist",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/organist",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Organist",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/organist",
+        "tool": "organist",
+        "variant": "default"
+      },
+      {
+        "argv": [
+          "/Users/utsavsharma/miniconda3/bin/python3",
+          "-B",
+          "bench/run.py",
+          "--tool",
+          "vagrant",
+          "--out",
+          "bench/results/final-20261006-reviewed-1/vagrant",
+          "--repeats",
+          "20",
+          "--warmups",
+          "3"
+        ],
+        "entry": "Vagrant",
+        "options": {},
+        "path": "bench/results/final-20261006-reviewed-1/vagrant",
+        "tool": "vagrant",
+        "variant": "default"
+      }
+    ],
+    "sample_policy": {
+      "repeats": 20,
+      "warmups": 3
+    },
+    "serialization_declaration": "Parent explicitly authorizes this declaration. Sole live executor; parent promises no parallel benchmark, build or install task throughout this session. Each of 26 fresh synchronous run.py invocations executes serially in declared roster order with 20 repeats, 3 warmups, keep=false. No diagnostics promoted; unrelated preexisting host services remain running.",
+    "timing_policy": "First-task A/B are single prepared-checkout observations; repeat20/warmup3 distributions descriptive only; no rank, cold-install, confidence or native-macOS inference. Result review pending; no final timing promotion."
+  }
+}
