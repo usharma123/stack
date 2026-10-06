@@ -1,0 +1,7 @@
+# Private Lando global config for one benchmark run (LANDO_CORE_USERCONFROOT); never the
+# user's ~/.lando. The shared Traefik proxy and URL scanner are off: the fixture serves no
+# HTTP. `lando setup` is NOT run (it can install Docker Desktop/buildx and a CA); the
+# provision step appends `orchestratorBin:` pointing at a checksum-verified Compose v2.40.3
+# (Lando 3.26.9's default orchestrator version) and installs pinned plugins with plugin-add.
+proxy: "OFF"
+scanner: false
