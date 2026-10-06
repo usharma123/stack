@@ -71,7 +71,8 @@ class GitGroveAdapter(WorktreeHostAdapter):
     def grove(self, args):
         return f"(cd {q(self.repo())} && GROVE_WORKTREE_ROOT={q(self.trees())} grove {args})"
 
-    def image(self, co):
+    def app_image(self, co):
+        # Not `image`: Adapter.image is the run's container-image metadata (None on host).
         return f"{self.project(co)}-app"
 
     def provision_tool(self):
@@ -112,7 +113,7 @@ class GitGroveAdapter(WorktreeHostAdapter):
             f"cd {q(co.path)}",
             "set -a; . ./.env.example; set +a",
             f"docker build --build-arg RWB_PYTHON_IMAGE --build-arg RWB_UV_IMAGE "
-            f"--label rwb.run={q(self.run_id)} -t {q(self.image(co))} ."])
+            f"--label rwb.run={q(self.run_id)} -t {q(self.app_image(co))} ."])
 
     def frozen_setup(self, co):
         return self.setup(co)
@@ -141,7 +142,7 @@ class GitGroveAdapter(WorktreeHostAdapter):
     def tool_versions(self, co):
         return "\n".join([
             "set -euo pipefail",
-            f"docker run --rm --network none {q(self.image(co))} sh -c "
+            f"docker run --rm --network none {q(self.app_image(co))} sh -c "
             "'python -VV; uv --version; uv pip list --python /app/.venv/bin/python --format freeze --exclude-editable'",
             f"grep -E '^RWB_' {q(co.path)}/.env.example"])
 
@@ -190,4 +191,4 @@ class GitGroveAdapter(WorktreeHostAdapter):
             self.grove(f"delete {q(self.branch(co.name))} --yes --delete-branch"),
             f"test ! -e {q(co.path)} || {{ echo 'worktree {co.path} still exists' >&2; exit 1; }}",
             self.verify_project_gone(project),
-            f"if docker image inspect {q(self.image(co))} >/dev/null 2>&1; then docker image rm {q(self.image(co))} >/dev/null; fi"])
+            f"if docker image inspect {q(self.app_image(co))} >/dev/null 2>&1; then docker image rm {q(self.app_image(co))} >/dev/null; fi"])

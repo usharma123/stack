@@ -11,14 +11,17 @@ parent-declared session manifest checked by bench/report.py.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 
 BENCH = Path(__file__).resolve().parent
@@ -26,6 +29,7 @@ sys.path.insert(0, str(BENCH))
 
 from rwb.adapters import registry  # noqa: E402
 from rwb.adapters.base import FEATURES  # noqa: E402
+from rwb.outcomes import Outcomes  # noqa: E402
 from rwb.record import Recorder, utc  # noqa: E402
 from rwb.scenario import ProvisionBlocked, ProvisionError, Scenario  # noqa: E402
 from rwb.transport import DockerTransport, HostTransport  # noqa: E402
@@ -77,39 +81,35 @@ def main(argv=None):
 
     out = Path(args.out or BENCH / "results" / f"{adapter.name}-{adapter.variant}-{run_id}").resolve()
     rec = Recorder(out)
-    workdir = Path(tempfile.mkdtemp(prefix=f"rwb-{run_id}-")) if adapter.transport == "host" else None
-    if adapter.transport == "docker":
-        resources = [x for flag, v in (("--cpus", args.cpus), ("--memory", args.memory)) if v for x in (flag, v)]
-        tx = DockerTransport(rec, run_id, adapter.name, adapter.image, adapter.mounts(), adapter.user,
-                             resources=resources)
-    else:
-        adapter.root = str(workdir / "w")
-        tx = HostTransport(rec, workdir, env=adapter.host_env(workdir))
-
-    meta = dict(run_id=run_id, tool=adapter.name, variant=adapter.variant, title=adapter.title,
-                started_utc=utc(), started_unix_ns=time.time_ns(), valid=False, completed=False,
-                host=dict(system=platform.system(), machine=platform.machine(), release=platform.release(),
-                          python=platform.python_version()),
-                harness=dict(commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain", "--", ".")),
-                             files=tree_hashes(BENCH / "rwb") | {"run.py": sha256(BENCH / "run.py")}),
-                fixture=tree_hashes(BENCH / "fixtures" / "app"),
-                shared_glue=tree_hashes(BENCH / "adapters" / "_shared"),
-                config=tree_hashes(adapter.config_dir()) if adapter.config_dir().exists() else {},
-                features={k: adapter.features[k] for k in FEATURES},
-                isolation_boundary=adapter.isolation_boundary, transport=adapter.transport,
-                image=adapter.image, options=options, repeats=args.repeats, warmups=args.warmups,
-                keep=args.keep, resources=dict(cpus=args.cpus, memory=args.memory),
-                pins=getattr(adapter, "pins", {}), errors=[],
-                setup_scope=adapter.setup_scope or "not declared",
-                prepare_scope=adapter.prepare_scope, start_scope=adapter.start_scope,
-                cache_note=adapter.cache_note)
-    rec.write_json("meta.json", meta)
+    # Everything between creating the results directory and the protected run below is
+    # initialization: a failure here still leaves a truthful receipt and removes only the
+    # exact tempdir this process created, then re-raises the original error.
+    init = dict(run_id=run_id, tool=adapter.name, variant=adapter.variant, title=adapter.title,
+                transport=adapter.transport, isolation_boundary=adapter.isolation_boundary,
+                started_utc=utc(), started_unix_ns=time.time_ns())
+    workdir = workdir_id = meta = None
 
     def on_signal(signum, _frame):
         raise KeyboardInterrupt(f"signal {signum}")
-    signal.signal(signal.SIGTERM, on_signal)
+    try:
+        signal.signal(signal.SIGTERM, on_signal)
+        if adapter.transport == "host":
+            workdir = Path(tempfile.mkdtemp(prefix=f"rwb-{run_id}-"))
+            workdir_id = dir_identity(workdir)
+        if adapter.transport == "docker":
+            resources = [x for flag, v in (("--cpus", args.cpus), ("--memory", args.memory)) if v for x in (flag, v)]
+            tx = DockerTransport(rec, run_id, adapter.name, adapter.image, adapter.mounts(), adapter.user,
+                                 resources=resources)
+        else:
+            adapter.root = str(workdir / "w")
+            tx = HostTransport(rec, workdir, env=adapter.host_env(workdir))
+        meta = initial_meta(adapter, args, options, init)
+        rec.write_json("meta.json", meta)
 
-    scenario = Scenario(adapter, tx, rec, args.repeats, args.warmups)
+        scenario = Scenario(adapter, tx, rec, args.repeats, args.warmups)
+    except BaseException as error:
+        initialization_failed(rec, out, init, meta, workdir, workdir_id, error)
+        raise
     try:
         if adapter.transport == "docker":
             tx.start()
@@ -155,6 +155,344 @@ def main(argv=None):
             subprocess.run(["rm", "-rf", str(workdir)])
     print(out)
     return 0 if meta["valid"] else 1
+
+
+def initial_meta(adapter, args, options, init):
+    """The meta.json written before any command runs; it must be JSON-serializable."""
+    return dict(init, valid=False, completed=False,
+                host=dict(system=platform.system(), machine=platform.machine(), release=platform.release(),
+                          python=platform.python_version()),
+                harness=dict(commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain", "--", ".")),
+                             files=tree_hashes(BENCH / "rwb") | {"run.py": sha256(BENCH / "run.py")}),
+                fixture=tree_hashes(BENCH / "fixtures" / "app"),
+                shared_glue=tree_hashes(BENCH / "adapters" / "_shared"),
+                config=tree_hashes(adapter.config_dir()) if adapter.config_dir().exists() else {},
+                features={k: adapter.features[k] for k in FEATURES},
+                image=adapter.image, options=options, repeats=args.repeats, warmups=args.warmups,
+                keep=args.keep, resources=dict(cpus=args.cpus, memory=args.memory),
+                pins=getattr(adapter, "pins", {}), errors=[],
+                setup_scope=adapter.setup_scope or "not declared",
+                prepare_scope=adapter.prepare_scope, start_scope=adapter.start_scope,
+                cache_note=adapter.cache_note)
+
+
+def dir_identity(path):
+    st = os.lstat(path)
+    return dict(dev=st.st_dev, ino=st.st_ino, uid=st.st_uid)
+
+
+def same_dir(st, identity):
+    return (stat.S_ISDIR(st.st_mode) and dict(dev=st.st_dev, ino=st.st_ino, uid=st.st_uid) == identity
+            and st.st_uid == os.getuid())
+
+
+JSON_DEPTH, JSON_NODES, REPR_LIMIT = 32, 20000, 300
+
+
+def safe_text(obj, render=repr):
+    """repr()/str() that cannot raise (an Exception) and is bounded in length."""
+    try:
+        text = render(obj)
+        if not isinstance(text, str):
+            raise TypeError("not a str")
+    except Exception:
+        text = f"<{render.__name__} of {type(obj).__name__} failed>"
+    return text if len(text) <= REPR_LIMIT else text[:REPR_LIMIT] + "...<truncated>"
+
+
+def jsonable(value):
+    """A JSON-safe copy that keeps what cannot be serialized visible as marker strings instead
+    of failing on it: unsupported values, unsupported or colliding mapping keys, circular
+    containers (tracked by the identity of each container on the active path), nesting deeper
+    than JSON_DEPTH and anything past JSON_NODES values. Container subclasses are read through
+    the base type's own iteration, so overridden methods are never called. Containers are
+    iterated lazily and stop at the budget with one remainder marker, so the copy holds at most
+    JSON_NODES values plus one marker per container open at the cutoff, and no key past the
+    cutoff is rendered."""
+    active, budget = set(), [JSON_NODES]
+    omitted = f"<omitted: more than {JSON_NODES} values>"
+
+    def key_text(key):
+        if isinstance(key, str):
+            return str.__str__(key)
+        if key is None or key is True or key is False:
+            return json.dumps(key)
+        if isinstance(key, int):
+            return int.__repr__(key)
+        if isinstance(key, float):
+            return float.__repr__(key)
+        return f"<invalid key {type(key).__name__}: {safe_text(key)}>"
+
+    def walk(obj, depth):
+        budget[0] -= 1
+        if budget[0] < 0:
+            return omitted
+        if obj is None or obj is True or obj is False:
+            return obj
+        if isinstance(obj, str):
+            return str.__str__(obj)
+        if isinstance(obj, int):
+            return int.__index__(obj)
+        if isinstance(obj, float):
+            obj = float.__float__(obj)
+            return obj if math.isfinite(obj) else f"<non-finite float: {obj!r}>"
+        if not isinstance(obj, (dict, list, tuple)):
+            return f"<unserializable {type(obj).__name__}: {safe_text(obj)}>"
+        if id(obj) in active:
+            return f"<circular reference: {type(obj).__name__}>"
+        if depth >= JSON_DEPTH:
+            return f"<omitted: {type(obj).__name__} nested deeper than {JSON_DEPTH}>"
+        active.add(id(obj))
+        try:
+            if isinstance(obj, dict):
+                copy = {}
+                for key, item in dict.items(obj):
+                    text = omitted if budget[0] <= 0 else key_text(key)
+                    while text in copy:
+                        text += " <duplicate key>"
+                    if budget[0] <= 0:
+                        copy[text] = omitted
+                        break
+                    copy[text] = walk(item, depth + 1)
+                return copy
+            copy = []
+            for item in list.__iter__(obj) if isinstance(obj, list) else tuple.__iter__(obj):
+                if budget[0] <= 0:
+                    copy.append(omitted)
+                    break
+                copy.append(walk(item, depth + 1))
+            return copy
+        finally:
+            active.discard(id(obj))
+    return walk(value, 0)
+
+
+TRUSTED_INIT_FIELDS = ("run_id", "tool", "variant", "title", "transport", "isolation_boundary",
+                       "started_utc", "started_unix_ns")
+
+
+def minimal_record(init, detail, tb, cleanup, fault):
+    """The fallback receipt when the full one cannot be built: only exact str/int fields of the
+    harness-built init dict plus harness-built text. No adapter-supplied object is touched."""
+    def scalar(value):
+        return value if type(value) in (str, int) else f"<omitted {type(value).__name__}>"
+    problems = [p for p in cleanup.get("problems", []) if type(p) is str]
+    record = {k: scalar(init.get(k)) for k in TRUSTED_INIT_FIELDS}
+    record.update(
+        valid=False, completed=False, reportable=False, timings={},
+        errors=[f"initialization: {detail}"], cleanup_problems=problems,
+        finished_utc=utc(), finished_unix_ns=time.time_ns(),
+        measurement="invalid: initialization failed before the protected run; no checks executed, no timings",
+        initialization_failure=dict(
+            error=detail, traceback=tb, receipt=f"minimal: the full receipt could not be written ({fault})",
+            workdir=dict(action=scalar(cleanup.get("action")), problems=problems)))
+    return record
+
+
+DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+WORKDIR_DEPTH = 64
+
+
+def fd_removal_supported():
+    return (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and os.scandir in os.supports_fd
+            and {os.open, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd)
+
+
+def remove_init_workdir(workdir, identity, steps_run):
+    """Remove the tempdir created by this initialization, and nothing else.
+
+    Only the exact path returned by mkdtemp is considered, and only while it is still a real
+    (non-symlink) directory with the device, inode and owner recorded at creation, and no
+    transport command has run in it (so everything inside was written by harness code).
+    Otherwise it is left in place and the reason is returned as a problem. The deletion itself
+    is bound to that identity through a directory descriptor (remove_verified_dir)."""
+    receipt = dict(path=str(workdir) if workdir else None, identity=identity, action="none", problems=[])
+    if workdir is None:
+        receipt["action"] = "none created"
+        return receipt
+    problems = receipt["problems"]
+    try:
+        st = os.lstat(workdir)
+    except FileNotFoundError:
+        receipt["action"] = "already absent"
+        return receipt
+    if identity is None:
+        problems.append(f"{workdir}: no creation identity recorded; left in place")
+    elif stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        problems.append(f"{workdir}: no longer a real directory; left in place")
+    elif not same_dir(st, identity):
+        problems.append(f"{workdir}: identity changed since creation; left in place")
+    elif steps_run:
+        problems.append(f"{workdir}: {steps_run} command(s) ran in it; left in place for inspection")
+    elif not fd_removal_supported():
+        problems.append(f"{workdir}: descriptor-relative removal is unavailable here; left in place")
+    if problems:
+        receipt["action"] = "left"
+        return receipt
+    return remove_verified_dir(Path(workdir), identity, receipt)
+
+
+def remove_verified_dir(workdir, identity, receipt):
+    """Open workdir without following a symlink, require the descriptor (and the name in its
+    parent) to match the creation identity, delete the contents relative to that descriptor,
+    and rmdir the name only if it still names the same directory. No fresh path lookup is ever
+    traversed for deletion, so a directory swapped in at the path is left alone and reported.
+    Residual limit: a replacement swapped in between the final identity check and rmdir is
+    removed only if it is an empty directory (rmdir never deletes contents)."""
+    problems, name = receipt["problems"], workdir.name
+    parent = fd = None
+    receipt["action"] = "left"
+    try:
+        parent = os.open(workdir.parent, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+        if not (same_dir(os.fstat(fd), identity)
+                and same_dir(os.stat(name, dir_fd=parent, follow_symlinks=False), identity)):
+            problems.append(f"{workdir}: identity changed since creation; left in place")
+            return receipt
+        remove_dir_contents(fd, 0)
+        if not same_dir(os.stat(name, dir_fd=parent, follow_symlinks=False), identity):
+            problems.append(f"{workdir}: replaced during removal; owned contents were removed through the"
+                            " verified descriptor, the entry now at the path was left in place")
+            return receipt
+        os.rmdir(name, dir_fd=parent)
+        receipt["action"] = "removed"
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+            receipt["verified_absent"] = False
+            problems.append(f"{workdir}: still present after removal")
+        except FileNotFoundError:
+            receipt["verified_absent"] = True
+    except OSError as error:
+        receipt["action"] = "failed"
+        problems.append(f"{workdir}: removal raised {type(error).__name__}: {error}; rest left in place")
+    finally:
+        for descriptor in (fd, parent):
+            if descriptor is not None:
+                os.close(descriptor)
+    return receipt
+
+
+def remove_dir_contents(dir_fd, depth):
+    """Delete everything below dir_fd without following symlinks. A subdirectory is entered only
+    through a descriptor matching the entry lstat'ed here; nesting is bounded by WORKDIR_DEPTH."""
+    if depth >= WORKDIR_DEPTH:
+        raise OSError(f"nested deeper than {WORKDIR_DEPTH} directories")
+    with os.scandir(dir_fd) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(st.st_mode):
+            os.unlink(name, dir_fd=dir_fd)
+            continue
+        child = os.open(name, DIR_FLAGS, dir_fd=dir_fd)
+        try:
+            cst = os.fstat(child)
+            if (cst.st_dev, cst.st_ino) != (st.st_dev, st.st_ino):
+                raise OSError(f"{name} changed while being removed")
+            remove_dir_contents(child, depth + 1)
+        finally:
+            os.close(child)
+        os.rmdir(name, dir_fd=dir_fd)
+
+
+def defer_signals(arrived, saved):
+    """Replace the SIGTERM/SIGINT handlers with ones that only record the signal (main thread
+    only; elsewhere, or for a handler not installed from Python, nothing is changed)."""
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous = signal.getsignal(signum)
+            if previous is not None:
+                signal.signal(signum, lambda s, _frame: arrived.append(s))
+                saved[signum] = previous
+        except (ValueError, OSError):
+            pass
+
+
+def restore_signals(saved):
+    for signum, previous in saved.items():
+        try:
+            signal.signal(signum, previous)
+        except (ValueError, OSError):
+            pass
+
+
+def initialization_failed(rec, out, init, meta, workdir, workdir_id, error):
+    """Record an initialization failure and remove its exact tempdir. Never raises, not even for
+    a second interrupt: SIGTERM/SIGINT are deferred while it runs, every recovery stage is
+    guarded against BaseException, and Recorder.close runs in an outer finally. Each secondary
+    fault is attached to the original error as a note; the caller re-raises that same object.
+    Limit: a signal landing after the handlers are restored, before the caller's raise, is not
+    deferred."""
+    def note(text):
+        try:
+            error.add_note(text)
+        except BaseException:
+            print(text, file=sys.stderr)
+
+    def fault_text(fault):
+        return f"{type(fault).__name__}: {safe_text(fault, str)}"
+    arrived, saved = [], {}
+    cleanup = dict(path=str(workdir) if workdir else None, action="unknown",
+                   problems=["tempdir cleanup was not attempted"])
+    recorded = None
+    try:
+        defer_signals(arrived, saved)
+        try:
+            cleanup = remove_init_workdir(workdir, workdir_id, rec.seq)
+            if not isinstance(cleanup, dict) or not isinstance(cleanup.get("problems"), list):
+                raise TypeError(f"tempdir cleanup returned {type(cleanup).__name__}, not a receipt")
+        except BaseException as fault:
+            cleanup = dict(path=str(workdir) if workdir else None, action="unknown",
+                           problems=[f"tempdir cleanup raised {fault_text(fault)}"])
+        detail = f"{type(error).__name__}: {safe_text(error, str)}"
+        try:
+            tb = "".join(traceback.format_exception(error))
+        except BaseException as fault:
+            tb = f"<traceback unavailable: {fault_text(fault)}>"
+        outcomes = Outcomes()
+        outcomes.add("harness", "error", detail=f"initialization: {detail}")
+        full_fault = None
+        try:
+            record = jsonable(dict(meta or init))
+            errors = record.get("errors")
+            record.update(
+                valid=False, completed=False, reportable=False, timings={},
+                errors=(errors if isinstance(errors, list) else []) + [f"initialization: {detail}"],
+                cleanup_problems=cleanup["problems"], finished_utc=utc(), finished_unix_ns=time.time_ns(),
+                measurement="invalid: initialization failed before the protected run; no checks executed, no timings",
+                initialization_failure=dict(
+                    error=detail, traceback=tb, initial_meta_written=(out / "meta.json").exists(),
+                    steps_run=rec.seq, workdir=jsonable(cleanup)))
+            rec.write_json("outcomes.json", outcomes.as_list())
+            rec.write_json("meta.json", record)
+            (out / "summary.md").write_text(render_summary(record, outcomes.as_list()))
+            recorded = "receipt"
+        except BaseException as fault:
+            full_fault = fault_text(fault)
+            note(f"rwb: recording the initialization failure in {out} raised {full_fault}")
+        if recorded is None:
+            try:
+                record = minimal_record(init, detail, tb, cleanup, full_fault)
+                rec.write_json("outcomes.json", outcomes.as_list())
+                rec.write_json("meta.json", record)
+                (out / "summary.md").write_text(render_summary(record, outcomes.as_list()))
+                recorded = "minimal receipt"
+            except BaseException as fault:
+                note(f"rwb: recording the minimal initialization receipt in {out} raised {fault_text(fault)}")
+        receipt = f"{recorded} in {out}/meta.json" if recorded else f"receipt NOT completed in {out}"
+        note(f"rwb: initialization failed; {receipt}; tempdir {cleanup.get('action')}"
+             + (f" ({'; '.join(map(str, cleanup['problems']))})" if cleanup.get("problems") else ""))
+    except BaseException as fault:
+        note(f"rwb: recording the initialization failure was interrupted by {fault_text(fault)}")
+    finally:
+        try:
+            rec.close()
+        except BaseException as fault:
+            note(f"rwb: closing {out}/steps.jsonl raised {fault_text(fault)}")
+        for signum in list(arrived):
+            note(f"rwb: signal {signum} arrived during initialization-failure recovery; deferred, the"
+                 " original error is re-raised")
+        restore_signals(saved)
 
 
 def teardown(scenario, adapter, tx, out, meta, keep=False):
