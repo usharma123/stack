@@ -13,6 +13,7 @@ DNVR_REV = "a66c2bbabb67293812a5c39855ab0ecf6af21d41"
 
 class DnvrAdapter(NixFlakeAdapter):
     name = "dnvr"
+    start_scope = "start-to-ready: PTY driver (`script` + FIFO), `dnvr up`, wait for pg.url/redis.url, detach"
     title = f"dnvr {DNVR_REV[:7]} (tmux runner)"
     flake_dir = "dnvr"
     shell_attr = "rwb"

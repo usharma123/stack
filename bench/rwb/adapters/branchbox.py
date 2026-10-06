@@ -40,6 +40,7 @@ print(json.dumps(dict(worktree=receipt["worktree_path"], branch=receipt["branch_
 
 class BranchboxAdapter(ContainerApp, Adapter):
     name = "branchbox"
+    prepare_scope = 'native `feature start` worktree/config creation (excluded from first_task)'
     title = "BranchBox"
     transport = "host"
     isolation_boundary = "container"

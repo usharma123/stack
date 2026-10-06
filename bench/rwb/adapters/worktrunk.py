@@ -26,6 +26,7 @@ WT_BINARY_SHA256 = "0708ca37fc39f9fa48edc1af500a2ff3664ec0155f63909425b02994f29f
 
 class WorktrunkAdapter(WorktreeHostAdapter):
     name = "worktrunk"
+    prepare_scope = 'native `wt switch --create` worktree creation (excluded from first_task)'
     title = "Worktrunk 0.80.0 + uv + Docker Compose"
     repo_name = "rwbt"
     repo_files = {"wt.toml": ".config/wt.toml", "compose.yaml": "compose.yaml",

@@ -26,6 +26,7 @@ GROVE_CLI_SHA256 = "b8cd71e6d268fc6578da93d8da293728085900e80978dd316e5e53654a42
 
 class GitGroveAdapter(WorktreeHostAdapter):
     name = "git-grove"
+    prepare_scope = "`git worktree add` at Grove's attach path (Grove attaches at start)"
     title = "GitGrove 0.1.0-alpha.1.8 + Docker Compose"
     repo_name = "rwbg"
     extra_host_programs = ("node", "npm")

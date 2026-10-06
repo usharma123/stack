@@ -25,6 +25,7 @@ BERTH_VERSION = "0.1.0"
 
 class BerthAdapter(ContainerApp, Adapter):
     name = "berth"
+    prepare_scope = 'fixture repository only; Berth creates the worktree inside setup (`berth up`), so it IS in first_task'
     title = "Berth"
     transport = "host"
     isolation_boundary = "container"

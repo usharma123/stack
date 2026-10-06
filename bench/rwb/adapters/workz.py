@@ -22,6 +22,7 @@ WORKZ_BINARY_SHA256 = "72994c049c43989e4ec868dd3741389548f70aa15342acd34cd88349c
 
 class WorkzAdapter(WorktreeHostAdapter):
     name = "workz"
+    prepare_scope = 'native `workz start --isolated --no-sync` worktree creation (excluded from first_task)'
     title = "workz 0.11.0 + uv + Docker Compose"
     repo_name = "rwbz"
     repo_files = {"workz.toml": ".workz.toml", "compose.yaml": "compose.yaml",
