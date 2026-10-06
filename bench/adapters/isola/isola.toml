@@ -1,0 +1,36 @@
+# isola 0.4.1 project config for the benchmark fixture. Rendered per run by the adapter:
+# @PROJECT@ / @DB_PREFIX@ make every name run-unique; @PG_PORT@ / @REDIS_PORT@ are the
+# benchmark-owned shared servers (shared-servers.sh), never a user's PostgreSQL or Redis.
+project = "@PROJECT@"
+copy_files = []
+
+[proxy]
+enabled = false
+
+[env_file]
+enabled = true
+create = true
+path = ".env.isola"
+
+# isola requires at least one service. The fixture is a CLI, so this keeper only holds the
+# worktree's environment "up"; it is adapter overhead, not an application server.
+[services.fixture]
+command = "exec python3 -c 'import signal; signal.pause()' rwb-isola-keeper"
+
+[services.fixture.env]
+DATABASE_URL = "${accessories.database.url}"
+REDIS_URL = "${accessories.cache.url}"
+UV_PYTHON_DOWNLOADS = "never"
+
+# One database per worktree, cloned from an empty template on the shared cluster.
+[accessories.database]
+kind = "postgres"
+server_url = "postgres://bench@127.0.0.1:@PG_PORT@/postgres"
+clone_from = "rwb_template"
+name = "@DB_PREFIX@_${ISOLA_BRANCH_SLUG}"
+
+# One logical Redis DB per worktree on the shared server, claimed with an owner marker.
+[accessories.cache]
+kind = "redis"
+server_url = "redis://127.0.0.1:@REDIS_PORT@"
+databases = 16
