@@ -22,6 +22,16 @@ def sha256_check(expected, path):
     return (f'{SHA256_FN}; __rwb_h=$(rwb_sha256 {path} | cut -d" " -f1) && '
             f'if [ "$__rwb_h" != {q(expected)} ]; then echo "sha256 mismatch for {path}: $__rwb_h" >&2; exit 1; fi')
 
+def agent_process_probe(pattern):
+    """Body listing non-zombie `agent` processes whose args match the ERE pattern.
+
+    `ps` is captured on its own so a failing or missing `ps` fails the body; filtering never
+    fails, so "no matches" is exit 0 with empty output (not an error that `|| true` masks)."""
+    return ('__rwb_ps=$(ps -eo pid=,user=,stat=,args=) && '
+            'printf \'%s\\n\' "$__rwb_ps" | '
+            f"awk '$2==\"agent\" && $3 !~ /^Z/ && $0 ~ /{pattern}/ && $0 !~ /grep|awk/'")
+
+
 # Capabilities compared across tools. Values: native | scripted | unsupported.
 FEATURES = {
     "lockfile": "Committed lock reproduces exact tool versions",
@@ -235,13 +245,11 @@ class Adapter:
 
     def service_processes(self):
         """Body listing PIDs+args of leftover PostgreSQL/Redis server processes (non-zombie)."""
-        return ("ps -eo pid=,user=,stat=,args= | awk '$2==\"agent\" && $3 !~ /^Z/' | "
-                "grep -E '(postgres|redis-server)( |$)' | grep -v -E 'grep|awk' || true")
+        return agent_process_probe("(postgres|redis-server)( |$)")
 
     def supervisor_processes(self):
         """Body listing leftover supervisors/managers (reported as observed, not a leak)."""
-        return ("ps -eo pid=,user=,stat=,args= | awk '$2==\"agent\" && $3 !~ /^Z/' | "
-                "grep -E 'process-compose|pitchfork|devenv|flox-activations|nix-daemon' | grep -v -E 'grep|awk' || true")
+        return agent_process_probe("process-compose|pitchfork|devenv|flox-activations|nix-daemon")
 
     def planned_pg_port(self, co):
         """Body printing the PostgreSQL port co WILL use (last stdout line), for tools that

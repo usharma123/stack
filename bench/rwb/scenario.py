@@ -28,6 +28,7 @@ class Scenario:
         self.started = set()    # checkouts whose services may be running (for cleanup)
         self.timings = {}
         self.locks = {}
+        self.hash_problems = {}  # checkout -> problems in its malformed lock-hash receipt
         self.listeners = []     # (pid file, argv tag) of benchmark-owned listeners to release
         # Per checkout: the user-visible steps from setup to the first passing test suite
         # (no harness-only verification steps); summed into first_task.<co>.
@@ -97,11 +98,10 @@ class Scenario:
         if not files:
             return None, {}
         result = self.run(label, "verify", f"{SHA256_FN}; rwb_sha256 {files}")
-        hashes = {}
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 2:
-                hashes[parts[1][len(self.co[co].path) + 1:]] = parts[0]
+        hashes, problems = parse_lock_hashes(result.stdout, self.co[co].path, self.ad.lock_files)
+        if problems:  # a malformed receipt proves nothing: report no hashes at all
+            self.hash_problems[co] = problems
+            return result, {}
         return result, hashes
 
     # ---- the workload ---------------------------------------------------------------
@@ -169,8 +169,10 @@ class Scenario:
             hashed, self.locks["a"] = self.hash_locks("a", "a-lock-hash")
             if self.ad.lock_files:
                 ok = hashed is not None and hashed.ok and len(self.locks["a"]) == len(self.ad.lock_files)
+                problems = self.hash_problems.get("a")
                 self.add("lock.created", "pass" if ok else "fail", self.mode("lockfile"),
-                         "" if ok else "lock file(s) missing after setup", [hashed])
+                         "" if ok else ("malformed lock hash receipt: " + "; ".join(problems) if problems
+                                        else "lock file(s) missing after setup"), [hashed])
             else:
                 self.add("lock.created", "unsupported", "n/a", "adapter declares no lock files")
         return self.start_and_identify(co, f"{co}-start", record_as=f"start.{co}", deps=phase_label)
@@ -445,8 +447,10 @@ class Scenario:
             _path_lines(_strip_paths(versions.stdout, c.path))
         ok = r.ok and same and versions.ok and same_versions
         if not complete:
+            malformed = "; ".join(self.hash_problems.get("a", []) + self.hash_problems.get("c", []))
             self.add("lock.frozen_copy", "blocked", self.mode("frozen_setup"),
-                     f"lock hashes incomplete (A {len(self.locks['a'])}, C {len(after)} of {expected})",
+                     f"lock hashes incomplete (A {len(self.locks['a'])}, C {len(after)} of {expected})"
+                     + (f"; malformed receipt: {malformed}" if malformed else ""),
                      [x for x in (r, hashed) if x is not None])
             return
         if r.timed_out or versions.timed_out:
@@ -683,6 +687,33 @@ def _version_lines(text):
     import re
     return [line.strip() for line in text.splitlines()
             if line.strip() and not _is_path(line.strip()) and re.search(r"\d+\.\d+", line)]
+
+
+def parse_lock_hashes(stdout, root, lock_files):
+    """Parse `rwb_sha256` output for the declared lock files under root.
+
+    Returns ({rel: hexdigest}, problems). Every non-blank line must be a 64-hex SHA-256
+    for exactly one declared file, each at most once; missing files are simply absent (the
+    caller reports them). Malformed, duplicate or unexpected lines are problems."""
+    import re
+    declared, prefix = set(lock_files), root + "/"
+    hashes, problems = {}, []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        m = re.fullmatch(r"([0-9a-f]{64}) [ *](.+)", line.strip())
+        if not m:
+            problems.append(f"malformed hash line: {line.strip()[:120]!r}")
+            continue
+        digest, path = m.groups()
+        rel = path[len(prefix):] if path.startswith(prefix) else None
+        if rel not in declared:
+            problems.append(f"hash for undeclared file: {path[:120]!r}")
+        elif rel in hashes:
+            problems.append(f"duplicate hash for {rel}")
+        else:
+            hashes[rel] = digest
+    return hashes, problems
 
 
 def sha256_text(text):

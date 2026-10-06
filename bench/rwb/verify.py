@@ -60,7 +60,9 @@ def app_result(payload, command, code=0, timed_out=False):
     if payload.get("command") != command:
         raise ValueError(f"receipt is for {payload.get('command')!r}, expected {command!r}")
     if payload.get("ok") is not True:
-        error = payload.get("error") or {}
+        error = payload.get("error")
+        if not isinstance(error, dict):  # malformed failure receipt: still a failure, never a crash
+            raise ValueError(f"{command} failed: malformed error {error!r}"[:300])
         raise ValueError(f"{command} failed: {error.get('code')}: {error.get('message')}")
     if code != 0:
         raise ValueError(f"{command} printed ok but exited {code}")

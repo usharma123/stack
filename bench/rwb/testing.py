@@ -154,7 +154,7 @@ class FakeTransport:
         elif label.endswith("-lock-hash"):
             name = co.group(1)
             path = self.world.checkout_path(name)
-            digest = "changed" if (name == "c" and self.world.lock_changes) else "same"
+            digest = ("c" if (name == "c" and self.world.lock_changes) else "5") * 64  # valid SHA-256 hex
             if name not in self.world.no_hash:
                 out = "".join(f"{digest}  {path}/{rel}\n" for rel in self.adapter.lock_files)
         elif label == "d-setup-invalid":

@@ -3,6 +3,7 @@
 python3 -m unittest discover -s bench/tests -v
 """
 from pathlib import Path
+import json
 import shutil
 import sys
 import tempfile
@@ -156,6 +157,13 @@ class VerifyTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify.app_result(dict(command="read", ok=True, result={}), "crud")
 
+    def test_app_result_malformed_error_is_value_error(self):
+        for error in ("broken", ["broken"], None, 7):
+            with self.assertRaises(ValueError, msg=repr(error)):
+                verify.app_result(dict(command="crud", ok=False, error=error), "crud", 1)
+        with self.assertRaises(ValueError):  # ok but no error key at all
+            verify.app_result(dict(command="crud", ok=False), "crud", 1)
+
 
 class ScenarioTest(unittest.TestCase):
     def test_well_behaved_tool_passes_everything(self):
@@ -289,6 +297,50 @@ class ScenarioTest(unittest.TestCase):
         out, _ = run_fake(Toy(), self.inject(fault))
         self.assertEqual(out["lock.created"]["status"], "fail")
         self.assertEqual(out["lock.frozen_copy"]["status"], "blocked")
+
+    def test_malformed_failure_receipt_fails_check_without_crashing(self):
+        def fault(r):
+            if r.label == "a-crud":
+                r.code, r.stdout = 1, json.dumps(dict(command="crud", ok=False, error="broken"))
+        out, _ = run_fake(Toy(), self.inject(fault))
+        self.assertEqual(out["crud_cache.a"]["status"], "fail")
+        self.assertIn("malformed error", out["crud_cache.a"]["detail"])
+
+    def test_lock_hash_receipt_must_be_exact(self):
+        good = "5" * 64
+        cases = {
+            "nonhex": lambda p: f"not-a-hash  {p}/toy.lock\n",
+            "short": lambda p: f"{'5' * 63}  {p}/toy.lock\n",
+            "upper": lambda p: f"{'A' * 64}  {p}/toy.lock\n",
+            "wrong file": lambda p: f"{good}  {p}/wrong.lock\n",
+            "other root": lambda p: f"{good}  /elsewhere/toy.lock\n",
+            "duplicate": lambda p: f"{good}  {p}/toy.lock\n{good}  {p}/toy.lock\n",
+            "extra": lambda p: f"{good}  {p}/toy.lock\n{good}  {p}/wrong.lock\n",
+            "trailing junk": lambda p: f"{good}  {p}/toy.lock\nsha256sum: warning\n",
+            "missing": lambda p: "",
+        }
+        for name, make in cases.items():
+            def configure(w, make=make):
+                for co in ("a", "c"):
+                    w.outputs[f"{co}-lock-hash"] = (make(w.checkout_path(co)), "")
+            out, _ = run_fake(Toy(), configure)
+            self.assertEqual(out["lock.created"]["status"], "fail", name)
+            self.assertEqual(out["lock.frozen_copy"]["status"], "blocked", name)
+        # Positive: exact declared set, 64-hex digests, binary-mode marker accepted.
+        def exact(w):
+            for co in ("a", "c"):
+                w.outputs[f"{co}-lock-hash"] = (f"{good} *{w.checkout_path(co)}/toy.lock\n\n", "")
+        out, _ = run_fake(Toy(), exact)
+        self.assertEqual(out["lock.created"]["status"], "pass")
+        self.assertEqual(out["lock.frozen_copy"]["status"], "pass")
+
+    def test_parse_lock_hashes_reports_missing_as_absent(self):
+        from rwb.scenario import parse_lock_hashes
+        good = "a" * 64
+        hashes, problems = parse_lock_hashes(f"{good}  /w/a/x.lock\n", "/w/a", ("x.lock", "y.lock"))
+        self.assertEqual((hashes, problems), ({"x.lock": good}, []))
+        hashes, problems = parse_lock_hashes(f"{good}  /w/a/x.lock\n{good}  /w/a/x.lock\n", "/w/a", ("x.lock",))
+        self.assertTrue(problems)
 
     def test_r1_7_no_listener_after_failed_setup_and_listener_always_released(self):
         out, tx = run_fake(Toy(), lambda w: w.codes.update({"e-setup": (1, False)}))
@@ -593,6 +645,64 @@ class ParentFindingsTest(unittest.TestCase):
         self.assertEqual(statuses["provision"], "blocked")
         self.assertTrue(all(v == "blocked" for v in statuses.values()))
         self.assertNotIn("a-setup", [r.label for r in rec.results])
+
+
+class ProcessProbeTest(unittest.TestCase):
+    """The default leftover-process probe fails when `ps` fails; no matches is a clean pass."""
+
+    @staticmethod
+    def probe(ps_body, body=None):
+        import subprocess
+        body = body or Toy().service_processes()
+        return subprocess.run(["bash", "-c", f"ps() {{ {ps_body}; }}; {body}"], capture_output=True, text=True)
+
+    def test_failing_ps_fails_the_probe_and_cleanup(self):
+        for body in (Toy().service_processes(), Toy().supervisor_processes()):
+            r = self.probe('echo "ps unavailable" >&2; return 127', body)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertEqual(r.stdout, "")
+        r = self.probe('echo "ps unavailable" >&2; return 127')
+        rec, world = FakeRecorder(), FakeWorld()
+        sc = Scenario(Toy(), FakeTransport(rec, Toy(), world), rec, repeats=1, warmups=0)
+        world.scenario = sc
+        world.codes["leftover-processes"] = (r.returncode, False)
+        sc.execute()
+        problems = sc.cleanup()
+        statuses = {o["check"]: o["status"] for o in sc.out.as_list()}
+        self.assertEqual(statuses["cleanup.processes"], "error")
+        self.assertIn("leftover process probe failed", problems)
+
+    def test_no_matches_is_exit_zero_and_matches_are_filtered(self):
+        r = self.probe('printf "  9 agent S bash\\n  8 root S postgres -D /x\\n  7 agent Z redis-server\\n"')
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        out, _ = run_fake(Toy(), lambda w: w.outputs.update({"leftover-processes": (r.stdout, "")}))
+        self.assertEqual(out["cleanup.processes"]["status"], "pass")
+        r = self.probe('printf "  1 agent S postgres -D /x\\n  4 agent S redis-server *:6379\\n  5 agent S postgresql-x\\n"')
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual([l.split()[0] for l in r.stdout.splitlines()], ["1", "4"])
+
+
+class StackFrozenSetupTest(unittest.TestCase):
+    def test_failed_partial_c_setup_is_still_cleaned_up(self):
+        from rwb.adapters.stack import StackAdapter
+        self.assertIs(StackAdapter.frozen_setup_starts_services, True)
+        ad, rec, world = StackAdapter(), FakeRecorder(), FakeWorld()
+        tx = FakeTransport(rec, ad, world)
+        sc = Scenario(ad, tx, rec, repeats=1, warmups=0)
+        world.scenario = sc
+        sc.prepare("a")
+        sc.bring_up("a", True)
+        def partial(r):  # `up` started C's services, then the recipe failed
+            if r.label == "c-frozen-setup":
+                world.running["c"] = True
+                world.generation["c"] = 1
+                r.code = 1
+        world.mutators.append(partial)
+        sc.frozen_copy()
+        self.assertIn("c", sc.started)
+        sc.cleanup()
+        self.assertIn("c-cleanup", [c[0] for c in tx.calls])
+        self.assertNotIn("c", world.running)
 
 
 class TeardownTest(unittest.TestCase):

@@ -57,6 +57,10 @@ class StackAdapter(Adapter):
         # ports. Stack installs locked tools at `up` (the start step), not at compile/exec.
         return self._in(co, "stack --json compile")
 
+    # The frozen recipe runs `up`; declared (not inferred) so a C setup that fails after
+    # starting some services is still cleaned up.
+    frozen_setup_starts_services = True
+
     def frozen_setup(self, co):
         # Installing from the lock requires `up` in Stack; services are stopped again at once.
         return self._in(co, "stack --json compile --locked && stack --json up && stack --json down")
