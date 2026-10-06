@@ -1,0 +1,50 @@
+# BranchBox 0.13.4 native Compose runtime: project = workspace basename (unique per run).
+# No host ports, container_name, external networks or fixed volume names. The workspace
+# labels let cleanup find this exact workspace's containers; RWB_WORKSPACE is passed on
+# every host operation that renders this file.
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    command: [sleep, infinity]
+    init: true
+    volumes:
+      - ../..:/workspaces:cached
+    labels:
+      devcontainer.local_folder: ${RWB_WORKSPACE:?Set the exact absolute workspace path}
+      devcontainer.config_file: ${RWB_WORKSPACE}/.devcontainer/devcontainer.json
+    environment:
+      DATABASE_URL: postgresql://bench:bench@postgres:5432/bench
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  postgres:
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, bench, -d, bench]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  redis:
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    command: [redis-server, --appendonly, "yes", --appendfsync, always]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+volumes:
+  pgdata: {}
+  redisdata: {}
