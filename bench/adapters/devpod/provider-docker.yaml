@@ -1,0 +1,37 @@
+name: docker
+version: v0.0.1
+icon: https://devpod.sh/assets/docker.svg
+home: https://github.com/loft-sh/devpod
+description: |-
+  DevPod on Docker
+optionGroups:
+  - options:
+      - DOCKER_PATH
+      - DOCKER_HOST
+      - INACTIVITY_TIMEOUT
+      - DOCKER_BUILDER
+    name: "Advanced Options"
+options:
+  INACTIVITY_TIMEOUT:
+    description: "If defined, will automatically stop the container after the inactivity period. Examples: 10m, 1h"
+  DOCKER_PATH:
+    description: The path where to find the docker binary.
+    default: docker
+  DOCKER_HOST:
+    global: true
+    description: The docker host to use.
+  DOCKER_BUILDER:
+    global: true
+    description: The docker builder to use.
+agent:
+  containerInactivityTimeout: ${INACTIVITY_TIMEOUT}
+  local: true
+  docker:
+    path: ${DOCKER_PATH}
+    builder: ${DOCKER_BUILDER}
+    install: false
+    env:
+      DOCKER_HOST: ${DOCKER_HOST}
+exec:
+  command: |-
+    "${DEVPOD}" helper sh -c "${COMMAND}"
