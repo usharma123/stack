@@ -1,0 +1,15 @@
+[GNUPG:] NEWSIG
+gpg: Signature made Thu Jan 22 06:56:42 2026 EST
+gpg:                using RSA key A28BF40C3E551372662D14F741AAE7DCCA3D8351
+[GNUPG:] KEYEXPIRED 1497755212
+[GNUPG:] KEY_CONSIDERED A28BF40C3E551372662D14F741AAE7DCCA3D8351 0
+[GNUPG:] SIG_ID fyeCowXKBBnqTI7QccxgZACW5sw 2026-01-22 1769083002
+[GNUPG:] GOODSIG 41AAE7DCCA3D8351 Efraim Flashner <efraim@flashner.co.il>
+gpg: Good signature from "Efraim Flashner <efraim@flashner.co.il>" [unknown]
+gpg:                 aka "Efraim Flashner <efraim.flashner@gmail.com>" [unknown]
+gpg:                 aka "William Flashner <themillak@gmail.com>" [unknown]
+[GNUPG:] VALIDSIG A28BF40C3E551372662D14F741AAE7DCCA3D8351 2026-01-22 1769083002 0 4 0 1 8 00 A28BF40C3E551372662D14F741AAE7DCCA3D8351
+[GNUPG:] TRUST_UNDEFINED 0 pgp
+gpg: WARNING: This key is not certified with a trusted signature!
+gpg:          There is no indication that the signature belongs to the owner.
+Primary key fingerprint: A28B F40C 3E55 1372 662D  14F7 41AA E7DC CA3D 8351
