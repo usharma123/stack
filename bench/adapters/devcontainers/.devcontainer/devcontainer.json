@@ -1,0 +1,13 @@
+{
+  "name": "rwb-python",
+  "dockerComposeFile": "compose.yaml",
+  "service": "app",
+  "runServices": ["app", "postgres", "redis"],
+  "workspaceFolder": "/workspace",
+  "remoteUser": "root",
+  "updateRemoteUserUID": false,
+  "userEnvProbe": "none",
+  "overrideCommand": false,
+  "shutdownAction": "none",
+  "postCreateCommand": ["uv", "sync", "--frozen"]
+}

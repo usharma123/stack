@@ -1,0 +1,8 @@
+{
+  "name": "rwb-devcontainers-cli",
+  "private": true,
+  "description": "Pinned Dev Containers CLI for the real-world benchmark; installed with npm ci into a benchmark-owned prefix",
+  "dependencies": {
+    "@devcontainers/cli": "0.89.0"
+  }
+}
