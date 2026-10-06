@@ -26,6 +26,7 @@ class Scenario:
         self.started = set()    # checkouts whose services may be running (for cleanup)
         self.timings = {}
         self.locks = {}
+        self.listeners = []     # pid files of benchmark-owned listeners to release
 
     # ---- primitives ---------------------------------------------------------------
     def run(self, label, phase, body, timeout=None):
@@ -55,7 +56,7 @@ class Scenario:
         payload = result.json()
         command = args.split()[0]
         try:
-            return result, verify.app_result(payload, command)
+            return result, verify.app_result(payload, command, result.code, result.timed_out)
         except ValueError as error:
             result.extra["app_error"] = str(error)
             return result, None
@@ -88,21 +89,30 @@ class Scenario:
         return result, hashes
 
     # ---- the workload ---------------------------------------------------------------
+    def prepare(self, co, lock_from=None, extra=""):
+        """Prepare a checkout; a failure is recorded and blocks everything that depends on it."""
+        body = self.ad.prepare(self.co[co], lock_from=self.co[lock_from] if lock_from else None)
+        r = self.run(f"{co}-prepare", "meta", body + ("\n" + extra if extra else ""))
+        if not r.ok:
+            self.add(f"prepare.{co}", "fail", "n/a", f"exit {r.code}" + (" (timed out)" if r.timed_out else ""), [r])
+        return r.ok
+
     def execute(self):
-        a = self.co["a"]
         self.provision_and_versions()
-        for name in ("a", "b"):
-            self.run(f"{name}-prepare", "meta", self.ad.prepare(self.co[name]) if name == "a"
-                     else self.ad.prepare(self.co[name], lock_from=a))
-            if name == "a":
-                if not self.bring_up("a", cold=True):
-                    return self.out
-                self.workload("a")
-                self.repeat_start("a")
-                # B is a teammate's checkout of the same commit: A's lock is committed into it.
-            else:
-                if self.bring_up("b", cold=False):
-                    self.workload("b")
+        if not self.prepare("a"):
+            for check in ("setup.a", "isolation", "stop.a", "lock.frozen_copy", "occupied_port"):
+                self.add(check, "blocked", detail="checkout A preparation failed")
+            return self.out
+        if not self.bring_up("a", cold=True):
+            return self.out
+        self.workload("a")
+        self.repeat_start("a")
+        # B is a teammate's checkout of the same commit: A's lock is committed into it.
+        if self.prepare("b", lock_from="a" if self.locks.get("a") else None):
+            if self.bring_up("b", cold=False):
+                self.workload("b")
+        else:
+            self.add("setup.b", "blocked", detail="checkout B preparation failed")
         self.isolation()
         self.repeats_phase()
         self.status_receipt()
@@ -131,7 +141,7 @@ class Scenario:
         if cold:
             hashed, self.locks["a"] = self.hash_locks("a", "a-lock-hash")
             if self.ad.lock_files:
-                ok = len(self.locks["a"]) == len(self.ad.lock_files)
+                ok = hashed is not None and hashed.ok and len(self.locks["a"]) == len(self.ad.lock_files)
                 self.add("lock.created", "pass" if ok else "fail", self.mode("lockfile"),
                          "" if ok else "lock file(s) missing after setup", [hashed])
             else:
@@ -211,6 +221,10 @@ class Scenario:
         if co not in self.ids:
             return
         again = self.run(f"{co}-start-again", "lifecycle", self.ad.start(self.co[co]), self.ad.timeouts["start"])
+        if not again.ok:
+            self.add("start.repeat", "fail", self.mode("services"),
+                     f"repeated start exit {again.code}" + (" (timed out)" if again.timed_out else ""), [again])
+            return
         result, ident, problems = self.identify(co, f"{co}-start-again-identity", wait=True)
         if ident is None:
             self.add("start.repeat", "fail", self.mode("services"), "; ".join(problems), [again, result])
@@ -250,9 +264,13 @@ class Scenario:
             for i in range(self.warmups + self.repeats):
                 warm = i < self.warmups
                 r = self.run(f"{key}-{'warmup' if warm else 'sample'}-{i:03d}", "warm", body)
-                if key == "repeat.app_read" and r.ok:
-                    payload = r.json() or {}
-                    if not (payload.get("ok") and payload["result"]["item"]["sku"] == "keeper-a"):
+                if key == "repeat.app_read":
+                    try:
+                        item = verify.app_result(r.json(), "read", r.code, r.timed_out)["item"]
+                        good = item.get("sku") == "keeper-a"
+                    except ValueError:
+                        good = False
+                    if not good and r.code == 0:
                         r.code = 1  # semantic failure even though the process exited 0
                 if not warm:
                     samples.append((r.ok, r.outer_ns, r.inner_ns, r.seq))
@@ -283,6 +301,13 @@ class Scenario:
         gone = self.run("a-stopped-probe", "verify", self.ad.stopped_probe(a, self.ids["a"]), 60)
         refused, _ = self.app("a", "a-after-stop", "verify", "identity", timeout=60)
         # A stopped tool must not let the app silently reach anything: identity must fail.
+        if refused.timed_out or gone.timed_out:
+            self.add("stop.a", "blocked", self.mode("stop_confirmation"), "post-stop probe timed out",
+                     [stop, gone, refused])
+            self.ids.pop("a", None)
+            for check in ("b.survives", "restart.a", "persist.pg", "persist.redis"):
+                self.add(check, "blocked", detail="stop could not be confirmed")
+            return
         ok = stop.ok and gone.ok and not refused.ok
         self.add("stop.a", "pass" if ok else "fail", self.mode("stop_confirmation"),
                  f"stop exit {stop.code}, probe exit {gone.code}, app after stop exit {refused.code}",
@@ -304,8 +329,7 @@ class Scenario:
         self.add("persist.pg", "pass" if pg_ok else "fail", "native",
                  "; ".join(problems) or r.extra.get("app_error", ""), [r])
         redis_policy = {k: self.ids["a"]["redis"].get(k) for k in ("appendonly", "appendfsync", "save", "dir")}
-        result = r.json() or {}
-        durable = (result.get("result") or {}).get("redis_durable")
+        durable = persisted is not None and persisted["redis_durable"] is True
         self.add("persist.redis", "pass" if durable else "fail", "native", f"policy={redis_policy}", [r])
         rc, cache = self.app("a", "a-cache-after-restart", "verify", "cache --checkout a")
         self.add("cache.after_restart", "pass" if cache is not None else "fail", "native",
@@ -321,15 +345,28 @@ class Scenario:
         if "a" not in self.locks:
             self.add("lock.frozen_copy", "blocked", detail="A's lock was not produced")
             return
-        self.run("c-prepare", "meta", self.ad.prepare(c, lock_from=self.co["a"]))
+        if not self.prepare("c", lock_from="a"):
+            self.add("lock.frozen_copy", "blocked", detail="checkout C preparation failed")
+            return
         r = self.run("c-frozen-setup", "setup", self.ad.frozen_setup(c), self.ad.timeouts["setup"])
         hashed, after = self.hash_locks("c", "c-lock-hash")
-        same = after == self.locks["a"]
+        expected = len(self.ad.lock_files)
+        complete = (hashed is not None and hashed.ok and len(after) == expected
+                    and len(self.locks["a"]) == expected)
+        same = complete and after == self.locks["a"]
         versions = self.run("c-tool-versions", "verify", self.ad.tool_versions(c))
         a_versions = next((x for x in self.rec.results if x.label == "a-tool-versions"), None)
         same_versions = a_versions is not None and _strip_paths(a_versions.stdout, self.co["a"].path) == \
             _strip_paths(versions.stdout, c.path)
         ok = r.ok and same and versions.ok and same_versions
+        if not complete:
+            self.add("lock.frozen_copy", "blocked", self.mode("frozen_setup"),
+                     f"lock hashes incomplete (A {len(self.locks['a'])}, C {len(after)} of {expected})",
+                     [x for x in (r, hashed) if x is not None])
+            return
+        if r.timed_out or versions.timed_out:
+            self.add("lock.frozen_copy", "blocked", self.mode("frozen_setup"), "timed out", [r, versions])
+            return
         detail = f"setup exit {r.code}; lock {'unchanged' if same else 'CHANGED'}; versions {'match' if same_versions else 'differ'}"
         self.add("lock.frozen_copy", "pass" if ok else "fail", self.mode("frozen_setup"), detail,
                  [r, hashed, versions])
@@ -343,16 +380,26 @@ class Scenario:
         except NotImplementedError:
             self.add("bad_config", "unsupported", "n/a", "adapter has no invalid-version recipe")
             return
-        self.run("d-prepare", "meta", self.ad.prepare(d) + "\n" + breaker)
+        if not self.prepare("d", extra=breaker):
+            self.add("bad_config", "blocked", detail="checkout D preparation (or config breaking) failed")
+            return
         before = self.run("d-procs-before", "verify", self.ad.service_processes())
         setup = self.run("d-setup-invalid", "failure", self.ad.setup(d), self.ad.timeouts["setup"])
         start_body = self.ad.start(d) if setup.ok and self.feature("services") != "unsupported" else None
         start = self.run("d-start-invalid", "failure", start_body, self.ad.timeouts["start"]) if start_body else None
         after = self.run("d-procs-after", "verify", self.ad.service_processes())
-        refused = not setup.ok or (start is not None and not start.ok)
+        kinds = [verify.refusal(setup.code, setup.timed_out)]
+        if start is not None:
+            kinds.append(verify.refusal(start.code, start.timed_out))
+        refused = "refused" in kinds and "infra" not in kinds
         leaked = len(after.stdout.splitlines()) > len(before.stdout.splitlines())
         if start is not None:
             self.started.add("d")
+        if "infra" in kinds or not (before.ok and after.ok):
+            self.add("bad_config", "blocked", self.mode("lockfile"),
+                     f"infrastructure fault: setup exit {setup.code}" + (f", start exit {start.code}" if start else ""),
+                     [r for r in (before, setup, start, after) if r is not None])
+            return
         ok = refused and not leaked
         self.add("bad_config", "pass" if ok else "fail", self.mode("lockfile"),
                  f"setup exit {setup.code}" + (f", start exit {start.code}" if start else "") +
@@ -367,8 +414,14 @@ class Scenario:
         if self.feature("services") == "unsupported":
             self.add("occupied_port", "unsupported", "n/a", "no service lifecycle")
             return
-        self.run("e-prepare", "meta", self.ad.prepare(e, lock_from=self.co["a"] if self.locks.get("a") else None))
+        if not self.prepare("e", lock_from="a" if self.locks.get("a") else None):
+            self.add("occupied_port", "blocked", detail="checkout E preparation failed")
+            return
         setup = self.run("e-setup", "setup", self.ad.setup(e), self.ad.timeouts["setup"])
+        if not setup.ok:
+            self.add("occupied_port", "blocked", detail=f"setup failed (exit {setup.code}); no listener started",
+                     evidence=[setup])
+            return
         port_body = self.ad.planned_pg_port(e)
         planned = e.pg_port
         if port_body:
@@ -378,33 +431,49 @@ class Scenario:
             except (ValueError, IndexError):
                 self.add("occupied_port", "blocked", detail="could not learn the planned port", evidence=[r])
                 return
-        squat = self.run("e-occupy-port", "failure", self.ad.occupy(planned, f"/tmp/rwb-squat-{planned}.pid"))
-        if not (setup.ok and squat.ok):
-            self.add("occupied_port", "blocked", detail="setup or squatter failed", evidence=[setup, squat])
+        pidfile = f"/tmp/rwb-squat-{planned}.pid"
+        self.listeners.append(pidfile)  # released in cleanup() whatever happens next
+        squat = self.run("e-occupy-port", "failure", self.ad.occupy(planned, pidfile))
+        if not squat.ok:
+            self.add("occupied_port", "blocked", detail="could not start the benchmark-owned listener",
+                     evidence=[setup, squat])
             return
         start = self.run("e-start", "failure", self.ad.start(e), self.ad.timeouts["start"])
         self.started.add("e")
-        ready_ok = None
+        ready = None
         evidence = [squat, start]
         if start.ok and self.ad.ready(e):
-            ready = self.run("e-ready", "failure", self.ad.ready(e), self.ad.timeouts["start"])
-            ready_ok = ready.ok
-            evidence.append(ready)
+            r = self.run("e-ready", "failure", self.ad.ready(e), self.ad.timeouts["start"])
+            ready = (r.code, r.timed_out)
+            evidence.append(r)
         ident = None
-        if start.ok and ready_ok is not False:
-            evidence.append(self.run("e-deps", "setup", self.ad.deps(e), self.ad.timeouts["setup"]))
-            wait = ready_ok is None
-            result, ident, _ = self.identify("e", "e-identity", phase="failure", wait=wait)
+        if start.ok and (ready is None or ready[0] == 0):
+            deps = self.run("e-deps", "setup", self.ad.deps(e), self.ad.timeouts["setup"])
+            evidence.append(deps)
+            if not deps.ok:
+                self.add("occupied_port", "blocked", detail=f"app dependencies failed (exit {deps.code})",
+                         evidence=evidence)
+                return
+            wait = ready is None
+            result, ident, problems = self.identify("e", "e-identity", phase="failure", wait=wait)
             evidence.append(result)
+            if ident is not None and problems:
+                ident = None  # reached something that is not this checkout's verified instance
             if wait:
-                ready_ok = ident is not None
-        label, good = verify.classify_conflict(start.ok, ready_ok, ident, {planned})
+                # Scripted readiness: the app's own wait is the gate (its timeout is a detection,
+                # unless the harness command itself timed out).
+                ready = (0 if ident is not None else (124 if result.timed_out else 3), result.timed_out)
+        label, good = verify.classify_conflict((start.code, start.timed_out), ready, ident, {planned})
         self.add("occupied_port", "pass" if good else "fail", self.mode("readiness"), label, evidence)
-        self.run("e-release-port", "cleanup", f"kill $(cat /tmp/rwb-squat-{planned}.pid) 2>/dev/null; true")
 
     # ---- cleanup (always runs) ------------------------------------------------------
     def cleanup(self):
         problems = []
+        for pidfile in self.listeners:
+            r = self.run("release-listener", "cleanup",
+                         f'test ! -f {pidfile} || {{ kill "$(cat {pidfile})" 2>/dev/null; rm -f {pidfile}; }}')
+            if not r.ok:
+                problems.append(f"could not release listener {pidfile}")
         for name in reversed(CHECKOUTS):
             if name in self.started:
                 body = self.ad.cleanup(self.co[name])
@@ -414,8 +483,14 @@ class Scenario:
                         problems.append(f"{name} cleanup exit {r.code}")
         leftovers = self.run("leftover-processes", "cleanup", self.ad.service_processes())
         lines = [line for line in leftovers.stdout.splitlines() if line.strip()]
-        self.add("cleanup.processes", "fail" if lines else "pass", self.mode("stop_confirmation"),
-                 f"{len(lines)} service processes remain" if lines else "", [leftovers])
+        if not leftovers.ok:
+            # A failed or timed-out probe proves nothing about leftovers.
+            self.add("cleanup.processes", "error", self.mode("stop_confirmation"),
+                     f"process probe failed (exit {leftovers.code}, timed out {leftovers.timed_out})", [leftovers])
+            problems.append("leftover process probe failed")
+        else:
+            self.add("cleanup.processes", "fail" if lines else "pass", self.mode("stop_confirmation"),
+                     f"{len(lines)} service processes remain" if lines else "", [leftovers])
         supervisors = self.run("leftover-supervisors", "cleanup", self.ad.supervisor_processes())
         names = [line.split(None, 3)[-1][:80] for line in supervisors.stdout.splitlines() if line.strip()]
         self.add("cleanup.supervisors", "observed", "n/a", "; ".join(names) or "none", [supervisors])

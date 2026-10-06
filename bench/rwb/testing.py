@@ -28,6 +28,10 @@ class FakeWorld:
         self.fail = set()        # labels forced to fail
         self.lock_changes = False
         self.shared_server = False  # database-boundary tools: one cluster, per-checkout DBs
+        self.bad_receipt = {}       # command -> result object replacing the correct one
+        self.codes = {}             # label -> (exit code, timed_out) forced for that step
+        self.no_hash = set()        # checkouts whose lock-hash step prints nothing
+        self.mutators = []          # callables(StepResult) applied to every result (fault injection)
 
     def token(self, co):
         return self.scenario.co[co].token if self.scenario else f"tok-{co}"
@@ -70,6 +74,7 @@ class FakeWorld:
             state["migrated"] = True
         elif command == "mark":
             state["keeper"] = True
+            result = dict(checkout=co)
         elif command == "crud":
             result = dict(steps=["create", "read", "update", "list", "delete"])
         elif command == "cache":
@@ -78,12 +83,15 @@ class FakeWorld:
             result = dict(source="hit", item=dict(sku=f"keeper-{co}"))
         elif command == "persist":
             state["durable"] = True
+            result = dict(saved=True)
         elif command == "persisted":
             result = dict(pg_keeper=state["keeper"], redis_durable=state["durable"])
         elif command == "check":
             if target != co:
                 return 1, dict(command=command, ok=False, error=dict(code="check_failed", message=f"saw {target}"))
-            result = ident
+            result = dict(ident, problems=[])
+        if command in self.bad_receipt:
+            result = self.bad_receipt[command]
         return 0, dict(command=command, ok=True, result=result)
 
 
@@ -102,7 +110,12 @@ class FakeTransport:
         code, out = 0, ""
         m = re.search(r"RWB_CHECKOUT=([a-e]) \S+ -m rwbapp (\w+)(.*?)(?:'|$)", body)
         co = re.match(r"([a-e])-", label)
-        if label in self.world.fail:
+        timed_out = False
+        if label in self.world.codes:
+            code, timed_out = self.world.codes[label]
+            if label.endswith("-identity") or "rwbapp" in body:
+                out = json.dumps(dict(command=m.group(2), ok=True, result={})) if m else ""
+        elif label in self.world.fail:
             code = 1
         elif m and "pytest" not in body:
             code, payload = self.world.app(m.group(1), m.group(2), m.group(3))
@@ -120,7 +133,8 @@ class FakeTransport:
             name = co.group(1)
             path = self.world.path(name)
             digest = "changed" if (name == "c" and self.world.lock_changes) else "same"
-            out = "".join(f"{digest}  {path}/{rel}\n" for rel in self.adapter.lock_files)
+            if name not in self.world.no_hash:
+                out = "".join(f"{digest}  {path}/{rel}\n" for rel in self.adapter.lock_files)
         elif label == "d-setup-invalid":
             code = 1
         elif label.endswith("-stopped-probe"):
@@ -128,6 +142,8 @@ class FakeTransport:
             code = 1 if name in self.world.running else 0
         elif label == "e-planned-port":
             out = "45999\n"
-        result = StepResult(seq, label, phase, code, 1_000_000, 900_000, out, "")
+        result = StepResult(seq, label, phase, code, 1_000_000, 900_000, out, "", timed_out)
+        for mutate in self.world.mutators:
+            mutate(result)
         self.recorder.results.append(result)
         return result

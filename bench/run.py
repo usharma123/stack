@@ -174,7 +174,10 @@ def dry_run(adapter):
     from rwb.testing import FakeTransport, FakeRecorder
     rec = FakeRecorder()
     tx = FakeTransport(rec, adapter)
+    if adapter.transport == "host":
+        adapter.root = adapter.root or "/tmp/rwb-dry-run"  # checkout paths derive from it
     scenario = Scenario(adapter, tx, rec, repeats=1, warmups=0)
+    tx.world.scenario = scenario  # the fake app reports each checkout's real source token
     scenario.execute()
     scenario.cleanup()
     for label, phase, body in tx.calls:

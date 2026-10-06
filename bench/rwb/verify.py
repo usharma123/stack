@@ -10,16 +10,65 @@ def url_port(url):
         return None
 
 
-def app_result(payload, command):
-    """Return the result object of a successful app command, or raise ValueError."""
+INFRA_EXITS = {124: "timed out", 126: "not executable", 127: "command not found"}
+
+# Exact result shapes required from successful app commands (fail closed on anything else).
+EXPECTED = {
+    "migrate": lambda r: isinstance(r.get("applied"), list) and r.get("current") == ["0001", "0002"],
+    "mark": lambda r: bool(r.get("checkout")),
+    "crud": lambda r: r.get("steps") == ["create", "read", "update", "list", "delete"],
+    "cache": lambda r: r.get("sequence") == ["miss", "hit", "miss", "hit"],
+    "read": lambda r: isinstance(r.get("item"), dict) and str(r["item"].get("sku", "")).startswith("keeper-"),
+    "persist": lambda r: r.get("saved") is True,
+    "persisted": lambda r: isinstance(r.get("pg_keeper"), bool) and isinstance(r.get("redis_durable"), bool),
+    "identity": lambda r: identity_complete(r),
+    "wait": lambda r: identity_complete(r),
+    "check": lambda r: identity_complete(r) and r.get("problems") == [],
+}
+
+
+def identity_complete(r):
+    """Identity receipts must carry every field the isolation/source/URL checks rely on."""
+    try:
+        return (isinstance(r["pg"]["port"], int) and bool(r["pg"]["data_directory"])
+                and "started" in r["pg"] and bool(r["redis"]["run_id"]) and isinstance(r["redis"]["port"], int)
+                and bool(r["urls"]["database"]) and bool(r["urls"]["redis"])
+                and bool(r["source"]["module"]) and bool(r["source"]["token"])
+                and isinstance(r["pg_markers"], list) and isinstance(r.get("declared"), dict))
+    except (KeyError, TypeError):
+        return False
+
+
+def refusal(code, timed_out):
+    """Classify a nonzero exit: a real refusal by the tool, or an infrastructure fault
+    (timeout, missing/unexecutable command) that must never count as a detected failure."""
+    if timed_out or code in INFRA_EXITS:
+        return "infra"
+    return "refused" if code != 0 else "accepted"
+
+
+def app_result(payload, command, code=0, timed_out=False):
+    """Return the result object of a successful app command, or raise ValueError.
+
+    Fails closed: the process must have exited 0 without timing out AND printed an ok
+    receipt for this command whose result has the expected shape."""
+    if timed_out:
+        raise ValueError(f"{command} timed out")
     if not isinstance(payload, dict):
-        raise ValueError("no JSON receipt from app")
+        raise ValueError(f"no JSON receipt from app (exit {code})")
     if payload.get("command") != command:
         raise ValueError(f"receipt is for {payload.get('command')!r}, expected {command!r}")
     if payload.get("ok") is not True:
         error = payload.get("error") or {}
         raise ValueError(f"{command} failed: {error.get('code')}: {error.get('message')}")
-    return payload["result"]
+    if code != 0:
+        raise ValueError(f"{command} printed ok but exited {code}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise ValueError(f"{command} receipt has no result object")
+    if command in EXPECTED and not EXPECTED[command](result):
+        raise ValueError(f"{command} result has unexpected content: {result!r}"[:300])
+    return result
 
 
 def identity_problems(identity, token=None, path=None):
@@ -101,8 +150,11 @@ def distinct_instances(first, second, boundary="service-instance", extra=None):
         problems.append(f"both checkouts reached the same PostgreSQL storage ({boundary})")
     if a["redis"] == b["redis"]:
         problems.append(f"both checkouts reached the same Redis storage ({boundary})")
-    if extra is not None and extra[0] == extra[1]:
-        problems.append("adapter instance receipts (containers/volumes) are identical")
+    if extra is not None:
+        if not all(isinstance(x, dict) and x for x in extra):
+            problems.append("adapter instance receipt (containers/volumes) missing or invalid for a checkout")
+        elif extra[0] == extra[1]:
+            problems.append("adapter instance receipts (containers/volumes) are identical")
     return problems
 
 
@@ -136,12 +188,22 @@ def unchanged_instance(before, after):
     return problems
 
 
-def classify_conflict(start_ok, ready_ok, identity, squatted_ports):
-    """Occupied-port startup. Good: refused, detected, or relocated to a working own instance."""
-    if not start_ok:
+def classify_conflict(start, ready, identity, squatted_ports):
+    """Occupied-port startup. Good: refused, detected, or relocated to a working own instance.
+
+    start/ready: (exit code, timed_out) or None for ready when no readiness step ran.
+    Timeouts and missing commands are infrastructure faults: never a good outcome."""
+    kind = refusal(*start)
+    if kind == "infra":
+        return f"start-infra-fault (exit {start[0]})", False
+    if kind == "refused":
         return "refused-at-start", True
-    if ready_ok is False:
-        return "detected-at-readiness", True
+    if ready is not None:
+        kind = refusal(*ready)
+        if kind == "infra":
+            return f"readiness-infra-fault (exit {ready[0]})", False
+        if kind == "refused":
+            return "detected-at-readiness", True
     if identity is None:
         return "reported-ready-but-unreachable", False
     if identity["pg"].get("port") in squatted_ports or identity["redis"].get("port") in squatted_ports:

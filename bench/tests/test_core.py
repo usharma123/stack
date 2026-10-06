@@ -126,9 +126,28 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(verify.restart_changes(before, before, "database"), [])
 
     def test_conflict_classification(self):
-        self.assertEqual(verify.classify_conflict(False, None, None, {1}), ("refused-at-start", True))
-        self.assertEqual(verify.classify_conflict(True, None, None, {1}), ("reported-ready-but-unreachable", False))
-        self.assertEqual(verify.classify_conflict(True, True, ident(port=1), {1})[1], False)
+        self.assertEqual(verify.classify_conflict((1, False), None, None, {1}), ("refused-at-start", True))
+        self.assertEqual(verify.classify_conflict((0, False), None, None, {1}), ("reported-ready-but-unreachable", False))
+        self.assertEqual(verify.classify_conflict((0, False), (0, False), ident(port=1), {1})[1], False)
+        # Timeouts and missing commands are infrastructure faults, never a detected conflict.
+        self.assertFalse(verify.classify_conflict((124, True), None, None, {1})[1])
+        self.assertFalse(verify.classify_conflict((127, False), None, None, {1})[1])
+        self.assertFalse(verify.classify_conflict((0, False), (127, False), None, {1})[1])
+        self.assertFalse(verify.classify_conflict((0, False), (1, True), None, {1})[1])
+
+    def test_app_result_fails_closed(self):
+        ok = dict(command="crud", ok=True, result=dict(steps=["create", "read", "update", "list", "delete"]))
+        self.assertTrue(verify.app_result(ok, "crud"))
+        with self.assertRaises(ValueError):
+            verify.app_result(ok, "crud", code=1)          # ok receipt but failed process
+        with self.assertRaises(ValueError):
+            verify.app_result(ok, "crud", timed_out=True)
+        with self.assertRaises(ValueError):
+            verify.app_result(dict(command="crud", ok=True, result={}), "crud")   # empty result
+        with self.assertRaises(ValueError):
+            verify.app_result(dict(command="crud", ok=True), "crud")              # absent result
+        with self.assertRaises(ValueError):
+            verify.app_result(dict(command="persisted", ok=True, result=dict(pg_keeper=True)), "persisted")
 
     def test_app_result_rejects_failures(self):
         with self.assertRaises(ValueError):
@@ -181,6 +200,128 @@ class ScenarioTest(unittest.TestCase):
     def test_semantic_read_failure_counts(self):
         out, _ = run_fake(Toy(), lambda w: w.fail.add("repeat.app_read-sample-002"))
         self.assertEqual(out["repeat.app_read"]["status"], "fail")
+
+    def test_empty_crud_receipt_fails(self):
+        out, _ = run_fake(Toy(), lambda w: w.bad_receipt.update(crud={}))
+        self.assertEqual(out["crud_cache.a"]["status"], "fail")
+
+    def test_ok_stdout_with_failed_exit_fails(self):
+        out, _ = run_fake(Toy(), lambda w: w.codes.update({"a-crud": (1, False)}))
+        self.assertEqual(out["crud_cache.a"]["status"], "fail")
+
+    def test_redis_loss_detected_from_receipt_not_exit(self):
+        out, _ = run_fake(Toy(), lambda w: w.bad_receipt.update(persisted=dict(pg_keeper=True, redis_durable=False)))
+        self.assertEqual(out["persist.redis"]["status"], "fail")
+        self.assertEqual(out["persist.pg"]["status"], "pass")
+
+    def test_missing_lock_hashes_never_pass(self):
+        for co in ("a", "c"):
+            out, _ = run_fake(Toy(), lambda w: w.no_hash.add(co))
+            self.assertNotEqual(out["lock.frozen_copy"]["status"], "pass", co)
+
+    def test_timed_out_leftover_probe_is_error(self):
+        out, _ = run_fake(Toy(), lambda w: w.codes.update({"leftover-processes": (124, True)}))
+        self.assertEqual(out["cleanup.processes"]["status"], "error")
+
+    def test_bad_config_infra_fault_is_blocked(self):
+        out, _ = run_fake(Toy(), lambda w: w.codes.update({"d-setup-invalid": (127, False)}))
+        self.assertEqual(out["bad_config"]["status"], "blocked")
+
+    def test_occupied_port_timeouts_never_pass(self):
+        for label, code in (("e-start", (124, True)), ("e-ready", (127, False)), ("e-ready", (1, True))):
+            out, _ = run_fake(Toy(), lambda w: w.codes.update({label: code}))
+            self.assertEqual(out["occupied_port"]["status"], "fail", (label, code))
+
+    def test_stop_probe_timeout_is_blocked_not_pass(self):
+        out, _ = run_fake(Toy(), lambda w: w.codes.update({"a-stopped-probe": (124, True)}))
+        self.assertEqual(out["stop.a"]["status"], "blocked")
+        self.assertEqual(out["persist.pg"]["status"], "blocked")
+
+    # ---- Astra round-1 regressions (bench/reviews/round-1-core.md) ----------------
+    @staticmethod
+    def inject(fn):
+        return lambda w: w.mutators.append(fn)
+
+    def test_r1_1_good_stdout_with_failed_or_timed_out_process(self):
+        def fault(r):
+            if r.label in ("a-start-identity", "a-crud"):
+                r.code, r.timed_out = 17, True
+        out, _ = run_fake(Toy(), self.inject(fault))
+        self.assertEqual(out["start.a"]["status"], "fail")
+
+    def test_r1_1_repeated_start_failure_fails_even_if_identity_is_fine(self):
+        def fault(r):
+            if r.label == "a-start-again":
+                r.code = 1
+        out, _ = run_fake(Toy(), self.inject(fault))
+        self.assertEqual(out["start.repeat"]["status"], "fail")
+
+    def test_r1_2_identity_without_source_or_urls_fails(self):
+        import json
+        for field in ("source", "urls"):
+            def fault(r, field=field):
+                if r.label == "a-start-identity":
+                    p = json.loads(r.stdout)
+                    del p["result"][field]
+                    r.stdout = json.dumps(p)
+            out, _ = run_fake(Toy(), self.inject(fault))
+            self.assertEqual(out["start.a"]["status"], "fail", field)
+
+    def test_r1_4_occupied_port_wrong_source_never_relocated(self):
+        import json
+        def fault(r):
+            if r.label == "e-identity":
+                p = json.loads(r.stdout)
+                p["result"]["source"]["token"] = "wrong-checkout"
+                r.stdout = json.dumps(p)
+        out, _ = run_fake(Toy(), self.inject(fault))
+        self.assertEqual(out["occupied_port"]["status"], "fail")
+
+    def test_r1_4_occupied_port_failed_deps_is_blocked(self):
+        out, _ = run_fake(Toy(), lambda w: w.codes.update({"e-deps": (1, False)}))
+        self.assertEqual(out["occupied_port"]["status"], "blocked")
+
+    def test_r1_5_failed_hash_commands_never_pass(self):
+        def fault(r):
+            if r.label.endswith("-lock-hash"):
+                r.code, r.stdout = 1, ""
+        out, _ = run_fake(Toy(), self.inject(fault))
+        self.assertEqual(out["lock.created"]["status"], "fail")
+        self.assertEqual(out["lock.frozen_copy"]["status"], "blocked")
+
+    def test_r1_7_no_listener_after_failed_setup_and_listener_always_released(self):
+        out, tx = run_fake(Toy(), lambda w: w.codes.update({"e-setup": (1, False)}))
+        self.assertEqual(out["occupied_port"]["status"], "blocked")
+        self.assertNotIn("e-occupy-port", [c[0] for c in tx.calls])
+        out, tx = run_fake(Toy(), lambda w: w.codes.update({"e-start": (124, True)}))
+        labels = [c[0] for c in tx.calls]
+        self.assertIn("e-occupy-port", labels)
+        self.assertIn("release-listener", labels[labels.index("e-occupy-port"):])
+
+    def test_r1_8_failed_preparation_blocks_dependents(self):
+        for co, check in (("a", "setup.a"), ("b", "setup.b"), ("c", "lock.frozen_copy"),
+                          ("d", "bad_config"), ("e", "occupied_port")):
+            out, tx = run_fake(Toy(), lambda w, co=co: w.codes.update({f"{co}-prepare": (1, False)}))
+            self.assertEqual(out[f"prepare.{co}"]["status"], "fail", co)
+            self.assertEqual(out[check]["status"], "blocked", co)
+            self.assertFalse(any(c[0] == f"{co}-setup-cold" or c[0] == f"{co}-setup-warm" for c in tx.calls), co)
+
+    def test_r1_9_missing_container_receipt_fails_isolation(self):
+        class Containers(Toy):
+            isolation_boundary = "container"
+            def instance_identity(self, co): return f"echo instance {co.name}"
+        def fault(r):
+            if r.label == "a-instance-identity":
+                r.code, r.stdout = 1, ""
+            elif r.label == "b-instance-identity":
+                r.stdout = '{"containers": ["b-pg", "b-redis"]}'
+        out, _ = run_fake(Containers(), self.inject(fault))
+        self.assertEqual(out["isolation"]["status"], "fail")
+        def good(r):
+            if r.label.endswith("-instance-identity"):
+                r.stdout = '{"containers": ["%s"]}' % r.label[0]
+        out, _ = run_fake(Containers(), self.inject(good))
+        self.assertEqual(out["isolation"]["status"], "pass")
 
     def test_outcome_validation(self):
         o = Outcomes()

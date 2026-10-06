@@ -109,3 +109,26 @@ separately and never mixed.
   container / database) with typed receipts; per-checkout SOURCE_TOKEN gate against
   wrong-code execution; A generates the lock, B/C/E receive it as committed; Stack uses the
   parent-built Linux binary (hash-checked at provision) and pinned mise 2026.10.3.
+- 2026-10-06 (Astra round 1, fail-closed): app receipts now require exit 0, no timeout, `ok`,
+  a result object and the exact expected shape (`verify.EXPECTED`); repeated reads validate
+  the item; Redis persistence is read from the validated `persisted` booleans; missing A/C
+  lock hashes make `lock.frozen_copy` blocked; a failed/timed-out leftover probe is `error`;
+  bad-config and occupied-port treat timeouts and exit 126/127 as infrastructure faults
+  (`blocked` / `fail`), never as a detected refusal; a timed-out post-stop probe blocks the
+  stop/restart checks. Files: `rwb/verify.py`, `rwb/scenario.py`, `rwb/testing.py`,
+  `tests/test_core.py` (38 tests). Adapter files (mise/flox/devbox) are separate work.
+- 2026-10-06 (Astra round 1 complete, `reviews/round-1-core.md`): all nine findings fixed in
+  core and covered by named injected-failure regressions in `tests/test_core.py`
+  (`test_r1_*`, plus earlier fail-closed tests; 47 tests pass). Mapping:
+  R1-1 `verify.app_result` requires exit 0/no timeout; repeated start gated on its exit.
+  R1-2 command schemas (`verify.EXPECTED`, `identity_complete`: source/URLs/ports/markers).
+  R1-3 `verify.refusal`: timeouts/126/127 are infrastructure faults (bad_config blocked,
+  occupied_port fail). R1-4 occupied-port identity problems (wrong source) reject relocation;
+  failed deps block. R1-5 complete declared lock sets + successful hash commands required.
+  R1-6 failed/timed-out leftover probe is `error` and invalidates cleanup. R1-7 listener
+  started only after successful setup, registered, and released in `cleanup()` always.
+  R1-8 `Scenario.prepare` records `prepare.<co>` failures and blocks dependents.
+  R1-9 container isolation requires valid receipts for both checkouts.
+  Reproducer `/tmp/stack-astra-core.2Q4stu/probe.py` (paths redirected) now fails closed
+  in every case. Also: `run.py --dry-run` binds the fake world to real checkout tokens.
+  Core files: rwb/verify.py, rwb/scenario.py, rwb/testing.py, run.py, tests/test_core.py.
