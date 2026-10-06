@@ -13,6 +13,23 @@ ports and starts no host-wide DDEV containers. Source facts (5da91aeb9ebab0b0e66
 `ddev exec` calls StartAppIfNotRunning (the entry resumes a stopped project); `ddev stop`
 removes containers and keeps volumes; `ddev delete` removes the project's volumes.
 
+Docker client config is private too (DOCKER_CONFIG in the run's state directory). DDEV pulls
+and builds through docker/cli + compose in-process (pkg/dockerutil/docker_manager.go,
+NewDockerCli/Initialize), and docker/cli reads DOCKER_CONFIG, so the host Docker Desktop
+credential helper that failed non-interactively is never consulted: anonymous public pulls on
+the user's current daemon context. The preflight builds that config before any docker call
+(adapters/ddev/docker_client_config.py, ComposeAdapter's reviewed approach) and fails closed
+unless the private and user configs resolve the same daemon endpoint. ~/.docker is only read.
+Only the persisted currentContext is supported: every body (provision, receipts, cleanup)
+starts with DOCKER_ENV_GUARD, which blocks (exit 77) before any docker call when
+DOCKER_HOST/DOCKER_CONTEXT/DOCKER_TLS/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH is exported, and the
+helper blocks an active context carrying TLS material or SkipTLSVerify (never copied). Only a
+preflight that passes those checks and the endpoint comparison seals the selection
+(SELECTION_MARKER); every later body, cleanup included, exits 77 before any docker call unless
+the private config still matches that seal. A rejected preflight therefore cannot leave
+cleanup or receipts on docker/cli's default socket, while failures after a successful seal
+(docker info, pulls, start) still get the full cleanup.
+
 Research: bench/research/ddev.md. Handoff: bench/CONTAINER-ADAPTERS.md.
 """
 from .base import q
@@ -27,6 +44,51 @@ ASSETS = {
     "linux-arm64": (f"ddev_linux-arm64.v{VERSION}.tar.gz", "41b1412c83e7e2ae04887f02a9b4bf6d441c6f662773d97979e9fe23acf93c0a"),
     "linux-amd64": (f"ddev_linux-amd64.v{VERSION}.tar.gz", "65fb822f0d2874220c8f9a6b2dfec095d37c0fdc555e34dc5b0e5f4177beeb93"),
 }
+PRIVATE_DOCKER_REL = "adapters/ddev/docker_client_config.py"
+# Daemon/TLS selection a private config cannot reproduce. Lando strips DOCKER_* before Compose
+# (utils/build-config.js) while the adapter's own docker calls would honour them, so these are
+# rejected rather than carried. Prefixed to every body by env(): names only, never values.
+DOCKER_OVERRIDES = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH")
+DOCKER_ENV_GUARD = (f"for rwb_v in {' '.join(DOCKER_OVERRIDES)}; do if printenv \"$rwb_v\" >/dev/null; then "
+                    'echo "RWB-BLOCKED: $rwb_v is set; only the persisted Docker currentContext is supported" >&2; '
+                    "exit 77; fi; done; ")
+
+
+# Written by the preflight only after the daemon selection is validated (seal_selection);
+# selection_guard() checks it before every later body's first docker call.
+SELECTION_MARKER = "docker-selection.json"
+
+
+def selection_guard(script, marker):
+    """Env-prefix line: exit 77 (silently passes otherwise) unless "$DOCKER_CONFIG" is the
+    config the preflight validated and sealed in `marker`. Without it, a rejected preflight
+    leaves an empty or missing private config, which docker/cli resolves to the default socket."""
+    return f'python3 -I {q(script)} --verify "$DOCKER_CONFIG" {q(marker)} || exit 77; '
+
+
+def seal_selection(script, marker):
+    """Preflight line, after every selection check: bind the validated endpoint and config."""
+    return f'python3 -I {q(script)} --seal "$DOCKER_CONFIG" {q(marker)} "$rwb_run_ctx"'
+
+
+def private_docker_config(src, script, marker):
+    """Shell lines building the run-private Docker client config at "$DOCKER_CONFIG" from the
+    user's config dir `src` (a shell expression, only read) and failing closed unless both
+    resolve the same daemon context endpoint. A previous seal is dropped first, so only a
+    preflight that passes every check (then seal_selection) enables later bodies. Shared
+    with the Lando adapter."""
+    ctx = "docker context inspect --format '{{.Name}} {{.Endpoints.docker.Host}}'"
+    return [
+        f"rm -f {q(marker)}",
+        f'rwb_user_docker="{src}"',
+        f'python3 -I {q(script)} "$rwb_user_docker" "$DOCKER_CONFIG"',
+        f'rwb_user_ctx=$(DOCKER_CONFIG="$rwb_user_docker" {ctx})',
+        f"rwb_run_ctx=$({ctx})",
+        'echo "docker context user=[$rwb_user_ctx] run=[$rwb_run_ctx]"',
+        'test "$rwb_user_ctx" = "$rwb_run_ctx" || { echo "private Docker config resolves a different daemon context" >&2; exit 1; }',
+    ]
+
+
 PG_IMAGE = "postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3"
 
 
@@ -63,9 +125,41 @@ class DdevAdapter(ContainerAdapter):
                     image_notes="PostgreSQL 17.6 on Debian bookworm (DDEV customizes it with apt, so the "
                                 "derived image is not byte-frozen); web container ddev/ddev-webserver as chosen by DDEV")
 
-    def env(self):
-        return super().env() + (f"export DDEV_XDG_CONFIG_HOME={q(self.state)}/ddev-xdg DDEV_NONINTERACTIVE=true "
-                                "DDEV_NO_INSTRUMENTATION=true NO_COLOR=1; ")
+    @property
+    def docker_config(self):
+        return f"{self.state}/docker-config"
+
+    @property
+    def selection_marker(self):
+        return f"{self.state}/{SELECTION_MARKER}"
+
+    def env(self, validated=True):
+        # RWB_USER_DOCKER_CONFIG keeps the user's (read-only) config dir across repeated env()s.
+        # Every body but the preflight (validated=False) requires the sealed daemon selection.
+        return DOCKER_ENV_GUARD + super().env() + (f"export DDEV_XDG_CONFIG_HOME={q(self.state)}/ddev-xdg DDEV_NONINTERACTIVE=true "
+                                "DDEV_NO_INSTRUMENTATION=true NO_COLOR=1 "
+                                'RWB_USER_DOCKER_CONFIG="${RWB_USER_DOCKER_CONFIG:-${DOCKER_CONFIG:-$HOME/.docker}}" '
+                                f"DOCKER_CONFIG={q(self.docker_config)}; ") + (
+            selection_guard(f"{self.src}/{PRIVATE_DOCKER_REL}", self.selection_marker) if validated else "")
+
+    def provision(self):
+        return [("preflight", self.env(validated=False) + self.preflight(), None)] + self.install()
+
+    def preflight(self):
+        # The private client config must exist before the shared preflight's `docker info`.
+        script = f"{self.src}/{PRIVATE_DOCKER_REL}"
+        return "\n".join(["set -eu", f"mkdir -p {q(self.docker_config)}",
+                          *private_docker_config("$RWB_USER_DOCKER_CONFIG", script, self.selection_marker),
+                          seal_selection(script, self.selection_marker),
+                          super().preflight()])
+
+    def validity(self):
+        return dict(super().validity(), docker_client_config=(
+            f"{self.docker_config}: user's persisted current context, no credsStore/auths (anonymous public pulls); "
+            "preflight fails closed if it resolves a different daemon endpoint; DOCKER_HOST/CONTEXT/TLS* env "
+            "overrides and TLS/SkipTLSVerify contexts are rejected before any docker call; every later body "
+            f"(receipts, cleanup) exits 77 before any docker call unless {self.selection_marker} seals the "
+            "validated endpoint and unchanged private config"))
 
     def selectors(self, name):
         # Compose project (containers, networks, compose volumes) and DDEV's own named

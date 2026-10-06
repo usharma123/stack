@@ -1,7 +1,22 @@
 # Private Lando global config for one benchmark run (LANDO_CORE_USERCONFROOT); never the
 # user's ~/.lando. The shared Traefik proxy and URL scanner are off: the fixture serves no
 # HTTP. `lando setup` is NOT run (it can install Docker Desktop/buildx and a CA); the
-# provision step appends `orchestratorBin:` pointing at a checksum-verified Compose v2.40.3
-# (Lando 3.26.9's default orchestrator version) and installs pinned plugins with plugin-add.
+# provision step copies a checksum-verified Compose v2.40.3 (Lando 3.26.9's default
+# orchestrator version) to <root>/bin/docker-compose-v2.40.3, appends `orchestratorBin:`
+# pointing at it and installs pinned plugins with plugin-add.
+#
+# `lando start/stop/destroy` still run autosetup (hooks/lando-run-setup.js) with these
+# `setup` options (lando/core 7a87f80). Each key below disables one host-mutating task:
+# skipInstallCa (system CA trust via sudo), buildEngine (Docker Desktop install), buildx
+# (download into the home Docker plugin dir), orchestrator (a second Compose download, which
+# ignores orchestratorBin unless this is false), installPlugins (no plugin installs).
+# Autosetup may still create the run-private CA under <root>/certs and the Landonet network.
 proxy: "OFF"
 scanner: false
+setup:
+  skipInstallCa: true
+  skipCommonPlugins: true
+  installPlugins: false
+  buildEngine: false
+  buildx: false
+  orchestrator: false

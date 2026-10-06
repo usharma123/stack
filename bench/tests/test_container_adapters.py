@@ -20,7 +20,7 @@ sys.path.insert(0, str(BENCH))
 
 from rwb import verify  # noqa: E402
 from rwb.adapters.base import FEATURES  # noqa: E402
-from rwb.adapters.ddev import DdevAdapter  # noqa: E402
+from rwb.adapters.ddev import DOCKER_OVERRIDES, PRIVATE_DOCKER_REL, DdevAdapter  # noqa: E402
 from rwb.adapters.devcontainers import IMAGES, RECEIPT_REL, DevcontainersAdapter  # noqa: E402
 from rwb.adapters.devpod import DevpodAdapter  # noqa: E402
 from rwb.adapters.lando import LANDO_IMAGES, LandoAdapter  # noqa: E402
@@ -30,6 +30,20 @@ from rwb.testing import FakeRecorder, FakeTransport, FakeWorld  # noqa: E402
 ADAPTERS = (DevcontainersAdapter, DevpodAdapter, DdevAdapter, LandoAdapter)
 RUN = "20261006t120000-abc123"
 RECEIPT = BENCH / RECEIPT_REL
+
+
+def seal_selection(adapter):
+    """Do what a validated DDEV/Lando preflight does before any later body may run: build the
+    private Docker config with the real helper (from an absent user config, so the built-in
+    default context) and seal that selection with `--seal`. The bodies' --verify guard then
+    passes for real instead of being bypassed."""
+    config = getattr(adapter, "docker_config", None) or f"{adapter.private_home}/.docker"
+    helper = [sys.executable, "-I", str(BENCH / PRIVATE_DOCKER_REL)]
+    env = {k: v for k, v in os.environ.items() if k not in DOCKER_OVERRIDES}
+    for args in ([str(Path(adapter.state, "no-user-docker")), config],
+                 ["--seal", config, adapter.selection_marker, "default unix:///var/run/docker.sock"]):
+        proc = subprocess.run(helper + args, capture_output=True, text=True, env=env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def make(cls, run_id=RUN):
@@ -288,7 +302,9 @@ class PlannedBodies(unittest.TestCase):
                     continue
                 with self.subTest(adapter=cls.name, step=label):
                     if re.search(rf"\b(devcontainer|devpod|ddev|lando) ", body):
-                        self.assertIn(adapter.env().strip(), body)
+                        sealing = label == "preflight" and hasattr(adapter, "selection_marker")
+                        expected = adapter.env(validated=False) if sealing else adapter.env()
+                        self.assertIn(expected.strip(), body)
             cleanup = adapter.cleanup_host()
             # Lando owns names with the normalized run id; the others with the raw run id.
             self.assertIn(f" remove {adapter.owner_token} ", cleanup)
@@ -484,6 +500,8 @@ class LandoOwnershipReceipts(unittest.TestCase):
         self.docker.chmod(self.docker.stat().st_mode | stat.S_IXUSR)
         self.state = tmp / "state.json"
         self.lando = make(LandoAdapter)
+        self.lando.root = str(tmp / "w")
+        seal_selection(self.lando)
         mine, other = self.lando.project("a"), "cit-observability-c"
         self.mine = mine
         self.state.write_text(json.dumps(dict(
@@ -695,6 +713,7 @@ class FullCleanupBody(unittest.TestCase):
         adapter = cls({"tools_dir": str(self.dir / "tools")}, None, RUN)
         adapter.root = str(self.dir / "w")
         Path(adapter.state).mkdir(parents=True, exist_ok=True)
+        seal_selection(adapter)
         # Snapshot as preflight records it: the shared infra did not exist before this run.
         Path(adapter.state, "shared-infra.json").write_text(json.dumps(
             {f"{k[:-1]}:{n}": dict(existed_before=False) for k, n in self.SHARED[cls]}))
