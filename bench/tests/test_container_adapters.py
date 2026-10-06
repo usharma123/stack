@@ -333,6 +333,8 @@ FAKE_DOCKER = textwrap.dedent('''\
     def save():
         json.dump(state, open(path, "w"))
     def label_filter(items, flt):
+        if flt.startswith("name="):  # docker matches names by substring
+            return [i for i in items if flt[len("name="):] in i["name"]]
         key, _, value = flt[len("label="):].partition("=")
         return [i for i in items if key in i["labels"] and (not value or i["labels"][key] == value)]
     def arg(name):
@@ -350,7 +352,7 @@ FAKE_DOCKER = textwrap.dedent('''\
                 items = [c for c in items if flt[len("volume="):] in c.get("volumes", [])]
         fmt = (arg("--format") or [""])[0]
         for c in items:
-            if "-q" in args:
+            if "-q" in args or "-aq" in args:
                 print(c["id"])
             else:
                 print(c["labels"].get("com.docker.compose.project", "") + "\\t" +
@@ -372,9 +374,11 @@ FAKE_DOCKER = textwrap.dedent('''\
         for v in items:
             print(v["name"])
     elif cmd == "network" and args[1] == "ls":
-        items = label_filter(state["networks"], arg("--filter")[0])
+        items = state["networks"]
+        for flt in arg("--filter"):
+            items = label_filter(items, flt)
         for n in items:
-            print(n["id"] + "\\t" + n["name"])
+            print(n["name"] if arg("--format") == ["{{.Name}}"] else n["id"] + "\\t" + n["name"])
     elif cmd == "image" and args[1] == "ls":
         for ref in state["images"]:
             print(ref)
@@ -382,7 +386,8 @@ FAKE_DOCKER = textwrap.dedent('''\
         found = [x for x in state[cmd + "s"] if args[2] in (x.get("id"), x["name"])]
         if not found:
             sys.exit(f"Error: No such {cmd}: {args[2]}")
-        print(json.dumps([dict(Name=found[0]["name"], Containers={})]))
+        print(json.dumps([dict(Name=found[0]["name"],
+                               Containers={c: {} for c in found[0].get("attached", [])})]))
     elif cmd == "rm":
         state["containers"] = [c for c in state["containers"] if c["id"] != args[-1]]; save()
     elif cmd == "network" and args[1] == "rm":
@@ -532,6 +537,141 @@ class LandoOwnershipReceipts(unittest.TestCase):
         self.assertEqual(len(json.loads(self.state.read_text())["containers"]), 2)
 
 
+class SharedInfraReceipts(unittest.TestCase):
+    """Astra R4 P1: a Docker daemon error (exit 1) must never read as "shared infra absent".
+    Existence comes only from successful exact-name listings; failures propagate."""
+
+    DAEMON_DOWN = "network ls|volume ls|network inspect|volume inspect"
+    ITEMS = ("network:ddev_default", "volume:ddev-global-cache")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        tmp = Path(self.tmp.name)
+        self.docker = tmp / "docker"
+        self.docker.write_text(FAKE_DOCKER)
+        self.docker.chmod(self.docker.stat().st_mode | stat.S_IXUSR)
+        self.state = tmp / "state.json"
+        self.snapshot = tmp / "shared.json"
+        self.world()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def world(self, networks=(), volumes=(), containers=()):
+        self.state.write_text(json.dumps(dict(
+            containers=list(containers), images=[],
+            volumes=[dict(name=n, labels={}) for n in volumes],
+            networks=[dict(id=f"id-{n}", name=n, labels={}, **extra) for n, extra in
+                      (x if isinstance(x, tuple) else (x, {}) for x in networks)])))
+
+    def record(self, **existed):
+        self.snapshot.write_text(json.dumps({k: dict(existed_before=v) for k, v in existed.items()}))
+
+    def receipt(self, *args, fail=""):
+        env = dict(os.environ, RWB_DOCKER=str(self.docker), RWB_FAKE_STATE=str(self.state), RWB_FAKE_FAIL=fail)
+        return subprocess.run([sys.executable, "-I", str(RECEIPT), *map(str, args)],
+                              capture_output=True, text=True, env=env)
+
+    def left(self):
+        state = json.loads(self.state.read_text())
+        return sorted(n["name"] for n in state["networks"]), sorted(v["name"] for v in state["volumes"])
+
+    def removals(self):
+        log = Path(str(self.state) + ".log")
+        return [c for c in log.read_text().splitlines() if " rm " in f" {c} "] if log.exists() else []
+
+    def test_snapshot_daemon_error_fails_and_keeps_existing_record(self):
+        self.world(networks=["ddev_default"], volumes=["ddev-global-cache"])
+        for fail in (self.DAEMON_DOWN, "volume ls"):  # total and partial (second-kind) failure
+            with self.subTest(fail=fail):
+                self.snapshot.write_text("prior")
+                proc = self.receipt("shared-snapshot", self.snapshot, *self.ITEMS, fail=fail)
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertIn("Cannot connect", proc.stderr)
+                self.assertEqual(self.snapshot.read_text(), "prior")
+        self.snapshot.unlink()
+        self.assertEqual(self.receipt("shared-snapshot", self.snapshot, *self.ITEMS, fail="volume ls").returncode, 1)
+        self.assertFalse(self.snapshot.exists(), "no ownership record after a partial failed query")
+        # The reproduced sequence: daemon error at snapshot, healthy cleanup later.
+        self.assertEqual(self.receipt("shared-cleanup", self.snapshot).returncode, 0)
+        self.assertEqual(self.left(), (["ddev_default"], ["ddev-global-cache"]))
+
+    def test_snapshot_records_presence_by_exact_name(self):
+        # Substring neighbours (ddev_default_extra) must not count as the named resource.
+        self.world(networks=["ddev_default_extra"], volumes=["ddev-global-cache"])
+        proc = self.receipt("shared-snapshot", self.snapshot, *self.ITEMS)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(self.snapshot.read_text()), {
+            "network:ddev_default": dict(existed_before=False),
+            "volume:ddev-global-cache": dict(existed_before=True)})
+        self.assertNotEqual(self.receipt("shared-snapshot", self.snapshot, "image:x").returncode, 0)
+
+    def test_cleanup_daemon_error_fails_without_reporting_absent(self):
+        self.world(networks=["ddev_default"], volumes=["ddev-global-cache"])
+        self.record(**{"network:ddev_default": False, "volume:ddev-global-cache": False})
+        for fail in (self.DAEMON_DOWN, "network ls", "volume ls"):
+            with self.subTest(fail=fail):
+                proc = self.receipt("shared-cleanup", self.snapshot, fail=fail)
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertNotIn("absent", proc.stdout)
+                self.assertEqual(self.removals(), [], "discovery failure must precede every removal")
+                self.assertEqual(self.left(), (["ddev_default"], ["ddev-global-cache"]))
+
+    def test_cleanup_truly_missing_is_absent(self):
+        self.record(**{"network:ddev_default": False, "volume:ddev-global-cache": False})
+        proc = self.receipt("shared-cleanup", self.snapshot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(set(json.loads(proc.stdout).values()), {"absent"})
+
+    def test_cleanup_keeps_preexisting_and_removes_unused_run_created(self):
+        self.world(networks=["ddev_default", "lando_bridge_network"], volumes=["ddev-global-cache"])
+        self.record(**{"network:ddev_default": True, "volume:ddev-global-cache": True,
+                       "network:lando_bridge_network": False})
+        proc = self.receipt("shared-cleanup", self.snapshot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["network:ddev_default"], "kept (pre-existing)")
+        self.assertEqual(result["network:lando_bridge_network"], "removed (created by this run)")
+        self.assertEqual(self.left(), (["ddev_default"], ["ddev-global-cache"]))
+
+    def test_cleanup_keeps_attached_and_used_run_created(self):
+        self.world(networks=[("ddev_default", dict(attached=["c9"]))], volumes=["ddev-global-cache"],
+                   containers=[dict(id="c9", status="running", labels={}, volumes=["ddev-global-cache"])])
+        self.record(**{"network:ddev_default": False, "volume:ddev-global-cache": False})
+        proc = self.receipt("shared-cleanup", self.snapshot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), {"network:ddev_default": "kept: 1 containers attached",
+                                                   "volume:ddev-global-cache": "kept: used by 1 containers"})
+        self.assertEqual(self.removals(), [])
+
+    def test_mixed_kind_check_failure_removes_nothing(self):
+        self.world(networks=["ddev_default"], volumes=["ddev-global-cache"])
+        self.record(**{"network:ddev_default": False, "volume:ddev-global-cache": False})
+        for fail in ("volume ls", "network ls", "network inspect", "ps -aq"):
+            with self.subTest(fail=fail):
+                proc = self.receipt("shared-cleanup", self.snapshot, fail=fail)
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertEqual(self.removals(), [])
+                self.assertEqual(self.left(), (["ddev_default"], ["ddev-global-cache"]))
+
+    def test_ambiguous_or_malformed_records_remove_nothing(self):
+        state = dict(containers=[], images=[], volumes=[dict(name="ddev-global-cache", labels={})],
+                     networks=[dict(id="n1", name="ddev_default", labels={}),
+                               dict(id="n2", name="ddev_default", labels={})])
+        self.state.write_text(json.dumps(state))
+        self.record(**{"network:ddev_default": False, "volume:ddev-global-cache": False})
+        proc = self.receipt("shared-cleanup", self.snapshot)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("ambiguous", proc.stderr)
+        for bad in ({"volume:ddev-global-cache": {"existed_before": False}, "image:x": {"existed_before": False}},
+                    {"volume:ddev-global-cache": {}}, {"volume:ddev-global-cache": {"existed_before": "no"}}):
+            with self.subTest(record=bad):
+                self.snapshot.write_text(json.dumps(bad))
+                self.assertEqual(self.receipt("shared-cleanup", self.snapshot).returncode, 1)
+        self.assertEqual(self.removals(), [])
+        self.assertEqual(len(json.loads(self.state.read_text())["networks"]), 2)
+
+
 class FullCleanupBody(unittest.TestCase):
     """Astra R3 P2: run the whole generated cleanup_host body (native teardown, owned-resource
     receipt removal, shared-infra cleanup) against the fake Docker CLI. Removal and shared
@@ -643,6 +783,19 @@ class FullCleanupBody(unittest.TestCase):
                 left = self.left()
                 self.assertEqual(left["containers"], ["foreign"])
                 self.assertIn("lando_bridge_network" if cls is LandoAdapter else "ddev_default", left["networks"])
+                self.assert_foreign_kept()
+
+    def test_shared_discovery_daemon_error_fails_cleanup_and_keeps_shared(self):
+        for cls in self.SHARED:
+            with self.subTest(adapter=cls.name):
+                proc = self.run_cleanup(self.adapter(cls), fail="network inspect|volume inspect|network ls --filter name=|volume ls --filter name=")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("shared-infra cleanup failed", proc.stderr)
+                self.assertNotIn("owned-resource removal failed", proc.stderr)
+                left = self.left()
+                self.assertEqual(left["containers"], ["foreign"])
+                for name in self.shared_names(cls):
+                    self.assertIn(name, left["networks"] + left["volumes"])
                 self.assert_foreign_kept()
 
     def test_native_teardown_failure_stays_best_effort(self):

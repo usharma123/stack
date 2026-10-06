@@ -232,46 +232,78 @@ def cmd_remove(token, *selectors):
 SHARED_KINDS = ("network", "volume")
 
 
-def cmd_shared_snapshot(path, *items):
-    record = {}
+def _shared_items(items):
+    parsed = []
     for item in items:
         kind, _, name = item.partition(":")
-        if kind not in SHARED_KINDS:
-            raise Fail(f"unknown shared kind {kind}")
-        existed = docker(kind, "inspect", name, ok_codes=(0, 1)).returncode == 0
-        record[item] = dict(existed_before=existed)
-    with open(path, "w") as handle:
+        if kind not in SHARED_KINDS or not name:
+            raise Fail(f"bad shared item {item!r}: expected network:NAME or volume:NAME")
+        parsed.append((item, kind, name))
+    return parsed
+
+
+def _shared_count(kind, name):
+    """Exact-name matches from a successful listing. A failed listing (daemon down, ...) raises:
+    an inspect error is never read as "absent", so no ownership is inferred from a failure."""
+    listed = lines(kind, "ls", "--filter", f"name={name}", "--format", "{{.Name}}")
+    return sum(1 for line in listed if line.strip() == name)
+
+
+def cmd_shared_snapshot(path, *items):
+    """Every listing must succeed before anything is written; a failed query leaves an
+    existing record untouched instead of recording pre-existing infra as run-created."""
+    record = {}
+    for item, kind, name in _shared_items(items):
+        record[item] = dict(existed_before=_shared_count(kind, name) > 0)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as handle:
         json.dump(record, handle, sort_keys=True)
+    os.replace(tmp, path)
     print(json.dumps(record, sort_keys=True))
 
 
 def cmd_shared_cleanup(path):
     """Shared infra (ddev_default, lando_bridge_network, ...) is removed only when this run
-    created it and nothing is attached; anything that pre-existed is never touched."""
+    created it and nothing is attached; anything that pre-existed is never touched. All
+    discovery and use checks finish before the first removal, and any failure raises."""
     if not os.path.exists(path):
         print("{}")
         return
     with open(path) as handle:
         record = json.load(handle)
-    result = {}
-    for item, info in sorted(record.items()):
-        kind, _, name = item.partition(":")
-        exists = docker(kind, "inspect", name, ok_codes=(0, 1)).returncode == 0
-        if info["existed_before"] or not exists:
-            result[item] = "kept (pre-existing)" if info["existed_before"] else "absent"
+    if not isinstance(record, dict):
+        raise Fail(f"{path}: expected a JSON object")
+    parsed = _shared_items(sorted(record))
+    for item, _, _ in parsed:
+        if not isinstance(record[item], dict) or not isinstance(record[item].get("existed_before"), bool):
+            raise Fail(f"{path}: {item} has no boolean existed_before")
+    result, candidates = {}, []
+    for item, kind, name in parsed:
+        if record[item]["existed_before"]:
+            result[item] = "kept (pre-existing)"
             continue
+        count = _shared_count(kind, name)
+        if count > 1:
+            raise Fail(f"{item}: {count} {kind}s named {name!r}; refusing ambiguous cleanup")
+        if count == 0:
+            result[item] = "absent"
+            continue
+        candidates.append((item, kind, name))
+    removals = []
+    for item, kind, name in candidates:
         if kind == "network":
             attached = json.loads(docker("network", "inspect", name).stdout)[0].get("Containers") or {}
             if attached:
                 result[item] = f"kept: {len(attached)} containers attached"
                 continue
-            docker("network", "rm", name)
         else:
             users = lines("ps", "-aq", "--filter", f"volume={name}")
             if users:
                 result[item] = f"kept: used by {len(users)} containers"
                 continue
-            docker("volume", "rm", name)
+        removals.append((item, kind, name))
+    for item, kind, name in removals:
+        docker(kind, "rm", name)
         result[item] = "removed (created by this run)"
     print(json.dumps(result, sort_keys=True))
 
