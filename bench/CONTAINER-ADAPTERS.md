@@ -86,7 +86,7 @@ Suggested commit units (each self-contained once CA1 is in):
 | setup | `devcontainer build` (app image) | Compose model validation only (scripted) | `ddev utility download-images` | `lando info` (config resolution only) |
 | start | `devcontainer up` (+ result JSON check: success, project name, container id) | `devpod up --ide none --configure-ssh=false` (+ project check) | `ddev start` | `lando start` (build steps install uv, `uv sync --frozen`) |
 | deps hook | postCreateCommand `uv sync --frozen` | same | scenario `deps` | Lando `build:` |
-| entry | `devcontainer exec` | `devpod ssh --command` | `ddev exec --service app --raw` | `lando exec appserver --` |
+| entry | `devcontainer exec` | `devpod ssh --command` (auto-starts a stopped workspace) | `ddev exec --service app --raw` | `lando exec appserver --` |
 | readiness | native: `up` waits for `service_healthy` | native, same | native: start waits for healthchecks | **scripted**: failed healthchecks are warnings; app `wait` decides |
 | stop / status | `docker compose stop` / `ps --format json` (**scripted**; CLI has neither) | `devpod stop` / `status --output json` | `ddev stop` (removes containers, keeps volumes) / `describe --json-output` | `lando stop` / `info --format json` |
 | cleanup | `compose down -v` (scripted) | `devpod delete` + owned volume removal (delete keeps volumes) | `ddev delete --yes --omit-snapshot --clean-containers=false` | `lando destroy --yes` |
@@ -113,10 +113,15 @@ Suggested commit units (each self-contained once CA1 is in):
 
 ## Source findings that differ from research or the brief
 
-1. **DevPod `ssh` does NOT auto-resume** at v0.6.15 (`cmd/ssh.go` `jumpContainer` calls
-   `startWait(ctx, client, false, log)`, which returns "DevPod workspace is stopped"). The research
-   note and the brief said it does. The stop probe uses Docker inspection regardless
-   (`compose_receipt stopped`). The first real run should confirm the after-stop entry fails.
+1. **DevPod `ssh` auto-resumes a stopped workspace** at v0.6.15. This section originally said
+   it did not, from a reading of `cmd/ssh.go` (`startWait(ctx, client, false, log)`). The first
+   real run disproved that: in `bench/results/smoke-devpod-1` `devpod stop` exited 0 and the
+   Docker-inspection probe saw every A container exited (steps 45/46), then the after-stop
+   `devpod ssh` recreated/started them and returned identity (step 47). That run retains
+   `stop.a = fail` and is not relabelled. The research note and brief were right. The adapter
+   now declares `entry_auto_resumes = True`, so `stop.a` is decided by the stop exit plus the
+   ownership-checked stopped probe (`compose_receipt stopped`) with no after-stop entry.
+   Restart and persistence keep their explicit `devpod up` and app receipts.
 2. **DevPod Compose project = workspace UID**, not the `--id`
    (`GetRunnerIDFromWorkspace`). `COMPOSE_PROJECT_NAME` overrides it. The adapter exports it as the
    id and fails `start` unless the project resolved from the checkout's
@@ -129,7 +134,7 @@ Suggested commit units (each self-contained once CA1 is in):
 
 ## Core integration hooks requested (parent / core owner)
 
-1. **`entry_auto_resumes`** (DDEV: `True`). `stop_restart` runs the after-stop app identity
+1. **`entry_auto_resumes`** (DDEV and DevPod: `True`; now honoured by `Scenario.stop_restart`). `stop_restart` runs the after-stop app identity
    through `enter()`. For DDEV that restarts A, so `stop.a` will read `fail`
    ("app after stop exit 0"), which is misleading. Request: when the attribute is true, decide
    `stop.a` from the stop exit + `stopped_probe`, and record the after-stop entry as an `observed`

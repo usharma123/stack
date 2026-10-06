@@ -8,9 +8,13 @@ and stop/start/delete; Docker Compose runs PostgreSQL and Redis. Source facts us
   (pkg/compose/helper.go GetProjectName, pkg/devcontainer/run.go GetRunnerIDFromWorkspace).
   Every call exports COMPOSE_PROJECT_NAME=<workspace id>, and start fails closed unless the
   project found by the checkout's Compose working directory equals that id.
-- `devpod ssh` calls startWait(create=false): a stopped workspace returns "DevPod workspace
-  is stopped" instead of resuming (cmd/ssh.go). The research note and brief said it
-  auto-resumes; the stop probe uses Docker inspection either way.
+- `devpod ssh` auto-starts a stopped workspace. A source reading of cmd/ssh.go
+  (startWait(create=false)) suggested it would refuse with "DevPod workspace is stopped",
+  but the first real run (bench/results/smoke-devpod-1, steps 45-47) showed `devpod stop`
+  exit 0, every A container exited, and the next `devpod ssh` recreating/starting them.
+  The research note and brief were right, so entry_auto_resumes = True: stop.a is decided
+  by the stop exit plus the Docker-inspection stopped probe (`compose_receipt stopped`),
+  with no after-stop entry; restart/persistence still use explicit `devpod up` receipts.
 - `devpod delete` runs `compose down` without --volumes: named volumes survive. Cleanup
   removes this project's volumes afterwards (scripted, ownership-checked).
 
@@ -40,6 +44,7 @@ class DevpodAdapter(ContainerAdapter):
     config_files = (".devcontainer/devcontainer.json", ".devcontainer/compose.yaml", ".devcontainer/Dockerfile")
     lock_files = ("uv.lock", ".devcontainer/Dockerfile", ".devcontainer/compose.yaml")
     start_waits_ready = True
+    entry_auto_resumes = True  # `devpod ssh` restarts a stopped workspace (smoke-devpod-1 step 47)
     setup_scope = "Compose model validation only; DevPod builds/pulls images, injects its agent and runs uv sync (postCreateCommand) in `up`"
     bad_config_pattern = r"3\.13\.99"
     features = {

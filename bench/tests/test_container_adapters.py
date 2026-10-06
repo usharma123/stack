@@ -157,7 +157,7 @@ class AdapterDeclarations(unittest.TestCase):
 
     def test_entry_resume_declarations(self):
         self.assertTrue(DdevAdapter.entry_auto_resumes)      # exec -> StartAppIfNotRunning
-        self.assertFalse(DevpodAdapter.entry_auto_resumes)   # ssh -> startWait(create=false)
+        self.assertTrue(DevpodAdapter.entry_auto_resumes)    # ssh restarted A in smoke-devpod-1
         self.assertIn("entry_auto_resumes", " ".join(make(DdevAdapter).core_hooks_required()))
 
     def test_checkout_names_are_distinct_run_owned_and_tool_valid(self):
