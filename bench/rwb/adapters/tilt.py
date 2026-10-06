@@ -186,19 +186,26 @@ class TiltAdapter(Adapter):
             self.compose("exec -T redis redis-server --version")]))
 
     def instance_identity(self, co):
+        # Every raw Docker query is its own guarded assignment (a failed substitution inside
+        # printf would still exit 0); empty required IDs fail; JSON is printed last.
         p = self.project(co)
         lbl = f"--filter label=com.docker.compose.project={p}"
-        return ("printf '{\"project\":\"%s\",\"postgres\":\"%s\",\"redis\":\"%s\",\"volumes\":\"%s\",\"network\":\"%s\"}\\n' "
-                f"{p} "
-                f'"$(docker ps -q --no-trunc {lbl} --filter label=com.docker.compose.service=postgres)" '
-                f'"$(docker ps -q --no-trunc {lbl} --filter label=com.docker.compose.service=redis)" '
-                f'"$(docker volume ls -q {lbl} | sort | tr \'\\n\' \' \')" '
-                f'"$(docker network ls -q --no-trunc {lbl})"')
+        return "\n".join([
+            "set -u",
+            f"pg=$(docker ps -q --no-trunc {lbl} --filter label=com.docker.compose.service=postgres) || exit 1",
+            f"rd=$(docker ps -q --no-trunc {lbl} --filter label=com.docker.compose.service=redis) || exit 1",
+            f"vols=$(docker volume ls -q {lbl}) || exit 1",
+            f"net=$(docker network ls -q --no-trunc {lbl}) || exit 1",
+            'for v in "$pg" "$rd" "$vols" "$net"; do [ -n "$v" ] || { echo "identity: empty Docker result" >&2; exit 1; }; done',
+            "vols=$(printf '%s\\n' \"$vols\" | sort | tr '\\n' ' ')",
+            f"printf '{{\"project\":\"%s\",\"postgres\":\"%s\",\"redis\":\"%s\",\"volumes\":\"%s\",\"network\":\"%s\"}}\\n' "
+            f'{p} "$pg" "$rd" "$vols" "$net"'])
 
     def stopped_probe(self, co, identity):
         p = self.project(co)
-        return (f"for i in $(seq 1 150); do test -z \"$(docker ps -aq --filter label=com.docker.compose.project={p})\" "
-                f"&& exit 0; sleep 0.2; done; echo 'containers of {p} remain' >&2; exit 1")
+        # The query's own status is checked: a failed `docker ps` is never read as "no containers".
+        return (f"for i in $(seq 1 150); do left=$(docker ps -aq --filter label=com.docker.compose.project={p}) "
+                f"|| exit 1; test -z \"$left\" && exit 0; sleep 0.2; done; echo 'containers of {p} remain' >&2; exit 1")
 
     # ---- leftovers and host cleanup (only this run's labels/names) ---------------------
     def service_processes(self):

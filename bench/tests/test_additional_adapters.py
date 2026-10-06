@@ -290,5 +290,124 @@ class OrganistHolder(unittest.TestCase):
             self.assertEqual(r.returncode, 0, (path.name, r.stderr))
 
 
+COUNTING_DOCKER = r'''#!/bin/bash
+# Test-only docker stub. Call N (1-based) behaves per $STUB_DIR/plan, one line per call:
+#   ok | fail | failout | empty | busy   (default ok). Every call is logged. Never real Docker.
+dir="$STUB_DIR"; n=$(( $(cat "$dir/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$dir/n"
+echo "docker $*" >> "$dir/calls.log"
+mode=$(sed -n "${n}p" "$dir/plan" 2>/dev/null); mode=${mode:-ok}
+case "$mode" in
+  fail) echo "Cannot connect to the Docker daemon" >&2; exit 1;;
+  failout) echo "partial-$n"; exit 1;;
+  empty) exit 0;;
+  busy) echo "ctr-busy"; exit 0;;
+esac
+case "$1 $2" in
+  "volume ls") echo "vol-b-$n"; echo "vol-a-$n";;
+  "volume inspect") echo "${@: -1}";;
+  "ps -aq") ;;   # stopped probe: nothing left
+  *) echo "id-$n-$(printf '%s' "$*" | cksum | cut -d' ' -f1)";;
+esac
+'''
+
+
+class StubDocker(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        bindir = self.dir / "bin"
+        bindir.mkdir()
+        for name, text in (("docker", COUNTING_DOCKER), ("sleep", "#!/bin/sh\nexit 0\n")):
+            (bindir / name).write_text(text)
+            (bindir / name).chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin", STUB_DIR=str(self.dir))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_body(self, body, plan=(), cwd=None, extra_env=None):
+        (self.dir / "plan").write_text("\n".join(plan) + "\n")
+        (self.dir / "n").write_text("0")
+        (self.dir / "calls.log").write_text("")
+        env = dict(self.env, **(extra_env or {}))
+        proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, cwd=cwd, timeout=60)
+        return proc, (self.dir / "calls.log").read_text().splitlines()
+
+
+class TiltReceipts(StubDocker):
+    """Astra P1/P2: Tilt identity and stopped probe must fail closed on Docker failures."""
+
+    def setUp(self):
+        super().setUp()
+        self.tilt = make(TiltAdapter)
+        self.co = {n: self.tilt.checkout(n, i, "t") for i, n in enumerate("ab")}
+
+    def test_identity_fails_on_any_failed_or_empty_query(self):
+        body = self.tilt.instance_identity(self.co["a"])
+        for index in range(4):
+            for mode in ("fail", "failout", "empty"):
+                plan = ["ok"] * 4
+                plan[index] = mode
+                proc, _ = self.run_body(body, plan)
+                self.assertNotEqual(proc.returncode, 0, (index, mode))
+                self.assertNotIn("{", proc.stdout, (index, mode))
+
+    def test_identity_valid_receipt_schema_and_exact_filters(self):
+        receipts = {}
+        for name in "ab":
+            proc, calls = self.run_body(self.tilt.instance_identity(self.co[name]))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            receipts[name] = json.loads(proc.stdout)
+            self.assertEqual(set(receipts[name]), {"project", "postgres", "redis", "volumes", "network"})
+            self.assertTrue(all(isinstance(v, str) and v for v in receipts[name].values()))
+            label = f"label=com.docker.compose.project={self.tilt.project(self.co[name])}"
+            self.assertEqual(len(calls), 4)
+            self.assertTrue(all(label in c for c in calls), calls)
+            self.assertFalse([c for c in calls if re.search(r" (rm|create|stop|kill|down)\b", c)], calls)
+        self.assertNotEqual(receipts["a"], receipts["b"])
+        self.assertTrue(receipts["a"]["volumes"].startswith("vol-a-"))  # sorted, deterministic
+
+    def test_stopped_probe_never_reads_a_failed_query_as_absence(self):
+        body = self.tilt.stopped_probe(self.co["a"], None)
+        label = f"label=com.docker.compose.project={self.tilt.project(self.co['a'])}"
+        for plan, ok in ((["fail"], False), (["failout"], False), (["ok"], True),
+                         (["busy"] * 150, False), (["busy", "busy", "ok"], True)):
+            proc, calls = self.run_body(body, plan)
+            self.assertEqual(proc.returncode == 0, ok, (plan[:3], proc.stderr))
+            self.assertTrue(calls and all(label in c and " ps -aq " in f" {c} " for c in calls), calls)
+
+
+class VagrantIdentity(StubDocker):
+    """Astra P1: vagrant-resources.sh identity fails on any failed or empty Docker result."""
+
+    SCRIPT = BENCH / "adapters" / "vagrant" / "vagrant-resources.sh"
+
+    def identity(self, plan=(), instance="rwb-20261006t000000-abc123-a"):
+        return self.run_body(f"bash {self.SCRIPT} identity", plan,
+                             extra_env=dict(RWB_INSTANCE=instance, RWB_RUN=RUN))
+
+    def test_each_query_failure_or_empty_result_fails(self):
+        for index in range(5):  # pg, redis, network, volume 1 (first!), volume 2
+            for mode in ("fail", "failout", "empty"):
+                plan = ["ok"] * 5
+                plan[index] = mode
+                proc, _ = self.identity(plan)
+                self.assertNotEqual(proc.returncode, 0, (index, mode))
+                self.assertNotIn("{", proc.stdout, (index, mode))
+
+    def test_valid_receipt_schema_names_and_no_mutation(self):
+        a, calls = self.identity()
+        self.assertEqual(a.returncode, 0, a.stderr)
+        ra = json.loads(a.stdout)
+        self.assertEqual(set(ra), {"instance", "pg", "redis", "network", "volumes"})
+        inst = "rwb-20261006t000000-abc123-a"
+        self.assertEqual(ra["volumes"], f"{inst}-pgdata {inst}-redisdata ")
+        for name in (f"{inst}-pg", f"{inst}-redis", f"{inst}-net", f"{inst}-pgdata", f"{inst}-redisdata"):
+            self.assertTrue(any(c.endswith(" " + name) for c in calls), name)
+        self.assertFalse([c for c in calls if re.search(r" (rm|create)\b", c)], calls)
+        b, _ = self.identity(instance="rwb-20261006t000000-abc123-b")
+        self.assertNotEqual(ra, json.loads(b.stdout))
+
+
 if __name__ == "__main__":
     unittest.main()
