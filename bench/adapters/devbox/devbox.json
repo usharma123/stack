@@ -1,0 +1,23 @@
+{
+  "packages": [
+    "python@3.13.15",
+    "uv@0.12.22",
+    "postgresql@17.10",
+    "redis@8.10.2"
+  ],
+  "env": {
+    "UV_PYTHON_DOWNLOADS": "never",
+    "PGUSER": "postgres",
+    "PGDATABASE": "postgres"
+  },
+  "shell": {
+    "init_hook": [
+      "set -a; . \"$DEVBOX_PROJECT_ROOT/bench.local.env\"; set +a",
+      "export DATABASE_URL=\"postgresql://postgres@127.0.0.1:${PGPORT}/postgres\"",
+      "export REDIS_URL=\"redis://127.0.0.1:${REDIS_PORT}/0\""
+    ],
+    "scripts": {
+      "initdb": "sh bench-devbox/initdb.sh"
+    }
+  }
+}
