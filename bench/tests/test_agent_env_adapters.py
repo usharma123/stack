@@ -395,5 +395,144 @@ class Receipts(unittest.TestCase):
             self.assertNotEqual(bad.returncode, 0)
 
 
+DOCKER_STUB = r'''#!/bin/bash
+# Test-only docker stub: answers from files in $STUB_DIR, logs every call. Never real Docker.
+echo "docker $*" >> "$STUB_DIR/calls.log"
+case "$1" in
+  ps) cat "$STUB_DIR/ps.out" 2>/dev/null; exit "$(cat "$STUB_DIR/ps.rc" 2>/dev/null || echo 0)";;
+  volume) cat "$STUB_DIR/vol.out" 2>/dev/null; exit "$(cat "$STUB_DIR/vol.rc" 2>/dev/null || echo 0)";;
+  *) echo "unexpected docker call: $*" >&2; exit 99;;
+esac
+'''
+
+
+class IsolaBadConfigDiagnostic(unittest.TestCase):
+    """bad_config passes only on isola's refusal of the injected endpoint 127.0.0.1:1."""
+
+    def outcome(self, stderr):
+        out, _ = run_fake_isola(lambda w: w.outputs.update({"d-setup-invalid": ("", stderr)}))
+        return out["bad_config"]
+
+    def test_actual_unreachable_endpoint_diagnostic_passes(self):
+        msg = ("error: accessory database: failed to connect to `user=bench database=postgres`: "
+               "127.0.0.1:1 (127.0.0.1): dial error: dial tcp 127.0.0.1:1: connect: connection refused\n")
+        self.assertEqual(self.outcome(msg)["status"], "pass")
+
+    def test_unrelated_errors_are_not_the_intended_rejection(self):
+        for msg in ("error: cannot resolve postgres@99.99.99: no release matches\n",
+                    f"dial tcp 127.0.0.1:{SHARED_PG_PORT}: connect: connection refused\n",
+                    "dial tcp 127.0.0.1:15432: connect: connection refused\n",
+                    "panic: runtime error: index out of range\n"):
+            self.assertEqual(self.outcome(msg)["status"], "blocked", msg)
+
+
+def run_fake_isola(configure):
+    adapter = make(IsolaAdapter)
+    rec, world = FakeRecorder(), FakeWorld()
+    tx = FakeTransport(rec, adapter, world)
+    sc = Scenario(adapter, tx, rec, repeats=1, warmups=0)
+    world.scenario = sc
+    configure(world)
+    sc.execute()
+    sc.cleanup()
+    return {o["check"]: o for o in sc.out.as_list()}, tx
+
+
+class StoppedProbeBodies(unittest.TestCase):
+    """Astra P2: project_stopped must return control so the appended checks really run."""
+
+    def setUp(self):
+        import os
+        import socket
+        import stat
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        stub = self.dir / "bin"
+        stub.mkdir()
+        for name, text in (("docker", DOCKER_STUB), ("sleep", "#!/bin/sh\nexit 0\n")):
+            (stub / name).write_text(text)
+            (stub / name).chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{stub}:/usr/bin:/bin", STUB_DIR=str(self.dir))
+        # Two closed ports for Berth's published-port check.
+        self.ports = []
+        for _ in range(2):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            self.ports.append(s.getsockname()[1])
+            s.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def state(self, running="", ps_rc=0, volumes=2, vol_rc=0):
+        (self.dir / "ps.out").write_text(running)
+        (self.dir / "ps.rc").write_text(str(ps_rc))
+        (self.dir / "vol.out").write_text("".join(f"vol{i}\n" for i in range(volumes)))
+        (self.dir / "vol.rc").write_text(str(vol_rc))
+        (self.dir / "calls.log").write_text("")
+
+    def probe(self, cls, env_file=True):
+        adapter = make(cls)
+        adapter.root = str(self.dir / "w")
+        co = adapter.checkout("a", 0, "tok")
+        if cls is BerthAdapter and env_file:
+            path = Path(adapter.env_file(co))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"PGPORT={self.ports[0]}\nREDIS_PORT={self.ports[1]}\n")
+        body = adapter.stopped_probe(co, None)
+        proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=self.env, timeout=60)
+        return proc, (self.dir / "calls.log").read_text()
+
+    def test_volume_check_runs_after_successful_poll(self):
+        for cls in (BerthAdapter, BranchboxAdapter):
+            for volumes, ok in ((0, False), (1, False), (2, True)):
+                self.state(volumes=volumes)
+                proc, calls = self.probe(cls)
+                self.assertEqual(proc.returncode == 0, ok, (cls.name, volumes, proc.stderr))
+                self.assertIn("docker volume ls", calls, cls.name)
+
+    def test_docker_failures_and_running_containers_fail(self):
+        for cls in (BerthAdapter, BranchboxAdapter):
+            for kwargs in (dict(ps_rc=1), dict(vol_rc=1), dict(running="c1\n")):
+                self.state(**kwargs)
+                proc, _ = self.probe(cls)
+                self.assertNotEqual(proc.returncode, 0, (cls.name, kwargs))
+
+    def test_berth_requires_env_file_and_closed_published_ports(self):
+        import socket
+        self.state()
+        proc, _ = self.probe(BerthAdapter, env_file=False)
+        self.assertNotEqual(proc.returncode, 0)
+        import threading
+        for index in (0, 1):
+            listener = socket.socket()
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", self.ports[index]))
+            listener.listen(64)
+            listener.settimeout(0.2)
+            stop = threading.Event()
+
+            def accept():  # keep accepting so the backlog never fills (a full backlog refuses)
+                while not stop.is_set():
+                    try:
+                        conn, _ = listener.accept()
+                        conn.close()
+                    except OSError:
+                        pass
+            thread = threading.Thread(target=accept, daemon=True)
+            thread.start()
+            try:
+                self.state()
+                proc, _ = self.probe(BerthAdapter)
+                self.assertNotEqual(proc.returncode, 0, f"port {index} still accepting")
+            finally:
+                stop.set()
+                thread.join(2)
+                listener.close()
+        self.state()
+        proc, _ = self.probe(BerthAdapter)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

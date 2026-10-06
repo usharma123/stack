@@ -29,6 +29,7 @@ SHARED_REDIS_PORT = 26390
 
 class IsolaAdapter(Adapter):
     name = "isola"
+    prepare_scope = 'git repository + `git worktree add` for B/D/E (excluded from first_task)'
     title = "isola"
     image = "ev-base"
     isolation_boundary = "database"
@@ -119,6 +120,11 @@ class IsolaAdapter(Adapter):
             lines.append(f"git {GIT_ID} -C {q(self.main())} worktree add -q -b {q(co.name)} {q(co.path)}")
         lines.append(f"printf '%s\\n' {q(co.token)} > {q(co.path)}/rwbapp/SOURCE_TOKEN")
         return "\n".join(lines)
+
+    # D's intended rejection names the injected unreachable endpoint (127.0.0.1:1); a refusal
+    # of any other address (e.g. the shared server on its real port) or a version/resolve error
+    # is unrelated and must not count as isola refusing the bad accessory.
+    bad_config_pattern = r"127\.0\.0\.1:1(?![0-9])"
 
     def break_config(self, co):
         # isola declares no versions; its own invalid-configuration failure is an accessory

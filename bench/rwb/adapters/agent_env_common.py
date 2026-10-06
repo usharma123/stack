@@ -117,12 +117,15 @@ def images_left(images):
 
 
 def project_stopped(project):
-    """Body exiting 0 once no container of the project is running (state checked by Docker)."""
+    """Body that waits until no container of the project is running (state checked by Docker)
+    and then RETURNS CONTROL to the caller's appended checks (never `exit 0`). A failed Docker
+    query fails the body (set -e on the assignment); running containers past the budget fail."""
     label = q(f"label=com.docker.compose.project={project}")
     return ("set -euo pipefail\n"
+            "__rwb_stopped=0\n"
             f"for i in $(seq 1 150); do r=$(docker ps -q --filter {label} --filter status=running); "
-            f"[ -z \"$r\" ] && exit 0; sleep 0.2; done\n"
-            f"echo 'project {project} still has running containers' >&2; exit 1")
+            f"if [ -z \"$r\" ]; then __rwb_stopped=1; break; fi; sleep 0.2; done\n"
+            f"[ \"$__rwb_stopped\" = 1 ] || {{ echo 'project {project} still has running containers' >&2; exit 1; }}")
 
 
 # Instance receipt for Compose-based lanes. argv: project, expected host checkout path,
