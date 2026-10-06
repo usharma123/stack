@@ -268,5 +268,109 @@ class PinsAndConfig(unittest.TestCase):
         self.assertIn(">&2", (BENCH / "adapters/git-grove/bin/start.sh").read_text())
 
 
+STATEFUL_DOCKER = r'''#!/usr/bin/env python3
+"""Test-only docker stub over $STUB_DIR/state.json. FAIL_KIND=ps|volume|network makes that
+kind's project discovery listing fail. Every call is logged. Never real Docker."""
+import json, os, sys
+d = os.environ["STUB_DIR"]; path = os.path.join(d, "state.json")
+st = json.load(open(path)); a = sys.argv[1:]
+open(os.path.join(d, "calls.log"), "a").write("docker " + " ".join(a) + "\n")
+kind = {"ps": "containers", "volume": "volumes", "network": "networks"}.get(a[0])
+def save(): json.dump(st, open(path, "w"))
+if "--format" in a and a[0] in ("ps", "volume", "network") and "-q" not in a:
+    if os.environ.get("FAIL_KIND") == a[0]:
+        sys.exit("Cannot connect to the Docker daemon")
+    for r in st[kind]: print(r["project"])
+elif "-q" in a and kind:
+    want = a[a.index("--filter") + 1].split("=", 2)[2]
+    for r in st[kind]:
+        if r["project"] == want: print(r["id"])
+elif a[:2] == ["rm", "-f"] or a[:2] in (["network", "rm"], ["volume", "rm"]):
+    k = "containers" if a[0] == "rm" else kind
+    ids = a[2:]; st[k] = [r for r in st[k] if r["id"] not in ids]; save()
+elif a[:2] == ["image", "ls"]:
+    for i in st["images"]: print(i)
+elif a[:2] == ["image", "rm"]:
+    st["images"] = [i for i in st["images"] if i not in a[2:]]; save()
+else:
+    sys.exit("unsupported " + " ".join(a))
+'''
+
+
+class SharedCleanupBodies(unittest.TestCase):
+    """Astra P2: no discovery or verification failure may be hidden by a later success."""
+
+    OWNED = ("rwb-20261006t120000-abc123-a", "rwb_20261006t120000_abc123_b")
+    FOREIGN = ("cit-observability-c", "rwb-20261006t120000-abc123-z", "xrwb-20261006t120000-abc123-a",
+               "rwb-20261006t120000-abc124-a")
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        bindir = self.dir / "bin"
+        bindir.mkdir()
+        (bindir / "docker").write_text(STATEFUL_DOCKER)
+        (bindir / "docker").chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin", STUB_DIR=str(self.dir))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def state(self, projects=OWNED + FOREIGN):
+        st = {k: [dict(id=f"{k[0]}{i}", project=p) for i, p in enumerate(projects)]
+              for k in ("containers", "volumes", "networks")}
+        st["images"] = [f"{self.OWNED[0]}-app:latest", "postgres:17.6-alpine"]
+        (self.dir / "state.json").write_text(json.dumps(st))
+        (self.dir / "calls.log").write_text("")
+
+    def run_body(self, body, fail_kind=None):
+        env = dict(self.env, **({"FAIL_KIND": fail_kind} if fail_kind else {}))
+        proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, timeout=60)
+        calls = (self.dir / "calls.log").read_text().splitlines()
+        return proc, calls, json.loads((self.dir / "state.json").read_text())
+
+    def test_cleanup_fails_before_any_removal_when_a_discovery_query_fails(self):
+        for name in ("workz", "worktrunk", "git-grove"):
+            for kind in ("ps", "volume", "network"):
+                self.state()
+                proc, calls, _ = self.run_body(make(name).cleanup_host(), kind)
+                self.assertNotEqual(proc.returncode, 0, (name, kind))
+                self.assertFalse([c for c in calls if " rm " in f" {c} "], (name, kind, calls))
+
+    def test_cleanup_removes_exactly_the_owned_projects(self):
+        for name in ("workz", "worktrunk", "git-grove"):
+            self.state()
+            proc, _, st = self.run_body(make(name).cleanup_host())
+            self.assertEqual(proc.returncode, 0, (name, proc.stderr))
+            for k in ("containers", "volumes", "networks"):
+                self.assertEqual(sorted(r["project"] for r in st[k]), sorted(self.FOREIGN), (name, k))
+            self.assertEqual(st["images"], ["postgres:17.6-alpine"])
+
+    def test_verification_fails_on_query_failure_or_any_leftover(self):
+        project = self.OWNED[0]
+        for name in ("workz", "worktrunk", "git-grove"):
+            body = "set -euo pipefail\n" + make(name).verify_project_gone(project)
+            self.state(projects=())
+            proc, _, _ = self.run_body(body)
+            self.assertEqual(proc.returncode, 0, (name, proc.stderr))
+            for kind in ("ps", "volume", "network"):
+                # -q listings: make that kind fail by removing its key (stub exits on KeyError)
+                self.state(projects=())
+                st = json.loads((self.dir / "state.json").read_text())
+                del st[{"ps": "containers", "volume": "volumes", "network": "networks"}[kind]]
+                (self.dir / "state.json").write_text(json.dumps(st))
+                proc, _, _ = self.run_body(body)
+                self.assertNotEqual(proc.returncode, 0, (name, kind))
+            for k in ("containers", "volumes", "networks"):
+                self.state(projects=())
+                st = json.loads((self.dir / "state.json").read_text())
+                st[k] = [dict(id="left", project=project)]
+                (self.dir / "state.json").write_text(json.dumps(st))
+                proc, _, _ = self.run_body(body)
+                self.assertNotEqual(proc.returncode, 0, (name, k))
+
+
 if __name__ == "__main__":
     unittest.main()

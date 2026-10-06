@@ -353,9 +353,12 @@ class WorktreeHostAdapter(Adapter):
         return "\n".join([
             "set -euo pipefail",
             f"re={q(project_re)}",
-            "projects=$( { docker ps -a --format '{{.Label \"com.docker.compose.project\"}}';"
-            " docker volume ls --format '{{.Label \"com.docker.compose.project\"}}';"
-            " docker network ls --format '{{.Label \"com.docker.compose.project\"}}'; } | sort -u)",
+            # Each discovery query is its own guarded assignment, all before any deletion: a
+            # failed listing can never be hidden by a later successful one.
+            "pc=$(docker ps -a --format '{{.Label \"com.docker.compose.project\"}}') || exit 1",
+            "pv=$(docker volume ls --format '{{.Label \"com.docker.compose.project\"}}') || exit 1",
+            "pn=$(docker network ls --format '{{.Label \"com.docker.compose.project\"}}') || exit 1",
+            "projects=$(printf '%s\\n%s\\n%s\\n' \"$pc\" \"$pv\" \"$pn\" | sort -u)",
             'for p in $projects; do',
             '  printf "%s" "$p" | grep -Eq "$re" || continue',
             '  ids=$(docker ps -a -q --filter "label=com.docker.compose.project=$p")',
@@ -380,9 +383,13 @@ class WorktreeHostAdapter(Adapter):
             '[ -z "$vols" ] || docker volume rm $vols >/dev/null'])
 
     def verify_project_gone(self, project):
-        return (f'left="$(docker ps -a -q --filter label=com.docker.compose.project={q(project)})'
-                f'$(docker volume ls -q --filter label=com.docker.compose.project={q(project)})'
-                f'$(docker network ls -q --filter label=com.docker.compose.project={q(project)})" && '
+        # Every query guarded on its own (one assignment of three substitutions only reports
+        # the last one's status); all three successful outputs must be empty.
+        label = q(f"label=com.docker.compose.project={project}")
+        return (f'lc=$(docker ps -a -q --filter {label}) || exit 1; '
+                f'lv=$(docker volume ls -q --filter {label}) || exit 1; '
+                f'ln=$(docker network ls -q --filter {label}) || exit 1; '
+                f'left="$lc$lv$ln"; '
                 f'test -z "$left" || {{ echo "resources of {project} remain: $left" >&2; exit 1; }}')
 
     # ---- app commands: no `cd`; the tool must place the process in co's worktree -----
