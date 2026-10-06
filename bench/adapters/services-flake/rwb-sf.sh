@@ -7,10 +7,24 @@
 #   rwb-sf.sh ready    native `project is-ready --wait` (120 s outer deadline), then require
 #                      pg/rd Running+Ready in the JSON process list
 #   rwb-sf.sh status   native JSON process list
+#   rwb-sf.sh logs     bounded native status + manager/process logs (diagnostics only)
 #   rwb-sf.sh down     native `down`, then wait for the recorded server PIDs and API to go
 set -euo pipefail
 cd "$(dirname "$0")"
 alive() { services process list -o json >/dev/null 2>&1; }
+# Bounded evidence: the native status (if a manager still answers), then the tails of the
+# process output log (settings.log_location) and the manager log (cli.options.log-file).
+logs() {
+  echo "== services process list"
+  timeout 10 services process list -o json 2>&1 | head -c 8192
+  echo
+  for f in .rwb-state/sf/processes.log .rwb-state/sf/process-compose.log; do
+    [ -f "$f" ] || { echo "== $f: absent"; continue; }
+    echo "== last 80 lines of $f (at most 16 KiB)"
+    tail -n 80 "$f" | head -c 16384
+    echo
+  done
+}
 
 case "${1:-}" in
 up)
@@ -21,7 +35,15 @@ up)
   services up -D
   ;;
 ready)
-  timeout 120 services project is-ready --wait
+  # A nonzero status (124 = the 120 s deadline) only adds bounded diagnostics and is
+  # returned unchanged.
+  rc=0
+  timeout 120 services project is-ready --wait || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "native readiness exited $rc; bounded diagnostics follow" >&2
+    logs >&2 || :
+    exit "$rc"
+  fi
   services process list -o json | jq -e '
     [.[] | select(.name == "pg" or .name == "rd")
          | select(.is_running == true and .status == "Running" and .is_ready == "Ready")]
@@ -29,6 +51,9 @@ ready)
   ;;
 status)
   services process list -o json
+  ;;
+logs)
+  logs || :
   ;;
 down)
   if ! alive; then
@@ -48,7 +73,7 @@ down)
   exit 1
   ;;
 *)
-  echo "usage: rwb-sf.sh up|ready|status|down" >&2
+  echo "usage: rwb-sf.sh up|ready|status|logs|down" >&2
   exit 2
   ;;
 esac

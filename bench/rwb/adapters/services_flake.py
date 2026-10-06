@@ -46,8 +46,10 @@ class ServicesFlakeAdapter(NixFlakeAdapter):
         return self._in(co, self.develop(co, body))
 
     def tool_versions(self, co):
-        return self.enter(co, "set -e; command -v python3 uv postgres redis-server process-compose; python3 --version; "
-                              "uv --version; postgres --version; redis-server --version; process-compose version")
+        # The devshell exposes the generated `services` wrapper (which execs the bundled
+        # process-compose), not a bare process-compose.
+        return self.enter(co, "set -e; command -v python3 uv postgres redis-server services; python3 --version; "
+                              "uv --version; postgres --version; redis-server --version; services version")
 
     def start(self, co):
         return self.enter(co, "bash ./rwb-sf.sh up")
@@ -63,3 +65,13 @@ class ServicesFlakeAdapter(NixFlakeAdapter):
 
     def cleanup(self, co):
         return self._in(co, "test ! -f services/flake.lock || " + self.develop(co, "bash ./rwb-sf.sh down"))
+
+    def artifacts(self, co):
+        # Only the log files under .rwb-state/sf, not the live pg/redis data directories.
+        return (".rwb-state/sf/process-compose.log", ".rwb-state/sf/processes.log")
+
+    def diagnostics(self, co):
+        return [("sf-logs", self.enter(co, "bash ./rwb-sf.sh logs"))]
+
+    def conflict_logs(self, co):
+        return self.enter(co, "bash ./rwb-sf.sh logs")

@@ -5,6 +5,7 @@
 #   rwb-pc.sh ready    native `project is-ready --wait` under a 120 s outer deadline, then
 #                      require postgres+redis Running/Ready in the JSON process list
 #   rwb-pc.sh status   native JSON process list
+#   rwb-pc.sh logs     bounded native status + manager/process logs (diagnostics only)
 #   rwb-pc.sh down     native `down`, then wait until the recorded service PIDs and the API are gone
 #
 # `up` must run inside the toolchain shell (postgres/redis on PATH); the manager inherits it.
@@ -20,6 +21,19 @@ mkdir -p .rwb-state/logs "$(dirname "$RWB_PC_SOCKET")"
 
 pc() { process-compose --unix-socket "$RWB_PC_SOCKET" "$@"; }
 alive() { pc process list -o json >/dev/null 2>&1; }
+# Bounded evidence: the native status (if a manager still answers), then the tails of the
+# manager log (--log-file) and the process output log (process-compose.yaml log_location).
+logs() {
+  echo "== process-compose process list ($RWB_PC_SOCKET)"
+  timeout 10 process-compose --unix-socket "$RWB_PC_SOCKET" process list -o json 2>&1 | head -c 8192
+  echo
+  for f in .rwb-state/logs/processes.log .rwb-state/logs/process-compose.log; do
+    [ -f "$f" ] || { echo "== $f: absent"; continue; }
+    echo "== last 80 lines of $f (at most 16 KiB)"
+    tail -n 80 "$f" | head -c 16384
+    echo
+  done
+}
 
 case "${1:-}" in
 up)
@@ -31,8 +45,15 @@ up)
     up -f process-compose.yaml --disable-dotenv --tui=false --detached postgres redis
   ;;
 ready)
-  # is-ready --wait has no deadline of its own and retries API errors forever.
-  timeout 120 process-compose --unix-socket "$RWB_PC_SOCKET" project is-ready --wait
+  # is-ready --wait has no deadline of its own and retries API errors forever. A nonzero
+  # status (124 = the 120 s deadline) only adds bounded diagnostics and is returned unchanged.
+  rc=0
+  timeout 120 process-compose --unix-socket "$RWB_PC_SOCKET" project is-ready --wait || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "native readiness exited $rc; bounded diagnostics follow" >&2
+    logs >&2 || :
+    exit "$rc"
+  fi
   pc process list -o json | jq -e '
     [.[] | select(.name == "postgres" or .name == "redis")
          | select(.is_running == true and .status == "Running" and .is_ready == "Ready")]
@@ -40,6 +61,9 @@ ready)
   ;;
 status)
   pc process list -o json
+  ;;
+logs)
+  logs || :
   ;;
 down)
   if ! alive; then
@@ -59,7 +83,7 @@ down)
   exit 1
   ;;
 *)
-  echo "usage: rwb-pc.sh up|ready|status|down" >&2
+  echo "usage: rwb-pc.sh up|ready|status|logs|down" >&2
   exit 2
   ;;
 esac

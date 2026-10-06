@@ -58,6 +58,16 @@ class DnvrAdapter(NixFlakeAdapter):
     def cleanup(self, co):
         return self._in(co, "test ! -f dnvr/flake.lock || " + self.develop(co, "bash ./rwb-dnvr.sh down"))
 
+    def artifacts(self, co):
+        # PG preset jsonlog, runner pane logs and the PTY transcripts ($DNVR_STATE/logs).
+        return (".dnvr/logs",)
+
+    def diagnostics(self, co):
+        return [("dnvr-logs", self.enter(co, "bash ./rwb-dnvr.sh logs"))]
+
+    def conflict_logs(self, co):
+        return self.enter(co, "bash ./rwb-dnvr.sh logs")
+
     def supervisor_processes(self):
         return ("ps -eo pid=,user=,stat=,args= | awk '$2==\"agent\" && $3 !~ /^Z/' | "
                 "grep -E 'tmux|dnvr-tmux-sidebar|rwb-redis|-pg( |$)' | grep -v -E 'grep|awk' || true")

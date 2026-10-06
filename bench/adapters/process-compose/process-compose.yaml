@@ -8,6 +8,9 @@ name: rwb
 is_strict: true
 disable_env_expansion: true
 ordered_shutdown: true
+# Process output (incl. PostgreSQL/Redis startup errors) is kept only in memory unless the
+# project sets log_location; relative to the manager's CWD, the checkout root (rwb-pc.sh).
+log_location: .rwb-state/logs/processes.log
 shell:
   shell_command: bash
   shell_argument: -euc

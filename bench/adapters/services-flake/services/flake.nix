@@ -33,6 +33,9 @@
             unix-socket = local.socket;
             log-file = ".rwb-state/sf/process-compose.log";
           };
+          # Process output (incl. PostgreSQL/Redis startup errors) is kept only in memory unless
+          # the project sets log_location; relative to the caller's CWD (the checkout root).
+          settings.log_location = ".rwb-state/sf/processes.log";
           services.postgres.pg = {
             enable = true;
             package = pkgs.postgresql_17;

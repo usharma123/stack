@@ -10,6 +10,8 @@
 #
 #   up      dnvr up on a PTY; wait pg.url + redis.url (dnvr-state); detach with Ctrl-G
 #   status  dnvr ps (flock-based liveness table)
+#   logs    bounded native service logs: the postgres preset's jsonlog (.dnvr/logs/<name>.json)
+#           and the runner's per-process pane logs (.dnvr/logs/tmux-<shell>-up/); no PTY transcripts
 #   down    Ctrl-C each process pane (the dashboard's `x`), wait until `dnvr ps` shows no
 #           running process, then kill the session (the dashboard's `Q`)
 set -euo pipefail
@@ -20,6 +22,16 @@ mkdir -p "$DNVR_STATE/logs" "$DNVR_STATE/runtime"
 
 session() { tmux -S "$sock" has-session -t =dnvr 2>/dev/null; }
 running() { dnvr ps | awk 'NR > 1 && $3 == "running"' | grep -q .; }
+logs() {
+  local f
+  for f in "$DNVR_STATE"/logs/*.json "$DNVR_STATE"/logs/tmux-*/*.log; do
+    [ -f "$f" ] || continue
+    echo "== $f: error lines (first 20), then last 40 lines (each at most 8 KiB)"
+    grep -E -i 'fatal|error|panic|in use' "$f" | head -n 20 | head -c 8192
+    tail -n 40 "$f" | head -c 8192
+    echo
+  done
+}
 
 up() {
   local transcript fifo spid rc=0 ready=true
@@ -54,7 +66,12 @@ up() {
   fi
   wait "$spid" || rc=$?
   echo "dnvr up transcript: $transcript (client exit $rc)" >&2
-  "$ready" || { echo "services did not publish readiness keys" >&2; dnvr ps >&2; exit 1; }
+  if ! "$ready"; then
+    echo "services did not publish readiness keys" >&2
+    dnvr ps >&2
+    logs >&2 || :
+    exit 1
+  fi
   exit "$rc"
 }
 
@@ -82,6 +99,7 @@ down() {
 case "${1:-}" in
 up) up ;;
 status) dnvr ps ;;
+logs) logs || : ;;
 down) down ;;
-*) echo "usage: rwb-dnvr.sh up|status|down" >&2; exit 2 ;;
+*) echo "usage: rwb-dnvr.sh up|status|logs|down" >&2; exit 2 ;;
 esac

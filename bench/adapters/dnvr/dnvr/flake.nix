@@ -25,7 +25,9 @@
           imports = [ ({ pkgs, presets, dnvrState, ... }: {
             dnvr.shells.rwb = { config, ... }: {
               description = "rwb fixture: postgres 17 + redis";
-              packages = [ pkgs.python313 pkgs.uv pkgs.tmux pkgs.util-linux ];
+              # pkgs.redis: the same package as rwb-redis's runtime input, on PATH so the
+              # requested `redis-server --version` receipt can run in the devshell.
+              packages = [ pkgs.python313 pkgs.uv pkgs.redis pkgs.tmux pkgs.util-linux ];
               env = {
                 UV_PYTHON_DOWNLOADS = "never";
                 UV_PYTHON = "${pkgs.python313}/bin/python3";

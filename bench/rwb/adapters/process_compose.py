@@ -133,3 +133,13 @@ class ProcessComposeAdapter(NixFlakeAdapter):
 
     def cleanup(self, co):
         return self._in(co, "test ! -f pc.local.env || bash ./rwb-pc.sh down")
+
+    def artifacts(self, co):
+        # Manager log (--log-file) and process output (process-compose.yaml log_location).
+        return (".rwb-state/logs",)
+
+    def diagnostics(self, co):
+        return [("pc-logs", self._in(co, "bash ./rwb-pc.sh logs"))]
+
+    def conflict_logs(self, co):
+        return self._in(co, "bash ./rwb-pc.sh logs")
