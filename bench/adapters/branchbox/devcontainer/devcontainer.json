@@ -1,0 +1,10 @@
+{
+  "name": "rwb-python-postgres-redis",
+  "dockerComposeFile": "compose.yaml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "remoteUser": "root",
+  "postCreateCommand": ["uv", "sync", "--frozen"],
+  "overrideCommand": false,
+  "shutdownAction": "none"
+}

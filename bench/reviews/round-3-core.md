@@ -1,0 +1,17 @@
+# Astra core/original-eight review
+
+Verdict: REQUEST_CHANGES.
+
+Read-only snapshot: /tmp/astra-core-r3/bench. No provisioning, services, or benchmark measurements ran. Full offline suite: 190 tests PASS. Original eight: 561 generated command bodies passed bash -n. Registry contains all 26 tools. Reproduction: `python3 -B /tmp/astra-core-r3/repro.py`.
+
+1. P1, bench/rwb/scenario.py:101-104 and :434-435. Invalid hashes and undeclared filenames pass lock verification. The parser accepts any two-token line, strips a path prefix without verifying it, and the gates only compare counts/equality. Injecting `not-a-hash  <checkout>/wrong.lock` for A and C yields lock.created=pass and lock.frozen_copy=pass. Require an exact set of declared lock paths, exactly 64 hexadecimal digest characters, and reject unexpected/duplicate/malformed rows. Update the fake to emit real-shaped hashes; it currently emits `same`.
+
+2. P1, bench/rwb/adapters/base.py:238-239. The default cleanup probe masks failure of ps as an empty successful inspection. Running its actual shell body with `ps() { echo 'ps unavailable' >&2; return 127; }` returns 0 and empty stdout, which cleanup treats as clean. This affects the original Docker lanes inheriting the default probe and D's leak comparison. Capture and check ps output before filtering; distinguish successful no matches from command failure. Add a shell-level regression rather than only overriding FakeTransport's final return code.
+
+3. P2, bench/rwb/adapters/stack.py:60-62, interacting with scenario.py:425-430. Stack frozen setup runs compile/up/down but does not contain the entire start() body including its environment/cd prefix. Substring inference therefore leaves C out of started. If up partially starts services and fails, the trailing && down never executes, and scenario cleanup never invokes c-cleanup. The offline partial-start injection confirms C remains running and c-cleanup is absent. Declare frozen_setup_starts_services=True on Stack, and assert cleanup tracking before a failed C frozen command. Outer container destruction remains a backstop; it does not repair the missing checkout cleanup and diagnostic evidence.
+
+4. P2, bench/rwb/verify.py:62-64. A malformed failure receipt whose error is a scalar raises AttributeError rather than ValueError. `app_result({'command':'crud','ok':False,'error':'broken'}, 'crud', 1)` reproduces it. Scenario.app catches only ValueError, so one tool receipt aborts remaining checks as a harness error. Validate error is a dictionary, and convert malformed error values to ValueError. Exercise the scenario-level negative case as well.
+
+Reviewed corrections present: command exit/timeouts gate app success; CRUD schemas reject empty results; intended diagnostics gate bad-config and occupied-port rejection; wrong-source occupied identities are discarded; missing A/C hash output no longer passes; cleanup timeout is rejected at core level; listener ownership registered before launch and setup failure prevents launch; preparation gates dependent work; missing instance receipt fails isolation; artifact copy/diagnostic errors cannot skip teardown stages; first-task starts-from-prepared disclosure is present. Existing tests cover these paths, but findings 1/2/4 remain incomplete fail-closed protections.
+
+No runtime approval is implied by offline tests or shell syntax checks. No reportable timings were generated.

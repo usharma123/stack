@@ -1,0 +1,21 @@
+[project]
+name = "rwbapp"
+version = "1.0.0"
+description = "Real-world benchmark fixture: migrations, CRUD and a Redis read-through cache"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "psycopg[binary]==3.3.6",
+    "redis==8.1.0",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.uv]
+# The environment tool under test must provide Python 3.13; uv must not download one.
+python-downloads = "never"
+python-preference = "only-system"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

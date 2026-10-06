@@ -1,0 +1,45 @@
+# Berth runs `docker compose -f <repo>/compose.yaml` from the ROOT repository, not from the
+# worktree it creates. The build context and bind mount below therefore name the created
+# sibling worktree explicitly through ${BERTH_NAME} (application wiring, not Berth rebasing).
+services:
+  app:
+    build:
+      context: ../app-${BERTH_NAME:?Berth name required}
+    volumes:
+      - type: bind
+        source: ../app-${BERTH_NAME:?Berth name required}
+        target: /workspace
+    environment:
+      DATABASE_URL: postgresql://bench:bench@postgres:5432/bench
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  postgres:
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports: ["127.0.0.1:${PGPORT:?}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "PGPASSWORD=$$POSTGRES_PASSWORD psql -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB -Atc 'select 1' | grep -qx 1"]
+      interval: 1s
+      timeout: 4s
+      retries: 60
+  redis:
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    command: [redis-server, --appendonly, "yes", --appendfsync, always]
+    ports: ["127.0.0.1:${REDIS_PORT:?}:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: [CMD-SHELL, "redis-cli ping | grep -qx PONG"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+volumes:
+  pgdata: {}
+  redisdata: {}

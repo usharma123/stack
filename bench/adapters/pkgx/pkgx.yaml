@@ -1,0 +1,11 @@
+# pkgx/dev project environment (bench/research/pkgx.md). Exact top-level pins; pkgx has no
+# lockfile, so transitive Pantry dependencies are not pinned by this file (the Pantry
+# checkout itself is frozen by PKGX_PANTRY_DIR at provisioning).
+# Deviations from the Nix lanes, from the linux/aarch64 bottle inventory on 2026-10-06:
+#   postgresql.org 17.2.0 (17.11 not published; only 17.0.0 and 17.2.0 exist in 17.x)
+#   redis.io 8.10.0 (8.10.2 not published for linux/aarch64)
+dependencies:
+  python.org: '=3.13.15'
+  postgresql.org: '=17.2.0'
+  redis.io: '=8.10.0'
+  astral.sh/uv: '=0.12.22'

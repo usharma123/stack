@@ -1,0 +1,5 @@
+# uv 0.12.23 (same release as the other container adapters' uv image), hash-locked wheels
+# for Linux arm64 and amd64 (glibc). pip installs only an artifact matching a listed hash.
+uv==0.12.23 \
+    --hash=sha256:9346c741175c7fc0d380f30fcfcb8d5e13f5f900b30536230c8d34208524e47a \
+    --hash=sha256:565c6e2874dbeae86c02f3dea97255e878fec672659a73d4930c6b93fcab2fff

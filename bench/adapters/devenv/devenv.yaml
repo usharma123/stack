@@ -1,0 +1,10 @@
+# Modules pinned to the same released source as the 2.4.0 CLI (bench/research/devenv.md).
+# nixpkgs deliberately differs from the research recipe (addf7cf5, the v2.4.0 repository's own
+# lock: Python 3.13.9, uv 0.9.15, PostgreSQL 17.7, Redis 8.2.2): it is the revision shared by
+# every Nix-based lane (Python 3.13.15, uv 0.12.22, PostgreSQL 17.11, Redis 8.10.2) so the
+# version cohort matches. Recorded as a deviation in the adapter pins.
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/151fa4e8ddfdd8dd25d945ad94ed54a13de9f6e4
+  devenv:
+    url: github:cachix/devenv/b904dcb51fe48c30db250038241507f60752f222?dir=src/modules

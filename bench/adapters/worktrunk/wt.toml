@@ -1,0 +1,20 @@
+# Committed as .config/wt.toml (Worktrunk 0.80.0 project config). Every hook and alias is
+# invoked explicitly by the benchmark through `wt` (`wt hook pre-start`, `wt -C <worktree> -y
+# <alias>`); the commands inside them are benchmark glue around uv and Docker Compose.
+#
+# Ports come from Worktrunk's native `hash_port` template filter (deterministic per branch,
+# range 10000-19999, no reservation or collision check). Compose project = branch name.
+
+[pre-start]
+deps = "uv sync --frozen --no-python-downloads"
+
+[pre-remove]
+# Blocking: destroys this worktree's services AND their volumes before the directory goes.
+services = "RWB_PG_PORT={{ branch | hash_port }} RWB_REDIS_PORT={{ ('redis-' ~ branch) | hash_port }} docker compose -p {{ branch | sanitize }} -f compose.yaml down --volumes --remove-orphans --timeout 30"
+
+[aliases]
+up = "RWB_PG_PORT={{ branch | hash_port }} RWB_REDIS_PORT={{ ('redis-' ~ branch) | hash_port }} docker compose -p {{ branch | sanitize }} -f compose.yaml up -d --wait --wait-timeout 120"
+stop-services = "RWB_PG_PORT={{ branch | hash_port }} RWB_REDIS_PORT={{ ('redis-' ~ branch) | hash_port }} docker compose -p {{ branch | sanitize }} -f compose.yaml stop --timeout 30"
+services-status = "RWB_PG_PORT={{ branch | hash_port }} RWB_REDIS_PORT={{ ('redis-' ~ branch) | hash_port }} docker compose -p {{ branch | sanitize }} -f compose.yaml ps --all --format json"
+ports = "echo {{ branch | hash_port }} {{ ('redis-' ~ branch) | hash_port }} {{ branch | sanitize }}"
+cmd = "env DATABASE_URL=postgresql://bench:bench@127.0.0.1:{{ branch | hash_port }}/bench REDIS_URL=redis://127.0.0.1:{{ ('redis-' ~ branch) | hash_port }}/0 {{ args }}"

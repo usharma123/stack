@@ -1,0 +1,50 @@
+# Docker Compose recipe (bench/research/compose.md). No published host ports, container_name
+# or fixed resource names: every container, network and volume is scoped by the project name
+# the benchmark passes per checkout (-p rwb-<run id>-<checkout>). The app container holds this
+# checkout's code (built from the checkout) and reaches services by DNS inside the project
+# network. `up --wait` returns once every healthcheck passes, including the app's own identity.
+services:
+  app:
+    build:
+      context: .
+    command: [sleep, infinity]
+    init: true
+    environment:
+      DATABASE_URL: postgresql://postgres@postgres:5432/postgres
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, -m, rwbapp, identity]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 1s
+  postgres:
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The image's init server listens on the socket only, so TCP readiness means the real server.
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  redis:
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    command: [redis-server, --appendonly, "yes", --appendfsync, always]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+volumes:
+  pgdata: {}
+  redisdata: {}

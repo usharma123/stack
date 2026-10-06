@@ -1,0 +1,11 @@
+# Committed as .workz.toml in the benchmark fixture repository (workz 0.11.0 schema).
+# Dependency sharing is disabled: each worktree gets its own uv venv from the committed
+# uv.lock (the benchmark's frozen-install contract), instead of workz's default .venv symlink.
+[sync]
+symlink = []
+copy = []
+
+[isolation]
+# Stable 0.11.0 allocates from 3000 regardless of base_port; the range size is honoured.
+# PORT -> PostgreSQL host port, PORT+1 -> Redis (workz's own managed REDIS_URL convention).
+port_range_size = 10

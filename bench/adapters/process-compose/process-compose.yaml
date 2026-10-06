@@ -1,0 +1,56 @@
+# Process Compose 1.122.0 project for PostgreSQL 17 + Redis (bench/research/process-compose.md).
+# Supervision, dependency gates, readiness probes, ordered shutdown and JSON status are
+# Process Compose features. The init/probe command bodies and the endpoint variables
+# (PGDATA, PGPORT, REDIS_DATA, REDIS_PORT, RWB_INSTANCE from rwb-env.sh) are project-owned.
+# Env expansion is disabled so the shell, not the loader, expands the variables.
+version: "0.5"
+name: rwb
+is_strict: true
+disable_env_expansion: true
+ordered_shutdown: true
+# Process output (incl. PostgreSQL/Redis startup errors) is kept only in memory unless the
+# project sets log_location; relative to the manager's CWD, the checkout root (rwb-pc.sh).
+log_location: .rwb-state/logs/processes.log
+shell:
+  shell_command: bash
+  shell_argument: -euc
+processes:
+  init-postgres:
+    command: |
+      umask 077
+      mkdir -p "$(dirname "$PGDATA")"
+      if [ ! -s "$PGDATA/PG_VERSION" ]; then
+        initdb -D "$PGDATA" -U postgres --auth=trust --encoding=UTF8 --locale=C
+      fi
+    availability: { restart: exit_on_failure }
+  init-redis:
+    command: 'umask 077; mkdir -p "$REDIS_DATA"'
+    availability: { restart: exit_on_failure }
+  postgres:
+    command: >-
+      exec postgres -D "$PGDATA" -p "$PGPORT" -c listen_addresses=127.0.0.1
+      -c unix_socket_directories= -c cluster_name="$RWB_INSTANCE"
+    depends_on:
+      init-postgres: { condition: process_completed_successfully }
+    readiness_probe:
+      exec:
+        command: 'psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -Atc "SELECT 1"'
+      period_seconds: 1
+      timeout_seconds: 2
+      failure_threshold: 120
+    availability: { restart: exit_on_failure, exit_on_skipped: true }
+    shutdown: { signal: 2, parent_only: true, timeout_seconds: 30 }
+  redis:
+    command: >-
+      exec redis-server --bind 127.0.0.1 --port "$REDIS_PORT" --dir "$REDIS_DATA"
+      --daemonize no --appendonly yes --appendfsync always
+    depends_on:
+      init-redis: { condition: process_completed_successfully }
+    readiness_probe:
+      exec:
+        command: 'test "$(redis-cli -h 127.0.0.1 -p "$REDIS_PORT" ping)" = PONG'
+      period_seconds: 1
+      timeout_seconds: 2
+      failure_threshold: 120
+    availability: { restart: exit_on_failure, exit_on_skipped: true }
+    shutdown: { signal: 15, timeout_seconds: 30 }

@@ -1,0 +1,50 @@
+# Committed Landofile. Each checkout gets its own app name in machine-local .lando.local.yml
+# (Lando strips -, _ and . when normalizing names, so names differ in alphanumerics).
+# Images are the official plugins' defaults pinned to digests; OS variants are Debian because
+# Lando's v3 service scripts expect bash (see CONTAINER-ADAPTERS.md for version labels).
+name: rwblando
+services:
+  appserver:
+    type: python:3.13.16
+    command: tail -f /dev/null
+    build:
+      # Lando build steps run once, on first start (or rebuild), as the mapped app user.
+      - python -m pip install --user --no-cache-dir --require-hashes -r .lando/uv-requirements.txt
+      - uv sync --frozen
+    overrides:
+      image: python:3.13.16-bookworm@sha256:d79ba8693551488516799bfce4566d8cbcccb87c9d9dfaef5e3915f1451e1326
+      environment:
+        DATABASE_URL: postgresql://postgres@database:5432/rwb
+        REDIS_URL: redis://cache:6379/0
+        UV_PYTHON_DOWNLOADS: never
+        UV_PYTHON_PREFERENCE: only-system
+        UV_LINK_MODE: copy
+        PYTHONDONTWRITEBYTECODE: "1"
+  database:
+    type: postgres:17
+    portforward: false
+    creds:
+      database: rwb
+    overrides:
+      image: bitnamilegacy/postgresql:17.6.0-debian-12-r4@sha256:926356130b77d5742d8ce605b258d35db9b62f2f8fd1601f9dbaef0c8a710a8d
+  cache:
+    type: redis:8
+    persist: true
+    portforward: false
+    healthcheck:
+      command: redis-cli ping
+      retry: 25
+      delay: 1000
+    overrides:
+      image: redis:8.10.2-trixie@sha256:c94085d298b738be22c9ccdc0ac3761fa6649df7dd82ad1d42367f3cb9714935
+      volumes:
+        # The Redis builder enables AOF but leaves /data on an anonymous volume; mount the
+        # app's declared named volume (long syntax: short syntax is resolved as a host path).
+        - type: volume
+          source: data_cache
+          target: /data
+tooling:
+  uv:
+    service: appserver
+    cmd: uv
+    dir: /app

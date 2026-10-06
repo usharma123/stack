@@ -1,0 +1,45 @@
+# Flox 1.17.0 recipe (bench/research/flox.md). Services are native ([services]); per-checkout
+# ports come from the uncommitted bench.local.env (Flox does not allocate TCP ports).
+schema-version = "1.16.0"
+minimum-cli-version = "1.17.0"
+
+[install]
+python.pkg-path = "python313"
+uv.pkg-path = "uv"
+postgresql.pkg-path = "postgresql_17"
+redis.pkg-path = "redis"
+
+[vars]
+UV_PYTHON_DOWNLOADS = "never"
+UV_PYTHON_PREFERENCE = "only-system"
+PGUSER = "postgres"
+PGDATABASE = "postgres"
+
+[hook]
+on-activate = '''
+  test -r "$FLOX_ENV_PROJECT/bench.local.env" || return 1
+  source "$FLOX_ENV_PROJECT/bench.local.env" || return 1
+  export PGPORT REDIS_PORT RWB_INSTANCE
+  export PGDATA="$FLOX_ENV_CACHE/pgdata"
+  export PGHOST=127.0.0.1
+  export REDIS_DATA="$FLOX_ENV_CACHE/redis"
+  export DATABASE_URL="postgresql://postgres@127.0.0.1:$PGPORT/postgres"
+  export REDIS_URL="redis://127.0.0.1:$REDIS_PORT/0"
+  mkdir -p "$FLOX_ENV_CACHE" "$REDIS_DATA" || return 1
+  if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    initdb -D "$PGDATA" -U postgres --auth=trust --encoding=UTF8 --locale=C > "$FLOX_ENV_CACHE/initdb.log" 2>&1 || return 1
+  fi
+  test -s "$PGDATA/PG_VERSION" || return 1
+'''
+
+[services.postgres]
+command = 'exec postgres -D "$PGDATA" -p "$PGPORT" -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c cluster_name="$RWB_INSTANCE"'
+shutdown.command = 'pg_ctl -D "$PGDATA" -m fast -w stop'
+shutdown.timeout-seconds = 30
+
+[services.redis]
+command = 'exec redis-server --bind 127.0.0.1 --port "$REDIS_PORT" --dir "$REDIS_DATA" --appendonly yes --appendfsync always --save "" --daemonize no'
+shutdown.timeout-seconds = 30
+
+[options]
+systems = ["aarch64-linux"]

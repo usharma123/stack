@@ -1,0 +1,9 @@
+version: 1
+compose: compose.yaml
+ports:
+  postgres:
+    env: PGPORT
+  redis:
+    env: REDIS_PORT
+snapshot:
+  volumes: [pgdata, redisdata]

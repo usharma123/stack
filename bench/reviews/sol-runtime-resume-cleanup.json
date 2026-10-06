@@ -1,0 +1,266 @@
+{
+  "run_id": "20261006t152552-67fb2a",
+  "started_utc": "2026-10-06T15:43:02.753222+00:00",
+  "finished_utc": "2026-10-06T15:43:03.279678+00:00",
+  "workdir": "/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/rwb-20261006t152552-67fb2a-4qahtfnx",
+  "image": "rwb-20261006t152552-67fb2a-a-app:latest",
+  "archive": {
+    "path": "/Users/utsavsharma/.t3/projects/stack/bench/results/runtime-resume-cleanup/interrupted-20261006t152552-67fb2a.tar.gz",
+    "sha256": "365fdd8b3a4abde3bb2b53802fd93db80a8e8d0f420b6953550ffefc16581864",
+    "bytes": 31517
+  },
+  "workdir_absent": true,
+  "original_result_unchanged": true,
+  "original_result_hashes": {
+    "logs/0001-preflight.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logs/0001-preflight.stdout": "7aadbdd66f01d3fe2b402b8eb9612a6c247c5a6e111f02073561031bfb9c70f6",
+    "logs/0002-install-devcontainers-cli.stderr": "1793da9a6fd2e752b2cb686796d2e46ef8f3d3caa98256a9da1ba77341e38001",
+    "logs/0002-install-devcontainers-cli.stdout": "da13ab9d025b19c91553bc7d4c450975d3e4e36dd7c5fef6f223f8008ba39547",
+    "logs/0003-tool-version.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logs/0003-tool-version.stdout": "3c2b0b81bd99ee7712ff1cfc02f2b5c7495de35f6a478bbac917824d2b7e06f4",
+    "logs/0004-a-prepare.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logs/0004-a-prepare.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logs/0005-a-setup.stderr": "707d8aee4e24977df4f2e230db1a1155c3fbb808a8819f840997d7c3e260deec",
+    "logs/0005-a-setup.stdout": "3ce1bddc4e8ce98f80e2b9b02579b7bda6a1f0f84c8882885bbcd0605c332165",
+    "logs/0006-a-lock-hash.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logs/0006-a-lock-hash.stdout": "fd78a2354fa07b5d502ee2fb7494cbe7546a2ed4746c1239684b5c9b79b8dd80",
+    "meta.json": "69422a8c3e9eb85b80d93fb2c25bae5b0d03e38c45a6f2025a30ed5f8dbc01d4",
+    "steps.jsonl": "1cd17c61edb208806b49980ff7659d4bbb2513f43b64b2b6a1e9cffd2a7bd4f3"
+  },
+  "no_signals_sent": true,
+  "expected_image_id": "sha256:893157558933308cdbb22d077465124ed455040f19d054077425f67281d3b010",
+  "image_project": "rwb-20261006t152552-67fb2a-a",
+  "checks": [
+    "No active benchmark process found before cleanup",
+    "Current tag resolved to exact expected image ID and Compose project label",
+    "No container referenced exact image ID or run token",
+    "No run-owned network or volume",
+    "Exact tempdir had current-user ownership, no symlink, and exact project token in w/a/.env",
+    "Archive preserved before deletion",
+    "docker image rm used exact tag without force",
+    "Exact image ID inspect failed after removal",
+    "Only exact owned tempdir removed",
+    "Original incomplete result file hashes unchanged"
+  ],
+  "commands": [
+    {
+      "argv": [
+        "docker",
+        "image",
+        "rm",
+        "rwb-20261006t152552-67fb2a-a-app:latest"
+      ],
+      "exit": 0,
+      "stdout": "Untagged: rwb-20261006t152552-67fb2a-a-app:latest\nDeleted: sha256:893157558933308cdbb22d077465124ed455040f19d054077425f67281d3b010\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "docker",
+        "image",
+        "inspect",
+        "sha256:893157558933308cdbb22d077465124ed455040f19d054077425f67281d3b010"
+      ],
+      "exit": 1,
+      "stdout": "[]\n",
+      "stderr": "Error response from daemon: No such image: sha256:893157558933308cdbb22d077465124ed455040f19d054077425f67281d3b010\n"
+    }
+  ],
+  "preexisting_containers": [
+    {
+      "id": "80af50cba0465e5393e8dd4ace8e0e892c4f1e0657bd823526b060d3d293d862",
+      "name": "/ev-fbundle",
+      "image": "sha256:61613637e02c263efc9a16e13f76c823a8d9210a3e920449bbe85207d95c5e66",
+      "status": "exited",
+      "started_at": "2026-10-02T15:23:36.685059627Z"
+    },
+    {
+      "id": "e8445f06a9e02b873e8c16c1e8556efa047647c4a26de78eb5f769a2c9de597b",
+      "name": "/ev-bundle",
+      "image": "sha256:bd95396340b127241897b2986f905907c1ff6d480e84fc701d2177a36ca587fc",
+      "status": "exited",
+      "started_at": "2026-10-02T15:19:40.003824421Z"
+    },
+    {
+      "id": "346a617e77f8e03779c0e8ffff12ff063208fb2361b621c0d83295a14a068b08",
+      "name": "/ev-mised",
+      "image": "sha256:bd95396340b127241897b2986f905907c1ff6d480e84fc701d2177a36ca587fc",
+      "status": "exited",
+      "started_at": "2026-10-02T15:10:35.36390271Z"
+    },
+    {
+      "id": "1548935c19cae5cc976a56613ad9c59fbc5f0799278ed531880ad68acfcb87ae",
+      "name": "/ev-mise",
+      "image": "sha256:bd95396340b127241897b2986f905907c1ff6d480e84fc701d2177a36ca587fc",
+      "status": "running",
+      "started_at": "2026-10-02T15:09:54.492572469Z"
+    },
+    {
+      "id": "083f410ab309328e39be2d6be35f3c93a7ece46d65c8890f45893037d0c6ad7c",
+      "name": "/ev-devenv",
+      "image": "sha256:98ecc336b9695bf5dc2bb64db08c607933ea8ad3cd110168afa236893e4135c1",
+      "status": "exited",
+      "started_at": "2026-10-02T14:50:35.53313446Z"
+    },
+    {
+      "id": "e0e1a85da6108833f4d9df0f1e48fd830256ba85e6ac50a438684d1d0da3862b",
+      "name": "/ev-devbox",
+      "image": "sha256:d03da616d6cc65beac75b6e3f0a5dbfcf8a40203e26b9d531b78251c49324cca",
+      "status": "exited",
+      "started_at": "2026-10-02T14:47:22.303337343Z"
+    },
+    {
+      "id": "34a9107a9a39b1fe6afcc654a4478cb00c54395c856d704d0dfbde2e211b303d",
+      "name": "/ev-flox",
+      "image": "sha256:61613637e02c263efc9a16e13f76c823a8d9210a3e920449bbe85207d95c5e66",
+      "status": "exited",
+      "started_at": "2026-10-02T14:43:20.349999509Z"
+    },
+    {
+      "id": "cc687e14b400096d70e8b3d80f594eb52a9fb176fac04d9509cf82a9e9ecf189",
+      "name": "/cit-observability-c-grafana-c-1",
+      "image": "sha256:e932bd6ed0e026595b08483cd0141e5103e1ab7ff8604839ff899b8dc54cabcb",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.376658167Z"
+    },
+    {
+      "id": "c559fc8546c5cadf8afd1540e7655d2b27ab16a5560e60c3c9cda25fce4c3353",
+      "name": "/cit-observability-c-postgres-c-1",
+      "image": "sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.243049208Z"
+    },
+    {
+      "id": "2ee092391b8ca7a11344214fadef3a38312e2317c2554014dbb0a2ff678df374",
+      "name": "/cit-observability-c-tempo-c-1",
+      "image": "sha256:65a5789759435f1ef696f1953258b9bbdb18eb571d5ce711ff812d2e128288a4",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.329643292Z"
+    },
+    {
+      "id": "8fc0257931cef5172807a2211b7fbbe6e364f760a2cab49ec199bf4d7669112f",
+      "name": "/cit-observability-c-loki-c-1",
+      "image": "sha256:4c431d2e6b9b38718694b31c5d56be7c80dc69c513215fde1aeb5b02cd4e2665",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.324753958Z"
+    },
+    {
+      "id": "2cd127fa70a60174c6ea6db6ad8020b6253164c40ea57c4faba7b67b246f4189",
+      "name": "/cit-observability-c-prometheus-c-1",
+      "image": "sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.322674958Z"
+    },
+    {
+      "id": "e73eecb0e49cb842544c6a9f935830537621fec9cf29ecea38a3b149f5caad2e",
+      "name": "/cit-observability-grafana-1",
+      "image": "sha256:e932bd6ed0e026595b08483cd0141e5103e1ab7ff8604839ff899b8dc54cabcb",
+      "status": "exited",
+      "started_at": "2026-09-15T16:10:12.29086163Z"
+    },
+    {
+      "id": "b548901b2bb1c1a21eb54d2b3e8f00bf4c527d8c0b426530e440e75a1b821156",
+      "name": "/cit-observability-collector-1",
+      "image": "sha256:e7c92c715f28ff142f3bcaccd4fc5603cf4c71276ef09954a38eb4038500a5a5",
+      "status": "exited",
+      "started_at": "2026-09-15T13:28:12.582652548Z"
+    },
+    {
+      "id": "3e3ddd961d8a5c46ff499a4ddeff62e99a232048e7e7f578e704094c8b5f3477",
+      "name": "/cit-observability-postgres-1",
+      "image": "sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94",
+      "status": "exited",
+      "started_at": "2026-09-15T13:24:58.883551541Z"
+    },
+    {
+      "id": "1cb5692538b94f3dda8d986b12c98f88e78ec898463fc09bed8fcc7cd5fba840",
+      "name": "/cit-observability-loki-1",
+      "image": "sha256:4c431d2e6b9b38718694b31c5d56be7c80dc69c513215fde1aeb5b02cd4e2665",
+      "status": "exited",
+      "started_at": "2026-09-15T13:24:58.87077725Z"
+    },
+    {
+      "id": "6dcf9a7c46ff43913df65c92468939215ea5bb5215953fbaa40f9c6706a42323",
+      "name": "/cit-observability-prometheus-1",
+      "image": "sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996",
+      "status": "exited",
+      "started_at": "2026-09-15T13:24:58.884155416Z"
+    },
+    {
+      "id": "f848d6234902c242e0a6c127783dfa33bd1d9909cb3915c7529d9bc639707e70",
+      "name": "/cit-observability-collector-storage-1",
+      "image": "sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0",
+      "status": "exited",
+      "started_at": "2026-09-15T17:38:06.675079836Z"
+    },
+    {
+      "id": "f8c7904d2cc842d73789549a6cbe41771deb68c3c478964d5bb029a43397bc17",
+      "name": "/cit-observability-tempo-1",
+      "image": "sha256:65a5789759435f1ef696f1953258b9bbdb18eb571d5ce711ff812d2e128288a4",
+      "status": "exited",
+      "started_at": "2026-09-15T17:57:29.638597722Z"
+    },
+    {
+      "id": "a4271bd32c8a408d3d466cea98f209e453f5f74e28752bab4b95fd88cb1edbd7",
+      "name": "/workbench-helix",
+      "image": "sha256:6ec11b5ef1499f3afed9a6b1d69b86df6209858f4d255743d39f8d6138f80f7d",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.237864292Z"
+    },
+    {
+      "id": "643cdf1822d03155ed63009375d1aecba3e1ca114e1f2a1e0f22b2971f70ec45",
+      "name": "/workbench-postgres",
+      "image": "sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.325039958Z"
+    },
+    {
+      "id": "e9ec12838726fdaa7089ba12747827701af0e22f566f01c752f221b79b93b6da",
+      "name": "/workbench-helix-minio",
+      "image": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "status": "running",
+      "started_at": "2026-10-02T14:33:02.241618167Z"
+    },
+    {
+      "id": "6d490e9646d7dd6800bf3c781be129a1763a396378bcfc8646ee38bf29a84698",
+      "name": "/workbench-helix-minio-init",
+      "image": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+      "status": "exited",
+      "started_at": "2026-09-29T18:33:42.47589809Z"
+    },
+    {
+      "id": "8ee852f64eb30eed87c563c47d89f7919e2bcfbe110567ed49db28a652e1dadd",
+      "name": "/t3code-qa-helix",
+      "image": "sha256:6ec11b5ef1499f3afed9a6b1d69b86df6209858f4d255743d39f8d6138f80f7d",
+      "status": "exited",
+      "started_at": "2026-09-15T12:48:59.454276958Z"
+    },
+    {
+      "id": "ba42824cb932fee2233609269320705de365593e35a5730cce4f818f106122ac",
+      "name": "/t3code-qa-helix-minio-init",
+      "image": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+      "status": "exited",
+      "started_at": "2026-07-14T13:32:58.935416794Z"
+    },
+    {
+      "id": "735d5fbd9ae6f37d923bde2059cfbc82b56e11e50af1b41a26dbeccfaeb12b37",
+      "name": "/t3code-qa-postgres",
+      "image": "sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229",
+      "status": "exited",
+      "started_at": "2026-09-15T12:48:59.4582795Z"
+    },
+    {
+      "id": "b1a32c56554ad2c8e927b62b6f433e6127680b5d52dbfcf4ef99491524081ccf",
+      "name": "/t3code-qa-helix-minio",
+      "image": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "status": "exited",
+      "started_at": "2026-09-15T12:48:59.456029375Z"
+    }
+  ],
+  "raw_receipt": {
+    "path": "bench/results/runtime-resume-cleanup/interrupted-20261006t152552-67fb2a-cleanup-raw.json",
+    "sha256": "1a222e9d768fea4e52664a975ada354223e22670df8753e055f08b344a2d5146",
+    "bytes": 588859
+  },
+  "preserved_workdir_file_count": 32
+}

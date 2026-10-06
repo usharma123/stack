@@ -1,0 +1,10 @@
+# Benchmark-supplied runtime for the isola lane (isola resolves no tools itself).
+# Canonical fixture versions; installed by the pinned mise into the run's own container.
+[tools]
+python = "3.13.16"
+uv = "0.12.23"
+postgres = "17.11"
+redis = "8.10.2"
+
+[settings]
+python.compile = false

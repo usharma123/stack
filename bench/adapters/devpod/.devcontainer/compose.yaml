@@ -1,0 +1,48 @@
+# No published ports, container_name or global volume names: every resource is scoped by
+# the Compose project name, which the benchmark sets per checkout (COMPOSE_PROJECT_NAME exported
+# to the workspace ID on every devpod call). Service DNS resolves inside the project network only.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: [sleep, infinity]
+    init: true
+    volumes:
+      - type: bind
+        source: ..
+        target: /workspace
+    environment:
+      DATABASE_URL: postgresql://bench:bench@postgres:5432/bench
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  postgres:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, bench, -d, bench]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+  redis:
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    command: [redis-server, --appendonly, "yes", --appendfsync, always]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+volumes:
+  pgdata:
+  redisdata:

@@ -1,0 +1,12 @@
+{
+  "source_revision": "06c351acc6a0744d918dc571c063ff1f6c300700",
+  "binary_path": "/tmp/stack-bench-build/target/release/stack",
+  "binary_sha256": "1d338d2cd92c4ee898037c9ee39dfbccb7c1e3dabae8180fbf65662ac015ce20",
+  "cargo_lock_sha256": "2739df41aa0e397eed1aadf0a2462df049f5bce543a215a3bf5fa52e23c95e30",
+  "product_diff_from_source": "",
+  "file_identity": "/tmp/stack-bench-build/target/release/stack: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=b9bc4e91f45cb49a758928d2c3d62ae13ed511f8, for GNU/Linux 3.7.0, stripped\n",
+  "builder_image_current": "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e",
+  "receipt": "original-stack-build-thread-receipts.json",
+  "handoff_sha256": "c2d8ce7994583a82bfbd3f102079e016e86170c18c239ded65c2987472df6f14",
+  "rebuild_performed": false
+}

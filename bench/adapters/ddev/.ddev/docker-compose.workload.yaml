@@ -1,0 +1,42 @@
+# Python runs as a DDEV custom Compose service (DDEV has no Python project type).
+# Every service is also attached to DDEV's shared ddev_default network, so application URLs
+# use the project-unique container names rather than generic aliases such as `db`.
+services:
+  db:
+    build:
+      args:
+        BASE_IMAGE: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+  app:
+    container_name: ddev-${DDEV_SITENAME}-app
+    image: ddev-${DDEV_SITENAME}-app-built
+    build:
+      context: app
+    working_dir: /workspace
+    user: "${DDEV_UID}:${DDEV_GID}"
+    environment:
+      DATABASE_URL: postgresql://db:db@ddev-${DDEV_SITENAME}-db:5432/db
+      REDIS_URL: redis://ddev-${DDEV_SITENAME}-redis:6379/0
+      HOME: /tmp
+      UV_CACHE_DIR: /tmp/uv-cache
+    volumes:
+      - ../:/workspace
+    restart: "no"
+    healthcheck:
+      test: [CMD, python, -c, "import socket; socket.create_connection(('ddev-${DDEV_SITENAME}-db',5432),2).close(); socket.create_connection(('ddev-${DDEV_SITENAME}-redis',6379),2).close()"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+  redis:
+    container_name: ddev-${DDEV_SITENAME}-redis
+    image: redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    command: [redis-server, --appendonly, "yes", --appendfsync, always]
+    volumes:
+      - redisdata:/data
+    restart: "no"
+    healthcheck:
+      test: [CMD-SHELL, "redis-cli ping | grep -qx PONG"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+volumes:
+  redisdata: {}

@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "project": "rwb",
+  "providers": {
+    "app": {"type": "custom-shell", "script": "bin/start.sh", "stopScript": "bin/stop.sh"}
+  },
+  "naming": {
+    "composeProject": "${branch_safe}",
+    "ports": {"DB_PORT": "auto", "REDIS_PORT": "auto"}
+  },
+  "envContract": {
+    "strict": false,
+    "sourceEnvFiles": [".env.example"],
+    "passthrough": ["RWB_PYTHON_IMAGE", "RWB_UV_IMAGE", "RWB_POSTGRES_IMAGE", "RWB_REDIS_IMAGE"],
+    "required": ["RWB_PYTHON_IMAGE", "RWB_UV_IMAGE", "RWB_POSTGRES_IMAGE", "RWB_REDIS_IMAGE"]
+  }
+}

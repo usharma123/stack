@@ -1,0 +1,16 @@
+# Stack recipe for the real-world benchmark fixture. Ports are assigned per checkout by
+# `stack compile`; services are verified by `stack up` and before every `stack exec`.
+[tools]
+python = "3.13.16"
+uv = "0.12.23"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+
+[services.postgres]
+preset = "postgres"
+version = "17.11"
+
+[services.redis]
+preset = "redis"
+version = "8.10.2"
