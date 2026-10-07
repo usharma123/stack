@@ -1968,3 +1968,12 @@ fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
     let out = fixture.command(&["logs", "web", "--tail", "0"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn unknown_required_services_name_the_ones_that_exist() {
+    let fixture = Fixture::with_bundle(WEB);
+    let out = fixture.command(&["--json", "exec", "--require", "kafka", "--", "true"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "unknown_service");
+    assert_eq!(error["hint"], "services: web");
+}

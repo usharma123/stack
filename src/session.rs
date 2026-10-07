@@ -825,14 +825,22 @@ pub struct LogsReport {
 pub fn logs(ctx: &Ctx, service: &str, tail: usize) -> Result<LogsReport> {
     let report = ctx.compile(false)?;
     if !report.stack.services.contains_key(service) {
-        let known: Vec<&String> = report.stack.services.keys().collect();
-        return Err(StackError::new("unknown_service", format!("no service named '{service}'"))
-            .hint(if known.is_empty() { "this project defines no services".to_string() } else { format!("services: {}", known.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")) }));
+        return Err(unknown_service(&report, service));
     }
     let out = mise::logs(&ctx.root, service, tail)?;
     let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
     let skip = lines.len().saturating_sub(tail);
     Ok(LogsReport { service: service.to_string(), lines: lines[skip..].to_vec(), truncated: out.stdout_truncated })
+}
+
+/// `unknown_service`, naming the services the project does define.
+fn unknown_service(report: &Report, name: &str) -> StackError {
+    let known: Vec<&str> = report.stack.services.keys().map(String::as_str).collect();
+    StackError::new("unknown_service", format!("no service named '{name}'")).hint(if known.is_empty() {
+        "this project defines no services".to_string()
+    } else {
+        format!("services: {}", known.join(", "))
+    })
 }
 
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
@@ -1510,10 +1518,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     };
     for name in &required {
         if !report.stack.services.contains_key(*name) {
-            return Err(StackError::new(
-                "unknown_service",
-                format!("no service named '{name}'"),
-            ));
+            return Err(unknown_service(&report, name));
         }
     }
     let unavailable: Vec<Value> = checks
