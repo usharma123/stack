@@ -48,10 +48,37 @@ assert_json '.ok and all(.data.checks[]; .ready and .identity == "instance")' "$
 jq -e --argjson p "$moved" '.data.session.services.postgres.port == $p' "$T/up-appF.json" >/dev/null || fail 'postgres did not move'
 stack logs postgres --tail 20 --json >"$T/logs-appF.json"
 assert_json '.ok and (.data.lines | length > 0) and .data.truncated == false' "$T/logs-appF.json"
+
+echo 'A generation change whose new port is taken: the old services stop, the squatter is a conflict'
+# While the services run on `moved`, reassign again; mise now reports the daemons with their
+# new configured ports although they still listen on the old ones. Squat the new Postgres port.
+stack compile --reassign-ports --json >"$T/reassign2-appF.json"
+next=$(jq -r '.data.ports.postgres' "$T/reassign2-appF.json")
+[[ "$next" != "$moved" ]] || fail 'second reassign kept the port'
+python3 -c 'import socket,sys,time; s=socket.socket(); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$next" &
+squatter2=$!
+trap 'kill "$squatter" "$squatter2" 2>/dev/null || true' EXIT
+for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/"$next") 2>/dev/null && break; sleep 0.1; done
+started=$(date +%s)
+if stack up --json >"$T/up-generation.json"; then fail 'up started over a foreign listener after a generation change'; fi
+(( $(date +%s) - started < 15 )) || fail 'up waited on the foreign listener'
+assert_json '.ok == false and .error.code == "port_conflict"' "$T/up-generation.json"
+jq -e --argjson p "$next" '.error.details[0].service == "postgres" and .error.details[0].port == $p' "$T/up-generation.json" >/dev/null || fail "generation conflict: $(cat "$T/up-generation.json")"
+jq -e '[.error.details[-1].steps[] | select(.step == "stop_previous" and .status == "ok")] | length == 1' "$T/up-generation.json" >/dev/null || fail 'the previous generation was not stopped first'
+# shellcheck disable=SC2046
+assert_dead $(recorded_pids "$T/up-appF.json")
+if (exec 3<>/dev/tcp/127.0.0.1/"$moved") 2>/dev/null; then fail "old Postgres port $moved still accepts"; fi
+kill -0 "$squatter2" || fail 'the second foreign listener was killed'
+stack down --json >"$T/down-generation.json"
+jq -e --argjson p "$next" '.ok and .data.confirmed and .data.conflicts[0].port == $p' "$T/down-generation.json" >/dev/null || fail "down after generation change: $(cat "$T/down-generation.json")"
+kill "$squatter2"; wait "$squatter2" 2>/dev/null || true
+stack up --json >"$T/up-appF2.json"
+assert_json '.ok and all(.data.checks[]; .ready and .identity == "instance")' "$T/up-appF2.json"
+jq -e --argjson p "$next" '.data.session.services.postgres.port == $p' "$T/up-appF2.json" >/dev/null || fail 'postgres did not move to the free port'
 stack down --json >"$T/down-appF.json"
 assert_json '.ok and .data.confirmed and (.data.conflicts == null)' "$T/down-appF.json"
 # shellcheck disable=SC2046
-assert_dead $(recorded_pids "$T/up-appF.json")
+assert_dead $(recorded_pids "$T/up-appF2.json")
 
 echo 'install puts the locked binaries in place without a session'
 rm -rf "$W/appG" && cp -r "$W/appF" "$W/appG" && rm -rf "$W/appG/.stack"

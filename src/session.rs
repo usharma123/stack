@@ -628,7 +628,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     let restart = previous.as_ref().is_some_and(|s| s.config_digest != digest);
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
     if restart || unrecorded {
-        if let Err(e) = down_locked(ctx) {
+        if let Err(e) = down_locked(ctx, provider.as_ref()) {
             return Err(steps.fail("stop_previous", e, true));
         }
         steps.ok("stop_previous", json!(null));
@@ -917,10 +917,10 @@ pub struct PortConflict {
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
 pub fn down(ctx: &Ctx) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    down_locked(ctx)
+    down_locked(ctx, None)
 }
 
-fn down_locked(ctx: &Ctx) -> Result<DownReport> {
+fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownReport> {
     let session = load(ctx)?;
     let reserved = ports::lookup(&ctx.state, &ctx.root)?;
     // Services always hold a port reservation from compile, and a launch record names any
@@ -944,18 +944,8 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
     pids.sort_unstable();
     pids.dedup();
 
-    // Ports stack owns, and must therefore see closed: those of supervisor daemons that are
-    // running or starting, and those recorded for a process stack started that is still
-    // alive, including an older generation's. A reserved port that something else listens on
-    // is a foreign program's: `mise daemons stop` cannot end it and stack must not try, so it
-    // is reported as a conflict instead of being waited for.
-    let supervised = |d: &DaemonStatus| {
-        matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive)
-    };
-    let mut ports: Vec<u16> = before.iter().filter(|d| supervised(d)).filter_map(|d| d.port).collect();
-    if let Some(session) = &session {
-        ports.extend(session.services.values().filter(|s| s.pid.is_some_and(pid_alive)).map(|s| s.port));
-    }
+    let provider = session.as_ref().and_then(|s| s.provider.clone()).or_else(|| provider.cloned());
+    let mut ports = owned_ports(ctx, session.as_ref(), &before, provider.as_ref());
     ports.sort_unstable();
     ports.dedup();
     ports.retain(|p| *p != 0);
@@ -1011,6 +1001,60 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
     })
 }
 
+/// Ports stack owns, and must therefore see closed: where a running or starting supervisor
+/// daemon actually listens, and the recorded port of a process stack started that is still
+/// alive, including an older generation's. `mise daemons` reports a daemon's *configured*
+/// port, which after a generation change is the new allocation and not where the old process
+/// listens, so a daemon whose configured port differs from its recorded one is asked through
+/// Pitchfork's own status for its active port. When that cannot be established, the recorded
+/// port (else the configured one) is kept: waiting on a port stack may own is a refusal to
+/// confirm, never a stop of something foreign. A reserved port nobody stack knows about
+/// listens on is a foreign program's: `mise daemons stop` cannot end it and stack must not
+/// try, so it is reported as a conflict instead of being waited for.
+fn owned_ports(
+    ctx: &Ctx,
+    session: Option<&Session>,
+    statuses: &[DaemonStatus],
+    provider: Option<&ProviderRecord>,
+) -> Vec<u16> {
+    let mut discovered: Option<Option<ProviderRecord>> = None;
+    let mut ports = Vec::new();
+    for d in statuses {
+        let supervised = matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive);
+        if !supervised {
+            continue;
+        }
+        let recorded = session.and_then(|s| s.services.get(&d.name)).map(|r| r.port).filter(|p| *p != 0);
+        if recorded.is_some() && recorded == d.port {
+            ports.extend(d.port);
+            continue;
+        }
+        let provider = match provider {
+            Some(p) => Some(p.clone()),
+            None => discovered.get_or_insert_with(|| discover_provider(ctx)).clone(),
+        };
+        let active = match (&d.id, &provider) {
+            (Some(id), Some(p)) => match mise::supervised(&p.pitchfork, &p.state_dir, id) {
+                Ok(mise::Supervised::Found { port: Some(active), .. }) => Some(active),
+                _ => None,
+            },
+            _ => None,
+        };
+        ports.extend(active.or(recorded).or(d.port));
+    }
+    if let Some(session) = session {
+        ports.extend(session.services.values().filter(|s| s.pid.is_some_and(pid_alive)).map(|s| s.port));
+    }
+    ports
+}
+
+/// The supervisor as `up` would record it, for a project without a launch record.
+fn discover_provider(ctx: &Ctx) -> Option<ProviderRecord> {
+    let (socket, _) = preflight_socket(ctx).ok()?;
+    let state_dir = socket?.path.parent()?.parent()?.to_path_buf();
+    Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
+}
+
 fn conflict(service: &str, port: u16, pinned: bool) -> PortConflict {
     PortConflict { service: service.to_string(), port, pinned, holder: ports::holder(port) }
 }
@@ -1025,7 +1069,9 @@ fn pinned_ports(ctx: &Ctx) -> Vec<String> {
 }
 
 /// Reserved ports of this checkout that something stack does not own is listening on. A
-/// supervisor daemon of the same service, running or starting on that port, is stack's own.
+/// supervisor daemon of the same service, running or starting with that configured port, is
+/// stack's own: this runs after `stop_previous`, so a daemon still running belongs to the
+/// unchanged generation whose recorded, configured and actual ports agree.
 fn port_conflicts(report: &Report, statuses: &[DaemonStatus]) -> Vec<PortConflict> {
     report
         .ports
@@ -1649,7 +1695,7 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         if busy {
             continue;
         }
-        let result = down_locked(&ctx);
+        let result = down_locked(&ctx, None);
         out.push(GcEntry {
             project: session.project,
             reason,
