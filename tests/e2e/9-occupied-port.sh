@@ -111,6 +111,28 @@ printf '[[use]]\nbundle = "path:%s"\n[services.redis]\npreset = "redis"\nversion
 cd "$W/appJ" || exit 1
 git init -q
 stack compile >/dev/null
-timeout 120 stack up --json >"$T/up-appJ.json" || { cat "$T/up-appJ.json"; fail 'up did not verify a preset whose readiness command hangs'; }
+# macOS does not ship GNU timeout. Give this test request its own process group so a
+# failed regression also terminates its waiting clients before the runner cleans up services.
+if ! python3 - >"$T/up-appJ.json" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+with subprocess.Popen(["stack", "up", "--json"], start_new_session=True) as child:
+    try:
+        sys.exit(child.wait(timeout=120))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        sys.exit(124)
+PY
+then
+  cat "$T/up-appJ.json"
+  fail 'up did not verify a preset whose readiness command hangs'
+fi
 assert_json '.ok and all(.data.checks[]; .ready)' "$T/up-appJ.json"
 stack down >/dev/null
