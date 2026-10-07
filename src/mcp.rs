@@ -86,6 +86,9 @@ fn tools() -> Value {
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
+        { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows).",
+          "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_exec", "description": "Run a command with the stack's tools and env. Connection variables of services that fail verification are withheld; required services must verify or the command does not run.",
           "inputSchema": schema(json!({
@@ -181,6 +184,15 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 },
             )
             .map(to_value)
+        }
+        "stack_install" => session::install(ctx).map(to_value),
+        "stack_logs" => {
+            let service = args["service"].as_str().ok_or_else(|| StackError::new("usage", "service is required"))?;
+            let tail = match &args["tail"] {
+                Value::Null => 100,
+                v => v.as_u64().filter(|n| (1..=10_000).contains(n)).ok_or_else(|| StackError::new("usage", format!("tail {v} must be 1 to 10000")))? as usize,
+            };
+            session::logs(ctx, service, tail).map(to_value)
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),

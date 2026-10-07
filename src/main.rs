@@ -43,6 +43,16 @@ enum Cmd {
     },
     /// Show the composed stack without writing anything
     Inspect,
+    /// Install the locked tools and service binaries without starting anything
+    Install,
+    /// Show the last lines a service wrote, as kept by the supervisor
+    Logs {
+        /// Service name from the composed stack
+        service: String,
+        /// Number of lines from the end (default 100)
+        #[arg(long, value_name = "N", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=10_000))]
+        tail: u64,
+    },
     /// Start services, verify each one, and record a session
     Up {
         /// Reclaim the session after this long without activity (e.g. 30m, 2h)
@@ -148,6 +158,21 @@ fn main() -> ExitCode {
                     println!("session {}", r.session.id);
                 })
             }),
+        Cmd::Install => session::install(&ctx).map(|r| {
+            emit(cli.json, &r, || {
+                for v in &r.versions {
+                    println!("{:<12} {}", v.name, v.resolved.as_deref().unwrap_or("-"));
+                }
+                println!("installed; nothing started");
+            })
+        }),
+        Cmd::Logs { service, tail } => session::logs(&ctx, service, *tail as usize).map(|r| {
+            emit(cli.json, &r, || {
+                for line in &r.lines {
+                    println!("{line}");
+                }
+            })
+        }),
         Cmd::Status => session::status(&ctx).map(|r| {
             let healthy = !r.stale && r.checks.iter().all(|c| c.ready);
             let code = emit(cli.json, &r, || {
@@ -184,7 +209,15 @@ fn main() -> ExitCode {
                 exec(&ctx, cmd, &req)
             }
         }
-        Cmd::Down => session::down(&ctx).map(|r| emit(cli.json, &r, || println!("stopped {} service(s); confirmed", r.stopped.len()))),
+        Cmd::Down => session::down(&ctx).map(|r| {
+            emit(cli.json, &r, || {
+                println!("stopped {} service(s); confirmed", r.stopped.len());
+                for c in &r.conflicts {
+                    println!("note: port {} reserved for {} is held by another program{}", c.port, c.service,
+                        c.holder.as_ref().map(|h| format!(" (pid {} {})", h.pid, h.command)).unwrap_or_default());
+                }
+            })
+        }),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
         Cmd::Gc { watch: true, interval, max_passes } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes),
         Cmd::Gc { .. } => session::gc_checked(&ctx.state).map(|r| {

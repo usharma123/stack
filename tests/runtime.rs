@@ -61,17 +61,34 @@ case "$1 $2" in
       touch "$REVIEW_FIXTURE/query-observed"
     fi
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
-    cat "$REVIEW_FIXTURE/daemons.json" ;;
+    # A supervised listener (see `daemons start`) is reported with its real PID while alive.
+    if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
+      python3 -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
+    else
+      cat "$REVIEW_FIXTURE/daemons.json"
+    fi ;;
   'daemons start')
     if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
+    # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
+    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
+      python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
+      echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
+      sleep 0.3
+    fi
     if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
       cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
       touch "$REVIEW_FIXTURE/started"
     fi
     if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
+  'daemons logs')
+    if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
-    if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi ;;
+    if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
+    # A stopped supervised listener is reported stopped, like a real daemon.
+    if test -f "$REVIEW_FIXTURE/listen-port"; then
+      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
+    fi ;;
 esac
 "#,
         )
@@ -1683,4 +1700,271 @@ fn every_partial_start_failure_preserves_observed_ownership() {
             assert_eq!(record["services"]["other"]["provider_id"], "app-0123456789abcdef/other", "{failure}: {record}");
         }
     }
+}
+
+// ---- port conflicts -------------------------------------------------------------------------
+
+fn assigned_port(fixture: &Fixture, service: &str) -> u16 {
+    let out = fixture.ok(&["inspect", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    u16::try_from(v["data"]["ports"][service].as_u64().expect("port assigned")).unwrap()
+}
+
+fn json_result(out: &Output) -> Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+#[test]
+fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "port_conflict", "{result}");
+    assert!(result["error"]["hint"].as_str().unwrap().contains("--reassign-ports"), "{result}");
+    assert_eq!(result["error"]["details"][0]["service"], "web");
+    assert_eq!(result["error"]["details"][0]["port"], port);
+    assert_eq!(result["error"]["details"][0]["pinned"], false);
+    let steps = result["error"]["details"].as_array().unwrap().last().unwrap();
+    assert_eq!(steps["changed"], false);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons stop"), "stop reconciliation ran against a foreign listener:\n{log}");
+    assert!(!log.contains("daemons start"), "started over a foreign listener:\n{log}");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists(), "no ownership was recorded");
+
+    // Stopping owns nothing here; the foreign listener is reported, not waited for.
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["confirmed"], true);
+    assert_eq!(result["data"]["conflicts"][0]["port"], port);
+
+    // Recovery: fresh ports, then a normal start on the new one.
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let moved = assigned_port(&fixture, "web");
+    assert_ne!(moved, port);
+    supervise_listener(&fixture, moved);
+    let result = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(result["data"]["checks"][0]["ready"], true, "{result}");
+    assert_eq!(result["data"]["checks"][0]["port"], moved);
+    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+}
+
+/// The fake supervisor starts a listener on `port` at `daemons start` and kills it at stop.
+fn supervise_listener(fixture: &Fixture, port: u16) {
+    fs::write(fixture.dir.path().join("listen-port"), port.to_string()).unwrap();
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "id": "app-test/web", "name": "web", "status": "running", "port": port }]).to_string(),
+    )
+    .unwrap();
+}
+
+/// After `compile --reassign-ports` while `web` still runs on `old`: the provider reports the
+/// daemon running with its *new* configured port `new`, Pitchfork reports the actual `old`.
+fn report_generation_change(fixture: &Fixture, old: u16, new: u16) {
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    fs::write(
+        fixture.dir.path().join("daemons.json"),
+        json!([{ "id": "app-test/web", "name": "web", "status": "running", "pid": pid, "port": new }]).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.dir.path().join("pf-status.json"),
+        json!({ "id": "app-test/web", "status": "running", "pid": pid, "active_port": old }).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_foreign_listener_on_the_new_port_of_a_changed_generation_is_a_conflict_after_the_old_stops() {
+    let fixture = Fixture::with_bundle(WEB);
+    let old = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, old);
+    fixture.ok(&["up", "--json"]);
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let new = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
+    report_generation_change(&fixture, old, new);
+
+    let started = Instant::now();
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "port_conflict", "{result}");
+    assert!(started.elapsed() < Duration::from_secs(10), "waited on the foreign listener");
+    assert_eq!(result["error"]["details"][0]["port"], new);
+    let steps = result["error"]["details"].as_array().unwrap().last().unwrap()["steps"].clone();
+    assert!(steps.as_array().unwrap().iter().any(|s| s["step"] == "stop_previous" && s["status"] == "ok"), "{steps}");
+    // The old generation was stopped: its process is gone and its port closed.
+    assert!(!pid_alive(pid), "old service survived the generation change");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", old)).is_err());
+    let log = fs::read_to_string(fixture.dir.path().join("pitchfork.log")).unwrap();
+    assert!(log.contains("status --json app-test/web"), "active port was not asked of the supervisor:\n{log}");
+}
+
+#[test]
+fn down_during_a_changed_generation_stops_the_old_service_and_reports_the_new_ports_squatter() {
+    let fixture = Fixture::with_bundle(WEB);
+    let old = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, old);
+    fixture.ok(&["up", "--json"]);
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let new = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
+    report_generation_change(&fixture, old, new);
+
+    let started = Instant::now();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert!(started.elapsed() < Duration::from_secs(10), "waited on the foreign listener");
+    assert_eq!(down["data"]["confirmed"], true);
+    assert_eq!(down["data"]["stopped"][0]["pid"], pid);
+    assert_eq!(down["data"]["conflicts"][0]["port"], new, "{down}");
+    assert!(!pid_alive(pid));
+}
+
+#[test]
+fn without_a_record_the_supervisors_active_port_decides_what_is_owned() {
+    // No session record, the provider reports the daemon with a configured port it does not
+    // listen on, and a squatter holds that configured port. Only Pitchfork's active port can
+    // tell the two apart; discarding its answer would wait on the squatter.
+    let fixture = Fixture::with_bundle(WEB);
+    let old = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, old);
+    fixture.ok(&["up", "--json"]);
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    for path in fixture.session_paths() {
+        fs::remove_file(path).unwrap();
+    }
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let new = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
+    report_generation_change(&fixture, old, new);
+
+    let started = Instant::now();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert!(started.elapsed() < Duration::from_secs(10), "waited on the squatter: {down}");
+    assert_eq!(down["data"]["conflicts"][0]["port"], new, "{down}");
+    assert!(!pid_alive(pid), "old service survived");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", old)).is_err());
+    // The supervisor was discovered without a record and asked for the active port.
+    let log = fs::read_to_string(fixture.dir.path().join("pitchfork.log")).unwrap();
+    assert!(log.contains("status --json app-test/web"), "{log}");
+    let mise_log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(mise_log.contains("which pitchfork"), "{mise_log}");
+
+}
+
+#[test]
+fn without_a_record_or_an_active_port_the_configured_port_is_waited_for_not_assumed_foreign() {
+    let fixture = Fixture::with_bundle(WEB);
+    let old = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, old);
+    fixture.ok(&["up", "--json"]);
+    for path in fixture.session_paths() {
+        fs::remove_file(path).unwrap();
+    }
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let new = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
+    report_generation_change(&fixture, old, new);
+    // The supervisor knows no such daemon: nothing establishes where it listens.
+    fs::remove_file(fixture.dir.path().join("pf-status.json")).unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "stop_unconfirmed");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", new)).is_ok(), "the squatter was ended");
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success()
+}
+
+#[test]
+fn a_pinned_port_held_by_another_program_points_at_the_override() {
+    let fixture = Fixture::with_bundle(WEB);
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        format!("[[use]]\nbundle='path:../bundle'\n[override.services.web]\nrun='true'\nport = {port}\n"),
+    )
+    .unwrap();
+    fixture.ok(&["compile"]);
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "port_conflict", "{result}");
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("[override.services]") && !hint.contains("--reassign-ports"), "{hint}");
+    assert_eq!(result["error"]["details"][0]["pinned"], true);
+}
+
+#[test]
+fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    let first = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(first["data"]["checks"][0]["ready"], true, "{first}");
+    // Same generation, daemon still running on the port: `up` reuses it rather than refusing.
+    let second = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(second["data"]["session"]["id"], first["data"]["session"]["id"]);
+    assert!(second["data"]["steps"].as_array().unwrap().iter().all(|s| s["status"] == "ok"), "{second}");
+
+    // The supervisor refusing to stop is still a failure; a running service is never "foreign".
+    fs::write(fixture.dir.path().join("fail-stop"), "").unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "stop_failed");
+    fs::remove_file(fixture.dir.path().join("fail-stop")).unwrap();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true);
+    assert!(down["data"]["conflicts"].is_null(), "{down}");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "supervised listener survived down");
+}
+
+// ---- install and logs ----------------------------------------------------------------------
+
+#[test]
+fn install_puts_locked_tools_in_place_without_starting_or_recording_anything() {
+    let fixture = Fixture::with_bundle(WEB);
+    let result = json_result(&fixture.ok(&["install", "--json"]));
+    let steps: Vec<&str> = result["data"]["steps"].as_array().unwrap().iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(steps, ["compile", "preflight", "install"], "{result}");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("install --yes --quiet"), "{log}");
+    assert!(!log.contains("daemons start") && !log.contains("daemons stop"), "{log}");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert!(status["data"]["session"].is_null() && status["data"]["checks"][0]["ready"] == false, "{status}");
+
+    // Locked like `up`: a request stack.lock does not pin is refused, not resolved.
+    fs::write(fixture.dir.path().join("bundle/bundle.toml"), format!("{WEB}[tools]\npython='3.13'\n")).unwrap();
+    let out = fixture.command(&["install", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "lock_outdated");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("latest python"), "resolved during a locked install:\n{log}");
+}
+
+#[test]
+fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
+    let fixture = Fixture::with_bundle(WEB);
+    let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "logs_failed", "never started: the supervisor has nothing");
+    let out = fixture.command(&["logs", "nope", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
+
+    fs::write(fixture.dir.path().join("logs.txt"), "one\ntwo\nthree\n").unwrap();
+    let result = json_result(&fixture.ok(&["logs", "web", "--tail", "2", "--json"]));
+    assert_eq!(result["data"]["lines"], json!(["two", "three"]));
+    assert_eq!(result["data"]["truncated"], false);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("daemons logs -- web -n 2 --raw --no-pager"), "{log}");
+    let out = fixture.ok(&["logs", "web"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\nthree\n");
+    let out = fixture.command(&["logs", "web", "--tail", "0"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }

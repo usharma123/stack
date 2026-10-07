@@ -45,8 +45,12 @@ cleanup() {
   for app in "$work"/w/*/; do
     [ -f "$app/stack.toml" ] && "$binary" -C "$app" down --json >/dev/null 2>&1 || true
   done
-  local supervisor
-  supervisor=$(cd "$work/w/appA" 2>/dev/null && mise which pitchfork 2>/dev/null) || supervisor=
+  local supervisor app
+  supervisor=
+  for app in "$work"/w/*/; do
+    [ -f "$app/stack.toml" ] || continue
+    supervisor=$(cd "$app" && mise which pitchfork 2>/dev/null) && break
+  done
   # Invoke the isolated binary directly with its explicit state directory. `mise exec`
   # would evaluate project env again while choosing the supervisor to stop.
   case "$supervisor" in

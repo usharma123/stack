@@ -19,7 +19,8 @@ class StackAdapter(Adapter):
     config_files = ("stack.toml",)
     lock_files = ("stack.lock",)
     setup_scope = ("`stack compile` only: resolves versions, writes stack.lock and assigns ports. Tool and "
-                   "service installation happens in `stack up` (start), so first_task is the comparable time")
+                   "service installation happens in `stack up` (start), so first_task is the comparable time. "
+                   "The frozen recipe uses `stack install`, which installs from the lock without starting")
     cache_note = ("fresh ev-base container: no mise/Stack tool cache; downloads in A's `up`, reused by B "
                   "(same container); pinned mise installed at provision (not timed)")
 
@@ -57,13 +58,12 @@ class StackAdapter(Adapter):
         # ports. Stack installs locked tools at `up` (the start step), not at compile/exec.
         return self._in(co, "stack --json compile")
 
-    # The frozen recipe runs `up`; declared (not inferred) so a C setup that fails after
-    # starting some services is still cleaned up.
-    frozen_setup_starts_services = True
+    # `stack install` compiles in locked mode and installs every pinned tool and service binary
+    # without starting services or recording a session.
+    frozen_setup_starts_services = False
 
     def frozen_setup(self, co):
-        # Installing from the lock requires `up` in Stack; services are stopped again at once.
-        return self._in(co, "stack --json compile --locked && stack --json up && stack --json down")
+        return self._in(co, "stack --json install")
 
     def enter(self, co, body):
         return self._in(co, f"stack exec -- bash -c {q(body)}")
@@ -79,6 +79,9 @@ class StackAdapter(Adapter):
 
     def stop(self, co):
         return self._in(co, "stack --json down")
+
+    def conflict_logs(self, co):
+        return self._in(co, "stack --json logs postgres --tail 50")
 
     def planned_pg_port(self, co):
         return self._in(co, "stack --json inspect | jq -er '.data.ports.postgres'")

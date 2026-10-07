@@ -1,0 +1,8 @@
+/home/agent/.local/share/mise/installs/python/3.13.16/bin/python3
+/home/agent/.local/share/mise/installs/uv/0.12.23/.mise-bins/uv
+/home/agent/.local/share/mise/installs/postgres/17.11/.mise-bins/postgres
+/home/agent/.local/share/mise/installs/redis/8.10.2/.mise-bins/redis-server
+Python 3.13.16
+uv 0.12.23 (aarch64-unknown-linux-gnu)
+postgres (PostgreSQL) 17.11
+Redis server v=8.10.2 sha=e0b56509:0 malloc=jemalloc-5.3.0 bits=64 build=bf3da2cf408b0fb9

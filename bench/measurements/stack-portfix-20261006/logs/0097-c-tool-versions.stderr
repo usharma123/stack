@@ -1,0 +1,2 @@
+stack: postgres not verified (no launch record; run `stack up`); endpoint withheld: DATABASE_URL, PGHOST, PGPORT, PGUSER, PGDATABASE
+stack: redis not verified (no launch record; run `stack up`); endpoint withheld: REDIS_URL

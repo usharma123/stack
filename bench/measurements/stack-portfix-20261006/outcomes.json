@@ -1,0 +1,322 @@
+[
+  {
+    "check": "setup.a",
+    "detail": "",
+    "evidence": [
+      7
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "lock.created",
+    "detail": "",
+    "evidence": [
+      8
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "deps.a",
+    "detail": "",
+    "evidence": [
+      11
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "start.a",
+    "detail": "readiness=native pg=43058 redis=46341",
+    "evidence": [
+      9,
+      10,
+      13
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "migrate.a",
+    "detail": "",
+    "evidence": [
+      14,
+      15
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "crud_cache.a",
+    "detail": "",
+    "evidence": [
+      16,
+      17,
+      18
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "tests.a",
+    "detail": "",
+    "evidence": [
+      19
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "start.repeat",
+    "detail": "start exit 0",
+    "evidence": [
+      20,
+      21
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "setup.b",
+    "detail": "",
+    "evidence": [
+      23
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "deps.b",
+    "detail": "",
+    "evidence": [
+      26
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "start.b",
+    "detail": "readiness=native pg=46899 redis=48130",
+    "evidence": [
+      24,
+      25,
+      28
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "migrate.b",
+    "detail": "",
+    "evidence": [
+      29,
+      30
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "crud_cache.b",
+    "detail": "",
+    "evidence": [
+      31,
+      32,
+      33
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "tests.b",
+    "detail": "",
+    "evidence": [
+      34
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "isolation",
+    "detail": "boundary=service-instance",
+    "evidence": [
+      35,
+      36
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "repeat.entry",
+    "detail": "",
+    "evidence": [
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "repeat.app_read",
+    "detail": "",
+    "evidence": [
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "status",
+    "detail": "exit 0",
+    "evidence": [
+      83
+    ],
+    "mode": "native",
+    "status": "observed"
+  },
+  {
+    "check": "stop.a",
+    "detail": "stop exit 0, probe exit 0, app after stop exit 3",
+    "evidence": [
+      85,
+      86,
+      87
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "b.survives",
+    "detail": "",
+    "evidence": [
+      88
+    ],
+    "mode": "n/a",
+    "status": "pass"
+  },
+  {
+    "check": "restart.a",
+    "detail": "readiness=native pg=43058 redis=46341",
+    "evidence": [
+      89,
+      90,
+      91
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "persist.pg",
+    "detail": "",
+    "evidence": [
+      92
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "persist.redis",
+    "detail": "policy={'appendonly': 'yes', 'appendfsync': 'everysec', 'save': '3600 1 300 100 60 10000', 'dir': '/home/agent/.local/state/mise/daemons/cafd555678070c8/data/redis'}",
+    "evidence": [
+      92
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "cache.after_restart",
+    "detail": "",
+    "evidence": [
+      93
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "lock.frozen_copy",
+    "detail": "setup exit 0; lock unchanged; versions match",
+    "evidence": [
+      95,
+      96,
+      97
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "bad_config",
+    "detail": "setup exit 1 (intended diagnostic)",
+    "evidence": [
+      99,
+      100,
+      101
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "occupied_port",
+    "detail": "refused-at-start",
+    "evidence": [
+      105,
+      106
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "cleanup.processes",
+    "detail": "",
+    "evidence": [
+      111
+    ],
+    "mode": "native",
+    "status": "pass"
+  },
+  {
+    "check": "cleanup.supervisors",
+    "detail": "/home/agent/.local/share/mise/installs/pitchfork/2.29.0/pitchfork supervisor run",
+    "evidence": [
+      112
+    ],
+    "mode": "n/a",
+    "status": "observed"
+  }
+]

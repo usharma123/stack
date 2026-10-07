@@ -4,9 +4,11 @@
 |---|---|
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve, lock, assign ports, write provider config |
 | `stack inspect` | Show the composed stack, origins and ports; writes nothing |
+| `stack install` | Install the locked tools and service binaries; start nothing, record nothing |
 | `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
 | `stack exec [--require S \| --require-all] [--json --timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack logs <service> [--tail N]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc [--watch [--interval 60s]]` | Renew this session's lease / reclaim expired and deleted-project sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
@@ -16,6 +18,26 @@
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
 
 - `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
+- `install` is `up` without the start: compile in locked mode, trust the generated config, check
+  the supervisor socket path, install every pinned tool and preset service binary. Use it to warm
+  a checkout (CI caches, disposable worktrees) without a session; `exec` then has the tools.
+- `up` fails with `port_conflict` when a port assigned to this checkout accepts connections and
+  no running daemon of that service is behind it. `details` name the service, the port, whether
+  the project pinned it, and the holding process when `lsof` (or `/proc` on Linux) can tell.
+  For an assigned port run `stack compile --reassign-ports` and `stack up` again; for a pinned
+  port change or remove the pin in `[override.services]`, or free the port. Stack never kills
+  the other program and never reassigns ports on its own.
+- `down` succeeds when everything stack owns is stopped. A foreign listener on one of this
+  checkout's reserved ports is listed under `conflicts` in the result, not waited for. What
+  stack owns is where a running daemon actually listens (asked of Pitchfork when the
+  configured port changed under it, as after `--reassign-ports`) and the recorded port of a
+  live recorded process; when that cannot be established, the port is waited for rather than
+  assumed foreign.
+- `logs` asks the supervisor (`mise daemons logs`) for one service's stored output, bounded to
+  `--tail` lines, 1 MiB and 30 seconds; it never follows. `unknown_service` names the services
+  the project defines; `logs_failed` is a failed retrieval, whether the daemon was never
+  started here, the provider exited nonzero, or the deadline passed; its message and `details`
+  say which.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;

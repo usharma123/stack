@@ -628,10 +628,24 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     let restart = previous.as_ref().is_some_and(|s| s.config_digest != digest);
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
     if restart || unrecorded {
-        if let Err(e) = down_locked(ctx) {
+        if let Err(e) = down_locked(ctx, provider.as_ref()) {
             return Err(steps.fail("stop_previous", e, true));
         }
         steps.ok("stop_previous", json!(null));
+    }
+    // Nothing can start on a port a foreign program holds, and the supervisor's own error
+    // would come after the attempt. Stack's own daemons still running (an unchanged
+    // generation) are not conflicts.
+    if !report.stack.services.is_empty() {
+        let statuses = match mise::daemons(&ctx.root) {
+            Ok(s) => s,
+            Err(e) => return Err(steps.fail("ports", e, false)),
+        };
+        let conflicts = port_conflicts(&report, &statuses);
+        if !conflicts.is_empty() {
+            return Err(steps.fail("ports", port_conflict_error(conflicts), false));
+        }
+        steps.ok("ports", json!(null));
     }
 
     let stamp = now();
@@ -763,6 +777,64 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct InstallReport {
+    pub steps: Vec<Value>,
+    pub ports: IndexMap<String, u16>,
+    pub versions: Vec<project::VersionReport>,
+}
+
+/// Install every locked tool and service binary without starting anything or recording a
+/// session: the compile, trust, socket preflight and install steps of `up`, and nothing after.
+/// Locked like `up`: a missing or stale pin is `lock_outdated`, never resolved here.
+pub fn install(ctx: &Ctx) -> Result<InstallReport> {
+    let mut steps = Steps::default();
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let report = match ctx.compile(true) {
+        Ok(r) => r,
+        Err(e) => return Err(steps.fail("compile", e, false)),
+    };
+    steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = mise::trust(&ctx.root) {
+        return Err(steps.fail("install", e, false));
+    }
+    if !report.stack.services.is_empty() {
+        match preflight_socket(ctx) {
+            Ok((_, detail)) => steps.ok("preflight", detail),
+            Err(e) => return Err(steps.fail("preflight", e, false)),
+        }
+    }
+    if let Err(e) = mise::install(&ctx.root) {
+        return Err(steps.fail("install", e, false));
+    }
+    steps.ok("install", json!(null));
+    Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions })
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogsReport {
+    pub service: String,
+    /// The last lines the supervisor kept for this service, oldest first.
+    pub lines: Vec<String>,
+    /// The supervisor returned more than stack's capture limit; `lines` holds the tail.
+    pub truncated: bool,
+}
+
+/// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
+/// time and size; never follows.
+pub fn logs(ctx: &Ctx, service: &str, tail: usize) -> Result<LogsReport> {
+    let report = ctx.compile(false)?;
+    if !report.stack.services.contains_key(service) {
+        let known: Vec<&String> = report.stack.services.keys().collect();
+        return Err(StackError::new("unknown_service", format!("no service named '{service}'"))
+            .hint(if known.is_empty() { "this project defines no services".to_string() } else { format!("services: {}", known.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")) }));
+    }
+    let out = mise::logs(&ctx.root, service, tail)?;
+    let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
+    let skip = lines.len().saturating_sub(tail);
+    Ok(LogsReport { service: service.to_string(), lines: lines[skip..].to_vec(), truncated: out.stdout_truncated })
+}
+
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
 fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
     let effective = mise::env(&ctx.root)?;
@@ -825,33 +897,43 @@ fn checks_match(previous: &Session, checks: &[Check]) -> bool {
 pub struct DownReport {
     pub stopped: Vec<Value>,
     pub confirmed: bool,
+    /// Reserved ports a program stack does not own is listening on. Not a failure of `down`:
+    /// nothing stack started is behind them, and `up` refuses to start over them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<PortConflict>,
+}
+
+/// A port reserved for one of this checkout's services that a foreign program holds.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortConflict {
+    pub service: String,
+    pub port: u16,
+    /// The project pinned this port in `[override.services]`; stack cannot move it.
+    pub pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<ports::Holder>,
 }
 
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
 pub fn down(ctx: &Ctx) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    down_locked(ctx)
+    down_locked(ctx, None)
 }
 
-fn down_locked(ctx: &Ctx) -> Result<DownReport> {
+fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownReport> {
     let session = load(ctx)?;
-    let mut ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?
-        .values()
-        .copied()
-        .collect();
+    let reserved = ports::lookup(&ctx.state, &ctx.root)?;
     // Services always hold a port reservation from compile, and a launch record names any
     // process stack started. With neither, stack owns nothing and the supervisor (which may
     // not even be configured for a tools-only project) has nothing to report.
-    let owns_services = !ports.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
+    let owns_services = !reserved.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
     // Failure to discover ownership cannot establish that nothing is running.
     let before = if owns_services { mise::daemons(&ctx.root)? } else { Vec::new() };
     let mut pids: Vec<(String, u32)> = before
         .iter()
         .filter_map(|d| d.pid.map(|p| (d.name.clone(), p)))
         .collect();
-    ports.extend(before.iter().filter_map(|d| d.port));
     if let Some(session) = &session {
-        ports.extend(session.services.values().map(|s| s.port));
         pids.extend(
             session
                 .services
@@ -859,19 +941,19 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
                 .filter_map(|(name, s)| s.pid.map(|p| (name.clone(), p))),
         );
     }
+    pids.sort_unstable();
+    pids.dedup();
+
+    let provider = session.as_ref().and_then(|s| s.provider.clone()).or_else(|| provider.cloned());
+    let mut ports = owned_ports(ctx, session.as_ref(), &before, provider.as_ref());
     ports.sort_unstable();
     ports.dedup();
     ports.retain(|p| *p != 0);
-    pids.sort_unstable();
-    pids.dedup();
 
     // Providers may list configured but never-started daemons. Stopping those returns
     // "no matching daemons"; only invoke stop when there is actual ownership to reconcile.
     let needs_stop = pids.iter().any(|(_, pid)| pid_alive(*pid))
-        || before
-            .iter()
-            .any(|d| matches!(d.status.as_str(), "running" | "starting"))
-        || ports.iter().any(|port| accepting(*port));
+        || before.iter().any(|d| matches!(d.status.as_str(), "running" | "starting"));
     if needs_stop {
         mise::stop(&ctx.root)?;
     }
@@ -902,13 +984,139 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
 
     remove_if_exists(&ctx.session_file())?;
     remove_if_exists(&ctx.index_file())?;
+    // Everything stack owned is gone, so whatever still answers on a reserved port is foreign.
+    let pinned = pinned_ports(ctx);
+    let conflicts = reserved
+        .iter()
+        .filter(|(_, port)| accepting(**port))
+        .map(|(service, port)| conflict(service, *port, pinned.contains(service)))
+        .collect();
     Ok(DownReport {
         stopped: pids
             .iter()
             .map(|(name, pid)| json!({ "service": name, "pid": pid }))
             .collect(),
         confirmed: true,
+        conflicts,
     })
+}
+
+/// Ports stack owns, and must therefore see closed: where a running or starting supervisor
+/// daemon actually listens, and the recorded port of a process stack started that is still
+/// alive, including an older generation's. `mise daemons` reports a daemon's *configured*
+/// port, which after a generation change is the new allocation and not where the old process
+/// listens, so a daemon whose configured port differs from its recorded one is asked through
+/// Pitchfork's own status for its active port. When that cannot be established, the recorded
+/// port (else the configured one) is kept: waiting on a port stack may own is a refusal to
+/// confirm, never a stop of something foreign. A reserved port nobody stack knows about
+/// listens on is a foreign program's: `mise daemons stop` cannot end it and stack must not
+/// try, so it is reported as a conflict instead of being waited for.
+fn owned_ports(
+    ctx: &Ctx,
+    session: Option<&Session>,
+    statuses: &[DaemonStatus],
+    provider: Option<&ProviderRecord>,
+) -> Vec<u16> {
+    let mut discovered: Option<Option<ProviderRecord>> = None;
+    let mut ports = Vec::new();
+    for d in statuses {
+        let supervised = matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive);
+        if !supervised {
+            continue;
+        }
+        let recorded = session.and_then(|s| s.services.get(&d.name)).map(|r| r.port).filter(|p| *p != 0);
+        if recorded.is_some() && recorded == d.port {
+            ports.extend(d.port);
+            continue;
+        }
+        let provider = match provider {
+            Some(p) => Some(p.clone()),
+            None => discovered.get_or_insert_with(|| discover_provider(ctx)).clone(),
+        };
+        let active = match (&d.id, &provider) {
+            (Some(id), Some(p)) => match mise::supervised(&p.pitchfork, &p.state_dir, id) {
+                Ok(mise::Supervised::Found { port: Some(active), .. }) => Some(active),
+                _ => None,
+            },
+            _ => None,
+        };
+        ports.extend(active.or(recorded).or(d.port));
+    }
+    if let Some(session) = session {
+        ports.extend(session.services.values().filter(|s| s.pid.is_some_and(pid_alive)).map(|s| s.port));
+    }
+    ports
+}
+
+/// The supervisor as `up` would record it, for a project without a launch record.
+fn discover_provider(ctx: &Ctx) -> Option<ProviderRecord> {
+    let (socket, _) = preflight_socket(ctx).ok()?;
+    let state_dir = socket?.path.parent()?.parent()?.to_path_buf();
+    Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
+}
+
+fn conflict(service: &str, port: u16, pinned: bool) -> PortConflict {
+    PortConflict { service: service.to_string(), port, pinned, holder: ports::holder(port) }
+}
+
+/// Services whose port the project pinned, read without resolving anything. Unreadable
+/// configuration means no pins: the hint then names `--reassign-ports`, which such a project
+/// would reject anyway.
+fn pinned_ports(ctx: &Ctx) -> Vec<String> {
+    ctx.compile(false)
+        .map(|r| r.stack.services.iter().filter(|(_, e)| e.value.fixed_port().is_some()).map(|(n, _)| n.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Reserved ports of this checkout that something stack does not own is listening on. A
+/// supervisor daemon of the same service, running or starting with that configured port, is
+/// stack's own: this runs after `stop_previous`, so a daemon still running belongs to the
+/// unchanged generation whose recorded, configured and actual ports agree.
+fn port_conflicts(report: &Report, statuses: &[DaemonStatus]) -> Vec<PortConflict> {
+    report
+        .ports
+        .iter()
+        .filter(|(name, port)| {
+            let owned = statuses.iter().any(|d| {
+                d.name == **name
+                    && d.port == Some(**port)
+                    && (matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive))
+            });
+            !owned && accepting(**port)
+        })
+        .map(|(name, port)| {
+            let pinned = report.stack.services.get(name).is_some_and(|e| e.value.fixed_port().is_some());
+            conflict(name, *port, pinned)
+        })
+        .collect()
+}
+
+/// `port_conflict`: which service, which port, who holds it, and what frees this checkout.
+fn port_conflict_error(conflicts: Vec<PortConflict>) -> StackError {
+    let names: Vec<String> = conflicts
+        .iter()
+        .map(|c| match &c.holder {
+            Some(h) => format!("{} (port {}, held by pid {} `{}`)", c.service, c.port, h.pid, h.command),
+            None => format!("{} (port {})", c.service, c.port),
+        })
+        .collect();
+    let (pinned, assigned): (Vec<&PortConflict>, Vec<&PortConflict>) = conflicts.iter().partition(|c| c.pinned);
+    let mut hints = Vec::new();
+    if !assigned.is_empty() {
+        hints.push("run `stack compile --reassign-ports` to give this checkout other ports, then `stack up`".to_string());
+    }
+    for c in pinned {
+        hints.push(format!(
+            "service '{}' pins port {} in [override.services]; change or remove the pin, or free the port",
+            c.service, c.port
+        ));
+    }
+    StackError::new(
+        "port_conflict",
+        format!("another program is listening on this checkout's port for {}", names.join(", ")),
+    )
+    .hint(hints.join("; "))
+    .details(conflicts.iter().map(|c| serde_json::to_value(c).expect("conflict serializes")).collect())
 }
 
 fn accepting(port: u16) -> bool {
@@ -1487,7 +1695,7 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         if busy {
             continue;
         }
-        let result = down_locked(&ctx);
+        let result = down_locked(&ctx, None);
         out.push(GcEntry {
             project: session.project,
             reason,
