@@ -431,6 +431,36 @@ pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result
     })
 }
 
+const LOGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const LOGS_LIMIT: usize = 1024 * 1024;
+
+/// `mise daemons logs -- <service> -n <tail> --raw --no-pager`: the supervisor's stored output
+/// for one daemon, through the same isolated configuration as every other provider call.
+/// Bounded by a deadline and an output cap; the pager and follow modes are never used.
+pub fn logs(root: &Path, service: &str, tail: usize) -> Result<crate::process::Captured> {
+    let n = tail.to_string();
+    let mut command = Command::new("mise");
+    configure_command(&mut command, root);
+    command
+        .args(["daemons", "logs", "--", service, "-n", &n, "--raw", "--no-pager"])
+        .current_dir(root)
+        .env("MISE_YES", "1")
+        .env("NO_COLOR", "1");
+    let out = crate::process::capture(&mut command, LOGS_TIMEOUT, LOGS_LIMIT).map_err(|e| {
+        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint("install mise: https://mise.jdx.dev")
+    })?;
+    if out.timed_out {
+        return Err(StackError::new("logs_failed", format!("mise daemons logs did not finish within {}s", LOGS_TIMEOUT.as_secs())));
+    }
+    if out.exit_code != Some(0) {
+        let detail = out.stderr.lines().chain(out.stdout.lines()).map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("failed").to_string();
+        return Err(StackError::new("logs_failed", format!("mise daemons logs {service} failed"))
+            .hint("the service may never have started here; `stack status` shows what the supervisor knows")
+            .details(vec![serde_json::json!({ "output": detail })]));
+    }
+    Ok(out)
+}
+
 pub fn start(root: &Path) -> Result<()> {
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }

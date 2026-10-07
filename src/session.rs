@@ -811,6 +811,30 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
     Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions })
 }
 
+#[derive(Debug, Serialize)]
+pub struct LogsReport {
+    pub service: String,
+    /// The last lines the supervisor kept for this service, oldest first.
+    pub lines: Vec<String>,
+    /// The supervisor returned more than stack's capture limit; `lines` holds the tail.
+    pub truncated: bool,
+}
+
+/// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
+/// time and size; never follows.
+pub fn logs(ctx: &Ctx, service: &str, tail: usize) -> Result<LogsReport> {
+    let report = ctx.compile(false)?;
+    if !report.stack.services.contains_key(service) {
+        let known: Vec<&String> = report.stack.services.keys().collect();
+        return Err(StackError::new("unknown_service", format!("no service named '{service}'"))
+            .hint(if known.is_empty() { "this project defines no services".to_string() } else { format!("services: {}", known.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")) }));
+    }
+    let out = mise::logs(&ctx.root, service, tail)?;
+    let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
+    let skip = lines.len().saturating_sub(tail);
+    Ok(LogsReport { service: service.to_string(), lines: lines[skip..].to_vec(), truncated: out.stdout_truncated })
+}
+
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
 fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
     let effective = mise::env(&ctx.root)?;

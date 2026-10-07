@@ -75,6 +75,8 @@ case "$1 $2" in
       touch "$REVIEW_FIXTURE/started"
     fi
     if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
+  'daemons logs')
+    if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
     if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi ;;
@@ -1817,3 +1819,22 @@ fn install_puts_locked_tools_in_place_without_starting_or_recording_anything() {
     assert!(!log.contains("latest python"), "resolved during a locked install:\n{log}");
 }
 
+#[test]
+fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
+    let fixture = Fixture::with_bundle(WEB);
+    let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "logs_failed", "never started: the supervisor has nothing");
+    let out = fixture.command(&["logs", "nope", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
+
+    fs::write(fixture.dir.path().join("logs.txt"), "one\ntwo\nthree\n").unwrap();
+    let result = json_result(&fixture.ok(&["logs", "web", "--tail", "2", "--json"]));
+    assert_eq!(result["data"]["lines"], json!(["two", "three"]));
+    assert_eq!(result["data"]["truncated"], false);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("daemons logs -- web -n 2 --raw --no-pager"), "{log}");
+    let out = fixture.ok(&["logs", "web"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\nthree\n");
+    let out = fixture.command(&["logs", "web", "--tail", "0"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

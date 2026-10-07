@@ -45,6 +45,14 @@ enum Cmd {
     Inspect,
     /// Install the locked tools and service binaries without starting anything
     Install,
+    /// Show the last lines a service wrote, as kept by the supervisor
+    Logs {
+        /// Service name from the composed stack
+        service: String,
+        /// Number of lines from the end (default 100)
+        #[arg(long, value_name = "N", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=10_000))]
+        tail: u64,
+    },
     /// Start services, verify each one, and record a session
     Up {
         /// Reclaim the session after this long without activity (e.g. 30m, 2h)
@@ -156,6 +164,13 @@ fn main() -> ExitCode {
                     println!("{:<12} {}", v.name, v.resolved.as_deref().unwrap_or("-"));
                 }
                 println!("installed; nothing started");
+            })
+        }),
+        Cmd::Logs { service, tail } => session::logs(&ctx, service, *tail as usize).map(|r| {
+            emit(cli.json, &r, || {
+                for line in &r.lines {
+                    println!("{line}");
+                }
             })
         }),
         Cmd::Status => session::status(&ctx).map(|r| {
