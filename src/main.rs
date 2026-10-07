@@ -326,7 +326,9 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             }
         }
         let s = &r.stack;
-        println!("{} tools, {} env, {} services, {} tasks", s.tools.len(), s.env.len(), s.services.len(), s.tasks.len());
+        // Counts what is listed below, including the supervisor tool stack adds for services.
+        let tools = r.versions.iter().filter(|v| v.kind == "tool").count().max(s.tools.len());
+        println!("{tools} tools, {} env, {} services, {} tasks", s.env.len(), s.services.len(), s.tasks.len());
         for v in &r.versions {
             let resolved = v.resolved.as_deref().unwrap_or("(not locked yet)");
             let moved = v.moved_from.as_deref().map(|m| format!("  (moved from {m})")).unwrap_or_default();
@@ -451,8 +453,44 @@ fn fail(as_json: bool, e: StackError) -> ExitCode {
             eprintln!("  hint: {hint}");
         }
         for d in &e.details {
-            eprintln!("  {d}");
+            eprintln!("  {}", human_detail(d));
         }
     }
     ExitCode::FAILURE
+}
+
+/// One error detail for people: `up`'s progress record as a step list, objects as
+/// `key: value` pairs. `--json` keeps the structured form.
+fn human_detail(detail: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let scalar = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let Value::Object(map) = detail else { return scalar(detail) };
+    if let Some(Value::Array(steps)) = map.get("steps") {
+        let steps: Vec<String> = steps
+            .iter()
+            .map(|s| match s["code"].as_str() {
+                Some(code) => format!("{} {} ({code})", scalar(&s["step"]), scalar(&s["status"])),
+                None => format!("{} {}", scalar(&s["step"]), scalar(&s["status"])),
+            })
+            .collect();
+        return format!(
+            "steps: {}; retry safe: {}; changed: {}",
+            steps.join(", "),
+            scalar(&map["retry_safe"]),
+            scalar(&map["changed"])
+        );
+    }
+    map.iter()
+        .map(|(k, v)| match v {
+            Value::Object(o) => format!(
+                "{k}: {}",
+                o.iter().map(|(k, v)| format!("{k} {}", scalar(v))).collect::<Vec<_>>().join(", ")
+            ),
+            v => format!("{k}: {}", scalar(v)),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }

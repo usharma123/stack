@@ -22,6 +22,10 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `install` is `up` without the start: compile in locked mode, trust the generated config, check
   the supervisor socket path, install every pinned tool and preset service binary. Use it to warm
   a checkout (CI caches, disposable worktrees) without a session; `exec` then has the tools.
+- Errors from `up` that happen once its steps have begun end their `details` with a progress
+  record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
+  come before it. Invalid arguments, an unreadable session, and a failed initial GC pass
+  have no progress record. Without `--json` both are printed as plain text.
 - `up` fails with `port_conflict` when a port assigned to this checkout accepts connections and
   no running daemon of that service is behind it. `details` name the service, the port, whether
   the project pinned it, and the holding process when `lsof` (or `/proc` on Linux) can tell.
