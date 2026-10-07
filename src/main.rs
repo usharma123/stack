@@ -125,6 +125,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Download mise into stack's data directory unless one is already on PATH
+    Setup {
+        /// Install stack's pinned mise even when another mise is on PATH
+        #[arg(long)]
+        force: bool,
+    },
     /// Check that mise, git and tar are usable and the project compiles
     Doctor,
     /// Serve the stack tools over MCP (stdio)
@@ -132,6 +138,7 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    stack::setup::use_managed_tools();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return usage_error(e),
@@ -256,6 +263,13 @@ fn main() -> ExitCode {
         }),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
+        }),
+        Cmd::Setup { force } => stack::setup::run(*force).map(|r| {
+            emit(cli.json, &r, || {
+                let how = if r.installed { "installed" } else { "already available" };
+                println!("mise {} {how} at {}", r.version, r.mise.display());
+                println!("ready; run `stack doctor` to check the rest");
+            })
         }),
         Cmd::Doctor => stack::doctor::run(&root, &ctx.cache, &ctx.state).map(|checks| {
             emit(cli.json, &checks, || {

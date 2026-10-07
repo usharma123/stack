@@ -13,12 +13,12 @@ to run services.
 
 ```sh
 npm install -g @ushawarma/stack
-stack --version
+stack setup
 ```
 
 Requires Node.js 22.14+ and supports macOS 13+ and Linux on x64 and arm64.
-Install [mise](https://mise.jdx.dev/getting-started.html) and put it on `PATH` for tools and services.
-Stack installs Pitchfork through mise.
+`stack setup` downloads the [mise](https://mise.jdx.dev) release stack is tested against, unless
+mise is already on `PATH`. Stack installs Pitchfork through mise.
 
 Start with [install and first run](https://github.com/usharma123/stack/blob/main/docs/user/install.md)
 for a complete example.

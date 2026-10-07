@@ -68,7 +68,7 @@ impl Resolver for MiseResolver {
             .env("NO_COLOR", "1");
         let out = crate::process::capture(&mut command, RESOLVE_TIMEOUT, 16 * 1024).map_err(|e| {
             StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
-                .hint("install mise: https://mise.jdx.dev")
+                .hint(crate::setup::MISE_INSTALL_HINT)
         })?;
         let fail = |why: String| {
             StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
@@ -340,7 +340,7 @@ fn mise(root: &Path, args: &[&str]) -> Result<Output> {
         .output()
         .map_err(|e| {
             StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
-                .hint("install mise: https://mise.jdx.dev")
+                .hint(crate::setup::MISE_INSTALL_HINT)
         })
 }
 
@@ -487,7 +487,7 @@ pub fn logs(root: &Path, service: &str, tail: usize, since: Option<u64>) -> Resu
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1");
     let out = crate::process::capture(&mut command, LOGS_TIMEOUT, LOGS_LIMIT).map_err(|e| {
-        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint("install mise: https://mise.jdx.dev")
+        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
     })?;
     if out.timed_out {
         return Err(StackError::new("logs_failed", format!("mise daemons logs did not finish within {}s", LOGS_TIMEOUT.as_secs())));

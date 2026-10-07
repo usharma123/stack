@@ -4,18 +4,21 @@ Install the CLI with:
 
 ```sh
 npm install -g @ushawarma/stack
-stack --version
+stack setup
 ```
 
 Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
-Services need [mise](https://mise.jdx.dev) on PATH; stack installs everything else, including
-Pitchfork, through it. Run `stack doctor` to check a machine.
+Stack needs [mise](https://mise.jdx.dev); it installs everything else, including Pitchfork,
+through it. `stack setup` uses a mise already on `PATH`; otherwise it downloads the pinned release
+stack is tested against (checked by SHA-256) into `~/.local/share/stack/bin` (`$STACK_DATA_DIR/bin`
+or `$XDG_DATA_HOME/stack/bin` when set). Stack finds it there without any `PATH` change. Run
+`stack doctor` to check a machine.
 Node.js 22.14+ is required. See [release guide](../RELEASING.md) for CI checks,
 trusted publishing setup, release tags, and recovery.
 
 ## First run
 
-Install [mise](https://mise.jdx.dev/getting-started.html) and make sure `mise`, `git`, and `tar` are on `PATH`.
+Run `stack setup` once, and make sure `git` and `tar` are on `PATH`.
 
 In an empty directory, create `stack.toml`:
 

@@ -14,6 +14,7 @@
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc [--watch [--interval 60s]]` | Renew this session's lease / reclaim expired and deleted-project sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
+| `stack setup [--force]` | Download stack's pinned mise unless one is on `PATH` (`--force`: install it anyway) |
 | `stack doctor` | Check mise, git and tar, Pitchfork's socket path, and that the project compiles |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 

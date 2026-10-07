@@ -18,7 +18,7 @@ pub struct Check {
 /// Every check, or `doctor_failed` listing them all when any fails.
 pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
     let mut checks = vec![
-        tool("mise", "mise", &["--version"], "install mise: https://mise.jdx.dev/getting-started.html"),
+        tool("mise", "mise", &["--version"], crate::setup::MISE_INSTALL_HINT),
         tool("git", "git", &["--version"], "install git; it fetches git+ bundles"),
         tool("tar", "tar", &["--version"], "install tar; it extracts git bundles"),
     ];
