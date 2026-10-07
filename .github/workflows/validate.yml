@@ -1,10 +1,11 @@
 name: Validate and package
 on:
   workflow_call:
-permissions:
-  contents: read
+permissions: {}
 jobs:
   native:
+    permissions:
+      contents: read
     name: Native (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -17,46 +18,67 @@ jobs:
           - { runner: macos-15, platform: darwin-arm64, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
+    env:
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 5
         with:
           node-version: '24.16.0'
           package-manager-cache: false
       - name: Install Rust
-        run: rustup toolchain install 1.93.1 --profile minimal --component clippy --target '${{ matrix.target }}'
+        timeout-minutes: 5
+        run: rustup toolchain install 1.93.1 --profile minimal --component clippy --target "$TARGET"
       - name: Install musl toolchain
+        timeout-minutes: 5
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -yqq musl-tools
       - run: node --test tests/*.test.mjs
+        timeout-minutes: 5
       - run: cargo +1.93.1 clippy --locked --all-targets -- -D warnings
+        timeout-minutes: 15
       - run: cargo +1.93.1 test --locked --all-targets
-      - run: cargo +1.93.1 build --locked --release --target '${{ matrix.target }}'
+        timeout-minutes: 15
+      - run: cargo +1.93.1 build --locked --release --target "$TARGET"
+        timeout-minutes: 15
         env:
           MACOSX_DEPLOYMENT_TARGET: '13.0'
       - name: Verify and identify binary
-        run: node scripts/artifact.mjs '${{ matrix.platform }}' 'target/${{ matrix.target }}/release/stack'
+        timeout-minutes: 5
+        run: node scripts/artifact.mjs "$PLATFORM" "target/$TARGET/release/stack"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         with:
           name: native-${{ matrix.platform }}
           path: artifacts/${{ matrix.platform }}/
           if-no-files-found: error
           retention-days: 7
   oci:
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.93.1 --profile minimal
+        timeout-minutes: 5
       - run: cargo +1.93.1 build --locked
+        timeout-minutes: 15
       - run: bash tests/e2e/ci-oci.sh target/debug/stack
+        timeout-minutes: 10
   # The service/session scenarios against real mise + Pitchfork, natively on each OS.
   # Scenario 5 (OCI) runs where Docker provides a registry; elsewhere it is reported as skipped.
   services:
+    permissions:
+      contents: read
     name: Services (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -67,47 +89,75 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.93.1 --profile minimal
+        timeout-minutes: 5
       - name: Install pinned mise
+        timeout-minutes: 5
+        env:
+          MISE_PLATFORM: ${{ matrix.mise }}
+          MISE_SHA256: ${{ matrix.mise_sha256 }}
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/mise.tgz" "https://github.com/jdx/mise/releases/download/v2026.9.18/mise-v2026.9.18-${{ matrix.mise }}.tar.gz"
-          echo "${{ matrix.mise_sha256 }}  $RUNNER_TEMP/mise.tgz" | shasum -a 256 -c -
+          curl --connect-timeout 10 --max-time 120 --retry 2 --retry-max-time 240 -fsSL -o "$RUNNER_TEMP/mise.tgz" "https://github.com/jdx/mise/releases/download/v2026.9.18/mise-v2026.9.18-${MISE_PLATFORM}.tar.gz"
+          echo "$MISE_SHA256  $RUNNER_TEMP/mise.tgz" | shasum -a 256 -c -
           tar -xzf "$RUNNER_TEMP/mise.tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
       - run: cargo +1.93.1 build --locked
+        timeout-minutes: 15
       - name: Verify real mise configuration isolation
+        timeout-minutes: 5
         run: STACK_TEST_MISE="$(command -v mise)" STACK_TEST_BINARY="$PWD/target/debug/stack" node --test tests/provider-boundary.test.mjs
       - name: Start a local OCI registry
+        timeout-minutes: 5
         if: matrix.registry
         run: |
           docker run -d --name stack-e2e-registry -p 127.0.0.1:5000:5000 registry:2.8.3
-          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:5000/v2/ && break; sleep 1; done
+          ready=false
+          for _ in $(seq 1 30); do
+            if curl --connect-timeout 2 --max-time 3 -fsS http://127.0.0.1:5000/v2/; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            docker logs stack-e2e-registry
+            exit 1
+          fi
           echo "STACK_E2E_REGISTRY=localhost:5000" >> "$GITHUB_ENV"
       - run: bash tests/e2e/native.sh target/debug/stack
+        timeout-minutes: 25
         env:
           STACK_E2E_RESULTS: ${{ runner.temp }}/e2e-results.jsonl
       - if: always()
+        timeout-minutes: 1
         run: cat "$RUNNER_TEMP/e2e-results.jsonl" || true
   package:
+    permissions:
+      contents: read
     needs: native
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 5
         with:
           node-version: '24.16.0'
           package-manager-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           pattern: native-*
           path: downloads
       - name: Assemble checked binaries
+        timeout-minutes: 5
         run: |
           mkdir artifacts
           for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
@@ -115,17 +165,19 @@ jobs:
           done
           node scripts/package.mjs
           mkdir dist
-          npm pack ./npm --pack-destination dist
+          npm pack ./npm --pack-destination dist --ignore-scripts
         env:
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-      - run: node scripts/smoke-install.mjs dist/*.tgz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
         with:
           name: npm-package
           path: dist/*.tgz
           if-no-files-found: error
           retention-days: 30
   install:
+    permissions:
+      contents: read
     needs: package
     strategy:
       fail-fast: false
@@ -135,14 +187,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 5
         with:
           node-version: '24.16.0'
           package-manager-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           name: npm-package
           path: dist
       - run: node scripts/smoke-install.mjs dist/*.tgz
+        timeout-minutes: 5

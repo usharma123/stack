@@ -127,6 +127,30 @@ pub fn exact_release(tool: &str, version: &str) -> bool {
 /// replace composed version requests with the exact versions stack.lock records.
 /// `identities` are instance tokens, exported as `STACK_IDENTITY_<NAME>` for the service to
 /// report back to its identity probe.
+/// Environment the provider config adds beyond what the stack declares, given the exact
+/// Python release stack.lock pins (if any). Part of the session fingerprint, so a change here
+/// restarts services the way a declared change would.
+pub fn implicit_env(stack: &Composed, python: Option<&str>) -> IndexMap<String, String> {
+    let mut env = IndexMap::new();
+    if !stack.tools.contains_key("python") {
+        return env;
+    }
+    // uv prefers an active Conda environment, then Python builds it manages itself, over the
+    // locked interpreter on PATH; `uv run` and `uv sync` would quietly use another release.
+    // Name the locked release and allow only installed interpreters, so uv finds this one on
+    // PATH (or a virtualenv built on it). A project's own `[env]` value wins for each variable.
+    let mut add = |key: &str, value: &str| {
+        if !stack.env.contains_key(key) {
+            env.insert(key.to_string(), value.to_string());
+        }
+    };
+    add("UV_PYTHON_PREFERENCE", "only-system");
+    if let Some(version) = python.filter(|v| exact_release("python", v)) {
+        add("UV_PYTHON", version);
+    }
+    env
+}
+
 pub fn render(
     stack: &Composed,
     ports: &IndexMap<String, u16>,
@@ -163,6 +187,9 @@ pub fn render(
         .iter()
         .map(|(k, e)| (k.clone(), Value::String(e.value.clone())))
         .collect();
+    for (key, value) in implicit_env(stack, versions.tools.get("python").map(String::as_str)) {
+        env.insert(key, Value::String(value));
+    }
     for (service, token) in identities {
         env.insert(crate::manifest::identity_var(service), Value::String(token.clone()));
     }

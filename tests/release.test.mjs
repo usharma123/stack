@@ -90,4 +90,76 @@ try {
   await test('CDN serving different bytes is rejected', async () => {
     await assert.rejects(publishPackage(tarball, { pause, fetchImpl: async url => url.endsWith('.tgz') ? new Response('corrupted') : json(registryData(url)) }), /Expected values/);
   });
+  for (const delayed of ['metadata', 'tarball', 'index']) {
+    await test(`propagation beyond five minutes recovers: ${delayed}`, async () => {
+      let elapsed = 0;
+      let publishes = 0;
+      const sleeps = [];
+      const logs = [];
+      await publishPackage(tarball, {
+        now: () => elapsed,
+        pause: async ms => { sleeps.push(ms); elapsed += ms; },
+        log: message => logs.push(message),
+        publish: () => { publishes++; return { status: 0 }; },
+        fetchImpl: async (url, options) => {
+          assert.ok(options.signal instanceof AbortSignal);
+          if (!publishes) return new Response('', { status: 404 });
+          const kind = url.endsWith('.tgz') ? 'tarball' : url.endsWith('/0.1.0-beta.1') ? 'metadata' : 'index';
+          if (kind === delayed && elapsed < 6 * 60 * 1000) return new Response('', { status: 404 });
+          return kind === 'tarball' ? new Response(bytes) : json(registryData(url));
+        }
+      });
+      assert.equal(publishes, 1);
+      assert.ok(elapsed >= 360000 && elapsed < 900000);
+      assert.deepEqual(sleeps.slice(0, 4), [10000, 20000, 40000, 60000]);
+      assert.ok(sleeps.every(ms => ms <= 60000));
+      assert.ok(logs.some(message => /900s.*retrying/.test(message)));
+    });
+  }
+  await test('verify-only stops at fifteen minutes and never publishes an absent version', async () => {
+    let elapsed = 0;
+    await assert.rejects(publishPackage(tarball, {
+      verifyOnly: true,
+      now: () => elapsed,
+      pause: async ms => { elapsed += ms; },
+      log: () => {},
+      fetchImpl: async () => new Response('', { status: 404 }),
+      publish: () => assert.fail('verify-only must never publish')
+    }), /within 15 minutes.*Version metadata/);
+    assert.equal(elapsed, 900000);
+  });
+  await test('request time counts toward the propagation deadline, including transient failures', async () => {
+    let elapsed = 0;
+    let reads = 0;
+    await assert.rejects(publishPackage(tarball, {
+      now: () => elapsed,
+      pause: async ms => { elapsed += ms; },
+      log: () => {},
+      fetchImpl: async () => {
+        if (++reads === 1) return json(remote);
+        elapsed += Math.min(15000, 900000 - elapsed);
+        return new Response('', { status: 503 });
+      },
+      publish: () => assert.fail('existing version must never publish')
+    }), /within 15 minutes.*HTTP 503/);
+    assert.equal(elapsed, 900000);
+    assert.ok(reads < 30);
+  });
+  await test('unavailable preflight fails closed after bounded retries', async () => {
+    let reads = 0;
+    await assert.rejects(publishPackage(tarball, {
+      pause, log: () => {},
+      fetchImpl: async () => { reads++; throw new Error('network unavailable'); },
+      publish: () => assert.fail('uncertain preflight must never publish')
+    }), /network unavailable/);
+    assert.equal(reads, 5);
+  });
+  await test('authentication failure during index verification stops immediately', async () => {
+    await assert.rejects(publishPackage(tarball, {
+      pause: () => assert.fail('must not retry authentication failures'),
+      fetchImpl: async url => url.endsWith('.tgz') ? new Response(bytes) :
+        url.endsWith('/0.1.0-beta.1') ? json(remote) : new Response('', { status: 403 }),
+      publish: () => assert.fail('existing version must never publish')
+    }), /HTTP 403/);
+  });
 } finally { rmSync(dir, { recursive: true, force: true }); }

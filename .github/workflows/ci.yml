@@ -4,13 +4,14 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-permissions:
-  contents: read
+permissions: {}
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   validate:
+    permissions:
+      contents: read
     uses: ./.github/workflows/validate.yml
   required:
     name: CI passed
@@ -21,5 +22,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - run: test "$RESULT" = success
+        timeout-minutes: 5
         env:
           RESULT: ${{ needs.validate.result }}

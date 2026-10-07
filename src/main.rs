@@ -58,7 +58,8 @@ enum Cmd {
         /// Reclaim the session after this long without activity (e.g. 30m, 2h)
         #[arg(long)]
         ttl: Option<String>,
-        /// Reclaim the session when this process exits (e.g. an agent runner)
+        /// Reclaim the session when this process exits. Pass a long-lived process such as the
+        /// agent runner or CI job, not a shell that exits after this command
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
         owner_pid: Option<u32>,
     },
@@ -77,6 +78,17 @@ enum Cmd {
         timeout: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Run a task from stack.toml once every service verifies
+    Run {
+        /// Task name, as in [tasks.<name>]
+        task: String,
+        /// With --json: stop the task after this long (e.g. 10m). Default: no limit
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
+        /// Extra arguments, appended to the task's command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Stop services; succeeds only once their processes are gone
     Down,
@@ -174,7 +186,7 @@ fn main() -> ExitCode {
             })
         }),
         Cmd::Status => session::status(&ctx).map(|r| {
-            let healthy = !r.stale && r.checks.iter().all(|c| c.ready);
+            let healthy = r.healthy;
             let code = emit(cli.json, &r, || {
                 match &r.session {
                     Some(s) => println!("session {}{}", s.id, if r.stale { " (stale: compiled configuration changed)" } else { "" }),
@@ -200,15 +212,10 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            if cli.json {
-                exec_json(&ctx, cmd, &req, timeout.as_deref())
-            } else if timeout.is_some() {
-                Err(StackError::new("usage", "--timeout applies only with --json")
-                    .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
-            } else {
-                exec(&ctx, cmd, &req)
-            }
+            run_command(&ctx, cli.json, cmd, &req, timeout.as_deref())
         }
+        Cmd::Run { task, timeout, args } => session::task_command(&ctx, task, args)
+            .and_then(|(cmd, req)| run_command(&ctx, cli.json, &cmd, &req, timeout.as_deref())),
         Cmd::Down => session::down(&ctx).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
@@ -320,7 +327,9 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             }
         }
         let s = &r.stack;
-        println!("{} tools, {} env, {} services, {} tasks", s.tools.len(), s.env.len(), s.services.len(), s.tasks.len());
+        // Counts what is listed below, including the supervisor tool stack adds for services.
+        let tools = r.versions.iter().filter(|v| v.kind == "tool").count().max(s.tools.len());
+        println!("{tools} tools, {} env, {} services, {} tasks", s.env.len(), s.services.len(), s.tasks.len());
         for v in &r.versions {
             let resolved = v.resolved.as_deref().unwrap_or("(not locked yet)");
             let moved = v.moved_from.as_deref().map(|m| format!("  (moved from {m})")).unwrap_or_default();
@@ -340,6 +349,17 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             println!("wrote {}{}", r.output.display(), if r.lock_changed { " and stack.lock" } else { "" });
         }
     })
+}
+
+fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+    if as_json {
+        exec_json(ctx, cmd, require, timeout)
+    } else if timeout.is_some() {
+        Err(StackError::new("usage", "--timeout applies only with --json")
+            .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
+    } else {
+        exec(ctx, cmd, require)
+    }
 }
 
 fn exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExitCode> {
@@ -434,8 +454,44 @@ fn fail(as_json: bool, e: StackError) -> ExitCode {
             eprintln!("  hint: {hint}");
         }
         for d in &e.details {
-            eprintln!("  {d}");
+            eprintln!("  {}", human_detail(d));
         }
     }
     ExitCode::FAILURE
+}
+
+/// One error detail for people: `up`'s progress record as a step list, objects as
+/// `key: value` pairs. `--json` keeps the structured form.
+fn human_detail(detail: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let scalar = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let Value::Object(map) = detail else { return scalar(detail) };
+    if let Some(Value::Array(steps)) = map.get("steps") {
+        let steps: Vec<String> = steps
+            .iter()
+            .map(|s| match s["code"].as_str() {
+                Some(code) => format!("{} {} ({code})", scalar(&s["step"]), scalar(&s["status"])),
+                None => format!("{} {}", scalar(&s["step"]), scalar(&s["status"])),
+            })
+            .collect();
+        return format!(
+            "steps: {}; retry safe: {}; changed: {}",
+            steps.join(", "),
+            scalar(&map["retry_safe"]),
+            scalar(&map["changed"])
+        );
+    }
+    map.iter()
+        .map(|(k, v)| match v {
+            Value::Object(o) => format!(
+                "{k}: {}",
+                o.iter().map(|(k, v)| format!("{k} {}", scalar(v))).collect::<Vec<_>>().join(", ")
+            ),
+            v => format!("{k}: {}", scalar(v)),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }

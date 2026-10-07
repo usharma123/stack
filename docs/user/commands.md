@@ -7,6 +7,7 @@
 | `stack install` | Install the locked tools and service binaries; start nothing, record nothing |
 | `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
+| `stack run <task> [--json --timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies |
 | `stack exec [--require S \| --require-all] [--json --timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
 | `stack logs <service> [--tail N]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
 | `stack down` | Stop services and confirm they are gone |
@@ -21,6 +22,10 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `install` is `up` without the start: compile in locked mode, trust the generated config, check
   the supervisor socket path, install every pinned tool and preset service binary. Use it to warm
   a checkout (CI caches, disposable worktrees) without a session; `exec` then has the tools.
+- Errors from `up` that happen once its steps have begun end their `details` with a progress
+  record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
+  come before it. Invalid arguments, an unreadable session, and a failed initial GC pass
+  have no progress record. Without `--json` both are printed as plain text.
 - `up` fails with `port_conflict` when a port assigned to this checkout accepts connections and
   no running daemon of that service is behind it. `details` name the service, the port, whether
   the project pinned it, and the holding process when `lsof` (or `/proc` on Linux) can tell.
@@ -38,6 +43,17 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the project defines; `logs_failed` is a failed retrieval, whether the daemon was never
   started here, the provider exited nonzero, or the deadline passed; its message and `details`
   say which.
+- `status --json` reports `healthy` (every service verified and the session current); the
+  exit code is 1 exactly when it is false, while `ok` stays true because status itself worked.
+  In a checkout with no launch record and no generated config yet (a fresh worktree), services
+  are reported not launched without querying the supervisor. With a launch record, a missing
+  generated config is written again from `stack.lock` and the services are verified as usual.
+- `run <task>` runs a task with `mise run --skip-deps`: mise's task semantics (templates,
+  shebangs, how arguments after `--` are passed) apply unchanged, but mise does not try to start
+  the services itself. Every service must verify first, whatever the task's `services` list:
+  mise hands a task every service's endpoint, including any stack would withhold. For commands
+  that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
+  than services to skip. `unknown_task` lists the tasks the project defines.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;
@@ -72,6 +88,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   you use execute without mise's trust prompt. Review bundles as you would any dependency.
 - `compile` also warns about service presets mise does not document (it currently documents
   cockroachdb, nats, postgres, redis and spicedb).
+- When a project pins `python`, the generated environment sets `UV_PYTHON` to the locked
+  release and `UV_PYTHON_PREFERENCE=only-system`, so `uv` selects the locked Python release,
+  not another one from an active Conda environment or a build it manages itself; a virtualenv
+  built on the locked release is still used. Set either variable in the project's `[env]` to
+  choose otherwise.
 - For a custom service, connect with `http://127.0.0.1:$<NAME>_PORT`. mise also sets
   `<NAME>_URL` to a Pitchfork proxy hostname (`https://<name>.<project>.localhost`), which only
   answers when Pitchfork's proxy is running.

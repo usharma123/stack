@@ -25,7 +25,13 @@ builds the artifact that releases promote and does the following:
 
 Actions are pinned to commit SHAs. Builds use Cargo.lock and no shared caches.
 Packaging starts as soon as native builds pass; independent OCI/service checks still
-block the final `CI passed` result. Jobs have timeouts. PR runs can cancel older runs; releases cannot cancel an active
+block the final `CI passed` result. The four-runner install matrix tests the uploaded
+tarball; packaging does not repeat its Linux smoke test. Every runner job and step
+has a timeout. Script subprocesses have hard kill deadlines: 30 seconds for local
+checks, 60 seconds for each GitHub API command, and three minutes for npm install
+or publish. Workflows default to no token permissions; jobs grant only the reads
+they need, with OIDC limited to publication. Checkouts never persist credentials.
+PR runs can cancel older runs; releases cannot cancel an active
 publication. Release runs queue instead of replacing pending releases. Set the
 `CI passed` job as a required branch protection check.
 The existing `tests/e2e/run.sh` service scenarios remain an additional manual
@@ -95,7 +101,14 @@ Stable versions use `latest`; prereleases use `next`.
 The publish script checks the immutable version first. An existing version is
 accepted only if its SHA-512 integrity matches the exact packed tarball and it has
 provenance. After publication it retries registry reads and tarball downloads for
-propagation, waits for the package index used by npm install, verifies integrity, and performs a clean registry installation.
+propagation for up to 15 minutes, including request time. Retries back off from 10
+to 60 seconds and log the elapsed time and last failure. Each request, including
+its response body, has a 15-second timeout capped by the remaining budget.
+Integrity or provenance mismatches and HTTP authentication failures stop immediately.
+The publish step has a 22-minute timeout to also cover the bounded preflight and
+three-minute npm publish command; the job has 30 minutes for setup and installation.
+Verification waits for the package index used by npm install and checks the
+downloaded tarball. A separate step performs a clean registry installation.
 
 If publication failed or its response was lost, rerun the failed publish job to
 reuse the original artifact. Never move a release tag or republish different bytes
@@ -112,10 +125,15 @@ and reuse the selected artifact; if it is unavailable, release a new version.
 Fix authentication errors rather than repeatedly publishing. A newer failed or
 unfinished eligible run for the commit blocks promotion even if an older run passed.
 
-GitHub release concurrency uses `queue: max` to retain pending releases. Older
-actionlint versions do not recognize this GitHub-supported field. For those
-versions, use `actionlint -ignore '^unexpected key "queue" for "concurrency" section'`
-to ignore only that schema mismatch.
+GitHub release concurrency uses `queue: max` to retain pending releases.
+Actionlint 1.7.12 does not recognize that GitHub-supported key yet. Until its schema
+catches up, ignore only that exact diagnostic:
+
+```sh
+actionlint -ignore '^unexpected key "queue" for "concurrency" section' \
+  .github/workflows/{ci,validate,release}.yml
+zizmor --no-progress .github/workflows/{ci,validate,release}.yml
+```
 
 ## Local packaging check
 

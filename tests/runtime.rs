@@ -80,6 +80,10 @@ case "$1 $2" in
       touch "$REVIEW_FIXTURE/started"
     fi
     if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
+  'run --skip-deps')
+    # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
+    shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
+    if test "$task" = fail; then exit 3; fi ;;
   'daemons logs')
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
@@ -1968,3 +1972,111 @@ fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
     let out = fixture.command(&["logs", "web", "--tail", "0"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn status_of_a_checkout_never_compiled_here_says_to_start_it_without_asking_the_supervisor() {
+    let fixture = Fixture::with_bundle(WEB);
+    // A fresh worktree has the committed stack.lock but no generated provider config, and an
+    // unconfigured `mise daemons` blames its own settings; it must not be asked.
+    fs::remove_file(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "unhealthy");
+    let result = json_result(&out);
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["healthy"], false);
+    assert_eq!(result["data"]["checks"][0]["ready"], false);
+    assert!(result["data"]["checks"][0]["reason"].as_str().unwrap().contains("stack up"), "{result}");
+    let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
+    assert!(json_result(&out)["error"]["hint"].as_str().unwrap().contains("stack up"));
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons --json") && !log.contains("daemons logs"), "{log}");
+}
+
+#[test]
+fn a_launched_checkout_missing_its_generated_config_is_still_asked_about() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    fixture.ok(&["up"]);
+    let config = fixture.dir.path().join("app/.config/mise/conf.d/stack.toml");
+    fs::remove_file(&config).unwrap();
+    // A launch record exists, so services may well be running: never claim otherwise.
+    let result = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(result["data"]["checks"][0]["ready"], true, "{result}");
+    assert!(config.exists(), "the derived config is written again from stack.lock");
+    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+}
+
+#[test]
+fn status_reports_health_alongside_the_exit_code() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let result = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(result["data"]["healthy"], true, "{result}");
+}
+
+#[test]
+fn unknown_required_services_name_the_ones_that_exist() {
+    let fixture = Fixture::with_bundle(WEB);
+    let out = fixture.command(&["--json", "exec", "--require", "kafka", "--", "true"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "unknown_service");
+    assert_eq!(error["hint"], "services: web");
+}
+
+#[test]
+fn run_hands_a_declared_task_to_mise_without_its_daemon_startup() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.greet]\nrun='echo hi'\n[tasks.fail]\nrun='false'\n");
+    let out = fixture.ok(&["run", "greet", "--", "a b", "it's", "--flag"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "greet|a b|it's|--flag|", "arguments arrive intact");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("run --skip-deps --no-timings greet -- a b it's --flag"), "{log}");
+
+    let out = fixture.command(&["--json", "run", "fail"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "the task's exit code");
+    assert_eq!(json_result(&out)["data"]["exit_code"], 3);
+
+    let out = fixture.command(&["--json", "run", "nope"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "unknown_task");
+    assert_eq!(error["hint"], "tasks: greet, fail");
+}
+
+#[test]
+fn run_refuses_while_any_service_is_unverified() {
+    // Even a task that names no services: `mise run` would hand it every service's endpoint
+    // again, including the ones stack withholds.
+    let fixture = Fixture::with_bundle(
+        "[bundle]\nname='test'\n[services.web]\nrun='true'\n[tasks.lint]\nrun='touch ran'\n",
+    );
+    let out = fixture.command(&["--json", "run", "lint"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "service_unavailable", "{error}");
+    assert_eq!(error["details"][0]["service"], "web");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("run --skip-deps"), "the task must not start:\n{log}");
+}
+
+#[test]
+fn mcp_runs_tasks_and_can_reassign_ports() {
+    let tasks = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.hello]\nrun='echo hi'\n");
+    let results = tasks.mcp(
+        &[
+            ("stack_run", json!({ "task": "hello", "args": ["there"] })),
+            ("stack_run", json!({ "task": "nope" })),
+        ],
+        &[],
+    );
+    assert_eq!(results[0]["structuredContent"]["data"]["stdout"], "hello|there|", "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "unknown_task");
+
+    let fixture = Fixture::with_bundle(WEB);
+    let before = json_result(&fixture.ok(&["inspect", "--json"]))["data"]["ports"]["web"].clone();
+    // Another program takes the port, as in a port_conflict.
+    let _held = std::net::TcpListener::bind(("127.0.0.1", before.as_u64().unwrap() as u16)).unwrap();
+    let results = fixture.mcp(&[("stack_compile", json!({ "reassign_ports": true }))], &[]);
+    let after = &results[0]["structuredContent"]["data"]["ports"]["web"];
+    assert!(after.is_u64() && *after != before, "{before} -> {after}");
+}
+

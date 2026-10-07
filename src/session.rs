@@ -825,14 +825,30 @@ pub struct LogsReport {
 pub fn logs(ctx: &Ctx, service: &str, tail: usize) -> Result<LogsReport> {
     let report = ctx.compile(false)?;
     if !report.stack.services.contains_key(service) {
-        let known: Vec<&String> = report.stack.services.keys().collect();
-        return Err(StackError::new("unknown_service", format!("no service named '{service}'"))
-            .hint(if known.is_empty() { "this project defines no services".to_string() } else { format!("services: {}", known.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")) }));
+        return Err(unknown_service(&report, service));
+    }
+    let configured = {
+        let _guard = project_lock(&ctx.state, &ctx.root)?;
+        has_provider_config(ctx, &report, load(ctx)?.is_some())?
+    };
+    if !configured {
+        return Err(StackError::new("logs_failed", format!("no launch record for {service} in this checkout"))
+            .hint("run `stack up` first"));
     }
     let out = mise::logs(&ctx.root, service, tail)?;
     let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
     let skip = lines.len().saturating_sub(tail);
     Ok(LogsReport { service: service.to_string(), lines: lines[skip..].to_vec(), truncated: out.stdout_truncated })
+}
+
+/// `unknown_service`, naming the services the project does define.
+fn unknown_service(report: &Report, name: &str) -> StackError {
+    let known: Vec<&str> = report.stack.services.keys().map(String::as_str).collect();
+    StackError::new("unknown_service", format!("no service named '{name}'")).hint(if known.is_empty() {
+        "this project defines no services".to_string()
+    } else {
+        format!("services: {}", known.join(", "))
+    })
 }
 
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
@@ -1135,6 +1151,8 @@ pub struct StatusReport {
     pub lease_expired: Option<String>,
     /// The complete compiled configuration changed since the session started.
     pub stale: bool,
+    /// Every service verified and the session is current; `stack status` exits 1 otherwise.
+    pub healthy: bool,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
@@ -1144,6 +1162,8 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let report = ctx.compile(false)?;
     let checks = if report.stack.services.is_empty() {
         Vec::new()
+    } else if !has_provider_config(ctx, &report, session.is_some())? {
+        not_launched(&report)
     } else {
         let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
         verify_session(
@@ -1155,17 +1175,54 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
             &Timings::new("status"),
         )
     };
+    let stale = session
+        .as_ref()
+        .is_some_and(|s| s.config_digest != config_digest(ctx, &report));
     Ok(StatusReport {
+        healthy: !stale && checks.iter().all(|c| c.ready),
+        stale,
         lease_expired: session
             .as_ref()
             .and_then(|s| s.lease.as_ref())
             .and_then(|l| l.expired(now())),
-        stale: session
-            .as_ref()
-            .is_some_and(|s| s.config_digest != config_digest(ctx, &report)),
         session,
         checks,
     })
+}
+
+/// Whether the provider can be asked about this checkout. A fresh checkout (a committed
+/// stack.lock, no generated config yet) cannot be: an unconfigured `mise daemons` blames its own
+/// settings. Without a launch record either, nothing was started from here. With one, the
+/// derived config is only missing (deleted, say) and is written again from stack.lock.
+fn has_provider_config(ctx: &Ctx, report: &Report, launched: bool) -> Result<bool> {
+    if report.output.exists() {
+        return Ok(true);
+    }
+    if !launched {
+        return Ok(false);
+    }
+    ctx.compile(true)?;
+    Ok(true)
+}
+
+fn not_launched(report: &Report) -> Vec<Check> {
+    report
+        .stack
+        .services
+        .keys()
+        .map(|service| Check {
+            service: service.clone(),
+            ready: false,
+            port: report.ports.get(service).copied(),
+            pid: None,
+            identity: None,
+            reason: Some("no launch record in this checkout; run `stack up`".into()),
+            withheld: Vec::new(),
+            checked_at: now(),
+            data_dir: None,
+            provider_id: None,
+        })
+        .collect()
 }
 
 pub struct ExecPlan {
@@ -1481,6 +1538,29 @@ pub enum Require {
     Only(Vec<String>),
 }
 
+/// A declared task as a command for `plan_exec`, with every service required. `mise run`
+/// keeps the provider's task semantics (templates, shebangs, argument passing); `--skip-deps`
+/// stops it from starting the task's daemons itself, since stack verifies them instead.
+pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<String>, Require)> {
+    let report = ctx.compile(false)?;
+    report.stack.tasks.get(name).ok_or_else(|| {
+        let known: Vec<&str> = report.stack.tasks.keys().map(String::as_str).collect();
+        StackError::new("unknown_task", format!("no task named '{name}'")).hint(if known.is_empty() {
+            "this project defines no tasks; add one under [tasks.<name>] in stack.toml".to_string()
+        } else {
+            format!("tasks: {}", known.join(", "))
+        })
+    })?;
+    let mut command: Vec<String> = ["mise", "run", "--skip-deps", "--no-timings", name, "--"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    command.extend(args.iter().cloned());
+    // `mise run` evaluates the provider config again and would restore the endpoints that
+    // `plan_exec` withholds from unverified services. Only a fully verified stack has none.
+    Ok((command, Require::All))
+}
+
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");
@@ -1510,10 +1590,7 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     };
     for name in &required {
         if !report.stack.services.contains_key(*name) {
-            return Err(StackError::new(
-                "unknown_service",
-                format!("no service named '{name}'"),
-            ));
+            return Err(unknown_service(&report, name));
         }
     }
     let unavailable: Vec<Value> = checks
@@ -1850,6 +1927,16 @@ fn config_digest(ctx: &Ctx, report: &Report) -> String {
     // Only when a service has a probe, so records written before probes existed stay current.
     if !report.identities.is_empty() {
         config["identities"] = json!(report.identities);
+    }
+    // Likewise only when present: stacks without implicit provider env keep their sessions.
+    let python = report
+        .versions
+        .iter()
+        .find(|v| v.kind == "tool" && v.name == "python")
+        .and_then(|v| v.resolved.as_deref());
+    let implicit = mise::implicit_env(&report.stack, python);
+    if !implicit.is_empty() {
+        config["implicit_env"] = json!(implicit);
     }
     sha256_hex(config.to_string().as_bytes())
 }

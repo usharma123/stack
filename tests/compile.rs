@@ -212,6 +212,8 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
         "[daemons.postgres]",
         "preset = \"postgres\"",
         "daemons = [\"postgres\"]",
+        "UV_PYTHON_PREFERENCE = \"only-system\"",
+        "UV_PYTHON = \"3.13.2\"",
     ] {
         assert!(rendered.contains(expected), "missing `{expected}` in:\n{rendered}");
     }
@@ -223,6 +225,27 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
         assert!(rendered.contains(&format!("port = {port}")));
     }
     assert_eq!(report.ports.len(), 2);
+}
+
+#[test]
+fn uv_python_selection_is_left_to_the_project_when_it_sets_one() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\npython = \"3.13\"\n[env]\nUV_PYTHON_PREFERENCE = \"managed\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    assert!(rendered.contains("UV_PYTHON_PREFERENCE = \"managed\""), "{rendered}");
+    assert!(!rendered.contains("only-system"), "{rendered}");
+    assert!(rendered.contains("UV_PYTHON = \"3.13.2\""), "each variable is overridden on its own: {rendered}");
+
+    let root = sb.project("[tools]\npython = \"3.13\"\n[env]\nUV_PYTHON = \"3.12\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    assert!(rendered.contains("UV_PYTHON = \"3.12\"") && !rendered.contains("3.13.2\"\nUV"), "{rendered}");
+
+    let root = sb.project("[tools]\njq = \"1.8\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    assert!(!rendered.contains("UV_PYTHON_PREFERENCE"), "only projects that pin python: {rendered}");
 }
 
 #[test]
