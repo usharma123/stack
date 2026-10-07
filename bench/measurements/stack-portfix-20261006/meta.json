@@ -1,0 +1,253 @@
+{
+  "artifact_errors": [],
+  "artifacts": [],
+  "cache_note": "fresh ev-base container: no mise/Stack tool cache; downloads in A's `up`, reused by B (same container); pinned mise installed at provision (not timed)",
+  "cleanup_problems": [],
+  "completed": true,
+  "config": {
+    "stack.toml": "48104e65fa199b21a08ef720a31c8def9dd4c2440998c229768c35fdfc4866a5"
+  },
+  "errors": [],
+  "features": {
+    "detached_services": "native",
+    "frozen_setup": "native",
+    "lockfile": "native",
+    "per_checkout_data": "native",
+    "per_checkout_ports": "native",
+    "readiness": "native",
+    "services": "native",
+    "stop_confirmation": "native",
+    "structured_status": "native",
+    "wrong_instance_guard": "native"
+  },
+  "finished_unix_ns": 1791332471413790000,
+  "finished_utc": "2026-10-07T00:21:11Z",
+  "fixture": {
+    ".pytest_cache/.gitignore": "3ed731b65d06150c138e2dadb0be0697550888a6b47eb8c45ecc9adba8b8e9bd",
+    ".pytest_cache/CACHEDIR.TAG": "37dc88ef9a0abeddbe81053a6dd8fdfb13afb613045ea1eb4a5c815a74a3bde4",
+    ".pytest_cache/README.md": "73fd6fccdd802c419a6b2d983d6c3173b7da97558ac4b589edec2dfe443db9ad",
+    ".pytest_cache/v/cache/lastfailed": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    ".pytest_cache/v/cache/nodeids": "f6960af9e70ebf0b397128442af853c5e02fbf6909173abbfd07a8846544a612",
+    "migrations/0001_items.sql": "ccd38aab957ea2bc977306d7adf434bd6b347c42e31dabf7cddec74b3a2ee9fe",
+    "migrations/0002_item_tags.sql": "7e9fc70a65254adc32a94c09f087a72316268d386dfbc622bdb2ea3446e25c53",
+    "pyproject.toml": "e3547372c0d7321cdb3872e061964ccab91c51242158a5b6d0da4d634bfbbcda",
+    "rwbapp/__init__.py": "814d4fb3ee9e89be949490926eecd392f466fe6651725c21265abc401b000ec4",
+    "rwbapp/__main__.py": "1c5e82f0b6ac259be1623baddf9777ec430b755b9d9d0509a77877f9702d8b23",
+    "rwbapp/core.py": "46761cc4240918143932c00acc1cb8bd56707369022272c03a7e6b3c42213534",
+    "tests/test_app.py": "5a2d27763e53ea5537caa834ba30032c7b55077d881e98950345066e03931545",
+    "uv.lock": "f1238f30ac738b082fbc3624705cf354b44d3af630599b896b8439527e52648d"
+  },
+  "harness": {
+    "commit": "a278a9acf30f38cf4037e36fe8faf7b49ab6110f",
+    "dirty": true,
+    "files": {
+      "__init__.py": "a129557add0b62e7fdc4d1ee7904a644350dcf6ea9d4df173bf746eb1c1eb71a",
+      "adapters/__init__.py": "19765a3a59b98095942da6d75b212db50cd42fba947196d6aefa09c1c6fbd580",
+      "adapters/agent_env_common.py": "3a580122487c972da27670d2db88e5b5211915e971851767eb6d95e6eac399ca",
+      "adapters/base.py": "b4462a9b7ac54425d2d877ee8d2679ef963951d6797704e19bf0a04db4c5775e",
+      "adapters/berth.py": "36fd41abcd229bbe4c17b34f99bff11e8cfb2e0d3052cb6f9d34d95a1bc6a738",
+      "adapters/branchbox.py": "d8bf759fa54e25a468e1e6dc7889b8f7eaadc23fb900fef3898783386327ed1d",
+      "adapters/common.py": "eb09d57249efcc17d5c15794e708a3ac03f69b3f6a96c83dfd2941f6b3131083",
+      "adapters/compose.py": "c7a39c6e0759f891b3f4e6a32d1302800e01827d0ac1869874261be66290ff47",
+      "adapters/ddev.py": "c1c3c128a5884679aeb147c4f717100d8d7120278b5334fd8a828f619c882211",
+      "adapters/devbox.py": "55ce14d0664e27127ba595e5c5a2fe30ac133a53ca03c2e60c70d714108b5491",
+      "adapters/devcontainers.py": "4222337ed672c3864b016a802c5d71b575456ed195bc4e086993a0e93b612965",
+      "adapters/devenv.py": "03f4fcb854679597d6e2a3c4980429f51793209660a68021f133fcac07c4aac0",
+      "adapters/devpod.py": "e8e3a4fb24c3dc4d0c3893b58a994a8f534878af85173b090e117c60da80b779",
+      "adapters/dnvr.py": "412f36f9258b870d9e3562cfde2b86c327457a3f1bfb65a08594c03c7917a81c",
+      "adapters/flox.py": "73b0b4faead558f8af3985262fb2dd3b8d74684034848d15bbf353c6c59c6bac",
+      "adapters/git_grove.py": "ee21232280df95b7897e9e063000c120ae792e6c5f62c39e49587fbb90d5ed02",
+      "adapters/guix.py": "7730659e3de1846f177fbd81a40e143b33ad2beadb77c64c2afd6c11fbcf11b3",
+      "adapters/isola.py": "e757a09afc8c29480c016c2782b8ecd19ba4cad8bc33ebfe98c12a8e5e4f238d",
+      "adapters/lando.py": "0312832e8780e20bb3a5fd7a5d45f1a42f3392cb9871d970a531a56f1c826fe2",
+      "adapters/mise.py": "976138d66e189ad4e991e24ac9334569efc0b154019c81dadb498a5ec49447ff",
+      "adapters/nix.py": "056861586c510612417a653fc8fe340f9e3765e62e6ee3d3f188a138844e8ce4",
+      "adapters/organist.py": "9695335efb28c9ca2285b09e1ff2afe72804290200e1fc784196e55f25be1f80",
+      "adapters/pixi.py": "6042d7605a27b76e6097fdae8e2663168eb66dc52723dbcdd1e76425ecf401db",
+      "adapters/pkgx.py": "df72533be1bc087b874fb5c827dc40cb36bf68bec244e4c90d20402f96b5534c",
+      "adapters/process_compose.py": "eba3b4b58d5d097e96e592adf0efc8e32276d292c619633125a8c170e26bef5d",
+      "adapters/registry.py": "6a4501017953629aada3d296f754885232d8a0ff1a5a85cee10a17fe401813d7",
+      "adapters/services_flake.py": "1aee8c6f249559dae395b892703d6b1718a41af797e5b7c70ad36680941ee19c",
+      "adapters/stack.py": "7b2c27999db8f97e6be60d4a20bb7cd44a4729919f4a28ddad53b8a7568263ef",
+      "adapters/tilt.py": "5383054065974a33c28160041cae9b65948b9e912cad64797e3f24b0bb426136",
+      "adapters/vagrant.py": "ba90da50e33dcbed2c8f8b575ddab79a88f2f2ff1b60f7fafed1fdb59403e126",
+      "adapters/worktree_common.py": "9a175e0617e36d09409aade2f72fc6408ef2345f2855857b931f37f09723b221",
+      "adapters/worktrunk.py": "0437feae392f7e83f0a9be828078e136d6e24546542869b130ea6dc9ee047f70",
+      "adapters/workz.py": "6f73ae72f4380e379413c18c62e1f7320cb34564e3214abf4e6198c2b68573fa",
+      "outcomes.py": "205430c823ad8127568701e913ac67c27dfb8fc749a9c131fbf813dcff4c98b5",
+      "record.py": "a914f61b737d706c8f8a9ac70424b4f54fc0ae979ff2669d4e29072baca2cb66",
+      "run.py": "06632638aef07b72ed0ba30a1ddfeb3143ce1d8c9627812bb3fe280d8009924d",
+      "scenario.py": "a4e2c00016164775dc9064e412723f95995c88817daa73c1b44b2d95878508c3",
+      "stats.py": "5a9be58d3090877df570695c1395f574ca4725e537f00ead6575640007af1ffe",
+      "testing.py": "41079e92a3c0e4d936a0f5b559b221ce78c4106dfba933e82b4679cc346f628e",
+      "transport.py": "15e690cc72e65a566364f1d9f1b4c26ed6f99806e11cfa1c270dc24b6fb5b528",
+      "verify.py": "b02793fb279e334315c2ae243015e373982ad3a4f9e4128544c3058456c9a3c8"
+    }
+  },
+  "host": {
+    "machine": "arm64",
+    "python": "3.12.9",
+    "release": "24.6.0",
+    "system": "Darwin"
+  },
+  "image": "ev-base",
+  "image_id": "sha256:748dca6569d1619558c68bcdda89b1770896995c3a286a26f72de572d55b7a2b",
+  "isolation": {
+    "a": {
+      "pg": [
+        "sysid",
+        "7693714259871724241",
+        "/home/agent/.local/state/mise/daemons/cafd555678070c8/data/postgres"
+      ],
+      "redis": [
+        "80711bab4ab70972dca9586b3138794ba9be9813"
+      ]
+    },
+    "b": {
+      "pg": [
+        "sysid",
+        "7693714290795727419",
+        "/home/agent/.local/state/mise/daemons/1bcdb5caafd60682/data/postgres"
+      ],
+      "redis": [
+        "1a3b35a4f4255ffb1a5168367f0dceea5bb4cfc1"
+      ]
+    },
+    "boundary": "service-instance"
+  },
+  "isolation_boundary": "service-instance",
+  "keep": false,
+  "measurement": "diagnostic: timings recorded per check; only passing checks' samples count",
+  "options": {
+    "stack_binary": "/tmp/stack-pr-build/target/release/stack",
+    "stack_sha256": "932acfa6019a731873e5592a84a0e3b1841a95da872c6965a5340ca55e5843f0"
+  },
+  "pins": {
+    "mise": "2026.10.3",
+    "stack_binary": "/tmp/stack-pr-build/target/release/stack",
+    "stack_sha256": "932acfa6019a731873e5592a84a0e3b1841a95da872c6965a5340ca55e5843f0"
+  },
+  "prepare_scope": "benchmark glue only: fixture + tool config copy, source token",
+  "repeats": 20,
+  "reportable": false,
+  "resources": {
+    "cpus": null,
+    "memory": null
+  },
+  "run_id": "20261007t002031-19c681",
+  "setup_scope": "`stack compile` only: resolves versions, writes stack.lock and assigns ports. Tool and service installation happens in `stack up` (start), so first_task is the comparable time. The frozen recipe uses `stack install`, which installs from the lock without starting",
+  "shared_glue": {
+    "rwb-env.sh": "b3855e88af12fc9a0e92a8105d8ef260cc703656e56203d20aca1653b647664c",
+    "rwb-services.sh": "e7572678db45619ab0927b6539ea7ff39e0c78f16edc71e09364e212223e5b7d"
+  },
+  "start_scope": "",
+  "started_unix_ns": 1791332431047131000,
+  "started_utc": "2026-10-07T00:20:31Z",
+  "timings": {
+    "deps.first_checkout": 547839958,
+    "deps.second_checkout": 124193584,
+    "first_task.a": {
+      "checkout": "first in run",
+      "excluded_prepare": "benchmark glue only: fixture + tool config copy, source token",
+      "ok": true,
+      "prepare_ns": 260412917,
+      "starts_from": "prepared checkout",
+      "steps": [
+        7,
+        9,
+        10,
+        11,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19
+      ],
+      "steps_ns": 14481431708,
+      "transport": "docker-exec",
+      "wall_ns": 14930076166
+    },
+    "first_task.b": {
+      "checkout": "second, A's lock, warm caches",
+      "excluded_prepare": "benchmark glue only: fixture + tool config copy, source token",
+      "ok": true,
+      "prepare_ns": 79407291,
+      "starts_from": "prepared checkout",
+      "steps": [
+        23,
+        24,
+        25,
+        26,
+        28,
+        29,
+        31,
+        32,
+        33,
+        34
+      ],
+      "steps_ns": 7383162501,
+      "transport": "docker-exec",
+      "wall_ns": 7736647375
+    },
+    "prepare.a": 260412917,
+    "prepare.b": 79407291,
+    "prepare.c": 75362083,
+    "prepare.d": 73874750,
+    "prepare.e": 63775750,
+    "ready.a": 991510542,
+    "ready.b": 5928234126,
+    "repeat.app_read": {
+      "inner": {
+        "failed": 0,
+        "max_ms": 340.881,
+        "min_ms": 125.056,
+        "n": 20,
+        "ok": 20,
+        "p50_ms": 133.767,
+        "p95_ms": 175.432
+      },
+      "outer": {
+        "failed": 0,
+        "max_ms": 414.813,
+        "min_ms": 181.389,
+        "n": 20,
+        "ok": 20,
+        "p50_ms": 191.733,
+        "p95_ms": 239.188
+      },
+      "transport": "docker-exec",
+      "warmups": 3
+    },
+    "repeat.entry": {
+      "inner": {
+        "failed": 0,
+        "max_ms": 35.266,
+        "min_ms": 28.484,
+        "n": 20,
+        "ok": 20,
+        "p50_ms": 33.139,
+        "p95_ms": 34.967
+      },
+      "outer": {
+        "failed": 0,
+        "max_ms": 101.388,
+        "min_ms": 81.729,
+        "n": 20,
+        "ok": 20,
+        "p50_ms": 90.33,
+        "p95_ms": 96.659
+      },
+      "transport": "docker-exec",
+      "warmups": 3
+    },
+    "setup.first_checkout": 1488854250,
+    "setup.second_checkout": 71818333
+  },
+  "title": "Stack",
+  "tool": "stack",
+  "transport": "docker",
+  "valid": true,
+  "variant": "default",
+  "warmups": 3
+}
