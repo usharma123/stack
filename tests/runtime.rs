@@ -1828,6 +1828,58 @@ fn down_during_a_changed_generation_stops_the_old_service_and_reports_the_new_po
     assert!(!pid_alive(pid));
 }
 
+#[test]
+fn without_a_record_the_supervisors_active_port_decides_what_is_owned() {
+    // No session record, the provider reports the daemon with a configured port it does not
+    // listen on, and a squatter holds that configured port. Only Pitchfork's active port can
+    // tell the two apart; discarding its answer would wait on the squatter.
+    let fixture = Fixture::with_bundle(WEB);
+    let old = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, old);
+    fixture.ok(&["up", "--json"]);
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    for path in fixture.session_paths() {
+        fs::remove_file(path).unwrap();
+    }
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let new = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
+    report_generation_change(&fixture, old, new);
+
+    let started = Instant::now();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert!(started.elapsed() < Duration::from_secs(10), "waited on the squatter: {down}");
+    assert_eq!(down["data"]["conflicts"][0]["port"], new, "{down}");
+    assert!(!pid_alive(pid), "old service survived");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", old)).is_err());
+    // The supervisor was discovered without a record and asked for the active port.
+    let log = fs::read_to_string(fixture.dir.path().join("pitchfork.log")).unwrap();
+    assert!(log.contains("status --json app-test/web"), "{log}");
+    let mise_log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(mise_log.contains("which pitchfork"), "{mise_log}");
+
+}
+
+#[test]
+fn without_a_record_or_an_active_port_the_configured_port_is_waited_for_not_assumed_foreign() {
+    let fixture = Fixture::with_bundle(WEB);
+    let old = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, old);
+    fixture.ok(&["up", "--json"]);
+    for path in fixture.session_paths() {
+        fs::remove_file(path).unwrap();
+    }
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let new = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
+    report_generation_change(&fixture, old, new);
+    // The supervisor knows no such daemon: nothing establishes where it listens.
+    fs::remove_file(fixture.dir.path().join("pf-status.json")).unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "stop_unconfirmed");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", new)).is_ok(), "the squatter was ended");
+}
+
 fn pid_alive(pid: u32) -> bool {
     Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success()
 }
