@@ -22,8 +22,11 @@ stack = "stack down"
 ```
 
 - `pre-start` runs in the new worktree after it is created and before background creation
-  hooks and `--execute`. If it fails (for example `port_conflict` or `lock_outdated`), the
-  worktree exists but nothing started; fix the cause and run the commands by hand.
+  hooks and `--execute`. If it fails before launch (`lock_outdated`, `port_conflict`,
+  `install_failed`), the worktree exists and nothing started. If it fails during start or
+  verification (`start_failed`, `not_ready`), services may be running under a launch record:
+  check `stack status` and run `stack down` before abandoning the worktree. Either way, fix
+  the cause and run the two commands by hand.
 - `pre-remove` runs in the worktree about to be removed. A failing `stack down`
   (`stop_unconfirmed`, a supervisor query failure) aborts the removal, so services are never
   orphaned by `wt remove`. `--no-hooks` skips both hooks; then stop services yourself first.

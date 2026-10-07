@@ -28,10 +28,16 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   port change or remove the pin in `[override.services]`, or free the port. Stack never kills
   the other program and never reassigns ports on its own.
 - `down` succeeds when everything stack owns is stopped. A foreign listener on one of this
-  checkout's reserved ports is listed under `conflicts` in the result, not waited for.
+  checkout's reserved ports is listed under `conflicts` in the result, not waited for. What
+  stack owns is where a running daemon actually listens (asked of Pitchfork when the
+  configured port changed under it, as after `--reassign-ports`) and the recorded port of a
+  live recorded process; when that cannot be established, the port is waited for rather than
+  assumed foreign.
 - `logs` asks the supervisor (`mise daemons logs`) for one service's stored output, bounded to
   `--tail` lines, 1 MiB and 30 seconds; it never follows. `unknown_service` names the services
-  the project defines; `logs_failed` means the supervisor has nothing for that daemon here.
+  the project defines; `logs_failed` is a failed retrieval, whether the daemon was never
+  started here, the provider exited nonzero, or the deadline passed; its message and `details`
+  say which.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;

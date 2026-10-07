@@ -61,9 +61,12 @@ independent agents, not scripts, use stack concurrently.
   killing a service mid-task, killing the agent runner (expect lease reclamation), deleting a
   checkout while its services run (expect `stack gc` to report `gc_incomplete` and keep the
   ownership record; by design it never stops a gone project's daemons by name, see
-  [DESIGN.md](DESIGN.md#runtime-contract). The orphan count for this fault measures what the
-  explicit recovery path, `stack down` from a restored checkout or stopping the recorded
-  supervisor daemon, leaves behind, not what GC removes), a foreign listener on a checkout's
+  [DESIGN.md](DESIGN.md#runtime-contract). Recreating the directory does not restore
+  ownership: a new directory at the old path is a different project and gets
+  `session_conflict`. The orphan count for this fault measures what the explicit recovery
+  path leaves behind, not what GC removes: identify the recorded supervisor daemon from the
+  indexed session (`provider_id`, `provider.state_dir`), stop it with Pitchfork directly, then
+  retry `stack gc`), a foreign listener on a checkout's
   assigned port (expect `port_conflict` and recovery through `stack compile --reassign-ports`).
 - **Recorded per run.** Task outcome (hidden test), wall time, agent tool calls, stack errors by
   code, every connection's reached instance (Postgres `data_directory`, Redis `dir`, logged by

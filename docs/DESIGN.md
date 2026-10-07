@@ -117,8 +117,12 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
   those processes dead and ports closed. A reserved port is stack's to wait for only when a
-  running or starting daemon, or a live recorded process, is behind it; a foreign listener on a
-  reserved port is reported in `conflicts`, not stopped and not a failure.
+  running or starting daemon, or a live recorded process, is behind it. `mise daemons` reports
+  a daemon's configured port, which after a generation change is the new allocation, so a
+  running daemon whose configured port differs from its recorded one is asked through
+  `pitchfork status --json` for its active port; if that cannot be established the recorded
+  (else configured) port is waited for. A foreign listener on a reserved port is reported in
+  `conflicts`, not stopped and not a failure.
 - **Installing.** `install` runs the compile, trust, socket-preflight and install steps of `up`
   and nothing after: no session, no stop, no start. It is locked like `up`.
 - **Logs.** `logs <service> --tail N` returns the supervisor's stored output for one daemon
