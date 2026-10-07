@@ -35,4 +35,4 @@ start=$(date +%s)
   echo '{"jsonrpc":"2.0","id":2,"method":"ping"}'
 } | stack mcp >"$T/mcp-timeout.out"
 (( $(date +%s) - start < 6 )) || fail 'MCP response exceeded the timeout'
-jq -se 'length == 2 and .[0].result.structuredContent.data.timed_out and .[1].result == {}' "$T/mcp-timeout.out" >/dev/null
+jq -se 'length == 2 and (.[0].result | (.isError and .structuredContent.error.code == "timed_out" and .structuredContent.error.details[0].timed_out)) and .[1].result == {}' "$T/mcp-timeout.out" >/dev/null
