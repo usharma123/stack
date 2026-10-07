@@ -74,17 +74,25 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   until their recorded processes are gone and ports closed, starts them again and verifies the
   whole stack, like `up`. Other services keep running and the session keeps its id. Use it
   after editing code a running service loaded; `up` leaves an unchanged configuration's
-  processes alone. It fails with `no_session` before `up`, `session_stale` when the
-  configuration changed since `up` (run `up`, which restarts what changed), and
-  `session_busy` while commands run in the session.
+  processes alone. Like `up`, it records an incomplete launch before starting anything and
+  records each replacement process as the supervisor reports it, so a failed restart leaves
+  the session unverified (run `up`) without losing track of what it started. It fails with
+  `no_session` before `up`, `session_stale` when the configuration changed since `up` or the
+  last start did not finish verifying (run `up`), and `session_busy` while commands run in
+  the session. Over MCP, `services` must be an array of names; omitting it restarts every
+  service.
 - A service can list `watch = ["app.py", "src"]`: files or directories (walked recursively,
   skipping hidden, `node_modules`, `target` and `__pycache__` entries), relative to the
   project. When one changed after the service started, `status`, `exec` and `run` report it
   in the check's `changed_since_start` (and on stderr) with a `stack restart` hint. It is a
-  note, not a verification failure. In a bundle, `{{bundle_dir}}` works in `watch` too.
+  note, not a verification failure. Each check examines at most 20000 directory entries and
+  does not follow links to directories; beyond that it sets `watch_incomplete`. Modification
+  times are compared to the millisecond. In a bundle, `{{bundle_dir}}` works in `watch` too.
 - `logs` prints, on stderr, when the current process started. The supervisor keeps output
-  across restarts; `--since-start` returns only the current process's lines. Sessions started
-  before 0.1.18 have no recorded start time until `up` starts a new process or `restart`.
+  across restarts; `--since-start` returns only the current process's lines (by the
+  supervisor's whole-second timestamps; during a repeated hour when clocks go back it may
+  include up to a second more). Processes started before 0.1.18 have no recorded start time
+  until `restart`, or `up` starts a new process.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;
   ownership records are kept so it can be retried. For a deleted (or replaced) project directory
   it queries Pitchfork using the recorded daemon IDs but never issues a stop-by-name request.

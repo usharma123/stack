@@ -480,9 +480,7 @@ pub fn logs(root: &Path, service: &str, tail: usize, since: Option<u64>) -> Resu
     configure_command(&mut command, root);
     command.args(["daemons", "logs", "--", service, "-n", &n, "--raw", "--no-pager"]);
     if let Some(at) = since {
-        let at = local_datetime(at)
-            .ok_or_else(|| StackError::new("logs_failed", format!("cannot express {at} as local time")))?;
-        command.args(["--since", &at]);
+        command.args(["--since", &since_argument(at, crate::state::now())]);
     }
     command
         .current_dir(root)
@@ -501,6 +499,25 @@ pub fn logs(root: &Path, service: &str, tail: usize, since: Option<u64>) -> Resu
             .details(vec![serde_json::json!({ "output": detail })]));
     }
     Ok(out)
+}
+
+/// Pitchfork's `--since` for the instant `at`: local wall-clock time, which it reads as an
+/// exact instant. A wall-clock time that names two instants (the repeated hour when clocks go
+/// back) or that cannot be formatted falls back to a relative age, rounded up so the start
+/// second is kept.
+fn since_argument(at: u64, now: u64) -> String {
+    since_argument_in(at, now, local_datetime)
+}
+
+fn since_argument_in(at: u64, now: u64, local_datetime: impl Fn(u64) -> Option<String>) -> String {
+    let local = local_datetime(at);
+    let ambiguous = local.is_none()
+        || local == local_datetime(at + 3600)
+        || local == at.checked_sub(3600).and_then(&local_datetime);
+    match local {
+        Some(local) if !ambiguous => local,
+        _ => format!("{}s", now.saturating_sub(at) + 1),
+    }
 }
 
 /// `YYYY-MM-DD HH:MM:SS` in local time, the form Pitchfork's `--since` takes for an instant.
@@ -564,6 +581,18 @@ mod tests {
         for bad in ["", "\n", "latest\n", "3.13.1\n3.13.2\n", "a b\n"] {
             assert_eq!(parse_resolved(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn log_cutoffs_avoid_wall_clock_times_that_name_two_instants() {
+        // A zone whose clocks go back an hour at 7200: 3600..7200 and 7200..10800 read alike.
+        let wall = |t: u64| Some(format!("wall {}", if (7200..10800).contains(&t) { t - 3600 } else { t }));
+        assert_eq!(since_argument_in(1000, 2000, wall), "wall 1000");
+        assert_eq!(since_argument_in(5000, 9000, wall), "4001s", "first pass through the repeated hour");
+        assert_eq!(since_argument_in(8000, 9000, wall), "1001s", "second pass");
+        assert_eq!(since_argument_in(20_000, 20_005, wall), "wall 20000");
+        assert_eq!(since_argument_in(5, 10, |_| None), "6s");
+        assert!(local_datetime(1_791_404_602).is_some_and(|t| t.len() == 19));
     }
 
     #[test]

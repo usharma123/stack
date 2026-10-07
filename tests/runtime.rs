@@ -1073,7 +1073,7 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     let up = json_result(&fixture.ok(&["up", "--json"]));
     let before = up["data"]["checks"][0]["pid"].as_u64().unwrap();
-    assert!(up["data"]["session"]["services"]["web"]["started_at"].is_u64(), "{up}");
+    assert!(up["data"]["session"]["services"]["web"]["started_at_ms"].is_u64(), "{up}");
 
     // Edited after the service started: reported, not a verification failure.
     thread::sleep(Duration::from_millis(1100));
@@ -1111,6 +1111,158 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     fixture.ok(&["down"]);
     let out = fixture.command(&["restart", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "no_session");
+}
+
+#[test]
+fn a_failed_restart_records_the_replacement_it_launched() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let old = up["data"]["session"]["services"]["web"]["pid"].as_u64().unwrap();
+    fs::write(fixture.dir.path().join("fail-env-after-start"), "").unwrap();
+    let out = fixture.command(&["restart", "web", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let replacement: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    assert_ne!(u64::from(replacement), old);
+    for path in fixture.session_paths() {
+        let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["launching"], true, "{record}");
+        assert_eq!(record["services"]["web"]["pid"], replacement, "{record}");
+    }
+    fs::remove_file(fixture.dir.path().join("fail-env-after-start")).unwrap();
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["healthy"], false, "{status}");
+    let out = fixture.command(&["restart", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "session_stale");
+
+    // A deleted checkout's GC keeps the incomplete record rather than releasing a live service.
+    let moved = fixture.dir.path().join("moved");
+    fs::rename(fixture.dir.path().join("app"), &moved).unwrap();
+    let gc = json_result(&fixture.command_at(fixture.dir.path(), &["gc", "--json"]).output().unwrap());
+    assert_eq!(gc["ok"], false, "{gc}");
+    assert_eq!(fixture.index_files(), 1);
+    assert!(pid_alive(replacement));
+    fs::rename(&moved, fixture.dir.path().join("app")).unwrap();
+    fixture.ok(&["up"]);
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+    fixture.ok(&["down"]);
+    assert!(!pid_alive(replacement));
+}
+
+#[test]
+fn a_moved_checkouts_only_record_is_kept_and_named() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    for path in fixture.session_paths().into_iter().skip(1) {
+        fs::remove_file(path).unwrap();
+    }
+    let moved = fixture.dir.path().join("moved");
+    fs::rename(fixture.dir.path().join("app"), &moved).unwrap();
+    fs::write(fixture.dir.path().join("daemons.json"), "[]").unwrap();
+    for command in [&["status", "--json"][..], &["down", "--json"]] {
+        let result = json_result(&fixture.command_at(&moved, command).output().unwrap());
+        assert_eq!(result["error"]["code"], "session_conflict", "{command:?}: {result}");
+        assert!(result["error"]["hint"].as_str().unwrap().contains("move the directory back"), "{result}");
+    }
+    assert!(moved.join(".stack/session.json").exists(), "the last record is kept");
+    assert!(pid_alive(pid));
+    Command::new("kill").arg(pid.to_string()).status().unwrap();
+}
+
+#[test]
+fn mcp_restart_rejects_a_malformed_service_list_before_stopping_anything() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let _ = fs::remove_file(fixture.dir.path().join("mise.log"));
+    let results = fixture.mcp(
+        &[("stack_restart", json!({ "services": "web" })), ("stack_restart", json!({ "services": [123] }))],
+        &[],
+    );
+    for result in &results {
+        assert_eq!(result["structuredContent"]["error"]["code"], "usage", "{result}");
+    }
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap_or_default();
+    assert!(!log.contains("daemons stop"), "{log}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn watch_compares_modification_times_below_a_second() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
+    let file = fixture.dir.path().join("app/main.py");
+    fs::write(&file, "before").unwrap();
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let start = up["data"]["session"]["services"]["web"]["started_at_ms"].as_u64().unwrap();
+    let set_mtime = |ms: u64| {
+        let file = fs::File::options().write(true).open(&file).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms)).unwrap();
+    };
+    let changed = || json_result(&fixture.ok(&["status", "--json"]))["data"]["checks"][0]["changed_since_start"].clone();
+    set_mtime(start - 1);
+    assert_eq!(changed(), Value::Null);
+    set_mtime(start + 1);
+    assert_eq!(changed(), json!(["main.py"]));
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_watch_too_large_to_scan_is_reported_incomplete() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['wide']\n");
+    let wide = fixture.dir.path().join("app/wide");
+    fs::create_dir(&wide).unwrap();
+    for i in 0..20_010 {
+        fs::File::create(wide.join(i.to_string())).unwrap();
+    }
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let start = Instant::now();
+    let out = fixture.ok(&["status", "--json"]);
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert_eq!(json_result(&out)["data"]["checks"][0]["watch_incomplete"], true);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn up_keeps_a_legacy_process_start_time_unknown() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let pid = up["data"]["session"]["services"]["web"]["pid"].clone();
+    for path in fixture.session_paths() {
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["services"]["web"].as_object_mut().unwrap().remove("started_at_ms");
+        fs::write(path, record.to_string()).unwrap();
+    }
+    let again = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(again["data"]["session"]["services"]["web"]["pid"], pid);
+    assert_eq!(again["data"]["session"]["services"]["web"].get("started_at_ms"), None, "{again}");
+    let out = fixture.command(&["logs", "web", "--since-start", "--json"]).output().unwrap();
+    assert!(json_result(&out)["error"]["hint"].as_str().unwrap().contains("stack restart"));
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn exec_with_a_timeout_passes_termination_on_to_the_command() {
+    let fixture = Fixture::new();
+    let marker = fixture.dir.path().join("child-pid");
+    let mut stack = fixture
+        .command(&["exec", "--timeout", "60s", "--", "sh", "-c", &format!("echo $$ > {}; exec sleep 60", marker.display())])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fs::read_to_string(&marker).map_or(true, |s| s.trim().is_empty()) {
+        assert!(Instant::now() < deadline, "command never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let child: u32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
+    let status = stack.wait().unwrap();
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    assert!(!pid_alive(child), "command {child} outlived stack");
 }
 
 #[test]

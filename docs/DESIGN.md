@@ -26,9 +26,11 @@ change what a bundle means.
   in the machine state dir): assigned ports, supervisor PIDs, data directories, verification
   results with timestamps, each service's start time, and an optional lease. It records what
   stack started; it is never treated as proof of what is running. The project copy only
-  mirrors the machine index for its own path: one naming another directory was copied in
-  (committed, cloned, duplicated) and is ignored. Stack keeps `.stack/` out of Git with its
-  own `.gitignore`.
+  mirrors the machine index for its own path. One naming another directory from a different
+  directory (by device and inode) was copied in (committed, cloned, duplicated) and is
+  ignored. One that came along when this directory was moved, or that cannot tell, may be the
+  last record of running services: it is kept and reported as `session_conflict` naming the
+  original path. Stack keeps `.stack/` out of Git with its own `.gitignore`.
 
 ## Composition rule
 

@@ -203,10 +203,15 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             session::logs(ctx, service, tail, args["since_start"] == true).map(to_value)
         }
         "stack_restart" => {
-            let services: Vec<String> = args["services"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            // Omitted or empty means every service; anything malformed must not widen to that.
+            let services: Vec<String> = match &args["services"] {
+                Value::Null => Vec::new(),
+                Value::Array(items) => items
+                    .iter()
+                    .map(|v| v.as_str().map(String::from).ok_or_else(|| StackError::new("usage", format!("service name {v} is not a string"))))
+                    .collect::<Result<_>>()?,
+                v => return Err(StackError::new("usage", format!("services must be an array of service names, not {v}"))),
+            };
             session::restart(ctx, &services).map(to_value)
         }
         "stack_status" => session::status(ctx).map(to_value),

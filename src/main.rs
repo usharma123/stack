@@ -411,6 +411,9 @@ fn warn_unverified(checks: &[session::Check]) {
 
 /// Services whose watched files changed after they started.
 fn warn_changed(checks: &[session::Check]) {
+    for c in checks.iter().filter(|c| c.watch_incomplete) {
+        eprintln!("stack: {}'s watch paths hold too many entries to check them all; narrow `watch`", c.service);
+    }
     for c in checks.iter().filter(|c| !c.changed_since_start.is_empty()) {
         eprintln!(
             "stack: {} changed after {} started; run `stack restart {}` to load it",
