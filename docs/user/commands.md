@@ -40,6 +40,9 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   say which.
 - `status --json` reports `healthy` (every service verified and the session current); the
   exit code is 1 exactly when it is false, while `ok` stays true because status itself worked.
+  In a checkout with no launch record and no generated config yet (a fresh worktree), services
+  are reported not launched without querying the supervisor. With a launch record, a missing
+  generated config is written again from `stack.lock` and the services are verified as usual.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;

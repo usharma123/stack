@@ -1970,6 +1970,41 @@ fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
 }
 
 #[test]
+fn status_of_a_checkout_never_compiled_here_says_to_start_it_without_asking_the_supervisor() {
+    let fixture = Fixture::with_bundle(WEB);
+    // A fresh worktree has the committed stack.lock but no generated provider config, and an
+    // unconfigured `mise daemons` blames its own settings; it must not be asked.
+    fs::remove_file(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "unhealthy");
+    let result = json_result(&out);
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["healthy"], false);
+    assert_eq!(result["data"]["checks"][0]["ready"], false);
+    assert!(result["data"]["checks"][0]["reason"].as_str().unwrap().contains("stack up"), "{result}");
+    let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
+    assert!(json_result(&out)["error"]["hint"].as_str().unwrap().contains("stack up"));
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons --json") && !log.contains("daemons logs"), "{log}");
+}
+
+#[test]
+fn a_launched_checkout_missing_its_generated_config_is_still_asked_about() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    fixture.ok(&["up"]);
+    let config = fixture.dir.path().join("app/.config/mise/conf.d/stack.toml");
+    fs::remove_file(&config).unwrap();
+    // A launch record exists, so services may well be running: never claim otherwise.
+    let result = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(result["data"]["checks"][0]["ready"], true, "{result}");
+    assert!(config.exists(), "the derived config is written again from stack.lock");
+    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+}
+
+#[test]
 fn status_reports_health_alongside_the_exit_code() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);

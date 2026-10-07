@@ -827,6 +827,14 @@ pub fn logs(ctx: &Ctx, service: &str, tail: usize) -> Result<LogsReport> {
     if !report.stack.services.contains_key(service) {
         return Err(unknown_service(&report, service));
     }
+    let configured = {
+        let _guard = project_lock(&ctx.state, &ctx.root)?;
+        has_provider_config(ctx, &report, load(ctx)?.is_some())?
+    };
+    if !configured {
+        return Err(StackError::new("logs_failed", format!("no launch record for {service} in this checkout"))
+            .hint("run `stack up` first"));
+    }
     let out = mise::logs(&ctx.root, service, tail)?;
     let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
     let skip = lines.len().saturating_sub(tail);
@@ -1154,6 +1162,8 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let report = ctx.compile(false)?;
     let checks = if report.stack.services.is_empty() {
         Vec::new()
+    } else if !has_provider_config(ctx, &report, session.is_some())? {
+        not_launched(&report)
     } else {
         let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
         verify_session(
@@ -1178,6 +1188,41 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
         session,
         checks,
     })
+}
+
+/// Whether the provider can be asked about this checkout. A fresh checkout (a committed
+/// stack.lock, no generated config yet) cannot be: an unconfigured `mise daemons` blames its own
+/// settings. Without a launch record either, nothing was started from here. With one, the
+/// derived config is only missing (deleted, say) and is written again from stack.lock.
+fn has_provider_config(ctx: &Ctx, report: &Report, launched: bool) -> Result<bool> {
+    if report.output.exists() {
+        return Ok(true);
+    }
+    if !launched {
+        return Ok(false);
+    }
+    ctx.compile(true)?;
+    Ok(true)
+}
+
+fn not_launched(report: &Report) -> Vec<Check> {
+    report
+        .stack
+        .services
+        .keys()
+        .map(|service| Check {
+            service: service.clone(),
+            ready: false,
+            port: report.ports.get(service).copied(),
+            pid: None,
+            identity: None,
+            reason: Some("no launch record in this checkout; run `stack up`".into()),
+            withheld: Vec::new(),
+            checked_at: now(),
+            data_dir: None,
+            provider_id: None,
+        })
+        .collect()
 }
 
 pub struct ExecPlan {
