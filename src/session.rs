@@ -1538,6 +1538,29 @@ pub enum Require {
     Only(Vec<String>),
 }
 
+/// A declared task as a command for `plan_exec`, with every service required. `mise run`
+/// keeps the provider's task semantics (templates, shebangs, argument passing); `--skip-deps`
+/// stops it from starting the task's daemons itself, since stack verifies them instead.
+pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<String>, Require)> {
+    let report = ctx.compile(false)?;
+    report.stack.tasks.get(name).ok_or_else(|| {
+        let known: Vec<&str> = report.stack.tasks.keys().map(String::as_str).collect();
+        StackError::new("unknown_task", format!("no task named '{name}'")).hint(if known.is_empty() {
+            "this project defines no tasks; add one under [tasks.<name>] in stack.toml".to_string()
+        } else {
+            format!("tasks: {}", known.join(", "))
+        })
+    })?;
+    let mut command: Vec<String> = ["mise", "run", "--skip-deps", "--no-timings", name, "--"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    command.extend(args.iter().cloned());
+    // `mise run` evaluates the provider config again and would restore the endpoints that
+    // `plan_exec` withholds from unverified services. Only a fully verified stack has none.
+    Ok((command, Require::All))
+}
+
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");

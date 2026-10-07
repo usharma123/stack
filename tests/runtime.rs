@@ -80,6 +80,10 @@ case "$1 $2" in
       touch "$REVIEW_FIXTURE/started"
     fi
     if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
+  'run --skip-deps')
+    # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
+    shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
+    if test "$task" = fail; then exit 3; fi ;;
   'daemons logs')
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
@@ -2019,4 +2023,37 @@ fn unknown_required_services_name_the_ones_that_exist() {
     let error = &json_result(&out)["error"];
     assert_eq!(error["code"], "unknown_service");
     assert_eq!(error["hint"], "services: web");
+}
+
+#[test]
+fn run_hands_a_declared_task_to_mise_without_its_daemon_startup() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.greet]\nrun='echo hi'\n[tasks.fail]\nrun='false'\n");
+    let out = fixture.ok(&["run", "greet", "--", "a b", "it's", "--flag"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "greet|a b|it's|--flag|", "arguments arrive intact");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("run --skip-deps --no-timings greet -- a b it's --flag"), "{log}");
+
+    let out = fixture.command(&["--json", "run", "fail"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "the task's exit code");
+    assert_eq!(json_result(&out)["data"]["exit_code"], 3);
+
+    let out = fixture.command(&["--json", "run", "nope"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "unknown_task");
+    assert_eq!(error["hint"], "tasks: greet, fail");
+}
+
+#[test]
+fn run_refuses_while_any_service_is_unverified() {
+    // Even a task that names no services: `mise run` would hand it every service's endpoint
+    // again, including the ones stack withholds.
+    let fixture = Fixture::with_bundle(
+        "[bundle]\nname='test'\n[services.web]\nrun='true'\n[tasks.lint]\nrun='touch ran'\n",
+    );
+    let out = fixture.command(&["--json", "run", "lint"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "service_unavailable", "{error}");
+    assert_eq!(error["details"][0]["service"], "web");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("run --skip-deps"), "the task must not start:\n{log}");
 }

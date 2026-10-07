@@ -44,6 +44,9 @@ stack exec --require redis -- python -c 'import os; print(os.environ["REDIS_URL"
 stack down                    # stop services and confirm they are gone
 ```
 
+Define `[tasks.<name>]` in `stack.toml` and run them with `stack run <name>`, which first
+verifies the stack's services.
+
 Commit `stack.toml` and `stack.lock` to share the configuration and resolved versions.
 Use `--json` for structured command results, or `stack mcp` for the stdio MCP server.
 

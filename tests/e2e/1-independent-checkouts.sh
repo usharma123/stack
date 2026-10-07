@@ -37,6 +37,9 @@ for a in appA appB; do
   stack up --json > "$T/up-$a.json"
   assert_json '.ok and (.data.checks | length == 2) and all(.data.checks[]; .ready and .identity == "instance" and .port >= 40000 and .port <= 49999)' "$T/up-$a.json"
   stack exec --require-all -- bash -c 'set -euo pipefail; uv sync -q; uv run pytest -q'
+  # The declared task, through mise's task runner, without mise starting the daemons again.
+  stack run test >"$T/run-$a.out" 2>&1 || { cat "$T/run-$a.out"; fail "stack run test failed in $a"; }
+  if grep -q 'already running' "$T/run-$a.out"; then cat "$T/run-$a.out"; fail "mise run restarted daemons in $a"; fi
   actual=$(stack exec --require postgres -- bash -c 'psql "$DATABASE_URL" -Atc "show data_directory"')
   expected=$(jq -r '.data.session.services.postgres.data_dir' "$T/up-$a.json")
   [[ "$actual" == "$expected" ]] || fail "wrong Postgres in $a"

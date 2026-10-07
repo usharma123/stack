@@ -48,7 +48,8 @@ LOG_LEVEL = "warn"     # both bundles set LOG_LEVEL; the project must choose
 ```sh
 stack compile                          # resolve, lock, assign ports, write .config/mise/conf.d/stack.toml
 stack up --ttl 30m                     # start services, verify each is *this* instance, record a session
-stack exec --require postgres -- pytest
+stack run test                         # the [tasks.test] command, once the services verify
+stack exec --require postgres -- psql  # any other command
 stack down                             # succeeds only once the processes are confirmed gone
 ```
 

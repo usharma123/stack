@@ -78,6 +78,17 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Run a task from stack.toml once every service verifies
+    Run {
+        /// Task name, as in [tasks.<name>]
+        task: String,
+        /// With --json: stop the task after this long (e.g. 10m). Default: no limit
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
+        /// Extra arguments, appended to the task's command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Stop services; succeeds only once their processes are gone
     Down,
     /// Renew this project's session lease
@@ -200,15 +211,10 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            if cli.json {
-                exec_json(&ctx, cmd, &req, timeout.as_deref())
-            } else if timeout.is_some() {
-                Err(StackError::new("usage", "--timeout applies only with --json")
-                    .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
-            } else {
-                exec(&ctx, cmd, &req)
-            }
+            run_command(&ctx, cli.json, cmd, &req, timeout.as_deref())
         }
+        Cmd::Run { task, timeout, args } => session::task_command(&ctx, task, args)
+            .and_then(|(cmd, req)| run_command(&ctx, cli.json, &cmd, &req, timeout.as_deref())),
         Cmd::Down => session::down(&ctx).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
@@ -340,6 +346,17 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             println!("wrote {}{}", r.output.display(), if r.lock_changed { " and stack.lock" } else { "" });
         }
     })
+}
+
+fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+    if as_json {
+        exec_json(ctx, cmd, require, timeout)
+    } else if timeout.is_some() {
+        Err(StackError::new("usage", "--timeout applies only with --json")
+            .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
+    } else {
+        exec(ctx, cmd, require)
+    }
 }
 
 fn exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExitCode> {
