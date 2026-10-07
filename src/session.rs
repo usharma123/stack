@@ -1143,6 +1143,8 @@ pub struct StatusReport {
     pub lease_expired: Option<String>,
     /// The complete compiled configuration changed since the session started.
     pub stale: bool,
+    /// Every service verified and the session is current; `stack status` exits 1 otherwise.
+    pub healthy: bool,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
@@ -1163,14 +1165,16 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
             &Timings::new("status"),
         )
     };
+    let stale = session
+        .as_ref()
+        .is_some_and(|s| s.config_digest != config_digest(ctx, &report));
     Ok(StatusReport {
+        healthy: !stale && checks.iter().all(|c| c.ready),
+        stale,
         lease_expired: session
             .as_ref()
             .and_then(|s| s.lease.as_ref())
             .and_then(|l| l.expired(now())),
-        stale: session
-            .as_ref()
-            .is_some_and(|s| s.config_digest != config_digest(ctx, &report)),
         session,
         checks,
     })

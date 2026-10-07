@@ -38,6 +38,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the project defines; `logs_failed` is a failed retrieval, whether the daemon was never
   started here, the provider exited nonzero, or the deadline passed; its message and `details`
   say which.
+- `status --json` reports `healthy` (every service verified and the session current); the
+  exit code is 1 exactly when it is false, while `ok` stays true because status itself worked.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;

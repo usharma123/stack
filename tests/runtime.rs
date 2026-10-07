@@ -1970,6 +1970,14 @@ fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
 }
 
 #[test]
+fn status_reports_health_alongside_the_exit_code() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let result = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(result["data"]["healthy"], true, "{result}");
+}
+
+#[test]
 fn unknown_required_services_name_the_ones_that_exist() {
     let fixture = Fixture::with_bundle(WEB);
     let out = fixture.command(&["--json", "exec", "--require", "kafka", "--", "true"]).output().unwrap();
