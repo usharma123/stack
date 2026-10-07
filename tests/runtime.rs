@@ -1199,10 +1199,14 @@ fn a_legacy_session_copy_is_ignored_unless_it_may_be_the_last_record_of_a_live_s
     let saved = fs::read(&index).unwrap();
     fs::remove_file(&index).unwrap();
     assert_eq!(status()["error"]["code"], "session_conflict");
-    // Once nothing it names runs, the copy describes nothing and is ignored.
+    // Once the supervisor confirms nothing it names runs, the copy describes nothing and is ignored.
     fs::write(&index, saved).unwrap();
     fixture.ok(&["down"]);
     assert_eq!(status()["data"]["session"], Value::Null);
+    // A launch that was in progress may still register services, so that copy is kept.
+    legacy["launching"] = Value::Bool(true);
+    fs::write(other.join(".stack/session.json"), legacy.to_string()).unwrap();
+    assert_eq!(status()["error"]["code"], "session_conflict");
 }
 
 #[test]

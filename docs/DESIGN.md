@@ -28,8 +28,8 @@ change what a bundle means.
   stack started; it is never treated as proof of what is running. The project copy only
   mirrors the machine index for its own path. One naming another directory from a different
   directory (by device and inode) was copied in (committed, cloned, duplicated) and is
-  ignored. So is one whose original path's machine index still holds it, or that names
-  nothing still alive. Otherwise (this directory was moved, or a record from before 0.1.18
+  ignored. So is one whose original path's machine index still holds it, or whose services
+  the supervisor confirms are gone (the same test `stack gc` uses before dropping a record). Otherwise (this directory was moved, or a record from before 0.1.18
   cannot tell) it may be the last record of running services: it is kept and reported as
   `session_conflict` naming the original path. Stack keeps `.stack/` out of Git with its own `.gitignore`.
 

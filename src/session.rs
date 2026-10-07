@@ -2082,11 +2082,11 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
     // directory, whose own record is in the machine index. A move's are this directory's, and
     // that copy may be the last record of them. Either way the copy is discarded only when it
     // cannot be the last record of anything running: it came from another directory, the
-    // index of its path still holds it, or nothing it names is alive.
+    // index of its path still holds it, or the supervisor confirms nothing it names runs.
     if !indexed && session.project != ctx.root {
         let same_directory = session.project_dir_id.is_some() && session.project_dir_id == dir_id(&ctx.root);
         let copied = session.project_dir_id.is_some() && !same_directory;
-        if copied || owned_elsewhere(ctx, &session) || !owns_anything_live(&session) {
+        if copied || owned_elsewhere(ctx, &session) || confirmed_gone(&session) {
             return Ok(None);
         }
         return Err(StackError::new(
@@ -2128,10 +2128,12 @@ fn owned_elsewhere(ctx: &Ctx, session: &Session) -> bool {
     read_json::<Session>(&index_path(&ctx.state, &session.project)).is_ok_and(|indexed| indexed.id == session.id)
 }
 
-/// Some process the record names is alive, or some port it reserved accepts connections:
-/// discarding the record could leave a service nobody can stop.
-fn owns_anything_live(session: &Session) -> bool {
-    session.services.values().any(|r| r.pid.is_some_and(pid_alive) || (r.port != 0 && accepting(r.port)))
+/// GC would reclaim this record without stopping anything: no launch is in progress and the
+/// supervisor confirms each service it names is gone. Otherwise discarding the record could
+/// leave a service nobody can stop.
+fn confirmed_gone(session: &Session) -> bool {
+    !session.launching
+        && session.services.values().all(|r| reconcile_gone(session.provider.as_ref(), r, false).is_ok())
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
