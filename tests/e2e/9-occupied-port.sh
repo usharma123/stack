@@ -90,3 +90,27 @@ assert_json '.ok and ([.data.steps[].step] == ["compile", "preflight", "install"
 if stack status --json >"$T/status-appI.json"; then fail 'status reported ready services after a plain install'; fi
 assert_json '.ok and .data.session == null and all(.data.checks[]; .ready == false)' "$T/status-appI.json"
 stack exec -- bash -c 'command -v psql >/dev/null && command -v redis-server >/dev/null' || fail 'installed tools are not on PATH in exec'
+
+echo 'Redis with a hanging preset readiness command still starts and verifies'
+# The supervisor races the preset's `redis-cli ... ping` with its TCP check. Once TCP
+# succeeds, stack verifies instance identity through the real client before recording a session.
+mkdir -p "$W/hang-bundle/bin" "$W/appJ"
+cat >"$W/hang-bundle/bin/redis-cli" <<'S'
+#!/bin/sh
+case " $* " in *" ping "*) exec sleep 100000 ;; esac
+self=$(cd "$(dirname "$0")" && pwd)
+IFS=:; for dir in $PATH; do
+  [ "$dir" = "$self" ] && continue
+  [ -x "$dir/redis-cli" ] && exec "$dir/redis-cli" "$@"
+done
+exit 127
+S
+chmod +x "$W/hang-bundle/bin/redis-cli"
+printf '[bundle]\nname = "hang"\n[paths]\nbin = ["bin"]\n' >"$W/hang-bundle/bundle.toml"
+printf '[[use]]\nbundle = "path:%s"\n[services.redis]\npreset = "redis"\nversion = "7"\n' "$W/hang-bundle" >"$W/appJ/stack.toml"
+cd "$W/appJ" || exit 1
+git init -q
+stack compile >/dev/null
+timeout 120 stack up --json >"$T/up-appJ.json" || { cat "$T/up-appJ.json"; fail 'up did not verify a preset whose readiness command hangs'; }
+assert_json '.ok and all(.data.checks[]; .ready)' "$T/up-appJ.json"
+stack down >/dev/null

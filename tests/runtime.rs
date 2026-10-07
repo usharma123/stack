@@ -68,6 +68,11 @@ case "$1 $2" in
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
   'daemons start')
+    # A request client that would launch a service later, after the request gave up. Like a
+    # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
+    if test -f "$REVIEW_FIXTURE/late-client"; then
+      python3 -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
+    fi
     if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
@@ -2080,3 +2085,52 @@ fn mcp_runs_tasks_and_can_reassign_ports() {
     assert!(after.is_u64() && *after != before, "{before} -> {after}");
 }
 
+#[test]
+fn interrupting_up_stops_its_start_request_so_nothing_launches_after_down() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::with_bundle(WEB);
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
+    // Like Ctrl-C in a terminal: the signal goes to stack's foreground process group.
+    let mut up = fixture.command(&["up", "--json"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let waiting = fixture.dir.path().join("client-waiting");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !waiting.exists() {
+        assert!(Instant::now() < deadline, "the start request's client never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::kill(-(up.id() as i32), libc::SIGINT) };
+    assert!(!up.wait().unwrap().success());
+    fixture.ok(&["down"]);
+    thread::sleep(Duration::from_secs(3));
+    assert!(!fixture.dir.path().join("late-launch").exists(), "a client of the interrupted start acted after down");
+}
+
+#[test]
+fn an_ignored_hangup_stays_ignored_after_captured_commands() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::new();
+    let mut command = fixture.command(&["mcp"]);
+    // As under `nohup`: SIGHUP is ignored when stack starts.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut server = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = server.stdin.take().unwrap();
+    let mut lines = BufReader::new(server.stdout.take().unwrap()).lines();
+    let app = fixture.dir.path().join("app");
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["true"],"dir":app}}});
+    writeln!(stdin, "{call}").unwrap();
+    assert!(lines.next().unwrap().unwrap().contains("\"isError\":false"), "a captured command ran");
+    unsafe { libc::kill(server.id() as i32, libc::SIGHUP) };
+    thread::sleep(Duration::from_millis(200));
+    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":2,"method":"ping"})).unwrap();
+    let reply: Value = serde_json::from_str(&lines.next().expect("server still answering").unwrap()).unwrap();
+    assert_eq!(reply["id"], 2);
+    drop(stdin);
+    assert!(server.wait().unwrap().success());
+}

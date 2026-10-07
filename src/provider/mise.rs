@@ -222,6 +222,15 @@ pub fn render(
                 put(&mut t, "ready_port", s.ready_port.map(|p| Value::Integer(p.into())));
                 if let Some(port) = ports.get(name) {
                     t.insert("port".into(), Value::Integer((*port).into()));
+                    // Pitchfork accepts the first successful readiness check. Let TCP unblock
+                    // a hanging preset probe only where stack subsequently verifies instance
+                    // identity through the service protocol. Other presets need their own
+                    // functional readiness checks; a listening port is not enough.
+                    if matches!(s.preset.as_deref(), Some("postgres" | "redis"))
+                        && s.ready_cmd.is_none() && s.ready_port.is_none()
+                    {
+                        t.insert("ready_port".into(), Value::Integer((*port).into()));
+                    }
                 }
                 (name.clone(), Value::Table(t))
             })
