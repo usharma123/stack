@@ -90,3 +90,49 @@ assert_json '.ok and ([.data.steps[].step] == ["compile", "preflight", "install"
 if stack status --json >"$T/status-appI.json"; then fail 'status reported ready services after a plain install'; fi
 assert_json '.ok and .data.session == null and all(.data.checks[]; .ready == false)' "$T/status-appI.json"
 stack exec -- bash -c 'command -v psql >/dev/null && command -v redis-server >/dev/null' || fail 'installed tools are not on PATH in exec'
+
+echo 'Redis with a hanging preset readiness command still starts and verifies'
+# The supervisor races the preset's `redis-cli ... ping` with its TCP check. Once TCP
+# succeeds, stack verifies instance identity through the real client before recording a session.
+mkdir -p "$W/hang-bundle/bin" "$W/appJ"
+cat >"$W/hang-bundle/bin/redis-cli" <<'S'
+#!/bin/sh
+case " $* " in *" ping "*) exec sleep 100000 ;; esac
+self=$(cd "$(dirname "$0")" && pwd)
+IFS=:; for dir in $PATH; do
+  [ "$dir" = "$self" ] && continue
+  [ -x "$dir/redis-cli" ] && exec "$dir/redis-cli" "$@"
+done
+exit 127
+S
+chmod +x "$W/hang-bundle/bin/redis-cli"
+printf '[bundle]\nname = "hang"\n[paths]\nbin = ["bin"]\n' >"$W/hang-bundle/bundle.toml"
+printf '[[use]]\nbundle = "path:%s"\n[services.redis]\npreset = "redis"\nversion = "7"\n' "$W/hang-bundle" >"$W/appJ/stack.toml"
+cd "$W/appJ" || exit 1
+git init -q
+stack compile >/dev/null
+# macOS does not ship GNU timeout. Give this test request its own process group so a
+# failed regression also terminates its waiting clients before the runner cleans up services.
+if ! python3 - >"$T/up-appJ.json" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+with subprocess.Popen(["stack", "up", "--json"], start_new_session=True) as child:
+    try:
+        sys.exit(child.wait(timeout=120))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        sys.exit(124)
+PY
+then
+  cat "$T/up-appJ.json"
+  fail 'up did not verify a preset whose readiness command hangs'
+fi
+assert_json '.ok and all(.data.checks[]; .ready)' "$T/up-appJ.json"
+stack down >/dev/null

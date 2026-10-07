@@ -219,10 +219,12 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
     }
     assert!(!rendered.contains("{{bundle_dir}}"));
 
-    // Every service gets a concrete port from stack's range, never the service default.
+    // Postgres and Redis get a TCP fallback on their assigned ports. Stack still verifies
+    // their instance identity after the supervisor reports them started.
     for (service, port) in &report.ports {
         assert!((40000..=49999).contains(port), "{service} got {port}");
         assert!(rendered.contains(&format!("port = {port}")));
+        assert!(rendered.contains(&format!("ready_port = {port}")), "{service}:\n{rendered}");
     }
     assert_eq!(report.ports.len(), 2);
 }
@@ -246,6 +248,34 @@ fn uv_python_selection_is_left_to_the_project_when_it_sets_one() {
     sb.compile(&root, Mode::UseLock).unwrap();
     let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
     assert!(!rendered.contains("UV_PYTHON_PREFERENCE"), "only projects that pin python: {rendered}");
+}
+
+#[test]
+fn a_services_own_readiness_check_is_kept() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.postgres]\npreset = \"postgres\"\nversion = \"17\"\nready_cmd = \"pg_isready\"\n[services.web]\nrun = \"exec ./serve\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    assert!(rendered.contains("ready_cmd = \"pg_isready\""), "{rendered}");
+    assert!(!rendered.contains("ready_port"), "custom services and explicit checks are left alone:\n{rendered}");
+}
+
+#[test]
+fn tcp_readiness_fallback_requires_builtin_protocol_verification() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.pg]\npreset='postgres'\n[services.redis]\npreset='redis'\n[services.cr]\npreset='cockroachdb'\n[services.nats]\npreset='nats'\n[services.spice]\npreset='spicedb'\n[services.explicit]\npreset='redis'\nready_port=6379\n");
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    let config: toml::Value = toml::from_str(&rendered).unwrap();
+    let daemons = config["daemons"].as_table().unwrap();
+    for name in ["pg", "redis"] {
+        assert_eq!(daemons[name]["ready_port"].as_integer(), Some(report.ports[name].into()));
+    }
+    for name in ["cr", "nats", "spice"] {
+        assert!(daemons[name].get("ready_port").is_none(), "{name}'s functional check must not be bypassed");
+        assert!(daemons[name].get("ready_cmd").is_none(), "{name} keeps the provider's preset check");
+    }
+    assert_eq!(daemons["explicit"]["ready_port"].as_integer(), Some(6379));
 }
 
 #[test]

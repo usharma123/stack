@@ -26,6 +26,15 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
   come before it. Invalid arguments, an unreadable session, and a failed initial GC pass
   have no progress record. Without `--json` both are printed as plain text.
+- Postgres and Redis presets get an additional TCP readiness check unless the service sets
+  `ready_cmd` or `ready_port`. The supervisor runs the preset's command too and accepts the
+  first successful check, so an open port can unblock a hanging preset probe. Stack then
+  verifies instance identity through SQL or Redis commands before recording a session.
+  Other presets keep their functional readiness checks.
+- `up` has no overall startup timeout. A live daemon whose readiness checks never succeed
+  can still leave the supervisor's start call waiting indefinitely, including Postgres or
+  Redis when their ports never open. Stack's 90-second verification window begins only after
+  that call returns; a verification failure then reports `not_ready`.
 - `up` fails with `port_conflict` when a port assigned to this checkout accepts connections and
   no running daemon of that service is behind it. `details` name the service, the port, whether
   the project pinned it, and the holding process when `lsof` (or `/proc` on Linux) can tell.
