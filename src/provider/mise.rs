@@ -473,12 +473,18 @@ const LOGS_LIMIT: usize = 1024 * 1024;
 /// `mise daemons logs -- <service> -n <tail> --raw --no-pager`: the supervisor's stored output
 /// for one daemon, through the same isolated configuration as every other provider call.
 /// Bounded by a deadline and an output cap; the pager and follow modes are never used.
-pub fn logs(root: &Path, service: &str, tail: usize) -> Result<crate::process::Captured> {
+/// `since` (Unix seconds) keeps only lines the supervisor stored from that second onwards.
+pub fn logs(root: &Path, service: &str, tail: usize, since: Option<u64>) -> Result<crate::process::Captured> {
     let n = tail.to_string();
     let mut command = Command::new("mise");
     configure_command(&mut command, root);
+    command.args(["daemons", "logs", "--", service, "-n", &n, "--raw", "--no-pager"]);
+    if let Some(at) = since {
+        let at = local_datetime(at)
+            .ok_or_else(|| StackError::new("logs_failed", format!("cannot express {at} as local time")))?;
+        command.args(["--since", &at]);
+    }
     command
-        .args(["daemons", "logs", "--", service, "-n", &n, "--raw", "--no-pager"])
         .current_dir(root)
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1");
@@ -497,12 +503,54 @@ pub fn logs(root: &Path, service: &str, tail: usize) -> Result<crate::process::C
     Ok(out)
 }
 
+/// `YYYY-MM-DD HH:MM:SS` in local time, the form Pitchfork's `--since` takes for an instant.
+#[cfg(unix)]
+fn local_datetime(secs: u64) -> Option<String> {
+    let t = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: localtime_r writes only the provided struct.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return None;
+        }
+        tm
+    };
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    ))
+}
+
+#[cfg(not(unix))]
+fn local_datetime(_: u64) -> Option<String> {
+    None
+}
+
 pub fn start(root: &Path) -> Result<()> {
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }
 
 pub fn stop(root: &Path) -> Result<()> {
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
+}
+
+/// Start only the named daemons of this project.
+pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
+    let mut args = vec!["daemons", "start", "--"];
+    args.extend(names.iter().map(String::as_str));
+    checked(root, &args, "start_failed").map(|_| ())
+}
+
+/// Stop only the named daemons of this project.
+pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
+    let mut args = vec!["daemons", "stop", "--"];
+    args.extend(names.iter().map(String::as_str));
+    checked(root, &args, "stop_failed").map(|_| ())
 }
 
 #[cfg(test)]

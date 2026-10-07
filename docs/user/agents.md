@@ -7,6 +7,7 @@ In a checkout with a `stack.toml`:
 ```sh
 stack up --ttl 30m                       # compile from stack.lock if needed, start, verify
 stack run test                           # a [tasks.test] command, once every service verifies
+stack restart api                        # after editing code a running service loaded
 stack exec --require-all -- <command>    # anything else, with the stack's tools and env
 stack down                               # before you finish or remove the checkout
 ```
@@ -26,7 +27,12 @@ stack --json exec --require-all --timeout 5m -- python --version
 stack --json down
 ```
 
-`exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code, or 124 on timeout. Without `--json`, commands keep the terminal and `--timeout` is unavailable.
+`exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code. On timeout it exits 124 with `ok: false` and code `timed_out`; the output so far is in `error.details`. Without `--json`, commands keep stdout and stderr, and `--timeout` works too.
+
+`stack up` does not restart a service whose configuration is unchanged, so after editing code a
+service loaded, run `stack restart <service>`. Declare `watch = [...]` on the service and
+`status`, `exec` and `run` tell you when that is needed. `stack logs <service> --since-start`
+shows only the current process's output.
 
 Start the stdio MCP server with:
 
@@ -34,7 +40,7 @@ Start the stdio MCP server with:
 stack mcp
 ```
 
-Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc` and `stack_doctor`.
+Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc` and `stack_doctor`.
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep

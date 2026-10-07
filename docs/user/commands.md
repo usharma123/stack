@@ -7,9 +7,10 @@
 | `stack install` | Install the locked tools and service binaries; start nothing, record nothing |
 | `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
-| `stack run <task> [--json --timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies |
-| `stack exec [--require S \| --require-all] [--json --timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
-| `stack logs <service> [--tail N]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
+| `stack restart [service...]` | Restart services of the running session (all when none named) and verify again |
+| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies |
+| `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack logs <service> [--tail N] [--since-start]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc [--watch [--interval 60s]]` | Renew this session's lease / reclaim expired and deleted-project sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
@@ -64,7 +65,26 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
   than services to skip. `unknown_task` lists the tasks the project defines.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
-  command's code (124 when `--timeout` expires). Without `--json` the command keeps the terminal.
+  command's code. When `--timeout` expires the command's process group is killed and stack
+  exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the
+  captured output is the error's only detail. Without `--json` the command keeps stdout and
+  stderr; with `--timeout` it also runs in its own process group, so its stdin is empty, and
+  interrupt, terminate and hangup signals are passed on to it.
+- `restart [service...]` stops the named services (every service when none are named), waits
+  until their recorded processes are gone and ports closed, starts them again and verifies the
+  whole stack, like `up`. Other services keep running and the session keeps its id. Use it
+  after editing code a running service loaded; `up` leaves an unchanged configuration's
+  processes alone. It fails with `no_session` before `up`, `session_stale` when the
+  configuration changed since `up` (run `up`, which restarts what changed), and
+  `session_busy` while commands run in the session.
+- A service can list `watch = ["app.py", "src"]`: files or directories (walked recursively,
+  skipping hidden, `node_modules`, `target` and `__pycache__` entries), relative to the
+  project. When one changed after the service started, `status`, `exec` and `run` report it
+  in the check's `changed_since_start` (and on stderr) with a `stack restart` hint. It is a
+  note, not a verification failure. In a bundle, `{{bundle_dir}}` works in `watch` too.
+- `logs` prints, on stderr, when the current process started. The supervisor keeps output
+  across restarts; `--since-start` returns only the current process's lines. Sessions started
+  before 0.1.18 have no recorded start time until `up` starts a new process or `restart`.
 - `gc` fails with `gc_incomplete` if a session it reclaims could not be confirmed stopped;
   ownership records are kept so it can be retried. For a deleted (or replaced) project directory
   it queries Pitchfork using the recorded daemon IDs but never issues a stop-by-name request.

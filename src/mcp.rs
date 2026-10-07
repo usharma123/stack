@@ -44,7 +44,7 @@ pub fn serve() -> std::io::Result<()> {
                 "protocolVersion": negotiate(msg["params"]["protocolVersion"].as_str()),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "stack", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_status to diagnose, and stack_down when finished.",
+                "instructions": "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -87,10 +87,12 @@ fn tools() -> Value {
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
         { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows).",
-          "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" } }), &["service"]) },
+        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded, then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then.",
+          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } } }), &[]) },
+        { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
+          "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. Connection variables of services that fail verification are withheld; required services must verify or the command does not run.",
+        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. A command still running at timeout_secs (default 600) is killed and the call fails with timed_out; its output so far is in the error details.",
           "inputSchema": schema(json!({
               "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
               "require": { "type": "array", "items": { "type": "string" } },
@@ -198,7 +200,14 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 Value::Null => 100,
                 v => v.as_u64().filter(|n| (1..=10_000).contains(n)).ok_or_else(|| StackError::new("usage", format!("tail {v} must be 1 to 10000")))? as usize,
             };
-            session::logs(ctx, service, tail).map(to_value)
+            session::logs(ctx, service, tail, args["since_start"] == true).map(to_value)
+        }
+        "stack_restart" => {
+            let services: Vec<String> = args["services"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            session::restart(ctx, &services).map(to_value)
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
@@ -257,7 +266,19 @@ fn captured(args: &Value, ctx: &Ctx, command: &[String], require: &Require) -> R
             .as_u64()
             .unwrap_or(DEFAULT_EXEC_TIMEOUT),
     );
-    run_captured(ctx, &plan, timeout)
+    let result = run_captured(ctx, &plan, timeout)?;
+    if result["timed_out"] == true {
+        return Err(timed_out(timeout, result, "raise timeout_secs"));
+    }
+    Ok(result)
+}
+
+/// A command stack killed at its deadline did not do its job: `timed_out`, with the captured
+/// result (output so far, checks) as the error's only detail.
+pub fn timed_out(timeout: Duration, result: Value, raise: &str) -> StackError {
+    StackError::new("timed_out", format!("command did not finish within {}s and was killed", timeout.as_secs()))
+        .hint(format!("{raise} if it needs longer; its output so far is in details"))
+        .details(vec![result])
 }
 
 /// Run a planned command with bounded output capture; shared by MCP and `stack exec --json`.

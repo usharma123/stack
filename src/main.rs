@@ -52,6 +52,9 @@ enum Cmd {
         /// Number of lines from the end (default 100)
         #[arg(long, value_name = "N", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=10_000))]
         tail: u64,
+        /// Only output of the current process, not of earlier runs the supervisor kept
+        #[arg(long)]
+        since_start: bool,
     },
     /// Start services, verify each one, and record a session
     Up {
@@ -63,6 +66,11 @@ enum Cmd {
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
         owner_pid: Option<u32>,
     },
+    /// Restart services of the running session (all when none are named), then verify again
+    Restart {
+        /// Services to restart; the others keep running
+        services: Vec<String>,
+    },
     /// Verify every service now, and show session and lease state
     Status,
     /// Run a command with the stack's tools and env; unverified endpoints are withheld
@@ -73,7 +81,7 @@ enum Cmd {
         /// Fail unless every service verifies
         #[arg(long, conflicts_with = "require")]
         require_all: bool,
-        /// With --json: stop the command after this long (e.g. 10m). Default: no limit
+        /// Kill the command after this long (e.g. 10m) and exit 124. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
@@ -83,7 +91,7 @@ enum Cmd {
     Run {
         /// Task name, as in [tasks.<name>]
         task: String,
-        /// With --json: stop the task after this long (e.g. 10m). Default: no limit
+        /// Kill the task after this long (e.g. 10m) and exit 124. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         /// Extra arguments, appended to the task's command
@@ -154,9 +162,10 @@ fn main() -> ExitCode {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
             project::compile(&opts(mode, true, *reassign_ports)).map(|r| report(cli.json, &r))
         }
-        Cmd::Inspect => {
-            project::compile(&opts(project::inspect_mode(&root), false, false)).map(|r| report(cli.json, &r))
-        }
+        Cmd::Inspect => project::compile(&opts(project::inspect_mode(&root), false, false)).map(|mut r| {
+            r.warnings.extend(session::stale_session(&ctx, &r));
+            report(cli.json, &r)
+        }),
         Cmd::Up { ttl, owner_pid } => ttl
             .as_deref()
             .map(parse_duration)
@@ -178,11 +187,25 @@ fn main() -> ExitCode {
                 println!("installed; nothing started");
             })
         }),
-        Cmd::Logs { service, tail } => session::logs(&ctx, service, *tail as usize).map(|r| {
+        Cmd::Logs { service, tail, since_start } => session::logs(&ctx, service, *tail as usize, *since_start).map(|r| {
             emit(cli.json, &r, || {
+                // On stderr, so the lines themselves stay pipeable.
+                if let (Some(at), false) = (r.started_at, r.since_start) {
+                    eprintln!("# current {} process started {}s ago; --since-start shows only its output",
+                        r.service, stack::state::now().saturating_sub(at));
+                }
                 for line in &r.lines {
                     println!("{line}");
                 }
+            })
+        }),
+        Cmd::Restart { services } => session::restart(&ctx, services).map(|r| {
+            emit(cli.json, &r, || {
+                for c in &r.checks {
+                    let note = if r.restarted.contains(&c.service) { "restarted" } else { "" };
+                    println!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                }
+                println!("session {}", r.session.id);
             })
         }),
         Cmd::Status => session::status(&ctx).map(|r| {
@@ -201,6 +224,7 @@ fn main() -> ExitCode {
                         Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
                     }
                 }
+                warn_changed(&r.checks);
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
@@ -335,6 +359,13 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             let moved = v.moved_from.as_deref().map(|m| format!("  (moved from {m})")).unwrap_or_default();
             println!("{} {} {} -> {resolved}{moved}", v.kind, v.name, v.requested);
         }
+        // Custom services have no release to resolve; list them too.
+        for (name, entry) in &s.services {
+            if !r.versions.iter().any(|v| v.kind == "service" && v.name == *name) {
+                let kind = if entry.value.preset.is_some() { "preset" } else { "custom" };
+                println!("service {name} ({kind}, {})", entry.origin);
+            }
+        }
         for (name, port) in &r.ports {
             println!("port {name} = {port}");
         }
@@ -352,52 +383,80 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
 }
 
 fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+    let timeout = timeout.map(parse_duration).transpose()?.map(Duration::from_secs);
     if as_json {
         exec_json(ctx, cmd, require, timeout)
-    } else if timeout.is_some() {
-        Err(StackError::new("usage", "--timeout applies only with --json")
-            .hint("without --json the command keeps the terminal; use your shell's `timeout`"))
     } else {
-        exec(ctx, cmd, require)
+        exec(ctx, cmd, require, timeout)
     }
 }
 
-fn exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExitCode> {
-    let plan = session::plan_exec(ctx, cmd, require)?;
-    for c in plan.checks.iter().filter(|c| !c.ready) {
+/// Unverified services, one line per distinct reason.
+fn warn_unverified(checks: &[session::Check]) {
+    let mut reasons: Vec<(&str, Vec<&str>, Vec<&str>)> = Vec::new();
+    for c in checks.iter().filter(|c| !c.ready) {
+        let reason = c.reason.as_deref().unwrap_or("unknown");
+        let i = reasons.iter().position(|(r, _, _)| *r == reason).unwrap_or_else(|| {
+            reasons.push((reason, Vec::new(), Vec::new()));
+            reasons.len() - 1
+        });
+        reasons[i].1.push(&c.service);
+        reasons[i].2.extend(c.withheld.iter().map(String::as_str));
+    }
+    for (reason, services, withheld) in reasons {
+        let withheld = if withheld.is_empty() { "nothing".into() } else { withheld.join(", ") };
+        eprintln!("stack: not verified: {} ({reason}); withheld: {withheld}", services.join(", "));
+    }
+}
+
+/// Services whose watched files changed after they started.
+fn warn_changed(checks: &[session::Check]) {
+    for c in checks.iter().filter(|c| !c.changed_since_start.is_empty()) {
         eprintln!(
-            "stack: {} not verified ({}); endpoint withheld: {}",
+            "stack: {} changed after {} started; run `stack restart {}` to load it",
+            c.changed_since_start.join(", "),
             c.service,
-            c.reason.as_deref().unwrap_or("unknown"),
-            if c.withheld.is_empty() { "nothing".into() } else { c.withheld.join(", ") }
+            c.service
         );
     }
+}
+
+fn exec(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>) -> Result<ExitCode> {
+    let plan = session::plan_exec(ctx, cmd, require)?;
+    warn_unverified(&plan.checks);
+    warn_changed(&plan.checks);
     let mut command = Command::new(&plan.program);
     for var in &plan.removed {
         command.env_remove(var);
     }
     command.args(&plan.args).envs(&plan.env).current_dir(&ctx.root);
-    let status = command
-        .status()
-        .map_err(|e| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display())))?;
-    Ok(ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8))
+    let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
+    let code = match timeout {
+        None => command.status().map_err(start_error)?.code(),
+        Some(timeout) => {
+            let (code, timed_out) = stack::process::run_with_deadline(&mut command, timeout).map_err(start_error)?;
+            if timed_out {
+                eprintln!("stack: command did not finish within {}s and was killed", timeout.as_secs());
+                return Ok(ExitCode::from(124));
+            }
+            code
+        }
+    };
+    Ok(ExitCode::from(code.unwrap_or(1).clamp(0, 255) as u8))
 }
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
 /// The process exits with the command's code (124 on timeout, like `timeout(1)`).
-fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>) -> Result<ExitCode> {
     // Large enough to mean "no limit" without overflowing deadline arithmetic.
-    let timeout = match timeout {
-        Some(t) => Duration::from_secs(parse_duration(t)?),
-        None => Duration::from_secs(365 * 24 * 3600),
-    };
+    let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
     let plan = session::plan_exec(ctx, cmd, require)?;
     let result = mcp::run_captured(ctx, &plan, timeout)?;
-    let code = if result["timed_out"] == true {
-        124
-    } else {
-        result["exit_code"].as_i64().unwrap_or(1).clamp(0, 255) as u8
-    };
+    if result["timed_out"] == true {
+        println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
+        return Ok(ExitCode::from(124));
+    }
+    let code = result["exit_code"].as_i64().unwrap_or(1).clamp(0, 255) as u8;
     println!("{}", json!({ "ok": true, "data": result }));
     Ok(ExitCode::from(code))
 }

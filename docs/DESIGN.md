@@ -24,8 +24,11 @@ change what a bundle means.
   resolvable preset service by requested and exact version.
 - **Session**: one running instance of a project on this machine (`.stack/session.json`, indexed
   in the machine state dir): assigned ports, supervisor PIDs, data directories, verification
-  results with timestamps, and an optional lease. It records what stack started; it is never
-  treated as proof of what is running.
+  results with timestamps, each service's start time, and an optional lease. It records what
+  stack started; it is never treated as proof of what is running. The project copy only
+  mirrors the machine index for its own path: one naming another directory was copied in
+  (committed, cloned, duplicated) and is ignored. Stack keeps `.stack/` out of Git with its
+  own `.gitignore`.
 
 ## Composition rule
 

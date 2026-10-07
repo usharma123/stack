@@ -64,6 +64,10 @@ pub struct Service {
     /// verified for liveness only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityProbe>,
+    /// Files or directories the running process loaded, relative to the project. When any
+    /// changes after the service started, checks report it so the service can be restarted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<String>,
 }
 
 /// A command that asks the running service, through the app's own connection settings, which

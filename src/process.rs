@@ -225,6 +225,78 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
     })
 }
 
+/// Process group of the command `run_with_deadline` is waiting for, for its signal handler.
+#[cfg(unix)]
+static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn forward_signal(signal: libc::c_int) {
+    let group = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
+    if group > 0 {
+        // SAFETY: kill is async-signal-safe; the group is the command's own.
+        unsafe {
+            libc::kill(-group, signal);
+        }
+    }
+}
+
+/// Run a command on the caller's stdout and stderr until it exits or `timeout` elapses, then
+/// kill its whole process group. The command gets its own group so descendants are stopped
+/// too; it therefore cannot read the terminal (stdin is empty). Interrupt, terminate and
+/// hangup signals stack receives meanwhile are passed on to the group, unless ignored.
+/// Returns the exit code (128 + the signal for a command a signal ended) and whether the
+/// deadline passed.
+#[cfg(unix)]
+pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result<(Option<i32>, bool)> {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0).stdin(Stdio::null());
+    let mut child = OwnedChild { child: command.spawn()?, terminated: false };
+    FORWARD_TO.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    let mut previous = Vec::new();
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: plain sigaction calls; the handler only reads an atomic and calls kill.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut old);
+            if old.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
+            let mut new: libc::sigaction = std::mem::zeroed();
+            new.sa_sigaction = forward_signal as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut new.sa_mask);
+            libc::sigaction(signal, &new, std::ptr::null_mut());
+            previous.push((signal, old));
+        }
+    }
+    let start = Instant::now();
+    let outcome = loop {
+        match child.child.try_wait() {
+            // Like a shell: a command ended by a signal reports 128 + its number.
+            Ok(Some(status)) => {
+                use std::os::unix::process::ExitStatusExt;
+                break Ok((status.code().or_else(|| status.signal().map(|s| 128 + s)), false));
+            }
+            Ok(None) if start.elapsed() >= timeout => break Ok((None, true)),
+            Ok(None) => std::thread::sleep(EXIT_CHECK_INTERVAL),
+            Err(e) => break Err(e),
+        }
+    };
+    child.terminate();
+    FORWARD_TO.store(0, std::sync::atomic::Ordering::SeqCst);
+    for (signal, old) in previous {
+        // SAFETY: restores the disposition read above.
+        unsafe {
+            libc::sigaction(signal, &old, std::ptr::null_mut());
+        }
+    }
+    outcome
+}
+
+#[cfg(not(unix))]
+pub fn run_with_deadline(_: &mut Command, _: Duration) -> io::Result<(Option<i32>, bool)> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "command deadlines currently require Unix"))
+}
+
 #[cfg(not(unix))]
 pub fn capture(_: &mut Command, _: Duration, _: usize) -> io::Result<Captured> {
     Err(io::Error::new(

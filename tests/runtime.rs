@@ -1009,15 +1009,132 @@ fn exec_json_reports_the_command_in_one_object_and_keeps_its_exit_code() {
     assert_eq!(result["data"]["stdout"], "out\n");
     assert_eq!(result["data"]["stderr"], "err\n");
 
+    // A command stack had to kill did not do its job: an error, with the output so far.
     let out = fixture
-        .command(&["--json", "exec", "--timeout", "1s", "--", "sleep", "10"])
+        .command(&["--json", "exec", "--timeout", "1s", "--", "sh", "-c", "echo partial; sleep 10"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(124));
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"]["timed_out"], true);
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["error"]["code"], "timed_out");
+    assert_eq!(result["error"]["details"][0]["timed_out"], true);
+    assert_eq!(result["error"]["details"][0]["stdout"], "partial\n");
+}
 
-    let out = fixture.command(&["exec", "--timeout", "1s", "--", "true"]).output().unwrap();
-    assert!(!out.status.success(), "--timeout without --json is rejected");
+#[test]
+fn exec_timeout_without_json_keeps_the_output_and_kills_the_whole_command() {
+    let fixture = Fixture::new();
+    let start = Instant::now();
+    let out = fixture
+        .command(&["exec", "--timeout", "1s", "--", "sh", "-c", "sleep 30 & echo $!; wait"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(124));
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("did not finish within 1s"));
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pid_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!pid_alive(pid), "descendant {pid} survived the deadline");
+
+    let out = fixture.command(&["exec", "--timeout", "10s", "--", "sh", "-c", "echo done; exit 7"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}
+
+#[test]
+fn a_session_copied_in_from_another_checkout_is_ignored_and_never_committed() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let ignore = fixture.dir.path().join("app/.stack/.gitignore");
+    assert_eq!(fs::read_to_string(&ignore).unwrap(), "*\n");
+
+    // A worktree or clone that received the project copy (say, committed by mistake).
+    let other = fixture.dir.path().join("other");
+    fs::create_dir_all(other.join(".stack")).unwrap();
+    fs::write(other.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n").unwrap();
+    fs::copy(fixture.dir.path().join("app/.stack/session.json"), other.join(".stack/session.json")).unwrap();
+    fs::copy(fixture.dir.path().join("app/stack.lock"), other.join("stack.lock")).unwrap();
+    let out = fixture.command_at(&other, &["status", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["session"], Value::Null, "{result}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn restart_replaces_only_the_named_service_and_keeps_the_session() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
+    fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let before = up["data"]["checks"][0]["pid"].as_u64().unwrap();
+    assert!(up["data"]["session"]["services"]["web"]["started_at"].is_u64(), "{up}");
+
+    // Edited after the service started: reported, not a verification failure.
+    thread::sleep(Duration::from_millis(1100));
+    fs::write(fixture.dir.path().join("app/main.py"), "v2").unwrap();
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(status["data"]["checks"][0]["ready"], true);
+    assert_eq!(status["data"]["checks"][0]["changed_since_start"], json!(["main.py"]), "{status}");
+    let out = fixture.ok(&["exec", "--", "true"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("stack restart web"));
+
+    let restarted = json_result(&fixture.ok(&["restart", "web", "--json"]));
+    assert_eq!(restarted["data"]["restarted"], json!(["web"]));
+    assert_eq!(restarted["data"]["session"]["id"], up["data"]["session"]["id"]);
+    let after = restarted["data"]["checks"][0]["pid"].as_u64().unwrap();
+    assert_ne!(after, before, "a new process");
+    assert!(!pid_alive(before as u32));
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("daemons stop -- web") && log.contains("daemons start -- web"), "{log}");
+
+    // The new process is the verified one, and it loaded the edit.
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(status["data"]["healthy"], true, "{status}");
+    assert!(status["data"]["checks"][0].get("changed_since_start").is_none(), "{status}");
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+
+    // Logs since the start ask the supervisor for that instant onwards.
+    fs::write(fixture.dir.path().join("logs.txt"), "new\n").unwrap();
+    let logs = json_result(&fixture.ok(&["logs", "web", "--since-start", "--json"]));
+    assert_eq!(logs["data"]["since_start"], true);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.lines().any(|l| l.starts_with("daemons logs -- web") && l.contains("--since 20")), "{log}");
+
+    let out = fixture.command(&["restart", "nope", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
+    fixture.ok(&["down"]);
+    let out = fixture.command(&["restart", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "no_session");
+}
+
+#[test]
+fn restart_refuses_a_session_started_from_another_configuration() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n",
+    )
+    .unwrap();
+    let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
+    assert!(inspect["data"]["warnings"].to_string().contains("different configuration"), "{inspect}");
+    let out = fixture.command(&["restart", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "session_stale");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn inspect_lists_custom_services() {
+    let fixture = Fixture::with_bundle(WEB);
+    let out = fixture.ok(&["inspect"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("service web (custom, bundle:test)"));
 }
 
 #[test]

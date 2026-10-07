@@ -139,6 +139,10 @@ pub struct ServiceRecord {
     pub data_dir: Option<String>,
     pub identity: Identity,
     pub verified_at: u64,
+    /// When stack last started this process (before the supervisor's start call). Older
+    /// records lack it; then nothing is known about the files it loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
     /// The supervisor's qualified id for this daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -169,6 +173,10 @@ pub struct Check {
     /// Connection variables poisoned or removed for commands because the service is not verified.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<String>,
+    /// Files under the service's `watch` paths modified after it started: the process may be
+    /// running older code. Reported, not a verification failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changed_since_start: Vec<String>,
     pub checked_at: u64,
     #[serde(skip)]
     data_dir: Option<String>,
@@ -203,6 +211,7 @@ fn verify_all(
             identity: None,
             reason: None,
             withheld: Vec::new(),
+            changed_since_start: Vec::new(),
             checked_at: now(),
             data_dir: status.and_then(|s| s.data_dir.clone()),
             provider_id: status.and_then(|s| s.id.clone()),
@@ -649,6 +658,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     }
 
     let stamp = now();
+    let launched_at = stamp;
     let lease = (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
         ttl_secs: lease.ttl_secs,
         owner_pid: lease.owner_pid,
@@ -673,7 +683,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                     .ports
                     .iter()
                     .map(|(name, port)| {
-                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0, provider_id: None };
+                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0, started_at: None, provider_id: None };
                         (name.clone(), record)
                     })
                     .collect(),
@@ -695,32 +705,8 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         }
         steps.ok("start", json!(null));
 
-        let deadline = Instant::now() + READY_TIMEOUT;
-        let timings = Timings::new("up_verify");
-        loop {
-            let statuses =
-                mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
-            record_launch_observations(ctx, &statuses).map_err(|e| steps.clone().fail("record_observed", e, true))?;
-            let env = mise::env(&ctx.root).map_err(|e| steps.clone().fail("verify", e, true))?;
-            checks = verify_all(&ctx.root, &report, &env, &statuses, &timings);
-            if checks.iter().all(|c| c.ready) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let failed: Vec<Value> = checks
-                    .iter()
-                    .filter(|c| !c.ready)
-                    .map(|c| json!({ "service": c.service, "reason": c.reason }))
-                    .collect();
-                let err = StackError::new(
-                    "not_ready",
-                    format!("{} service(s) failed verification", failed.len()),
-                )
-                .details(failed);
-                return Err(steps.fail("verify", err, true));
-            }
-            sleep(Duration::from_millis(300));
-        }
+        checks = verify_until_ready(ctx, &report, "up_verify", |statuses| record_launch_observations(ctx, statuses))
+            .map_err(|(step, e)| steps.clone().fail(step, e, true))?;
         steps.ok(
             "verify",
             json!(checks
@@ -751,17 +737,14 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         services: checks
             .iter()
             .map(|c| {
-                (
-                    c.service.clone(),
-                    ServiceRecord {
-                        port: c.port.unwrap_or_default(),
-                        pid: c.pid,
-                        data_dir: c.data_dir.clone(),
-                        identity: c.identity.unwrap_or(Identity::Liveness),
-                        verified_at: c.checked_at,
-                        provider_id: c.provider_id.clone(),
-                    },
-                )
+                // A process the previous record already knew keeps its start time; anything
+                // else was started by this call.
+                let kept = previous
+                    .as_ref()
+                    .and_then(|p| p.services.get(&c.service))
+                    .filter(|r| r.pid.is_some() && r.pid == c.pid)
+                    .map(|r| r.started_at.unwrap_or(r.verified_at));
+                (c.service.clone(), record_of(c, kept.unwrap_or(launched_at)))
             })
             .collect(),
         provider: if report.stack.services.is_empty() { None } else { provider },
@@ -775,6 +758,140 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps: steps.0,
         reaped,
     })
+}
+
+/// Verify every service until all pass, or fail with `not_ready` after READY_TIMEOUT.
+/// `observe` sees each supervisor listing before it is checked. Errors name their step.
+fn verify_until_ready(
+    ctx: &Ctx,
+    report: &Report,
+    timings: &'static str,
+    mut observe: impl FnMut(&[DaemonStatus]) -> Result<()>,
+) -> std::result::Result<Vec<Check>, (&'static str, StackError)> {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let timings = Timings::new(timings);
+    loop {
+        let statuses = mise::daemons(&ctx.root).map_err(|e| ("verify", e))?;
+        observe(&statuses).map_err(|e| ("record_observed", e))?;
+        let env = mise::env(&ctx.root).map_err(|e| ("verify", e))?;
+        let checks = verify_all(&ctx.root, report, &env, &statuses, &timings);
+        if checks.iter().all(|c| c.ready) {
+            return Ok(checks);
+        }
+        if Instant::now() >= deadline {
+            let failed: Vec<Value> = checks
+                .iter()
+                .filter(|c| !c.ready)
+                .map(|c| json!({ "service": c.service, "reason": c.reason }))
+                .collect();
+            let err = StackError::new("not_ready", format!("{} service(s) failed verification", failed.len()))
+                .details(failed);
+            return Err(("verify", err));
+        }
+        sleep(Duration::from_millis(300));
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RestartReport {
+    pub session: Session,
+    pub restarted: Vec<String>,
+    pub checks: Vec<Check>,
+    pub steps: Vec<Value>,
+}
+
+/// Stop and start the named services (every service when none are named) of the running,
+/// current session, then verify the whole stack again. Other services keep running. The
+/// session keeps its id: the configuration is unchanged, only processes are new.
+pub fn restart(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
+    let mut steps = Steps::default();
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let mut session = load(ctx)?.ok_or_else(|| {
+        StackError::new("no_session", "no session for this project").hint("run `stack up`")
+    })?;
+    if has_active_executions(&session) {
+        return Err(StackError::new("session_busy", "commands are still executing in this session"));
+    }
+    let report = ctx.compile(true)?;
+    mise::trust(&ctx.root)?;
+    if session.launching || session.config_digest != config_digest(ctx, &report) {
+        return Err(StackError::new(
+            "session_stale",
+            "the running services were not verified with the current configuration",
+        )
+        .hint("run `stack up`; it restarts and verifies every service"));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for name in services {
+        if !report.stack.services.contains_key(name) {
+            return Err(unknown_service(&report, name));
+        }
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    if names.is_empty() {
+        names = report.stack.services.keys().cloned().collect();
+    }
+    if names.is_empty() {
+        return Err(StackError::new("unknown_service", "this project defines no services"));
+    }
+
+    // Confirm the old processes are gone before starting new ones on the same ports.
+    if let Err(e) = mise::stop_daemons(&ctx.root, &names) {
+        return Err(steps.fail("stop", e, true));
+    }
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        let alive: Vec<Value> = names
+            .iter()
+            .filter_map(|n| session.services.get(n).map(|r| (n, r)))
+            .filter(|(_, r)| r.pid.is_some_and(pid_alive) || accepting(r.port))
+            .map(|(n, r)| json!({ "service": n, "pid": r.pid, "port": r.port }))
+            .collect();
+        if alive.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let err = StackError::new("stop_unconfirmed", "services did not stop")
+                .hint("retry `stack restart`, or `stack down` and `stack up`")
+                .details(alive);
+            return Err(steps.fail("stop", err, true));
+        }
+        sleep(Duration::from_millis(200));
+    }
+    steps.ok("stop", json!(names));
+
+    // The supervisor stamps output with whole seconds. Starting in a second the old processes
+    // never wrote in keeps `logs --since-start` free of their last lines.
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    sleep(Duration::from_secs(elapsed.as_secs() + 1) - elapsed);
+    let started_at = now();
+    if let Err(e) = mise::start_daemons(&ctx.root, &names) {
+        return Err(steps.fail("start", e, true));
+    }
+    steps.ok("start", json!(names));
+    let checks = verify_until_ready(ctx, &report, "restart_verify", |_| Ok(()))
+        .map_err(|(step, e)| steps.clone().fail(step, e, true))?;
+    steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
+
+    for check in &checks {
+        // Untouched services keep their start time while they are the same process.
+        let started = session
+            .services
+            .get(&check.service)
+            .filter(|r| !names.contains(&check.service) && r.pid.is_some() && r.pid == check.pid)
+            .and_then(|r| r.started_at)
+            .unwrap_or(started_at);
+        session.services.insert(check.service.clone(), record_of(check, started));
+    }
+    if let Some(lease) = session.lease.as_mut() {
+        lease.renewed_at = now();
+    }
+    save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
+    Ok(RestartReport { session, restarted: names, checks, steps: steps.0 })
 }
 
 #[derive(Debug, Serialize)]
@@ -818,27 +935,49 @@ pub struct LogsReport {
     pub lines: Vec<String>,
     /// The supervisor returned more than stack's capture limit; `lines` holds the tail.
     pub truncated: bool,
+    /// When stack last started the service's current process, if recorded. Lines before it
+    /// came from an earlier process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    /// Only lines since `started_at` were requested.
+    pub since_start: bool,
 }
 
 /// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
-/// time and size; never follows.
-pub fn logs(ctx: &Ctx, service: &str, tail: usize) -> Result<LogsReport> {
+/// time and size; never follows. With `since_start`, only output of the current process.
+pub fn logs(ctx: &Ctx, service: &str, tail: usize, since_start: bool) -> Result<LogsReport> {
     let report = ctx.compile(false)?;
     if !report.stack.services.contains_key(service) {
         return Err(unknown_service(&report, service));
     }
-    let configured = {
+    let (configured, started_at) = {
         let _guard = project_lock(&ctx.state, &ctx.root)?;
-        has_provider_config(ctx, &report, load(ctx)?.is_some())?
+        let session = load(ctx)?;
+        let started_at = session.as_ref().and_then(|s| s.services.get(service)).and_then(|r| r.started_at);
+        (has_provider_config(ctx, &report, session.is_some())?, started_at)
     };
     if !configured {
         return Err(StackError::new("logs_failed", format!("no launch record for {service} in this checkout"))
             .hint("run `stack up` first"));
     }
-    let out = mise::logs(&ctx.root, service, tail)?;
+    let since = match (since_start, started_at) {
+        (false, _) => None,
+        (true, Some(at)) => Some(at),
+        (true, None) => {
+            return Err(StackError::new("logs_failed", format!("no recorded start time for {service}"))
+                .hint("sessions started before stack 0.1.18 lack one; `stack restart` records it"))
+        }
+    };
+    let out = mise::logs(&ctx.root, service, tail, since)?;
     let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
     let skip = lines.len().saturating_sub(tail);
-    Ok(LogsReport { service: service.to_string(), lines: lines[skip..].to_vec(), truncated: out.stdout_truncated })
+    Ok(LogsReport {
+        service: service.to_string(),
+        lines: lines[skip..].to_vec(),
+        truncated: out.stdout_truncated,
+        started_at,
+        since_start,
+    })
 }
 
 /// `unknown_service`, naming the services the project does define.
@@ -907,6 +1046,19 @@ fn checks_match(previous: &Session, checks: &[Check]) -> bool {
                 .get(&c.service)
                 .is_some_and(|r| r.pid == c.pid && Some(r.port) == c.port)
         })
+}
+
+/// The session record of a verified check.
+fn record_of(check: &Check, started_at: u64) -> ServiceRecord {
+    ServiceRecord {
+        port: check.port.unwrap_or_default(),
+        pid: check.pid,
+        data_dir: check.data_dir.clone(),
+        identity: check.identity.unwrap_or(Identity::Liveness),
+        verified_at: check.checked_at,
+        started_at: Some(started_at),
+        provider_id: check.provider_id.clone(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1218,6 +1370,7 @@ fn not_launched(report: &Report) -> Vec<Check> {
             identity: None,
             reason: Some("no launch record in this checkout; run `stack up`".into()),
             withheld: Vec::new(),
+            changed_since_start: Vec::new(),
             checked_at: now(),
             data_dir: None,
             provider_id: None,
@@ -1881,29 +2034,47 @@ pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
 fn load(ctx: &Ctx) -> Result<Option<Session>> {
     // The machine index is authoritative. A crash between the two atomic writes can
     // leave the project copy behind; lifecycle operations always use the indexed generation.
-    let path = if ctx.index_file().exists() {
-        ctx.index_file()
-    } else {
-        ctx.session_file()
-    };
+    let indexed = ctx.index_file().exists();
+    let path = if indexed { ctx.index_file() } else { ctx.session_file() };
     if !path.exists() {
         return Ok(None);
     }
     let session = read_json::<Session>(&path)?;
+    // The project copy mirrors the record for this path only. One naming another directory
+    // was copied in with the files (committed to Git, a cloned or duplicated checkout): its
+    // services belong to that directory, whose own record is in the machine index.
+    if !indexed && session.project != ctx.root {
+        return Ok(None);
+    }
     // A different directory now at this path must not adopt (or stop) the old one's services.
     if project_replaced(&session, &ctx.root) {
-        return Err(StackError::new(
+        let err = StackError::new(
             "session_conflict",
             "a session recorded for a previous directory at this path still owns services",
-        )
-        .hint("run `stack gc` to reclaim them through the supervisor; it reports anything it cannot confirm"));
+        );
+        return Err(if indexed {
+            err.hint("run `stack gc` to reclaim them through the supervisor; it reports anything it cannot confirm")
+        } else {
+            err.hint(format!(
+                "{} came with this directory from an earlier one at the same path; stop that \
+                 directory's services if any still run, then delete the file",
+                ctx.session_file().display()
+            ))
+        });
     }
     Ok(Some(session))
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
     write_json(&ctx.index_file(), session)?;
-    write_json(&ctx.session_file(), session)
+    write_json(&ctx.session_file(), session)?;
+    // The project copy describes this checkout only; keep it out of version control so clones
+    // and worktrees never carry it.
+    let ignore = ctx.root.join(".stack").join(".gitignore");
+    if !ignore.exists() {
+        fs::write(&ignore, "*\n").map_err(|e| crate::error::io_error(ignore.display(), e))?;
+    }
+    Ok(())
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {
@@ -1919,6 +2090,15 @@ fn has_active_executions(session: &Session) -> bool {
         .active_executions
         .values()
         .any(|pid| pid_alive(*pid))
+}
+
+/// A note when this checkout's running session was started from a configuration other than
+/// `report` (such as an edited `[env]`), for `inspect`. Read-only: no lock, no provider calls.
+pub fn stale_session(ctx: &Ctx, report: &Report) -> Option<String> {
+    let session = load(ctx).ok()??;
+    (session.config_digest != config_digest(ctx, report)).then(|| {
+        "the running services were started from a different configuration; `stack up` restarts them with this one".to_string()
+    })
 }
 
 fn config_digest(ctx: &Ctx, report: &Report) -> String {
@@ -1976,8 +2156,60 @@ fn verify_session(
                 &inherited_env(),
             );
         }
+        let watch = &report.stack.services[&check.service].value.watch;
+        let started = session.and_then(|s| s.services.get(&check.service)).and_then(|r| r.started_at);
+        if let (false, Some(started)) = (watch.is_empty(), started) {
+            check.changed_since_start = changed_since(&ctx.root, watch, started);
+        }
     }
     checks
+}
+
+/// Most changed files a check names; the first are enough to act on.
+const CHANGED_LIMIT: usize = 5;
+/// Most directory entries examined per check, so a huge tree cannot stall every command.
+const WATCH_SCAN_LIMIT: usize = 20_000;
+
+/// Files under `watch` (relative to `root`) modified after `started_at`, in the order found.
+/// Directories are walked recursively, skipping hidden entries and common build and
+/// dependency directories.
+fn changed_since(root: &Path, watch: &[String], started_at: u64) -> Vec<String> {
+    let modified_after = |meta: &fs::Metadata| {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| d.as_secs() > started_at)
+    };
+    let mut changed = Vec::new();
+    let mut pending: Vec<PathBuf> = watch.iter().map(|w| root.join(w)).collect();
+    pending.reverse();
+    let mut scanned = 0;
+    while let Some(path) = pending.pop() {
+        if changed.len() >= CHANGED_LIMIT || scanned >= WATCH_SCAN_LIMIT {
+            break;
+        }
+        scanned += 1;
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if meta.is_dir() {
+            let Ok(entries) = fs::read_dir(&path) else { continue };
+            let mut children: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with('.') && !matches!(name.as_ref(), "node_modules" | "target" | "__pycache__")
+                })
+                .map(|e| e.path())
+                .collect();
+            children.sort();
+            children.reverse();
+            pending.extend(children);
+        } else if modified_after(&meta) {
+            let shown = path.strip_prefix(root).unwrap_or(&path);
+            changed.push(shown.display().to_string());
+        }
+    }
+    changed
 }
 
 /// An execution is registered under the lifecycle lock and removed at command completion.
@@ -2356,6 +2588,7 @@ mod tests {
             ready_port: None,
             port: None,
             identity: None,
+            watch: Vec::new(),
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [
