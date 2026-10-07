@@ -11,7 +11,7 @@ const cargoVersion = readFileSync('Cargo.toml', 'utf8').match(/^version = "([^"]
 if (cargoVersion !== manifest.version) throw new Error('Cargo and npm versions differ');
 const tag = process.env.RELEASE_TAG;
 if (tag && tag !== `v${manifest.version}`) throw new Error(`Tag ${tag} must match v${manifest.version}`);
-const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const commit = execFileSync('git', ['rev-parse', 'HEAD'], { timeout: 30000, killSignal: 'SIGKILL', encoding: 'utf8' }).trim();
 const hashes = {};
 for (const platform of platforms) {
   const source = path.join(process.argv[2] ?? 'artifacts', platform);

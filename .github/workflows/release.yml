@@ -2,8 +2,7 @@ name: Release
 on:
   push:
     tags: ['v*']
-permissions:
-  contents: read
+permissions: {}
 concurrency:
   group: npm-release
   queue: max
@@ -15,24 +14,28 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: read
+      actions: read # Select and download the tested CI artifact.
     outputs:
       run-id: ${{ steps.source.outputs.run-id }}
       artifact-id: ${{ steps.source.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 5
         with:
           node-version: '24.16.0'
           package-manager-cache: false
       - name: Check release origin
+        timeout-minutes: 1
         run: |
           test "$GITHUB_REPOSITORY" = usharma123/stack
           git merge-base --is-ancestor HEAD origin/main
       - name: Select exact commit's main CI artifact
+        timeout-minutes: 3
         id: source
         run: node scripts/promote.mjs select
         env:
@@ -45,17 +48,20 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      actions: read
-      id-token: write
+      actions: read # Select and download the tested CI artifact.
+      id-token: write # npm trusted publishing and provenance.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 5
         with:
           node-version: '24.16.0'
           package-manager-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
         with:
           artifact-ids: ${{ needs.source.outputs.artifact-id }}
           run-id: ${{ needs.source.outputs.run-id }}
@@ -63,13 +69,15 @@ jobs:
           path: dist
           digest-mismatch: error
       - name: Verify tested package identity and binaries
+        timeout-minutes: 1
         run: node scripts/promote.mjs verify dist/*.tgz
       - name: Publish and verify immutable package
         timeout-minutes: 22
         run: node scripts/publish.mjs dist/*.tgz
       - name: Install from npm registry
+        timeout-minutes: 6
         run: |
           version=$(node -p "require('./npm/package.json').version")
           mkdir registry
-          npm pack "@ushawarma/stack@$version" --pack-destination registry --registry=https://registry.npmjs.org
+          npm pack "@ushawarma/stack@$version" --pack-destination registry --ignore-scripts --fetch-timeout=30000 --fetch-retries=2 --registry=https://registry.npmjs.org
           node scripts/smoke-install.mjs registry/*.tgz

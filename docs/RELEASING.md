@@ -25,7 +25,13 @@ builds the artifact that releases promote and does the following:
 
 Actions are pinned to commit SHAs. Builds use Cargo.lock and no shared caches.
 Packaging starts as soon as native builds pass; independent OCI/service checks still
-block the final `CI passed` result. Jobs have timeouts. PR runs can cancel older runs; releases cannot cancel an active
+block the final `CI passed` result. The four-runner install matrix tests the uploaded
+tarball; packaging does not repeat its Linux smoke test. Every runner job and step
+has a timeout. Script subprocesses have hard kill deadlines: 30 seconds for local
+checks, 60 seconds for each GitHub API command, and three minutes for npm install
+or publish. Workflows default to no token permissions; jobs grant only the reads
+they need, with OIDC limited to publication. Checkouts never persist credentials.
+PR runs can cancel older runs; releases cannot cancel an active
 publication. Release runs queue instead of replacing pending releases. Set the
 `CI passed` job as a required branch protection check.
 The existing `tests/e2e/run.sh` service scenarios remain an additional manual
@@ -119,10 +125,19 @@ and reuse the selected artifact; if it is unavailable, release a new version.
 Fix authentication errors rather than repeatedly publishing. A newer failed or
 unfinished eligible run for the commit blocks promotion even if an older run passed.
 
-GitHub release concurrency uses `queue: max` to retain pending releases. Older
-actionlint versions do not recognize this GitHub-supported field. For those
-versions, use `actionlint -ignore '^unexpected key "queue" for "concurrency" section'`
-to ignore only that schema mismatch.
+GitHub release concurrency uses `queue: max` to retain pending releases. The CI
+caller uses `$/` to resolve the reusable workflow at the running commit, following
+[GitHub's self-repository recommendation](https://github.blog/changelog/2026-07-30-reference-same-repository-actions-with-self-repository-syntax/).
+Actionlint 1.7.12 does not recognize these two GitHub-supported features. Until
+its schema catches up, ignore only these exact diagnostics:
+
+```sh
+actionlint \
+  -ignore '^unexpected key "queue" for "concurrency" section' \
+  -ignore '^reusable workflow call "\$/.github/workflows/validate.yml" at "uses" is not following the format' \
+  .github/workflows/{ci,validate,release}.yml
+zizmor --no-progress .github/workflows/{ci,validate,release}.yml
+```
 
 ## Local packaging check
 

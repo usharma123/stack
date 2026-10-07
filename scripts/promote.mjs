@@ -35,7 +35,7 @@ export function selectArtifact(artifacts, run, now = Date.now()) {
 
 export function verifyPackage(file, { commit, version, tag }) {
   assert.equal(tag, `v${version}`, 'Release tag must match the checkout version');
-  const read = name => execFileSync('tar', ['-xOf', file, `package/${name}`], { maxBuffer: 128 * 1024 * 1024 });
+  const read = name => execFileSync('tar', ['-xOf', file, `package/${name}`], { timeout: 30000, killSignal: 'SIGKILL', maxBuffer: 128 * 1024 * 1024 });
   const manifest = JSON.parse(read('package.json'));
   assert.equal(manifest.name, '@ushawarma/stack', 'Unexpected package name');
   assert.equal(manifest.version, version, 'Package version differs from checkout');
@@ -50,7 +50,7 @@ export function verifyPackage(file, { commit, version, tag }) {
 }
 
 function main() {
-  const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const commit = execFileSync('git', ['rev-parse', 'HEAD'], { timeout: 30000, killSignal: 'SIGKILL', encoding: 'utf8' }).trim();
   const version = JSON.parse(readFileSync('npm/package.json')).version;
   const tag = process.env.GITHUB_REF_NAME;
   assert.equal(process.env.GITHUB_REPOSITORY, repository, 'Unexpected release repository');
@@ -60,7 +60,7 @@ function main() {
     'Cargo and npm versions differ');
   if (process.argv[2] === 'select') {
     const api = endpoint => JSON.parse(execFileSync('gh', ['api', '--paginate', '--slurp', endpoint],
-      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
+      { timeout: 60000, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
     const runs = api(`repos/${repository}/actions/workflows/ci.yml/runs?head_sha=${commit}&per_page=100`)
       .flatMap(page => page.workflow_runs);
     const run = selectRun(runs, commit, tag);
