@@ -1794,3 +1794,26 @@ fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
     assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "supervised listener survived down");
 }
 
+// ---- install and logs ----------------------------------------------------------------------
+
+#[test]
+fn install_puts_locked_tools_in_place_without_starting_or_recording_anything() {
+    let fixture = Fixture::with_bundle(WEB);
+    let result = json_result(&fixture.ok(&["install", "--json"]));
+    let steps: Vec<&str> = result["data"]["steps"].as_array().unwrap().iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(steps, ["compile", "preflight", "install"], "{result}");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("install --yes --quiet"), "{log}");
+    assert!(!log.contains("daemons start") && !log.contains("daemons stop"), "{log}");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert!(status["data"]["session"].is_null() && status["data"]["checks"][0]["ready"] == false, "{status}");
+
+    // Locked like `up`: a request stack.lock does not pin is refused, not resolved.
+    fs::write(fixture.dir.path().join("bundle/bundle.toml"), format!("{WEB}[tools]\npython='3.13'\n")).unwrap();
+    let out = fixture.command(&["install", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "lock_outdated");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("latest python"), "resolved during a locked install:\n{log}");
+}
+

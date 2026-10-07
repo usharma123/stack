@@ -43,6 +43,8 @@ enum Cmd {
     },
     /// Show the composed stack without writing anything
     Inspect,
+    /// Install the locked tools and service binaries without starting anything
+    Install,
     /// Start services, verify each one, and record a session
     Up {
         /// Reclaim the session after this long without activity (e.g. 30m, 2h)
@@ -148,6 +150,14 @@ fn main() -> ExitCode {
                     println!("session {}", r.session.id);
                 })
             }),
+        Cmd::Install => session::install(&ctx).map(|r| {
+            emit(cli.json, &r, || {
+                for v in &r.versions {
+                    println!("{:<12} {}", v.name, v.resolved.as_deref().unwrap_or("-"));
+                }
+                println!("installed; nothing started");
+            })
+        }),
         Cmd::Status => session::status(&ctx).map(|r| {
             let healthy = !r.stale && r.checks.iter().all(|c| c.ready);
             let code = emit(cli.json, &r, || {

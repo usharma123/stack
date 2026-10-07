@@ -86,6 +86,7 @@ fn tools() -> Value {
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
+        { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_exec", "description": "Run a command with the stack's tools and env. Connection variables of services that fail verification are withheld; required services must verify or the command does not run.",
           "inputSchema": schema(json!({
@@ -182,6 +183,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             )
             .map(to_value)
         }
+        "stack_install" => session::install(ctx).map(to_value),
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
         "stack_down" => session::down(ctx).map(to_value),

@@ -777,6 +777,40 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct InstallReport {
+    pub steps: Vec<Value>,
+    pub ports: IndexMap<String, u16>,
+    pub versions: Vec<project::VersionReport>,
+}
+
+/// Install every locked tool and service binary without starting anything or recording a
+/// session: the compile, trust, socket preflight and install steps of `up`, and nothing after.
+/// Locked like `up`: a missing or stale pin is `lock_outdated`, never resolved here.
+pub fn install(ctx: &Ctx) -> Result<InstallReport> {
+    let mut steps = Steps::default();
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let report = match ctx.compile(true) {
+        Ok(r) => r,
+        Err(e) => return Err(steps.fail("compile", e, false)),
+    };
+    steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = mise::trust(&ctx.root) {
+        return Err(steps.fail("install", e, false));
+    }
+    if !report.stack.services.is_empty() {
+        match preflight_socket(ctx) {
+            Ok((_, detail)) => steps.ok("preflight", detail),
+            Err(e) => return Err(steps.fail("preflight", e, false)),
+        }
+    }
+    if let Err(e) = mise::install(&ctx.root) {
+        return Err(steps.fail("install", e, false));
+    }
+    steps.ok("install", json!(null));
+    Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions })
+}
+
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
 fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
     let effective = mise::env(&ctx.root)?;
