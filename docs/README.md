@@ -9,6 +9,7 @@
 - [Service identity probes](user/identity-probes.md)
 - [Publishing bundles to OCI registries](user/registries.md)
 - [JSON output and MCP](user/agents.md)
+- [Worktree and agent-sandbox integration](user/worktrees.md)
 
 ## Working on Stack
 

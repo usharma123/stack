@@ -71,7 +71,12 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Ports.** Assigned per checkout from 40000-49999 via a locked machine-wide registry; reused
   across restarts; pruned when a project directory disappears; `--reassign-ports` after a foreign
   program takes one. Projects may pin ports in `[override.services]`; pins are checked against
-  other projects' reservations. Service defaults (5432, 6379) are never used.
+  other projects' reservations. Service defaults (5432, 6379) are never used. Before starting,
+  `up` checks every assigned port: one that accepts connections without a running or starting
+  supervisor daemon of that service behind it is a `port_conflict`, naming the service, the port
+  and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
+  assigned ports and the override for pinned ones. Stack never reassigns on its own: `down`
+  removes the session while reservations persist, so "no session" does not mean "never used".
 - **Generations.** A session fingerprints the complete composed configuration, bundle lock and
   assigned ports. `status` reports a change as stale; `exec` withholds service endpoints until
   `up` stops the previous owned instance and verifies the new configuration. Legacy records
@@ -111,7 +116,14 @@ output (mise's answer when no release matches) is an error, not a version.
   policy still takes precedence over a surviving command.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
-  those processes dead and ports closed.
+  those processes dead and ports closed. A reserved port is stack's to wait for only when a
+  running or starting daemon, or a live recorded process, is behind it; a foreign listener on a
+  reserved port is reported in `conflicts`, not stopped and not a failure.
+- **Installing.** `install` runs the compile, trust, socket-preflight and install steps of `up`
+  and nothing after: no session, no stop, no start. It is locked like `up`.
+- **Logs.** `logs <service> --tail N` returns the supervisor's stored output for one daemon
+  (`mise daemons logs`, bounded by a deadline and a 1 MiB cap, never following). The output's
+  location follows the supervisor's state directory unless `PITCHFORK_LOGS_DIR` moves it.
 - **Deleted projects.** At `up` the machine index records each daemon's qualified Pitchfork id,
   the Pitchfork binary, its effective state directory, and the project directory's device and
   inode, plus its creation time when the filesystem exposes it. Creation time detects inode
