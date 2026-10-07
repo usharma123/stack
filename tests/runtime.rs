@@ -64,6 +64,12 @@ case "$1 $2" in
     cat "$REVIEW_FIXTURE/daemons.json" ;;
   'daemons start')
     if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
+    # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
+    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
+      python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
+      echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
+      sleep 0.3
+    fi
     if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
       cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
       touch "$REVIEW_FIXTURE/started"
@@ -1684,3 +1690,107 @@ fn every_partial_start_failure_preserves_observed_ownership() {
         }
     }
 }
+
+// ---- port conflicts -------------------------------------------------------------------------
+
+fn assigned_port(fixture: &Fixture, service: &str) -> u16 {
+    let out = fixture.ok(&["inspect", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    u16::try_from(v["data"]["ports"][service].as_u64().expect("port assigned")).unwrap()
+}
+
+fn json_result(out: &Output) -> Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+#[test]
+fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "port_conflict", "{result}");
+    assert!(result["error"]["hint"].as_str().unwrap().contains("--reassign-ports"), "{result}");
+    assert_eq!(result["error"]["details"][0]["service"], "web");
+    assert_eq!(result["error"]["details"][0]["port"], port);
+    assert_eq!(result["error"]["details"][0]["pinned"], false);
+    let steps = result["error"]["details"].as_array().unwrap().last().unwrap();
+    assert_eq!(steps["changed"], false);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons stop"), "stop reconciliation ran against a foreign listener:\n{log}");
+    assert!(!log.contains("daemons start"), "started over a foreign listener:\n{log}");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists(), "no ownership was recorded");
+
+    // Stopping owns nothing here; the foreign listener is reported, not waited for.
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["confirmed"], true);
+    assert_eq!(result["data"]["conflicts"][0]["port"], port);
+
+    // Recovery: fresh ports, then a normal start on the new one.
+    fixture.ok(&["compile", "--reassign-ports"]);
+    let moved = assigned_port(&fixture, "web");
+    assert_ne!(moved, port);
+    supervise_listener(&fixture, moved);
+    let result = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(result["data"]["checks"][0]["ready"], true, "{result}");
+    assert_eq!(result["data"]["checks"][0]["port"], moved);
+    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+}
+
+/// The fake supervisor starts a listener on `port` at `daemons start` and kills it at stop.
+fn supervise_listener(fixture: &Fixture, port: u16) {
+    fs::write(fixture.dir.path().join("listen-port"), port.to_string()).unwrap();
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "name": "web", "status": "running", "port": port }]).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_pinned_port_held_by_another_program_points_at_the_override() {
+    let fixture = Fixture::with_bundle(WEB);
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        format!("[[use]]\nbundle='path:../bundle'\n[override.services.web]\nrun='true'\nport = {port}\n"),
+    )
+    .unwrap();
+    fixture.ok(&["compile"]);
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "port_conflict", "{result}");
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("[override.services]") && !hint.contains("--reassign-ports"), "{hint}");
+    assert_eq!(result["error"]["details"][0]["pinned"], true);
+}
+
+#[test]
+fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    let first = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(first["data"]["checks"][0]["ready"], true, "{first}");
+    // Same generation, daemon still running on the port: `up` reuses it rather than refusing.
+    let second = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(second["data"]["session"]["id"], first["data"]["session"]["id"]);
+    assert!(second["data"]["steps"].as_array().unwrap().iter().all(|s| s["status"] == "ok"), "{second}");
+
+    // The supervisor refusing to stop is still a failure; a running service is never "foreign".
+    fs::write(fixture.dir.path().join("fail-stop"), "").unwrap();
+    let out = fixture.command(&["down", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "stop_failed");
+    fs::remove_file(fixture.dir.path().join("fail-stop")).unwrap();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true);
+    assert!(down["data"]["conflicts"].is_null(), "{down}");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "supervised listener survived down");
+}
+

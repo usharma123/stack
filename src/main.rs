@@ -184,7 +184,15 @@ fn main() -> ExitCode {
                 exec(&ctx, cmd, &req)
             }
         }
-        Cmd::Down => session::down(&ctx).map(|r| emit(cli.json, &r, || println!("stopped {} service(s); confirmed", r.stopped.len()))),
+        Cmd::Down => session::down(&ctx).map(|r| {
+            emit(cli.json, &r, || {
+                println!("stopped {} service(s); confirmed", r.stopped.len());
+                for c in &r.conflicts {
+                    println!("note: port {} reserved for {} is held by another program{}", c.port, c.service,
+                        c.holder.as_ref().map(|h| format!(" (pid {} {})", h.pid, h.command)).unwrap_or_default());
+                }
+            })
+        }),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
         Cmd::Gc { watch: true, interval, max_passes } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes),
         Cmd::Gc { .. } => session::gc_checked(&ctx.state).map(|r| {

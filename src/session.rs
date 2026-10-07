@@ -633,6 +633,20 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         }
         steps.ok("stop_previous", json!(null));
     }
+    // Nothing can start on a port a foreign program holds, and the supervisor's own error
+    // would come after the attempt. Stack's own daemons still running (an unchanged
+    // generation) are not conflicts.
+    if !report.stack.services.is_empty() {
+        let statuses = match mise::daemons(&ctx.root) {
+            Ok(s) => s,
+            Err(e) => return Err(steps.fail("ports", e, false)),
+        };
+        let conflicts = port_conflicts(&report, &statuses);
+        if !conflicts.is_empty() {
+            return Err(steps.fail("ports", port_conflict_error(conflicts), false));
+        }
+        steps.ok("ports", json!(null));
+    }
 
     let stamp = now();
     let lease = (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
@@ -825,6 +839,21 @@ fn checks_match(previous: &Session, checks: &[Check]) -> bool {
 pub struct DownReport {
     pub stopped: Vec<Value>,
     pub confirmed: bool,
+    /// Reserved ports a program stack does not own is listening on. Not a failure of `down`:
+    /// nothing stack started is behind them, and `up` refuses to start over them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<PortConflict>,
+}
+
+/// A port reserved for one of this checkout's services that a foreign program holds.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortConflict {
+    pub service: String,
+    pub port: u16,
+    /// The project pinned this port in `[override.services]`; stack cannot move it.
+    pub pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<ports::Holder>,
 }
 
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
@@ -835,23 +864,18 @@ pub fn down(ctx: &Ctx) -> Result<DownReport> {
 
 fn down_locked(ctx: &Ctx) -> Result<DownReport> {
     let session = load(ctx)?;
-    let mut ports: Vec<u16> = ports::lookup(&ctx.state, &ctx.root)?
-        .values()
-        .copied()
-        .collect();
+    let reserved = ports::lookup(&ctx.state, &ctx.root)?;
     // Services always hold a port reservation from compile, and a launch record names any
     // process stack started. With neither, stack owns nothing and the supervisor (which may
     // not even be configured for a tools-only project) has nothing to report.
-    let owns_services = !ports.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
+    let owns_services = !reserved.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
     // Failure to discover ownership cannot establish that nothing is running.
     let before = if owns_services { mise::daemons(&ctx.root)? } else { Vec::new() };
     let mut pids: Vec<(String, u32)> = before
         .iter()
         .filter_map(|d| d.pid.map(|p| (d.name.clone(), p)))
         .collect();
-    ports.extend(before.iter().filter_map(|d| d.port));
     if let Some(session) = &session {
-        ports.extend(session.services.values().map(|s| s.port));
         pids.extend(
             session
                 .services
@@ -859,19 +883,29 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
                 .filter_map(|(name, s)| s.pid.map(|p| (name.clone(), p))),
         );
     }
+    pids.sort_unstable();
+    pids.dedup();
+
+    // Ports stack owns, and must therefore see closed: those of supervisor daemons that are
+    // running or starting, and those recorded for a process stack started that is still
+    // alive, including an older generation's. A reserved port that something else listens on
+    // is a foreign program's: `mise daemons stop` cannot end it and stack must not try, so it
+    // is reported as a conflict instead of being waited for.
+    let supervised = |d: &DaemonStatus| {
+        matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive)
+    };
+    let mut ports: Vec<u16> = before.iter().filter(|d| supervised(d)).filter_map(|d| d.port).collect();
+    if let Some(session) = &session {
+        ports.extend(session.services.values().filter(|s| s.pid.is_some_and(pid_alive)).map(|s| s.port));
+    }
     ports.sort_unstable();
     ports.dedup();
     ports.retain(|p| *p != 0);
-    pids.sort_unstable();
-    pids.dedup();
 
     // Providers may list configured but never-started daemons. Stopping those returns
     // "no matching daemons"; only invoke stop when there is actual ownership to reconcile.
     let needs_stop = pids.iter().any(|(_, pid)| pid_alive(*pid))
-        || before
-            .iter()
-            .any(|d| matches!(d.status.as_str(), "running" | "starting"))
-        || ports.iter().any(|port| accepting(*port));
+        || before.iter().any(|d| matches!(d.status.as_str(), "running" | "starting"));
     if needs_stop {
         mise::stop(&ctx.root)?;
     }
@@ -902,13 +936,83 @@ fn down_locked(ctx: &Ctx) -> Result<DownReport> {
 
     remove_if_exists(&ctx.session_file())?;
     remove_if_exists(&ctx.index_file())?;
+    // Everything stack owned is gone, so whatever still answers on a reserved port is foreign.
+    let pinned = pinned_ports(ctx);
+    let conflicts = reserved
+        .iter()
+        .filter(|(_, port)| accepting(**port))
+        .map(|(service, port)| conflict(service, *port, pinned.contains(service)))
+        .collect();
     Ok(DownReport {
         stopped: pids
             .iter()
             .map(|(name, pid)| json!({ "service": name, "pid": pid }))
             .collect(),
         confirmed: true,
+        conflicts,
     })
+}
+
+fn conflict(service: &str, port: u16, pinned: bool) -> PortConflict {
+    PortConflict { service: service.to_string(), port, pinned, holder: ports::holder(port) }
+}
+
+/// Services whose port the project pinned, read without resolving anything. Unreadable
+/// configuration means no pins: the hint then names `--reassign-ports`, which such a project
+/// would reject anyway.
+fn pinned_ports(ctx: &Ctx) -> Vec<String> {
+    ctx.compile(false)
+        .map(|r| r.stack.services.iter().filter(|(_, e)| e.value.fixed_port().is_some()).map(|(n, _)| n.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Reserved ports of this checkout that something stack does not own is listening on. A
+/// supervisor daemon of the same service, running or starting on that port, is stack's own.
+fn port_conflicts(report: &Report, statuses: &[DaemonStatus]) -> Vec<PortConflict> {
+    report
+        .ports
+        .iter()
+        .filter(|(name, port)| {
+            let owned = statuses.iter().any(|d| {
+                d.name == **name
+                    && d.port == Some(**port)
+                    && (matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive))
+            });
+            !owned && accepting(**port)
+        })
+        .map(|(name, port)| {
+            let pinned = report.stack.services.get(name).is_some_and(|e| e.value.fixed_port().is_some());
+            conflict(name, *port, pinned)
+        })
+        .collect()
+}
+
+/// `port_conflict`: which service, which port, who holds it, and what frees this checkout.
+fn port_conflict_error(conflicts: Vec<PortConflict>) -> StackError {
+    let names: Vec<String> = conflicts
+        .iter()
+        .map(|c| match &c.holder {
+            Some(h) => format!("{} (port {}, held by pid {} `{}`)", c.service, c.port, h.pid, h.command),
+            None => format!("{} (port {})", c.service, c.port),
+        })
+        .collect();
+    let (pinned, assigned): (Vec<&PortConflict>, Vec<&PortConflict>) = conflicts.iter().partition(|c| c.pinned);
+    let mut hints = Vec::new();
+    if !assigned.is_empty() {
+        hints.push("run `stack compile --reassign-ports` to give this checkout other ports, then `stack up`".to_string());
+    }
+    for c in pinned {
+        hints.push(format!(
+            "service '{}' pins port {} in [override.services]; change or remove the pin, or free the port",
+            c.service, c.port
+        ));
+    }
+    StackError::new(
+        "port_conflict",
+        format!("another program is listening on this checkout's port for {}", names.join(", ")),
+    )
+    .hint(hints.join("; "))
+    .details(conflicts.iter().map(|c| serde_json::to_value(c).expect("conflict serializes")).collect())
 }
 
 fn accepting(port: u16) -> bool {
