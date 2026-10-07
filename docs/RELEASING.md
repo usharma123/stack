@@ -125,16 +125,12 @@ and reuse the selected artifact; if it is unavailable, release a new version.
 Fix authentication errors rather than repeatedly publishing. A newer failed or
 unfinished eligible run for the commit blocks promotion even if an older run passed.
 
-GitHub release concurrency uses `queue: max` to retain pending releases. The CI
-caller uses `$/` to resolve the reusable workflow at the running commit, following
-[GitHub's self-repository recommendation](https://github.blog/changelog/2026-07-30-reference-same-repository-actions-with-self-repository-syntax/).
-Actionlint 1.7.12 does not recognize these two GitHub-supported features. Until
-its schema catches up, ignore only these exact diagnostics:
+GitHub release concurrency uses `queue: max` to retain pending releases.
+Actionlint 1.7.12 does not recognize that GitHub-supported key yet. Until its schema
+catches up, ignore only that exact diagnostic:
 
 ```sh
-actionlint \
-  -ignore '^unexpected key "queue" for "concurrency" section' \
-  -ignore '^reusable workflow call "\$/.github/workflows/validate.yml" at "uses" is not following the format' \
+actionlint -ignore '^unexpected key "queue" for "concurrency" section' \
   .github/workflows/{ci,validate,release}.yml
 zizmor --no-progress .github/workflows/{ci,validate,release}.yml
 ```
