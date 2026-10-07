@@ -58,7 +58,8 @@ enum Cmd {
         /// Reclaim the session after this long without activity (e.g. 30m, 2h)
         #[arg(long)]
         ttl: Option<String>,
-        /// Reclaim the session when this process exits (e.g. an agent runner)
+        /// Reclaim the session when this process exits. Pass a long-lived process such as the
+        /// agent runner or CI job, not a shell that exits after this command
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
         owner_pid: Option<u32>,
     },
