@@ -1150,6 +1150,34 @@ fn a_failed_restart_records_the_replacement_it_launched() {
 }
 
 #[test]
+fn retrying_an_incomplete_launch_keeps_what_it_recorded_until_down_confirms_it() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    fs::write(fixture.dir.path().join("fail-env-after-start"), "").unwrap();
+    assert!(!fixture.command(&["restart", "web", "--json"]).output().unwrap().status.success());
+    let replacement: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    fs::remove_file(fixture.dir.path().join("fail-env-after-start")).unwrap();
+
+    // The recovery `up` fails right after writing its launch record.
+    fs::write(fixture.dir.path().join("fail-query-after-one"), "").unwrap();
+    let retry = json_result(&fixture.command(&["up", "--json"]).output().unwrap());
+    assert_eq!(retry["ok"], false, "{retry}");
+    fs::remove_file(fixture.dir.path().join("fail-query-after-one")).unwrap();
+    let record: Value = serde_json::from_slice(&fs::read(&fixture.session_paths()[0]).unwrap()).unwrap();
+    assert_eq!(record["services"]["web"]["pid"], replacement, "{record}");
+
+    // Even with the supervisor listing nothing, the recorded process is stopped, not abandoned.
+    fs::write(fixture.dir.path().join("daemons.json"), "[]").unwrap();
+    let down = json_result(&fixture.command(&["down", "--json"]).output().unwrap());
+    let alive = pid_alive(replacement);
+    if alive {
+        Command::new("kill").arg(replacement.to_string()).status().unwrap();
+    }
+    assert!(down["ok"] == false || !alive, "down confirmed while {replacement} lived: {down}");
+}
+
+#[test]
 fn a_moved_checkouts_only_record_is_kept_and_named() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));

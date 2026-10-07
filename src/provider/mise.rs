@@ -502,9 +502,9 @@ pub fn logs(root: &Path, service: &str, tail: usize, since: Option<u64>) -> Resu
 }
 
 /// Pitchfork's `--since` for the instant `at`: local wall-clock time, which it reads as an
-/// exact instant. A wall-clock time that names two instants (the repeated hour when clocks go
-/// back) or that cannot be formatted falls back to a relative age, rounded up so the start
-/// second is kept.
+/// exact instant. A wall-clock time that names two instants (repeated when clocks go back, by
+/// any amount up to three hours in 15-minute steps, which covers every zone in use) or that
+/// cannot be formatted falls back to a relative age, rounded up so the start second is kept.
 fn since_argument(at: u64, now: u64) -> String {
     since_argument_in(at, now, local_datetime)
 }
@@ -512,8 +512,9 @@ fn since_argument(at: u64, now: u64) -> String {
 fn since_argument_in(at: u64, now: u64, local_datetime: impl Fn(u64) -> Option<String>) -> String {
     let local = local_datetime(at);
     let ambiguous = local.is_none()
-        || local == local_datetime(at + 3600)
-        || local == at.checked_sub(3600).and_then(&local_datetime);
+        || (1..=12u64).map(|k| k * 900).any(|shift| {
+            local == local_datetime(at + shift) || local == at.checked_sub(shift).and_then(&local_datetime)
+        });
     match local {
         Some(local) if !ambiguous => local,
         _ => format!("{}s", now.saturating_sub(at) + 1),
@@ -592,6 +593,11 @@ mod tests {
         assert_eq!(since_argument_in(8000, 9000, wall), "1001s", "second pass");
         assert_eq!(since_argument_in(20_000, 20_005, wall), "wall 20000");
         assert_eq!(since_argument_in(5, 10, |_| None), "6s");
+        // A 30-minute rollback at 7200 (as on Lord Howe Island): both passes are ambiguous.
+        let half = |t: u64| Some(format!("wall {}", if (7200..9000).contains(&t) { t - 1800 } else { t }));
+        assert_eq!(since_argument_in(6000, 9500, half), "3501s");
+        assert_eq!(since_argument_in(7800, 9500, half), "1701s");
+        assert_eq!(since_argument_in(5000, 9500, half), "wall 5000");
         assert!(local_datetime(1_791_404_602).is_some_and(|t| t.len() == 19));
     }
 

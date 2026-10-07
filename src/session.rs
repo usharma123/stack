@@ -674,6 +674,10 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         // Ownership is recorded before anything starts. If start or verification fails, or the
         // service is later removed from the configuration, `down` still knows what to reconcile.
         let unverified = previous.as_ref().map_or(true, |p| p.launching || p.config_digest != digest);
+        // Retrying an incomplete launch of this same generation stopped nothing, so whatever it
+        // recorded (a process an interrupted `up` or `restart` observed) may still run. Those
+        // identifiers are kept until observations replace them or `down` confirms them gone.
+        let carried = previous.as_ref().filter(|p| p.launching && !restart);
         if unverified {
             let launch = Session {
                 id: new_session_id(ctx),
@@ -688,7 +692,11 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                     .ports
                     .iter()
                     .map(|(name, port)| {
-                        let record = ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0, started_at_ms: None, provider_id: None };
+                        let record = carried
+                            .and_then(|p| p.services.get(name))
+                            .filter(|r| r.port == *port)
+                            .map(|r| ServiceRecord { identity: Identity::Liveness, verified_at: 0, ..r.clone() })
+                            .unwrap_or(ServiceRecord { port: *port, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 0, started_at_ms: None, provider_id: None });
                         (name.clone(), record)
                     })
                     .collect(),
