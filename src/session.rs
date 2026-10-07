@@ -2080,11 +2080,13 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
     // was either copied in with the files (committed to Git, a cloned or duplicated checkout)
     // or came along when this very directory was moved. A copy's services belong to the other
     // directory, whose own record is in the machine index. A move's are this directory's, and
-    // that copy may be the last record of them: it is never discarded.
+    // that copy may be the last record of them. Either way the copy is discarded only when it
+    // cannot be the last record of anything running: it came from another directory, the
+    // index of its path still holds it, or nothing it names is alive.
     if !indexed && session.project != ctx.root {
         let same_directory = session.project_dir_id.is_some() && session.project_dir_id == dir_id(&ctx.root);
         let copied = session.project_dir_id.is_some() && !same_directory;
-        if copied {
+        if copied || owned_elsewhere(ctx, &session) || !owns_anything_live(&session) {
             return Ok(None);
         }
         return Err(StackError::new(
@@ -2118,6 +2120,18 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
         });
     }
     Ok(Some(session))
+}
+
+/// The machine index of the copy's own path still holds this session, so GC and that
+/// checkout keep its ownership whether this directory is a copy or was moved from there.
+fn owned_elsewhere(ctx: &Ctx, session: &Session) -> bool {
+    read_json::<Session>(&index_path(&ctx.state, &session.project)).is_ok_and(|indexed| indexed.id == session.id)
+}
+
+/// Some process the record names is alive, or some port it reserved accepts connections:
+/// discarding the record could leave a service nobody can stop.
+fn owns_anything_live(session: &Session) -> bool {
+    session.services.values().any(|r| r.pid.is_some_and(pid_alive) || (r.port != 0 && accepting(r.port)))
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {

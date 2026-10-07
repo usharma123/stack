@@ -1178,6 +1178,34 @@ fn retrying_an_incomplete_launch_keeps_what_it_recorded_until_down_confirms_it()
 }
 
 #[test]
+fn a_legacy_session_copy_is_ignored_unless_it_may_be_the_last_record_of_a_live_service() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let mut legacy: Value = serde_json::from_slice(&fs::read(fixture.dir.path().join("app/.stack/session.json")).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("project_dir_id");
+    legacy.as_object_mut().unwrap().remove("project_dir_created");
+    let other = fixture.dir.path().join("other");
+    fs::create_dir_all(other.join(".stack")).unwrap();
+    fs::copy(fixture.dir.path().join("app/stack.toml"), other.join("stack.toml")).unwrap();
+    fs::copy(fixture.dir.path().join("app/stack.lock"), other.join("stack.lock")).unwrap();
+    fs::write(other.join(".stack/session.json"), legacy.to_string()).unwrap();
+    let status = || json_result(&fixture.command_at(&other, &["status", "--json"]).output().unwrap());
+
+    // The original checkout still holds the record in the machine index.
+    assert_eq!(status()["data"]["session"], Value::Null);
+    // Without that index entry, the copy may be the last record of the running service.
+    let index = fixture.session_paths().into_iter().nth(1).unwrap();
+    let saved = fs::read(&index).unwrap();
+    fs::remove_file(&index).unwrap();
+    assert_eq!(status()["error"]["code"], "session_conflict");
+    // Once nothing it names runs, the copy describes nothing and is ignored.
+    fs::write(&index, saved).unwrap();
+    fixture.ok(&["down"]);
+    assert_eq!(status()["data"]["session"], Value::Null);
+}
+
+#[test]
 fn a_moved_checkouts_only_record_is_kept_and_named() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
