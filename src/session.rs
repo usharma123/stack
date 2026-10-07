@@ -1928,6 +1928,16 @@ fn config_digest(ctx: &Ctx, report: &Report) -> String {
     if !report.identities.is_empty() {
         config["identities"] = json!(report.identities);
     }
+    // Likewise only when present: stacks without implicit provider env keep their sessions.
+    let python = report
+        .versions
+        .iter()
+        .find(|v| v.kind == "tool" && v.name == "python")
+        .and_then(|v| v.resolved.as_deref());
+    let implicit = mise::implicit_env(&report.stack, python);
+    if !implicit.is_empty() {
+        config["implicit_env"] = json!(implicit);
+    }
     sha256_hex(config.to_string().as_bytes())
 }
 

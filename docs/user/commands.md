@@ -84,6 +84,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   you use execute without mise's trust prompt. Review bundles as you would any dependency.
 - `compile` also warns about service presets mise does not document (it currently documents
   cockroachdb, nats, postgres, redis and spicedb).
+- When a project pins `python`, the generated environment sets `UV_PYTHON` to the locked
+  release and `UV_PYTHON_PREFERENCE=only-system`, so `uv` selects the locked Python release,
+  not another one from an active Conda environment or a build it manages itself; a virtualenv
+  built on the locked release is still used. Set either variable in the project's `[env]` to
+  choose otherwise.
 - For a custom service, connect with `http://127.0.0.1:$<NAME>_PORT`. mise also sets
   `<NAME>_URL` to a Pitchfork proxy hostname (`https://<name>.<project>.localhost`), which only
   answers when Pitchfork's proxy is running.

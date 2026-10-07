@@ -40,6 +40,10 @@ for a in appA appB; do
   # The declared task, through mise's task runner, without mise starting the daemons again.
   stack run test >"$T/run-$a.out" 2>&1 || { cat "$T/run-$a.out"; fail "stack run test failed in $a"; }
   if grep -q 'already running' "$T/run-$a.out"; then cat "$T/run-$a.out"; fail "mise run restarted daemons in $a"; fi
+  # uv uses the locked interpreter on PATH, not a Python build it manages itself.
+  py=$(stack exec -- python -c 'import sys; print(sys.executable)')
+  uvpy=$(stack exec -- uv run --no-project python -c 'import sys; print(sys.executable)')
+  [[ "$(stack exec -- uv run --no-project python -V)" == "$(stack exec -- python -V)" ]] || fail "uv ran $uvpy, not the locked $py"
   actual=$(stack exec --require postgres -- bash -c 'psql "$DATABASE_URL" -Atc "show data_directory"')
   expected=$(jq -r '.data.session.services.postgres.data_dir' "$T/up-$a.json")
   [[ "$actual" == "$expected" ]] || fail "wrong Postgres in $a"
