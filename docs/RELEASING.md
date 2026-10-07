@@ -95,7 +95,14 @@ Stable versions use `latest`; prereleases use `next`.
 The publish script checks the immutable version first. An existing version is
 accepted only if its SHA-512 integrity matches the exact packed tarball and it has
 provenance. After publication it retries registry reads and tarball downloads for
-propagation, waits for the package index used by npm install, verifies integrity, and performs a clean registry installation.
+propagation for up to 15 minutes, including request time. Retries back off from 10
+to 60 seconds and log the elapsed time and last failure. Each request, including
+its response body, has a 15-second timeout capped by the remaining budget.
+Integrity or provenance mismatches and HTTP authentication failures stop immediately.
+The publish step has a 22-minute timeout to also cover the bounded preflight and
+three-minute npm publish command; the job has 30 minutes for setup and installation.
+Verification waits for the package index used by npm install and checks the
+downloaded tarball. A separate step performs a clean registry installation.
 
 If publication failed or its response was lost, rerun the failed publish job to
 reuse the original artifact. Never move a release tag or republish different bytes
