@@ -44,7 +44,7 @@ pub fn serve() -> std::io::Result<()> {
                 "protocolVersion": negotiate(msg["params"]["protocolVersion"].as_str()),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "stack", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use stack_up before work that needs services, stack_exec to run commands (unverified service endpoints are withheld), stack_status to diagnose, and stack_down when finished.",
+                "instructions": "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_status to diagnose, and stack_down when finished.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -82,8 +82,8 @@ fn schema(props: Value, required: &[&str]) -> Value {
 fn tools() -> Value {
     json!([
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock.",
-          "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" } }), &[]) },
+        { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock; reassign_ports gives this checkout fresh ports (after a port_conflict).",
+          "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" }, "reassign_ports": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
         { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
@@ -97,6 +97,12 @@ fn tools() -> Value {
               "require_all": { "type": "boolean" },
               "timeout_secs": { "type": "integer" }
           }), &["command"]) },
+        { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec.",
+          "inputSchema": schema(json!({
+              "task": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
+              "timeout_secs": { "type": "integer" }
+          }), &["task"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept.", "inputSchema": schema(json!({}), &[]) },
@@ -140,19 +146,19 @@ fn to_value<T: Serialize>(v: T) -> Value {
 }
 
 fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
-    let compile = |mode, write| {
+    let compile = |mode, write, reassign_ports| {
         project::compile(&Options {
             root: ctx.root.clone(),
             mode,
             write,
             cache: ctx.cache.clone(),
             state: ctx.state.clone(),
-            reassign_ports: false,
+            reassign_ports,
             resolver: None,
         })
     };
     match name {
-        "stack_inspect" => compile(project::inspect_mode(&ctx.root), false).map(to_value),
+        "stack_inspect" => compile(project::inspect_mode(&ctx.root), false, false).map(to_value),
         "stack_compile" => {
             let mode = if args["update"] == true {
                 Mode::Update
@@ -161,7 +167,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             } else {
                 Mode::UseLock
             };
-            compile(mode, true).map(to_value)
+            compile(mode, true, args["reassign_ports"] == true).map(to_value)
         }
         "stack_up" => {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
@@ -200,6 +206,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_gc" => session::gc_checked(&ctx.state).map(to_value),
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_exec" => exec(args, ctx),
+        "stack_run" => run(args, ctx),
         _ => Err(StackError::new(
             "unknown_tool",
             format!("no tool named '{name}'"),
@@ -230,7 +237,21 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
                 .unwrap_or_default(),
         )
     };
-    let plan = session::plan_exec(ctx, &command, &require)?;
+    captured(args, ctx, &command, &require)
+}
+
+fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
+    let task = args["task"].as_str().ok_or_else(|| StackError::new("usage", "task is required"))?;
+    let extra: Vec<String> = args["args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let (command, require) = session::task_command(ctx, task, &extra)?;
+    captured(args, ctx, &command, &require)
+}
+
+fn captured(args: &Value, ctx: &Ctx, command: &[String], require: &Require) -> Result<Value> {
+    let plan = session::plan_exec(ctx, command, require)?;
     let timeout = Duration::from_secs(
         args["timeout_secs"]
             .as_u64()

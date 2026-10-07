@@ -17,7 +17,7 @@ Start the stdio MCP server with:
 stack mcp
 ```
 
-Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile`, `stack_install`, `stack_up`, `stack_status`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc` and `stack_doctor`.
+Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc` and `stack_doctor`.
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep

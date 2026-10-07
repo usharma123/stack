@@ -2057,3 +2057,26 @@ fn run_refuses_while_any_service_is_unverified() {
     let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
     assert!(!log.contains("run --skip-deps"), "the task must not start:\n{log}");
 }
+
+#[test]
+fn mcp_runs_tasks_and_can_reassign_ports() {
+    let tasks = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.hello]\nrun='echo hi'\n");
+    let results = tasks.mcp(
+        &[
+            ("stack_run", json!({ "task": "hello", "args": ["there"] })),
+            ("stack_run", json!({ "task": "nope" })),
+        ],
+        &[],
+    );
+    assert_eq!(results[0]["structuredContent"]["data"]["stdout"], "hello|there|", "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "unknown_task");
+
+    let fixture = Fixture::with_bundle(WEB);
+    let before = json_result(&fixture.ok(&["inspect", "--json"]))["data"]["ports"]["web"].clone();
+    // Another program takes the port, as in a port_conflict.
+    let _held = std::net::TcpListener::bind(("127.0.0.1", before.as_u64().unwrap() as u16)).unwrap();
+    let results = fixture.mcp(&[("stack_compile", json!({ "reassign_ports": true }))], &[]);
+    let after = &results[0]["structuredContent"]["data"]["ports"]["web"];
+    assert!(after.is_u64() && *after != before, "{before} -> {after}");
+}
+
