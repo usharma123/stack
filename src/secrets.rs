@@ -299,7 +299,10 @@ fn run_within(request: &Request<'_>, exe: &Path, args: &[&str], step: &str, requ
         .envs(request.env)
         .env("FNOX_NON_INTERACTIVE", "1")
         .env("NO_COLOR", "1")
-        .arg("--non-interactive")
+        // fnox's resolution daemon detaches into a session of its own, so the process-group
+        // kill at the deadline would not reach it, and it keeps resolved values cached in
+        // memory for hours. Stack resolves in the foreground only.
+        .args(["--non-interactive", "--no-daemon"])
         .args(args)
         .current_dir(request.root);
     let out = process::capture(&mut command, timeout, RESOLVE_OUTPUT_LIMIT).map_err(|e| {
@@ -418,9 +421,15 @@ struct Described {
     dynamic_leases: Vec<Value>,
 }
 
+/// fnox 1.39.0 omits optional fields (`as_file`, `env`, `lease`) when they are not set.
 #[derive(Deserialize)]
 struct DescribedKey {
     key: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    lease: Option<Value>,
+    #[serde(default)]
     as_file: bool,
     injectable: Injectable,
 }
@@ -451,8 +460,8 @@ fn check_described(object: &serde_json::Map<String, Value>, requested: &[String]
     for key in requested {
         match described.keys.iter().find(|k| k.key == *key) {
             None => missing.push(json!({ "key": key, "reason": "unknown" })),
-            Some(_) if described.dynamic_leases.iter().any(|l| mentions(l, key)) => {
-                unsupported.push(json!({ "key": key, "reason": "a dynamic lease; use `stack exec -- fnox exec -- ...`" }));
+            Some(k) if k.kind.as_deref() == Some("lease") || k.lease.is_some() || described.dynamic_leases.iter().any(|l| mentions(l, key)) => {
+                unsupported.push(json!({ "key": key, "reason": "supplied by a lease; use `stack exec -- fnox exec -- ...`" }));
             }
             Some(k) if k.as_file => unsupported.push(json!({ "key": key, "reason": "a file secret (as_file); use `stack exec -- fnox exec -- ...`" })),
             Some(k) if !k.injectable.exec => unsupported.push(json!({ "key": key, "reason": "not injectable into a command's environment (env = false or exec injection disabled)" })),
@@ -711,11 +720,14 @@ mod tests {
                 {"key":"OK","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},
                 {"key":"FILE","kind":"secret","env":true,"as_file":true,"injectable":{"exec":true,"shell":true}},
                 {"key":"HIDDEN","kind":"secret","env":false,"as_file":false,"injectable":{"exec":false,"shell":false}},
-                {"key":"LEASED","kind":"lease","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}}],
-               "dynamic_leases":[{"name":"aws","env_vars":["LEASED"]}]}"#,
+                {"key":"LEASED","kind":"lease","lease":"aws","injectable":{"exec":true,"shell":true}},
+                {"key":"BY_LEASE","kind":"secret","lease":"aws","injectable":{"exec":true,"shell":true}},
+                {"key":"MINIMAL","kind":"secret","injectable":{"exec":true,"shell":true}}],
+               "dynamic_leases":["DYNAMIC"]}"#,
         );
-        check_described(&described, &["OK".into()]).unwrap();
-        for (key, code) in [("NOPE", "secret_missing"), ("FILE", "secret_unsupported"), ("HIDDEN", "secret_unsupported"), ("LEASED", "secret_unsupported")] {
+        // Optional fields fnox omits when unset are not required.
+        check_described(&described, &["OK".into(), "MINIMAL".into()]).unwrap();
+        for (key, code) in [("NOPE", "secret_missing"), ("FILE", "secret_unsupported"), ("HIDDEN", "secret_unsupported"), ("LEASED", "secret_unsupported"), ("BY_LEASE", "secret_unsupported")] {
             let e = check_described(&described, &[key.into()]).unwrap_err();
             assert_eq!((e.code, e.details[0]["key"].as_str()), (code, Some(key)));
         }
@@ -785,7 +797,7 @@ mod tests {
         let env = IndexMap::new();
         let request = Request { root: dir.path(), cache: dir.path(), pin: ToolSpec::new("1.39.0"), env: &env, removed: &[] };
         let start = std::time::Instant::now();
-        let e = run_within(&request, &exe, &["env", "--json", "--describe"], "describe", &["K".into()], Duration::from_millis(300)).unwrap_err();
+        let e = run_within(&request, &exe, &["env", "--json", "--describe"], "describe", &["K".into()], Duration::from_millis(1500)).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(e.code, "secret_unavailable");
         assert_eq!((e.details[0]["timed_out"].clone(), e.details[0]["kind"].clone()), (json!(true), json!("timed_out")));

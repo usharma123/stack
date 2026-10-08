@@ -3387,8 +3387,8 @@ fn a_grant_reaches_only_its_command_and_is_redacted_from_captured_output() {
     let app = fixture.dir.path().join("app").canonicalize().unwrap();
     let log = fnox_log(&fixture);
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[0], format!("--non-interactive env --json --describe|1|{}", app.display()));
-    assert_eq!(log[1], format!("--non-interactive env --json --keys DEPLOY_KEY|1|{}", app.display()));
+    assert_eq!(log[0], format!("--non-interactive --no-daemon env --json --describe|1|{}", app.display()));
+    assert_eq!(log[1], format!("--non-interactive --no-daemon env --json --keys DEPLOY_KEY|1|{}", app.display()));
     // The release was located in a scratch root that names fnox and nothing else, now gone.
     let ls = fs::read_to_string(fixture.dir.path().join("ls.log")).unwrap();
     assert!(ls.contains(&format!("dir={}", fixture.dir.path().join("cache/secrets").canonicalize().unwrap().display())), "{ls}");
@@ -3519,7 +3519,7 @@ fn fnox_failures_map_to_codes_and_nothing_fnox_printed_is_forwarded() {
         ("describe", "oversized", None, "secret_unavailable", "kind=oversized", 1),
         ("describe", "exit", None, "secret_unavailable", "kind=protocol", 1),
         ("describe", "file", Some(describe(&ok_key.replace(r#""as_file":false"#, r#""as_file":true"#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
-        ("describe", "file", Some(describe(ok_key, r#"{"name":"aws","env_vars":["DEPLOY_KEY"]}"#)), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe(&ok_key.replace(r#""kind":"secret""#, r#""kind":"lease","lease":"aws""#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
         ("describe", "file", Some(describe(&ok_key.replace(r#""exec":true"#, r#""exec":false"#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
         ("describe", "file", Some(describe("", "")), "secret_missing", "reason=unknown", 1),
         ("keys", "garbage", None, "secret_unavailable", "kind=protocol", 2),
@@ -3662,7 +3662,7 @@ fn doctor_reports_fnox_from_its_value_free_description_only() {
     assert_no_leak(&text, "doctor");
     let log = fnox_log(&fixture);
     assert_eq!(log.len(), 1, "{log:?}");
-    assert!(log[0].starts_with("--non-interactive env --json --describe|1|"), "{log:?}");
+    assert!(log[0].starts_with("--non-interactive --no-daemon env --json --describe|1|"), "{log:?}");
 
     fs::write(fixture.dir.path().join("fnox-describe-mode"), "config").unwrap();
     let (envelope, text, _) = json_run(&fixture, &["doctor"]);
