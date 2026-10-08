@@ -71,5 +71,6 @@ Full docs live in [docs/](https://github.com/usharma123/stack/tree/main/docs).
 - [Service identity probes](https://github.com/usharma123/stack/blob/main/docs/user/identity-probes.md)
 - [Publishing bundles to OCI registries](https://github.com/usharma123/stack/blob/main/docs/user/registries.md)
 - [JSON output and MCP](https://github.com/usharma123/stack/blob/main/docs/user/agents.md)
+- [Agent skills](https://github.com/usharma123/stack/blob/main/docs/user/skills.md)
 
 Building from source? Start with [development and validation](https://github.com/usharma123/stack/blob/main/docs/operations/development.md).

@@ -38,6 +38,11 @@
   retrying is safe. `up` and `restart` have a 10m startup deadline, configurable with
   `--timeout`. Expiry retains launch records and reports `timed_out`; recording the partial
   launch can take up to 10s beyond the deadline, plus connection checks.
+- **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
+  stack.lock pins (mise lists skills per active release, and stack's scratch configuration
+  activates only the pinned ones). The provider's own skill is never surfaced to agents. Skill
+  links are opt-in, and stack only ever replaces or removes a link it recorded and that still
+  points where it left it.
 - **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
   `exec` (whose output is captured into the object); errors have a stable `code`, a `hint` and
   `details`. A command that could not do its job reports `ok: false`. `stack mcp` serves the same
@@ -51,6 +56,9 @@ tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are 
 Version resolution runs `mise latest` in a scratch provider root of its own under stack's
 cache, whose only configuration is the one tool and its options; nothing in the project's
 `[env]` or tasks is evaluated, and the root is removed afterwards.
+Skills discovery (`inspect`, `compile`, the `skills` step) works the same way, in a scratch
+root naming only stack.lock's pins; tool versions and options with template syntax are
+rejected because mise would evaluate them there.
 `stack exec` carries this same boundary into nested mise commands. Direct mise invocations
 outside `stack exec` still follow mise's normal configuration rules.
 

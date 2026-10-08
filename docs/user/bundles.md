@@ -83,7 +83,9 @@ as `fnox` that mise's registry installs through packslip (`compile` asks `mise r
 trust options need mise 2026.9.2 or newer. Everything else is `invalid_tool`, with a hint
 naming what the tool accepts: an unknown option (including packslip's `pin`, which is a
 packslip command-line flag, not a mise option), a wrong type, a table without `version`, a
-nested value, or `mr_boxington` without Mr Boxington. Extending the list is a code change.
+nested value, `mr_boxington` without Mr Boxington, or template syntax (`{{`, `{%`, `{#`) in a
+version or option string, which mise would render (`exec()` included) wherever stack asks it
+about the tool. Extending the list is a code change.
 
 `"1.93"` and `{ version = "1.93" }` are the same value. Layers that differ in any option
 conflict, and only `[override.tools]` resolves it by replacing the whole value. `stack.lock`

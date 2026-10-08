@@ -9,6 +9,7 @@
 - [Service identity probes](user/identity-probes.md)
 - [Publishing bundles to OCI registries](user/registries.md)
 - [JSON output and MCP](user/agents.md)
+- [Agent skills](user/skills.md)
 - [Worktree and agent-sandbox integration](user/worktrees.md)
 
 ## Working on Stack
@@ -27,5 +28,6 @@ Start with [development and validation](operations/development.md).
 - [Review](eval-followup-review-r1.md)
 - [Review resolution](eval-followup-review-resolution.md)
 - [Port conflicts, install, logs review (2026-10-06)](reviews/2026-10-06-occupied-port-install-logs.md)
+- [Agent skills real-tool receipts (2026-10-08)](reviews/2026-10-08-skills-smoke.md)
 
 [Repository home](../README.md)

@@ -3,7 +3,7 @@
 | Command | Does |
 |---|---|
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve, lock, assign ports, write provider config |
-| `stack inspect` | Show the composed stack, origins and ports; writes nothing |
+| `stack inspect [--all-skills]` | Show the composed stack, origins, ports and the pinned releases' [agent skills](skills.md); writes nothing |
 | `stack install` | Install the locked tools and service binaries; start nothing, record nothing |
 | `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
@@ -21,6 +21,15 @@
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
 
 - `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
+- `inspect` and `compile` list the [agent skills](skills.md) of the releases stack.lock pins
+  under `skills`. To find them they run `mise ls --json` and `mise skills ls --json` (10s
+  each) in a scratch directory under stack's cache that names only the pins, and remove it;
+  they install nothing and write nothing into the project. When mise cannot answer, every
+  entry is `unavailable` with a `skills_unavailable` warning and the command still succeeds.
+  `--all-skills` also lists the provider's (Pitchfork's) under `provider_skills`.
+- With `[skills] dir` in stack.toml, `install` and `up` add a `skills` step after installing
+  that links available skills into that directory. Its problems are warnings (step status
+  `warning`, top-level `warnings`), never failures. See [agent skills](skills.md).
 - `install` is `up` without the start: compile in locked mode, trust the generated config, check
   the supervisor socket path, install every pinned tool and preset service binary. Use it to warm
   a checkout (CI caches, disposable worktrees) without a session; `exec` then has the tools.
@@ -133,7 +142,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   to releases too. Unknown presets fail in locked mode (`unlocked_service`).
 - `tools.<name>` accepts a table with `version` and [allowlisted options](bundles.md#tool-options)
   (`mr_boxington` on `rust`; `pubkey`, `identity`, `identity_prefix`, `issuer` on packslip-backed
-  tools). Anything else is `invalid_tool`. `compile` asks `mise registry` once per registry name
+  tools). Anything else is `invalid_tool`, as is template syntax (`{{`, `{%`, `{#`) in a version
+  or option string, which mise would evaluate. `compile` asks `mise registry` once per registry name
   that carries packslip options. Version reports (`inspect`, `compile`, `install`) list a pin's
   `options`. `install`, `up` and `doctor` run `mise version` when an option needs a newer mise
   (2026.9.2) and fail with `provider_outdated` before installing anything.

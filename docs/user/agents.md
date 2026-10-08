@@ -12,6 +12,9 @@ stack exec --require-all -- <command>    # anything else, with the stack's tools
 stack down                               # before you finish or remove the checkout
 ```
 
+Tools the stack pins may ship agent skills for exactly that release: `stack --json inspect`
+lists them under `skills`, and MCP `stack_skill` returns one's text. See [agent skills](skills.md).
+
 Every checkout, including each Git worktree, gets its own ports and data, so parallel agents
 do not share databases. Connection strings arrive in the environment (`DATABASE_URL`,
 `REDIS_URL`, `<NAME>_PORT`); do not hardcode ports. Prefer `--ttl` over `--owner-pid` unless
@@ -54,7 +57,7 @@ Start the stdio MCP server with:
 stack mcp
 ```
 
-Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc` and `stack_doctor`.
+Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc`, `stack_doctor`, and `stack_skill` (the `SKILL.md` of one skill `stack_inspect` lists as available, at most 64 KiB).
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep
