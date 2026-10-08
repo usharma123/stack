@@ -74,6 +74,9 @@ impl Resolver for MiseResolver {
             StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
                 .hint("check the tool name and version; `mise ls-remote <tool>` lists releases")
         };
+        if out.timed_out && crate::process::expired() {
+            return Err(StackError::new("timed_out", format!("resolving {spec} was cut short by the deadline")));
+        }
         if out.timed_out {
             return Err(fail(format!("mise did not answer within {}s", RESOLVE_TIMEOUT.as_secs())));
         }
@@ -271,7 +274,7 @@ fn put(t: &mut Table, key: &str, value: Option<Value>) {
 
 use crate::error::{Result, StackError};
 use serde::Deserialize;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 /// One supervised service as Pitchfork reports it.
 #[derive(Debug, Clone, Deserialize)]
@@ -329,19 +332,37 @@ pub fn configure_command(command: &mut Command, root: &Path) {
     command.envs(config_env(root));
 }
 
+/// A mise command, bounded by the caller's deadline (see `process::output`).
 fn mise(root: &Path, args: &[&str]) -> Result<Output> {
     let mut command = Command::new("mise");
     configure_command(&mut command, root);
     command.args(args)
         .current_dir(root)
         .env("MISE_YES", "1")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| {
-            StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
-                .hint(crate::setup::MISE_INSTALL_HINT)
-        })
+        .env("NO_COLOR", "1");
+    crate::process::output(&mut command).map_err(|e| match e.kind() {
+        std::io::ErrorKind::TimedOut => StackError::new("timed_out", format!("mise {}: {e}", args.join(" "))),
+        _ => StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
+            .hint(crate::setup::MISE_INSTALL_HINT),
+    })
+}
+
+/// Make sure Pitchfork's supervisor runs before a supervisor request under a deadline.
+///
+/// A request client that finds no supervisor starts one as its own child, in its own process
+/// group. Under a deadline that group is killed when time runs out, and the supervisor of every
+/// project using this state directory with it. Started here first, in a session of its own that
+/// stack never signals, it is already running when the request comes. Best effort: should this
+/// fail, the request starts the supervisor as it always did.
+fn detach_supervisor(root: &Path) {
+    let Some(wait) = crate::process::remaining() else { return };
+    let mut command = Command::new("mise");
+    configure_command(&mut command, root);
+    command.args(["x", "--", "pitchfork", "supervisor", "start"])
+        .current_dir(root)
+        .env("MISE_YES", "1")
+        .env("NO_COLOR", "1");
+    let _ = crate::process::run_detached(&mut command, wait);
 }
 
 fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
@@ -349,7 +370,8 @@ fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
     if out.status.success() {
         return Ok(out);
     }
-    Err(StackError::new(code, format!("mise {} failed", args.join(" ")))
+    let failed = if crate::process::expired() { "was cut short by the deadline" } else { "failed" };
+    Err(StackError::new(code, format!("mise {} {failed}", args.join(" ")))
         .details(vec![serde_json::json!({ "output": tail(&out) })]))
 }
 
@@ -592,10 +614,12 @@ fn local_datetime(_: u64) -> Option<String> {
 }
 
 pub fn start(root: &Path) -> Result<()> {
+    detach_supervisor(root);
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }
 
 pub fn stop(root: &Path) -> Result<()> {
+    detach_supervisor(root);
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
 }
 
@@ -603,6 +627,7 @@ pub fn stop(root: &Path) -> Result<()> {
 pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["daemons", "start", "--"];
     args.extend(names.iter().map(String::as_str));
+    detach_supervisor(root);
     checked(root, &args, "start_failed").map(|_| ())
 }
 
@@ -610,6 +635,7 @@ pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
 pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["daemons", "stop", "--"];
     args.extend(names.iter().map(String::as_str));
+    detach_supervisor(root);
     checked(root, &args, "stop_failed").map(|_| ())
 }
 

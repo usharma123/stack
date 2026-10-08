@@ -16,6 +16,10 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
+fn startup_timeout_schema() -> Value {
+    json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
+}
+
 pub fn serve() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -84,11 +88,11 @@ fn tools() -> Value {
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock; reassign_ports gives this checkout fresh ports (after a port_conflict).",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" }, "reassign_ports": { "type": "boolean" } }), &[]) },
-        { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid.",
-          "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID } }), &[]) },
+        { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up.",
+          "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded, then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then.",
-          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } } }), &[]) },
+        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded, then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up.",
+          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
           "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
@@ -184,12 +188,14 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                         .and_then(session::owner_pid)?,
                 ),
             };
+            let timeout = startup_timeout(args)?;
             session::up(
                 ctx,
                 LeaseOptions {
                     ttl_secs,
                     owner_pid,
                 },
+                timeout,
             )
             .map(to_value)
         }
@@ -212,7 +218,8 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                     .collect::<Result<_>>()?,
                 v => return Err(StackError::new("usage", format!("services must be an array of service names, not {v}"))),
             };
-            session::restart(ctx, &services).map(to_value)
+            let timeout = startup_timeout(args)?;
+            session::restart(ctx, &services, timeout).map(to_value)
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
@@ -225,6 +232,19 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             "unknown_tool",
             format!("no tool named '{name}'"),
         )),
+    }
+}
+
+/// `timeout_secs` of `stack_up` and `stack_restart`: a whole number of seconds, at least 1.
+/// Omitted (or null) means the default. Checked before any lifecycle work.
+fn startup_timeout(args: &Value) -> Result<Duration> {
+    match &args["timeout_secs"] {
+        Value::Null => Ok(session::DEFAULT_STARTUP_TIMEOUT),
+        v => v
+            .as_u64()
+            .filter(|secs| *secs >= 1)
+            .map(Duration::from_secs)
+            .ok_or_else(|| StackError::new("usage", format!("timeout_secs {v} must be a whole number of seconds, at least 1"))),
     }
 }
 
@@ -339,4 +359,30 @@ pub fn parse_duration(s: &str) -> Result<u64> {
     };
     n.checked_mul(mult)
         .ok_or_else(|| StackError::new("usage", "duration is too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_timeouts_are_whole_seconds_of_at_least_one() {
+        assert_eq!(startup_timeout(&json!({})).unwrap(), session::DEFAULT_STARTUP_TIMEOUT);
+        assert_eq!(startup_timeout(&json!({ "timeout_secs": null })).unwrap(), session::DEFAULT_STARTUP_TIMEOUT);
+        assert_eq!(startup_timeout(&json!({ "timeout_secs": 1 })).unwrap(), Duration::from_secs(1));
+        assert_eq!(startup_timeout(&json!({ "timeout_secs": 86400 })).unwrap(), Duration::from_secs(86400));
+        for bad in [json!(0), json!(-1), json!(1.5), json!("30"), json!(true), json!([5])] {
+            let e = startup_timeout(&json!({ "timeout_secs": bad })).unwrap_err();
+            assert_eq!(e.code, "usage", "{bad}");
+        }
+    }
+
+    #[test]
+    fn up_and_restart_advertise_their_timeout() {
+        let tools = tools();
+        for name in ["stack_up", "stack_restart"] {
+            let tool = tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap();
+            assert_eq!(tool["inputSchema"]["properties"]["timeout_secs"]["minimum"], 1, "{tool}");
+        }
+    }
 }

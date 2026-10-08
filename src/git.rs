@@ -4,7 +4,7 @@ use crate::error::{io_error, Result, StackError};
 use crate::hash::sha256_hex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
@@ -12,11 +12,9 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
         cmd.arg("-C").arg(dir);
     }
     // Never block on a credential prompt: agents can't answer it.
-    cmd.args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null());
-    let out = cmd
-        .output()
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    // Bounded by the caller's deadline, as when `up` fetches a locked bundle.
+    let out = crate::process::output(&mut cmd)
         .map_err(|e| StackError::new("git_unavailable", format!("cannot run git: {e}")))?;
     if !out.status.success() {
         return Err(StackError::new(
@@ -41,8 +39,12 @@ pub fn ensure_mirror(cache: &Path, url: &str, fetch: bool) -> Result<PathBuf> {
     if !mirror.exists() {
         let parent = mirror.parent().expect("mirror has parent");
         fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
-        let target = mirror.to_string_lossy().to_string();
+        // Cloned aside first: a clone cut short (by a deadline, say) must not pass for a mirror.
+        let staging = mirror.with_extension("tmp");
+        let _ = fs::remove_dir_all(&staging);
+        let target = staging.to_string_lossy().to_string();
         git(None, &["clone", "--bare", "--quiet", url, &target])?;
+        fs::rename(&staging, &mirror).map_err(|e| io_error(mirror.display(), e))?;
     } else if fetch {
         git(
             Some(&mirror),
@@ -81,30 +83,24 @@ pub fn materialize(mirror: &Path, commit: &str, dest: &Path) -> Result<()> {
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).map_err(|e| io_error(tmp.display(), e))?;
 
-    let mut archive = Command::new("git")
-        .arg("-C")
-        .arg(mirror)
-        .args(["archive", "--format=tar", commit])
-        .stdout(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| StackError::new("git_unavailable", format!("cannot run git: {e}")))?;
-    let tar = Command::new("tar")
-        .arg("-x")
-        .arg("-C")
-        .arg(&tmp)
-        .stdin(archive.stdout.take().expect("piped stdout"))
-        .status()
-        .map_err(|e| StackError::new("tar_unavailable", format!("cannot run tar: {e}")))?;
-    let archived = archive
-        .wait()
-        .map_err(|e| io_error("git archive", e))?;
-    if !archived.success() || !tar.success() {
-        let _ = fs::remove_dir_all(&tmp);
-        return Err(StackError::new(
-            "materialize_failed",
-            format!("could not extract commit {commit}"),
-        ));
+    // Through a file rather than a pipe, so each step is bounded by the caller's deadline.
+    // Absolute, since git resolves `-o` inside the mirror.
+    let archive = std::path::absolute(dest.with_extension("tar")).map_err(|e| io_error(dest.display(), e))?;
+    let extracted = git(Some(mirror), &["archive", "--format=tar", "-o", &archive.to_string_lossy(), commit])
+        .and_then(|_| {
+            crate::process::output(Command::new("tar").arg("-x").arg("-f").arg(&archive).arg("-C").arg(&tmp))
+                .map_err(|e| StackError::new("tar_unavailable", format!("cannot run tar: {e}")))
+        });
+    let _ = fs::remove_file(&archive);
+    match extracted {
+        Ok(out) if out.status.success() => {}
+        failed => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(match failed {
+                Err(e) if e.code.ends_with("_unavailable") => e,
+                _ => StackError::new("materialize_failed", format!("could not extract commit {commit}")),
+            });
+        }
     }
     fs::rename(&tmp, dest).map_err(|e| io_error(dest.display(), e))
 }

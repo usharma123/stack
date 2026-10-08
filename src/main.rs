@@ -65,11 +65,18 @@ enum Cmd {
         /// agent runner or CI job, not a shell that exits after this command
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
         owner_pid: Option<u32>,
+        /// Give up after this long (e.g. 5m), exit 124 and keep what was launched recorded for
+        /// `status` and `down`. Covers the whole startup. Default 10m
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
     },
     /// Restart services of the running session (all when none are named), then verify again
     Restart {
         /// Services to restart; the others keep running
         services: Vec<String>,
+        /// Give up after this long (e.g. 5m) and exit 124, like `up --timeout`. Default 10m
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
     },
     /// Verify every service now, and show session and lease state
     Status,
@@ -173,11 +180,12 @@ fn main() -> ExitCode {
             r.warnings.extend(session::stale_session(&ctx, &r));
             report(cli.json, &r)
         }),
-        Cmd::Up { ttl, owner_pid } => ttl
+        Cmd::Up { ttl, owner_pid, timeout } => ttl
             .as_deref()
             .map(parse_duration)
             .transpose()
-            .and_then(|ttl_secs| session::up(&ctx, LeaseOptions { ttl_secs, owner_pid: *owner_pid }))
+            .and_then(|ttl_secs| Ok((ttl_secs, startup_timeout(timeout.as_deref())?)))
+            .and_then(|(ttl_secs, timeout)| session::up(&ctx, LeaseOptions { ttl_secs, owner_pid: *owner_pid }, timeout))
             .map(|r| {
                 emit(cli.json, &r, || {
                     for c in &r.checks {
@@ -206,15 +214,17 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Restart { services } => session::restart(&ctx, services).map(|r| {
-            emit(cli.json, &r, || {
-                for c in &r.checks {
-                    let note = if r.restarted.contains(&c.service) { "restarted" } else { "" };
-                    println!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
-                }
-                println!("session {}", r.session.id);
-            })
-        }),
+        Cmd::Restart { services, timeout } => startup_timeout(timeout.as_deref())
+            .and_then(|timeout| session::restart(&ctx, services, timeout))
+            .map(|r| {
+                emit(cli.json, &r, || {
+                    for c in &r.checks {
+                        let note = if r.restarted.contains(&c.service) { "restarted" } else { "" };
+                        println!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                    }
+                    println!("session {}", r.session.id);
+                })
+            }),
         Cmd::Status => session::status(&ctx).map(|r| {
             let healthy = r.healthy;
             let code = emit(cli.json, &r, || {
@@ -282,7 +292,21 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(code) => code,
+        // Like `timeout(1)`, and like `exec --timeout`.
+        Err(e) if e.code == "timed_out" => {
+            fail(cli.json, e);
+            ExitCode::from(124)
+        }
         Err(e) => fail(cli.json, e),
+    }
+}
+
+/// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.
+fn startup_timeout(timeout: Option<&str>) -> Result<Duration> {
+    match timeout.map(parse_duration).transpose()? {
+        None => Ok(session::DEFAULT_STARTUP_TIMEOUT),
+        Some(0) => Err(StackError::new("usage", "--timeout must be at least 1s")),
+        Some(secs) => Ok(Duration::from_secs(secs)),
     }
 }
 
@@ -545,6 +569,12 @@ fn human_detail(detail: &serde_json::Value) -> String {
         other => other.to_string(),
     };
     let Value::Object(map) = detail else { return scalar(detail) };
+    // What a startup deadline cut short, as `timed_out` reports it.
+    if let Some(cause) = map.get("cause").filter(|c| c["code"].is_string()) {
+        let mut lines = vec![format!("cut short: error[{}]: {}", scalar(&cause["code"]), scalar(&cause["message"]))];
+        lines.extend(cause["details"].as_array().into_iter().flatten().map(|d| format!("    {}", human_detail(d))));
+        return lines.join("\n");
+    }
     if let Some(Value::Array(steps)) = map.get("steps") {
         let steps: Vec<String> = steps
             .iter()

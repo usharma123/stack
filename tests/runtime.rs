@@ -2557,3 +2557,191 @@ fn an_ignored_hangup_stays_ignored_after_captured_commands() {
     drop(stdin);
     assert!(server.wait().unwrap().success());
 }
+
+/// `web` as the supervisor reports it once started: running as `service`, which never listens.
+fn supervise_never_ready(fixture: &Fixture, service: &Detached) {
+    let port = assigned_port(fixture, "web");
+    fs::write(fixture.dir.path().join("pf-tracked-pid"), service.0.to_string()).unwrap();
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "id": "app-test/web", "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
+    )
+    .unwrap();
+}
+
+fn launch_records(fixture: &Fixture) -> Vec<Value> {
+    fixture.session_paths().iter().map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap()).collect()
+}
+
+#[test]
+fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_down() {
+    let fixture = Fixture::with_bundle(WEB);
+    let service = Detached::spawn();
+    supervise_never_ready(&fixture, &service);
+    let start = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
+    let took = start.elapsed();
+    // Readiness alone would have been waited for 90s.
+    assert!(took >= Duration::from_secs(2) && took < Duration::from_secs(20), "{took:?}");
+    assert_eq!(out.status.code(), Some(124));
+    let result = json_result(&out);
+    let error = &result["error"];
+    assert_eq!(error["code"], "timed_out", "{result}");
+    assert_eq!(error["message"], "`stack up` did not finish within 2s");
+    assert!(error["hint"].as_str().unwrap().contains("`stack down` stops them"), "{result}");
+    assert_eq!(error["details"][0]["cause"]["code"], "not_ready", "{result}");
+    assert_eq!(error["details"][0]["cause"]["details"][0]["service"], "web", "{result}");
+    let progress = &error["details"][1];
+    assert_eq!(progress["changed"], true, "{result}");
+    let steps: Vec<(&str, &str)> = progress["steps"].as_array().unwrap().iter().map(|s| (s["step"].as_str().unwrap(), s["status"].as_str().unwrap())).collect();
+    assert_eq!(&steps[steps.len() - 2..], [("start", "ok"), ("verify", "failed")], "{result}");
+
+    // Nothing stopped the service, and its ownership is recorded as an incomplete launch.
+    assert!(service.alive());
+    for record in launch_records(&fixture) {
+        assert_eq!(record["launching"], true, "{record}");
+        assert_eq!(record["services"]["web"]["pid"], service.0, "{record}");
+    }
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["healthy"], false, "{status}");
+    assert!(!fixture.command(&["exec", "--require", "web", "--", "true"]).output().unwrap().status.success());
+
+    // `down` stops it through the supervisor, and nothing is left for GC.
+    fixture.ok(&["down"]);
+    assert!(!service.alive());
+    assert_eq!(json_result(&fixture.ok(&["gc", "--json"]))["data"], json!([]));
+
+    // Once the service can become ready, the same command succeeds.
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--timeout", "30s"]);
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn mcp_up_reports_its_timeout_as_an_error_and_down_still_stops_what_launched() {
+    let fixture = Fixture::with_bundle(WEB);
+    let service = Detached::spawn();
+    supervise_never_ready(&fixture, &service);
+    let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 1 })), ("stack_status", json!({})), ("stack_down", json!({}))], &[]);
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    let error = &results[0]["structuredContent"]["error"];
+    assert_eq!(error["code"], "timed_out", "{error}");
+    assert_eq!(error["message"], "`stack up` did not finish within 1s");
+    assert_eq!(error["details"][0]["cause"]["code"], "not_ready", "{error}");
+    assert_eq!(results[1]["structuredContent"]["data"]["healthy"], false, "{}", results[1]);
+    assert_eq!(results[2]["isError"], false, "{}", results[2]);
+    assert!(!service.alive());
+}
+
+#[test]
+fn a_start_request_cut_short_by_the_timeout_is_killed_with_its_process_group() {
+    let fixture = Fixture::with_bundle(WEB);
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
+    let start = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "2s"]).output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    assert_eq!(out.status.code(), Some(124));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error[timed_out]: `stack up` did not finish within 2s"), "{stderr}");
+    assert!(stderr.contains("cut short: error[start_failed]"), "{stderr}");
+    assert!(fixture.dir.path().join("client-waiting").exists(), "the start request never ran");
+    // What the supervisor reported after the cut-short start is recorded, not forgotten.
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    let after_start = log.split("daemons start").nth(1).expect("start requested");
+    assert!(after_start.contains("daemons --json"), "{log}");
+    for record in launch_records(&fixture) {
+        assert_eq!(record["launching"], true, "{record}");
+    }
+    // The request's own descendants went with it: none acts after the timeout.
+    thread::sleep(Duration::from_secs(3));
+    assert!(!fixture.dir.path().join("late-launch").exists(), "a client of the cut-short start acted later");
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn startup_waits_for_a_busy_project_only_until_its_timeout() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::with_bundle(WEB);
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
+    let mut first = fixture.command(&["up", "--timeout", "60s"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let waiting = fixture.dir.path().join("client-waiting");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !waiting.exists() {
+        assert!(Instant::now() < deadline, "the first start request never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let start = Instant::now();
+    let out = fixture.command(&["restart", "--timeout", "1s", "--json"]).output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert_eq!(out.status.code(), Some(124));
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    assert_eq!(result["error"]["details"][0]["cause"]["code"], "lock_busy", "{result}");
+    assert!(result["error"]["hint"].as_str().unwrap().starts_with("nothing was started"), "{result}");
+    let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 1 }))], &[]);
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    assert_eq!(results[0]["structuredContent"]["error"]["details"][0]["cause"]["code"], "lock_busy", "{}", results[0]);
+
+    unsafe { libc::kill(-(first.id() as i32), libc::SIGINT) };
+    assert!(!first.wait().unwrap().success());
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_restart_cut_short_keeps_the_session_and_records_the_incomplete_launch() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    let start = Instant::now();
+    let out = fixture.command(&["restart", "web", "--timeout", "2s", "--json"]).output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    assert_eq!(out.status.code(), Some(124));
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    assert_eq!(result["error"]["message"], "`stack restart` did not finish within 2s");
+    assert_eq!(result["error"]["details"][1]["changed"], true, "{result}");
+    for record in launch_records(&fixture) {
+        assert_eq!(record["id"], up["data"]["session"]["id"], "{record}");
+        assert_eq!(record["launching"], true, "{record}");
+    }
+    assert!(!fixture.command(&["exec", "--require", "web", "--", "true"]).output().unwrap().status.success());
+
+    // A retried `up` completes the launch; `down` then confirms cleanup.
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
+    fixture.ok(&["up", "--timeout", "30s"]);
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn startup_timeouts_are_checked_before_any_lifecycle_work() {
+    let fixture = Fixture::with_bundle(WEB);
+    for args in [&["up", "--timeout", "0s"][..], &["up", "--timeout", "soon"], &["restart", "web", "--timeout", "0"]] {
+        let out = fixture.command(&[&["--json"][..], args].concat()).output().unwrap();
+        assert!(!out.status.success() && out.status.code() != Some(124), "{args:?}");
+        assert_eq!(json_result(&out)["error"]["code"], "usage", "{args:?}");
+    }
+    let results = fixture.mcp(
+        &[
+            ("stack_up", json!({ "timeout_secs": 0 })),
+            ("stack_up", json!({ "timeout_secs": "30" })),
+            ("stack_restart", json!({ "services": ["web"], "timeout_secs": 1.5 })),
+        ],
+        &[],
+    );
+    for result in &results {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"]["code"], "usage", "{result}");
+    }
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons"), "{log}");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
+    assert_eq!(fixture.index_files(), 0);
+}

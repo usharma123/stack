@@ -25,6 +25,8 @@ pub const LAYER_TYPE: &str = "application/vnd.stack.bundle.layer.v1.tar+gzip";
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const MAX_BLOB: u64 = 256 * 1024 * 1024;
+/// Longest one registry request may take, body included.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How far one bundle layer may expand. Digests bound what is downloaded, not what a
 /// compressed archive expands to.
@@ -115,7 +117,7 @@ impl Default for Client {
             // Redirects are handled explicitly so they cannot carry auth to another origin.
             agent: ureq::AgentBuilder::new()
                 .redirects(0)
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(REQUEST_TIMEOUT)
                 .build(),
             token: RefCell::new(None),
             credential_origin: RefCell::new(None),
@@ -152,6 +154,14 @@ fn basic(user: &str, pass: &str) -> String {
         }
     }
     out
+}
+
+/// `req` bounded by REQUEST_TIMEOUT and by the caller's deadline, if any (as within `stack up`).
+fn bounded(req: ureq::Request) -> Result<ureq::Request> {
+    if crate::process::expired() {
+        return Err(StackError::new("timed_out", format!("the deadline passed before a registry {} request", req.method())));
+    }
+    Ok(req.timeout(crate::process::bounded(REQUEST_TIMEOUT)))
 }
 
 fn oci_err(context: &str, e: ureq::Error) -> StackError {
@@ -202,7 +212,7 @@ impl Client {
         loop {
             validate_transport(&target, &registry)?;
             let target_origin = target.origin().ascii_serialization();
-            let mut req = self.agent.request(method, target.as_str());
+            let mut req = bounded(self.agent.request(method, target.as_str()))?;
             if let Some(a) = accept {
                 req = req.set("Accept", a);
             }
@@ -271,7 +281,7 @@ impl Client {
                 return Err(StackError::new("oci_auth_untrusted", format!("token origin {} is not approved", realm.origin().ascii_serialization()))
                     .hint("approve the registry's token service origin in STACK_OCI_AUTH_REALMS (comma-separated origins)"));
             }
-            let mut req = self.agent.get(realm.as_str());
+            let mut req = bounded(self.agent.get(realm.as_str()))?;
             for k in ["service", "scope"] {
                 if let Some(v) = field(k) {
                     req = req.query(k, &v);
