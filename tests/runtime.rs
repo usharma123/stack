@@ -65,6 +65,9 @@ case "$1 $2" in
     case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; rust@1.93) v=1.93.1 ;; esac
     echo "$v" ;;
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
+  # Skills discovery (`inspect`, `compile`): nothing installed, no skills.
+  'ls --json') echo '{}' ;;
+  'skills ls') echo '[]' ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
     echo 'mise WARN  mise version 2099.1.1 available' >&2

@@ -82,6 +82,30 @@ pub struct Report {
     /// Valid but risky choices, such as tools that are not pinned to a version.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Agent skills of the pinned releases (`inspect`, `compile`); see `skills::discover`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<crate::skills::Skill>>,
+    /// Skills of tools stack adds for its provider, listed only when asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_skills: Option<Vec<crate::skills::Skill>>,
+    /// `[skills] dir`: where `up` and `install` link the stack's skills.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_dir: Option<String>,
+    /// The lock this report describes: what stack.lock holds after this command.
+    #[serde(skip)]
+    pub lock: Lockfile,
+}
+
+impl Report {
+    /// Add the skills of the releases this report pins. `all` also lists the provider's.
+    pub fn attach_skills(&mut self, cache: &Path, all: bool) {
+        let found = crate::skills::discover(cache, &self.lock, &self.versions);
+        self.warnings.extend(found.warnings);
+        self.skills = Some(found.skills);
+        if all {
+            self.provider_skills = Some(found.provider_skills);
+        }
+    }
 }
 
 /// `stack inspect` previews a project that has no lock yet; once locked it reports drift.
@@ -178,6 +202,9 @@ pub fn compile(opts: &Options) -> Result<Report> {
 /// The caller holds the project lock when publishing configuration or changing a session.
 pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
     let project = read_project(&opts.root)?;
+    if let Some(skills) = &project.skills {
+        crate::skills::validate_dir(&skills.dir)?;
+    }
     let previous = lock::read(&opts.root)?;
     if opts.mode == Mode::Frozen && previous.is_none() {
         return Err(
@@ -283,6 +310,10 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         provider: "mise",
         output,
         written: opts.write,
+        skills: None,
+        provider_skills: None,
+        skills_dir: project.skills.map(|s| s.dir),
+        lock: new_lock,
     })
 }
 

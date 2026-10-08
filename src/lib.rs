@@ -16,6 +16,7 @@ pub mod project;
 pub mod provider;
 pub mod session;
 pub mod setup;
+pub mod skills;
 pub mod source;
 pub mod state;
 pub mod timing;

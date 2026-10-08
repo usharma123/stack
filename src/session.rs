@@ -527,6 +527,27 @@ impl Steps {
             .push(json!({ "step": step, "status": "ok", "detail": detail }));
     }
 
+    /// A step that completed with warnings: the command still succeeds.
+    fn warn(&mut self, step: &str, detail: Value) {
+        self.0
+            .push(json!({ "step": step, "status": "warning", "detail": detail }));
+    }
+
+    /// `[skills] dir`: link the stack's skills after install. Every outcome is a warning at
+    /// worst; the returned messages are the result's `warnings`.
+    fn skills(&mut self, ctx: &Ctx, report: &Report) -> Vec<String> {
+        let Some(dir) = report.skills_dir.as_deref() else { return Vec::new() };
+        let sync = crate::skills::sync_step(&ctx.cache, &ctx.root, dir, &report.lock, &report.versions);
+        let warnings: Vec<String> = sync
+            .warnings
+            .iter()
+            .map(|w| format!("skills: {}: {}", w["code"].as_str().unwrap_or_default(), w["message"].as_str().unwrap_or_default()))
+            .collect();
+        let detail = serde_json::to_value(&sync).expect("sync report serializes");
+        if warnings.is_empty() { self.ok("skills", detail) } else { self.warn("skills", detail) }
+        warnings
+    }
+
     /// Attach the steps that already ran, and whether repeating the command is safe.
     fn fail(mut self, step: &str, err: StackError, changed: bool) -> StackError {
         self.0
@@ -573,6 +594,9 @@ pub struct UpReport {
     pub checks: Vec<Check>,
     pub steps: Vec<Value>,
     pub reaped: Vec<GcEntry>,
+    /// Problems that did not stop startup (the `skills` step).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Preserve every observed launch identity before further provider calls can fail.
@@ -647,6 +671,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         return Err(steps.fail("install", e, false));
     }
     steps.ok("install", json!(null));
+    let warnings = steps.skills(ctx, &report);
     // Recorded before anything starts, so a deleted project's services can still be found.
     let provider = socket.and_then(|socket| {
         let state_dir = socket.path.parent()?.parent()?.to_path_buf();
@@ -787,6 +812,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         checks,
         steps: steps.0,
         reaped,
+        warnings,
     })
 }
 
@@ -1016,6 +1042,9 @@ pub struct InstallReport {
     pub steps: Vec<Value>,
     pub ports: IndexMap<String, u16>,
     pub versions: Vec<project::VersionReport>,
+    /// Problems that did not stop installation (the `skills` step).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Install every locked tool and service binary without starting anything or recording a
@@ -1045,7 +1074,8 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
         return Err(steps.fail("install", e, false));
     }
     steps.ok("install", json!(null));
-    Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions })
+    let warnings = steps.skills(ctx, &report);
+    Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions, warnings })
 }
 
 #[derive(Debug, Serialize)]

@@ -137,6 +137,18 @@ pub struct ProjectManifest {
     /// Explicit resolutions. The only way to replace a value another layer defines.
     #[serde(rename = "override", default)]
     pub overrides: Overrides,
+    /// Opt-in links to the stack's agent skills. Project only: a bundle cannot write into a
+    /// project's tree.
+    #[serde(default)]
+    pub skills: Option<SkillsConfig>,
+}
+
+/// `[skills]` in stack.toml.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Directory, relative to the project root, where `up` and `install` link available skills.
+    pub dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -42,7 +42,12 @@ enum Cmd {
         reassign_ports: bool,
     },
     /// Show the composed stack without writing anything
-    Inspect,
+    Inspect {
+        /// Also list skills of tools stack adds for its provider (Pitchfork), under
+        /// `provider_skills`. For people: an agent should not drive the supervisor directly
+        #[arg(long)]
+        all_skills: bool,
+    },
     /// Install the locked tools and service binaries without starting anything
     Install,
     /// Show the last lines a service wrote, as kept by the supervisor
@@ -174,10 +179,14 @@ fn main() -> ExitCode {
     let result: Result<ExitCode> = match &cli.cmd {
         Cmd::Compile { update, locked, reassign_ports } => {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
-            project::compile(&opts(mode, true, *reassign_ports)).map(|r| report(cli.json, &r))
+            project::compile(&opts(mode, true, *reassign_ports)).map(|mut r| {
+                r.attach_skills(&ctx.cache, false);
+                report(cli.json, &r)
+            })
         }
-        Cmd::Inspect => project::compile(&opts(project::inspect_mode(&root), false, false)).map(|mut r| {
+        Cmd::Inspect { all_skills } => project::compile(&opts(project::inspect_mode(&root), false, false)).map(|mut r| {
             r.warnings.extend(session::stale_session(&ctx, &r));
+            r.attach_skills(&ctx.cache, *all_skills);
             report(cli.json, &r)
         }),
         Cmd::Up { ttl, owner_pid, timeout } => ttl
@@ -192,6 +201,9 @@ fn main() -> ExitCode {
                         println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
                     }
                     println!("session {}", r.session.id);
+                    for w in &r.warnings {
+                        eprintln!("warning: {w}");
+                    }
                 })
             }),
         Cmd::Install => session::install(&ctx).map(|r| {
@@ -200,6 +212,9 @@ fn main() -> ExitCode {
                     println!("{:<12} {}", v.name, v.resolved.as_deref().unwrap_or("-"));
                 }
                 println!("installed; nothing started");
+                for w in &r.warnings {
+                    eprintln!("warning: {w}");
+                }
             })
         }),
         Cmd::Logs { service, tail, since_start } => session::logs(&ctx, service, *tail as usize, *since_start).map(|r| {
@@ -410,6 +425,18 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
         for o in &s.overrides {
             let replaced = if o.replaced.is_empty() { "nothing".into() } else { o.replaced.join(", ") };
             println!("override {}.{} (replaced: {replaced})", o.kind, o.key);
+        }
+        for (list, label) in [(&r.skills, "skill"), (&r.provider_skills, "provider skill")] {
+            for k in list.iter().flatten() {
+                let at = k.version.as_deref().map(|v| format!("@{v}")).unwrap_or_default();
+                let status = serde_json::to_value(k.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+                match (&k.name, &k.entrypoint) {
+                    (Some(name), Some(entry)) if k.status == stack::skills::Status::Available => {
+                        println!("{label} {}{at} {name}: {}", k.tool, entry.display())
+                    }
+                    _ => println!("{label} {}{at} {status}{}", k.tool, k.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
+                }
+            }
         }
         for w in &r.warnings {
             eprintln!("warning: {w}");

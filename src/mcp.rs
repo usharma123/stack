@@ -48,7 +48,7 @@ pub fn serve() -> std::io::Result<()> {
                 "protocolVersion": negotiate(msg["params"]["protocolVersion"].as_str()),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "stack", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished.",
+                "instructions": "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -85,7 +85,10 @@ fn schema(props: Value, required: &[&str]) -> Value {
 
 fn tools() -> Value {
     json!([
-        { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything. `skills` lists the agent skills of the exact releases stack.lock pins (status available, no_skill, not_installed or unavailable); all_skills also lists the provider's own under provider_skills, for people.",
+          "inputSchema": schema(json!({ "all_skills": { "type": "boolean" } }), &[]) },
+        { "name": "stack_skill", "description": "The SKILL.md text (at most 64 KiB) of one available skill that stack_inspect lists under `skills`, at the release stack.lock pins. It is the tool's own documentation; read it, do not run it.",
+          "inputSchema": schema(json!({ "tool": { "type": "string" }, "name": { "type": "string" } }), &["tool", "name"]) },
         { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock; reassign_ports gives this checkout fresh ports (after a port_conflict).",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" }, "reassign_ports": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up.",
@@ -164,7 +167,11 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         })
     };
     match name {
-        "stack_inspect" => compile(project::inspect_mode(&ctx.root), false, false).map(to_value),
+        "stack_inspect" => compile(project::inspect_mode(&ctx.root), false, false).map(|mut r| {
+            r.attach_skills(&ctx.cache, args["all_skills"] == true);
+            to_value(r)
+        }),
+        "stack_skill" => skill(args, ctx).map(to_value),
         "stack_compile" => {
             let mode = if args["update"] == true {
                 Mode::Update
@@ -173,7 +180,10 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             } else {
                 Mode::UseLock
             };
-            compile(mode, true, args["reassign_ports"] == true).map(to_value)
+            compile(mode, true, args["reassign_ports"] == true).map(|mut r| {
+                r.attach_skills(&ctx.cache, false);
+                to_value(r)
+            })
         }
         "stack_up" => {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
@@ -233,6 +243,25 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             format!("no tool named '{name}'"),
         )),
     }
+}
+
+/// One skill's text, from the same discovery `stack_inspect` runs, never a provider's.
+fn skill(args: &Value, ctx: &Ctx) -> Result<crate::skills::SkillText> {
+    let field = |key: &str| {
+        args[key].as_str().filter(|s| !s.is_empty()).ok_or_else(|| StackError::new("usage", format!("{key} is required")))
+    };
+    let (tool, name) = (field("tool")?, field("name")?);
+    let report = project::compile(&Options {
+        root: ctx.root.clone(),
+        mode: project::inspect_mode(&ctx.root),
+        write: false,
+        cache: ctx.cache.clone(),
+        state: ctx.state.clone(),
+        reassign_ports: false,
+        resolver: None,
+    })?;
+    let found = crate::skills::discover(&ctx.cache, &report.lock, &report.versions);
+    crate::skills::read(&found, tool, name)
 }
 
 /// `timeout_secs` of `stack_up` and `stack_restart`: a whole number of seconds, at least 1.
