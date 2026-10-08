@@ -29,6 +29,8 @@ for variable in $(compgen -e); do
   esac
 done
 export STACK_STATE_DIR="$work/state" STACK_CACHE_DIR="$work/cache" PITCHFORK_STATE_DIR="$work/pf"
+# Pitchfork registers projects in its config directory; name it rather than rely on HOME.
+export PITCHFORK_CONFIG_DIR="$work/h/.config/pitchfork"
 export MISE_DATA_DIR="$work/mise/data" MISE_CACHE_DIR="$work/mise/cache" \
   MISE_STATE_DIR="$work/mise/state" MISE_CONFIG_DIR="$work/mise/config"
 export MISE_GLOBAL_CONFIG_FILE="$work/mise/config/config.toml" \

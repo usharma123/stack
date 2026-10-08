@@ -62,6 +62,8 @@ def isolated_env(work, inherited=None):
                XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".local/share"),
                XDG_STATE_HOME=str(home / ".local/state"), STACK_STATE_DIR=str(home / ".local/state/stack"),
                STACK_CACHE_DIR=str(home / ".cache/stack"), PITCHFORK_STATE_DIR=str(work / "pf"),
+               # Pitchfork registers projects in its config directory; name it rather than rely on HOME.
+               PITCHFORK_CONFIG_DIR=str(home / ".config/pitchfork"),
                MISE_DATA_DIR=str(home / ".local/share/mise"), MISE_CACHE_DIR=str(home / ".cache/mise"),
                MISE_STATE_DIR=str(home / ".local/state/mise"), MISE_CONFIG_DIR=str(home / ".config/mise"),
                MISE_GLOBAL_CONFIG_FILE=str(home / ".config/mise/config.toml"),

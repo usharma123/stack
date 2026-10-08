@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
-const overrides = ['STACK_STATE_DIR', 'STACK_CACHE_DIR', 'PITCHFORK_STATE_DIR', 'MISE_CONFIG_FILE',
-  'MISE_DATA_DIR', 'MISE_STATE_DIR', 'MISE_CACHE_DIR', 'MISE_CONFIG_DIR', 'MISE_GLOBAL_CONFIG_FILE',
-  'MISE_SYSTEM_CONFIG_FILE', 'MISE_ENV', 'MISE_OVERRIDE_CONFIG_FILENAMES', '__MISE_DIFF'];
+const overrides = ['STACK_STATE_DIR', 'STACK_CACHE_DIR', 'PITCHFORK_STATE_DIR', 'PITCHFORK_CONFIG_DIR',
+  'PITCHFORK_LOGS_DIR', 'MISE_CONFIG_FILE', 'MISE_DATA_DIR', 'MISE_STATE_DIR', 'MISE_CACHE_DIR', 'MISE_CONFIG_DIR',
+  'MISE_GLOBAL_CONFIG_FILE', 'MISE_SYSTEM_CONFIG_FILE', 'MISE_ENV', 'MISE_OVERRIDE_CONFIG_FILENAMES', '__MISE_DIFF'];
 
 test('pilot discards inherited provider state and configuration selectors', () => {
   execFileSync('python3', ['-c', `
@@ -18,6 +18,8 @@ env = m.isolated_env(pathlib.Path('/tmp/isolated'), {**{k: '/sentinel' for k in 
 assert all('/sentinel' not in v for v in env.values())
 assert env['PATH'] == '/usr/bin'
 assert env['PITCHFORK_STATE_DIR'] == '/tmp/isolated/pf'
+assert env['PITCHFORK_CONFIG_DIR'] == '/tmp/isolated/h/.config/pitchfork'
+assert 'PITCHFORK_LOGS_DIR' not in env
 assert 'MISE_CONFIG_FILE' not in env
 for key in ['STACK_STATE_DIR','STACK_CACHE_DIR','MISE_DATA_DIR','MISE_CACHE_DIR','MISE_STATE_DIR']:
     assert env[key].startswith('/tmp/isolated/h/'), key
@@ -43,6 +45,8 @@ test('native runner isolates every override before any Stack or mise invocation'
     for (const key of overrides) assert.ok(env[key] === null || env[key].startsWith(`${work}/`), `${key}: ${env[key]}`);
     assert.equal(env.MISE_CONFIG_FILE, null);
     assert.equal(env.PITCHFORK_STATE_DIR, `${work}/pf`);
+    assert.equal(env.PITCHFORK_CONFIG_DIR, `${work}/h/.config/pitchfork`);
+    assert.equal(env.PITCHFORK_LOGS_DIR, null);
   } finally {
     if (work) rmSync(work, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
