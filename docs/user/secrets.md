@@ -75,6 +75,11 @@ endpoints withheld:
    replacing every occurrence of a short string would mangle output, and leaving it would leak
    it. This is a usability limit, not a confidentiality property. On the terminal there is no
    minimum.
+6. With `--json` and over MCP, a value that text stack writes into captured output could spell
+   out is refused too (`secret_unsupported`): for example `redacted` itself, a value starting
+   with `]` or `…`, one ending with `[`, `[r`, … `[redacted`, or one containing U+FFFD. Whether
+   a value conflicts can depend on the other values granted with it (they decide which markers
+   are in use). See [redaction](#redaction-in-captured-output).
 
 Results of granted commands list the names (never values) under `secrets` and anything declined
 under `warnings`. `inspect --json` lists each task's `secrets` names. Results of commands without
@@ -91,7 +96,7 @@ diagnostic.
 | `invalid_secret` | malformed, duplicate or protected name; fnox missing from tools or unpinned; fnox returned a protected key in `set` | `[{ key, operation: "declare" \| "set", reason, task? }]` |
 | `secret_missing` | fnox does not know a key, or could not resolve it | `[{ key, reason: "unknown" \| "unresolved" }]` |
 | `secret_unavailable` | fnox not locked, not installed, not on `PATH`, not the pinned release; protocol violation, oversized answer, error reply, nonzero exit, timeout | `[{ step, kind, exit_code?, timed_out }]` |
-| `secret_unsupported` | file secret, lease, key not injectable into an environment, value under 8 bytes when captured, value containing a NUL byte | `[{ key, reason }]` |
+| `secret_unsupported` | file secret, lease, key not injectable into an environment, value under 8 bytes when captured, value stack's own inserted text could spell out when captured, value containing a NUL byte | `[{ key, reason }]` |
 
 `kind` for `secret_unavailable` is one of `not_locked`, `not_installed`, `not_on_path`,
 `not_pinned`, `provider`, `spawn`, `timed_out`, `oversized`, `protocol`, or fnox's own error kind
@@ -109,6 +114,24 @@ to 64 KiB: a value split across reads, written twice, overlapping another value,
 the start of the retained tail is still replaced. Overlapping values become one run naming each
 key. Timeout results and error details built from the output are redacted the same way.
 
+A replacement never writes a granted value back. The only text in a captured stream the command
+did not write is what stack inserts (markers, the `…[truncated]…` notice, and U+FFFD where the
+output is not UTF-8), so stack checks every value against that text when the grant is resolved:
+
+- A key is named in its marker only if it is a variable name and no granted value could be read
+  across `[redacted:KEY]` (a value equal to a key, a value containing `d:KEY]`, and so on).
+  Otherwise its marker is `[redacted]`. Names fnox reports for dependencies follow the same rule.
+- A granted value that could still be read across a marker, the notice or U+FFFD is refused
+  (`secret_unsupported`, see above). A dependency value fnox resolved along the way that could
+  be is left out of redaction, as a short one is; the command never receives dependencies.
+- Repeated markers in one run are written once: identical values under two hidden keys become
+  one `[redacted]`.
+
+The guarantee is on the `stdout` and `stderr` strings themselves, as a JSON parser returns them.
+The JSON text of a result escapes `"`, `\` and control characters, so a value containing a
+backslash can appear in the raw text if the command prints the unescaped form; that is a
+transformation, like the ones below.
+
 ## Boundary
 
 What a grant does and does not promise:
@@ -117,7 +140,8 @@ What a grant does and does not promise:
   captured, so stack cannot redact anything, and a command that prints a value prints it. There
   is no result to say otherwise; the `--secret` help says so.
 - **Transformed values are not caught.** A value the program base64-encodes, URL-encodes,
-  hashes, splits or re-encodes no longer matches literally and is not replaced.
+  hashes, splits or re-encodes no longer matches literally and is not replaced. This includes
+  forms that only match after JSON escaping of the result.
 - **Inherited variables pass through.** Variables your shell already had are inherited by the
   command byte for byte, as before, including one with the same name as a secret fnox did not
   grant. A grant adds the granted keys and applies fnox's removals; it is not a sandbox.

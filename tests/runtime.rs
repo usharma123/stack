@@ -3515,6 +3515,90 @@ fn short_values_are_refused_when_captured_and_allowed_on_the_terminal() {
     assert_no_leak_on_disk(&fixture);
 }
 
+/// fnox answers `--keys` with `set`, whatever keys were asked for.
+fn answer_keys(fixture: &Fixture, set: Value) {
+    let root = fixture.dir.path();
+    fs::write(root.join("fnox-keys-mode"), "file").unwrap();
+    fs::write(root.join("fnox-keys.json"), json!({ "schema": 1, "set": set, "files": {}, "remove": [], "missing": [], "leases": [] }).to_string()).unwrap();
+}
+
+/// No `values` in either captured stream of `data`, for every way of returning a result.
+fn assert_streams_clean(data: &Value, values: &[&str], context: &str) {
+    for stream in ["stdout", "stderr"] {
+        let text = data[stream].as_str().unwrap_or_else(|| panic!("{context}: no {stream} in {data}"));
+        for value in values {
+            assert!(!text.contains(value), "{context}: {value} in {stream}: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_redaction_marker_never_reproduces_a_granted_value() {
+    let fixture = secrets_fixture("");
+    let marker = fixture.dir.path().join("ran");
+
+    // The marker word: refused before the command runs, on the CLI and over MCP.
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": "redacted" }));
+    let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "touch", marker.to_str().unwrap()]);
+    assert_eq!(envelope["error"]["code"], "secret_unsupported", "{text}");
+    assert_eq!(envelope["error"]["details"][0]["key"], "DEPLOY_KEY");
+    assert!(!marker.exists(), "the command ran");
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["touch", marker.to_str().unwrap()], "secrets": ["DEPLOY_KEY"] }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "secret_unsupported", "{}", results[0]);
+    assert!(!marker.exists(), "the command ran");
+    // The terminal captures nothing, so the value is granted there.
+    let out = fixture.command(&["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf %s "$DEPLOY_KEY""#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "redacted");
+
+    // SENTRY_DSN's value is what DEPLOY_KEY's labeled marker and the text after it would spell,
+    // and DEPLOY_KEY's value is its own name: neither key is shown, and neither value appears.
+    let tail = "d:DEPLOY_KEY]-tail-0007";
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": DEPLOY_VALUE, "SENTRY_DSN": tail }));
+    let script = r#"printf '%s-tail-0007\n' "$DEPLOY_KEY"; printf '%s-tail-0007\n' "$DEPLOY_KEY" >&2; printf '%s\n' "$SENTRY_DSN""#;
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--secret", "SENTRY_DSN", "--", "sh", "-c", script]);
+    assert!(out.status.success(), "{text}");
+    assert_streams_clean(&envelope["data"], &[DEPLOY_VALUE, tail], "exec --json");
+    assert_eq!(envelope["data"]["stdout"], "[redacted]-tail-0007\n[redacted:SENTRY_DSN]\n");
+    assert_eq!(envelope["data"]["stderr"], "[redacted]-tail-0007\n");
+    assert_no_leak(&text, "exec --json");
+    let results = fixture.mcp(
+        &[
+            ("stack_exec", json!({ "command": ["sh", "-c", script], "secrets": ["DEPLOY_KEY", "SENTRY_DSN"] })),
+            ("stack_exec", json!({ "command": ["sh", "-c", format!("{script}; sleep 5")], "secrets": ["DEPLOY_KEY", "SENTRY_DSN"], "timeout_secs": 1 })),
+        ],
+        &[],
+    );
+    assert_streams_clean(&results[0]["structuredContent"]["data"], &[DEPLOY_VALUE, tail], "MCP");
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "timed_out", "{}", results[1]);
+    assert_streams_clean(&results[1]["structuredContent"]["error"]["details"][0], &[DEPLOY_VALUE, tail], "MCP timeout");
+
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": "DEPLOY_KEY" }));
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf '%s\n' "$DEPLOY_KEY" | tee /dev/stderr"#]);
+    assert!(out.status.success(), "{text}");
+    assert_eq!((envelope["data"]["stdout"].as_str(), envelope["data"]["stderr"].as_str()), (Some("[redacted]\n"), Some("[redacted]\n")));
+
+    // A dependency named after a granted value is replaced without its name.
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": "LEAKSENTINEL0008", "DEP_LEAKSENTINEL0008": "leak-sentinel-dependency-0003" }));
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf '%s leak-sentinel-dependency-0003\n' "$DEPLOY_KEY""#]);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(envelope["data"]["stdout"], "[redacted:DEPLOY_KEY] [redacted]\n");
+    assert_streams_clean(&envelope["data"], &["LEAKSENTINEL0008", "leak-sentinel-dependency-0003"], "dependency");
+
+    // The 64 KiB bound applies to the replaced stream: markers longer than the value they
+    // replace do not let it grow, and a cut through a marker spells nothing.
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": DEPLOY_VALUE, "SENTRY_DSN": tail }));
+    let script = r#"i=0; while [ $i -lt 4000 ]; do printf '%s-tail-0007' "$DEPLOY_KEY"; i=$((i+1)); done"#;
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--secret", "SENTRY_DSN", "--", "sh", "-c", script]);
+    assert!(out.status.success(), "{text}");
+    let stdout = envelope["data"]["stdout"].as_str().unwrap();
+    let body = stdout.strip_prefix("…[truncated]…").unwrap_or_else(|| panic!("not truncated: {} bytes", stdout.len()));
+    assert_eq!(body.len(), 64 * 1024);
+    assert!(body.ends_with("[redacted]-tail-0007"), "{}", &body[body.len() - 40..]);
+    assert_streams_clean(&envelope["data"], &[DEPLOY_VALUE, tail], "bounded");
+    assert_no_leak_on_disk(&fixture);
+}
+
 #[test]
 fn fnox_failures_map_to_codes_and_nothing_fnox_printed_is_forwarded() {
     let fixture = secrets_fixture("");

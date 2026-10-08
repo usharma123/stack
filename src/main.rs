@@ -99,7 +99,7 @@ enum Cmd {
         timeout: Option<String>,
         /// Grant this fnox secret to the command (repeatable), resolved through the stack's
         /// pinned fnox. With --json its value is redacted from the captured output (and values
-        /// under 8 bytes are refused); without --json the command owns the terminal and its
+        /// under 8 bytes, or ones a redaction marker could spell out, are refused); without --json the command owns the terminal and its
         /// output is shown as written, unredacted
         #[arg(long = "secret", value_name = "KEY")]
         secret: Vec<String>,

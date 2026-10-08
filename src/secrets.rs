@@ -38,6 +38,9 @@ pub const FNOX: &str = "fnox";
 /// confidentiality property: a longer value is not safer, only legible to replace.
 pub const MIN_CAPTURED_LEN: usize = 8;
 
+/// Why a value whose replacement could spell it (or another value) out is refused.
+const CONFLICT: &str = "text stack inserts into captured output (a redaction marker, the truncation notice or U+FFFD) could reproduce the value";
+
 /// Each fnox (and the provider query locating it) must answer within this, or the deadline.
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -605,10 +608,23 @@ fn interpret(object: serde_json::Map<String, Value>, grant: &Grant, protected: &
         redactor.add(key, value.as_bytes());
         set.push((key.clone(), value));
     }
-    // Dependencies fnox resolved along the way are never given to the command; replacing them
-    // too costs nothing.
+    // A value that a marker (with its key or without), the truncation notice or lossy decoding
+    // could spell out cannot be kept out of captured output, so it is not granted there.
+    let conflicts = redactor.conflicts();
+    if grant.captured && !conflicts.is_empty() {
+        let refused: Vec<Value> = conflicts.iter().map(|k| json!({ "key": k, "reason": CONFLICT })).collect();
+        return Err(StackError::new("secret_unsupported", format!("stack cannot grant {} here", key_list(&refused)))
+            .hint("run without --json (the command then owns the terminal and nothing is captured), or change the value")
+            .details(refused));
+    }
+    // Dependencies fnox resolved along the way are never given to the command; they are
+    // replaced too where that is safe (one that conflicts is left out, like a short one).
     for (key, value) in answer.set.iter().filter(|(k, v)| !requested.contains(k) && v.len() >= MIN_CAPTURED_LEN) {
-        redactor.add(key, value.as_bytes());
+        let mut with = redactor.clone();
+        with.add(key, value.as_bytes());
+        if with.conflicts().is_empty() {
+            redactor = with;
+        }
     }
     Ok(Resolved { keys: requested.clone(), set, remove, warnings, redactor })
 }
@@ -806,6 +822,35 @@ mod tests {
         // Terminal mode has no minimum.
         let r = interpret(object(r#"{"schema":1,"set":{"DEPLOY_KEY":"seven77"}}"#), &grant(&["DEPLOY_KEY"], false), &none).unwrap();
         assert_eq!(r.set[0].1, "seven77");
+    }
+
+    #[test]
+    fn values_a_marker_could_spell_out_are_refused_when_captured() {
+        let none = |_: &str| false;
+        let answer = |set: &str| object(&format!(r#"{{"schema":1,"set":{set}}}"#));
+        // The marker word: no marker could be written without it.
+        let e = interpret(answer(r#"{"DEPLOY_KEY":"redacted","SENTRY_DSN":"sentry-value-1"}"#), &grant(&["DEPLOY_KEY", "SENTRY_DSN"], true), &none).unwrap_err();
+        assert_eq!(e.code, "secret_unsupported");
+        assert_eq!(e.details, vec![json!({ "key": "DEPLOY_KEY", "reason": CONFLICT })]);
+        assert!(!serde_json::to_string(&e).unwrap().contains("sentry-value"));
+        // On the terminal nothing is captured, so nothing is refused.
+        let r = interpret(answer(r#"{"DEPLOY_KEY":"redacted"}"#), &grant(&["DEPLOY_KEY"], false), &none).unwrap();
+        assert_eq!(r.set[0].1, "redacted");
+
+        // A value equal to its key, or to another granted key: that key is not shown.
+        let r = interpret(answer(r#"{"DEPLOY_KEY":"DEPLOY_KEY"}"#), &grant(&["DEPLOY_KEY"], true), &none).unwrap();
+        assert_eq!(r.redactor.redact("DEPLOY_KEY=DEPLOY_KEY"), "[redacted]=[redacted]");
+        let r = interpret(answer(r#"{"DEPLOY_KEY":"deploy-value-123","SENTRY_DSN":"DEPLOY_KEY"}"#), &grant(&["DEPLOY_KEY", "SENTRY_DSN"], true), &none).unwrap();
+        assert_eq!(r.redactor.redact("deploy-value-123 DEPLOY_KEY"), "[redacted] [redacted:SENTRY_DSN]");
+
+        // Dependencies: a name containing a granted value is not shown, nor one that is not a
+        // variable name; one whose value a marker could spell out is left out, as a short one is.
+        let set = r#"{"DEPLOY_KEY":"LEAKVALUE9","DEP_LEAKVALUE9":"dependency-value-1","odd dep":"dependency-value-2","DEP3":"[redacted","DEP4":"redacted"}"#;
+        let r = interpret(answer(set), &grant(&["DEPLOY_KEY"], true), &none).unwrap();
+        assert!(r.redactor.conflicts().is_empty());
+        assert_eq!(format!("{:?}", r.redactor), r#"Redactor { keys: ["DEPLOY_KEY", "DEP_LEAKVALUE9", "odd dep"] }"#);
+        let out = r.redactor.redact("LEAKVALUE9 dependency-value-1 dependency-value-2");
+        assert_eq!(out, "[redacted:DEPLOY_KEY] [redacted] [redacted]");
     }
 
     #[cfg(unix)]

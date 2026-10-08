@@ -105,7 +105,7 @@ fn tools() -> Value {
               "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
               "require": { "type": "array", "items": { "type": "string" } },
               "require_all": { "type": "boolean" },
-              "secrets": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Values are replaced by [redacted:KEY] in stdout and stderr; values shorter than 8 bytes are refused (secret_unsupported)" },
+              "secrets": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Values are replaced by [redacted:KEY] ([redacted] where naming the key could spell out a value) in stdout and stderr; values shorter than 8 bytes or ones a marker could spell out are refused (secret_unsupported)" },
               "timeout_secs": { "type": "integer" }
           }), &["command"]) },
         { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec. The task receives exactly the secrets it declares (secrets = [...] in stack.toml), redacted from its output; no others can be added here.",

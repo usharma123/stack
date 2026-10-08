@@ -91,8 +91,9 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `exec --secret KEY` (repeatable) and a task's `secrets = [...]` grant named fnox secrets,
   resolved through the fnox release `stack.lock` pins once services verify. Names are checked
   before any provider call (`invalid_secret`). With `--json` granted values are replaced by
-  `[redacted:KEY]` in the captured output before it is bounded, and values under 8 bytes are
-  refused (`secret_unsupported`); without `--json` the command's output reaches the terminal
+  `[redacted:KEY]` (`[redacted]` where naming the key could spell out a value) in the captured
+  output before it is bounded, and values under 8 bytes or ones stack's markers could spell out
+  are refused (`secret_unsupported`); without `--json` the command's output reaches the terminal
   unredacted. The result lists granted names under `secrets` and declined removals under
   `warnings`. See [secret grants](secrets.md) for the rules, codes and boundary.
 - `restart [service...]` stops the named services (every service when none are named), waits

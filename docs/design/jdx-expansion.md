@@ -630,6 +630,10 @@ Redaction, in captured mode (`exec --json`, `run --json`, MCP `stack_exec`, `sta
   confidentiality property: 8 bytes makes the matcher's replacements legible, it does not make
   a longer value safer. Astra would rather redact every nonempty value; see
   [Fable vs Astra](#fable-vs-astra).
+- No replacement may write a granted value back: a key is named in its marker only when no value
+  could be read across `[redacted:KEY]` (otherwise `[redacted]`), and a value that could still
+  be read across a marker, the `…[truncated]…` notice or U+FFFD is refused in captured mode
+  (`secret_unsupported`). A conflicting dependency value is left out of redaction.
 - Without `--json`, the command owns the terminal: nothing is captured and nothing is redacted.
   The result of a terminal run cannot say otherwise because there is no result; the docs and the
   `--secret` help text say so.
@@ -654,7 +658,7 @@ runs `fnox env --json --describe` for its own value-free check.
 | `invalid_secret` | bad key name, protected key declared or returned in `set`, `fnox` missing from tools | `[{ key, operation: "declare" / "set", reason }]` |
 | `secret_missing` | fnox does not know a key, or could not resolve it | `[{ key, reason: "unknown" / "unresolved" }]` |
 | `secret_unavailable` | fnox not the pinned tool, not installed, protocol violation, nonzero exit, timeout | `[{ kind?, exit_code?, timed_out }]` |
-| `secret_unsupported` | file secret, lease, non-exec-injectable key, or a value under 8 bytes in captured mode | `[{ key, reason }]` |
+| `secret_unsupported` | file secret, lease, non-exec-injectable key, or (in captured mode) a value under 8 bytes or one stack's markers could spell out | `[{ key, reason }]` |
 
 ### Tests
 

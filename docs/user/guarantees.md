@@ -49,8 +49,8 @@
   is granted, resolved at start from the fnox release `stack.lock` pins; a grant never sets or
   removes a service endpoint or other variable stack controls. Values never enter `stack.lock`,
   generated configuration, session records, timings or reports, and captured output (`--json`,
-  MCP) never contains a granted value literally (values of at least 8 bytes; shorter ones are
-  refused there). Terminal output is not redacted, transformed values are not caught, and
+  MCP) never contains a granted value literally, including through stack's own markers (values
+  of at least 8 bytes that no marker could spell out; others are refused there). Terminal output is not redacted, transformed values are not caught, and
   inherited variables pass through: see [secret grants](secrets.md#boundary).
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe. `up` and `restart` have a 10m startup deadline, configurable with
