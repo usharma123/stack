@@ -63,6 +63,20 @@ These establish the inherited DX base. They do not validate the new jdx routes.
 
 Implementation validation is pending.
 
+### Foundations and mbx
+
+Integrated as `29c1767`, from worker commit `e0574e2`.
+
+- Integration checkout: `cargo test --locked --test compile` passed, 38 tests.
+- Worker checkout: 242 Rust tests, Clippy, and 41 Node tests passed. The optional real-mise
+  isolation test was run separately and passed.
+- Real-tool results: two isolated Cargo worktrees reached mbx through exec and run. The
+  second build recorded one cache hit. Native service scenarios 1 and 6 passed.
+- Commands, versions, and limitations are recorded in
+  [the route 2 smoke record](../reviews/2026-10-08-tool-options-mbx-smoke.md).
+
+Artifact locking, secret grants, and both skills phases are in progress in separate worktrees.
+
 ## Review results
 
 Pending.
