@@ -776,6 +776,8 @@ mod tests {
             resolved: resolved.map(Into::into),
             origin: origin.into(),
             moved_from: None,
+            backend: None,
+            artifacts: None,
         }
     }
 

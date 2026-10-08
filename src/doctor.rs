@@ -42,6 +42,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             state: state.to_path_buf(),
             reassign_ports: false,
             resolver: None,
+            locker: None,
         });
         if let Ok(r) = &compiled {
             for key in ["PITCHFORK_STATE_DIR", "HOME", "XDG_STATE_HOME"] {
@@ -49,7 +50,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             }
         }
         if let Ok(r) = &compiled {
-            if let Some(check) = provider_release(root, &project::provider_requirements(&r.stack)) {
+            if let Some(check) = provider_release(root, &project::install_requirements(r)) {
                 checks.push(check);
             }
             let fnox = r.versions.iter().find(|v| v.kind == "tool" && v.name == crate::secrets::FNOX).and_then(|v| v.resolved.as_deref());

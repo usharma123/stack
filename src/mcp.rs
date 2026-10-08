@@ -166,6 +166,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             state: ctx.state.clone(),
             reassign_ports,
             resolver: None,
+            locker: None,
         })
     };
     match name {
@@ -261,8 +262,9 @@ fn skill(args: &Value, ctx: &Ctx) -> Result<crate::skills::SkillText> {
         state: ctx.state.clone(),
         reassign_ports: false,
         resolver: None,
+        locker: None,
     })?;
-    let found = crate::skills::discover(&ctx.cache, &report.lock, &report.versions);
+    let found = report.discover_skills(&ctx.cache);
     crate::skills::read(&found, tool, name)
 }
 

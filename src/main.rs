@@ -181,6 +181,7 @@ fn main() -> ExitCode {
         state: ctx.state.clone(),
         reassign_ports,
         resolver: None,
+        locker: None,
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
@@ -217,6 +218,11 @@ fn main() -> ExitCode {
             emit(cli.json, &r, || {
                 for v in &r.versions {
                     println!("{:<12} {}", v.name, v.resolved.as_deref().unwrap_or("-"));
+                }
+                if let Some(detail) = r.steps.iter().find(|s| s["step"] == "install").map(|s| &s["detail"]) {
+                    let names = |key: &str| detail[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                    println!("checked (mise install --locked): {}", names("locked"));
+                    println!("unchecked (mise install): {}", names("plain"));
                 }
                 println!("installed; nothing started");
                 for w in &r.warnings {
@@ -418,6 +424,13 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             let resolved = v.resolved.as_deref().unwrap_or("(not locked yet)");
             let moved = v.moved_from.as_deref().map(|m| format!("  (moved from {m})")).unwrap_or_default();
             println!("{} {} {} -> {resolved}{moved}", v.kind, v.name, v.requested);
+            if let Some(artifacts) = &v.artifacts {
+                let states: Vec<String> = artifacts
+                    .iter()
+                    .map(|(platform, a)| format!("{platform} {}{}", a.state.name(), a.change.map(|c| format!(" ({c})")).unwrap_or_default()))
+                    .collect();
+                println!("  artifacts: {}", states.join(", "));
+            }
         }
         // Custom services have no release to resolve; list them too.
         for (name, entry) in &s.services {

@@ -1,5 +1,6 @@
 //! stack: compose reusable development bundles and run them through existing providers.
 
+pub mod artifacts;
 pub mod compose;
 pub mod doctor;
 pub mod error;

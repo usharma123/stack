@@ -8,6 +8,7 @@
 use crate::error::{Result, StackError};
 use crate::hash::sha256_hex;
 use crate::manifest::Service;
+use crate::artifacts;
 use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
@@ -50,6 +51,7 @@ impl Ctx {
             state: self.state.clone(),
             reassign_ports: false,
             resolver: None,
+            locker: None,
         })
     }
 
@@ -539,7 +541,8 @@ impl Steps {
     /// worst; the returned messages are the result's `warnings`.
     fn skills(&mut self, ctx: &Ctx, report: &Report) -> Vec<String> {
         let Some(dir) = report.skills_dir.as_deref() else { return Vec::new() };
-        let sync = crate::skills::sync_step(&ctx.cache, &ctx.root, dir, &report.lock, &report.versions);
+        let empty = crate::lock::Lockfile::new(Vec::new(), Vec::new(), Vec::new());
+        let sync = crate::skills::sync_step(&ctx.cache, &ctx.root, dir, report.lock.as_ref().unwrap_or(&empty), &report.versions);
         let warnings: Vec<String> = sync
             .warnings
             .iter()
@@ -650,10 +653,12 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     };
     steps.ok("compile", json!({ "ports": report.ports }));
 
-    // A mise too old for what the configuration asks would silently ignore it.
-    if let Err(e) = mise::require(&ctx.root, &project::provider_requirements(&report.stack)) {
-        return Err(steps.fail("install", e, false));
-    }
+    // A mise too old for what the configuration asks would silently ignore it. The artifact
+    // policy is checked, and the provider's lock rendered from stack.lock, before any install.
+    let plan = match prepare_install(ctx, &report) {
+        Ok(plan) => plan,
+        Err(e) => return Err(steps.fail("install", e, false)),
+    };
     if let Err(e) = mise::trust(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
@@ -669,10 +674,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
-    if let Err(e) = mise::install(&ctx.root) {
-        return Err(steps.fail("install", e, false));
+    match install_partitioned(ctx, &plan) {
+        Ok(detail) => steps.ok("install", detail),
+        Err(e) => return Err(steps.fail("install", e, false)),
     }
-    steps.ok("install", json!(null));
     let warnings = steps.skills(ctx, &report);
     // Recorded before anything starts, so a deleted project's services can still be found.
     let provider = socket.and_then(|socket| {
@@ -1060,9 +1065,10 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
         Err(e) => return Err(steps.fail("compile", e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
-    if let Err(e) = mise::require(&ctx.root, &project::provider_requirements(&report.stack)) {
-        return Err(steps.fail("install", e, false));
-    }
+    let plan = match prepare_install(ctx, &report) {
+        Ok(plan) => plan,
+        Err(e) => return Err(steps.fail("install", e, false)),
+    };
     if let Err(e) = mise::trust(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
@@ -1072,12 +1078,78 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
-    if let Err(e) = mise::install(&ctx.root) {
-        return Err(steps.fail("install", e, false));
+    match install_partitioned(ctx, &plan) {
+        Ok(detail) => steps.ok("install", detail),
+        Err(e) => return Err(steps.fail("install", e, false)),
     }
-    steps.ok("install", json!(null));
     let warnings = steps.skills(ctx, &report);
     Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions, warnings })
+}
+
+/// What the install step will do, decided before anything is installed.
+struct InstallPlan {
+    artifacts: artifacts::PlatformSummary,
+    partition: artifacts::Partition,
+    /// A service preset whose tool stack does not know: plain `mise install` of everything
+    /// left, as before artifact locking.
+    everything: bool,
+}
+
+/// Stated with every install: what `verified` means for releases already on the machine.
+const INSTALL_BOUNDARY: &str = "mise checks the recorded checksum (and packslip signer) of artifacts it downloads; a release already installed on this machine is reported installed without being checked again";
+
+/// Before anything installs: mise new enough for the configuration and the lock, the artifact
+/// policy met on this platform, and `.config/mise/mise.lock` rendered from stack.lock.
+fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
+    mise::require(&ctx.root, &project::install_requirements(report))?;
+    let platform = artifacts::current_platform();
+    let policy = &report.artifact_policy;
+    let pins = report.pins();
+    let lock = report.provider_lock();
+    if policy.required() {
+        if !policy.platforms.contains(&platform) {
+            return Err(StackError::new(
+                "artifact_unlocked",
+                format!("[lock] artifacts = \"required\", but this machine's platform {platform} is not in [lock] platforms ({})", policy.platforms.join(", ")),
+            )
+            .hint("add the platform to `[lock] platforms` and run `stack compile`, or relax `[lock] artifacts`")
+            .with_detail(json!({ "platform": platform, "state": "unlisted" })));
+        }
+        let unchecked = artifacts::unchecked(lock, &pins, std::slice::from_ref(&platform), &Default::default());
+        if !unchecked.is_empty() {
+            return Err(artifacts::unlocked_error(unchecked));
+        }
+    }
+    let mut partition = artifacts::partition(lock, &pins, &platform);
+    // Requests that name no release are not pins; they install as they always did.
+    for (name, e) in &report.stack.tools {
+        if mise::unversioned(&e.value.version) && !partition.plain.contains(name) && !partition.locked.contains(name) {
+            partition.plain.push(name.clone());
+        }
+    }
+    let everything = report.stack.services.values().any(|e| e.value.preset.as_deref().is_some_and(|p| mise::preset_tool(p).is_none()));
+    artifacts::write_rendered(&ctx.root, report.lock.as_ref())?;
+    Ok(InstallPlan { artifacts: artifacts::summary(lock, &pins, &platform), partition, everything })
+}
+
+/// `mise install --locked` for pins whose coverage here is verified or exempt, then plain
+/// `mise install` for the rest; an empty partition is skipped.
+fn install_partitioned(ctx: &Ctx, plan: &InstallPlan) -> Result<Value> {
+    if !plan.partition.locked.is_empty() {
+        mise::install_tools(&ctx.root, &plan.partition.locked, true)?;
+    }
+    if !plan.partition.plain.is_empty() {
+        mise::install_tools(&ctx.root, &plan.partition.plain, false)?;
+    }
+    if plan.everything {
+        mise::install_tools(&ctx.root, &[], false)?;
+    }
+    Ok(json!({
+        "artifacts": plan.artifacts,
+        "locked": plan.partition.locked,
+        "plain": plan.partition.plain,
+        "boundary": INSTALL_BOUNDARY,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -1461,6 +1533,10 @@ pub struct StatusReport {
     pub stale: bool,
     /// Every service verified and the session is current; `stack status` exits 1 otherwise.
     pub healthy: bool,
+    /// Artifact coverage of the locked releases on this machine's platform. Read from
+    /// stack.lock; nothing is fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<artifacts::PlatformSummary>,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
@@ -1486,7 +1562,9 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let stale = session
         .as_ref()
         .is_some_and(|s| s.config_digest != config_digest(ctx, &report));
+    let artifacts = (!report.pins().is_empty()).then(|| report.current_artifacts());
     Ok(StatusReport {
+        artifacts,
         healthy: !stale && checks.iter().all(|c| c.ready),
         stale,
         lease_expired: session

@@ -145,6 +145,10 @@ pub struct ProjectManifest {
     /// project's tree.
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
+    /// Artifact locking: which platforms stack.lock covers and whether coverage is required.
+    /// Project only; a bundle cannot set it.
+    #[serde(default)]
+    pub lock: LockSettings,
 }
 
 /// `[skills]` in stack.toml.
@@ -153,6 +157,18 @@ pub struct ProjectManifest {
 pub struct SkillsConfig {
     /// Directory, relative to the project root, where `up` and `install` link available skills.
     pub dir: String,
+}
+
+/// `[lock]` as written; see `artifacts::Policy` for defaults and validation.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockSettings {
+    /// mise platform names (`macos-arm64`, `linux-x64`), or `current`.
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
+    /// `best-effort` (default) or `required`.
+    #[serde(default)]
+    pub artifacts: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

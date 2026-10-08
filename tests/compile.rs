@@ -88,6 +88,20 @@ impl Resolver for Upstream {
     }
 }
 
+/// mise for artifact locking: a current release whose `mise lock` adds nothing, as offline.
+/// Artifact behaviour itself is tested in `tests/artifacts.rs`.
+struct QuietLocker;
+
+impl mise::Locker for QuietLocker {
+    fn version(&self, _: &Path) -> Result<mise::CalVer, StackError> {
+        Ok(mise::CalVer(2026, 10, 3))
+    }
+
+    fn lock(&self, _: &mise::ScratchRoot, _: &[String], _: &[String]) -> Result<mise::LockRun, StackError> {
+        Ok(mise::LockRun { exit_code: Some(0), stderr: String::new() })
+    }
+}
+
 const PYBASE: &str = r#"
 [bundle]
 name = "pybase"
@@ -148,6 +162,7 @@ impl Sandbox {
             state: self.path("state"),
             reassign_ports: false,
             resolver: Some(self.upstream.clone()),
+            locker: Some(Arc::new(QuietLocker)),
         }
     }
 
@@ -579,7 +594,7 @@ fn exact_tool_and_service_versions_survive_upstream_releases_and_a_fresh_cache()
         assert_eq!(resolved(&first, name), version, "{name}");
     }
     let locked = lock::read(&root).unwrap().unwrap();
-    assert_eq!(locked.version, 2);
+    assert_eq!(locked.version, 3);
     let pg = locked.service("postgres").unwrap();
     assert_eq!((pg.tool.as_deref(), pg.requested.as_str(), pg.resolved.as_str()), (Some("postgres"), "17", "17.2"));
     assert_eq!(locked.tool("pitchfork").unwrap().resolved, "2.29.0", "provider tools are locked too");
@@ -693,7 +708,7 @@ fn legacy_locks_keep_bundle_pins_and_migrate_only_through_compile() {
     let migrated = sb.compile(&root, Mode::UseLock).unwrap();
     assert!(migrated.lock_changed);
     let lock = lock::read(&root).unwrap().unwrap();
-    assert_eq!(lock.version, 2);
+    assert_eq!(lock.version, 3);
     assert_eq!(lock.bundles[0].commit.as_deref(), Some(v1.as_str()), "bundle pin kept");
     assert_eq!(lock.bundles[0].content_hash, hash);
     assert_eq!(lock.tool("python").unwrap().resolved, "3.13.2");
@@ -704,7 +719,7 @@ fn legacy_locks_keep_bundle_pins_and_migrate_only_through_compile() {
 fn unsupported_or_inconsistent_lock_versions_are_rejected() {
     let sb = Sandbox::new();
     let root = sb.project("[tools]\njq = \"1.7\"\n");
-    fs::write(root.join("stack.lock"), "version = 3\n").unwrap();
+    fs::write(root.join("stack.lock"), "version = 4\n").unwrap();
     assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
     fs::write(root.join("stack.lock"), "version = 1\n[[tool]]\nname = \"jq\"\nrequested = \"1.7\"\nresolved = \"1.7.1\"\n").unwrap();
     assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
@@ -870,7 +885,7 @@ fn rust_mbx_bundle_locks_renders_and_reports_its_options() {
     assert_eq!((rust.requested.as_str(), rust.resolved.as_str()), ("1.93", "1.93.1"));
     assert_eq!(rust.options.get("mr_boxington"), Some(&OptionValue::Bool(true)));
     assert!(lock.tool("mbx").unwrap().options.is_empty());
-    assert_eq!(lock.version, 2, "options extend version 2");
+    assert_eq!(lock.version, 3, "options extend version 2 and survive into version 3");
     assert!(lock_text(&root).contains("[tool.options]\nmr_boxington = true"), "{}", lock_text(&root));
 
     // The resolver was asked with the options, so a backend that needs them can list releases.

@@ -110,6 +110,65 @@ impl Resolver for MiseResolver {
     }
 }
 
+/// Locks artifacts in a scratch root and reports the provider release. `stack compile` uses
+/// [`MiseLocker`]; tests substitute a fake that writes a lock into the scratch root.
+pub trait Locker: Send + Sync {
+    /// The release of the provider that will read the rendered lock.
+    fn version(&self, root: &Path) -> Result<CalVer> {
+        provider_version(root)
+    }
+
+    /// `mise lock --platform <platforms> <tools>...` in `scratch`, bounded. The lock it leaves
+    /// is read from the scratch root by the caller; a nonzero exit is not a failure by itself.
+    fn lock(&self, scratch: &ScratchRoot, platforms: &[String], tools: &[String]) -> Result<LockRun>;
+}
+
+/// How a `mise lock` run ended. Exit status and the presence of an entry prove nothing about
+/// whether a refresh happened (an offline run exits 0 and keeps what it was given).
+#[derive(Debug, Clone, Default)]
+pub struct LockRun {
+    pub exit_code: Option<i32>,
+    pub stderr: String,
+}
+
+/// Locking fetches metadata and, for some backends, artifacts.
+pub const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const LOCK_OUTPUT_LIMIT: usize = 64 * 1024;
+
+pub struct MiseLocker;
+
+impl Locker for MiseLocker {
+    fn lock(&self, scratch: &ScratchRoot, platforms: &[String], tools: &[String]) -> Result<LockRun> {
+        let platforms = platforms.join(",");
+        let mut args = vec!["lock", "--platform", platforms.as_str()];
+        args.extend(tools.iter().map(String::as_str));
+        let mut command = scratch.command(&args);
+        let out = crate::process::capture(&mut command, LOCK_TIMEOUT, LOCK_OUTPUT_LIMIT).map_err(|e| {
+            StackError::new("artifact_lock_failed", format!("cannot run mise lock: {e}"))
+                .hint(format!("{}; stack.lock was not changed", crate::setup::MISE_INSTALL_HINT))
+        })?;
+        lock_run(out)
+    }
+}
+
+/// A finished `mise lock`, or the failure a timeout is.
+pub fn lock_run(out: crate::process::Captured) -> Result<LockRun> {
+    if out.timed_out && crate::process::expired() {
+        return Err(StackError::new("timed_out", "`mise lock` was cut short by the deadline; stack.lock was not changed"));
+    }
+    if out.timed_out {
+        return Err(StackError::new("artifact_lock_failed", format!("`mise lock` did not finish within {}s", LOCK_TIMEOUT.as_secs()))
+            .hint("check mise and network access; stack.lock was not changed")
+            .with_detail(serde_json::json!({ "output": readable_tail(&out.stderr, TAIL_LINES) })));
+    }
+    Ok(LockRun { exit_code: out.exit_code, stderr: out.stderr })
+}
+
+/// The last lines of provider text in readable form, as kept in error details.
+pub fn text_tail(text: &str) -> String {
+    readable_tail(text, TAIL_LINES)
+}
+
 /// What `mise latest` answered, as an exact release or `resolve_failed`.
 fn interpret_latest(tool: &str, spec: &str, out: crate::process::Captured) -> Result<String> {
     let fail = |why: String| {
@@ -600,8 +659,112 @@ pub fn trust(root: &Path) -> Result<()> {
     checked(root, &["trust", "--quiet", &output_path(root).to_string_lossy()], "provider_failed").map(|_| ())
 }
 
-pub fn install(root: &Path) -> Result<()> {
-    checked(root, &["install", "--yes", "--quiet"], "install_failed").map(|_| ())
+/// `mise install` of the named tools (with `--locked` when `locked`), or of everything the
+/// configuration names when `tools` is empty. Naming a tool installs every version the
+/// configuration gives it, with the configuration's options, services' preset tools included.
+/// A download mise refuses because it does not match the rendered lock is `artifact_mismatch`
+/// with what mise said parsed into details; any other failure is `install_failed`.
+pub fn install_tools(root: &Path, tools: &[String], locked: bool) -> Result<()> {
+    let mut args = vec!["install"];
+    if locked {
+        args.push("--locked");
+    }
+    args.extend(["--yes", "--quiet"]);
+    args.extend(tools.iter().map(String::as_str));
+    let out = mise(root, &args)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let failed = if crate::process::expired() { "was cut short by the deadline" } else { "failed" };
+    let text = strip_escapes(&format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+    let refused = refusals(&text);
+    if let Some(first) = refused.first() {
+        let mut details: Vec<serde_json::Value> = refused.iter().map(|r| serde_json::to_value(r).expect("refusal serializes")).collect();
+        details.push(serde_json::json!({ "output": tail(&out) }));
+        return Err(StackError::new(
+            "artifact_mismatch",
+            format!(
+                "mise refused {} for {}{}: it does not match stack.lock",
+                match first.kind { "checksum" => "a download", "signer" => "the signer", _ => "the signing repository" },
+                first.name,
+                first.platform.as_deref().map(|p| format!(" on {p}")).unwrap_or_default()
+            ),
+        )
+        .hint("verify the release upstream; if the change is expected, run `stack compile --update` and review the stack.lock diff")
+        .details(details));
+    }
+    Err(StackError::new("install_failed", format!("mise {} {failed}", args.join(" ")))
+        .details(vec![serde_json::json!({ "output": tail(&out) })]))
+}
+
+/// One download or signer mise refused against the lock.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Refusal {
+    /// `checksum`, `signer`, or `repository` (a packslip repository identity mise.lock pins).
+    pub kind: &'static str,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Checksum and signer refusals in mise's install output (mise 2026.10.3). A locked download
+/// whose bytes differ is reported, through the error chain, as
+///
+/// ```text
+/// mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks <url>: Checksum mismatch for file <path>:
+/// Expected: sha256:...
+/// Actual:   sha256:...
+/// ```
+///
+/// conda says `checksum mismatch for <url>: expected <checksum>`; packslip says `mise.lock says
+/// <locked> signed <tool>@<version>, but this release is signed by <signer>; ...`, and for a
+/// repository whose identity changed `packslip:<tool>: this release was signed by <project> as
+/// <kind> <actual>, but mise.lock pins <kind> <expected> for it`. Only refusals whose tool can be
+/// named are returned; anything else stays `install_failed`.
+pub fn refusals(text: &str) -> Vec<Refusal> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<Refusal> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let installing = line.split("Failed to install ").nth(1).and_then(|r| r.split(": ").next()).map(|n| n.trim().to_string());
+        let refusal = if line.contains("Checksum mismatch") {
+            let (mut name, mut platform, mut url) = (None, None, None);
+            if let Some((tool, rest)) = line.split("lockfile entry for ").nth(1).and_then(|r| r.split_once(" on ")) {
+                name = Some(tool.trim().to_string());
+                let (p, rest) = rest.split_once(" locks ").unwrap_or((rest.split(':').next().unwrap_or(rest), ""));
+                platform = Some(p.split_whitespace().next().unwrap_or(p).to_string());
+                url = rest.split(": ").next().map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
+            }
+            let field = |key: &str| lines[i..].iter().take(6).find_map(|l| l.trim().strip_prefix(key)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+            name.or(installing).map(|name| Refusal { kind: "checksum", name, platform, expected: field("Expected:"), actual: field("Actual:"), url })
+        } else if let Some(rest) = line.split("checksum mismatch for ").nth(1) {
+            let (url, expected) = rest.rsplit_once(": expected ").map_or((rest, None), |(u, e)| (u, Some(e.trim().to_string())));
+            installing.map(|name| Refusal { kind: "checksum", name, platform: None, expected, actual: None, url: Some(url.trim().to_string()) })
+        } else if let Some(rest) = line.split("mise.lock says ").nth(1).filter(|r| r.contains(" but this release is signed by ")) {
+            let (expected, rest) = rest.split_once(" signed ").unwrap_or((rest, ""));
+            let (name, rest) = rest.split_once(", but this release is signed by ").unwrap_or((rest, ""));
+            let actual = rest.split("; ").next().unwrap_or(rest);
+            Some(Refusal { kind: "signer", name: name.trim().to_string(), platform: None, expected: Some(expected.trim().to_string()), actual: Some(actual.trim().to_string()), url: None })
+        } else if line.contains("this release was signed by ") && line.contains(", but mise.lock pins ") {
+            let name = line.split("packslip:").nth(1).and_then(|r| r.split(": ").next()).map(|n| format!("packslip:{}", n.trim())).or(installing);
+            let actual = line.split(" as ").nth(1).and_then(|r| r.split(", but").next()).map(|a| a.trim().to_string());
+            let expected = line.split(", but mise.lock pins ").nth(1).and_then(|r| r.split(" for it").next()).map(|e| e.trim().to_string());
+            name.map(|name| Refusal { kind: "repository", name, platform: None, expected, actual, url: None })
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal.filter(|r| !r.name.is_empty()) {
+            if !out.contains(&refusal) {
+                out.push(refusal);
+            }
+        }
+    }
+    out
 }
 
 /// The environment mise would give a command: tools on PATH, env, service connection vars.
@@ -894,6 +1057,49 @@ pitchfork ERROR Daemon app-9df2/api failed to start
         assert_eq!(since_argument_in(7800, 9500, half), "1701s");
         assert_eq!(since_argument_in(5000, 9500, half), "wall 5000");
         assert!(local_datetime(1_791_404_602).is_some_and(|t| t.len() == 19));
+    }
+
+    /// `mise install --locked jq` with a tampered checksum, mise 2026.10.3 (temp paths shortened).
+    const CHECKSUM_REFUSAL: &str = "mise by @jdx \u{2013} installing 1 tool
+mise \u{2717} jq@1.7.1  467ms \u{b7} failed: lockfile entry for jq@1.7.1 on macos-arm64 locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64
+mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/d/downloads/jq/1.7.1/jq-macos-arm64:
+Expected: sha256:0000000000000000000000000000000000000000000000000000000000000000
+Actual:   sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a
+mise ERROR Version: 2026.10.3 macos-arm64 (2026-10-05)";
+
+    #[test]
+    fn checksum_refusals_are_parsed_from_real_output() {
+        let r = refusals(CHECKSUM_REFUSAL);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0], Refusal {
+            kind: "checksum",
+            name: "jq@1.7.1".into(),
+            platform: Some("macos-arm64".into()),
+            expected: Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".into()),
+            actual: Some("sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a".into()),
+            url: Some("https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64".into()),
+        });
+    }
+
+    /// Formats from mise 2026.10.3's source (`backend/conda.rs`, `backend/packslip.rs`,
+    /// `packslip_forge.rs`); not produced by a run here.
+    #[test]
+    fn conda_signer_and_repository_refusals_are_parsed_from_their_source_formats() {
+        let conda = "mise ERROR Failed to install conda:postgresql@17.6: checksum mismatch for https://conda.anaconda.org/x/postgresql.conda: expected sha256:abc";
+        let r = refusals(conda);
+        assert_eq!((r[0].kind, r[0].name.as_str(), r[0].expected.as_deref(), r[0].url.as_deref()), ("checksum", "conda:postgresql@17.6", Some("sha256:abc"), Some("https://conda.anaconda.org/x/postgresql.conda")));
+        let signer = "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says sigstore-oidc:https://github.com/jdx/fnox/.github/workflows/release.yml signed fnox@1.39.0, but this release is signed by sigstore-oidc:https://github.com/evil/fnox/.github/workflows/release.yml; remove the entry from mise.lock to accept the new signer";
+        let r = refusals(signer);
+        assert_eq!(r[0].kind, "signer");
+        assert_eq!(r[0].name, "fnox@1.39.0");
+        assert_eq!(r[0].expected.as_deref(), Some("sigstore-oidc:https://github.com/jdx/fnox/.github/workflows/release.yml"));
+        assert_eq!(r[0].actual.as_deref(), Some("sigstore-oidc:https://github.com/evil/fnox/.github/workflows/release.yml"));
+        let repo = "mise ERROR packslip:github.com/jdx/fnox: this release was signed by jdx/fnox as GitHub repository ID 999, but mise.lock pins GitHub repository ID 1078762196 for it. The name now belongs to a different repository";
+        let r = refusals(repo);
+        assert_eq!((r[0].kind, r[0].name.as_str()), ("repository", "packslip:github.com/jdx/fnox"));
+        assert_eq!((r[0].actual.as_deref(), r[0].expected.as_deref()), (Some("GitHub repository ID 999"), Some("GitHub repository ID 1078762196")));
+        assert!(refusals("mise ERROR Failed to install jq@1.7.1: network unreachable").is_empty());
+        assert!(refusals("Checksum mismatch for file /x:").is_empty(), "no tool can be named");
     }
 
     #[test]
