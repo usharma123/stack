@@ -18,7 +18,7 @@ do not share databases. Connection strings arrive in the environment (`DATABASE_
 you can name a process that lives as long as your work: a shell that exits after the command
 would end the lease at once.
 
-Use `--json` for structured output. Stack emits an object on stdout with `ok`, and errors include a stable `code`, `hint`, and `details`. `stack gc --watch --json` emits one object per pass.
+Use `--json` for structured output. Stack emits an object on stdout with `ok`, and errors include a stable `code`, `hint`, and `details`. `stack gc --watch --json` emits one object per pass. `ok` alone does not say whether your command passed: see [reading results](#reading-results).
 
 ```sh
 stack --json inspect
@@ -45,6 +45,39 @@ Configure your MCP client to launch `stack` with the argument `mcp`. The server 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep
 output collection waiting for EOF.
+
+## Reading results
+
+`stack --json` prints the same envelope that an MCP call returns as `structuredContent`. `ok`,
+and MCP's `isError` with it, says whether the Stack operation worked, not whether your command
+or services did:
+
+| Operation | Succeeded when |
+|---|---|
+| `exec`, `run` (`stack_exec`, `stack_run`) | `ok` is true and `data.exit_code` is 0 |
+| `status` (`stack_status`) | `ok` is true and `data.healthy` is true |
+| anything else | `ok` is true |
+
+- A command that ran and exited 7 gives `ok: true`, `isError: false` and `data.exit_code: 7`;
+  the CLI exits 7 too. `data.exit_code` is `null` when a signal ended the command.
+- `status` gives `ok: true` when it could check, even if a service is down: then
+  `data.healthy` is false, `data.checks` says which service and why, and the CLI exits 1.
+- `ok: false` (`isError: true`) means Stack did not do what you asked; act on `error.code` and
+  `error.hint`. A command killed at its deadline is `timed_out` (CLI exit 124), and
+  `error.details[0]` holds its `stdout`, `stderr` and `checks` so far.
+
+```python
+def succeeded(operation, envelope):
+    """operation: a CLI subcommand or MCP tool name; envelope: parsed stdout or structuredContent."""
+    if not envelope["ok"]:
+        return False  # error.code and error.hint say what to do; timed_out output is in error.details[0]
+    operation = operation.removeprefix("stack_")
+    if operation in ("exec", "run"):
+        return envelope["data"]["exit_code"] == 0
+    if operation == "status":
+        return envelope["data"]["healthy"]
+    return True
+```
 
 Use `--require <service>` or `--require-all` when a command must have verified services. See [guarantees and limits](guarantees.md) for endpoint checks, leases, and cleanup behavior.
 

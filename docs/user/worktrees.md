@@ -43,4 +43,57 @@ The same two commands fit any tool with blocking create and remove hooks. Run `s
 from a hook that can still fail the removal; a hook that only runs after deletion is too late
 for Stack to act on. Recipes for workz and GitGrove have not been verified.
 
+## Isolated runs
+
+An evaluation, a sandboxed agent or a throwaway check can run Stack without touching the
+user's installation by pointing every store at one disposable directory. Keep `HOME`, so Git
+and SSH configuration still work. Set all three Pitchfork directories: Pitchfork reads its
+config from `$HOME/.config/pitchfork` whatever `XDG_CONFIG_HOME` says, registers every project
+Stack starts there, and on macOS also keeps state under `~/.local/state`. In bash:
+
+```sh
+iso=$(mktemp -d /tmp/stack-iso.XXXXXX)   # short: the supervisor socket must fit 104 bytes on macOS
+global_receipt() {
+  for f in ~/.config/pitchfork/config.toml ~/.local/state/pitchfork/state.toml ~/.config/mise/config.toml; do
+    shasum -a 256 "$f" 2>/dev/null || echo "absent $f"
+  done
+}
+global_receipt >"$iso/global-before"
+for v in $(compgen -e); do
+  case $v in MISE_*|__MISE*|PITCHFORK_*|STACK_*) unset "$v" ;; esac
+done
+export STACK_STATE_DIR=$iso/stack/state STACK_DATA_DIR=$iso/stack/data STACK_CACHE_DIR=$iso/stack/cache
+export MISE_DATA_DIR=$iso/mise/data MISE_CACHE_DIR=$iso/mise/cache MISE_STATE_DIR=$iso/mise/state \
+  MISE_CONFIG_DIR=$iso/mise/config MISE_GLOBAL_CONFIG_FILE=$iso/mise/config/config.toml
+export PITCHFORK_CONFIG_DIR=$iso/pf/config PITCHFORK_STATE_DIR=$iso/pf/state PITCHFORK_LOGS_DIR=$iso/pf/logs
+export XDG_CONFIG_HOME=$iso/xdg/config XDG_DATA_HOME=$iso/xdg/data XDG_CACHE_HOME=$iso/xdg/cache \
+  XDG_STATE_HOME=$iso/xdg/state UV_CACHE_DIR=$iso/uv-cache
+export npm_config_cache=$iso/npm/cache npm_config_userconfig=$iso/npm/npmrc npm_config_prefix=$iso/npm/prefix
+```
+
+Then install Stack into the directory rather than globally, work, and clean up:
+
+```sh
+npm install --prefix "$iso/cli" --save-exact @ushawarma/stack@<version>
+export PATH="$iso/cli/node_modules/.bin:$PATH"
+stack setup
+cd <checkout>
+stack doctor                           # pitchfork_socket shows the socket path fits
+stack compile && stack up --ttl 30m    # ... and the work
+stack down                             # in every checkout you started
+stack exec -- pitchfork supervisor stop   # the isolated supervisor, from a compiled checkout
+stack gc
+global_receipt | diff "$iso/global-before" - && rm -rf "$iso"
+```
+
+- A `mise` already on `PATH` is used as a binary with the isolated stores. Leave it off `PATH`
+  and `stack setup` downloads the pinned release into `$STACK_DATA_DIR/bin` instead.
+- The empty npm user config drops registry credentials from `~/.npmrc`; add only what the run
+  needs.
+- On Linux, Pitchfork's default state follows `XDG_STATE_HOME`: add that real path to
+  `global_receipt` if it is set.
+- Keep the receipts and the directory of a run that changed one; it was not isolated.
+
+Verified on macOS arm64 with Stack 0.1.18 and Pitchfork 2.29.0.
+
 [All docs](../README.md)
