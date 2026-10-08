@@ -76,6 +76,10 @@ impl ScratchRoot {
     pub fn create(cache: &Path, purpose: &str) -> Result<Self> {
         let parent = cache.join(purpose);
         std::fs::create_dir_all(&parent).map_err(|e| io_error(parent.display(), e))?;
+        // mise compares its ceiling (the root's parent) with the working directory's ancestors
+        // by equality, and the working directory is resolved: through a linked cache path
+        // (`/tmp` on macOS) the ceiling would never match and mise would search above the root.
+        let parent = parent.canonicalize().map_err(|e| io_error(parent.display(), e))?;
         let dir = tempfile::Builder::new().prefix("q-").tempdir_in(&parent).map_err(|e| io_error(parent.display(), e))?;
         Ok(Self { dir })
     }
@@ -158,7 +162,7 @@ mod tests {
         let a = ScratchRoot::create(cache.path(), "lock").unwrap();
         let b = ScratchRoot::create(cache.path(), "lock").unwrap();
         assert_ne!(a.path(), b.path());
-        assert!(a.path().starts_with(cache.path().join("lock")));
+        assert!(a.path().starts_with(cache.path().canonicalize().unwrap().join("lock")));
         let written = a.write_tools(&[Pin { tool: "jq".into(), spec: ToolSpec::new("1.7.1") }]).unwrap();
         assert_eq!(written, a.path().join(".config/mise/conf.d/stack.toml"));
         let command = a.command(&["ls", "--json"]);
