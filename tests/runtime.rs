@@ -68,7 +68,12 @@ case "$1 $2" in
   'ls --json')
     # Installed releases, asked in a scratch root: where it ran and the only configuration it saw.
     { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/ls.log"
-    if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '{}'; fi ;;
+    if test "${3-}" = fnox; then
+      { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/fnox-ls.log"
+      if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
+    elif test -f "$REVIEW_FIXTURE/ls.json"; then
+      printf '{"fnox":'; cat "$REVIEW_FIXTURE/ls.json"; echo '}'
+    else echo '{}'; fi ;;
   'skills ls') echo '[]' ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
@@ -3390,7 +3395,7 @@ fn a_grant_reaches_only_its_command_and_is_redacted_from_captured_output() {
     assert_eq!(log[0], format!("--non-interactive --no-daemon env --json --describe|1|{}", app.display()));
     assert_eq!(log[1], format!("--non-interactive --no-daemon env --json --keys DEPLOY_KEY|1|{}", app.display()));
     // The release was located in a scratch root that names fnox and nothing else, now gone.
-    let ls = fs::read_to_string(fixture.dir.path().join("ls.log")).unwrap();
+    let ls = fs::read_to_string(fixture.dir.path().join("fnox-ls.log")).unwrap();
     assert!(ls.contains(&format!("dir={}", fixture.dir.path().join("cache/secrets").canonicalize().unwrap().display())), "{ls}");
     let config: String = ls.lines().filter(|l| !l.starts_with("dir=") && !l.starts_with('#')).collect::<Vec<_>>().join("\n");
     assert_eq!(config.trim(), "[tools]\nfnox = \"1.39.0\"", "{ls}");
@@ -3644,7 +3649,7 @@ fn secret_declarations_are_checked_when_the_stack_compiles() {
         let (envelope, _, _) = json_run(&fixture, &["exec", "--secret", key, "--", "true"]);
         assert_eq!(envelope["error"]["code"], "invalid_secret", "{key}: {envelope}");
     }
-    assert!(!fixture.dir.path().join("ls.log").exists());
+    assert!(!fixture.dir.path().join("fnox-ls.log").exists());
     assert!(fnox_log(&fixture).is_empty());
 }
 
