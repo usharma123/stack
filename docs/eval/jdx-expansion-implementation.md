@@ -49,7 +49,19 @@ Review findings are corrected and sent through another review round before compl
 
 ## Validation results
 
-Pending.
+### Base before implementation
+
+At `904cc6e`, on macOS arm64 with mise 2026.10.3:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked --all-targets` | Passed, 222 tests |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `node --test tests/*.test.mjs` | Passed, 41 tests; one opt-in real-mise isolation test skipped |
+
+These establish the inherited DX base. They do not validate the new jdx routes.
+
+Implementation validation is pending.
 
 ## Review results
 
