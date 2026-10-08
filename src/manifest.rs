@@ -251,17 +251,13 @@ struct Location {
 const EXCERPT_WIDTH: usize = 100;
 
 fn parse<T: serde::de::DeserializeOwned>(text: &str) -> std::result::Result<T, ParseFailure> {
-    toml::from_str(text).map_err(|e| ParseFailure {
-        message: e.message().trim_end().to_string(),
-        // A missing table or key is reported at an empty span, or one over the whole
-        // document, at its start: no place in the text to show.
-        at: e
-            .span()
-            .filter(|span| {
-                let rest = text.get(span.end..).unwrap_or_default();
-                span.start > 0 || !(span.is_empty() || rest.trim().is_empty())
-            })
-            .map(|span| locate(text, span.start)),
+    toml::from_str(text).map_err(|e| {
+        let message = e.message().trim_end().to_string();
+        // Only a key missing from the document itself has no place in the text to show; it is
+        // reported at an empty span. Every other error, syntax errors included, is located,
+        // even one spanning the whole document: a key missing from a table points at the table.
+        let whole_document = message.starts_with("missing field ") && e.span().is_some_and(|span| span.is_empty());
+        ParseFailure { at: e.span().filter(|_| !whole_document).map(|span| locate(text, span.start)), message }
     })
 }
 
@@ -351,6 +347,38 @@ mod tests {
         assert!(f.message.contains("missing field `bundle`") && f.at.is_none(), "{f:?}");
         let e = f.into_error("bundle_invalid", Path::new("/b/bundle.toml"), Some("path:../b"));
         assert_eq!(e.message, "path:../b: /b/bundle.toml: missing field `bundle`");
+    }
+
+    #[test]
+    fn errors_at_the_start_of_a_short_document_are_located_in_projects_and_bundles() {
+        for (text, message, column) in [
+            ("@", "invalid key", 1),
+            ("@\n", "invalid key", 1),
+            ("[", "invalid table header", 1),
+            ("x = 1", "unknown field `x`", 1),
+        ] {
+            for (kind, f) in [("project", failure(text)), ("bundle", parse::<BundleManifest>(text).unwrap_err())] {
+                assert!(f.message.contains(message), "{kind} {text:?}: {f:?}");
+                let at = f.at.as_ref().unwrap_or_else(|| panic!("{kind} {text:?} lost its location: {f:?}"));
+                assert_eq!((at.line, at.column), (1, column), "{kind} {text:?}");
+                assert_eq!(at.excerpt, format!("  |\n1 | {}\n  | ^", text.trim_end()), "{kind} {text:?}");
+                let path = Path::new("/p/stack.toml");
+                let e = f.into_error("manifest_invalid", path, None);
+                assert!(e.message.starts_with("/p/stack.toml:1:1: "), "{kind} {text:?}: {}", e.message);
+                assert_eq!((e.details[0]["line"].as_u64(), e.details[0]["column"].as_u64()), (Some(1), Some(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_missing_from_a_table_points_at_the_table() {
+        for text in ["[tasks.t]\n", "[[use]]\n"] {
+            let f = failure(text);
+            assert!(f.message.starts_with("missing field"), "{text:?}: {f:?}");
+            assert_eq!(f.at.map(|at| (at.line, at.column)), Some((1, 1)), "{text:?}");
+        }
+        let f = parse::<BundleManifest>("[bundle]\nversion = '1'\n").unwrap_err();
+        assert!(f.message.contains("missing field `name`") && f.at.is_some(), "{f:?}");
     }
 
     #[test]
