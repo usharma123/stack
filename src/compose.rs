@@ -74,6 +74,7 @@ impl LoadedBundle {
             if let Some(probe) = service.identity.as_mut() {
                 expand(&mut probe.command);
             }
+            service.watch.iter_mut().for_each(expand);
         }
         for bin in &manifest.paths.bin {
             let path = dir.join(bin);

@@ -68,7 +68,7 @@ impl Resolver for MiseResolver {
             .env("NO_COLOR", "1");
         let out = crate::process::capture(&mut command, RESOLVE_TIMEOUT, 16 * 1024).map_err(|e| {
             StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
-                .hint("install mise: https://mise.jdx.dev")
+                .hint(crate::setup::MISE_INSTALL_HINT)
         })?;
         let fail = |why: String| {
             StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
@@ -340,7 +340,7 @@ fn mise(root: &Path, args: &[&str]) -> Result<Output> {
         .output()
         .map_err(|e| {
             StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
-                .hint("install mise: https://mise.jdx.dev")
+                .hint(crate::setup::MISE_INSTALL_HINT)
         })
 }
 
@@ -473,17 +473,21 @@ const LOGS_LIMIT: usize = 1024 * 1024;
 /// `mise daemons logs -- <service> -n <tail> --raw --no-pager`: the supervisor's stored output
 /// for one daemon, through the same isolated configuration as every other provider call.
 /// Bounded by a deadline and an output cap; the pager and follow modes are never used.
-pub fn logs(root: &Path, service: &str, tail: usize) -> Result<crate::process::Captured> {
+/// `since` (Unix seconds) keeps only lines the supervisor stored from that second onwards.
+pub fn logs(root: &Path, service: &str, tail: usize, since: Option<u64>) -> Result<crate::process::Captured> {
     let n = tail.to_string();
     let mut command = Command::new("mise");
     configure_command(&mut command, root);
+    command.args(["daemons", "logs", "--", service, "-n", &n, "--raw", "--no-pager"]);
+    if let Some(at) = since {
+        command.args(["--since", &since_argument(at, crate::state::now())]);
+    }
     command
-        .args(["daemons", "logs", "--", service, "-n", &n, "--raw", "--no-pager"])
         .current_dir(root)
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1");
     let out = crate::process::capture(&mut command, LOGS_TIMEOUT, LOGS_LIMIT).map_err(|e| {
-        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint("install mise: https://mise.jdx.dev")
+        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
     })?;
     if out.timed_out {
         return Err(StackError::new("logs_failed", format!("mise daemons logs did not finish within {}s", LOGS_TIMEOUT.as_secs())));
@@ -497,12 +501,74 @@ pub fn logs(root: &Path, service: &str, tail: usize) -> Result<crate::process::C
     Ok(out)
 }
 
+/// Pitchfork's `--since` for the instant `at`: local wall-clock time, which it reads as an
+/// exact instant. A wall-clock time that names two instants (repeated when clocks go back, by
+/// any amount up to three hours in 15-minute steps, which covers every zone in use) or that
+/// cannot be formatted falls back to a relative age, rounded up so the start second is kept.
+fn since_argument(at: u64, now: u64) -> String {
+    since_argument_in(at, now, local_datetime)
+}
+
+fn since_argument_in(at: u64, now: u64, local_datetime: impl Fn(u64) -> Option<String>) -> String {
+    let local = local_datetime(at);
+    let ambiguous = local.is_none()
+        || (1..=12u64).map(|k| k * 900).any(|shift| {
+            local == local_datetime(at + shift) || local == at.checked_sub(shift).and_then(&local_datetime)
+        });
+    match local {
+        Some(local) if !ambiguous => local,
+        _ => format!("{}s", now.saturating_sub(at) + 1),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` in local time, the form Pitchfork's `--since` takes for an instant.
+#[cfg(unix)]
+fn local_datetime(secs: u64) -> Option<String> {
+    let t = libc::time_t::try_from(secs).ok()?;
+    // SAFETY: localtime_r writes only the provided struct.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return None;
+        }
+        tm
+    };
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    ))
+}
+
+#[cfg(not(unix))]
+fn local_datetime(_: u64) -> Option<String> {
+    None
+}
+
 pub fn start(root: &Path) -> Result<()> {
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }
 
 pub fn stop(root: &Path) -> Result<()> {
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
+}
+
+/// Start only the named daemons of this project.
+pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
+    let mut args = vec!["daemons", "start", "--"];
+    args.extend(names.iter().map(String::as_str));
+    checked(root, &args, "start_failed").map(|_| ())
+}
+
+/// Stop only the named daemons of this project.
+pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
+    let mut args = vec!["daemons", "stop", "--"];
+    args.extend(names.iter().map(String::as_str));
+    checked(root, &args, "stop_failed").map(|_| ())
 }
 
 #[cfg(test)]
@@ -516,6 +582,23 @@ mod tests {
         for bad in ["", "\n", "latest\n", "3.13.1\n3.13.2\n", "a b\n"] {
             assert_eq!(parse_resolved(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn log_cutoffs_avoid_wall_clock_times_that_name_two_instants() {
+        // A zone whose clocks go back an hour at 7200: 3600..7200 and 7200..10800 read alike.
+        let wall = |t: u64| Some(format!("wall {}", if (7200..10800).contains(&t) { t - 3600 } else { t }));
+        assert_eq!(since_argument_in(1000, 2000, wall), "wall 1000");
+        assert_eq!(since_argument_in(5000, 9000, wall), "4001s", "first pass through the repeated hour");
+        assert_eq!(since_argument_in(8000, 9000, wall), "1001s", "second pass");
+        assert_eq!(since_argument_in(20_000, 20_005, wall), "wall 20000");
+        assert_eq!(since_argument_in(5, 10, |_| None), "6s");
+        // A 30-minute rollback at 7200 (as on Lord Howe Island): both passes are ambiguous.
+        let half = |t: u64| Some(format!("wall {}", if (7200..9000).contains(&t) { t - 1800 } else { t }));
+        assert_eq!(since_argument_in(6000, 9500, half), "3501s");
+        assert_eq!(since_argument_in(7800, 9500, half), "1701s");
+        assert_eq!(since_argument_in(5000, 9500, half), "wall 5000");
+        assert!(local_datetime(1_791_404_602).is_some_and(|t| t.len() == 19));
     }
 
     #[test]

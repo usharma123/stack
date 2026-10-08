@@ -19,7 +19,7 @@ cd "$W/appA" || exit 1
 jq -se '
   length == 8 and
   (map(select(.id == 1)) | length == 1 and .[0].result.protocolVersion == "2025-06-18") and
-  (map(select(.id == 2)) | length == 1 and (.[0].result.tools | map(.name) | sort) == (["stack_inspect", "stack_compile", "stack_install", "stack_up", "stack_status", "stack_run", "stack_exec", "stack_logs", "stack_renew", "stack_down", "stack_gc", "stack_doctor"] | sort)) and
+  (map(select(.id == 2)) | length == 1 and (.[0].result.tools | map(.name) | sort) == (["stack_inspect", "stack_compile", "stack_install", "stack_up", "stack_status", "stack_run", "stack_restart", "stack_exec", "stack_logs", "stack_renew", "stack_down", "stack_gc", "stack_doctor"] | sort)) and
   (map(select(.id == 3)) | .[0].result.structuredContent.data | .exit_code == 0 and (.stdout | contains("unverified.stack.invalid"))) and
   (map(select(.id == 4)) | .[0].result | .isError and .structuredContent.error.code == "service_unavailable") and
   (map(select(.id == 5)) | .[0].result.structuredContent | .ok and all(.data.checks[]; .ready and .identity == "instance")) and
@@ -35,4 +35,4 @@ start=$(date +%s)
   echo '{"jsonrpc":"2.0","id":2,"method":"ping"}'
 } | stack mcp >"$T/mcp-timeout.out"
 (( $(date +%s) - start < 6 )) || fail 'MCP response exceeded the timeout'
-jq -se 'length == 2 and .[0].result.structuredContent.data.timed_out and .[1].result == {}' "$T/mcp-timeout.out" >/dev/null
+jq -se 'length == 2 and (.[0].result | (.isError and .structuredContent.error.code == "timed_out" and .structuredContent.error.details[0].timed_out)) and .[1].result == {}' "$T/mcp-timeout.out" >/dev/null

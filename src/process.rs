@@ -55,9 +55,18 @@ impl Tail {
 struct OwnedChild {
     child: Child,
     terminated: bool,
+    /// Set once `terminate` reaped the child.
+    status: Option<std::process::ExitStatus>,
 }
 
 impl OwnedChild {
+    fn new(child: Child) -> Self {
+        Self { child, terminated: false, status: None }
+    }
+
+    /// Kill the child's process group, then reap the child. Callers observe exit with
+    /// `exited`, which does not reap: until this `wait`, the child's PID (and so its group
+    /// ID) cannot be reused, and the group signal cannot reach an unrelated process.
     fn terminate(&mut self) {
         if self.terminated {
             return;
@@ -65,15 +74,35 @@ impl OwnedChild {
         self.terminated = true;
         #[cfg(unix)]
         {
-            // SAFETY: the child was launched into its own process group. Negative PID
-            // targets that owned group, including descendants that hold its output pipes.
+            // SAFETY: the child was launched into its own process group and is not reaped yet.
+            // Negative PID targets that owned group, including descendants that hold its pipes.
             unsafe {
                 libc::kill(-(self.child.id() as i32), libc::SIGKILL);
             }
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.status = self.child.wait().ok();
     }
+}
+
+/// Whether the child has exited, leaving it unreaped (see `OwnedChild::terminate`).
+#[cfg(unix)]
+fn exited(child: &Child) -> io::Result<bool> {
+    // SAFETY: waitid only writes the zeroed siginfo; WNOWAIT leaves the child waitable.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // With WNOHANG and nothing to report, the zeroed siginfo is left unchanged.
+    Ok(info.si_signo != 0)
 }
 
 impl Drop for OwnedChild {
@@ -157,10 +186,7 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let start = Instant::now();
-    let mut child = OwnedChild {
-        child: command.spawn()?,
-        terminated: false,
-    };
+    let mut child = OwnedChild::new(command.spawn()?);
     let mut stdout = child
         .child
         .stdout
@@ -178,21 +204,21 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
     let (mut out_open, mut err_open) = (true, true);
     // After both pipes close the command is normally exiting; reap it with a short backoff.
     let mut reap_backoff = Duration::from_micros(250);
-    let (exit_code, timed_out) = loop {
+    let timed_out = loop {
         if out_open {
             out_open = drain(&mut stdout, &mut out)?;
         }
         if err_open {
             err_open = drain(&mut stderr, &mut err)?;
         }
-        if let Some(status) = child.child.try_wait()? {
-            break (status.code(), false);
+        if exited(&child.child)? {
+            break false;
         }
         let Some(remaining) = timeout
             .checked_sub(start.elapsed())
             .filter(|r| !r.is_zero())
         else {
-            break (None, true);
+            break true;
         };
         let open: Vec<_> = [
             (out_open, stdout.as_raw_fd()),
@@ -209,6 +235,7 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
         }
     };
     child.terminate();
+    let exit_code = if timed_out { None } else { child.status.and_then(|s| s.code()) };
     // These reads never wait for EOF. A detached child cannot keep the server blocked.
     if out_open {
         drain(&mut stdout, &mut out)?;
@@ -223,6 +250,162 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
         stdout: out.text(),
         stderr: err.text(),
     })
+}
+
+/// Process group of the command `run_with_deadline` is waiting for, for its signal handler.
+#[cfg(unix)]
+static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn forward_signal(signal: libc::c_int) {
+    let group = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
+    if group > 0 {
+        // SAFETY: kill is async-signal-safe; the group is the command's own.
+        unsafe {
+            libc::kill(-group, signal);
+        }
+    }
+}
+
+/// The signals `run_with_deadline` passes on to its command.
+#[cfg(unix)]
+const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+#[cfg(unix)]
+fn os_check(rc: libc::c_int) -> io::Result<()> {
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// Set this thread's signal mask, returning the previous one.
+#[cfg(unix)]
+fn set_mask(how: libc::c_int, set: &libc::sigset_t) -> io::Result<libc::sigset_t> {
+    // SAFETY: plain pthread_sigmask call with valid pointers.
+    unsafe {
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        match libc::pthread_sigmask(how, set, &mut old) {
+            0 => Ok(old),
+            errno => Err(io::Error::from_raw_os_error(errno)),
+        }
+    }
+}
+
+/// Install the forwarding handler for each signal that is not ignored, returning the
+/// dispositions to restore. On failure, whatever was installed is restored first.
+#[cfg(unix)]
+fn install_forwarding() -> io::Result<Vec<(libc::c_int, libc::sigaction)>> {
+    let mut previous = Vec::new();
+    for signal in FORWARDED {
+        // SAFETY: plain sigaction calls; the handler only reads an atomic and calls kill.
+        let installed = unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            os_check(libc::sigaction(signal, std::ptr::null(), &mut old)).and_then(|()| {
+                if old.sa_sigaction == libc::SIG_IGN {
+                    return Ok(None);
+                }
+                let mut new: libc::sigaction = std::mem::zeroed();
+                new.sa_sigaction = forward_signal as *const () as libc::sighandler_t;
+                libc::sigemptyset(&mut new.sa_mask);
+                os_check(libc::sigaction(signal, &new, std::ptr::null_mut())).map(|()| Some(old))
+            })
+        };
+        match installed {
+            Ok(Some(old)) => previous.push((signal, old)),
+            Ok(None) => {}
+            Err(e) => {
+                restore_dispositions(&previous);
+                return Err(e);
+            }
+        }
+    }
+    Ok(previous)
+}
+
+#[cfg(unix)]
+fn restore_dispositions(previous: &[(libc::c_int, libc::sigaction)]) {
+    for (signal, old) in previous {
+        // SAFETY: restores a disposition read by install_forwarding.
+        unsafe {
+            libc::sigaction(*signal, old, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Run a command on the caller's stdout and stderr until it exits or `timeout` elapses, then
+/// kill its whole process group. The command gets its own group so descendants are stopped
+/// too; it therefore cannot read the terminal (stdin is empty). Interrupt, terminate and
+/// hangup signals stack receives meanwhile are passed on to the group, unless ignored.
+///
+/// Those signals stay blocked from before the spawn until forwarding targets the new group,
+/// and again during teardown, so none can end stack while the command would be left running;
+/// one arriving in between is delivered (and forwarded) once unblocked. The command starts
+/// with the caller's signal mask. Returns the exit code (128 + the signal for a command a
+/// signal ended) and whether the deadline passed.
+#[cfg(unix)]
+pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result<(Option<i32>, bool)> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: building a signal set in local memory.
+    let held = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in FORWARDED {
+            libc::sigaddset(&mut set, signal);
+        }
+        set
+    };
+    let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
+    let result = run_held(command, timeout, &held, caller_mask);
+    let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
+    return result;
+
+    fn run_held(
+        command: &mut Command,
+        timeout: Duration,
+        held: &libc::sigset_t,
+        caller_mask: libc::sigset_t,
+    ) -> io::Result<(Option<i32>, bool)> {
+        let previous = install_forwarding()?;
+        command.process_group(0).stdin(Stdio::null());
+        // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
+        unsafe {
+            command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => OwnedChild::new(child),
+            Err(e) => {
+                restore_dispositions(&previous);
+                return Err(e);
+            }
+        };
+        FORWARD_TO.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+        let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
+            let start = Instant::now();
+            loop {
+                if exited(&child.child)? {
+                    break Ok(false);
+                }
+                if start.elapsed() >= timeout {
+                    break Ok(true);
+                }
+                std::thread::sleep(EXIT_CHECK_INTERVAL);
+            }
+        });
+        let _ = set_mask(libc::SIG_BLOCK, held);
+        child.terminate();
+        FORWARD_TO.store(0, std::sync::atomic::Ordering::SeqCst);
+        restore_dispositions(&previous);
+        let timed_out = waited?;
+        // Like a shell: a command ended by a signal reports 128 + its number.
+        let code = child.status.and_then(|status| {
+            use std::os::unix::process::ExitStatusExt;
+            status.code().or_else(|| status.signal().map(|s| 128 + s))
+        });
+        Ok((if timed_out { None } else { code }, timed_out))
+    }
+}
+
+#[cfg(not(unix))]
+pub fn run_with_deadline(_: &mut Command, _: Duration) -> io::Result<(Option<i32>, bool)> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "command deadlines currently require Unix"))
 }
 
 #[cfg(not(unix))]
