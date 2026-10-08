@@ -671,6 +671,20 @@ mod tests {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
+    /// Whether `pid` ends within a second. A killed process finishes exiting after the signal is
+    /// sent, and one that was orphaned then stays a zombie until its new parent reaps it. Neither
+    /// runs again: on Linux `pid_alive` counts a zombie as gone; elsewhere this waits for the reap.
+    fn ends_soon(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::state::pid_alive(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     #[test]
     fn deadline_scopes_nest_and_restore_the_enclosing_deadline() {
         assert_eq!(deadline(), None);
@@ -712,8 +726,8 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         assert_eq!(out.status.signal(), Some(libc::SIGKILL));
         assert_eq!(String::from_utf8_lossy(&out.stderr), "partial\n");
-        let descendant: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-        assert!(!alive(descendant), "the deadline left {descendant} running");
+        let descendant: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert!(ends_soon(descendant), "the deadline left {descendant} running");
     }
 
     #[test]
@@ -758,7 +772,9 @@ mod tests {
     fn a_detached_command_still_running_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
-        let script = format!("echo $$ >{}; sleep 20", pid_file.display());
+        // `exec`, so the recorded PID is the whole command: dash would otherwise fork `sleep`
+        // and leave it running once the shell is killed.
+        let script = format!("echo $$ >{}; exec sleep 20", pid_file.display());
         let status = run_detached(Command::new("sh").args(["-c", &script]), Duration::from_millis(300)).unwrap();
         assert!(status.is_none());
         let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
@@ -783,14 +799,7 @@ mod tests {
         assert!(out.timed_out);
         assert!(start.elapsed() < Duration::from_secs(2));
         let pid = out.stdout.trim().parse::<u32>().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::state::pid_alive(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !crate::state::pid_alive(pid),
-            "descendant {pid} survived timeout"
-        );
+        assert!(ends_soon(pid), "descendant {pid} survived timeout");
     }
 
     #[test]
