@@ -37,6 +37,11 @@ from the cut-short step; the progress record, if present, stays last. Recording 
 launch can take up to 10s beyond the deadline, plus connection checks. Inspect `stack status`
 and run `stack down` before abandoning a failed launch. Retrying `up` lets a slow service
 continue starting; a permanently stuck service needs `down` before a fresh `up`.
+Before it asks Pitchfork's supervisor to start or stop services, a startup under a deadline
+starts the supervisor in a session of its own, so the deadline never ends the supervisor.
+When that fails (`mise x -- pitchfork supervisor start` exits non-zero, or mise cannot be
+found or run), the supervisor is not asked and the error is `start_failed`, `stop_failed`
+or `provider_unavailable`; one still running at the deadline is left to finish.
 
 `stack up` does not restart a service whose configuration is unchanged, so after editing code a
 service loaded, run `stack restart <service>`. Declare `watch = [...]` on the service and

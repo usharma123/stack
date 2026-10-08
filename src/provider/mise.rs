@@ -352,8 +352,12 @@ fn mise(root: &Path, args: &[&str]) -> Result<Output> {
 /// A request client that finds no supervisor starts one as its own child, in its own process
 /// group. Under a deadline that group is killed when time runs out, and the supervisor of every
 /// project using this state directory with it. Started here first, in a session of its own that
-/// stack never signals, it is already running when the request comes. Best effort: should this
-/// fail, the request starts the supervisor as it always did.
+/// stack never signals, it is already running when the request comes; Pitchfork reports
+/// success when one already runs. When it cannot be started here, the request must not be made:
+/// this fails with `code`, or `provider_unavailable` when mise cannot be found or run, and a
+/// startup whose deadline has passed reports that as `timed_out`. A start still running at the
+/// deadline goes on in its own session. Without a deadline nothing is killed, and the request
+/// starts the supervisor as it always did.
 ///
 /// The supervisor runs every daemon through `mise x` in its project, so each gets its own
 /// project's tools. A supervisor that `mise daemons` starts learns which mise to run from the
@@ -361,11 +365,18 @@ fn mise(root: &Path, args: &[&str]) -> Result<Output> {
 /// Without either, Pitchfork only looks in a few fixed places, and when mise is installed
 /// elsewhere it runs every project's daemons without mise, with the tools on its own PATH:
 /// the tools of whichever project started it.
-fn detach_supervisor(root: &Path) {
-    let Some(wait) = crate::process::remaining() else { return };
+fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
+    const START: &str = "mise x -- pitchfork supervisor start";
+    let Some(wait) = crate::process::remaining() else { return Ok(()) };
+    if wait.is_zero() {
+        return Err(StackError::new("timed_out", format!("the deadline passed before `{START}`")));
+    }
     // The mise every request below runs, named to a process with another working directory,
     // so only an absolute path will do.
-    let Some(mise_bin) = crate::setup::find_on_path_from(root).filter(|p| p.is_absolute()) else { return };
+    let mise_bin = crate::setup::find_on_path_from(root).filter(|p| p.is_absolute()).ok_or_else(|| {
+        StackError::new("provider_unavailable", "cannot find mise on PATH to start the service supervisor")
+            .hint(crate::setup::MISE_INSTALL_HINT)
+    })?;
     let mut command = Command::new(&mise_bin);
     configure_command(&mut command, root);
     command.args(["x", "--", "pitchfork", "supervisor", "start"])
@@ -373,7 +384,16 @@ fn detach_supervisor(root: &Path) {
         .env("PITCHFORK_MISE_BIN", &mise_bin)
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1");
-    let _ = crate::process::run_detached(&mut command, wait);
+    let status = crate::process::run_detached(&mut command, wait).map_err(|e| {
+        StackError::new("provider_unavailable", format!("cannot run {}: {e}", mise_bin.display()))
+            .hint(crate::setup::MISE_INSTALL_HINT)
+    })?;
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(StackError::new(code, format!("`{START}` failed ({status}), so the supervisor was not asked"))
+            .hint(format!("run `{START}` in the project to see why"))),
+        None => Err(StackError::new(code, format!("`{START}` was cut short by the deadline; it goes on in its own session"))),
+    }
 }
 
 fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
@@ -625,12 +645,12 @@ fn local_datetime(_: u64) -> Option<String> {
 }
 
 pub fn start(root: &Path) -> Result<()> {
-    detach_supervisor(root);
+    detach_supervisor(root, "start_failed")?;
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }
 
 pub fn stop(root: &Path) -> Result<()> {
-    detach_supervisor(root);
+    detach_supervisor(root, "stop_failed")?;
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
 }
 
@@ -638,7 +658,7 @@ pub fn stop(root: &Path) -> Result<()> {
 pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["daemons", "start", "--"];
     args.extend(names.iter().map(String::as_str));
-    detach_supervisor(root);
+    detach_supervisor(root, "start_failed")?;
     checked(root, &args, "start_failed").map(|_| ())
 }
 
@@ -646,7 +666,7 @@ pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
 pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["daemons", "stop", "--"];
     args.extend(names.iter().map(String::as_str));
-    detach_supervisor(root);
+    detach_supervisor(root, "stop_failed")?;
     checked(root, &args, "stop_failed").map(|_| ())
 }
 
@@ -657,6 +677,15 @@ mod tests {
     /// What `mise daemons start` printed for a service that failed on a bad edit, captured
     /// with NO_COLOR and CI set (DX evaluation of 0.1.18, log 130), with a shorter path.
     const FAILED_START: &str = "\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api] Traceback (most recent call last):\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api]   File \"/p/server.py\", line 2, in <module>\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api]     raise RuntimeError(\"bad edit\")\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api] RuntimeError: bad edit\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{280b} [app-9df2/api] waiting for delay (3s)...\n\rpitchfork ERROR Daemon app-9df2/api failed to start\n\u{2717} [app-9df2/api] failed (exit code 1): Daemon app-9df2/api failed with exit code 1";
+
+    #[test]
+    fn a_deadline_already_past_starts_no_supervisor_and_makes_no_request() {
+        let root = tempfile::tempdir().unwrap();
+        let _expired = crate::process::deadline_scope(Some(std::time::Instant::now()));
+        let e = start(root.path()).unwrap_err();
+        assert_eq!(e.code, "timed_out", "{e:?}");
+        assert!(e.message.contains("before `mise x -- pitchfork supervisor start`"), "{e:?}");
+    }
 
     #[test]
     fn captured_spinner_frames_leave_the_traceback_and_the_final_error() {
