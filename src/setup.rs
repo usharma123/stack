@@ -84,9 +84,48 @@ pub fn run(force: bool) -> Result<Report> {
 
 pub const MISE_INSTALL_HINT: &str = "run `stack setup` to download mise, or install it yourself: https://mise.jdx.dev";
 
+/// The mise a bare `mise` command runs: the first executable on PATH.
 fn find_on_path() -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).map(|d| d.join("mise")).find(|p| crate::hash::is_executable(p))
+    find_on_path_from(Path::new(""))
+}
+
+/// The mise a bare `mise` command run in `dir` runs. A relative PATH entry, including the
+/// empty one that means the working directory, is found under `dir`, as that command finds it.
+pub fn find_on_path_from(dir: &Path) -> Option<PathBuf> {
+    find_in(&std::env::var_os("PATH")?, dir)
+}
+
+/// The first file named `mise` in `paths` this process may run, as the OS searches them. A
+/// directory named `mise` is skipped even with its search bits set, and so is a file whose
+/// execute bits are all for someone else, as the OS skips both.
+fn find_in(paths: &std::ffi::OsStr, dir: &Path) -> Option<PathBuf> {
+    std::env::split_paths(paths)
+        .map(|d| dir.join(d).join("mise"))
+        .find(|p| p.is_file() && may_execute(p))
+}
+
+/// Whether `execve` would let this process run `path`: the kernel's own check, for this
+/// process's user and groups and any ACL, not the mode bits alone.
+#[cfg(unix)]
+fn may_execute(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: the path is NUL-terminated and only read; the id calls cannot fail.
+    unsafe {
+        // `access` checks the real ids, `execve` the effective ones. They are the same unless
+        // stack runs set-id, and plain `access` works where a container's seccomp profile
+        // refuses the `faccessat2` that `AT_EACCESS` needs on Linux.
+        if libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() {
+            libc::access(path.as_ptr(), libc::X_OK) == 0
+        } else {
+            libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn may_execute(path: &Path) -> bool {
+    crate::hash::is_executable(path)
 }
 
 fn version(mise: &Path) -> Option<String> {
@@ -155,6 +194,47 @@ mod tests {
         header.set_cksum();
         builder.append_data(&mut header, path, body).unwrap();
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_the_first_executable_file_as_the_os_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let executable = |path: PathBuf, mode: u32| {
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let searchable = std::fs::Permissions::from_mode(0o755);
+        std::fs::create_dir(dir("folder").join("mise")).unwrap();
+        std::fs::set_permissions(root.path().join("folder/mise"), searchable).unwrap();
+        executable(dir("plain").join("mise"), 0o644);
+        // Executable by others but not by its owner, this process: the OS passes it by.
+        let theirs = executable(dir("theirs").join("mise"), 0o645);
+        std::os::unix::fs::symlink(root.path().join("folder/mise"), dir("to-folder").join("mise")).unwrap();
+        let real = executable(dir("real").join("mise"), 0o755);
+        std::os::unix::fs::symlink(&real, dir("link").join("mise")).unwrap();
+        let path = |entries: &[&str]| std::env::join_paths(entries.iter().map(|e| root.path().join(e))).unwrap();
+
+        let skipped = path(&["folder", "plain", "to-folder", "real"]);
+        assert_eq!(find_in(&skipped, Path::new("")), Some(real.clone()));
+        let linked = path(&["folder", "link", "real"]);
+        assert_eq!(find_in(&linked, Path::new("")), Some(root.path().join("link/mise")));
+        assert_eq!(find_in(&path(&["folder", "plain"]), Path::new("")), None);
+        // Root may run any file with an execute bit, so for root the OS runs `theirs`.
+        // SAFETY: geteuid cannot fail.
+        let runs_theirs = unsafe { libc::geteuid() } == 0;
+        let first = if runs_theirs { theirs } else { real.clone() };
+        assert_eq!(find_in(&path(&["theirs", "real"]), Path::new("")), Some(first.clone()));
+        // Relative entries, the empty one included, are found under `dir`.
+        let relative = std::env::join_paths(["folder", "", "theirs", "real"]).unwrap();
+        assert_eq!(find_in(&relative, root.path()), Some(first));
     }
 
     #[test]

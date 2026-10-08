@@ -18,8 +18,10 @@ python3 eval/harness/pilot.py --stack target/release/stack --projects 3 --rounds
 ```
 
 - Needs `mise` on PATH and port 5432 free (or occupied: withheld endpoints must never reach it).
-- HOME and XDG directories are isolated under a short `/tmp/spl.*` directory. `fresh` starts
-  with no installed tools or downloads; `cached` reuses that HOME with new project checkouts.
+- HOME, XDG, Stack, mise and Pitchfork config and state directories are isolated under a short
+  `/tmp/spl.*` directory, and inherited `MISE_*`, `PITCHFORK_*` and Stack overrides are dropped.
+  `fresh` starts with no installed tools or downloads; `cached` reuses that HOME with new
+  project checkouts.
 - Each round runs every project concurrently. A worker starts the stack with `--owner-pid` of a
   stand-in runner process, runs the bundled task (`uv sync`, `pytest`, `mise run seed`, the
   bundled `acme` CLI), checks over the app's own `DATABASE_URL`/`REDIS_URL` which Postgres data
@@ -54,7 +56,9 @@ independent agents, not scripts, use stack concurrently.
   and (B) the project's existing setup instructions without stack. Randomize arm order per task.
 - **Tasks.** At least 12 tasks across at least 3 repositories that need Postgres and Redis
   (e.g. add a migration and endpoint, fix a failing integration test, add a cache layer). Each
-  task has a hidden acceptance test run afterwards by the harness, never by the agent.
+  task has a hidden acceptance test run afterwards by the harness, never by the agent. Agents
+  judge their own commands by `data.exit_code`, not `ok` (see
+  [reading results](user/agents.md#reading-results)).
 - **Concurrency.** 4 agents at once on one machine, each in its own fresh checkout, repeated
   over at least 3 rounds; one round per arm starts from an empty tool cache.
 - **Controlled faults.** In a fixed, pre-registered subset of runs: a foreign Postgres on 5432,
@@ -68,6 +72,9 @@ independent agents, not scripts, use stack concurrently.
   indexed session (`provider_id`, `provider.state_dir`), stop it with Pitchfork directly, then
   retry `stack gc`), a foreign listener on a checkout's
   assigned port (expect `port_conflict` and recovery through `stack compile --reassign-ports`).
+- **Isolation.** Every agent runs in the [isolated environment](user/worktrees.md#isolated-runs),
+  with `HOME` preserved, its own supervisor and the global receipts taken before and after. A
+  run that changed a receipt is invalid: keep it and report it beside the rerun.
 - **Recorded per run.** Task outcome (hidden test), wall time, agent tool calls, stack errors by
   code, every connection's reached instance (Postgres `data_directory`, Redis `dir`, logged by
   a wrapper), service processes alive after the agent finished and after `stack gc`, stack and

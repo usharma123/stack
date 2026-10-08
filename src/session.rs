@@ -27,6 +27,10 @@ use std::time::{Duration, Instant};
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `up` and `restart` may take in all, unless the caller says otherwise.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Time allowed past an expired deadline to record what a cut-short start launched.
+const RECORD_GRACE: Duration = Duration::from_secs(10);
 
 pub struct Ctx {
     pub root: PathBuf,
@@ -256,10 +260,12 @@ fn concurrently<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> R
         return items.iter().map(f).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let deadline = crate::process::deadline();
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    let _deadline = crate::process::deadline_scope(deadline);
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -583,7 +589,16 @@ fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()
     save(ctx, &launch)
 }
 
-pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
+/// Start and verify every service, all within `timeout`: GC, waiting for the project lock,
+/// compiling, installing, starting and verifying. When time runs out the current step is cut
+/// short (its subprocesses killed with their process groups) and the result is `timed_out`;
+/// ownership of anything launched stays recorded, as for any failed launch.
+pub fn up(ctx: &Ctx, lease: LeaseOptions, timeout: Duration) -> Result<UpReport> {
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
+    up_within(ctx, lease).map_err(|e| startup_timed_out(e, "up", timeout))
+}
+
+fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     if let Some(pid) = lease.owner_pid {
         owner_pid(pid.into())?;
     }
@@ -591,7 +606,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     let reaped = gc(&ctx.state)?;
     steps.ok("gc", json!({ "reaped": reaped.len() }));
 
-    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let _guard = project_lock(&ctx.state, &ctx.root).map_err(|e| steps.clone().fail("lock", e, false))?;
     let previous = load(ctx)?;
     if previous.as_ref().is_some_and(has_active_executions) {
         return Err(steps.fail(
@@ -710,7 +725,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         if let Err(start_error) = mise::start(&ctx.root) {
-            let observed = mise::daemons(&ctx.root).and_then(|statuses| record_launch_observations(ctx, &statuses));
+            let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
             }
@@ -718,8 +733,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         }
         steps.ok("start", json!(null));
 
-        checks = verify_until_ready(ctx, &report, "up_verify", |statuses| record_launch_observations(ctx, statuses))
-            .map_err(|(step, e)| steps.clone().fail(step, e, true))?;
+        checks = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, e, true))?;
         steps.ok(
             "verify",
             json!(checks
@@ -772,15 +786,69 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     })
 }
 
-/// Verify every service until all pass, or fail with `not_ready` after READY_TIMEOUT.
-/// `observe` sees each supervisor listing before it is checked. Errors name their step.
+/// Verify what a start launched, recording each supervisor listing as it is seen. Should the
+/// deadline end verification before any listing was seen, what launched is recorded anyway.
+fn verify_launch(ctx: &Ctx, report: &Report, timings: &'static str) -> std::result::Result<Vec<Check>, (&'static str, StackError)> {
+    verify_until_ready(ctx, report, timings, |statuses| record_launch_observations(ctx, statuses)).inspect_err(|_| {
+        if crate::process::expired() {
+            // Best effort: the launch record already names the provider that can stop them.
+            let _ = record_after_failed_start(ctx);
+        }
+    })
+}
+
+/// Record whatever a failed or cut-short start launched. A start the deadline ended gets a
+/// short grace period for this: losing track of a launched service is worse than overrunning.
+fn record_after_failed_start(ctx: &Ctx) -> Result<()> {
+    let _grace = crate::process::grace_scope(RECORD_GRACE);
+    mise::daemons(&ctx.root).and_then(|statuses| record_launch_observations(ctx, &statuses))
+}
+
+/// When a startup given `timeout` must end. A timeout too long to fix as a point in time is
+/// refused before any work, rather than leaving the startup unbounded.
+fn startup_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        StackError::new("usage", format!("a startup timeout of {}s is too long", timeout.as_secs()))
+            .hint("give the time startup may take, e.g. 10m or 2h")
+    })
+}
+
+/// `timed_out` for a startup whose deadline passed, else `error` unchanged. What was cut short
+/// is the `cause`; the progress record, if any, stays last as on every failure of `up`.
+fn startup_timed_out(mut error: StackError, command: &str, timeout: Duration) -> StackError {
+    if !crate::process::expired() {
+        return error;
+    }
+    let progress = error
+        .details
+        .last()
+        .is_some_and(|d| d.get("steps").is_some())
+        .then(|| error.details.pop())
+        .flatten();
+    let changed = progress.as_ref().is_some_and(|p| p["changed"] == true);
+    let mut details = vec![json!({ "cause": error })];
+    details.extend(progress);
+    StackError::new("timed_out", format!("`stack {command}` did not finish within {}s", timeout.as_secs()))
+        .hint(if changed {
+            "what it launched stays recorded: `stack status` shows it, `stack up` again keeps waiting for \
+             services still starting (give it a longer timeout if startup needs one), and `stack down` stops them"
+        } else {
+            "nothing was started; retry, with a longer timeout if this step needs it"
+        })
+        .details(details)
+}
+
+/// Verify every service until all pass, or fail with `not_ready` after READY_TIMEOUT (or
+/// earlier, at the caller's deadline). `observe` sees each supervisor listing before it is
+/// checked. Errors name their step.
 fn verify_until_ready(
     ctx: &Ctx,
     report: &Report,
     timings: &'static str,
     mut observe: impl FnMut(&[DaemonStatus]) -> Result<()>,
 ) -> std::result::Result<Vec<Check>, (&'static str, StackError)> {
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let window = Instant::now() + READY_TIMEOUT;
+    let deadline = crate::process::deadline().map_or(window, |d| d.min(window));
     let timings = Timings::new(timings);
     loop {
         let statuses = mise::daemons(&ctx.root).map_err(|e| ("verify", e))?;
@@ -790,18 +858,25 @@ fn verify_until_ready(
         if checks.iter().all(|c| c.ready) {
             return Ok(checks);
         }
-        if Instant::now() >= deadline {
-            let failed: Vec<Value> = checks
-                .iter()
-                .filter(|c| !c.ready)
-                .map(|c| json!({ "service": c.service, "reason": c.reason }))
-                .collect();
-            let err = StackError::new("not_ready", format!("{} service(s) failed verification", failed.len()))
-                .details(failed);
-            return Err(("verify", err));
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(("verify", not_ready(&checks)));
         }
-        sleep(Duration::from_millis(300));
+        sleep(Duration::from_millis(300).min(deadline - now));
+        // The caller's deadline leaves no time to look again: report what was last seen.
+        if crate::process::expired() {
+            return Err(("verify", not_ready(&checks)));
+        }
     }
+}
+
+fn not_ready(checks: &[Check]) -> StackError {
+    let failed: Vec<Value> = checks
+        .iter()
+        .filter(|c| !c.ready)
+        .map(|c| json!({ "service": c.service, "reason": c.reason }))
+        .collect();
+    StackError::new("not_ready", format!("{} service(s) failed verification", failed.len())).details(failed)
 }
 
 #[derive(Debug, Serialize)]
@@ -815,7 +890,15 @@ pub struct RestartReport {
 /// Stop and start the named services (every service when none are named) of the running,
 /// current session, then verify the whole stack again. Other services keep running. The
 /// session keeps its id: the configuration is unchanged, only processes are new.
-pub fn restart(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
+///
+/// Everything happens within `timeout`, as for [`up`]. When it passes, services not named keep
+/// running and the session is left incomplete (unverified) with what was launched recorded.
+pub fn restart(ctx: &Ctx, services: &[String], timeout: Duration) -> Result<RestartReport> {
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
+    restart_within(ctx, services).map_err(|e| startup_timed_out(e, "restart", timeout))
+}
+
+fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     let mut steps = Steps::default();
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     let mut session = load(ctx)?.ok_or_else(|| {
@@ -857,7 +940,7 @@ pub fn restart(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     if let Err(e) = mise::stop_daemons(&ctx.root, &names) {
         return Err(steps.fail("stop", e, true));
     }
-    let deadline = Instant::now() + STOP_TIMEOUT;
+    let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     loop {
         let alive: Vec<Value> = names
             .iter()
@@ -883,7 +966,7 @@ pub fn restart(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    sleep(Duration::from_secs(elapsed.as_secs() + 1) - elapsed);
+    sleep(crate::process::bounded(Duration::from_secs(elapsed.as_secs() + 1) - elapsed));
     let started_at = now_ms();
 
     // Like `up`, an incomplete launch is recorded before anything starts, and every replacement
@@ -898,15 +981,14 @@ pub fn restart(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     session.launching = true;
     save(ctx, &session).map_err(|e| steps.clone().fail("record_launch", e, true))?;
     if let Err(start_error) = mise::start_daemons(&ctx.root, &names) {
-        let observed = mise::daemons(&ctx.root).and_then(|statuses| record_launch_observations(ctx, &statuses));
+        let observed = record_after_failed_start(ctx);
         if let Err(error) = observed {
             return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
         }
         return Err(steps.fail("start", start_error, true));
     }
     steps.ok("start", json!(names));
-    let checks = verify_until_ready(ctx, &report, "restart_verify", |statuses| record_launch_observations(ctx, statuses))
-        .map_err(|(step, e)| steps.clone().fail(step, e, true))?;
+    let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, e, true))?;
     steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
 
     for check in &checks {
@@ -1161,7 +1243,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
         mise::stop(&ctx.root)?;
     }
 
-    let deadline = Instant::now() + STOP_TIMEOUT;
+    let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     let leftovers = loop {
         let alive: Vec<Value> = pids
             .iter()
@@ -1914,7 +1996,46 @@ pub struct GcEntry {
     pub error: Option<String>,
     /// Per-service outcomes for a gone project.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub services: Vec<Value>,
+    pub services: Vec<GcService>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GcService {
+    pub service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<Recovery>,
+}
+
+/// Commands a person runs to finish what GC refused to do itself. They are POSIX shell
+/// commands with every recorded value quoted, so they can be copied as they are.
+#[derive(Debug, Serialize)]
+pub struct Recovery {
+    /// Shows what runs now: under the recorded supervisor id, or as the recorded pid.
+    pub inspect: String,
+    /// Offered only while the supervisor still reports the recorded pid and port. Run it only
+    /// after `inspect` shows the same pid: nothing makes the check and the stop atomic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_port: Option<u16>,
+}
+
+/// Why a gone project's service keeps its record, and what a person can do about it.
+struct Unconfirmed {
+    why: String,
+    recovery: Option<Recovery>,
+}
+
+impl From<String> for Unconfirmed {
+    fn from(why: String) -> Self {
+        Self { why, recovery: None }
+    }
 }
 
 /// Reclaim sessions whose lease expired or whose project directory is gone.
@@ -1989,11 +2110,12 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
+        let service = name.clone();
         match reconcile_gone(session.provider.as_ref(), record, session.launching) {
-            Ok(outcome) => services.push(json!({ "service": name, "outcome": outcome })),
-            Err(why) => {
-                services.push(json!({ "service": name, "error": why }));
+            Ok(outcome) => services.push(GcService { service, outcome: Some(outcome), error: None, recovery: None }),
+            Err(Unconfirmed { why, recovery }) => {
                 problems.push(format!("{name}: {why}"));
+                services.push(GcService { service, outcome: None, error: Some(why), recovery });
             }
         }
     }
@@ -2011,19 +2133,31 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
     }
 }
 
-fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, launching: bool) -> std::result::Result<String, String> {
+fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, launching: bool) -> std::result::Result<String, Unconfirmed> {
     let alive = record.pid.is_some_and(pid_alive);
     let listening = record.port != 0 && accepting(record.port);
     let (Some(provider), Some(id)) = (provider, record.provider_id.as_deref()) else {
         return Err(match record.pid {
-            Some(pid) if alive => format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
-            _ => "no supervisor identity was recorded; terminal state cannot be confirmed; record retained".into(),
+            Some(pid) if alive => Unconfirmed {
+                why: format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
+                recovery: Some(process_recovery(pid, record)),
+            },
+            _ => String::from("no supervisor identity was recorded; terminal state cannot be confirmed; record retained").into(),
         });
+    };
+    let supervisor = |stop: bool| Recovery {
+        inspect: pitchfork_command(provider, "status", id),
+        stop: stop.then(|| pitchfork_command(provider, "stop", id)),
+        recorded_pid: record.pid,
+        recorded_port: (record.port != 0).then_some(record.port),
     };
     match mise::supervised(&provider.pitchfork, &provider.state_dir, id)? {
         mise::Supervised::NotFound => match record.pid {
-            _ if launching => Err("startup was interrupted or failed; absence of a daemon now does not prove that startup cannot still register it; record retained".into()),
-            Some(pid) if alive => Err(format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled")),
+            _ if launching => Err(String::from("startup was interrupted or failed; absence of a daemon now does not prove that startup cannot still register it; record retained").into()),
+            Some(pid) if alive => Err(Unconfirmed {
+                why: format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled"),
+                recovery: Some(process_recovery(pid, record)),
+            }),
             _ if listening => Ok(format!("port {} is held by a process the supervisor does not track; left alone", record.port)),
             _ => Ok("not running".into()),
         },
@@ -2031,24 +2165,83 @@ fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, lau
             if status == "stopped" && !alive && !pid.is_some_and(pid_alive) && !launching {
                 return Ok("not running (supervisor confirms stopped)".into());
             }
+            // Whatever runs under the id now may not be this generation: offer only `inspect`.
+            let unconfirmed = |why: String| Err(Unconfirmed { why, recovery: Some(supervisor(false)) });
             if status != "running" || !pid.is_some_and(pid_alive) {
-                return Err(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
+                return unconfirmed(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
             }
             let Some(recorded) = record.pid else {
-                return Err(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
+                return unconfirmed(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
             };
             if pid != Some(recorded) {
-                return Err(format!(
+                return unconfirmed(format!(
                     "{id} now runs pid {}, not the recorded pid {recorded} (restarted, or the path was reused); not signalled",
                     pid.unwrap_or(0)
                 ));
             }
             if port != Some(record.port) {
-                return Err(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
+                return unconfirmed(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
             }
-            Err(format!("{id} matches pid {recorded}, but Pitchfork cannot atomically validate and stop that generation; not signalled. Stop the service explicitly and retry GC"))
+            Err(Unconfirmed {
+                why: format!(
+                    "{id} matches pid {recorded}, but Pitchfork cannot atomically validate and stop that generation; not signalled. \
+                     Inspect it, stop it explicitly only if it is still pid {recorded}, and retry GC"
+                ),
+                recovery: Some(supervisor(true)),
+            })
         }
     }
+}
+
+/// `PITCHFORK_STATE_DIR=<dir> <pitchfork> <action> -- <id>`: the recorded supervisor, reached
+/// the way GC reached it, without the deleted project's configuration.
+fn pitchfork_command(provider: &ProviderRecord, action: &str, id: &str) -> String {
+    format!(
+        "PITCHFORK_STATE_DIR={} {} {action} -- {}",
+        shell_quote(&provider.state_dir.to_string_lossy()),
+        shell_quote(&provider.pitchfork.to_string_lossy()),
+        shell_quote(id)
+    )
+}
+
+/// Without a supervisor that vouches for the pid, a person can only look at it.
+fn process_recovery(pid: u32, record: &ServiceRecord) -> Recovery {
+    Recovery {
+        inspect: format!("ps -o pid,lstart,command -p {pid}"),
+        stop: None,
+        recorded_pid: Some(pid),
+        recorded_port: (record.port != 0).then_some(record.port),
+    }
+}
+
+/// One POSIX shell word for `value`. Words that cannot be misread are left bare for legibility.
+fn shell_quote(value: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || "_-./,:@+".contains(c);
+    if !value.is_empty() && value.chars().all(bare) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// What a person runs to finish the cleanup GC refused, one service per paragraph.
+fn recovery_steps(entries: &[GcEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|e| e.services.iter())
+        .filter_map(|s| {
+            let recovery = s.recovery.as_ref()?;
+            let recorded = match (recovery.recorded_pid, recovery.recorded_port) {
+                (Some(pid), Some(port)) => format!(" (recorded pid {pid}, port {port})"),
+                (Some(pid), None) => format!(" (recorded pid {pid})"),
+                _ => String::new(),
+            };
+            let mut step = format!("  {}{recorded}:\n    {}", s.service, recovery.inspect);
+            if let Some(stop) = &recovery.stop {
+                step.push_str(&format!("\n    {stop}"));
+            }
+            Some(step)
+        })
+        .collect()
 }
 
 /// Like [`gc`], but fails when any session it tried to reclaim is still running or could not
@@ -2063,8 +2256,21 @@ pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
         "gc_incomplete",
         format!("{failed} session(s) could not be confirmed stopped"),
     )
-    .hint("retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed")
+    .hint(gc_hint(&entries))
     .details(entries.iter().map(|e| serde_json::to_value(e).expect("gc entry serializes")).collect()))
+}
+
+fn gc_hint(entries: &[GcEntry]) -> String {
+    let steps = recovery_steps(entries);
+    if steps.is_empty() {
+        return "retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed".into();
+    }
+    format!(
+        "services of a deleted or replaced checkout are never stopped by name. For each service below, run \
+         the inspect command; run the stop command, where offered, only if inspect shows the recorded pid. \
+         Then retry `stack gc`. Records are kept until cleanup is confirmed\n{}",
+        steps.join("\n")
+    )
 }
 
 fn load(ctx: &Ctx) -> Result<Option<Session>> {
@@ -2345,6 +2551,47 @@ fn lock_digest(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_startup_reports_timed_out_with_the_cut_short_step_and_its_progress() {
+        let progress = json!({ "steps": [{ "step": "start", "status": "ok" }, { "step": "verify", "status": "failed", "code": "not_ready" }], "retry_safe": true, "changed": true });
+        let cut_short = || {
+            StackError::new("not_ready", "1 service(s) failed verification")
+                .details(vec![json!({ "service": "web", "reason": "port 1 is not accepting connections" }), progress.clone()])
+        };
+        let _deadline = crate::process::deadline_scope(Some(Instant::now()));
+        let e = startup_timed_out(cut_short(), "up", Duration::from_secs(5));
+        assert_eq!(e.code, "timed_out");
+        assert_eq!(e.message, "`stack up` did not finish within 5s");
+        assert!(e.hint.as_deref().unwrap().contains("`stack down` stops them"), "{e}");
+        assert_eq!(e.details.len(), 2);
+        assert_eq!(e.details[0]["cause"]["code"], "not_ready");
+        assert_eq!(e.details[0]["cause"]["details"], json!([{ "service": "web", "reason": "port 1 is not accepting connections" }]));
+        assert_eq!(e.details[1], progress);
+
+        let busy = startup_timed_out(StackError::new("lock_busy", "held"), "restart", Duration::from_secs(1));
+        assert_eq!(busy.code, "timed_out");
+        assert!(busy.hint.as_deref().unwrap().starts_with("nothing was started"), "{busy}");
+        assert_eq!(busy.details, vec![json!({ "cause": { "code": "lock_busy", "message": "held" } })]);
+    }
+
+    #[test]
+    fn a_startup_timeout_too_long_to_track_is_refused_not_lifted() {
+        let ten_minutes = startup_deadline(DEFAULT_STARTUP_TIMEOUT).unwrap();
+        assert!(ten_minutes > Instant::now() + Duration::from_secs(590));
+        for timeout in [Duration::from_secs(u64::MAX), Duration::MAX] {
+            let e = startup_deadline(timeout).unwrap_err();
+            assert_eq!(e.code, "usage", "{e}");
+            assert_eq!(e.message, format!("a startup timeout of {}s is too long", timeout.as_secs()));
+        }
+    }
+
+    #[test]
+    fn a_failure_before_the_deadline_is_reported_as_itself() {
+        let _deadline = crate::process::deadline_scope(Some(Instant::now() + Duration::from_secs(60)));
+        let e = startup_timed_out(StackError::new("start_failed", "no"), "up", Duration::from_secs(60));
+        assert_eq!((e.code, e.message.as_str()), ("start_failed", "no"));
+    }
 
     const PG: Option<&str> = Some("postgres");
 
@@ -2777,5 +3024,49 @@ mod tests {
         );
         let err = run_probe(&env, "redis-cli", &[]).unwrap_err();
         assert!(err.contains("printed more than"), "{err}");
+    }
+
+    /// Values a recorded path or id could hold, including every character a shell treats
+    /// specially somewhere, and the empty string.
+    const AWKWARD: &[&str] = &[
+        "plain/path-1.2_x",
+        "",
+        "two words",
+        "it's",
+        "''",
+        "\"double\"",
+        "$HOME ${HOME} $(id) `id`",
+        "a\\b\\",
+        "line\nbreak\ttab",
+        "*?[a-z]{1,2}",
+        ";|&<>()!#%^",
+        "~root",
+        "=x",
+        "-n",
+        "ünïcødé ✓",
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quoted_words_reach_a_command_unchanged() {
+        for shell in ["sh", "bash", "zsh"] {
+            if which_in(std::env::var("PATH").ok().as_deref(), shell).is_none() {
+                continue;
+            }
+            for value in AWKWARD {
+                let script = format!("printf '%s' {}", shell_quote(value));
+                let out = Command::new(shell).args(["-c", &script]).output().unwrap();
+                assert_eq!(String::from_utf8_lossy(&out.stdout), *value, "{shell}: {script}");
+            }
+        }
+    }
+
+    #[test]
+    fn pitchfork_commands_name_the_recorded_supervisor_and_id() {
+        let provider = ProviderRecord { pitchfork: "/opt/pf/bin/pitchfork".into(), state_dir: "/tmp/pf state".into() };
+        assert_eq!(
+            pitchfork_command(&provider, "status", "app-0123/web"),
+            "PITCHFORK_STATE_DIR='/tmp/pf state' /opt/pf/bin/pitchfork status -- app-0123/web"
+        );
     }
 }

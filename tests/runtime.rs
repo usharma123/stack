@@ -45,6 +45,17 @@ impl Fixture {
             &mise,
             r#"#!/bin/sh
 echo "$*" >>"$REVIEW_FIXTURE/mise.log"
+# Which file ran, however PATH named it: a relative entry is found from the working directory.
+case $0 in */*) self=${0%/*} ;; *) self=. ;; esac
+echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
+# A supervisor stand-in that runs until killed, started only when none runs. `$1` records who
+# started it: `mise x` in stack's own session, or a request client in its killable group.
+supervise() {
+  if test -f "$REVIEW_FIXTURE/supervisor-process" && ! kill -0 "$(cut -d' ' -f1 "$REVIEW_FIXTURE/supervisor-pid" 2>/dev/null)" 2>/dev/null; then
+    sleep 60 </dev/null >/dev/null 2>&1 &
+    echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
+  fi
+}
 case "$1 $2" in
   'latest '*)
     if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
@@ -54,6 +65,10 @@ case "$1 $2" in
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
   'env --json')
     if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
+    # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
+    if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
+      touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
+    fi
     cat "$REVIEW_FIXTURE/env.json" ;;
   'daemons --json')
     if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
@@ -68,6 +83,7 @@ case "$1 $2" in
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
   'daemons start')
+    supervise request
     # A request client that would launch a service later, after the request gave up. Like a
     # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
     if test -f "$REVIEW_FIXTURE/late-client"; then
@@ -84,11 +100,18 @@ case "$1 $2" in
       cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
       touch "$REVIEW_FIXTURE/started"
     fi
-    if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
+    if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi ;;
   'run --skip-deps')
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
     if test "$task" = fail; then exit 3; fi ;;
+  'x --')
+    # The supervisor stack starts on its own: which mise it is told to run daemons with.
+    echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log"
+    # A start that hangs for `x-hang` seconds (its PID recorded to end it) or fails, as asked.
+    if test -f "$REVIEW_FIXTURE/x-hang"; then echo $$ >"$REVIEW_FIXTURE/x-hang-pid"; exec sleep "$(cat "$REVIEW_FIXTURE/x-hang")"; fi
+    if test -f "$REVIEW_FIXTURE/x-fail"; then echo 'cannot start the supervisor' >&2; exit 1; fi
+    supervise detached ;;
   'daemons logs')
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
@@ -1396,6 +1419,35 @@ fn a_failed_start_keeps_ownership_even_after_the_service_is_removed() {
     assert!(fixture.session_paths().iter().all(|p| p.exists()));
 }
 
+#[test]
+fn a_failed_start_reports_the_services_error_without_the_supervisors_animation() {
+    let fixture = Fixture::with_bundle(WEB);
+    let frame = |n: u32| format!("{} [{WEB_ID}] waiting for delay (3s)...\n\r", char::from_u32(0x280b + n).unwrap());
+    let said = |line: &str| format!("\u{2022} [{WEB_ID}] {line}\n");
+    let output: String = [
+        frame(0),
+        said("Traceback (most recent call last):"),
+        frame(1),
+        said("  File \"/p/server.py\", line 2, in <module>"),
+        frame(2),
+        said("RuntimeError: bad edit"),
+        frame(3),
+        format!("\u{1b}[31mpitchfork ERROR\u{1b}[0m Daemon {WEB_ID} failed to start\n"),
+    ]
+    .concat();
+    fs::write(fixture.dir.path().join("fail-start"), output).unwrap();
+    let out = fixture.command(&["up", "--json"]).env("NO_COLOR", "1").env("CI", "1").output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "start_failed", "{result}");
+    assert_eq!(
+        result["error"]["details"][0]["output"],
+        format!(
+            "\u{2022} [{WEB_ID}] Traceback (most recent call last):\n\u{2022} [{WEB_ID}]   File \"/p/server.py\", line 2, in <module>\n\u{2022} [{WEB_ID}] RuntimeError: bad edit\npitchfork ERROR Daemon {WEB_ID} failed to start\nstart failed"
+        ),
+        "{result}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn non_unicode_arguments_never_crash_usage_errors() {
@@ -1783,6 +1835,91 @@ fn deleted_projects_are_retained_until_the_supervisor_confirms_terminal_cleanup(
     assert_eq!(fixture.gc(&[]).1["data"], json!([]));
 }
 
+/// The recorded supervisor, moved where every path segment needs shell quoting.
+fn awkward_provider(fixture: &Fixture) -> (String, String) {
+    let weird = fixture.dir.path().join("we ird 'q' \"dq\" $HOME `id` $(id) ;|&*?\\ ü");
+    fs::create_dir(&weird).unwrap();
+    let pitchfork = weird.join("pitch fork");
+    fs::copy(fixture.dir.path().join("bin/pitchfork"), &pitchfork).unwrap();
+    let state_dir = weird.join("state $(touch pwned)");
+    let index = fs::read_dir(fixture.dir.path().join("state/sessions")).unwrap().next().unwrap().unwrap().path();
+    let mut session: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+    session["provider"] = json!({ "pitchfork": pitchfork, "state_dir": state_dir });
+    fs::write(&index, session.to_string()).unwrap();
+    (pitchfork.to_str().unwrap().into(), state_dir.to_str().unwrap().into())
+}
+
+#[test]
+fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    let (pitchfork, state_dir) = awkward_provider(&fixture);
+    fixture.supervisor_tracks(running.service.0, running.port);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    let service = &result["error"]["details"][0]["services"][0];
+    let recovery = &service["recovery"];
+    assert_eq!(recovery["recorded_pid"], running.service.0, "{result}");
+    assert_eq!(recovery["recorded_port"], running.port, "{result}");
+    let (inspect, stop) = (recovery["inspect"].as_str().unwrap(), recovery["stop"].as_str().unwrap());
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains(inspect) && hint.contains(stop), "{hint}");
+    assert!(running.service.alive(), "GC must not stop by daemon name");
+
+    let shell = |command: &str| {
+        let out = Command::new("sh").args(["-c", command]).env("REVIEW_FIXTURE", fixture.dir.path()).output().unwrap();
+        assert!(out.status.success(), "{command}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(shell(inspect).contains(&format!("\"pid\":{}", running.service.0)));
+    assert!(running.service.alive(), "inspect stopped the service");
+    shell(stop);
+    let log = fixture.pitchfork_log();
+    for action in ["status", "stop"] {
+        assert!(log.lines().any(|l| l == format!("{state_dir} {action} -- {WEB_ID}")), "{action}: {log}");
+    }
+    assert!(!fixture.dir.path().join("pwned").exists() && !Path::new("pwned").exists(), "a recorded path was executed");
+    assert!(Path::new(&pitchfork).exists());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running.service.alive() {
+        assert!(Instant::now() < deadline, "stop did not reach the service");
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "stopped" }).to_string()).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    assert_eq!(fixture.index_files(), 0);
+}
+
+#[test]
+fn every_gc_mode_shows_the_recovery_commands() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    fixture.supervisor_tracks(running.service.0, running.port);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    let recovery = &result["error"]["details"][0]["services"][0]["recovery"];
+    let commands = [recovery["inspect"].as_str().unwrap(), recovery["stop"].as_str().unwrap()];
+    for args in [&["gc"][..], &["gc", "--watch", "--max-passes", "1"], &["gc", "--watch", "--max-passes", "1", "--json"]] {
+        let out = fixture.command_at(fixture.dir.path(), args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        // People read stderr; with --json, each pass is one object on stdout.
+        let shown = match args.contains(&"--json") {
+            true => serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["hint"].as_str().unwrap().to_string(),
+            false => String::from_utf8_lossy(&out.stderr).into_owned(),
+        };
+        for command in commands {
+            assert!(shown.contains(command), "{args:?} omits {command}:\n{shown}");
+        }
+    }
+    assert!(running.service.alive(), "GC must not stop by daemon name");
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+}
+
 #[test]
 fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
@@ -1813,6 +1950,13 @@ fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
         assert!(running.service.alive() && other.alive(), "{case}: a process was signalled");
         assert_eq!(fixture.index_files(), 1, "{case}: ownership record dropped");
         assert!(!fixture.pitchfork_log().contains(" stop "), "{case}: {}", fixture.pitchfork_log());
+        let service = &result["error"]["details"][0]["services"][0];
+        // Only the recorded generation, still reported as such, may be offered for a manual stop.
+        let matches = case == "replacement after status";
+        assert_eq!(service["recovery"].get("stop").is_some(), matches, "{case}: {result}");
+        if case != "query fails" {
+            assert!(service["recovery"]["inspect"].is_string(), "{case}: {result}");
+        }
     }
 }
 
@@ -2088,6 +2232,280 @@ fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure(
     let result = json_result(&fixture.ok(&["up", "--json"]));
     assert_eq!(result["data"]["checks"][0]["ready"], true, "{result}");
     assert_eq!(result["data"]["checks"][0]["port"], moved);
+    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+}
+
+#[test]
+fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
+    // Pitchfork finds mise for `mise x` only in a few fixed places, unless told. A supervisor
+    // that cannot find it runs every project's daemons with the tools of the project that
+    // started it, so another project's service gets another release.
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let log = fs::read_to_string(fixture.dir.path().join("supervisor-start.log")).unwrap();
+    let mise = fixture.dir.path().join("bin/mise");
+    let expected = format!("x -- pitchfork supervisor start|{}", mise.display());
+    assert!(!log.is_empty() && log.lines().all(|line| line == expected), "expected `{expected}`:\n{log}");
+    fixture.ok(&["down", "--json"]);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_absolutely() {
+    supervisor_outlives_a_timed_out_start(None, "bin/mise", None);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_relatively() {
+    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", None);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_mise_is_in_the_project() {
+    // An empty PATH entry means the working directory.
+    supervisor_outlives_a_timed_out_start(Some(""), "app/mise", None);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_directory_named_mise() {
+    // The OS skips a directory named `mise` on PATH, searchable or not, for the file after it.
+    supervisor_outlives_a_timed_out_start(None, "bin/mise", Some(Decoy::Directory));
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_directory_named_mise() {
+    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", Some(Decoy::Directory));
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_mise_only_others_may_run() {
+    // The OS skips a file this user may not run for the file after it, whatever others may.
+    supervisor_outlives_a_timed_out_start(None, "bin/mise", Some(Decoy::OthersOnly));
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_mise_only_others_may_run() {
+    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", Some(Decoy::OthersOnly));
+}
+
+/// What comes before the mise to find on PATH, named `mise` in an entry of the same kind.
+enum Decoy {
+    /// A searchable directory.
+    Directory,
+    /// A file, mode 0645: executable by others, but not by its owner, the user running stack.
+    OthersOnly,
+}
+
+/// The wrong mise: one stack must never run. It records that it ran.
+const WRONG_MISE: &str = "#!/bin/sh\necho \"$0 $*\" >>\"$REVIEW_FIXTURE/wrong-mise.log\"\nexit 1\n";
+
+fn running_as_root() -> bool {
+    // SAFETY: geteuid cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `stack -C app up --timeout 2s` from another directory, with mise on PATH as `entry` names it
+/// (`None`: the fixture's absolute `bin`) and found at `mise_at`. The directory stack runs in
+/// has its own `bin/mise` and `mise`, which a relative entry must not find: the provider runs
+/// mise in the project. The request is cut short; the supervisor stack started before it is
+/// in a session of its own, so it survives, and the request never starts one in its group.
+/// A `decoy` is in an entry of the same kind before it (`decoy/mise`, under the project when
+/// relative).
+fn supervisor_outlives_a_timed_out_start(entry: Option<&str>, mise_at: &str, decoy: Option<Decoy>) {
+    if matches!(decoy, Some(Decoy::OthersOnly)) && running_as_root() {
+        // Root may run a file any execute bit allows, and the OS runs the decoy for it too.
+        eprintln!("skipped: needs a user other than root");
+        return;
+    }
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let mise = dir.join(mise_at);
+    if !mise.exists() {
+        fs::create_dir_all(mise.parent().unwrap()).unwrap();
+        fs::copy(dir.join("bin/mise"), &mise).unwrap();
+    }
+    let caller = dir.join("caller");
+    fs::create_dir_all(caller.join("bin")).unwrap();
+    for name in ["bin/mise", "mise"] {
+        fs::write(caller.join(name), WRONG_MISE).unwrap();
+        fs::set_permissions(caller.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The rest of PATH, without any other mise.
+    let rest = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|d| d.is_absolute() && !d.join("mise").exists())
+        .collect::<Vec<_>>();
+    let first = entry.map_or_else(|| dir.join("bin"), std::path::PathBuf::from);
+    let decoy = decoy.map(|kind| {
+        let entry = if entry.is_some() { std::path::PathBuf::from("decoy") } else { dir.join("decoy") };
+        // An absolute entry replaces the project path it is joined to.
+        let decoy = dir.join("app").join(&entry).join("mise");
+        match kind {
+            Decoy::Directory => {
+                fs::create_dir_all(&decoy).unwrap();
+                fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Decoy::OthersOnly => {
+                fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+                fs::write(&decoy, WRONG_MISE).unwrap();
+                fs::set_permissions(&decoy, fs::Permissions::from_mode(0o645)).unwrap();
+            }
+        }
+        entry
+    });
+    let path = std::env::join_paths(decoy.into_iter().chain([first]).chain(rest)).unwrap();
+    let run = |args: &[&str]| fixture.command(args).current_dir(&caller).env("PATH", &path).output().unwrap();
+    fs::write(dir.join("supervisor-process"), "").unwrap();
+    fs::write(dir.join("slow-start"), "30").unwrap();
+    fs::remove_file(dir.join("mise-self.log")).unwrap();
+
+    let out = run(&["up", "--timeout", "2s", "--json"]);
+    assert_eq!(out.status.code(), Some(124), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(json_result(&out)["error"]["details"][0]["cause"]["code"], "start_failed");
+    let recorded = fs::read_to_string(dir.join("supervisor-pid")).expect("no supervisor started");
+    let (pid, by) = recorded.trim().split_once(' ').unwrap();
+    let supervisor = Detached(pid.parse().unwrap());
+    assert_eq!(by, "detached", "the request started the supervisor in the group its deadline kills");
+    assert!(supervisor.alive(), "the supervisor ended with the timed-out request");
+    // The supervisor was started with, and told to run daemons with, the mise the request ran.
+    let expected = mise.canonicalize().unwrap();
+    let starts = fs::read_to_string(dir.join("supervisor-start.log")).unwrap();
+    let told = starts.trim().strip_prefix("x -- pitchfork supervisor start|").unwrap();
+    assert_eq!(Path::new(told).canonicalize().unwrap(), expected, "{starts}");
+    let ran = fs::read_to_string(dir.join("mise-self.log")).unwrap();
+    for call in ["x --", "daemons start"] {
+        assert!(ran.lines().any(|l| l.ends_with(call)), "no `mise {call}`:\n{ran}");
+    }
+    assert!(ran.lines().all(|l| Path::new(l.rsplitn(3, ' ').last().unwrap()) == expected), "{ran}");
+    assert!(!dir.join("wrong-mise.log").exists(), "{}", fs::read_to_string(dir.join("wrong-mise.log")).unwrap());
+
+    // Later commands see the launch still recorded, stop it, and leave the supervisor running.
+    fs::remove_file(dir.join("slow-start")).unwrap();
+    let status = json_result(&run(&["status", "--json"]));
+    assert_eq!(status["data"]["session"]["launching"], true, "{status}");
+    let down = run(&["down", "--json"]);
+    assert_eq!(json_result(&down)["data"]["confirmed"], true, "{}", String::from_utf8_lossy(&down.stdout));
+    assert!(supervisor.alive());
+    assert_eq!(fs::read_to_string(dir.join("supervisor-pid")).unwrap(), recorded);
+    assert!(!dir.join("wrong-mise.log").exists());
+}
+
+/// The `mise` calls the fixture has seen since `from` lines of its log.
+fn mise_calls(fixture: &Fixture, from: usize) -> Vec<String> {
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap_or_default();
+    log.lines().skip(from).map(str::to_string).collect()
+}
+
+fn no_supervisor_request(calls: &[String]) {
+    let requests: Vec<_> = calls.iter().filter(|c| c.starts_with("daemons start") || c.starts_with("daemons stop")).collect();
+    assert!(requests.is_empty(), "a request was made, whose client could start the supervisor in a killable group: {requests:?}");
+}
+
+#[test]
+fn a_supervisor_stack_cannot_start_stops_up_before_any_request_and_a_retry_succeeds() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fs::write(dir.join("supervisor-process"), "").unwrap();
+    fs::write(dir.join("x-fail"), "").unwrap();
+    let from = mise_calls(&fixture, 0).len();
+
+    let out = fixture.command(&["up", "--timeout", "30s", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert!(!out.status.success() && out.status.code() != Some(124), "{result}");
+    let error = &result["error"];
+    assert_eq!(error["code"], "start_failed", "{result}");
+    assert!(error["message"].as_str().unwrap().contains("`mise x -- pitchfork supervisor start` failed"), "{result}");
+    assert!(error["hint"].as_str().unwrap().contains("in the project to see why"), "{result}");
+    let calls = mise_calls(&fixture, from);
+    assert!(calls.iter().any(|c| c.starts_with("x -- pitchfork supervisor start")), "{calls:?}");
+    no_supervisor_request(&calls);
+    assert!(!dir.join("supervisor-pid").exists(), "a supervisor was started");
+
+    // Without a deadline `down` is unchanged, and once the supervisor can start, `up` works.
+    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+    fs::remove_file(dir.join("x-fail")).unwrap();
+    fixture.ok(&["up", "--timeout", "30s", "--json"]);
+    let recorded = fs::read_to_string(dir.join("supervisor-pid")).expect("no supervisor started");
+    let (pid, by) = recorded.trim().split_once(' ').unwrap();
+    let supervisor = Detached(pid.parse().unwrap());
+    assert_eq!(by, "detached");
+    assert!(supervisor.alive());
+    fixture.ok(&["down", "--json"]);
+}
+
+#[test]
+fn a_supervisor_stack_cannot_start_stops_restart_before_it_stops_anything() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let service = fs::read_to_string(dir.join("pf-tracked-pid")).unwrap().trim().parse::<u32>().unwrap();
+    fs::write(dir.join("x-fail"), "").unwrap();
+    let from = mise_calls(&fixture, 0).len();
+
+    for args in [&["restart", "--timeout", "30s", "--json"][..], &["restart", "web", "--timeout", "30s", "--json"]] {
+        let out = fixture.command(args).output().unwrap();
+        let result = json_result(&out);
+        assert!(!out.status.success() && out.status.code() != Some(124), "{result}");
+        assert_eq!(result["error"]["code"], "stop_failed", "{result}");
+        assert!(pid_alive(service), "the service was stopped");
+    }
+    no_supervisor_request(&mise_calls(&fixture, from));
+    fs::remove_file(dir.join("x-fail")).unwrap();
+    fixture.ok(&["restart", "web", "--json"]);
+    assert!(!pid_alive(service), "the old service survived the restart");
+    fixture.ok(&["down", "--json"]);
+}
+
+#[test]
+fn a_supervisor_stack_cannot_run_stops_up_before_any_request() {
+    // A mise first on PATH that names a missing interpreter: the OS skips it for a bare
+    // `mise`, but run by path it cannot be started at all.
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    fs::create_dir(dir.join("broken")).unwrap();
+    fs::write(dir.join("broken/mise"), "#!/nonexistent/interpreter\n").unwrap();
+    fs::set_permissions(dir.join("broken/mise"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(dir.join("supervisor-process"), "").unwrap();
+    let path = format!("{}:{}:{}", dir.join("broken").display(), dir.join("bin").display(), std::env::var("PATH").unwrap());
+    let from = mise_calls(&fixture, 0).len();
+
+    let out = fixture.command(&["up", "--timeout", "30s", "--json"]).env("PATH", path).output().unwrap();
+    let result = json_result(&out);
+    assert!(!out.status.success() && out.status.code() != Some(124), "{result}");
+    assert_eq!(result["error"]["code"], "provider_unavailable", "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("broken/mise"), "{result}");
+    no_supervisor_request(&mise_calls(&fixture, from));
+    assert!(!dir.join("supervisor-pid").exists(), "a supervisor was started");
+}
+
+#[test]
+fn a_supervisor_start_still_running_at_the_deadline_is_left_to_finish_and_no_request_is_made() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    fs::write(dir.join("supervisor-process"), "").unwrap();
+    fs::write(dir.join("x-hang"), "30").unwrap();
+    let from = mise_calls(&fixture, 0).len();
+
+    let started = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
+    let elapsed = started.elapsed();
+    let result = json_result(&out);
+    let hung = Detached(fs::read_to_string(dir.join("x-hang-pid")).expect("the start never ran").trim().parse().unwrap());
+    assert_eq!(out.status.code(), Some(124), "{result}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    let cause = &result["error"]["details"][0]["cause"];
+    assert_eq!(cause["code"], "start_failed", "{result}");
+    assert!(cause["message"].as_str().unwrap().contains("cut short by the deadline"), "{result}");
+    // Left running in a session of its own, not in a group stack kills.
+    assert!(hung.alive(), "the start was killed");
+    let group = Command::new("ps").args(["-o", "pgid=", "-p", &hung.0.to_string()]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&group.stdout).trim(), hung.0.to_string());
+    no_supervisor_request(&mise_calls(&fixture, from));
+    assert!(!dir.join("supervisor-pid").exists(), "a supervisor was started");
+    // The launch stays recorded for `down`, which needs no deadline.
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["session"]["launching"], true, "{status}");
     assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
 }
 
@@ -2462,4 +2880,236 @@ fn an_ignored_hangup_stays_ignored_after_captured_commands() {
     assert_eq!(reply["id"], 2);
     drop(stdin);
     assert!(server.wait().unwrap().success());
+}
+
+/// `web` as the supervisor reports it once started: running as `service`, which never listens.
+fn supervise_never_ready(fixture: &Fixture, service: &Detached) {
+    let port = assigned_port(fixture, "web");
+    fs::write(fixture.dir.path().join("pf-tracked-pid"), service.0.to_string()).unwrap();
+    fs::write(
+        fixture.dir.path().join("daemons-started.json"),
+        json!([{ "id": "app-test/web", "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
+    )
+    .unwrap();
+}
+
+fn launch_records(fixture: &Fixture) -> Vec<Value> {
+    fixture.session_paths().iter().map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap()).collect()
+}
+
+/// The `timed_out` error of a startup whose deadline passed while verifying `service`, which
+/// started but never became ready. Each look at it first asks the supervisor and mise, so the
+/// deadline may end verification at any of these: readiness failed (`not_ready`, naming the
+/// service), or a lookup was not started (`timed_out`) or was cut short (`provider_failed`).
+/// The same lookups also run before the start, so the failed step must be `verify`, after it.
+fn assert_cut_short_verifying(error: &Value, service: &str) {
+    let cause = &error["details"][0]["cause"];
+    let message = cause["message"].as_str().unwrap_or_default();
+    let lookup = ["mise env --json", "mise daemons --json"].into_iter().any(|call| match cause["code"].as_str() {
+        Some("timed_out") => message == format!("{call}: the deadline passed before it could start"),
+        Some("provider_failed") => message == format!("{call} was cut short by the deadline"),
+        _ => false,
+    });
+    let unready = cause["code"] == "not_ready" && cause["details"][0]["service"] == service;
+    assert!(lookup || unready, "{error}");
+    let progress = &error["details"][1];
+    assert_eq!(progress["changed"], true, "{error}");
+    let steps = progress["steps"].as_array().unwrap();
+    assert_eq!(steps[steps.len() - 2], json!({ "step": "start", "status": "ok", "detail": null }), "{error}");
+    assert_eq!(steps[steps.len() - 1], json!({ "step": "verify", "status": "failed", "code": cause["code"] }), "{error}");
+}
+
+#[test]
+fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_down() {
+    let fixture = Fixture::with_bundle(WEB);
+    let service = Detached::spawn();
+    supervise_never_ready(&fixture, &service);
+    let start = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
+    let took = start.elapsed();
+    // Readiness alone would have been waited for 90s.
+    assert!(took >= Duration::from_secs(2) && took < Duration::from_secs(20), "{took:?}");
+    assert_eq!(out.status.code(), Some(124));
+    let result = json_result(&out);
+    let error = &result["error"];
+    assert_eq!(error["code"], "timed_out", "{result}");
+    assert_eq!(error["message"], "`stack up` did not finish within 2s");
+    assert!(error["hint"].as_str().unwrap().contains("`stack down` stops them"), "{result}");
+    assert_cut_short_verifying(error, "web");
+
+    // Nothing stopped the service, and its ownership is recorded as an incomplete launch.
+    assert!(service.alive());
+    for record in launch_records(&fixture) {
+        assert_eq!(record["launching"], true, "{record}");
+        assert_eq!(record["services"]["web"]["pid"], service.0, "{record}");
+    }
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["healthy"], false, "{status}");
+    assert!(!fixture.command(&["exec", "--require", "web", "--", "true"]).output().unwrap().status.success());
+
+    // `down` stops it through the supervisor, and nothing is left for GC.
+    fixture.ok(&["down"]);
+    assert!(!service.alive());
+    assert_eq!(json_result(&fixture.ok(&["gc", "--json"]))["data"], json!([]));
+
+    // Once the service can become ready, the same command succeeds.
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--timeout", "30s"]);
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn mcp_up_reports_its_timeout_as_an_error_and_down_still_stops_what_launched() {
+    let fixture = Fixture::with_bundle(WEB);
+    let service = Detached::spawn();
+    supervise_never_ready(&fixture, &service);
+    mcp_up_times_out_and_down_stops(&fixture, &service);
+}
+
+#[test]
+fn mcp_up_cut_short_while_verifying_keeps_what_launched_for_down() {
+    let fixture = Fixture::with_bundle(WEB);
+    let service = Detached::spawn();
+    supervise_never_ready(&fixture, &service);
+    fs::write(fixture.dir.path().join("slow-env-after-start"), "30").unwrap();
+    let start = Instant::now();
+    let cause = mcp_up_times_out_and_down_stops(&fixture, &service);
+    assert_eq!(cause["code"], "provider_failed", "{cause}");
+    assert_eq!(cause["message"], "mise env --json was cut short by the deadline", "{cause}");
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+}
+
+/// `stack_up` of `service` (supervised, never ready) with a 2s timeout, then `stack_status` and
+/// `stack_down` from the same server: the timeout is a tool error that leaves the launch
+/// recorded and unhealthy, and `down` stops it. Returns the timeout's cause. On a loaded
+/// machine 1s can pass before the start, when nothing was launched yet.
+fn mcp_up_times_out_and_down_stops(fixture: &Fixture, service: &Detached) -> Value {
+    let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 2 })), ("stack_status", json!({})), ("stack_down", json!({}))], &[]);
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    let error = &results[0]["structuredContent"]["error"];
+    assert_eq!(error["code"], "timed_out", "{error}");
+    assert_eq!(error["message"], "`stack up` did not finish within 2s");
+    assert!(error["hint"].as_str().unwrap().contains("`stack down` stops them"), "{error}");
+    assert_cut_short_verifying(error, "web");
+    let status = &results[1]["structuredContent"]["data"];
+    assert_eq!(status["healthy"], false, "{status}");
+    assert_eq!(status["session"]["launching"], true, "{status}");
+    assert_eq!(status["session"]["services"]["web"]["pid"], service.0, "{status}");
+    assert_eq!(results[2]["isError"], false, "{}", results[2]);
+    assert!(!service.alive());
+    assert!(fixture.session_paths().iter().all(|p| !p.exists()), "the launch is still recorded after down");
+    error["details"][0]["cause"].clone()
+}
+
+#[test]
+fn a_start_request_cut_short_by_the_timeout_is_killed_with_its_process_group() {
+    let fixture = Fixture::with_bundle(WEB);
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
+    let start = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "2s"]).output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    assert_eq!(out.status.code(), Some(124));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error[timed_out]: `stack up` did not finish within 2s"), "{stderr}");
+    assert!(stderr.contains("cut short: error[start_failed]"), "{stderr}");
+    assert!(fixture.dir.path().join("client-waiting").exists(), "the start request never ran");
+    // What the supervisor reported after the cut-short start is recorded, not forgotten.
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    let after_start = log.split("daemons start").nth(1).expect("start requested");
+    assert!(after_start.contains("daemons --json"), "{log}");
+    for record in launch_records(&fixture) {
+        assert_eq!(record["launching"], true, "{record}");
+    }
+    // The request's own descendants went with it: none acts after the timeout.
+    thread::sleep(Duration::from_secs(3));
+    assert!(!fixture.dir.path().join("late-launch").exists(), "a client of the cut-short start acted later");
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn startup_waits_for_a_busy_project_only_until_its_timeout() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::with_bundle(WEB);
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
+    let mut first = fixture.command(&["up", "--timeout", "60s"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let waiting = fixture.dir.path().join("client-waiting");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !waiting.exists() {
+        assert!(Instant::now() < deadline, "the first start request never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let start = Instant::now();
+    let out = fixture.command(&["restart", "--timeout", "1s", "--json"]).output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert_eq!(out.status.code(), Some(124));
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    assert_eq!(result["error"]["details"][0]["cause"]["code"], "lock_busy", "{result}");
+    assert!(result["error"]["hint"].as_str().unwrap().starts_with("nothing was started"), "{result}");
+    let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 1 }))], &[]);
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    assert_eq!(results[0]["structuredContent"]["error"]["details"][0]["cause"]["code"], "lock_busy", "{}", results[0]);
+
+    unsafe { libc::kill(-(first.id() as i32), libc::SIGINT) };
+    assert!(!first.wait().unwrap().success());
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_restart_cut_short_keeps_the_session_and_records_the_incomplete_launch() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    let start = Instant::now();
+    let out = fixture.command(&["restart", "web", "--timeout", "2s", "--json"]).output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    assert_eq!(out.status.code(), Some(124));
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    assert_eq!(result["error"]["message"], "`stack restart` did not finish within 2s");
+    assert_eq!(result["error"]["details"][1]["changed"], true, "{result}");
+    for record in launch_records(&fixture) {
+        assert_eq!(record["id"], up["data"]["session"]["id"], "{record}");
+        assert_eq!(record["launching"], true, "{record}");
+    }
+    assert!(!fixture.command(&["exec", "--require", "web", "--", "true"]).output().unwrap().status.success());
+
+    // A retried `up` completes the launch; `down` then confirms cleanup.
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
+    fixture.ok(&["up", "--timeout", "30s"]);
+    fixture.ok(&["exec", "--require", "web", "--", "true"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn startup_timeouts_are_checked_before_any_lifecycle_work() {
+    let fixture = Fixture::with_bundle(WEB);
+    for args in [&["up", "--timeout", "0s"][..], &["up", "--timeout", "soon"], &["restart", "web", "--timeout", "0"]] {
+        let out = fixture.command(&[&["--json"][..], args].concat()).output().unwrap();
+        assert!(!out.status.success() && out.status.code() != Some(124), "{args:?}");
+        assert_eq!(json_result(&out)["error"]["code"], "usage", "{args:?}");
+    }
+    let results = fixture.mcp(
+        &[
+            ("stack_up", json!({ "timeout_secs": 0 })),
+            ("stack_up", json!({ "timeout_secs": "30" })),
+            ("stack_restart", json!({ "services": ["web"], "timeout_secs": 1.5 })),
+        ],
+        &[],
+    );
+    for result in &results {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["error"]["code"], "usage", "{result}");
+    }
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons"), "{log}");
+    assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
+    assert_eq!(fixture.index_files(), 0);
 }

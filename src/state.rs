@@ -54,9 +54,24 @@ impl FileLock {
             .truncate(false)
             .open(path)
             .map_err(|e| io_error(path.display(), e))?;
-        file.lock_exclusive()
-            .map_err(|e| io_error(path.display(), e))?;
-        Ok(Self { _file: file })
+        if crate::process::deadline().is_none() {
+            file.lock_exclusive().map_err(|e| io_error(path.display(), e))?;
+            return Ok(Self { _file: file });
+        }
+        // Under a deadline, wait for another holder only as long as it allows.
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e) if e.raw_os_error() != fs2::lock_contended_error().raw_os_error() => {
+                    return Err(io_error(path.display(), e))
+                }
+                Err(_) if crate::process::expired() => {
+                    return Err(StackError::new("lock_busy", format!("{} is still locked by another stack command", path.display()))
+                        .hint("another `stack up`, `restart` or `down` may be running for this project; retry when it finishes"))
+                }
+                Err(_) => std::thread::sleep(crate::process::bounded(std::time::Duration::from_millis(50))),
+            }
+        }
     }
 }
 
@@ -133,6 +148,25 @@ pub fn pid_alive(pid: u32) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_lock_is_waited_for_only_until_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.lock");
+        let held = FileLock::acquire(&path).unwrap();
+        let start = std::time::Instant::now();
+        let busy = {
+            let _deadline = crate::process::deadline_scope(Some(start + std::time::Duration::from_millis(300)));
+            FileLock::acquire(&path).err().expect("the lock is held")
+        };
+        assert_eq!(busy.code, "lock_busy");
+        assert!(busy.message.contains("project.lock"), "{busy}");
+        let waited = start.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(300) && waited < std::time::Duration::from_secs(3), "{waited:?}");
+        drop(held);
+        let _deadline = crate::process::deadline_scope(Some(std::time::Instant::now() + std::time::Duration::from_secs(5)));
+        FileLock::acquire(&path).unwrap();
+    }
 
     #[test]
     fn pid_alive_sees_this_process() {

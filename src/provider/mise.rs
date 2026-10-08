@@ -74,6 +74,9 @@ impl Resolver for MiseResolver {
             StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
                 .hint("check the tool name and version; `mise ls-remote <tool>` lists releases")
         };
+        if out.timed_out && crate::process::expired() {
+            return Err(StackError::new("timed_out", format!("resolving {spec} was cut short by the deadline")));
+        }
         if out.timed_out {
             return Err(fail(format!("mise did not answer within {}s", RESOLVE_TIMEOUT.as_secs())));
         }
@@ -271,7 +274,7 @@ fn put(t: &mut Table, key: &str, value: Option<Value>) {
 
 use crate::error::{Result, StackError};
 use serde::Deserialize;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 /// One supervised service as Pitchfork reports it.
 #[derive(Debug, Clone, Deserialize)]
@@ -329,19 +332,68 @@ pub fn configure_command(command: &mut Command, root: &Path) {
     command.envs(config_env(root));
 }
 
+/// A mise command, bounded by the caller's deadline (see `process::output`).
 fn mise(root: &Path, args: &[&str]) -> Result<Output> {
     let mut command = Command::new("mise");
     configure_command(&mut command, root);
     command.args(args)
         .current_dir(root)
         .env("MISE_YES", "1")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| {
-            StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
-                .hint(crate::setup::MISE_INSTALL_HINT)
-        })
+        .env("NO_COLOR", "1");
+    crate::process::output(&mut command).map_err(|e| match e.kind() {
+        std::io::ErrorKind::TimedOut => StackError::new("timed_out", format!("mise {}: {e}", args.join(" "))),
+        _ => StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
+            .hint(crate::setup::MISE_INSTALL_HINT),
+    })
+}
+
+/// Make sure Pitchfork's supervisor runs before a supervisor request under a deadline.
+///
+/// A request client that finds no supervisor starts one as its own child, in its own process
+/// group. Under a deadline that group is killed when time runs out, and the supervisor of every
+/// project using this state directory with it. Started here first, in a session of its own that
+/// stack never signals, it is already running when the request comes; Pitchfork reports
+/// success when one already runs. When it cannot be started here, the request must not be made:
+/// this fails with `code`, or `provider_unavailable` when mise cannot be found or run, and a
+/// startup whose deadline has passed reports that as `timed_out`. A start still running at the
+/// deadline goes on in its own session. Without a deadline nothing is killed, and the request
+/// starts the supervisor as it always did.
+///
+/// The supervisor runs every daemon through `mise x` in its project, so each gets its own
+/// project's tools. A supervisor that `mise daemons` starts learns which mise to run from the
+/// configuration mise registers; one started here learns it from `PITCHFORK_MISE_BIN`.
+/// Without either, Pitchfork only looks in a few fixed places, and when mise is installed
+/// elsewhere it runs every project's daemons without mise, with the tools on its own PATH:
+/// the tools of whichever project started it.
+fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
+    const START: &str = "mise x -- pitchfork supervisor start";
+    let Some(wait) = crate::process::remaining() else { return Ok(()) };
+    if wait.is_zero() {
+        return Err(StackError::new("timed_out", format!("the deadline passed before `{START}`")));
+    }
+    // The mise every request below runs, named to a process with another working directory,
+    // so only an absolute path will do.
+    let mise_bin = crate::setup::find_on_path_from(root).filter(|p| p.is_absolute()).ok_or_else(|| {
+        StackError::new("provider_unavailable", "cannot find mise on PATH to start the service supervisor")
+            .hint(crate::setup::MISE_INSTALL_HINT)
+    })?;
+    let mut command = Command::new(&mise_bin);
+    configure_command(&mut command, root);
+    command.args(["x", "--", "pitchfork", "supervisor", "start"])
+        .current_dir(root)
+        .env("PITCHFORK_MISE_BIN", &mise_bin)
+        .env("MISE_YES", "1")
+        .env("NO_COLOR", "1");
+    let status = crate::process::run_detached(&mut command, wait).map_err(|e| {
+        StackError::new("provider_unavailable", format!("cannot run {}: {e}", mise_bin.display()))
+            .hint(crate::setup::MISE_INSTALL_HINT)
+    })?;
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(StackError::new(code, format!("`{START}` failed ({status}), so the supervisor was not asked"))
+            .hint(format!("run `{START}` in the project to see why"))),
+        None => Err(StackError::new(code, format!("`{START}` was cut short by the deadline; it goes on in its own session"))),
+    }
 }
 
 fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
@@ -349,32 +401,75 @@ fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
     if out.status.success() {
         return Ok(out);
     }
-    Err(StackError::new(code, format!("mise {} failed", args.join(" ")))
+    let failed = if crate::process::expired() { "was cut short by the deadline" } else { "failed" };
+    Err(StackError::new(code, format!("mise {} {failed}", args.join(" ")))
         .details(vec![serde_json::json!({ "output": tail(&out) })]))
 }
 
-/// Last lines of combined output, without terminal escape codes.
+/// Lines of provider output kept in an error: enough for a traceback and the final error.
+const TAIL_LINES: usize = 20;
+
+/// Last lines of combined output, as a terminal would have left them.
 pub fn tail(out: &Output) -> String {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    readable_tail(&text, TAIL_LINES)
+}
+
+/// The last `max` lines of terminal output in readable form: escape sequences removed, each
+/// carriage-return redraw reduced to what it finally showed, blank lines dropped, and spinner
+/// frames dropped unless they are all there is. The supervisor animates progress even when
+/// it is captured, between the lines a failing service printed.
+fn readable_tail(text: &str, max: usize) -> String {
+    let plain = strip_escapes(text);
+    let lines: Vec<&str> = plain
+        .split('\n')
+        .filter_map(|line| line.split('\r').rev().find(|s| !s.trim().is_empty()))
+        .map(str::trim_end)
+        .collect();
+    let content: Vec<&str> = lines.iter().copied().filter(|l| !spinner_frame(l)).collect();
+    let kept = if content.is_empty() { &lines[lines.len().saturating_sub(1)..] } else { &content[..] };
+    kept[kept.len().saturating_sub(max)..].join("\n")
+}
+
+/// A progress line: it starts with a Braille spinner glyph.
+fn spinner_frame(line: &str) -> bool {
+    line.trim_start().chars().next().is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+}
+
+/// `text` without ANSI escape sequences (CSI such as colours and line clearing, OSC such as
+/// titles and hyperlinks, and two-character escapes) or other control characters. Newlines,
+/// carriage returns and tabs are kept.
+fn strip_escapes(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // Skip CSI sequences: ESC [ params final-byte
-            if chars.peek() == Some(&'[') {
-                chars.next();
+        if c != '\u{1b}' {
+            if !c.is_control() || matches!(c, '\n' | '\r' | '\t') {
+                clean.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters, then one final byte.
+            Some('[') => {
                 for n in chars.by_ref() {
                     if ('@'..='~').contains(&n) {
                         break;
                     }
                 }
             }
-            continue;
+            // OSC: up to BEL or ST (ESC \\).
+            Some(']') => {
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' || (n == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
-        clean.push(c);
     }
-    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines[lines.len().saturating_sub(12)..].join("\n")
+    clean
 }
 
 pub fn trust(root: &Path) -> Result<()> {
@@ -550,10 +645,12 @@ fn local_datetime(_: u64) -> Option<String> {
 }
 
 pub fn start(root: &Path) -> Result<()> {
+    detach_supervisor(root, "start_failed")?;
     checked(root, &["daemons", "start"], "start_failed").map(|_| ())
 }
 
 pub fn stop(root: &Path) -> Result<()> {
+    detach_supervisor(root, "stop_failed")?;
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
 }
 
@@ -561,6 +658,7 @@ pub fn stop(root: &Path) -> Result<()> {
 pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["daemons", "start", "--"];
     args.extend(names.iter().map(String::as_str));
+    detach_supervisor(root, "start_failed")?;
     checked(root, &args, "start_failed").map(|_| ())
 }
 
@@ -568,12 +666,60 @@ pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
 pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
     let mut args = vec!["daemons", "stop", "--"];
     args.extend(names.iter().map(String::as_str));
+    detach_supervisor(root, "stop_failed")?;
     checked(root, &args, "stop_failed").map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `mise daemons start` printed for a service that failed on a bad edit, captured
+    /// with NO_COLOR and CI set (DX evaluation of 0.1.18, log 130), with a shorter path.
+    const FAILED_START: &str = "\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api] Traceback (most recent call last):\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api]   File \"/p/server.py\", line 2, in <module>\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api]     raise RuntimeError(\"bad edit\")\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api] RuntimeError: bad edit\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{280b} [app-9df2/api] waiting for delay (3s)...\n\rpitchfork ERROR Daemon app-9df2/api failed to start\n\u{2717} [app-9df2/api] failed (exit code 1): Daemon app-9df2/api failed with exit code 1";
+
+    #[test]
+    fn a_deadline_already_past_starts_no_supervisor_and_makes_no_request() {
+        let root = tempfile::tempdir().unwrap();
+        let _expired = crate::process::deadline_scope(Some(std::time::Instant::now()));
+        let e = start(root.path()).unwrap_err();
+        assert_eq!(e.code, "timed_out", "{e:?}");
+        assert!(e.message.contains("before `mise x -- pitchfork supervisor start`"), "{e:?}");
+    }
+
+    #[test]
+    fn captured_spinner_frames_leave_the_traceback_and_the_final_error() {
+        assert_eq!(
+            readable_tail(FAILED_START, TAIL_LINES),
+            "\u{2022} [app-9df2/api] Traceback (most recent call last):
+\u{2022} [app-9df2/api]   File \"/p/server.py\", line 2, in <module>
+\u{2022} [app-9df2/api]     raise RuntimeError(\"bad edit\")
+\u{2022} [app-9df2/api] RuntimeError: bad edit
+pitchfork ERROR Daemon app-9df2/api failed to start
+\u{2717} [app-9df2/api] failed (exit code 1): Daemon app-9df2/api failed with exit code 1"
+        );
+    }
+
+    #[test]
+    fn redraws_keep_what_the_terminal_finally_showed() {
+        assert_eq!(readable_tail("Downloading 10%\rDownloading 100%\r\nError: disk full\r\n", 5), "Downloading 100%\nError: disk full");
+        assert_eq!(readable_tail("\u{280b} starting\r\u{2819} starting\r\u{2839} starting\n", 5), "\u{2839} starting");
+        assert_eq!(readable_tail("", 5), "");
+    }
+
+    #[test]
+    fn escape_sequences_and_controls_are_removed_but_text_is_kept() {
+        let text = "\u{1b}[31mError:\u{1b}[0m port \u{1b}]8;;https://x/\u{7}5432\u{1b}]8;;\u{7} in use\u{1b}[2K\u{8}\n\u{1b}]0;title\u{1b}\\\tdétail ✓\u{1b}7";
+        assert_eq!(readable_tail(text, 5), "Error: port 5432 in use\n\tdétail ✓");
+    }
+
+    #[test]
+    fn only_the_last_lines_are_kept_with_the_error_last() {
+        let text: String = (1..=30).map(|n| format!("\u{280b} wait\nline {n}\n")).collect::<String>() + "Error: final";
+        let tail = readable_tail(&text, TAIL_LINES);
+        assert_eq!(tail.lines().count(), TAIL_LINES);
+        assert!(tail.starts_with("line 12\n") && tail.ends_with("line 30\nError: final"), "{tail}");
+    }
 
     #[test]
     fn resolved_versions_are_one_exact_line() {

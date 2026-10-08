@@ -37,6 +37,9 @@ bundle = "oci:ghcr.io/acme/obs:2.0.0"
 [[use]]
 bundle = "git+https://github.com/acme/bundles?ref=v3&dir=node"   # a bundle in a subdirectory
 
+[[use]]
+bundle = "path:../bundles/team"   # a local directory, relative to this stack.toml
+
 [tasks.test]
 run = "uv sync -q && uv run pytest -q"
 services = ["postgres", "redis"]
@@ -44,6 +47,10 @@ services = ["postgres", "redis"]
 [override.env]
 LOG_LEVEL = "warn"     # both bundles set LOG_LEVEL; the project must choose
 ```
+
+A local path needs the `path:` prefix; a bare `../bundles/team` fails with `source_invalid`.
+`stack.lock` records a local bundle's content hash, so after editing it run `stack compile`:
+`compile --locked` reports `lock_outdated` until you do.
 
 ```sh
 stack compile                          # resolve, lock, assign ports, write .config/mise/conf.d/stack.toml
