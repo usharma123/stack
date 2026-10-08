@@ -75,7 +75,21 @@ Integrated as `29c1767`, from worker commit `e0574e2`.
 - Commands, versions, and limitations are recorded in
   [the route 2 smoke record](../reviews/2026-10-08-tool-options-mbx-smoke.md).
 
-Artifact locking, secret grants, and both skills phases are in progress in separate worktrees.
+### Skills discovery and sync
+
+Worker commits `d3c85ff` through `be93cc3` were integrated as `a9bfb91` through `926b0ff`.
+
+- Integration checkout: all 10 binary-level skills tests passed.
+- The worker's Rust, Clippy, and Node checks passed. It also recorded real-tool discovery,
+  MCP retrieval, install/sync, and tools-only up receipts in
+  [the skills smoke record](../reviews/2026-10-08-skills-smoke.md).
+- Real mise evaluated template expressions in tool option strings even in a tools-only
+  scratch config. Tool parsing now rejects template syntax. Discovery also refuses
+  templated lock entries, and the scratch helper resolves cache paths before setting mise's
+  directory boundary. These findings were sent to both active route workers.
+
+Artifact locking and secret grants are in progress in separate worktrees. Combined-route
+validation and independent review are pending.
 
 ## Review results
 
