@@ -88,8 +88,32 @@ Worker commits `d3c85ff` through `be93cc3` were integrated as `a9bfb91` through 
   templated lock entries, and the scratch helper resolves cache paths before setting mise's
   directory boundary. These findings were sent to both active route workers.
 
-Artifact locking and secret grants are in progress in separate worktrees. Combined-route
-validation and independent review are pending.
+### Secret grants
+
+Worker commits `0485ae5` through `bd057d5` were integrated as `b4114b3` through `5f68ca4`.
+The integration fixture separates fnox-only release queries from skills discovery queries.
+
+At `ae3f2b9`:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked --all-targets` | Passed, 291 tests |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed before the fixture-only adjustment |
+| `node --test tests/*.test.mjs` | Passed, 41 tests; one opt-in test skipped |
+| `bash tests/e2e/native.sh target/debug/stack 10-secrets` | Passed on macOS arm64 with real mise 2026.10.3 and fnox 1.39.0 |
+
+The real-fnox scenario covers task, exec, MCP, terminal output, unsupported short values,
+missing/protected keys, malformed configuration, doctor, and a persisted-file sentinel sweep.
+More receipts and boundaries are in
+[the secret-grants smoke record](../reviews/2026-10-08-fnox-secrets-smoke.md).
+
+A separate integration probe found that the redaction label can itself contain a granted
+literal. `redacted` becomes `[redacted:TOKEN]`, and a value equal to its key name appears in
+that label too. A focused follow-up is correcting this before review. Passing ordinary
+sentinel tests does not cover this case.
+
+Artifact locking and the redaction follow-up are in progress in separate worktrees.
+Final combined-route validation and independent review are pending.
 
 ## Review results
 
