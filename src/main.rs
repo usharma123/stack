@@ -345,7 +345,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
             match &result {
                 Ok(entries) if entries.is_empty() => {}
                 Ok(entries) => print_gc(entries),
-                Err(e) => eprintln!("error[{}]: {}", e.code, e.message),
+                Err(e) => print_error(e),
             }
         }
         use std::io::Write;
@@ -549,15 +549,20 @@ fn fail(as_json: bool, e: StackError) -> ExitCode {
     if as_json {
         println!("{}", json!({ "ok": false, "error": e }));
     } else {
-        eprintln!("error[{}]: {}", e.code, e.message);
-        if let Some(hint) = &e.hint {
-            eprintln!("  hint: {hint}");
-        }
-        for d in &e.details {
-            eprintln!("  {}", human_detail(d));
-        }
+        print_error(&e);
     }
     ExitCode::FAILURE
+}
+
+/// An error for people, on stderr: the message, then the hint and details that say what to do.
+fn print_error(e: &StackError) {
+    eprintln!("error[{}]: {}", e.code, e.message);
+    if let Some(hint) = &e.hint {
+        eprintln!("  hint: {hint}");
+    }
+    for d in &e.details {
+        eprintln!("  {}", human_detail(d));
+    }
 }
 
 /// One error detail for people: `up`'s progress record as a step list, objects as

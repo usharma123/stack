@@ -1871,6 +1871,33 @@ fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim(
 }
 
 #[test]
+fn every_gc_mode_shows_the_recovery_commands() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    fixture.supervisor_tracks(running.service.0, running.port);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    let recovery = &result["error"]["details"][0]["services"][0]["recovery"];
+    let commands = [recovery["inspect"].as_str().unwrap(), recovery["stop"].as_str().unwrap()];
+    for args in [&["gc"][..], &["gc", "--watch", "--max-passes", "1"], &["gc", "--watch", "--max-passes", "1", "--json"]] {
+        let out = fixture.command_at(fixture.dir.path(), args).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        // People read stderr; with --json, each pass is one object on stdout.
+        let shown = match args.contains(&"--json") {
+            true => serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["hint"].as_str().unwrap().to_string(),
+            false => String::from_utf8_lossy(&out.stderr).into_owned(),
+        };
+        for command in commands {
+            assert!(shown.contains(command), "{args:?} omits {command}:\n{shown}");
+        }
+    }
+    assert!(running.service.alive(), "GC must not stop by daemon name");
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+}
+
+#[test]
 fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
