@@ -92,8 +92,15 @@ fn find_on_path() -> Option<PathBuf> {
 /// The mise a bare `mise` command run in `dir` runs. A relative PATH entry, including the
 /// empty one that means the working directory, is found under `dir`, as that command finds it.
 pub fn find_on_path_from(dir: &Path) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).map(|d| dir.join(d).join("mise")).find(|p| crate::hash::is_executable(p))
+    find_in(&std::env::var_os("PATH")?, dir)
+}
+
+/// The first executable file named `mise` in `paths`, as the OS searches them. A directory
+/// named `mise` is skipped even with its search bits set, as the OS skips it.
+fn find_in(paths: &std::ffi::OsStr, dir: &Path) -> Option<PathBuf> {
+    std::env::split_paths(paths)
+        .map(|d| dir.join(d).join("mise"))
+        .find(|p| p.is_file() && crate::hash::is_executable(p))
 }
 
 fn version(mise: &Path) -> Option<String> {
@@ -162,6 +169,40 @@ mod tests {
         header.set_cksum();
         builder.append_data(&mut header, path, body).unwrap();
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_the_first_executable_file_as_the_os_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let executable = |path: PathBuf, mode: u32| {
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let searchable = std::fs::Permissions::from_mode(0o755);
+        std::fs::create_dir(dir("folder").join("mise")).unwrap();
+        std::fs::set_permissions(root.path().join("folder/mise"), searchable).unwrap();
+        executable(dir("plain").join("mise"), 0o644);
+        std::os::unix::fs::symlink(root.path().join("folder/mise"), dir("to-folder").join("mise")).unwrap();
+        let real = executable(dir("real").join("mise"), 0o755);
+        std::os::unix::fs::symlink(&real, dir("link").join("mise")).unwrap();
+        let path = |entries: &[&str]| std::env::join_paths(entries.iter().map(|e| root.path().join(e))).unwrap();
+
+        let skipped = path(&["folder", "plain", "to-folder", "real"]);
+        assert_eq!(find_in(&skipped, Path::new("")), Some(real.clone()));
+        let linked = path(&["folder", "link", "real"]);
+        assert_eq!(find_in(&linked, Path::new("")), Some(root.path().join("link/mise")));
+        assert_eq!(find_in(&path(&["folder", "plain"]), Path::new("")), None);
+        // Relative entries, the empty one included, are found under `dir`.
+        let relative = std::env::join_paths(["folder", "", "real"]).unwrap();
+        assert_eq!(find_in(&relative, root.path()), Some(real));
     }
 
     #[test]

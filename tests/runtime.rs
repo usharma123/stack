@@ -2245,18 +2245,29 @@ fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
 
 #[test]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_absolutely() {
-    supervisor_outlives_a_timed_out_start(None, "bin/mise");
+    supervisor_outlives_a_timed_out_start(None, "bin/mise", false);
 }
 
 #[test]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_relatively() {
-    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise");
+    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", false);
 }
 
 #[test]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_mise_is_in_the_project() {
     // An empty PATH entry means the working directory.
-    supervisor_outlives_a_timed_out_start(Some(""), "app/mise");
+    supervisor_outlives_a_timed_out_start(Some(""), "app/mise", false);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_directory_named_mise() {
+    // The OS skips a directory named `mise` on PATH, searchable or not, for the file after it.
+    supervisor_outlives_a_timed_out_start(None, "bin/mise", true);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_directory_named_mise() {
+    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", true);
 }
 
 /// `stack -C app up --timeout 2s` from another directory, with mise on PATH as `entry` names it
@@ -2264,7 +2275,9 @@ fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_mise_is_in_the_pr
 /// has its own `bin/mise` and `mise`, which a relative entry must not find: the provider runs
 /// mise in the project. The request is cut short; the supervisor stack started before it is
 /// in a session of its own, so it survives, and the request never starts one in its group.
-fn supervisor_outlives_a_timed_out_start(entry: Option<&str>, mise_at: &str) {
+/// With `decoy`, an entry of the same kind comes first, holding a searchable directory named
+/// `mise` (`decoy/mise`, under the project when relative).
+fn supervisor_outlives_a_timed_out_start(entry: Option<&str>, mise_at: &str, decoy: bool) {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
     let mise = dir.join(mise_at);
@@ -2284,7 +2297,15 @@ fn supervisor_outlives_a_timed_out_start(entry: Option<&str>, mise_at: &str) {
         .filter(|d| d.is_absolute() && !d.join("mise").exists())
         .collect::<Vec<_>>();
     let first = entry.map_or_else(|| dir.join("bin"), std::path::PathBuf::from);
-    let path = std::env::join_paths(std::iter::once(first).chain(rest)).unwrap();
+    let decoy = decoy.then(|| {
+        let entry = if entry.is_some() { std::path::PathBuf::from("decoy") } else { dir.join("decoy") };
+        // An absolute entry replaces the project path it is joined to.
+        let folder = dir.join("app").join(&entry).join("mise");
+        fs::create_dir_all(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        entry
+    });
+    let path = std::env::join_paths(decoy.into_iter().chain([first]).chain(rest)).unwrap();
     let run = |args: &[&str]| fixture.command(args).current_dir(&caller).env("PATH", &path).output().unwrap();
     fs::write(dir.join("supervisor-process"), "").unwrap();
     fs::write(dir.join("slow-start"), "30").unwrap();
