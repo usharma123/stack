@@ -363,8 +363,9 @@ fn mise(root: &Path, args: &[&str]) -> Result<Output> {
 /// the tools of whichever project started it.
 fn detach_supervisor(root: &Path) {
     let Some(wait) = crate::process::remaining() else { return };
-    // Named to a process with another working directory, so only an absolute path will do.
-    let Some(mise_bin) = crate::setup::find_on_path().filter(|p| p.is_absolute()) else { return };
+    // The mise every request below runs, named to a process with another working directory,
+    // so only an absolute path will do.
+    let Some(mise_bin) = crate::setup::find_on_path_from(root).filter(|p| p.is_absolute()) else { return };
     let mut command = Command::new(&mise_bin);
     configure_command(&mut command, root);
     command.args(["x", "--", "pitchfork", "supervisor", "start"])

@@ -85,9 +85,15 @@ pub fn run(force: bool) -> Result<Report> {
 pub const MISE_INSTALL_HINT: &str = "run `stack setup` to download mise, or install it yourself: https://mise.jdx.dev";
 
 /// The mise a bare `mise` command runs: the first executable on PATH.
-pub fn find_on_path() -> Option<PathBuf> {
+fn find_on_path() -> Option<PathBuf> {
+    find_on_path_from(Path::new(""))
+}
+
+/// The mise a bare `mise` command run in `dir` runs. A relative PATH entry, including the
+/// empty one that means the working directory, is found under `dir`, as that command finds it.
+pub fn find_on_path_from(dir: &Path) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).map(|d| d.join("mise")).find(|p| crate::hash::is_executable(p))
+    std::env::split_paths(&paths).map(|d| dir.join(d).join("mise")).find(|p| crate::hash::is_executable(p))
 }
 
 fn version(mise: &Path) -> Option<String> {

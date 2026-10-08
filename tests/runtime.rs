@@ -45,6 +45,17 @@ impl Fixture {
             &mise,
             r#"#!/bin/sh
 echo "$*" >>"$REVIEW_FIXTURE/mise.log"
+# Which file ran, however PATH named it: a relative entry is found from the working directory.
+case $0 in */*) self=${0%/*} ;; *) self=. ;; esac
+echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
+# A supervisor stand-in that runs until killed, started only when none runs. `$1` records who
+# started it: `mise x` in stack's own session, or a request client in its killable group.
+supervise() {
+  if test -f "$REVIEW_FIXTURE/supervisor-process" && ! kill -0 "$(cut -d' ' -f1 "$REVIEW_FIXTURE/supervisor-pid" 2>/dev/null)" 2>/dev/null; then
+    sleep 60 </dev/null >/dev/null 2>&1 &
+    echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
+  fi
+}
 case "$1 $2" in
   'latest '*)
     if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
@@ -68,6 +79,7 @@ case "$1 $2" in
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
   'daemons start')
+    supervise request
     # A request client that would launch a service later, after the request gave up. Like a
     # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
     if test -f "$REVIEW_FIXTURE/late-client"; then
@@ -91,7 +103,8 @@ case "$1 $2" in
     if test "$task" = fail; then exit 3; fi ;;
   'x --')
     # The supervisor stack starts on its own: which mise it is told to run daemons with.
-    echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log" ;;
+    echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log"
+    supervise detached ;;
   'daemons logs')
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
@@ -2228,6 +2241,84 @@ fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
     let expected = format!("x -- pitchfork supervisor start|{}", mise.display());
     assert!(!log.is_empty() && log.lines().all(|line| line == expected), "expected `{expected}`:\n{log}");
     fixture.ok(&["down", "--json"]);
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_absolutely() {
+    supervisor_outlives_a_timed_out_start(None, "bin/mise");
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_relatively() {
+    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise");
+}
+
+#[test]
+fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_mise_is_in_the_project() {
+    // An empty PATH entry means the working directory.
+    supervisor_outlives_a_timed_out_start(Some(""), "app/mise");
+}
+
+/// `stack -C app up --timeout 2s` from another directory, with mise on PATH as `entry` names it
+/// (`None`: the fixture's absolute `bin`) and found at `mise_at`. The directory stack runs in
+/// has its own `bin/mise` and `mise`, which a relative entry must not find: the provider runs
+/// mise in the project. The request is cut short; the supervisor stack started before it is
+/// in a session of its own, so it survives, and the request never starts one in its group.
+fn supervisor_outlives_a_timed_out_start(entry: Option<&str>, mise_at: &str) {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let mise = dir.join(mise_at);
+    if !mise.exists() {
+        fs::create_dir_all(mise.parent().unwrap()).unwrap();
+        fs::copy(dir.join("bin/mise"), &mise).unwrap();
+    }
+    let caller = dir.join("caller");
+    fs::create_dir_all(caller.join("bin")).unwrap();
+    let wrong = "#!/bin/sh\necho \"$0 $*\" >>\"$REVIEW_FIXTURE/wrong-mise.log\"\nexit 1\n";
+    for name in ["bin/mise", "mise"] {
+        fs::write(caller.join(name), wrong).unwrap();
+        fs::set_permissions(caller.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The rest of PATH, without any other mise.
+    let rest = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|d| d.is_absolute() && !d.join("mise").exists())
+        .collect::<Vec<_>>();
+    let first = entry.map_or_else(|| dir.join("bin"), std::path::PathBuf::from);
+    let path = std::env::join_paths(std::iter::once(first).chain(rest)).unwrap();
+    let run = |args: &[&str]| fixture.command(args).current_dir(&caller).env("PATH", &path).output().unwrap();
+    fs::write(dir.join("supervisor-process"), "").unwrap();
+    fs::write(dir.join("slow-start"), "30").unwrap();
+    fs::remove_file(dir.join("mise-self.log")).unwrap();
+
+    let out = run(&["up", "--timeout", "2s", "--json"]);
+    assert_eq!(out.status.code(), Some(124), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(json_result(&out)["error"]["details"][0]["cause"]["code"], "start_failed");
+    let recorded = fs::read_to_string(dir.join("supervisor-pid")).expect("no supervisor started");
+    let (pid, by) = recorded.trim().split_once(' ').unwrap();
+    let supervisor = Detached(pid.parse().unwrap());
+    assert_eq!(by, "detached", "the request started the supervisor in the group its deadline kills");
+    assert!(supervisor.alive(), "the supervisor ended with the timed-out request");
+    // The supervisor was started with, and told to run daemons with, the mise the request ran.
+    let expected = mise.canonicalize().unwrap();
+    let starts = fs::read_to_string(dir.join("supervisor-start.log")).unwrap();
+    let told = starts.trim().strip_prefix("x -- pitchfork supervisor start|").unwrap();
+    assert_eq!(Path::new(told).canonicalize().unwrap(), expected, "{starts}");
+    let ran = fs::read_to_string(dir.join("mise-self.log")).unwrap();
+    for call in ["x --", "daemons start"] {
+        assert!(ran.lines().any(|l| l.ends_with(call)), "no `mise {call}`:\n{ran}");
+    }
+    assert!(ran.lines().all(|l| Path::new(l.rsplitn(3, ' ').last().unwrap()) == expected), "{ran}");
+    assert!(!dir.join("wrong-mise.log").exists(), "{}", fs::read_to_string(dir.join("wrong-mise.log")).unwrap());
+
+    // Later commands see the launch still recorded, stop it, and leave the supervisor running.
+    fs::remove_file(dir.join("slow-start")).unwrap();
+    let status = json_result(&run(&["status", "--json"]));
+    assert_eq!(status["data"]["session"]["launching"], true, "{status}");
+    let down = run(&["down", "--json"]);
+    assert_eq!(json_result(&down)["data"]["confirmed"], true, "{}", String::from_utf8_lossy(&down.stdout));
+    assert!(supervisor.alive());
+    assert_eq!(fs::read_to_string(dir.join("supervisor-pid")).unwrap(), recorded);
+    assert!(!dir.join("wrong-mise.log").exists());
 }
 
 /// The fake supervisor starts a listener on `port` at `daemons start` and kills it at stop.
