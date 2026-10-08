@@ -135,7 +135,9 @@ At `e90a7fe`, on macOS arm64:
 | `node --test tests/*.test.mjs` | Passed, 41 tests; one opt-in real-provider test skipped |
 | `git diff --check` | Passed |
 
-The real-provider boundary test and complete native scenarios are running separately.
+The opt-in real-provider boundary test passed separately against mise 2026.10.3. The OCI
+CI scenario also passed, including immutable replay, moved-tag updates, and upload rejection.
+Complete native service scenarios are still running.
 Linux real-tool validation is delegated to GPT-6.1-Sol with isolated containers. No remote
 CI run or four-platform result is claimed. `cargo fmt --check` reports formatting differences
 in both inherited code and additions; it is not a repository CI gate.
