@@ -85,8 +85,14 @@ impl Source {
                 dir,
             });
         }
-        Err(StackError::new("source_invalid", format!("unrecognised bundle source '{spec}'"))
-            .hint("use git+<url>?ref=<ref>, oci:<registry>/<repo>:<tag> or path:<dir>"))
+        let err = StackError::new("source_invalid", format!("unrecognised bundle source '{spec}'"));
+        let local = ["./", "../", "/", "~"].iter().any(|p| spec.starts_with(p)) || project_root.join(spec).is_dir();
+        Err(if local {
+            let value = toml::Value::String(format!("path:{spec}"));
+            err.hint(format!("a local bundle directory is written bundle = {value}"))
+        } else {
+            err.hint("use git+<url>?ref=<ref>, oci:<registry>/<repo>:<tag> or path:<dir>")
+        })
     }
 
     pub fn fetch(
@@ -277,6 +283,24 @@ mod tests {
             git("git+https://h/r?dir=./py&ref=v1").unwrap(),
             Source::Git { url: "https://h/r".into(), reference: "v1".into(), dir: Some(PathBuf::from("./py")) }
         );
+    }
+
+    #[test]
+    fn a_bare_local_path_is_answered_with_its_path_form() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("team bundle")).unwrap();
+        for (spec, hint) in [
+            ("../bundles/team", r#"bundle = "path:../bundles/team""#),
+            ("/abs/b", r#"bundle = "path:/abs/b""#),
+            ("team bundle", r#"bundle = "path:team bundle""#),
+            (r#"./say "hi""#, r#"bundle = 'path:./say "hi"'"#),
+        ] {
+            let err = Source::parse(spec, dir.path()).unwrap_err();
+            assert_eq!(err.code, "source_invalid");
+            assert!(err.hint.as_deref().unwrap().ends_with(hint), "{spec}: {:?}", err.hint);
+        }
+        let err = git("github.com/o/r").unwrap_err();
+        assert!(err.hint.unwrap().starts_with("use git+"));
     }
 
     #[test]

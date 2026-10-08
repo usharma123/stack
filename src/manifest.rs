@@ -219,9 +219,7 @@ pub fn read_project(root: &Path) -> Result<ProjectManifest> {
         StackError::new("manifest_missing", format!("cannot read {}: {e}", path.display()))
             .hint("create a stack.toml; see README.md for the format")
     })?;
-    toml::from_str(&text).map_err(|e| {
-        StackError::new("manifest_invalid", format!("{}: {}", path.display(), e.message()))
-    })
+    parse(&text).map_err(|e| e.into_error("manifest_invalid", &path, None))
 }
 
 pub fn read_bundle(dir: &Path, source: &str) -> Result<BundleManifest> {
@@ -229,6 +227,171 @@ pub fn read_bundle(dir: &Path, source: &str) -> Result<BundleManifest> {
     let text = fs::read_to_string(&path).map_err(|e| {
         StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: {e}"))
     })?;
-    toml::from_str(&text)
-        .map_err(|e| StackError::new("bundle_invalid", format!("{source}: {}", e.message())))
+    parse(&text).map_err(|e| e.into_error("bundle_invalid", &path, Some(source)))
+}
+
+/// A TOML document that failed to parse or to match its schema, located in its text.
+#[derive(Debug)]
+struct ParseFailure {
+    message: String,
+    at: Option<Location>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Location {
+    /// 1-based line.
+    line: usize,
+    /// 1-based, in characters rather than bytes, as editors count.
+    column: usize,
+    /// The line, then a caret under the column.
+    excerpt: String,
+}
+
+/// Longest stretch of one line an excerpt shows; longer lines are cut around the column.
+const EXCERPT_WIDTH: usize = 100;
+
+fn parse<T: serde::de::DeserializeOwned>(text: &str) -> std::result::Result<T, ParseFailure> {
+    toml::from_str(text).map_err(|e| ParseFailure {
+        message: e.message().trim_end().to_string(),
+        // A missing table or key is reported at an empty span, or one over the whole
+        // document, at its start: no place in the text to show.
+        at: e
+            .span()
+            .filter(|span| {
+                let rest = text.get(span.end..).unwrap_or_default();
+                span.start > 0 || !(span.is_empty() || rest.trim().is_empty())
+            })
+            .map(|span| locate(text, span.start)),
+    })
+}
+
+impl ParseFailure {
+    /// `<file>:<line>:<column>: <message>` and the excerpt. A bundle names its `use` source
+    /// first. The details repeat the location for programs.
+    fn into_error(self, code: &'static str, file: &Path, source: Option<&str>) -> StackError {
+        let origin = source.map(|s| format!("{s}: ")).unwrap_or_default();
+        let mut detail = serde_json::json!({ "file": file });
+        if let Some(source) = source {
+            detail["source"] = source.into();
+        }
+        let message = match &self.at {
+            Some(at) => {
+                detail["line"] = at.line.into();
+                detail["column"] = at.column.into();
+                format!("{origin}{}:{}:{}: {}\n{}", file.display(), at.line, at.column, self.message, at.excerpt)
+            }
+            None => format!("{origin}{}: {}", file.display(), self.message),
+        };
+        StackError::new(code, message).with_detail(detail)
+    }
+}
+
+/// Where byte `offset` of `text` is. Offsets past the end, or inside a character, are moved
+/// back to the nearest character start.
+fn locate(text: &str, offset: usize) -> Location {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
+    let line = text[..start].matches('\n').count() + 1;
+    let before = text[start..offset].chars().count();
+    let row: Vec<char> = text[start..end].trim_end_matches('\r').chars().collect();
+
+    // A window of the line that contains the column, marked where it was cut.
+    let from = before.saturating_sub(EXCERPT_WIDTH / 2).min(row.len().saturating_sub(EXCERPT_WIDTH));
+    let to = (from + EXCERPT_WIDTH).min(row.len());
+    let cut_before = if from > 0 { "…" } else { "" };
+    let cut_after = if to < row.len() { "…" } else { "" };
+    let shown: String = row[from..to].iter().collect();
+    // Tabs are kept so the caret lines up however the terminal renders them.
+    let pad: String = cut_before
+        .chars()
+        .chain(row[from..before.min(row.len())].iter().copied())
+        .map(|c| if c == '\t' { '\t' } else { ' ' })
+        .collect();
+    let number = line.to_string();
+    let gutter = " ".repeat(number.len());
+    Location {
+        line,
+        column: before + 1,
+        excerpt: format!("{gutter} |\n{number} | {cut_before}{shown}{cut_after}\n{gutter} | {pad}^"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(text: &str) -> ParseFailure {
+        parse::<ProjectManifest>(text).unwrap_err()
+    }
+
+    #[test]
+    fn syntax_errors_name_the_line_and_column_under_a_caret() {
+        let f = failure("[env]\nA = '1'\n[services.api\nrun = 'x'\n");
+        let at = f.at.unwrap();
+        assert_eq!((at.line, at.column), (3, 14));
+        assert_eq!(at.excerpt, "  |\n3 | [services.api\n  |              ^");
+        assert!(f.message.contains("invalid table header"), "{}", f.message);
+    }
+
+    #[test]
+    fn schema_errors_point_at_the_offending_key() {
+        let f = failure("[services.w]\nrun = 'x'\nrnu = 'y'\n");
+        let at = f.at.unwrap();
+        assert_eq!((at.line, at.column), (3, 1), "{}", at.excerpt);
+        assert!(f.message.contains("unknown field `rnu`"), "{}", f.message);
+    }
+
+    #[test]
+    fn errors_about_the_whole_document_have_no_location() {
+        let f = parse::<BundleManifest>("[tools]\npython = '3'\n").unwrap_err();
+        assert!(f.message.contains("missing field `bundle`") && f.at.is_none(), "{f:?}");
+        let e = f.into_error("bundle_invalid", Path::new("/b/bundle.toml"), Some("path:../b"));
+        assert_eq!(e.message, "path:../b: /b/bundle.toml: missing field `bundle`");
+    }
+
+    #[test]
+    fn columns_count_characters_not_bytes() {
+        let f = failure("[env]\nNAME = \"ünï✓\" x\n");
+        let at = f.at.unwrap();
+        assert_eq!((at.line, at.column), (2, 15), "{at:?}");
+        assert_eq!(at.excerpt, format!("  |\n2 | NAME = \"ünï✓\" x\n  | {}^", " ".repeat(14)));
+    }
+
+    #[test]
+    fn offsets_inside_a_character_or_past_the_end_still_locate() {
+        let text = "a = 1\nb = \"ü\"";
+        let inside = text.find('ü').unwrap() + 1;
+        assert_eq!(locate(text, inside).column, 6);
+        let end = locate(text, text.len() + 10);
+        assert_eq!((end.line, end.column), (2, 8));
+        assert_eq!(locate("", 0).excerpt, "  |\n1 | \n  | ^");
+        assert_eq!(locate("x\r\ny", 1).excerpt, "  |\n1 | x\n  |  ^");
+    }
+
+    #[test]
+    fn tabs_stay_under_the_caret_and_long_lines_are_cut_around_it() {
+        assert_eq!(locate("\tk = ?", 5).excerpt, "  |\n1 | \tk = ?\n  | \t    ^");
+        let long = format!("k = \"{}\" ?", "x".repeat(300));
+        let at = locate(&long, long.len() - 1);
+        let lines: Vec<&str> = at.excerpt.lines().collect();
+        assert!(lines[1].starts_with("1 | …x") && lines[1].ends_with("\" ?"), "{}", at.excerpt);
+        assert_eq!(lines[1].chars().count(), "1 | …".chars().count() + EXCERPT_WIDTH);
+        // The caret is under the last character shown.
+        assert_eq!(lines[2].chars().count(), lines[1].chars().count());
+        assert_eq!(at.column, long.chars().count());
+    }
+
+    #[test]
+    fn errors_keep_their_code_and_name_the_file_and_source() {
+        let e = failure("[x\n").into_error("bundle_invalid", Path::new("/b/bundle.toml"), Some("path:../b"));
+        assert_eq!(e.code, "bundle_invalid");
+        assert!(e.message.starts_with("path:../b: /b/bundle.toml:1:3: "), "{}", e.message);
+        assert_eq!(e.details[0]["line"], 1);
+        assert_eq!(e.details[0]["column"], 3);
+        assert_eq!(e.details[0]["source"], "path:../b");
+    }
 }

@@ -766,3 +766,25 @@ fn every_known_preset_and_omitted_version_gets_a_reusable_exact_pin() {
     assert_eq!(resolved(&updated, "nats"), "3.0.0");
     assert_eq!(resolved(&updated, "pg"), "18.1");
 }
+
+#[test]
+fn malformed_manifests_are_located_by_file_line_and_column() {
+    let sb = Sandbox::new();
+    let root = sb.project("[env]\nA = '1'\n[services.api\nrun = 'x'\n");
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "manifest_invalid");
+    let file = root.join("stack.toml");
+    assert!(err.message.starts_with(&format!("{}:3:14: invalid table header", file.display())), "{}", err.message);
+    assert!(err.message.ends_with("3 | [services.api\n  |              ^"), "{}", err.message);
+    assert_eq!((err.details[0]["line"].as_u64(), err.details[0]["column"].as_u64()), (Some(3), Some(14)));
+
+    let repo = sb.bundle("broken", "[bundle]\nname = 'b'\n[services.w]\nrun = 'x'\nreddy_port = 3\n");
+    fs::write(root.join("stack.toml"), use_git(&repo, "v1")).unwrap();
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid");
+    let source = format!("git+file://{}?ref=v1", repo.display());
+    assert!(err.message.starts_with(&format!("{source}: ")), "{}", err.message);
+    assert!(err.message.contains("bundle.toml:5:1: unknown field `reddy_port`"), "{}", err.message);
+    assert!(err.message.ends_with("5 | reddy_port = 3\n  | ^"), "{}", err.message);
+    assert_eq!(err.details[0]["source"], source.as_str());
+}
