@@ -75,6 +75,14 @@ case "$1 $2" in
       printf '{"fnox":'; cat "$REVIEW_FIXTURE/ls.json"; echo '}'
     else echo '{}'; fi ;;
   'skills ls') echo '[]' ;;
+  'lock --platform')
+    # Artifact locking in a scratch root: what it was given, then the lock a test supplies.
+    { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml; echo '--- seed'; cat .config/mise/mise.lock; } >>"$REVIEW_FIXTURE/lock.log"
+    if test -f "$REVIEW_FIXTURE/mise-lock.toml"; then cp "$REVIEW_FIXTURE/mise-lock.toml" .config/mise/mise.lock; fi ;;
+  'install --locked'|'install --yes')
+    # The rendered lock as the install saw it.
+    if test -f .config/mise/mise.lock; then cp .config/mise/mise.lock "$REVIEW_FIXTURE/rendered-at-install"; fi
+    if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
     echo 'mise WARN  mise version 2099.1.1 available' >&2
@@ -3725,4 +3733,179 @@ fn templated_fnox_pins_never_reach_the_release_query() {
     assert!(!fs::read_to_string(root.join("ls.log")).unwrap_or_default().contains("exec("), "a template reached `mise ls`");
     assert!(fnox_log(&fixture).is_empty());
     assert!(!marker.exists());
+}
+
+// ---- artifact locking ----------------------------------------------------------------------
+
+const TOOLS_BUNDLE: &str = "[bundle]\nname='test'\n[tools]\njq='1.7.1'\nrust='1.93.1'\n'npm:prettier'='3.6.2'\nuv='0.9.0'\n[env]\nHOOK=\"{{ exec(command='touch hook-ran') }}\"\n";
+
+/// A lock `mise lock` hands back: jq checked on this platform, rust exempt, prettier with a
+/// sidecar reference, uv not lockable.
+fn tool_lock(platform: &str) -> String {
+    format!(
+        r#"lockfile_version = 3
+[[tools.jq]]
+version = "1.7.1"
+backend = "aqua:jqlang/jq"
+specifiers = ["1.7.1"]
+[tools.jq."platforms.{platform}"]
+checksum = "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a"
+url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64"
+[[tools.rust]]
+version = "1.93.1"
+backend = "core:rust"
+specifiers = ["1.93.1"]
+[[tools."npm:prettier"]]
+version = "3.6.2"
+aube = {{ path = "locks/npm-prettier/3.6.2", digest = "sha256:0b89" }}
+backend = "npm:prettier"
+specifiers = ["3.6.2"]
+"#
+    )
+}
+
+/// The project locked for this platform only, with `extra` appended to stack.toml.
+fn artifact_fixture(extra: &str) -> (Fixture, String) {
+    let fixture = Fixture::with_bundle(TOOLS_BUNDLE);
+    let platform = stack::artifacts::current_platform();
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(&platform)).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\n{extra}")).unwrap();
+    fixture.ok(&["compile"]);
+    (fixture, platform)
+}
+
+fn mise_log(fixture: &Fixture) -> String {
+    fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap_or_default()
+}
+
+#[test]
+fn compile_locks_in_a_tools_only_scratch_root_and_install_partitions_by_coverage() {
+    let (fixture, platform) = artifact_fixture("");
+    let lock_log = fs::read_to_string(fixture.dir.path().join("lock.log")).unwrap();
+    assert!(lock_log.contains(&format!("args=lock --platform {platform} ")), "{lock_log}");
+    let last = lock_log.rsplit("dir=").next().unwrap();
+    assert!(last.contains("[tools]") && !last.contains("[env]") && !last.contains("HOOK"), "{last}");
+    assert!(!last.contains("/app"), "never in the project: {last}");
+    assert!(!fixture.dir.path().join("app/hook-ran").exists());
+    let stack_lock = fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap();
+    assert!(stack_lock.contains("version = 3") && stack_lock.contains("[provider_lock]") && !stack_lock.contains("aube"), "{stack_lock}");
+
+    let before = mise_log(&fixture).len();
+    let result = json_result(&fixture.ok(&["install", "--json"]));
+    let calls: Vec<String> = mise_log(&fixture)[before..].lines().filter(|l| l.starts_with("install")).map(|l| l.trim().to_string()).collect();
+    assert_eq!(calls, ["install --locked --yes --quiet jq rust", "install --yes --quiet npm:prettier uv"], "{result}");
+    let detail = &result["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "install").unwrap()["detail"];
+    assert_eq!(detail["locked"], json!(["jq", "rust"]));
+    assert_eq!(detail["plain"], json!(["npm:prettier", "uv"]));
+    assert_eq!(detail["artifacts"]["platform"], platform.as_str());
+    assert_eq!(detail["artifacts"]["verified"], json!(["jq@1.7.1"]));
+    assert_eq!(detail["artifacts"]["exempt"], json!(["rust@1.93.1"]));
+    assert_eq!(detail["artifacts"]["unsupported"], json!(["npm:prettier@3.6.2"]));
+    assert_eq!(detail["artifacts"]["missing"], json!(["uv@0.9.0"]));
+    assert!(detail["boundary"].as_str().unwrap().contains("already installed"));
+    // The lock mise checked against was rendered from stack.lock before the install.
+    let rendered = fs::read_to_string(fixture.dir.path().join("rendered-at-install")).unwrap();
+    assert!(rendered.contains("sha256:0bbe619e") && !rendered.contains("aube") && !rendered.contains("provider ="), "{rendered}");
+
+    // status reports this platform's coverage; exec neither installs nor renders.
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["artifacts"]["verified"], json!(["jq@1.7.1"]), "{status}");
+    fs::remove_file(fixture.dir.path().join("app/.config/mise/mise.lock")).unwrap();
+    let before = mise_log(&fixture).len();
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.command(&["status", "--json"]).output().unwrap();
+    assert!(!fixture.dir.path().join("app/.config/mise/mise.lock").exists());
+    assert!(!mise_log(&fixture)[before..].contains("install") && !mise_log(&fixture)[before..].contains("lock --platform"));
+    // A second ordinary compile with nothing new to lock asks mise for nothing.
+    fs::remove_file(fixture.dir.path().join("lock.log")).unwrap();
+    let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
+    let jq = inspect["data"]["versions"].as_array().unwrap().iter().find(|v| v["name"] == "jq").unwrap().clone();
+    assert_eq!(jq["backend"], "aqua:jqlang/jq");
+    assert_eq!(jq["artifacts"][platform.as_str()]["state"], "verified", "{jq}");
+}
+
+#[test]
+fn refused_downloads_and_signers_are_artifact_mismatch_and_other_failures_install_failed() {
+    let (fixture, platform) = artifact_fixture("");
+    let checksum = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/x/jq-macos-arm64:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:1111\n");
+    fs::write(fixture.dir.path().join("install-locked-fail"), &checksum).unwrap();
+    let before = mise_log(&fixture).len();
+    let out = fixture.command(&["install", "--json"]).output().unwrap();
+    let e = &json_result(&out)["error"];
+    assert_eq!(e["code"], "artifact_mismatch", "{e}");
+    assert_eq!(e["details"][0], json!({ "kind": "checksum", "name": "jq@1.7.1", "platform": platform, "expected": "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a", "actual": "sha256:1111", "url": "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64" }));
+    assert!(e["hint"].as_str().unwrap().contains("compile --update"));
+    assert!(!mise_log(&fixture)[before..].contains("install --yes"), "nothing else is installed after a refusal");
+
+    fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says sigstore-oidc:a signed fnox@1.39.0, but this release is signed by sigstore-oidc:b; remove the entry from mise.lock to accept the new signer\n").unwrap();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!((e["code"].as_str(), e["details"][0]["kind"].as_str(), e["details"][0]["expected"].as_str()), (Some("artifact_mismatch"), Some("signer"), Some("sigstore-oidc:a")));
+
+    fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR network unreachable\n").unwrap();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "install_failed");
+}
+
+#[test]
+fn version_2_locks_install_plainly_and_required_policies_refuse_before_any_install() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    // The lock the fixture compiled, turned into version 2.
+    let v3 = fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap();
+    let v2 = v3.replace("version = 3", "version = 2");
+    let v2 = v2.split("[provider_lock]").next().unwrap().to_string();
+    fs::write(fixture.dir.path().join("app/stack.lock"), &v2).unwrap();
+    let before = mise_log(&fixture).len();
+    let result = json_result(&fixture.ok(&["install", "--json"]));
+    let log = &mise_log(&fixture)[before..];
+    assert!(log.contains("install --yes --quiet jq") && !log.contains("--locked"), "{log}");
+    let detail = &result["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "install").unwrap()["detail"];
+    assert_eq!(detail["artifacts"]["missing"], json!(["jq@1.7.1"]));
+    assert!(!fixture.dir.path().join("app/.config/mise/mise.lock").exists(), "nothing to render from version 2");
+    assert_eq!(fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap(), v2, "install never rewrites it");
+
+    let required = |extra: &str| fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nartifacts='required'\n{extra}")).unwrap();
+    required("");
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "lock_outdated", "{e}");
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+
+    // A version 3 lock that leaves a pin unsupported, or this platform unlisted.
+    let (fixture, _) = artifact_fixture("");
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\nartifacts='required'\n").unwrap();
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "artifact_unlocked", "{e}");
+    assert!(e["details"].as_array().unwrap().iter().any(|d| d["name"] == "npm:prettier@3.6.2" && d["state"] == "unsupported"), "{e}");
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    let other = if stack::artifacts::current_platform() == "linux-x64" { "linux-arm64" } else { "linux-x64" };
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(other).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['{other}']\nartifacts='required'\n")).unwrap();
+    fixture.ok(&["compile"]);
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "artifact_unlocked", "{e}");
+    assert_eq!(e["details"][0]["state"], "unlisted");
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+}
+
+#[test]
+fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so() {
+    let (fixture, _) = artifact_fixture("");
+    fs::remove_file(fixture.dir.path().join("app/.config/mise/mise.lock")).unwrap();
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.15 macos-arm64 (2026-09-15)\n").unwrap();
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "provider_outdated", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("2026.9.16"));
+    assert!(!fixture.dir.path().join("app/.config/mise/mise.lock").exists());
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+    let doctor = json_result(&fixture.command(&["doctor", "--json"]).output().unwrap());
+    let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "mise_release").unwrap().clone();
+    assert_eq!(check["ok"], false, "{doctor}");
+    assert!(check["detail"].as_str().unwrap().contains("2026.9.16"), "{check}");
+    let e = json_result(&fixture.command(&["compile", "--locked", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "provider_outdated");
 }
