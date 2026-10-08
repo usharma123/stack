@@ -262,19 +262,63 @@ mod tests {
         }
     }
 
+    /// Set in the child [`rerun_cleanly`] starts.
+    const CLEAN_RUN: &str = "STACK_GIT_TEST_CLEAN_RUN";
+
+    /// Run test `name` of this module again in a child process that sees no git configuration
+    /// outside the repository and no proxy settings, so neither can change where git connects.
+    /// Everything it writes stays in `scratch`. Bounded, so a git never cut short fails the test
+    /// rather than hanging it.
+    fn rerun_cleanly(name: &str, scratch: &Path) {
+        let name = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"]).env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        for (var, rel) in [("HOME", "home"), ("TMPDIR", "tmp"), ("XDG_CONFIG_HOME", "xdg")] {
+            fs::create_dir(scratch.join(rel)).unwrap();
+            command.env(var, scratch.join(rel));
+        }
+        command.envs([("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null"), (CLEAN_RUN, "1")]);
+        let run = crate::process::capture(&mut command, Duration::from_secs(30), 1 << 20).unwrap();
+        let report = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert!(!run.timed_out, "{name} did not finish within 30s\n{report}");
+        assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "{name} failed\n{report}");
+    }
+
     #[test]
     fn a_clone_cut_short_publishes_nothing_and_leaves_nothing_behind() {
         let tmp = tempfile::tempdir().unwrap();
+        if std::env::var_os(CLEAN_RUN).is_none() {
+            return rerun_cleanly("a_clone_cut_short_publishes_nothing_and_leaves_nothing_behind", tmp.path());
+        }
         let cache = tmp.path().join("cache");
-        // Accepts connections and never answers, as a stalled remote would.
+        // Takes the request and never answers it, as a stalled remote would.
         let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let url = format!("http://127.0.0.1:{}/repo.git", silent.local_addr().unwrap().port());
+        let (requested, request) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (conn, _) = silent.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&conn), &mut line).unwrap();
+            requested.send(line).unwrap();
+            // Held open until git is gone.
+            let _ = std::io::copy(&mut &conn, &mut std::io::sink());
+        });
+        let limit = Duration::from_millis(500);
         let start = Instant::now();
         let cut = {
-            let _deadline = crate::process::deadline_scope(Some(start + Duration::from_millis(500)));
+            let _deadline = crate::process::deadline_scope(Some(start + limit));
             ensure_mirror(&cache, &url, false).expect_err("the remote never answers")
         };
-        assert!(start.elapsed() < Duration::from_secs(5), "{:?}: {cut}", start.elapsed());
+        let elapsed = start.elapsed();
+        let request = request.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("git never reached the remote: {cut}"));
+        assert!(request.starts_with("GET /repo.git/info/refs"), "{request:?}");
+        // Killed while waiting, so git never got to say why it failed.
+        assert_eq!(cut.code, "git_failed", "{cut}");
+        assert!(cut.message.ends_with("failed: "), "{cut}");
+        assert!(elapsed >= limit && elapsed < limit + Duration::from_secs(5), "{elapsed:?}: {cut}");
         let mirror = mirror_path(&cache, &url);
         assert_eq!(entries(&cache.join("git")), [format!("{}.lock", mirror.file_name().unwrap().to_string_lossy())].into(), "{cut}");
     }
