@@ -41,7 +41,8 @@ resolve a conflict or replace a value, and every override is reported with what 
 
 ## Versions
 
-`stack.lock` version 2 records `[[tool]]` and `[[service]]` entries: `name`, `requested` (as
+`stack.lock` version 3 records `[[tool]]` and `[[service]]` entries (as version 2 did) and
+embeds mise's artifact lock under `[provider_lock]` (see below). The entries are: `name`, `requested` (as
 composed), `resolved` (an exact release), `resolved_on` (the platform that resolved it) and, for
 services, the provider `tool` the preset installs. Resolution is `mise latest <tool>@<request>`,
 run outside any project so project configuration cannot change what a request means; empty
@@ -64,13 +65,21 @@ output (mise's answer when no release matches) is an error, not a version.
   empty and nonrelease values cannot replace an exact pin. `--update` can repair invalid pins.
 - Stack isolates mise config selection for resolution, installation, daemons and nested exec.
   Only its generated file is loaded; parent/global/project aliases are excluded.
-- Version 1 locks are read for migration only. `compile` rewrites them as version 2 keeping every
+- Version 1 locks are read for migration only. `compile` rewrites them keeping every
   bundle pin; locked operations refuse them. Moving a running session from a range to its exact
   release is a configuration change, so the next `up` restarts it. Within a major version
   (`17` → `17.11`, `8` → `8.10.2`) mise's presets reuse existing data; this was checked on macOS
   with mise 2026.9.18.
-- An exact version is not an artifact checksum: the same version string could in principle be
-  served as different bytes. mise's own lockfile checksums are not used yet.
+- An exact version is not an artifact checksum. `[provider_lock]` is mise's `mise.lock`
+  re-nested verbatim (plus stack's `provider` and `stack_sidecars` keys), matched to pins by
+  tool name as rendered and version; its `options` are mise's own and never compared with
+  declared options. `compile` locks the pins that need entries in a scratch root seeded with
+  nothing for them and merges: committed values change only under `--update`, differences are
+  reported, a skipped refresh is `retained`, shared conda records are merged per (platform,
+  package) and pruned when unreferenced. Locked operations render `.config/mise/mise.lock` from
+  stack.lock before installing and split the install into `mise install --locked` (verified or
+  exempt here) and plain `mise install` (unsupported or missing). Version 2 locks remain valid
+  under `best-effort`; `required` refuses them. See [Artifact checksums](user/commands.md#artifact-checksums).
 
 ## Runtime contract
 
@@ -209,7 +218,9 @@ staging directory behind.
   x64 macOS is not exercised by the service scenarios.
 - Identity probes are opt-in; services without one, and presets other than Postgres and Redis,
   are liveness-only.
-- Exact versions are release names, not artifact checksums.
+- Artifact checksums cover what mise can lock and downloads; releases already installed are not
+  re-checked, and npm/Python dependency graphs, URL-less backends and tools mise cannot lock
+  (redis today) are reported but not covered.
 - OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
 - Unattended expiry needs `stack gc --watch` running under a supervisor of your choice.
 - Deleted-project cleanup depends on what was recorded at launch; it refuses rather than guesses.

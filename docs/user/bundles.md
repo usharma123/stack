@@ -129,3 +129,10 @@ run = "cargo build"
 See [commands](commands.md) for compile options and [guarantees](guarantees.md) for locking and conflict rules.
 
 [All docs](../README.md)
+
+## Artifact lock settings
+
+`[lock]` (`platforms`, `artifacts`) belongs to the project's `stack.toml` only; a bundle that
+sets it is `bundle_invalid`. Bundles cannot weaken or widen a project's artifact policy. See
+[Artifact checksums](commands.md#artifact-checksums).
+

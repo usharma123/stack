@@ -46,6 +46,13 @@ When that fails (`mise x -- pitchfork supervisor start` exits non-zero, or mise 
 found or run), the supervisor is not asked and the error is `start_failed`, `stop_failed`
 or `provider_unavailable`; one still running at the deadline is left to finish.
 
+`install` and `up` report this platform's artifact coverage in their `install` step
+(`artifacts.verified`, `exempt`, `unsupported`, `missing`), and `compile`/`inspect` report it per
+`versions[]` entry and platform. `artifact_mismatch` means mise refused a download or signer that
+differs from stack.lock: do not work around it; report it, and only run `stack compile --update`
+when the change is expected upstream. `artifact_unlocked` means the project requires coverage
+that stack.lock lacks. A `verified` release already installed on the machine was not re-checked.
+
 `stack up` does not restart a service whose configuration is unchanged, so after editing code a
 service loaded, run `stack restart <service>`. Declare `watch = [...]` on the service and
 `status`, `exec` and `run` tell you when that is needed. `stack logs <service> --since-start`

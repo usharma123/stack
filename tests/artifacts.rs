@@ -594,3 +594,16 @@ fn compile_reports_inspect_artifacts_without_a_lock_as_unresolved() {
 fn mise_inspect_mode(sb: &Sandbox) -> Mode {
     stack::project::inspect_mode(&sb.root())
 }
+
+#[test]
+fn only_the_project_sets_the_artifact_policy() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("bundle.toml"), "[bundle]\nname = \"b\"\n[lock]\nartifacts = \"best-effort\"\n").unwrap();
+    let e = stack::manifest::read_bundle(dir.path(), "path:b").unwrap_err();
+    assert_eq!(e.code, "bundle_invalid");
+    assert!(e.message.contains("lock"), "{e:?}");
+    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\n[lock]\nplatforms = [\"macos-aarch64\"]\n");
+    let e = sb.compile(Mode::UseLock).unwrap_err();
+    assert_eq!(e.code, "manifest_invalid");
+    assert_eq!(sb.files(), vec![None, None, None]);
+}

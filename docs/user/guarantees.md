@@ -8,9 +8,20 @@
   the exact release, so a fresh machine installs the same versions after upstream releases.
   `compile` resolves only new or changed requests, `--update` re-resolves all of them and
   reports moves, and `--locked` (and `up`, `exec`, `status`) refuse missing or stale pins.
-  An exact version names a release; it is not a checksum of the downloaded artifact.
+  An exact version names a release; the artifact checksums below are what pin the bytes.
   A tool's [allowlisted options](bundles.md#tool-options) are part of its pin: stack.lock
   records them, and changing one is a changed request (`lock_outdated` in locked mode).
+- **Artifact checksums.** `stack.lock` embeds mise's lock for every pin on each `[lock]
+  platforms` entry. A release downloaded on a platform where its coverage is `verified` has the
+  checksum stack.lock records (and for packslip-backed tools the recorded signer), or `install`
+  and `up` fail with `artifact_mismatch` naming the tool. Committed checksums change only through
+  `compile --update`, which reports every change; ordinary `compile` keeps them and warns when
+  upstream differs. Coverage (`verified`, `exempt`, `unsupported`, `missing`) is reported per
+  tool and platform, and nothing is called verified that mise did not check. Not covered: tools
+  mise cannot lock (redis today), backends without download URLs (`core:rust`, `cargo`, `go`),
+  npm and Python dependency graphs, and releases already installed on the machine, which mise
+  does not re-check. `[lock] artifacts = "required"` turns any gap on a listed platform into
+  `artifact_unlocked`. See [Artifact checksums](commands.md#artifact-checksums).
 - **No silent conflicts.** If two layers define the same key differently, compile fails with every
   conflict listed. Only `[override.*]` resolves one, and the output records what it replaced.
 - **Bundles carry files.** `{{bundle_dir}}` and `paths.bin` resolve to the bundle's own files.
@@ -62,7 +73,9 @@ and global mise aliases cannot reinterpret locked releases. Put application vari
 tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected.
 Version resolution runs `mise latest` in a scratch provider root of its own under stack's
 cache, whose only configuration is the one tool and its options; nothing in the project's
-`[env]` or tasks is evaluated, and the root is removed afterwards.
+`[env]` or tasks is evaluated, and the root is removed afterwards. Artifact locking does the
+same with one scratch root per `compile` naming every pin at its exact version; values with
+template syntax are refused before mise could evaluate them.
 Skills discovery (`inspect`, `compile`, the `skills` step) works the same way, in a scratch
 root naming only stack.lock's pins; tool versions and options with template syntax are
 rejected because mise would evaluate them there.
