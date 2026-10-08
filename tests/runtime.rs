@@ -1783,6 +1783,64 @@ fn deleted_projects_are_retained_until_the_supervisor_confirms_terminal_cleanup(
     assert_eq!(fixture.gc(&[]).1["data"], json!([]));
 }
 
+/// The recorded supervisor, moved where every path segment needs shell quoting.
+fn awkward_provider(fixture: &Fixture) -> (String, String) {
+    let weird = fixture.dir.path().join("we ird 'q' \"dq\" $HOME `id` $(id) ;|&*?\\ ü");
+    fs::create_dir(&weird).unwrap();
+    let pitchfork = weird.join("pitch fork");
+    fs::copy(fixture.dir.path().join("bin/pitchfork"), &pitchfork).unwrap();
+    let state_dir = weird.join("state $(touch pwned)");
+    let index = fs::read_dir(fixture.dir.path().join("state/sessions")).unwrap().next().unwrap().unwrap().path();
+    let mut session: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+    session["provider"] = json!({ "pitchfork": pitchfork, "state_dir": state_dir });
+    fs::write(&index, session.to_string()).unwrap();
+    (pitchfork.to_str().unwrap().into(), state_dir.to_str().unwrap().into())
+}
+
+#[test]
+fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    let (pitchfork, state_dir) = awkward_provider(&fixture);
+    fixture.supervisor_tracks(running.service.0, running.port);
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok, "{result}");
+    let service = &result["error"]["details"][0]["services"][0];
+    let recovery = &service["recovery"];
+    assert_eq!(recovery["recorded_pid"], running.service.0, "{result}");
+    assert_eq!(recovery["recorded_port"], running.port, "{result}");
+    let (inspect, stop) = (recovery["inspect"].as_str().unwrap(), recovery["stop"].as_str().unwrap());
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains(inspect) && hint.contains(stop), "{hint}");
+    assert!(running.service.alive(), "GC must not stop by daemon name");
+
+    let shell = |command: &str| {
+        let out = Command::new("sh").args(["-c", command]).env("REVIEW_FIXTURE", fixture.dir.path()).output().unwrap();
+        assert!(out.status.success(), "{command}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(shell(inspect).contains(&format!("\"pid\":{}", running.service.0)));
+    assert!(running.service.alive(), "inspect stopped the service");
+    shell(stop);
+    let log = fixture.pitchfork_log();
+    for action in ["status", "stop"] {
+        assert!(log.lines().any(|l| l == format!("{state_dir} {action} -- {WEB_ID}")), "{action}: {log}");
+    }
+    assert!(!fixture.dir.path().join("pwned").exists() && !Path::new("pwned").exists(), "a recorded path was executed");
+    assert!(Path::new(&pitchfork).exists());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running.service.alive() {
+        assert!(Instant::now() < deadline, "stop did not reach the service");
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(fixture.dir.path().join("pf-status.json"), json!({ "id": WEB_ID, "status": "stopped" }).to_string()).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    assert_eq!(fixture.index_files(), 0);
+}
+
 #[test]
 fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
@@ -1813,6 +1871,13 @@ fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
         assert!(running.service.alive() && other.alive(), "{case}: a process was signalled");
         assert_eq!(fixture.index_files(), 1, "{case}: ownership record dropped");
         assert!(!fixture.pitchfork_log().contains(" stop "), "{case}: {}", fixture.pitchfork_log());
+        let service = &result["error"]["details"][0]["services"][0];
+        // Only the recorded generation, still reported as such, may be offered for a manual stop.
+        let matches = case == "replacement after status";
+        assert_eq!(service["recovery"].get("stop").is_some(), matches, "{case}: {result}");
+        if case != "query fails" {
+            assert!(service["recovery"]["inspect"].is_string(), "{case}: {result}");
+        }
     }
 }
 

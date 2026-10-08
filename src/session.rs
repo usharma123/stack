@@ -1914,7 +1914,46 @@ pub struct GcEntry {
     pub error: Option<String>,
     /// Per-service outcomes for a gone project.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub services: Vec<Value>,
+    pub services: Vec<GcService>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GcService {
+    pub service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<Recovery>,
+}
+
+/// Commands a person runs to finish what GC refused to do itself. They are POSIX shell
+/// commands with every recorded value quoted, so they can be copied as they are.
+#[derive(Debug, Serialize)]
+pub struct Recovery {
+    /// Shows what runs now: under the recorded supervisor id, or as the recorded pid.
+    pub inspect: String,
+    /// Offered only while the supervisor still reports the recorded pid and port. Run it only
+    /// after `inspect` shows the same pid: nothing makes the check and the stop atomic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recorded_port: Option<u16>,
+}
+
+/// Why a gone project's service keeps its record, and what a person can do about it.
+struct Unconfirmed {
+    why: String,
+    recovery: Option<Recovery>,
+}
+
+impl From<String> for Unconfirmed {
+    fn from(why: String) -> Self {
+        Self { why, recovery: None }
+    }
 }
 
 /// Reclaim sessions whose lease expired or whose project directory is gone.
@@ -1989,11 +2028,12 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
+        let service = name.clone();
         match reconcile_gone(session.provider.as_ref(), record, session.launching) {
-            Ok(outcome) => services.push(json!({ "service": name, "outcome": outcome })),
-            Err(why) => {
-                services.push(json!({ "service": name, "error": why }));
+            Ok(outcome) => services.push(GcService { service, outcome: Some(outcome), error: None, recovery: None }),
+            Err(Unconfirmed { why, recovery }) => {
                 problems.push(format!("{name}: {why}"));
+                services.push(GcService { service, outcome: None, error: Some(why), recovery });
             }
         }
     }
@@ -2011,19 +2051,31 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
     }
 }
 
-fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, launching: bool) -> std::result::Result<String, String> {
+fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, launching: bool) -> std::result::Result<String, Unconfirmed> {
     let alive = record.pid.is_some_and(pid_alive);
     let listening = record.port != 0 && accepting(record.port);
     let (Some(provider), Some(id)) = (provider, record.provider_id.as_deref()) else {
         return Err(match record.pid {
-            Some(pid) if alive => format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
-            _ => "no supervisor identity was recorded; terminal state cannot be confirmed; record retained".into(),
+            Some(pid) if alive => Unconfirmed {
+                why: format!("pid {pid} is alive, but no supervisor id was recorded to confirm it is this service; not signalled"),
+                recovery: Some(process_recovery(pid, record)),
+            },
+            _ => String::from("no supervisor identity was recorded; terminal state cannot be confirmed; record retained").into(),
         });
+    };
+    let supervisor = |stop: bool| Recovery {
+        inspect: pitchfork_command(provider, "status", id),
+        stop: stop.then(|| pitchfork_command(provider, "stop", id)),
+        recorded_pid: record.pid,
+        recorded_port: (record.port != 0).then_some(record.port),
     };
     match mise::supervised(&provider.pitchfork, &provider.state_dir, id)? {
         mise::Supervised::NotFound => match record.pid {
-            _ if launching => Err("startup was interrupted or failed; absence of a daemon now does not prove that startup cannot still register it; record retained".into()),
-            Some(pid) if alive => Err(format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled")),
+            _ if launching => Err(String::from("startup was interrupted or failed; absence of a daemon now does not prove that startup cannot still register it; record retained").into()),
+            Some(pid) if alive => Err(Unconfirmed {
+                why: format!("the supervisor no longer tracks {id}, and pid {pid} is alive (possibly reused); not signalled"),
+                recovery: Some(process_recovery(pid, record)),
+            }),
             _ if listening => Ok(format!("port {} is held by a process the supervisor does not track; left alone", record.port)),
             _ => Ok("not running".into()),
         },
@@ -2031,24 +2083,83 @@ fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, lau
             if status == "stopped" && !alive && !pid.is_some_and(pid_alive) && !launching {
                 return Ok("not running (supervisor confirms stopped)".into());
             }
+            // Whatever runs under the id now may not be this generation: offer only `inspect`.
+            let unconfirmed = |why: String| Err(Unconfirmed { why, recovery: Some(supervisor(false)) });
             if status != "running" || !pid.is_some_and(pid_alive) {
-                return Err(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
+                return unconfirmed(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
             }
             let Some(recorded) = record.pid else {
-                return Err(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
+                return unconfirmed(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
             };
             if pid != Some(recorded) {
-                return Err(format!(
+                return unconfirmed(format!(
                     "{id} now runs pid {}, not the recorded pid {recorded} (restarted, or the path was reused); not signalled",
                     pid.unwrap_or(0)
                 ));
             }
             if port != Some(record.port) {
-                return Err(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
+                return unconfirmed(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
             }
-            Err(format!("{id} matches pid {recorded}, but Pitchfork cannot atomically validate and stop that generation; not signalled. Stop the service explicitly and retry GC"))
+            Err(Unconfirmed {
+                why: format!(
+                    "{id} matches pid {recorded}, but Pitchfork cannot atomically validate and stop that generation; not signalled. \
+                     Inspect it, stop it explicitly only if it is still pid {recorded}, and retry GC"
+                ),
+                recovery: Some(supervisor(true)),
+            })
         }
     }
+}
+
+/// `PITCHFORK_STATE_DIR=<dir> <pitchfork> <action> -- <id>`: the recorded supervisor, reached
+/// the way GC reached it, without the deleted project's configuration.
+fn pitchfork_command(provider: &ProviderRecord, action: &str, id: &str) -> String {
+    format!(
+        "PITCHFORK_STATE_DIR={} {} {action} -- {}",
+        shell_quote(&provider.state_dir.to_string_lossy()),
+        shell_quote(&provider.pitchfork.to_string_lossy()),
+        shell_quote(id)
+    )
+}
+
+/// Without a supervisor that vouches for the pid, a person can only look at it.
+fn process_recovery(pid: u32, record: &ServiceRecord) -> Recovery {
+    Recovery {
+        inspect: format!("ps -o pid,lstart,command -p {pid}"),
+        stop: None,
+        recorded_pid: Some(pid),
+        recorded_port: (record.port != 0).then_some(record.port),
+    }
+}
+
+/// One POSIX shell word for `value`. Words that cannot be misread are left bare for legibility.
+fn shell_quote(value: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || "_-./,:@+".contains(c);
+    if !value.is_empty() && value.chars().all(bare) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// What a person runs to finish the cleanup GC refused, one service per paragraph.
+fn recovery_steps(entries: &[GcEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|e| e.services.iter())
+        .filter_map(|s| {
+            let recovery = s.recovery.as_ref()?;
+            let recorded = match (recovery.recorded_pid, recovery.recorded_port) {
+                (Some(pid), Some(port)) => format!(" (recorded pid {pid}, port {port})"),
+                (Some(pid), None) => format!(" (recorded pid {pid})"),
+                _ => String::new(),
+            };
+            let mut step = format!("  {}{recorded}:\n    {}", s.service, recovery.inspect);
+            if let Some(stop) = &recovery.stop {
+                step.push_str(&format!("\n    {stop}"));
+            }
+            Some(step)
+        })
+        .collect()
 }
 
 /// Like [`gc`], but fails when any session it tried to reclaim is still running or could not
@@ -2063,8 +2174,21 @@ pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
         "gc_incomplete",
         format!("{failed} session(s) could not be confirmed stopped"),
     )
-    .hint("retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed")
+    .hint(gc_hint(&entries))
     .details(entries.iter().map(|e| serde_json::to_value(e).expect("gc entry serializes")).collect()))
+}
+
+fn gc_hint(entries: &[GcEntry]) -> String {
+    let steps = recovery_steps(entries);
+    if steps.is_empty() {
+        return "retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed".into();
+    }
+    format!(
+        "services of a deleted or replaced checkout are never stopped by name. For each service below, run \
+         the inspect command; run the stop command, where offered, only if inspect shows the recorded pid. \
+         Then retry `stack gc`. Records are kept until cleanup is confirmed\n{}",
+        steps.join("\n")
+    )
 }
 
 fn load(ctx: &Ctx) -> Result<Option<Session>> {
@@ -2777,5 +2901,49 @@ mod tests {
         );
         let err = run_probe(&env, "redis-cli", &[]).unwrap_err();
         assert!(err.contains("printed more than"), "{err}");
+    }
+
+    /// Values a recorded path or id could hold, including every character a shell treats
+    /// specially somewhere, and the empty string.
+    const AWKWARD: &[&str] = &[
+        "plain/path-1.2_x",
+        "",
+        "two words",
+        "it's",
+        "''",
+        "\"double\"",
+        "$HOME ${HOME} $(id) `id`",
+        "a\\b\\",
+        "line\nbreak\ttab",
+        "*?[a-z]{1,2}",
+        ";|&<>()!#%^",
+        "~root",
+        "=x",
+        "-n",
+        "ünïcødé ✓",
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quoted_words_reach_a_command_unchanged() {
+        for shell in ["sh", "bash", "zsh"] {
+            if which_in(std::env::var("PATH").ok().as_deref(), shell).is_none() {
+                continue;
+            }
+            for value in AWKWARD {
+                let script = format!("printf '%s' {}", shell_quote(value));
+                let out = Command::new(shell).args(["-c", &script]).output().unwrap();
+                assert_eq!(String::from_utf8_lossy(&out.stdout), *value, "{shell}: {script}");
+            }
+        }
+    }
+
+    #[test]
+    fn pitchfork_commands_name_the_recorded_supervisor_and_id() {
+        let provider = ProviderRecord { pitchfork: "/opt/pf/bin/pitchfork".into(), state_dir: "/tmp/pf state".into() };
+        assert_eq!(
+            pitchfork_command(&provider, "status", "app-0123/web"),
+            "PITCHFORK_STATE_DIR='/tmp/pf state' /opt/pf/bin/pitchfork status -- app-0123/web"
+        );
     }
 }
