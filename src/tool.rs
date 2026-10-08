@@ -73,6 +73,7 @@ impl ToolSpec {
                 .with_detail(serde_json::json!({ "tool": name, "origin": origin }))
         };
         let table = match value {
+            toml::Value::String(version) if templated(version) => return Err(invalid(TEMPLATE.into())),
             toml::Value::String(version) => return Ok(Self::new(version.clone())),
             toml::Value::Table(table) => table,
             other => {
@@ -83,6 +84,7 @@ impl ToolSpec {
             }
         };
         let version = match table.get("version") {
+            Some(toml::Value::String(v)) if templated(v) => return Err(invalid(TEMPLATE.into())),
             Some(toml::Value::String(v)) if !v.trim().is_empty() => v.clone(),
             Some(toml::Value::String(_)) => return Err(invalid("`version` is empty".into())),
             Some(other) => return Err(invalid(format!("`version` must be a string, found {}", other.type_str()))),
@@ -99,6 +101,9 @@ impl ToolSpec {
             let value = match (allowed.kind, value) {
                 (Kind::Bool, toml::Value::Boolean(b)) => OptionValue::Bool(*b),
                 (Kind::String, toml::Value::String(s)) => {
+                    if templated(s) {
+                        return Err(invalid(format!("option `{key}` {TEMPLATE}")));
+                    }
                     if let Some(why) = (allowed.check)(s) {
                         return Err(invalid(format!("option `{key}` {why}")));
                     }
@@ -143,6 +148,16 @@ impl ToolSpec {
 }
 
 pub const MR_BOXINGTON: &str = "mr_boxington";
+
+/// mise renders tool versions and option strings as templates whenever it loads a config,
+/// `exec()` included, so a value with template syntax would run commands wherever stack asks
+/// mise about the tool (resolution, discovery), not only where the project's config is used.
+const TEMPLATE: &str = "must not contain template syntax (`{{`, `{%` or `{#`)";
+
+/// Text mise would render as a template.
+pub fn templated(value: &str) -> bool {
+    ["{{", "{%", "{#"].iter().any(|t| value.contains(t))
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
@@ -307,6 +322,10 @@ mod tests {
             ("github:jdx/fnox", "{ version = \"1\", identity = \"a\" }", "packslip backend"),
             ("aqua:jqlang/jq", "{ version = \"1\", pubkey = \"x\" }", "packslip backend"),
             ("jq", "3", "found integer"),
+            ("jq", "\"{{ exec(command='touch x') }}\"", "template syntax"),
+            ("jq", "{ version = \"{% if true %}1{% endif %}\" }", "template syntax"),
+            ("fnox", "{ version = \"1\", identity = \"{{ exec(command='touch x') }}\" }", "option `identity` must not contain template syntax"),
+            ("packslip:x.dev/a/b", "{ version = \"1\", issuer = \"{# c #}\" }", "template syntax"),
             ("jq", "[\"1\"]", "found array"),
         ] {
             let e = parse(name, text).unwrap_err();
