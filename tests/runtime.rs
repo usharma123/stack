@@ -84,7 +84,7 @@ case "$1 $2" in
       cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
       touch "$REVIEW_FIXTURE/started"
     fi
-    if test -f "$REVIEW_FIXTURE/fail-start"; then echo 'start failed' >&2; exit 1; fi ;;
+    if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi ;;
   'run --skip-deps')
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
@@ -1394,6 +1394,35 @@ fn a_failed_start_keeps_ownership_even_after_the_service_is_removed() {
     assert!(!out.status.success(), "down confirmed cleanup without asking the supervisor");
     assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "provider_failed");
     assert!(fixture.session_paths().iter().all(|p| p.exists()));
+}
+
+#[test]
+fn a_failed_start_reports_the_services_error_without_the_supervisors_animation() {
+    let fixture = Fixture::with_bundle(WEB);
+    let frame = |n: u32| format!("{} [{WEB_ID}] waiting for delay (3s)...\n\r", char::from_u32(0x280b + n).unwrap());
+    let said = |line: &str| format!("\u{2022} [{WEB_ID}] {line}\n");
+    let output: String = [
+        frame(0),
+        said("Traceback (most recent call last):"),
+        frame(1),
+        said("  File \"/p/server.py\", line 2, in <module>"),
+        frame(2),
+        said("RuntimeError: bad edit"),
+        frame(3),
+        format!("\u{1b}[31mpitchfork ERROR\u{1b}[0m Daemon {WEB_ID} failed to start\n"),
+    ]
+    .concat();
+    fs::write(fixture.dir.path().join("fail-start"), output).unwrap();
+    let out = fixture.command(&["up", "--json"]).env("NO_COLOR", "1").env("CI", "1").output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "start_failed", "{result}");
+    assert_eq!(
+        result["error"]["details"][0]["output"],
+        format!(
+            "\u{2022} [{WEB_ID}] Traceback (most recent call last):\n\u{2022} [{WEB_ID}]   File \"/p/server.py\", line 2, in <module>\n\u{2022} [{WEB_ID}] RuntimeError: bad edit\npitchfork ERROR Daemon {WEB_ID} failed to start\nstart failed"
+        ),
+        "{result}"
+    );
 }
 
 #[cfg(unix)]

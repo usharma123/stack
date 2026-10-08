@@ -353,28 +353,70 @@ fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
         .details(vec![serde_json::json!({ "output": tail(&out) })]))
 }
 
-/// Last lines of combined output, without terminal escape codes.
+/// Lines of provider output kept in an error: enough for a traceback and the final error.
+const TAIL_LINES: usize = 20;
+
+/// Last lines of combined output, as a terminal would have left them.
 pub fn tail(out: &Output) -> String {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    readable_tail(&text, TAIL_LINES)
+}
+
+/// The last `max` lines of terminal output in readable form: escape sequences removed, each
+/// carriage-return redraw reduced to what it finally showed, blank lines dropped, and spinner
+/// frames dropped unless they are all there is. The supervisor animates progress even when
+/// it is captured, between the lines a failing service printed.
+fn readable_tail(text: &str, max: usize) -> String {
+    let plain = strip_escapes(text);
+    let lines: Vec<&str> = plain
+        .split('\n')
+        .filter_map(|line| line.split('\r').rev().find(|s| !s.trim().is_empty()))
+        .map(str::trim_end)
+        .collect();
+    let content: Vec<&str> = lines.iter().copied().filter(|l| !spinner_frame(l)).collect();
+    let kept = if content.is_empty() { &lines[lines.len().saturating_sub(1)..] } else { &content[..] };
+    kept[kept.len().saturating_sub(max)..].join("\n")
+}
+
+/// A progress line: it starts with a Braille spinner glyph.
+fn spinner_frame(line: &str) -> bool {
+    line.trim_start().chars().next().is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+}
+
+/// `text` without ANSI escape sequences (CSI such as colours and line clearing, OSC such as
+/// titles and hyperlinks, and two-character escapes) or other control characters. Newlines,
+/// carriage returns and tabs are kept.
+fn strip_escapes(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // Skip CSI sequences: ESC [ params final-byte
-            if chars.peek() == Some(&'[') {
-                chars.next();
+        if c != '\u{1b}' {
+            if !c.is_control() || matches!(c, '\n' | '\r' | '\t') {
+                clean.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters, then one final byte.
+            Some('[') => {
                 for n in chars.by_ref() {
                     if ('@'..='~').contains(&n) {
                         break;
                     }
                 }
             }
-            continue;
+            // OSC: up to BEL or ST (ESC \\).
+            Some(']') => {
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' || (n == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
-        clean.push(c);
     }
-    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines[lines.len().saturating_sub(12)..].join("\n")
+    clean
 }
 
 pub fn trust(root: &Path) -> Result<()> {
@@ -574,6 +616,44 @@ pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `mise daemons start` printed for a service that failed on a bad edit, captured
+    /// with NO_COLOR and CI set (DX evaluation of 0.1.18, log 130), with a shorter path.
+    const FAILED_START: &str = "\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api] Traceback (most recent call last):\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api]   File \"/p/server.py\", line 2, in <module>\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api]     raise RuntimeError(\"bad edit\")\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{2022} [app-9df2/api] RuntimeError: bad edit\n\u{280b} [app-9df2/api] waiting for delay (3s)...\n\r\u{280b} [app-9df2/api] waiting for delay (3s)...\n\rpitchfork ERROR Daemon app-9df2/api failed to start\n\u{2717} [app-9df2/api] failed (exit code 1): Daemon app-9df2/api failed with exit code 1";
+
+    #[test]
+    fn captured_spinner_frames_leave_the_traceback_and_the_final_error() {
+        assert_eq!(
+            readable_tail(FAILED_START, TAIL_LINES),
+            "\u{2022} [app-9df2/api] Traceback (most recent call last):
+\u{2022} [app-9df2/api]   File \"/p/server.py\", line 2, in <module>
+\u{2022} [app-9df2/api]     raise RuntimeError(\"bad edit\")
+\u{2022} [app-9df2/api] RuntimeError: bad edit
+pitchfork ERROR Daemon app-9df2/api failed to start
+\u{2717} [app-9df2/api] failed (exit code 1): Daemon app-9df2/api failed with exit code 1"
+        );
+    }
+
+    #[test]
+    fn redraws_keep_what_the_terminal_finally_showed() {
+        assert_eq!(readable_tail("Downloading 10%\rDownloading 100%\r\nError: disk full\r\n", 5), "Downloading 100%\nError: disk full");
+        assert_eq!(readable_tail("\u{280b} starting\r\u{2819} starting\r\u{2839} starting\n", 5), "\u{2839} starting");
+        assert_eq!(readable_tail("", 5), "");
+    }
+
+    #[test]
+    fn escape_sequences_and_controls_are_removed_but_text_is_kept() {
+        let text = "\u{1b}[31mError:\u{1b}[0m port \u{1b}]8;;https://x/\u{7}5432\u{1b}]8;;\u{7} in use\u{1b}[2K\u{8}\n\u{1b}]0;title\u{1b}\\\tdétail ✓\u{1b}7";
+        assert_eq!(readable_tail(text, 5), "Error: port 5432 in use\n\tdétail ✓");
+    }
+
+    #[test]
+    fn only_the_last_lines_are_kept_with_the_error_last() {
+        let text: String = (1..=30).map(|n| format!("\u{280b} wait\nline {n}\n")).collect::<String>() + "Error: final";
+        let tail = readable_tail(&text, TAIL_LINES);
+        assert_eq!(tail.lines().count(), TAIL_LINES);
+        assert!(tail.starts_with("line 12\n") && tail.ends_with("line 30\nError: final"), "{tail}");
+    }
 
     #[test]
     fn resolved_versions_are_one_exact_line() {
