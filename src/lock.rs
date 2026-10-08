@@ -1,4 +1,5 @@
 use crate::error::{io_error, Result, StackError};
+use crate::tool::ToolOptions;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -54,6 +55,10 @@ pub struct LockedVersion {
     /// a platform lacks fails at install rather than resolving differently per machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_on: Option<String>,
+    /// Allowlisted provider options declared with the request (`mr_boxington`, packslip trust
+    /// options). Part of the pin's identity: a changed option is a changed request.
+    #[serde(default, skip_serializing_if = "ToolOptions::is_empty")]
+    pub options: ToolOptions,
 }
 
 impl Lockfile {

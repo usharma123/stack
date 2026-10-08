@@ -9,6 +9,8 @@
   `compile` resolves only new or changed requests, `--update` re-resolves all of them and
   reports moves, and `--locked` (and `up`, `exec`, `status`) refuse missing or stale pins.
   An exact version names a release; it is not a checksum of the downloaded artifact.
+  A tool's [allowlisted options](bundles.md#tool-options) are part of its pin: stack.lock
+  records them, and changing one is a changed request (`lock_outdated` in locked mode).
 - **No silent conflicts.** If two layers define the same key differently, compile fails with every
   conflict listed. Only `[override.*]` resolves one, and the output records what it replaced.
 - **Bundles carry files.** `{{bundle_dir}}` and `paths.bin` resolve to the bundle's own files.
@@ -46,6 +48,9 @@
 Stack provider commands use only the generated Stack mise configuration. Project, parent
 and global mise aliases cannot reinterpret locked releases. Put application variables and
 tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected.
+Version resolution runs `mise latest` in a scratch provider root of its own under stack's
+cache, whose only configuration is the one tool and its options; nothing in the project's
+`[env]` or tasks is evaluated, and the root is removed afterwards.
 `stack exec` carries this same boundary into nested mise commands. Direct mise invocations
 outside `stack exec` still follow mise's normal configuration rules.
 

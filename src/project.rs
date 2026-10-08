@@ -7,6 +7,7 @@ use crate::manifest::{read_bundle, read_project};
 use crate::ports::{self, Request};
 use crate::provider::mise;
 use crate::source::{Mode, Source};
+use crate::tool::{ToolOptions, ToolSpec};
 use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -52,6 +53,9 @@ pub struct VersionReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     pub requested: String,
+    /// Allowlisted provider options declared with the request; omitted when there are none.
+    #[serde(skip_serializing_if = "ToolOptions::is_empty")]
+    pub options: ToolOptions,
     /// `None` only when nothing is locked yet and the command may not resolve (`inspect`).
     pub resolved: Option<String>,
     /// `bundle:<name>`, `project`, `override`, or `provider` for tools stack adds itself.
@@ -120,11 +124,33 @@ fn unpinnable_tools(stack: &Composed) -> Vec<String> {
     stack
         .tools
         .iter()
-        .filter(|(_, e)| mise::unversioned(&e.value))
+        .filter(|(_, e)| mise::unversioned(&e.value.version))
         .map(|(name, e)| {
-            format!("tools.{name} = \"{}\" ({}) names no release; stack.lock cannot pin it", e.value, e.origin)
+            format!("tools.{name} = \"{}\" ({}) names no release; stack.lock cannot pin it", e.value.version, e.origin)
         })
         .collect()
+}
+
+/// The provider releases this stack needs, beyond what any stack needs. Commands that install
+/// (`install`, `up`) and `doctor` check them; an older mise would silently ignore what the
+/// configuration asked for.
+pub fn provider_requirements(stack: &Composed) -> Vec<mise::Requirement> {
+    let mut out = Vec::new();
+    for (name, e) in &stack.tools {
+        if e.value.mr_boxington() {
+            out.push(mise::Requirement {
+                minimum: mise::MR_BOXINGTON_MISE,
+                reason: format!("tools.{name} ({}) sets mr_boxington", e.origin),
+            });
+        }
+        if e.value.has_packslip_options() {
+            out.push(mise::Requirement {
+                minimum: mise::PACKSLIP_OPTIONS_MISE,
+                reason: format!("tools.{name} ({}) sets packslip trust options", e.origin),
+            });
+        }
+    }
+    out
 }
 
 pub fn default_cache_dir() -> PathBuf {
@@ -292,6 +318,7 @@ struct VersionRequest {
     name: String,
     tool: Option<String>,
     requested: String,
+    options: ToolOptions,
     origin: String,
 }
 
@@ -312,7 +339,7 @@ fn lock_versions(
     let mut requests: Vec<VersionRequest> = stack
         .tools
         .iter()
-        .map(|(name, e)| VersionRequest { kind: "tool", name: name.clone(), tool: None, requested: e.value.clone(), origin: e.origin.clone() })
+        .map(|(name, e)| VersionRequest { kind: "tool", name: name.clone(), tool: None, requested: e.value.version.clone(), options: e.value.options.clone(), origin: e.origin.clone() })
         .collect();
     if !stack.services.is_empty() && !stack.tools.contains_key("pitchfork") {
         requests.push(VersionRequest {
@@ -320,13 +347,14 @@ fn lock_versions(
             name: "pitchfork".into(),
             tool: None,
             requested: mise::PITCHFORK_VERSION.into(),
+            options: ToolOptions::new(),
             origin: "provider".into(),
         });
     }
     for (name, e) in &stack.services {
         let Some(preset) = e.value.preset.as_deref() else { continue };
         if let Some(tool) = mise::preset_tool(preset) {
-            requests.push(VersionRequest { kind: "service", name: name.clone(), tool: Some(tool.into()), requested: e.value.version.clone().unwrap_or_else(|| "latest".into()), origin: e.origin.clone() });
+            requests.push(VersionRequest { kind: "service", name: name.clone(), tool: Some(tool.into()), requested: e.value.version.clone().unwrap_or_else(|| "latest".into()), options: ToolOptions::new(), origin: e.origin.clone() });
         } else if opts.mode == Mode::Frozen {
             return Err(StackError::new("unlocked_service", format!("services.{name} uses unsupported preset {preset:?}; locked mode cannot establish its tool or version")));
         }
@@ -338,15 +366,19 @@ fn lock_versions(
     let resolver: &dyn mise::Resolver = match &opts.resolver {
         Some(r) => r.as_ref(),
         None => {
-            default_resolver = mise::MiseResolver { cwd: opts.cache.join("resolve") };
+            default_resolver = mise::MiseResolver { cache: opts.cache.clone() };
             &default_resolver
         }
     };
+    // Whenever requests may be resolved; locked and read-only modes reuse what compile checked.
+    if opts.write && opts.mode != Mode::Frozen {
+        check_packslip_backends(stack, resolver)?;
+    }
     let (mut tools, mut services, mut reports) = (Vec::new(), Vec::new(), Vec::new());
     let (mut stale, mut failed) = (Vec::new(), Vec::new());
     for r in requests {
         let prior = previous.and_then(|l| if r.kind == "tool" { l.tool(&r.name) } else { l.service(&r.name) });
-        let same = prior.filter(|p| p.requested == r.requested && p.tool == r.tool);
+        let same = prior.filter(|p| p.requested == r.requested && p.tool == r.tool && p.options == r.options);
         if !mise::unversioned(&r.requested) && opts.mode != Mode::Update {
             if let Some(pin) = same {
                 if !mise::exact_release(r.tool.as_deref().unwrap_or(&r.name), &pin.resolved) {
@@ -362,7 +394,12 @@ fn lock_versions(
             match same {
                 Some(p) => Some((p.resolved.clone(), p.resolved_on.clone())),
                 None => {
-                    stale.push(serde_json::json!({ "kind": r.kind, "name": r.name, "requested": r.requested, "locked": prior.map(|p| &p.requested) }));
+                    let mut detail = serde_json::json!({ "kind": r.kind, "name": r.name, "requested": r.requested, "locked": prior.map(|p| &p.requested) });
+                    if !r.options.is_empty() || prior.is_some_and(|p| !p.options.is_empty()) {
+                        detail["options"] = serde_json::json!(r.options);
+                        detail["locked_options"] = serde_json::json!(prior.map(|p| &p.options));
+                    }
+                    stale.push(detail);
                     continue;
                 }
             }
@@ -371,7 +408,8 @@ fn lock_versions(
         } else if !opts.write {
             None
         } else {
-            match resolver.resolve(r.tool.as_deref().unwrap_or(&r.name), &r.requested) {
+            let spec = ToolSpec { version: r.requested.clone(), options: r.options.clone() };
+            match resolver.resolve_spec(r.tool.as_deref().unwrap_or(&r.name), &spec) {
                 Ok(v) if mise::exact_release(r.tool.as_deref().unwrap_or(&r.name), &v) => {
                     moved_from = prior.map(|p| p.resolved.clone()).filter(|p| *p != v);
                     Some((v, Some(platform())))
@@ -393,6 +431,7 @@ fn lock_versions(
                 requested: r.requested.clone(),
                 resolved: version.clone(),
                 resolved_on: resolved_on.clone(),
+                options: r.options.clone(),
             };
             if r.kind == "tool" { tools.push(entry) } else { services.push(entry) }
         }
@@ -401,6 +440,7 @@ fn lock_versions(
             name: r.name,
             tool: r.tool,
             requested: r.requested,
+            options: r.options,
             resolved: resolved.map(|(v, _)| v),
             origin: r.origin,
             moved_from,
@@ -423,6 +463,28 @@ fn lock_versions(
         .details(failed));
     }
     Ok((tools, services, reports))
+}
+
+/// Packslip trust options on a registry name (`fnox = { version, identity }`) are valid only
+/// when mise's registry installs that tool through packslip; mise would otherwise ignore them.
+fn check_packslip_backends(stack: &Composed, resolver: &dyn mise::Resolver) -> Result<()> {
+    for (name, e) in stack.tools.iter().filter(|(name, e)| e.value.needs_packslip_backend(name)) {
+        let backend = resolver.registry_backend(name)?;
+        if backend.as_deref().is_some_and(crate::tool::is_packslip) {
+            continue;
+        }
+        let why = match &backend {
+            Some(b) => format!("mise's registry installs it through {b}"),
+            None => "mise's registry does not say which backend installs it".to_string(),
+        };
+        return Err(StackError::new(
+            "invalid_tool",
+            format!("tools.{name} ({}) sets packslip trust options, but {why}", e.origin),
+        )
+        .hint(format!("{}; to name the backend yourself, use `\"packslip:<host>/<owner>/<repo>\"` as the tool name", crate::tool::accepted(name)))
+        .with_detail(serde_json::json!({ "tool": name, "origin": e.origin, "backend": backend })));
+    }
+    Ok(())
 }
 
 fn write_if_changed(path: &Path, contents: &str) -> Result<()> {

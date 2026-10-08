@@ -58,11 +58,17 @@ supervise() {
 }
 case "$1 $2" in
   'latest '*)
+    # Where resolution ran and the only configuration it could see.
+    { echo "dir=$(pwd -P) trusted=${MISE_TRUSTED_CONFIG_PATHS-unset} no_config=${MISE_NO_CONFIG-unset}"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/latest.log"
     if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
     v=${2#*@}; if test "$v" = "$2"; then v=1.0.0; fi
-    case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; esac
+    case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; rust@1.93) v=1.93.1 ;; esac
     echo "$v" ;;
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
+  'version ')
+    echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
+    echo 'mise WARN  mise version 2099.1.1 available' >&2
+    if test -f "$REVIEW_FIXTURE/mise-version"; then cat "$REVIEW_FIXTURE/mise-version"; else echo '2026.10.3 macos-arm64 (2026-10-05)'; fi ;;
   'env --json')
     if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
     # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
@@ -3112,4 +3118,108 @@ fn startup_timeouts_are_checked_before_any_lifecycle_work() {
     assert!(!log.contains("daemons"), "{log}");
     assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
     assert_eq!(fixture.index_files(), 0);
+}
+
+// ---- Rust build caching through Mr Boxington (route 2) ---------------------------------------
+
+const RUST_MBX: &str = "[bundle]\nname = 'rust-mbx'\n[tools]\nrust = { version = '1.93', mr_boxington = true }\nmbx = '1.22.0'\n[tasks.build]\nrun = 'cargo build'\n";
+
+#[test]
+fn resolution_sees_only_a_tools_configuration_in_a_scratch_root_of_its_own() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    let app = fixture.dir.path().join("app");
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nSECRET = \"{{ exec(command='touch ran') }}\"\n").unwrap();
+    let _ = fs::remove_file(fixture.dir.path().join("latest.log"));
+    fixture.ok(&["compile", "--update"]);
+    let log = fs::read_to_string(fixture.dir.path().join("latest.log")).unwrap();
+    let cache = fs::canonicalize(fixture.dir.path().join("cache")).unwrap();
+    let dirs: Vec<&str> = log.lines().filter_map(|l| l.strip_prefix("dir=")).map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(dirs.len(), 2, "rust and mbx: {log}");
+    assert_ne!(dirs[0], dirs[1], "each resolution gets its own root: {log}");
+    for dir in &dirs {
+        assert!(Path::new(dir).starts_with(cache.join("resolve")), "{dir}");
+        assert!(!Path::new(dir).exists(), "scratch roots are removed: {dir}");
+        assert!(log.contains(&format!("dir={dir} trusted={dir} no_config=unset")) || {
+            // The trusted path may be spelled through a symlink (/var vs /private/var).
+            let line = log.lines().find(|l| l.starts_with(&format!("dir={dir} "))).unwrap();
+            let trusted = line.split("trusted=").nth(1).unwrap().split(' ').next().unwrap();
+            fs::canonicalize(Path::new(trusted).parent().unwrap()).unwrap() == Path::new(dir).parent().unwrap()
+        }, "{log}");
+    }
+    assert!(log.contains("[tools.rust]\nversion = \"1.93\"\nmr_boxington = true\n"), "{log}");
+    assert!(log.contains("[tools]\nmbx = \"1.22.0\"\n"), "{log}");
+    assert!(!log.contains("[env]") && !log.contains("exec("), "{log}");
+    assert!(!app.join("ran").exists());
+    let lock = fs::read_to_string(app.join("stack.lock")).unwrap();
+    assert!(lock.contains("resolved = \"1.93.1\"") && lock.contains("mr_boxington = true"), "{lock}");
+}
+
+#[test]
+fn install_and_up_refuse_a_mise_too_old_for_mr_boxington_before_installing() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    let log = fixture.dir.path().join("mise.log");
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.1 macos-arm64 (2026-09-01)\n").unwrap();
+    for args in [&["install", "--json"][..], &["up", "--json"]] {
+        let _ = fs::remove_file(&log);
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(err["error"]["code"], "provider_outdated", "{err}");
+        assert!(err["error"]["message"].as_str().unwrap().contains("older than 2026.9.2"), "{err}");
+        assert_eq!(err["error"]["details"][0]["actual"], "2026.9.1", "{err}");
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("install") && !calls.contains("trust"), "{args:?}: {calls}");
+    }
+    let version_log = fs::read_to_string(fixture.dir.path().join("version.log")).unwrap();
+    assert!(version_log.lines().all(|l| l == "no_config=1"), "{version_log}");
+
+    let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "mise_release").cloned();
+    assert_eq!(check.as_ref().unwrap()["ok"], false, "{doctor}");
+
+    // The release that introduced the option is enough; stderr's update notice is ignored.
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.2 macos-arm64 (2026-09-02)\n").unwrap();
+    let _ = fs::remove_file(&log);
+    fixture.ok(&["install", "--json"]);
+    assert!(fs::read_to_string(&log).unwrap().contains("install --yes --quiet"));
+    let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let checks = doctor["data"].as_array().or(doctor["error"]["details"].as_array()).unwrap().clone();
+    let check = checks.iter().find(|c| c["name"] == "mise_release").unwrap();
+    assert_eq!(check["ok"], true, "{doctor}");
+    assert!(check["detail"].as_str().unwrap().starts_with("mise 2026.9.2; needs 2026.9.2 (tools.rust (bundle:rust-mbx) sets mr_boxington)"), "{doctor}");
+}
+
+#[test]
+fn stacks_without_mr_boxington_never_ask_for_the_provider_release() {
+    let fixture = Fixture::new();
+    fs::write(fixture.dir.path().join("mise-version"), "2020.1.1\n").unwrap();
+    fixture.ok(&["install", "--json"]);
+    fixture.ok(&["up", "--json"]);
+    let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!doctor.to_string().contains("mise_release"), "{doctor}");
+    assert!(!fixture.dir.path().join("version.log").exists());
+}
+
+#[test]
+fn exec_finds_cargo_through_the_wrapper_mise_puts_first_and_run_passes_through() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    let wrappers = fixture.dir.path().join("command-wrappers/bin");
+    fs::create_dir_all(&wrappers).unwrap();
+    fs::write(wrappers.join("cargo"), "#!/bin/sh\necho \"wrapped cargo $*\"\n").unwrap();
+    fs::set_permissions(wrappers.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}:{}", wrappers.display(), fixture.dir.path().join("bin").display(), std::env::var("PATH").unwrap());
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
+    let out = fixture.ok(&["--json", "exec", "--", "cargo", "build"]);
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["data"]["stdout"], "wrapped cargo build\n", "{result}");
+    let out = fixture.ok(&["--json", "run", "build"]);
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["data"]["stdout"], "build|", "the task goes to `mise run` unchanged: {result}");
+    let rendered = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    let doc: toml::Table = toml::from_str(&rendered).unwrap();
+    assert_eq!(doc["tools"]["rust"]["version"].as_str(), Some("1.93.1"), "{rendered}");
+    assert_eq!(doc["tools"]["rust"]["mr_boxington"].as_bool(), Some(true), "{rendered}");
 }

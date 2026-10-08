@@ -624,6 +624,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     };
     steps.ok("compile", json!({ "ports": report.ports }));
 
+    // A mise too old for what the configuration asks would silently ignore it.
+    if let Err(e) = mise::require(&ctx.root, &project::provider_requirements(&report.stack)) {
+        return Err(steps.fail("install", e, false));
+    }
     if let Err(e) = mise::trust(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
@@ -1025,6 +1029,9 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
         Err(e) => return Err(steps.fail("compile", e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = mise::require(&ctx.root, &project::provider_requirements(&report.stack)) {
+        return Err(steps.fail("install", e, false));
+    }
     if let Err(e) = mise::trust(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }

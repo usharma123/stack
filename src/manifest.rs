@@ -14,7 +14,8 @@ pub const PROJECT_FILE: &str = "stack.toml";
 pub struct BundleManifest {
     pub bundle: BundleMeta,
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    /// Version requests, as written: a string or a table (see `tool::ToolSpec::parse`).
+    pub tools: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub env: IndexMap<String, String>,
     #[serde(default)]
@@ -125,7 +126,8 @@ pub struct ProjectManifest {
     #[serde(rename = "use", default)]
     pub uses: Vec<UseEntry>,
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    /// Version requests, as written: a string or a table (see `tool::ToolSpec::parse`).
+    pub tools: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub env: IndexMap<String, String>,
     #[serde(default)]
@@ -148,7 +150,8 @@ pub struct UseEntry {
 #[serde(deny_unknown_fields)]
 pub struct Overrides {
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    /// Version requests, as written: a string or a table (see `tool::ToolSpec::parse`).
+    pub tools: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub env: IndexMap<String, String>,
     #[serde(default)]

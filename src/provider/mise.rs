@@ -1,6 +1,8 @@
 //! mise installs tools; Pitchfork (via `mise daemons`) supervises services.
 
 use crate::compose::Composed;
+use crate::tool::ToolSpec;
+pub use super::scratch::{Pin, ScratchRoot};
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
@@ -42,57 +44,179 @@ pub fn unversioned(request: &str) -> bool {
 /// Finds the exact release a version request currently means.
 pub trait Resolver: Send + Sync {
     fn resolve(&self, tool: &str, request: &str) -> Result<String>;
+
+    /// Resolution with the tool's allowlisted options, which some backends need to list
+    /// releases at all (packslip trust options). Resolvers that need no options keep this.
+    fn resolve_spec(&self, tool: &str, spec: &ToolSpec) -> Result<String> {
+        self.resolve(tool, &spec.version)
+    }
+
+    /// The backend mise's registry installs a short name through (`packslip:github.com/jdx/fnox`
+    /// for `fnox`), or `None` when it cannot say. Asked only for registry names that carry
+    /// packslip trust options.
+    fn registry_backend(&self, _tool: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
-/// `mise latest <tool>@<request>`, run outside any project so project configuration cannot
-/// change which release a request means.
+/// `mise latest <tool>@<request>` in a scratch provider root of its own under the cache, whose
+/// only configuration is the one tool and its options. Neither the project's nor the user's
+/// configuration can change which release a request means, and no `[env]` template or task
+/// of the project's is evaluated.
 pub struct MiseResolver {
-    pub cwd: PathBuf,
+    pub cache: PathBuf,
 }
 
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl Resolver for MiseResolver {
     fn resolve(&self, tool: &str, request: &str) -> Result<String> {
-        std::fs::create_dir_all(&self.cwd).map_err(|e| crate::error::io_error(self.cwd.display(), e))?;
+        self.resolve_spec(tool, &ToolSpec::new(request))
+    }
+
+    fn resolve_spec(&self, tool: &str, request: &ToolSpec) -> Result<String> {
+        let scratch = ScratchRoot::create(&self.cache, "resolve")?;
+        scratch.write_tools(&[Pin { tool: tool.to_string(), spec: request.clone() }])?;
         // `latest` already interprets a bare version as a prefix; it rejects the explicit
         // `prefix:` spelling that other mise commands accept.
-        let request = request.strip_prefix("prefix:").unwrap_or(request);
-        let spec = if request.trim() == "latest" { tool.to_string() } else { format!("{tool}@{request}") };
-        let mut command = Command::new("mise");
-        configure_command(&mut command, &self.cwd);
-        command.env("MISE_NO_CONFIG", "1")
-            .args(["latest", &spec])
-            .current_dir(&self.cwd)
-            .env("MISE_YES", "1")
-            .env("NO_COLOR", "1");
+        let version = request.version.as_str();
+        let version = version.strip_prefix("prefix:").unwrap_or(version);
+        let spec = if version.trim() == "latest" { tool.to_string() } else { format!("{tool}@{version}") };
+        let mut command = scratch.command(&["latest", &spec]);
         let out = crate::process::capture(&mut command, RESOLVE_TIMEOUT, 16 * 1024).map_err(|e| {
             StackError::new("provider_unavailable", format!("cannot run mise: {e}"))
                 .hint(crate::setup::MISE_INSTALL_HINT)
         })?;
-        let fail = |why: String| {
-            StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
-                .hint("check the tool name and version; `mise ls-remote <tool>` lists releases")
-        };
-        if out.timed_out && crate::process::expired() {
-            return Err(StackError::new("timed_out", format!("resolving {spec} was cut short by the deadline")));
-        }
+        interpret_latest(tool, &spec, out)
+    }
+
+    /// `mise registry <tool>`: backends in mise's order of preference; the first is the one a
+    /// current release installs through. No configuration is loaded.
+    fn registry_backend(&self, tool: &str) -> Result<Option<String>> {
+        let scratch = ScratchRoot::create(&self.cache, "registry")?;
+        let mut command = scratch.command(&["registry", tool]);
+        command.env("MISE_NO_CONFIG", "1");
+        let out = crate::process::capture(&mut command, VERSION_TIMEOUT, 16 * 1024).map_err(|e| {
+            StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
+        })?;
         if out.timed_out {
-            return Err(fail(format!("mise did not answer within {}s", RESOLVE_TIMEOUT.as_secs())));
+            let code = if crate::process::expired() { "timed_out" } else { "provider_unavailable" };
+            return Err(StackError::new(code, format!("`mise registry {tool}` did not answer")));
         }
         if out.exit_code != Some(0) {
-            let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("mise failed");
-            return Err(fail(err.to_string()));
+            return Ok(None);
         }
-        parse_resolved(&out.stdout).filter(|v| exact_release(tool, v)).ok_or_else(|| {
-            // mise exits 0 with no output when no release matches the prefix.
-            fail(if out.stdout.trim().is_empty() {
-                "no release matches".to_string()
-            } else {
-                format!("unexpected output {:?}", out.stdout.trim())
-            })
-        })
+        Ok(out.stdout.split_whitespace().next().map(str::to_string))
     }
+}
+
+/// What `mise latest` answered, as an exact release or `resolve_failed`.
+fn interpret_latest(tool: &str, spec: &str, out: crate::process::Captured) -> Result<String> {
+    let fail = |why: String| {
+        StackError::new("resolve_failed", format!("cannot resolve {spec}: {why}"))
+            .hint("check the tool name and version; `mise ls-remote <tool>` lists releases")
+    };
+    if out.timed_out && crate::process::expired() {
+        return Err(StackError::new("timed_out", format!("resolving {spec} was cut short by the deadline")));
+    }
+    if out.timed_out {
+        return Err(fail(format!("mise did not answer within {}s", RESOLVE_TIMEOUT.as_secs())));
+    }
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("mise failed");
+        return Err(fail(err.to_string()));
+    }
+    parse_resolved(&out.stdout).filter(|v| exact_release(tool, v)).ok_or_else(|| {
+        // mise exits 0 with no output when no release matches the prefix.
+        fail(if out.stdout.trim().is_empty() {
+            "no release matches".to_string()
+        } else {
+            format!("unexpected output {:?}", out.stdout.trim())
+        })
+    })
+}
+
+/// A mise release by its calendar version (`2026.9.2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CalVer(pub u32, pub u32, pub u32);
+
+impl CalVer {
+    /// The release `mise version` prints first on stdout (`2026.10.3 macos-arm64 (2026-10-05)`).
+    /// Only stdout is read: mise's update notice on stderr names another release.
+    pub fn parse(stdout: &str) -> Option<Self> {
+        let token = stdout.lines().map(str::trim).find(|l| !l.is_empty())?.split_whitespace().next()?;
+        let mut parts = token.strip_prefix('v').unwrap_or(token).split('.');
+        let mut part = || parts.next()?.parse::<u32>().ok();
+        let version = Self(part()?, part()?, part()?);
+        parts.next().is_none().then_some(version)
+    }
+}
+
+impl std::fmt::Display for CalVer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
+
+/// The first mise release that honours `mr_boxington` on Rust tools.
+pub const MR_BOXINGTON_MISE: CalVer = CalVer(2026, 9, 2);
+/// The first mise release whose packslip backend reads `pubkey`, `identity`, `identity_prefix`
+/// and `issuer` tool options.
+pub const PACKSLIP_OPTIONS_MISE: CalVer = CalVer(2026, 9, 2);
+
+/// A provider release the configuration needs, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub minimum: CalVer,
+    /// Names what needs it, e.g. "tools.rust (bundle:rust-mbx) sets mr_boxington".
+    pub reason: String,
+}
+
+const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The release of the mise on PATH, from `mise version` with no configuration loaded.
+pub fn provider_version(root: &Path) -> Result<CalVer> {
+    let mut command = Command::new("mise");
+    configure_command(&mut command, root);
+    command.args(["version"]).current_dir(root).env("MISE_NO_CONFIG", "1").env("NO_COLOR", "1");
+    let out = crate::process::capture(&mut command, VERSION_TIMEOUT, 16 * 1024).map_err(|e| {
+        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
+    })?;
+    if out.timed_out && crate::process::expired() {
+        return Err(StackError::new("timed_out", "`mise version` was cut short by the deadline"));
+    }
+    if out.timed_out || out.exit_code != Some(0) {
+        let why = if out.timed_out { format!("did not answer within {}s", VERSION_TIMEOUT.as_secs()) } else { "failed".into() };
+        return Err(StackError::new("provider_unavailable", format!("`mise version` {why}")).hint(crate::setup::MISE_INSTALL_HINT));
+    }
+    CalVer::parse(&out.stdout).ok_or_else(|| {
+        StackError::new("provider_outdated", format!("cannot read a release from `mise version`: {:?}", out.stdout.trim()))
+            .hint("upgrade mise (`mise self-update`), or run `stack setup --force` for the release stack is tested against")
+    })
+}
+
+/// `Err(provider_outdated)` naming every requirement `version` does not meet.
+pub fn check_requirements(version: CalVer, requirements: &[Requirement]) -> Result<()> {
+    let unmet: Vec<&Requirement> = requirements.iter().filter(|r| version < r.minimum).collect();
+    let Some(first) = unmet.first() else { return Ok(()) };
+    let minimum = unmet.iter().map(|r| r.minimum).max().expect("unmet is not empty");
+    Err(StackError::new(
+        "provider_outdated",
+        format!("mise {version} is older than {}, which {} needs", first.minimum, first.reason),
+    )
+    .hint(format!("upgrade mise to {minimum} or newer (`mise self-update`, or `stack setup --force` for the release stack is tested against)"))
+    .details(unmet.iter().map(|r| serde_json::json!({ "minimum": r.minimum.to_string(), "actual": version.to_string(), "reason": r.reason })).collect()))
+}
+
+/// Runs `mise version` once, only when there is something to check, and fails with
+/// `provider_outdated` before anything is installed when the release is too old.
+pub fn require(root: &Path, requirements: &[Requirement]) -> Result<Option<CalVer>> {
+    if requirements.is_empty() {
+        return Ok(None);
+    }
+    let version = provider_version(root)?;
+    check_requirements(version, requirements)?;
+    Ok(Some(version))
 }
 
 /// One version on one line; anything else is not an answer stack can lock.
@@ -173,8 +297,8 @@ pub fn render(
         .tools
         .iter()
         .map(|(k, e)| {
-            let version = versions.tools.get(k).unwrap_or(&e.value);
-            (k.clone(), Value::String(version.clone()))
+            let version = versions.tools.get(k).unwrap_or(&e.value.version);
+            (k.clone(), e.value.at(version.as_str()).to_toml())
         })
         .collect();
     if has_services && !tools.contains_key("pitchfork") {
@@ -719,6 +843,31 @@ pitchfork ERROR Daemon app-9df2/api failed to start
         let tail = readable_tail(&text, TAIL_LINES);
         assert_eq!(tail.lines().count(), TAIL_LINES);
         assert!(tail.starts_with("line 12\n") && tail.ends_with("line 30\nError: final"), "{tail}");
+    }
+
+    #[test]
+    fn provider_releases_are_read_from_the_first_stdout_line_only() {
+        assert_eq!(CalVer::parse("2026.10.3 macos-arm64 (2026-10-05)\n"), Some(CalVer(2026, 10, 3)));
+        assert_eq!(CalVer::parse("\nv2026.9.2 linux-x64\n"), Some(CalVer(2026, 9, 2)));
+        for bad in ["", "mise WARN  mise version 2026.10.4 available", "2026.10", "2026.10.3.1 x", "latest"] {
+            assert_eq!(CalVer::parse(bad), None, "{bad:?}");
+        }
+        assert!(CalVer(2026, 10, 0) > CalVer(2026, 9, 2) && CalVer(2026, 9, 1) < MR_BOXINGTON_MISE);
+    }
+
+    #[test]
+    fn requirements_fail_provider_outdated_naming_what_needs_them() {
+        let need = |minimum, reason: &str| Requirement { minimum, reason: reason.into() };
+        let reqs = [need(MR_BOXINGTON_MISE, "tools.rust (project) sets mr_boxington"), need(CalVer(2026, 9, 16), "the lock")];
+        assert!(check_requirements(CalVer(2026, 9, 16), &reqs).is_ok());
+        let e = check_requirements(CalVer(2026, 9, 2), &reqs).unwrap_err();
+        assert_eq!(e.code, "provider_outdated");
+        assert_eq!(e.details.len(), 1, "{e:?}");
+        let e = check_requirements(CalVer(2026, 8, 30), &reqs).unwrap_err();
+        assert_eq!(e.message, "mise 2026.8.30 is older than 2026.9.2, which tools.rust (project) sets mr_boxington needs");
+        assert!(e.hint.unwrap().contains("2026.9.16 or newer"));
+        assert_eq!(e.details[0]["actual"], "2026.8.30");
+        assert!(require(Path::new("/nonexistent"), &[]).unwrap().is_none(), "nothing to check runs nothing");
     }
 
     #[test]

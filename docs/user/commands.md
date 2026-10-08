@@ -15,7 +15,7 @@
 | `stack renew` / `stack gc [--watch [--interval 60s]]` | Renew this session's lease / reclaim expired and deleted-project sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
 | `stack setup [--force]` | Download stack's pinned mise unless one is on `PATH` (`--force`: install it anyway) |
-| `stack doctor` | Check mise, git and tar, Pitchfork's socket path, and that the project compiles |
+| `stack doctor` | Check mise, git and tar, Pitchfork's socket path, that the project compiles, and that mise is new enough for its tool options |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
@@ -131,6 +131,15 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - Supported presets are postgres, redis, cockroachdb, nats and spicedb. Omitted service
   versions resolve `latest` once and get an exact pin. `prefix:` and `sub-` selectors resolve
   to releases too. Unknown presets fail in locked mode (`unlocked_service`).
+- `tools.<name>` accepts a table with `version` and [allowlisted options](bundles.md#tool-options)
+  (`mr_boxington` on `rust`; `pubkey`, `identity`, `identity_prefix`, `issuer` on packslip-backed
+  tools). Anything else is `invalid_tool`. `compile` asks `mise registry` once per registry name
+  that carries packslip options. Version reports (`inspect`, `compile`, `install`) list a pin's
+  `options`. `install`, `up` and `doctor` run `mise version` when an option needs a newer mise
+  (2026.9.2) and fail with `provider_outdated` before installing anything.
+- `compile` resolves each version request in its own scratch directory under stack's cache
+  (`resolve/`), configured with that one tool only, and removes it afterwards. mise records
+  each such configuration among its tracked configs; the entries point at removed files.
 - Requests that name no release (`system`, `path:`, `ref:`) remain explicitly nonreproducible
   and produce warnings for both tools and services. Damaged release pins fail with `lock_invalid`.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.

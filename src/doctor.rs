@@ -48,6 +48,11 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
                 if let Some(entry) = r.stack.env.get(key) { configured.insert(key.into(), entry.value.clone()); }
             }
         }
+        if let Ok(r) = &compiled {
+            if let Some(check) = provider_release(root, &project::provider_requirements(&r.stack)) {
+                checks.push(check);
+            }
+        }
         checks.push(match compiled {
             Ok(r) => Check {
                 name: "project",
@@ -89,6 +94,18 @@ fn tool(name: &'static str, program: &str, args: &[&str], hint: &'static str) ->
         },
         Err(e) => Check { name, ok: false, detail: format!("cannot run {program}: {e}"), hint: Some(hint) },
     }
+}
+
+/// Whether mise is new enough for what this project's configuration asks (`mr_boxington`).
+/// Nothing to check when the configuration needs nothing beyond any stack.
+fn provider_release(root: &Path, requirements: &[crate::provider::mise::Requirement]) -> Option<Check> {
+    use crate::provider::mise;
+    let version = match mise::require(root, requirements) {
+        Ok(version) => version?,
+        Err(e) => return Some(Check { name: "mise_release", ok: false, detail: e.message, hint: Some("upgrade mise (`mise self-update`)") }),
+    };
+    let needs: Vec<String> = requirements.iter().map(|r| format!("{} ({})", r.minimum, r.reason)).collect();
+    Some(Check { name: "mise_release", ok: true, detail: format!("mise {version}; needs {}", needs.join(", ")), hint: None })
 }
 
 fn writable(state: &Path) -> Check {
