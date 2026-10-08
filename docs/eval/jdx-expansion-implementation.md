@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: implementation in progress. Validation results below are updated as work finishes.
+Status: all four routes and skills sync are integrated. Independent review is in progress.
 
 ## Scope and base
 
@@ -61,7 +61,7 @@ At `904cc6e`, on macOS arm64 with mise 2026.10.3:
 
 These establish the inherited DX base. They do not validate the new jdx routes.
 
-Implementation validation is pending.
+Combined validation is recorded below.
 
 ### Foundations and mbx
 
@@ -107,14 +107,42 @@ missing/protected keys, malformed configuration, doctor, and a persisted-file se
 More receipts and boundaries are in
 [the secret-grants smoke record](../reviews/2026-10-08-fnox-secrets-smoke.md).
 
-A separate integration probe found that the redaction label can itself contain a granted
-literal. `redacted` becomes `[redacted:TOKEN]`, and a value equal to its key name appears in
-that label too. A focused follow-up is correcting this before review. Passing ordinary
-sentinel tests does not cover this case.
+A separate integration probe found that the redaction label could itself contain a granted
+literal. The follow-up was integrated as `75e1c58` and `e90a7fe`. It uses an unnamed marker
+when a label would reproduce a value and refuses captured grants when inserted text cannot
+be made safe. It adds unit, seeded streaming, timeout, truncation, CLI, and MCP regressions.
+Terminal output retains its existing behavior. Astra is reviewing these added restrictions
+and the stated output boundary.
 
-Artifact locking and the redaction follow-up are in progress in separate worktrees.
-Final combined-route validation and independent review are pending.
+### Artifact locking
+
+Worker commits `0034141`, `325e40e`, and `619adcc` were integrated as `2a1e7d5`, `77cf44b`,
+and `23d0450`. Integration preserved the skills and secrets fields, discovery, steps,
+warnings, and shared fake-provider behavior alongside the optional v3 lock report.
+
+The worker recorded real v3 generation, unchanged ordinary compilation, cold checksum
+mismatch rejection, warm-install behavior, and explicit update reporting in
+[the artifact-lock smoke record](../reviews/2026-10-08-artifact-lock-smoke.md).
+
+### Combined routes
+
+At `e90a7fe`, on macOS arm64:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked --all-targets` | Passed, 341 tests |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `node --test tests/*.test.mjs` | Passed, 41 tests; one opt-in real-provider test skipped |
+| `git diff --check` | Passed |
+
+The real-provider boundary test and complete native scenarios are running separately.
+Linux real-tool validation is delegated to GPT-6.1-Sol with isolated containers. No remote
+CI run or four-platform result is claimed. `cargo fmt --check` reports formatting differences
+in both inherited code and additions; it is not a repository CI gate.
 
 ## Review results
 
-Pending.
+Astra round 1 reviews exact implementation commit `e90a7fe` against the DX base in a separate,
+read-only checkout. The brief includes all four routes, skills sync, integration validation,
+prior template and redaction findings, responses, and unresolved installation and sync
+failure questions. Its verdict and any subsequent remediation rounds are pending.
