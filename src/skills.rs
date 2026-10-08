@@ -730,8 +730,9 @@ fn symlink(_: &Path, _: &Path) -> std::io::Result<()> {
 /// Point stack's link at `target`: a new link beside it, renamed over it once it is confirmed
 /// still to be the link stack recorded. A rename cannot replace a directory with a link.
 fn replace_link(dir: &Path, link: &Path, recorded: &Path, target: &Path) -> std::result::Result<(), String> {
-    let temp = dir.join(format!(".stack-skills-{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&temp);
+    // A fresh name: creating the link fails rather than replacing anything already there.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let temp = dir.join(format!(".stack-skills-{}-{nanos}.tmp", std::process::id()));
     symlink(target, &temp).map_err(|e| e.to_string())?;
     let still_ours = std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
         && std::fs::read_link(link).ok().as_deref() == Some(recorded);
