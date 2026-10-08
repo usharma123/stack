@@ -116,8 +116,14 @@ fn targets(lock: &Lockfile, versions: &[VersionReport]) -> Vec<Target> {
         let tool = v.tool.clone().unwrap_or_else(|| v.name.clone());
         let locked = if v.kind == "service" { lock.service(&v.name) } else { lock.tool(&v.name) };
         let locked = locked.filter(|l| l.requested == v.requested && l.options == v.options);
+        // mise renders versions and option strings as templates when it loads the scratch
+        // config; a pin that carries one is never written there.
+        let templated = locked.is_some_and(|l| {
+            crate::tool::templated(&l.resolved)
+                || l.options.values().any(|o| matches!(o, crate::tool::OptionValue::String(s) if crate::tool::templated(s)))
+        });
         let pin = locked
-            .filter(|l| !crate::provider::mise::unversioned(&l.resolved))
+            .filter(|l| !templated && !crate::provider::mise::unversioned(&l.resolved))
             .map(|l| Pin { tool: tool.clone(), spec: ToolSpec { version: l.resolved.clone(), options: l.options.clone() } });
         let service = (v.kind == "service").then(|| v.name.clone());
         if let Some(existing) = out.iter_mut().find(|t| t.pin.is_some() && t.pin == pin) {
@@ -129,6 +135,7 @@ fn targets(lock: &Lockfile, versions: &[VersionReport]) -> Vec<Target> {
         }
         let reason = match (&pin, locked) {
             (Some(_), _) => None,
+            (None, Some(_)) if templated => Some("its stack.lock entry contains template syntax, which mise would evaluate".to_string()),
             (None, Some(l)) => Some(format!("`{}` names no release, so no skill can be matched to one", l.resolved)),
             (None, None) => Some("stack.lock does not pin a release yet; run `stack compile`".to_string()),
         };
@@ -812,6 +819,21 @@ mod tests {
         assert!(d.warnings.is_empty());
         let text = read(&d, "fnox", "fnox-setup").unwrap();
         assert_eq!(text.text, "# fnox-setup\n");
+    }
+
+    #[test]
+    fn templated_lock_entries_are_never_written_for_mise() {
+        let mut fnox = locked("fnox", None, "1.39.0");
+        fnox.options.insert("identity".into(), crate::tool::OptionValue::String("{{ exec(command='x') }}".into()));
+        let lock = Lockfile::new(vec![], vec![fnox.clone(), locked("jq", None, "1.7.1")], vec![]);
+        let mut v = version("tool", "fnox", None, Some("1.39.0"), "project");
+        v.options = fnox.options.clone();
+        let d = discover_with(&lock, &[v, version("tool", "jq", None, Some("1.7.1"), "project")], |pins| {
+            assert_eq!(pins.iter().map(|p| p.tool.as_str()).collect::<Vec<_>>(), ["jq"]);
+            Ok(Answer::default())
+        });
+        assert_eq!(d.skills[0].status, Status::Unavailable);
+        assert!(d.skills[0].reason.as_deref().unwrap().contains("template"));
     }
 
     #[test]
