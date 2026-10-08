@@ -49,18 +49,42 @@ An evaluation, a sandboxed agent or a throwaway check can run Stack without touc
 user's installation by pointing every store at one disposable directory. Keep `HOME`, so Git
 and SSH configuration still work. Set all three Pitchfork directories: Pitchfork reads its
 config from `$HOME/.config/pitchfork` whatever `XDG_CONFIG_HOME` says, registers every project
-Stack starts there, and on macOS also keeps state under `~/.local/state`. In bash:
+Stack starts there, and on macOS also keeps state under `~/.local/state`.
 
-```sh
-iso=$(mktemp -d /tmp/stack-iso.XXXXXX)   # short: the supervisor socket must fit 104 bytes on macOS
+Save this as a file and run it with bash, for example
+`bash isolated-stack.sh 0.1.18 ~/src/app stack exec -- pytest`. Pasted into an interactive
+shell, the first failure's `exit` would close that shell.
+
+```bash
+#!/usr/bin/env bash
+# usage: isolated-stack.sh <stack version> <checkout> <command> [args...]
+set -u
+[ $# -ge 3 ] || { echo "usage: $0 <stack version> <checkout> <command> [args...]" >&2; exit 2; }
+version=$1 checkout=$2
+shift 2
+iso=$(mktemp -d /tmp/stack-iso.XXXXXX) || exit 1   # short: the supervisor socket must fit 104 bytes on macOS
+echo "isolated root: $iso" >&2
+keep() { echo "$1; keeping $iso" >&2; exit "${2:-1}"; }
+trap 'echo "interrupted; cleaning up" >&2' INT TERM   # stop the command, not the cleanup
+
+# A missing file is recorded as absent. A file that exists but cannot be read fails the receipt.
 global_receipt() {
-  for f in ~/.config/pitchfork/config.toml ~/.local/state/pitchfork/state.toml ~/.config/mise/config.toml; do
-    shasum -a 256 "$f" 2>/dev/null || echo "absent $f"
-  done
+  node -e '
+    const fs = require("fs"), { createHash } = require("crypto");
+    for (const f of process.argv.slice(1)) {
+      let data;
+      try { data = fs.readFileSync(f); } catch (e) {
+        if (e.code !== "ENOENT") throw e;
+        console.log(`absent ${f}`);
+        continue;
+      }
+      console.log(`${createHash("sha256").update(data).digest("hex")}  ${f}`);
+    }' ~/.config/pitchfork/config.toml ~/.local/state/pitchfork/state.toml ~/.config/mise/config.toml
 }
-global_receipt >"$iso/global-before"
+global_receipt >"$iso/global-before" || keep "cannot read a global provider file"
+
 for v in $(compgen -e); do
-  case $v in MISE_*|__MISE*|PITCHFORK_*|STACK_*) unset "$v" ;; esac
+  case $v in MISE_*|__MISE*|PITCHFORK_*|STACK_*|npm_config_*|NPM_CONFIG_*) unset "$v" ;; esac
 done
 export STACK_STATE_DIR=$iso/stack/state STACK_DATA_DIR=$iso/stack/data STACK_CACHE_DIR=$iso/stack/cache
 export MISE_DATA_DIR=$iso/mise/data MISE_CACHE_DIR=$iso/mise/cache MISE_STATE_DIR=$iso/mise/state \
@@ -68,32 +92,56 @@ export MISE_DATA_DIR=$iso/mise/data MISE_CACHE_DIR=$iso/mise/cache MISE_STATE_DI
 export PITCHFORK_CONFIG_DIR=$iso/pf/config PITCHFORK_STATE_DIR=$iso/pf/state PITCHFORK_LOGS_DIR=$iso/pf/logs
 export XDG_CONFIG_HOME=$iso/xdg/config XDG_DATA_HOME=$iso/xdg/data XDG_CACHE_HOME=$iso/xdg/cache \
   XDG_STATE_HOME=$iso/xdg/state UV_CACHE_DIR=$iso/uv-cache
-export npm_config_cache=$iso/npm/cache npm_config_userconfig=$iso/npm/npmrc npm_config_prefix=$iso/npm/prefix
-```
+export npm_config_cache=$iso/npm/cache npm_config_userconfig=$iso/npm/npmrc \
+  npm_config_globalconfig=$iso/npm/global-npmrc npm_config_prefix=$iso/npm/prefix
 
-Then install Stack into the directory rather than globally, work, and clean up:
-
-```sh
-npm install --prefix "$iso/cli" --save-exact @ushawarma/stack@<version>
+npm install --prefix "$iso/cli" --save-exact "@ushawarma/stack@$version" || keep "npm install failed"
 export PATH="$iso/cli/node_modules/.bin:$PATH"
-stack setup
-cd <checkout>
-stack doctor                           # pitchfork_socket shows the socket path fits
-stack compile && stack up --ttl 30m    # ... and the work
-stack down                             # in every checkout you started
-stack exec -- pitchfork supervisor stop   # the isolated supervisor, from a compiled checkout
-stack gc
-global_receipt | diff "$iso/global-before" - && rm -rf "$iso"
+stack setup || keep "stack setup failed"
+# Every step that needs the checkout runs in a subshell, so this shell never enters it.
+(cd "$checkout" && stack doctor && stack compile) || keep "doctor or compile failed; nothing started"
+
+# The command runs only after up verifies, but cleanup runs either way: a failed up
+# (start_failed, not_ready) can leave services running.
+(cd "$checkout" && stack up --ttl 30m && "$@")
+status=$?
+
+(cd "$checkout" && stack down) || keep "stack down failed; services may still run, see stack status"
+(cd "$checkout" && stack exec -- pitchfork supervisor stop) || keep "supervisor stop failed"
+(cd "$checkout" && stack exec -- pitchfork supervisor status --json) >"$iso/supervisor-after" ||
+  keep "supervisor status failed"
+node -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).status === "down" ? 0 : 1)' \
+  "$iso/supervisor-after" || keep "the supervisor is not confirmed down"
+(cd "$checkout" && stack gc) || keep "stack gc failed"
+global_receipt >"$iso/global-after" || keep "cannot read a global provider file"
+cmp -s "$iso/global-before" "$iso/global-after" || keep "a global provider file changed; the run was not isolated"
+[ "$status" = 0 ] || keep "the command exited $status; everything it started is stopped" "$status"
+rm -rf -- "$iso"
 ```
 
+The script deletes its root only after `stack down` confirmed this checkout's services
+stopped, Pitchfork reports the isolated supervisor `down`, `stack gc` succeeded, the global
+receipts match and the command exited 0. Every other outcome exits nonzero and keeps the root,
+with its receipts and supervisor logs, at the path printed on the first line. It checks each
+step's exit status itself, because `set -e` ignores a failure in an `&&` list unless it is
+the last command.
+
+- Clean up only that exact path, after reading it. A kept root whose services may still run
+  needs `stack down` from the checkout, then the supervisor stop, run with `iso` set to that
+  path and the script's exports. Never delete by pattern, such as `/tmp/stack-iso.*`, and
+  never decide a directory or supervisor is yours from `pgrep` or `ps`. Another run's looks
+  the same.
+- An interrupt stops the command, and cleanup still runs. Interrupting cleanup makes that step
+  fail, so the root is kept.
+- For several checkouts, run `stack down` in each before stopping the supervisor.
 - A `mise` already on `PATH` is used as a binary with the isolated stores. Leave it off `PATH`
   and `stack setup` downloads the pinned release into `$STACK_DATA_DIR/bin` instead.
-- The empty npm user config drops registry credentials from `~/.npmrc`; add only what the run
-  needs.
+- The empty npm user and global configs drop registry settings and credentials from
+  `~/.npmrc` and npm's own `etc/npmrc`; add only what the run needs.
 - On Linux, Pitchfork's default state follows `XDG_STATE_HOME`: add that real path to
   `global_receipt` if it is set.
-- Keep the receipts and the directory of a run that changed one; it was not isolated.
 
-Verified on macOS arm64 with Stack 0.1.18 and Pitchfork 2.29.0.
+The isolation settings were verified on macOS arm64 with Stack 0.1.18 and Pitchfork 2.29.0.
+The failure handling is tested with stand-in commands, not live services.
 
 [All docs](../README.md)
