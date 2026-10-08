@@ -594,7 +594,7 @@ fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()
 /// short (its subprocesses killed with their process groups) and the result is `timed_out`;
 /// ownership of anything launched stays recorded, as for any failed launch.
 pub fn up(ctx: &Ctx, lease: LeaseOptions, timeout: Duration) -> Result<UpReport> {
-    let _deadline = crate::process::deadline_scope(Instant::now().checked_add(timeout));
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
     up_within(ctx, lease).map_err(|e| startup_timed_out(e, "up", timeout))
 }
 
@@ -804,6 +804,15 @@ fn record_after_failed_start(ctx: &Ctx) -> Result<()> {
     mise::daemons(&ctx.root).and_then(|statuses| record_launch_observations(ctx, &statuses))
 }
 
+/// When a startup given `timeout` must end. A timeout too long to fix as a point in time is
+/// refused before any work, rather than leaving the startup unbounded.
+fn startup_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        StackError::new("usage", format!("a startup timeout of {}s is too long", timeout.as_secs()))
+            .hint("give the time startup may take, e.g. 10m or 2h")
+    })
+}
+
 /// `timed_out` for a startup whose deadline passed, else `error` unchanged. What was cut short
 /// is the `cause`; the progress record, if any, stays last as on every failure of `up`.
 fn startup_timed_out(mut error: StackError, command: &str, timeout: Duration) -> StackError {
@@ -885,7 +894,7 @@ pub struct RestartReport {
 /// Everything happens within `timeout`, as for [`up`]. When it passes, services not named keep
 /// running and the session is left incomplete (unverified) with what was launched recorded.
 pub fn restart(ctx: &Ctx, services: &[String], timeout: Duration) -> Result<RestartReport> {
-    let _deadline = crate::process::deadline_scope(Instant::now().checked_add(timeout));
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
     restart_within(ctx, services).map_err(|e| startup_timed_out(e, "restart", timeout))
 }
 
@@ -2564,6 +2573,17 @@ mod tests {
         assert_eq!(busy.code, "timed_out");
         assert!(busy.hint.as_deref().unwrap().starts_with("nothing was started"), "{busy}");
         assert_eq!(busy.details, vec![json!({ "cause": { "code": "lock_busy", "message": "held" } })]);
+    }
+
+    #[test]
+    fn a_startup_timeout_too_long_to_track_is_refused_not_lifted() {
+        let ten_minutes = startup_deadline(DEFAULT_STARTUP_TIMEOUT).unwrap();
+        assert!(ten_minutes > Instant::now() + Duration::from_secs(590));
+        for timeout in [Duration::from_secs(u64::MAX), Duration::MAX] {
+            let e = startup_deadline(timeout).unwrap_err();
+            assert_eq!(e.code, "usage", "{e}");
+            assert_eq!(e.message, format!("a startup timeout of {}s is too long", timeout.as_secs()));
+        }
     }
 
     #[test]
