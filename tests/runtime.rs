@@ -65,6 +65,10 @@ case "$1 $2" in
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
   'env --json')
     if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
+    # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
+    if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
+      touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
+    fi
     cat "$REVIEW_FIXTURE/env.json" ;;
   'daemons --json')
     if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
@@ -2893,6 +2897,28 @@ fn launch_records(fixture: &Fixture) -> Vec<Value> {
     fixture.session_paths().iter().map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap()).collect()
 }
 
+/// The `timed_out` error of a startup whose deadline passed while verifying `service`, which
+/// started but never became ready. Each look at it first asks the supervisor and mise, so the
+/// deadline may end verification at any of these: readiness failed (`not_ready`, naming the
+/// service), or a lookup was not started (`timed_out`) or was cut short (`provider_failed`).
+/// The same lookups also run before the start, so the failed step must be `verify`, after it.
+fn assert_cut_short_verifying(error: &Value, service: &str) {
+    let cause = &error["details"][0]["cause"];
+    let message = cause["message"].as_str().unwrap_or_default();
+    let lookup = ["mise env --json", "mise daemons --json"].into_iter().any(|call| match cause["code"].as_str() {
+        Some("timed_out") => message == format!("{call}: the deadline passed before it could start"),
+        Some("provider_failed") => message == format!("{call} was cut short by the deadline"),
+        _ => false,
+    });
+    let unready = cause["code"] == "not_ready" && cause["details"][0]["service"] == service;
+    assert!(lookup || unready, "{error}");
+    let progress = &error["details"][1];
+    assert_eq!(progress["changed"], true, "{error}");
+    let steps = progress["steps"].as_array().unwrap();
+    assert_eq!(steps[steps.len() - 2], json!({ "step": "start", "status": "ok", "detail": null }), "{error}");
+    assert_eq!(steps[steps.len() - 1], json!({ "step": "verify", "status": "failed", "code": cause["code"] }), "{error}");
+}
+
 #[test]
 fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_down() {
     let fixture = Fixture::with_bundle(WEB);
@@ -2909,12 +2935,7 @@ fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_dow
     assert_eq!(error["code"], "timed_out", "{result}");
     assert_eq!(error["message"], "`stack up` did not finish within 2s");
     assert!(error["hint"].as_str().unwrap().contains("`stack down` stops them"), "{result}");
-    assert_eq!(error["details"][0]["cause"]["code"], "not_ready", "{result}");
-    assert_eq!(error["details"][0]["cause"]["details"][0]["service"], "web", "{result}");
-    let progress = &error["details"][1];
-    assert_eq!(progress["changed"], true, "{result}");
-    let steps: Vec<(&str, &str)> = progress["steps"].as_array().unwrap().iter().map(|s| (s["step"].as_str().unwrap(), s["status"].as_str().unwrap())).collect();
-    assert_eq!(&steps[steps.len() - 2..], [("start", "ok"), ("verify", "failed")], "{result}");
+    assert_cut_short_verifying(error, "web");
 
     // Nothing stopped the service, and its ownership is recorded as an incomplete launch.
     assert!(service.alive());
@@ -2943,15 +2964,42 @@ fn mcp_up_reports_its_timeout_as_an_error_and_down_still_stops_what_launched() {
     let fixture = Fixture::with_bundle(WEB);
     let service = Detached::spawn();
     supervise_never_ready(&fixture, &service);
-    let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 1 })), ("stack_status", json!({})), ("stack_down", json!({}))], &[]);
+    mcp_up_times_out_and_down_stops(&fixture, &service);
+}
+
+#[test]
+fn mcp_up_cut_short_while_verifying_keeps_what_launched_for_down() {
+    let fixture = Fixture::with_bundle(WEB);
+    let service = Detached::spawn();
+    supervise_never_ready(&fixture, &service);
+    fs::write(fixture.dir.path().join("slow-env-after-start"), "30").unwrap();
+    let start = Instant::now();
+    let cause = mcp_up_times_out_and_down_stops(&fixture, &service);
+    assert_eq!(cause["code"], "provider_failed", "{cause}");
+    assert_eq!(cause["message"], "mise env --json was cut short by the deadline", "{cause}");
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+}
+
+/// `stack_up` of `service` (supervised, never ready) with a 2s timeout, then `stack_status` and
+/// `stack_down` from the same server: the timeout is a tool error that leaves the launch
+/// recorded and unhealthy, and `down` stops it. Returns the timeout's cause. On a loaded
+/// machine 1s can pass before the start, when nothing was launched yet.
+fn mcp_up_times_out_and_down_stops(fixture: &Fixture, service: &Detached) -> Value {
+    let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 2 })), ("stack_status", json!({})), ("stack_down", json!({}))], &[]);
     assert_eq!(results[0]["isError"], true, "{}", results[0]);
     let error = &results[0]["structuredContent"]["error"];
     assert_eq!(error["code"], "timed_out", "{error}");
-    assert_eq!(error["message"], "`stack up` did not finish within 1s");
-    assert_eq!(error["details"][0]["cause"]["code"], "not_ready", "{error}");
-    assert_eq!(results[1]["structuredContent"]["data"]["healthy"], false, "{}", results[1]);
+    assert_eq!(error["message"], "`stack up` did not finish within 2s");
+    assert!(error["hint"].as_str().unwrap().contains("`stack down` stops them"), "{error}");
+    assert_cut_short_verifying(error, "web");
+    let status = &results[1]["structuredContent"]["data"];
+    assert_eq!(status["healthy"], false, "{status}");
+    assert_eq!(status["session"]["launching"], true, "{status}");
+    assert_eq!(status["session"]["services"]["web"]["pid"], service.0, "{status}");
     assert_eq!(results[2]["isError"], false, "{}", results[2]);
     assert!(!service.alive());
+    assert!(fixture.session_paths().iter().all(|p| !p.exists()), "the launch is still recorded after down");
+    error["details"][0]["cause"].clone()
 }
 
 #[test]
