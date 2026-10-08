@@ -30,7 +30,9 @@ was found. The project's `fnox.toml` used the `plain` provider with sentinel val
 | 13 | `pgrep -fl fnox` before and after all runs | no fnox processes either time | `--no-daemon`: no resolution daemon was started |
 | 14 | `grep -rlI smoke-sentinel .stack .config stack.lock $STACK_STATE_DIR $STACK_CACHE_DIR` | nothing | `<cache>/secrets/` empty afterwards (scratch roots removed) |
 | 15 | `STACK_TIMINGS=1 stack --json exec --secret DEPLOY_KEY -- true` | phases `lock compile trust env secrets reserve total`; no sentinel | |
-| 16 | `tests/e2e/native.sh target/release/stack 10-secrets` | passed | isolated HOME and mise data directory; `stack install` downloaded and installed fnox 1.39.0 itself; covers `run`, `exec --json`, terminal `exec`, short/unknown/protected keys, MCP `stack_exec`, malformed `fnox.toml`, doctor, and a sweep of everything stack wrote |
+| 16 | Ceiling check: a parent of the cache holds `.config/mise/conf.d/stack.toml` with `[env] CEILING_SENTINEL = "{{ exec(command='touch <dir>/parent-ran') }}"`; `stack --json exec --secret DEPLOY_KEY -- true` with `STACK_CACHE_DIR` under it, once as `/private/tmp/...` and once through the `/tmp` link | before the fix: canonical path `parent-ran` absent, linked path `parent-ran` **created** (mise's ceiling never matched the resolved working directory, so it read the parent's config during `mise ls`); after canonicalizing the cache in `secrets.rs`: absent for both | the shared scratch helper gets the same fix on the integration branch (0364dee); the secrets query no longer depends on it |
+| 17 | Templated pins (unit and fake-provider tests): a stack.lock fnox `resolved` of `{{ exec(...) }}`, and `fnox = { version = "1.39.0", identity = "{{ exec(...) }}" }` | `lock_invalid` for the lock; for the option, `invalid_tool` once tool options refuse templates (4a1e9d2), and `secret_unavailable` (`kind: templated`) from the release query otherwise | nothing templated is written into the fnox query config; no scratch root is created |
+| 18 | `tests/e2e/native.sh target/release/stack 10-secrets` | passed | isolated HOME and mise data directory; `stack install` downloaded and installed fnox 1.39.0 itself; covers `run`, `exec --json`, terminal `exec`, short/unknown/protected keys, MCP `stack_exec`, malformed `fnox.toml`, doctor, and a sweep of everything stack wrote |
 
 Upstream facts this implementation relies on were checked against fnox v1.39.0 and mise
 v2026.10.3 source by a separate research task (no edits) and partly reproduced above:
@@ -41,6 +43,11 @@ detaches with `setsid()` and caches values in memory (default idle timeout 8 hou
 passes `--no-daemon`; `--non-interactive` does not stop operating-system dialogs or configured
 commands; `mise ls --json fnox` returns an array whose `install_path` is the release directory,
 and packslip puts `.mise-bins` first on `PATH` with a link into that directory.
+
+Regression, same release build: `tests/e2e/native.sh target/release/stack 1-independent-checkouts
+2-wrong-instance 3-leases 4-mcp 6-configuration-generation 10-secrets` passed in that order.
+(Running `4-mcp` directly after `1-independent-checkouts` fails on this branch and, by
+construction, on its base: it expects `appA` stopped, which scenarios 2 and 3 do.)
 
 Not run here: a real non-plain provider (1Password, keychain, cloud secret managers), fnox
 leases and file secrets with real backends (refused by design; covered with fakes), a fnox that

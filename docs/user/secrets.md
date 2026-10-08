@@ -95,7 +95,11 @@ diagnostic.
 
 `kind` for `secret_unavailable` is one of `not_locked`, `not_installed`, `not_on_path`,
 `not_pinned`, `provider`, `spawn`, `timed_out`, `oversized`, `protocol`, or fnox's own error kind
-(`config`, `resolution`).
+(`config`, `resolution`; `unknown` when fnox names a kind stack will not echo).
+
+Resolution runs while stack holds the checkout's project lock, like the rest of planning a
+command, so other stack commands in the same checkout wait for it: at most about 90 seconds
+(the release query and the two fnox calls, 30 seconds each), usually well under one.
 
 ## Redaction in captured output
 

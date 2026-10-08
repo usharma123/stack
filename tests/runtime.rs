@@ -3687,3 +3687,37 @@ fn doctor_reports_fnox_from_its_value_free_description_only() {
     assert!(fnox_log(&fixture).iter().all(|l| !l.contains("--keys")), "doctor resolved a value");
     assert_no_leak_on_disk(&fixture);
 }
+
+#[test]
+fn templated_fnox_pins_never_reach_the_release_query() {
+    let fixture = secrets_fixture("");
+    let root = fixture.dir.path().to_path_buf();
+    let marker = root.join("template-ran");
+    let template = format!("{{{{ exec(command='touch {}') }}}}", marker.display());
+    // A stack.lock whose fnox pin was edited to a template is refused before any provider call.
+    let lock_path = root.join("app/stack.lock");
+    let lock = fs::read_to_string(&lock_path).unwrap();
+    assert!(lock.contains("resolved = \"1.39.0\""), "{lock}");
+    fs::write(&lock_path, lock.replace("resolved = \"1.39.0\"", &format!("resolved = {:?}", template))).unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+    assert_eq!(envelope["error"]["code"], "lock_invalid", "{text}");
+    fs::write(&lock_path, &lock).unwrap();
+    // An option carrying a template is refused: `invalid_tool` at compile once tool options are
+    // checked for templates, and in any case never written into the fnox release query.
+    fs::write(
+        root.join("app/stack.toml"),
+        format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = {{ version = \"1.39.0\", identity = {:?} }}\n", template),
+    )
+    .unwrap();
+    let (compiled, text, _) = json_run(&fixture, &["compile"]);
+    if compiled["ok"] == true {
+        let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "secret_unavailable", "{text}");
+        assert_eq!(envelope["error"]["details"][0]["kind"], "templated", "{text}");
+    } else {
+        assert_eq!(compiled["error"]["code"], "invalid_tool", "{text}");
+    }
+    assert!(!fs::read_to_string(root.join("ls.log")).unwrap_or_default().contains("exec("), "a template reached `mise ls`");
+    assert!(fnox_log(&fixture).is_empty());
+    assert!(!marker.exists());
+}
