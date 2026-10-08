@@ -221,19 +221,13 @@ fn install_dir(request: &Request<'_>) -> Result<PathBuf> {
     pinned_install_dir(request.cache, &request.pin)
 }
 
-/// Text mise would render as a template (`exec()` included) when it loads a config. Mirrors
-/// `tool::templated` on the integration branch; kept here so this query never depends on
-/// compile-time validation having run.
-fn templated(value: &str) -> bool {
-    ["{{", "{%", "{#"].iter().any(|t| value.contains(t))
-}
-
 fn pinned_install_dir(cache: &Path, pin: &ToolSpec) -> Result<PathBuf> {
     let version = pin.version.clone();
     // mise evaluates templates in `[tools]` versions and option strings too, so a pin carrying
-    // one is never written into the query config.
-    let options_templated = pin.options.values().any(|o| matches!(o, crate::tool::OptionValue::String(s) if templated(s)));
-    if templated(&version) || options_templated {
+    // one is never written into the query config. Compilation refuses such pins already; this
+    // check holds for a stack.lock edited by hand.
+    let options_templated = pin.options.values().any(|o| matches!(o, crate::tool::OptionValue::String(s) if crate::tool::templated(s)));
+    if crate::tool::templated(&version) || options_templated {
         return Err(unavailable(
             "fnox's pin contains template syntax, which mise would evaluate; stack does not query it",
             json!({ "step": "locate", "kind": "templated", "timed_out": false }),
@@ -243,13 +237,9 @@ fn pinned_install_dir(cache: &Path, pin: &ToolSpec) -> Result<PathBuf> {
     let failed = |kind: &str, why: String| {
         unavailable(format!("cannot locate fnox {version}: {why}"), json!({ "step": "locate", "kind": kind, "timed_out": kind == "timed_out" }))
     };
-    // mise matches its ceiling against the resolved working directory, so the root must sit
-    // under a resolved path: through a linked cache (`/tmp` on macOS) mise would read
-    // configuration above the root and evaluate its templates. (The shared scratch helper does
-    // this too on the integration branch; doing it here keeps this query safe on its own.)
-    std::fs::create_dir_all(cache).map_err(|e| crate::error::io_error(cache.display(), e))?;
-    let cache = cache.canonicalize().map_err(|e| crate::error::io_error(cache.display(), e))?;
-    let scratch = ScratchRoot::create(&cache, "secrets")?;
+    // The scratch root sits under the resolved cache path, so through a linked cache (`/tmp`
+    // on macOS) mise still stops at the root and reads no configuration above it.
+    let scratch = ScratchRoot::create(cache, "secrets")?;
     scratch.write_tools(&[Pin { tool: FNOX.into(), spec: pin.clone() }])?;
     let mut command = scratch.command(&["ls", "--json", FNOX]);
     let out = process::capture(&mut command, RESOLVE_TIMEOUT, RESOLVE_OUTPUT_LIMIT)
