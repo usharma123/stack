@@ -89,6 +89,9 @@ case "$1 $2" in
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
     if test "$task" = fail; then exit 3; fi ;;
+  'x --')
+    # The supervisor stack starts on its own: which mise it is told to run daemons with.
+    echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log" ;;
   'daemons logs')
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
@@ -2210,6 +2213,21 @@ fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure(
     assert_eq!(result["data"]["checks"][0]["ready"], true, "{result}");
     assert_eq!(result["data"]["checks"][0]["port"], moved);
     assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
+}
+
+#[test]
+fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
+    // Pitchfork finds mise for `mise x` only in a few fixed places, unless told. A supervisor
+    // that cannot find it runs every project's daemons with the tools of the project that
+    // started it, so another project's service gets another release.
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let log = fs::read_to_string(fixture.dir.path().join("supervisor-start.log")).unwrap();
+    let mise = fixture.dir.path().join("bin/mise");
+    let expected = format!("x -- pitchfork supervisor start|{}", mise.display());
+    assert!(!log.is_empty() && log.lines().all(|line| line == expected), "expected `{expected}`:\n{log}");
+    fixture.ok(&["down", "--json"]);
 }
 
 /// The fake supervisor starts a listener on `port` at `daemons start` and kills it at stop.

@@ -84,7 +84,8 @@ pub fn run(force: bool) -> Result<Report> {
 
 pub const MISE_INSTALL_HINT: &str = "run `stack setup` to download mise, or install it yourself: https://mise.jdx.dev";
 
-fn find_on_path() -> Option<PathBuf> {
+/// The mise a bare `mise` command runs: the first executable on PATH.
+pub fn find_on_path() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths).map(|d| d.join("mise")).find(|p| crate::hash::is_executable(p))
 }

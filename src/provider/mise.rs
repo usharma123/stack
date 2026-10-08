@@ -354,12 +354,22 @@ fn mise(root: &Path, args: &[&str]) -> Result<Output> {
 /// project using this state directory with it. Started here first, in a session of its own that
 /// stack never signals, it is already running when the request comes. Best effort: should this
 /// fail, the request starts the supervisor as it always did.
+///
+/// The supervisor runs every daemon through `mise x` in its project, so each gets its own
+/// project's tools. A supervisor that `mise daemons` starts learns which mise to run from the
+/// configuration mise registers; one started here learns it from `PITCHFORK_MISE_BIN`.
+/// Without either, Pitchfork only looks in a few fixed places, and when mise is installed
+/// elsewhere it runs every project's daemons without mise, with the tools on its own PATH:
+/// the tools of whichever project started it.
 fn detach_supervisor(root: &Path) {
     let Some(wait) = crate::process::remaining() else { return };
-    let mut command = Command::new("mise");
+    // Named to a process with another working directory, so only an absolute path will do.
+    let Some(mise_bin) = crate::setup::find_on_path().filter(|p| p.is_absolute()) else { return };
+    let mut command = Command::new(&mise_bin);
     configure_command(&mut command, root);
     command.args(["x", "--", "pitchfork", "supervisor", "start"])
         .current_dir(root)
+        .env("PITCHFORK_MISE_BIN", &mise_bin)
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1");
     let _ = crate::process::run_detached(&mut command, wait);
