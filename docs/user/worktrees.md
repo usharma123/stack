@@ -141,7 +141,8 @@ the last command.
 - On Linux, Pitchfork's default state follows `XDG_STATE_HOME`: add that real path to
   `global_receipt` if it is set.
 
-The isolation settings were verified on macOS arm64 with Stack 0.1.18 and Pitchfork 2.29.0.
-The failure handling is tested with stand-in commands, not live services.
+The script's successful service run was verified on macOS arm64 with the published Stack
+0.1.18 package and Pitchfork 2.29.0, including confirmed shutdown and unchanged global
+receipts. Failure handling is tested with stand-in commands.
 
 [All docs](../README.md)

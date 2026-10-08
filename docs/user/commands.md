@@ -5,9 +5,9 @@
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve, lock, assign ports, write provider config |
 | `stack inspect` | Show the composed stack, origins and ports; writes nothing |
 | `stack install` | Install the locked tools and service binaries; start nothing, record nothing |
-| `stack up [--ttl 30m] [--owner-pid N]` | Start services, verify them, record a session |
+| `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
-| `stack restart [service...]` | Restart services of the running session (all when none named) and verify again |
+| `stack restart [service...] [--timeout D]` | Restart services of the running session (all when none named) and verify again |
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
 | `stack logs <service> [--tail N] [--since-start]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
@@ -33,10 +33,16 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   first successful check, so an open port can unblock a hanging preset probe. Stack then
   verifies instance identity through SQL or Redis commands before recording a session.
   Other presets keep their functional readiness checks.
-- `up` has no overall startup timeout. A live daemon whose readiness checks never succeed
-  can still leave the supervisor's start call waiting indefinitely, including Postgres or
-  Redis when their ports never open. Stack's 90-second verification window begins only after
-  that call returns; a verification failure then reports `not_ready`.
+- `up` and `restart` have an overall startup timeout, default `10m`; set `--timeout 30s`
+  or another duration of at least 1s. It covers locks, GC, compilation and downloads,
+  installation, stopping for restart, readiness and verification. Expiry reports `timed_out`
+  and exits 124. Its first detail contains the cut-short error under `cause`; a progress
+  record, when available, stays last. The provider request's process group is terminated,
+  while the supervisor and services keep running with their ownership records retained.
+  Allow up to 10s beyond the deadline to record a partial launch, plus connection-check overhead.
+  Inspect `stack status`; retry `up` for a slow service, or run `stack down` before fixing and
+  retrying a service that will never become ready. Verification also has its existing 90s
+  window after the provider start returns; that window alone reports `not_ready`.
 - `up` fails with `port_conflict` when a port assigned to this checkout accepts connections and
   no running daemon of that service is behind it. `details` name the service, the port, whether
   the project pinned it, and the holding process when `lsof` (or `/proc` on Linux) can tell.
@@ -98,8 +104,15 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   ownership records are kept so it can be retried. For a deleted (or replaced) project directory
   it queries Pitchfork using the recorded daemon IDs but never issues a stop-by-name request.
   Even matching PID/port metadata cannot make that separate request safe from replacement.
-  Inspect the intended daemon and stop it explicitly, then retry GC. Unknown, starting,
-  stopping and retrying states retain the record. Data directories are kept.
+  Each uncertain service can include `recovery.inspect`, a copyable POSIX shell command for
+  the recorded supervisor, or `ps` when only a PID was recorded. `recovery.stop` is offered
+  only when the supervisor still reports the recorded PID and port. Run inspect first and
+  stop only if the PID still matches; these two operations are not atomic. Then retry GC.
+  Unknown, starting, stopping and retrying states retain the record. Data directories are kept.
+- Malformed `stack.toml` and `bundle.toml` errors name the file, line and character column,
+  with the offending line and a caret. JSON details repeat the location and the bundle source.
+  Errors about a missing whole-document table have no specific location. Captured provider
+  errors keep the final diagnostic lines with terminal escapes and spinner frames removed.
 - `gc --watch` runs until terminated (or `--max-passes N`), one pass every `--interval`; with
   `--json` it prints one object per pass. stack installs no background service: run it under
   systemd, launchd or your agent runner if you want unattended expiry.

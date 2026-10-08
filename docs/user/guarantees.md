@@ -29,9 +29,13 @@
   For deleted or replaced projects, GC retains live or uncertain services and reports
   `gc_incomplete`: Pitchfork cannot atomically validate and stop a recorded generation.
   Stop the original checkout with `stack down` before deleting it. GC releases gone-project
-  records only after shutdown is confirmed; it never signals a replacement service.
+  records only after shutdown is confirmed; it never signals a replacement service. Its
+  recovery commands let you inspect the recorded supervisor and explicitly stop a service
+  only after checking its recorded PID still matches.
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
-  retrying is safe.
+  retrying is safe. `up` and `restart` have a 10m startup deadline, configurable with
+  `--timeout`. Expiry retains launch records and reports `timed_out`; recording the partial
+  launch can take up to 10s beyond the deadline, plus connection checks.
 - **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
   `exec` (whose output is captured into the object); errors have a stable `code`, a `hint` and
   `details`. A command that could not do its job reports `ok: false`. `stack mcp` serves the same

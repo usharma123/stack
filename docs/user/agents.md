@@ -5,9 +5,9 @@
 In a checkout with a `stack.toml`:
 
 ```sh
-stack up --ttl 30m                       # compile from stack.lock if needed, start, verify
+stack up --ttl 30m --timeout 5m          # compile from stack.lock if needed, start, verify
 stack run test                           # a [tasks.test] command, once every service verifies
-stack restart api                        # after editing code a running service loaded
+stack restart api --timeout 1m            # after editing code a running service loaded
 stack exec --require-all -- <command>    # anything else, with the stack's tools and env
 stack down                               # before you finish or remove the checkout
 ```
@@ -22,12 +22,21 @@ Use `--json` for structured output. Stack emits an object on stdout with `ok`, a
 
 ```sh
 stack --json inspect
-stack --json up --ttl 30m
+stack --json up --ttl 30m --timeout 5m
 stack --json exec --require-all --timeout 5m -- python --version
 stack --json down
 ```
 
 `exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code. On timeout it exits 124 with `ok: false` and code `timed_out`; the output so far is in `error.details`. Without `--json`, commands keep stdout and stderr, and `--timeout` works too.
+
+`up` and `restart` default to a 10m startup deadline. Their CLI `--timeout` accepts durations
+of at least 1s; MCP `timeout_secs` accepts a whole number of seconds of at least 1, default
+600. The deadline includes locking, compilation, installation and readiness. Expiry gives
+`timed_out`, CLI exit 124 and MCP `isError: true`. The first detail holds `cause`, the error
+from the cut-short step; the progress record, if present, stays last. Recording a partial
+launch can take up to 10s beyond the deadline, plus connection checks. Inspect `stack status`
+and run `stack down` before abandoning a failed launch. Retrying `up` lets a slow service
+continue starting; a permanently stuck service needs `down` before a fresh `up`.
 
 `stack up` does not restart a service whose configuration is unchanged, so after editing code a
 service loaded, run `stack restart <service>`. Declare `watch = [...]` on the service and
@@ -70,7 +79,7 @@ or services did:
 def succeeded(operation, envelope):
     """operation: a CLI subcommand or MCP tool name; envelope: parsed stdout or structuredContent."""
     if not envelope["ok"]:
-        return False  # error.code and error.hint say what to do; timed_out output is in error.details[0]
+        return False  # error.code, error.hint and operation-specific details say what to do
     operation = operation.removeprefix("stack_")
     if operation in ("exec", "run"):
         return envelope["data"]["exit_code"] == 0
