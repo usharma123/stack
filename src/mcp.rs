@@ -2,6 +2,7 @@
 
 use crate::error::{Result, StackError};
 use crate::project::{self, default_cache_dir, Options};
+use crate::secrets::Grant;
 use crate::session::{self, Ctx, LeaseOptions, Require};
 use crate::source::Mode;
 use crate::state::default_state_dir;
@@ -99,14 +100,15 @@ fn tools() -> Value {
         { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
           "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. A command still running at timeout_secs (default 600) is killed and the call fails with timed_out; its output so far is in the error details.",
+        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. A command still running at timeout_secs (default 600) is killed and the call fails with timed_out; its output so far is in the error details. secrets grants named fnox secrets to this command only; their values never appear in the result.",
           "inputSchema": schema(json!({
               "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
               "require": { "type": "array", "items": { "type": "string" } },
               "require_all": { "type": "boolean" },
+              "secrets": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Values are replaced by [redacted:KEY] in stdout and stderr; values shorter than 8 bytes are refused (secret_unsupported)" },
               "timeout_secs": { "type": "integer" }
           }), &["command"]) },
-        { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec.",
+        { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec. The task receives exactly the secrets it declares (secrets = [...] in stack.toml), redacted from its output; no others can be added here.",
           "inputSchema": schema(json!({
               "task": { "type": "string" },
               "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
@@ -286,6 +288,7 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
+    let secrets = secret_names(&args["secrets"])?;
     let require = if args["require_all"] == true {
         Require::All
     } else {
@@ -300,7 +303,20 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
                 .unwrap_or_default(),
         )
     };
-    captured(args, ctx, &command, &require)
+    captured(args, ctx, &command, &require, secrets)
+}
+
+/// `secrets` of `stack_exec`: omitted, or an array of names. Anything else is refused rather
+/// than read as no grant.
+fn secret_names(value: &Value) -> Result<Vec<String>> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map(String::from).ok_or_else(|| StackError::new("usage", format!("secret name {v} is not a string"))))
+            .collect(),
+        v => Err(StackError::new("usage", format!("secrets must be an array of secret names, not {v}"))),
+    }
 }
 
 fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
@@ -309,12 +325,16 @@ fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
         .as_array()
         .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let (command, require) = session::task_command(ctx, task, &extra)?;
-    captured(args, ctx, &command, &require)
+    if !args["secrets"].is_null() {
+        return Err(StackError::new("usage", "stack_run grants exactly the secrets the task declares and accepts no others")
+            .hint("declare them under [tasks.<name>] secrets = [...] in stack.toml, or use stack_exec with secrets"));
+    }
+    let (command, require, secrets) = session::task_command(ctx, task, &extra)?;
+    captured(args, ctx, &command, &require, secrets)
 }
 
-fn captured(args: &Value, ctx: &Ctx, command: &[String], require: &Require) -> Result<Value> {
-    let plan = session::plan_exec(ctx, command, require)?;
+fn captured(args: &Value, ctx: &Ctx, command: &[String], require: &Require, secrets: Vec<String>) -> Result<Value> {
+    let plan = session::plan_exec_with(ctx, command, require, &Grant { keys: secrets, captured: true })?;
     let timeout = Duration::from_secs(
         args["timeout_secs"]
             .as_u64()
@@ -343,13 +363,15 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
     for var in &plan.removed {
         command.env_remove(var);
     }
-    let output = crate::process::capture(
+    // Granted values are replaced as the output streams in, before it is bounded.
+    let output = crate::process::capture_redacted(
         command
             .args(&plan.args)
             .envs(&plan.env)
             .current_dir(&ctx.root),
         timeout,
         OUTPUT_LIMIT,
+        Some(&plan.redactor),
     )
     .map_err(|e| {
         StackError::new(
@@ -357,14 +379,20 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
             format!("cannot execute {}: {e}", plan.program.display()),
         )
     })?;
-    Ok(json!({
+    let mut result = json!({
         "exit_code": output.exit_code,
         "timed_out": output.timed_out,
         "stdout": output.stdout,
         "stderr": output.stderr,
         "unverified": plan.checks.iter().filter(|c| !c.ready).map(|c| &c.service).collect::<Vec<_>>(),
         "checks": plan.checks,
-    }))
+    });
+    // Names only, and only for commands granted secrets, so other results keep their shape.
+    if !plan.secrets.is_empty() {
+        result["secrets"] = json!(plan.secrets);
+        result["warnings"] = json!(plan.secret_warnings);
+    }
+    Ok(result)
 }
 
 /// `90`, `90s`, `30m`, `2h`, `1d`.

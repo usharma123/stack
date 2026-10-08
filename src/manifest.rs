@@ -118,6 +118,10 @@ pub struct Task {
     /// Services that must be running and ready before the task starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
+    /// Names of fnox secrets the task is granted (never values). Resolved by stack when the
+    /// task runs; see `secrets.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

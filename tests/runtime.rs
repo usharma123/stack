@@ -65,8 +65,10 @@ case "$1 $2" in
     case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; rust@1.93) v=1.93.1 ;; esac
     echo "$v" ;;
   'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
-  # Skills discovery (`inspect`, `compile`): nothing installed, no skills.
-  'ls --json') echo '{}' ;;
+  'ls --json')
+    # Installed releases, asked in a scratch root: where it ran and the only configuration it saw.
+    { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/ls.log"
+    if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '{}'; fi ;;
   'skills ls') echo '[]' ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
@@ -113,7 +115,9 @@ case "$1 $2" in
   'run --skip-deps')
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
-    if test "$task" = fail; then exit 3; fi ;;
+    if test "$task" = fail; then exit 3; fi
+    # A task that shows the environment it was given, on both streams.
+    if test "$task" = showenv; then echo; env | sort; env | sort >&2; fi ;;
   'x --')
     # The supervisor stack starts on its own: which mise it is told to run daemons with.
     echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log"
@@ -3225,4 +3229,461 @@ fn exec_finds_cargo_through_the_wrapper_mise_puts_first_and_run_passes_through()
     let doc: toml::Table = toml::from_str(&rendered).unwrap();
     assert_eq!(doc["tools"]["rust"]["version"].as_str(), Some("1.93.1"), "{rendered}");
     assert_eq!(doc["tools"]["rust"]["mr_boxington"].as_bool(), Some(true), "{rendered}");
+}
+
+// ---- secret grants -----------------------------------------------------------------------
+
+const DEPLOY_VALUE: &str = "leak-sentinel-deploy-0001";
+/// Every value the fake fnox can print, on any stream; none may reach a result or a file.
+const SENTINELS: &[&str] = &[
+    DEPLOY_VALUE,
+    "leak-sentinel-sentry-0002",
+    "leak-sentinel-dependency-0003",
+    "leak-sentinel-stderr-0004",
+    "leak-sentinel-config-0005",
+    "leak-sentinel-garbage-0006",
+    "short77",
+];
+
+/// fnox as mise installs it: the executable in the release directory and a link to it in
+/// `.mise-bins`, which is what the stack's PATH names. Steps answer from files the test writes
+/// (`fnox-<step>-mode`, `fnox-<step>.json`); every run logs its arguments and prints a
+/// diagnostic quoting a secret on stderr, as fnox does for a malformed configuration.
+const FAKE_FNOX: &str = r##"#!/bin/sh
+echo "$*|${FNOX_NON_INTERACTIVE-unset}|$(pwd -P)" >>"$REVIEW_FIXTURE/fnox.log"
+echo '  × fnox.toml line 3: DEPLOY_KEY = "leak-sentinel-stderr-0004"' >&2
+case " $* " in *" --describe "*) step=describe ;; *) step=keys ;; esac
+case "$(cat "$REVIEW_FIXTURE/fnox-$step-mode" 2>/dev/null)" in
+  garbage) echo 'leak-sentinel-garbage-0006 is not the protocol'; exit 0 ;;
+  config) echo '{"schema":1,"error":{"kind":"config","message":"line 3: DEPLOY_KEY = leak-sentinel-config-0005"}}'; exit 1 ;;
+  oversized) head -c 70000 /dev/zero | tr '\0' x; exit 0 ;;
+  exit) exit 3 ;;
+  file) cat "$REVIEW_FIXTURE/fnox-$step.json"; exit "$(cat "$REVIEW_FIXTURE/fnox-$step-exit" 2>/dev/null || echo 0)" ;;
+esac
+if test "$step" = describe; then
+  echo '{"schema":1,"fnox_version":"1.39.0","profile":["default"],"keys":[{"key":"DEPLOY_KEY","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},{"key":"SENTRY_DSN","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},{"key":"SHORT_KEY","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},{"key":"HIDDEN","kind":"secret","env":false,"as_file":false,"injectable":{"exec":false,"shell":false}}],"dynamic_leases":[],"daemon_enabled":false}'
+else
+  echo '{"schema":1,"fnox_version":"1.39.0","scope":"exec","profile":["default"],"set":{"DEPLOY_KEY":"leak-sentinel-deploy-0001","SENTRY_DSN":"leak-sentinel-sentry-0002","SHORT_KEY":"short77","DEP":"leak-sentinel-dependency-0003"},"files":{},"remove":["HIDDEN","PGHOST","DATABASE_URL","PATH","MISE_SHELL","__MISE_DIFF","STACK_PROJECT"],"missing":[],"leases":[]}'
+fi
+"##;
+
+fn write_exe(path: &Path, script: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A project with fnox 1.39.0 in its tools, installed (as mise reports it) under
+/// `installs/fnox/1.39.0`, plus `extra` in stack.toml. The stack's PATH starts with the
+/// `.mise-bins` directory of `path_install` (the pinned release unless a test says otherwise).
+fn secrets_fixture(extra: &str) -> Fixture {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let install = root.join("installs/fnox/1.39.0");
+    write_exe(&install.join("fnox"), FAKE_FNOX);
+    fs::create_dir_all(install.join(".mise-bins")).unwrap();
+    std::os::unix::fs::symlink(install.join("fnox"), install.join(".mise-bins/fnox")).unwrap();
+    installed(&fixture, &[("1.39.0", true)]);
+    path_first(&fixture, &install.join(".mise-bins"));
+    fs::write(
+        root.join("app/stack.toml"),
+        format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n{extra}"),
+    )
+    .unwrap();
+    fixture.ok(&["compile"]);
+    fixture
+}
+
+/// What `mise ls --json fnox` reports: these releases, installed or not.
+fn installed(fixture: &Fixture, releases: &[(&str, bool)]) {
+    let root = fixture.dir.path();
+    let rows: Vec<Value> = releases
+        .iter()
+        .map(|(v, installed)| json!({ "version": v, "install_path": root.join("installs/fnox").join(v), "installed": installed, "active": true }))
+        .collect();
+    fs::write(root.join("ls.json"), Value::Array(rows).to_string()).unwrap();
+}
+
+/// The stack's PATH (as `mise env` reports it) with `dir` first.
+fn path_first(fixture: &Fixture, dir: &Path) {
+    let path = format!("{}:{}:{}", dir.display(), fixture.dir.path().join("bin").display(), std::env::var("PATH").unwrap());
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
+}
+
+fn assert_no_leak(text: &str, context: &str) {
+    for sentinel in SENTINELS {
+        assert!(!text.contains(sentinel), "{context}: {sentinel} leaked into {text}");
+    }
+}
+
+/// No sentinel in anything stack wrote: the project's `.stack/`, generated config, stack.lock,
+/// the machine state and the cache.
+fn assert_no_leak_on_disk(fixture: &Fixture) {
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                walk(&path, files);
+            } else if kind.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for dir in ["app", "state", "cache"] {
+        walk(&fixture.dir.path().join(dir), &mut files);
+    }
+    assert!(files.iter().any(|f| f.ends_with("stack.lock")), "{files:?}");
+    for file in files {
+        let text = String::from_utf8_lossy(&fs::read(&file).unwrap()).into_owned();
+        assert_no_leak(&text, &file.display().to_string());
+    }
+}
+
+/// `stack --json <args>`: the envelope, and both streams for leak checks.
+fn json_run(fixture: &Fixture, args: &[&str]) -> (Value, String, Output) {
+    let mut full = vec!["--json"];
+    full.extend_from_slice(args);
+    let out = fixture.command(&full).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{args:?}: {text}"));
+    (envelope, text, out)
+}
+
+fn fnox_log(fixture: &Fixture) -> Vec<String> {
+    fs::read_to_string(fixture.dir.path().join("fnox.log")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+#[test]
+fn a_grant_reaches_only_its_command_and_is_redacted_from_captured_output() {
+    let fixture = secrets_fixture("[services.db]\npreset = 'postgres'\nversion = '17'\n");
+    let script = r#"printf '%s\n' "$DEPLOY_KEY"; printf 'x%sy\n' "$DEPLOY_KEY" >&2; env | sort"#;
+    let mut command = fixture.command(&["--json", "exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", script]);
+    let out = command.env("HIDDEN", "inherited-hidden").env("DATABASE_URL", "postgresql://u@127.0.0.1:5432/db").output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert_no_leak(&text, "exec --json");
+    let data = &serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"];
+    assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]));
+    let stdout = data["stdout"].as_str().unwrap();
+    assert!(stdout.starts_with("[redacted:DEPLOY_KEY]\n"), "{stdout}");
+    assert!(stdout.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n"), "{stdout}");
+    assert_eq!(data["stderr"], "x[redacted:DEPLOY_KEY]y\n");
+    // Unrequested keys and dependencies are dropped; fnox's removal applies where stack allows.
+    for absent in ["SENTRY_DSN=", "SHORT_KEY=", "DEP=", "HIDDEN="] {
+        assert!(!stdout.contains(&format!("\n{absent}")), "{absent} in {stdout}");
+    }
+    // Protected variables keep what stack decided (withheld, poisoned, set) and are reported.
+    assert!(stdout.contains(&format!("\nPGHOST={UNVERIFIED}\n")), "{stdout}");
+    assert!(stdout.contains(&format!("\nDATABASE_URL=postgresql://u@{UNVERIFIED}:5432/")), "{stdout}");
+    assert!(stdout.contains("\nPATH=") && stdout.contains("\nSTACK_PROJECT="), "{stdout}");
+    let warnings: Vec<&str> = data["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+    for name in ["PGHOST", "DATABASE_URL", "PATH", "MISE_SHELL", "__MISE_DIFF", "STACK_PROJECT"] {
+        assert!(warnings.contains(&format!("fnox asked to remove {name}; kept").as_str()), "{name}: {warnings:?}");
+    }
+    // Describe first, then only the granted keys; never interactive; in the project.
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let log = fnox_log(&fixture);
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[0], format!("--non-interactive env --json --describe|1|{}", app.display()));
+    assert_eq!(log[1], format!("--non-interactive env --json --keys DEPLOY_KEY|1|{}", app.display()));
+    // The release was located in a scratch root that names fnox and nothing else, now gone.
+    let ls = fs::read_to_string(fixture.dir.path().join("ls.log")).unwrap();
+    assert!(ls.contains(&format!("dir={}", fixture.dir.path().join("cache/secrets").canonicalize().unwrap().display())), "{ls}");
+    let config: String = ls.lines().filter(|l| !l.starts_with("dir=") && !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+    assert_eq!(config.trim(), "[tools]\nfnox = \"1.39.0\"", "{ls}");
+    assert_eq!(fs::read_dir(fixture.dir.path().join("cache/secrets")).unwrap().count(), 0);
+
+    // A timed-out capture is redacted too, on the CLI and over MCP.
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--timeout", "1s", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"echo "$DEPLOY_KEY"; sleep 5"#]);
+    assert_eq!(out.status.code(), Some(124), "{text}");
+    assert_eq!(envelope["error"]["code"], "timed_out");
+    assert_eq!(envelope["error"]["details"][0]["stdout"], "[redacted:DEPLOY_KEY]\n");
+    assert_no_leak(&text, "exec --json timeout");
+
+    let results = fixture.mcp(
+        &[
+            ("stack_exec", json!({ "command": ["sh", "-c", script], "secrets": ["DEPLOY_KEY"] })),
+            ("stack_exec", json!({ "command": ["sh", "-c", r#"echo "$DEPLOY_KEY"; sleep 5"#], "secrets": ["DEPLOY_KEY"], "timeout_secs": 1 })),
+            ("stack_exec", json!({ "command": ["true"], "secrets": "DEPLOY_KEY" })),
+            ("stack_exec", json!({ "command": ["true"], "secrets": [7] })),
+            ("stack_exec", json!({ "command": ["true"], "secrets": ["PGHOST"] })),
+        ],
+        &[],
+    );
+    assert_no_leak(&results.iter().map(Value::to_string).collect::<String>(), "MCP");
+    let data = &results[0]["structuredContent"]["data"];
+    assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]), "{}", results[0]);
+    assert!(data["stdout"].as_str().unwrap().contains("DEPLOY_KEY=[redacted:DEPLOY_KEY]"));
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "timed_out");
+    assert_eq!(results[1]["structuredContent"]["error"]["details"][0]["stdout"], "[redacted:DEPLOY_KEY]\n");
+    assert_eq!(results[2]["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(results[3]["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(results[4]["structuredContent"]["error"]["code"], "invalid_secret");
+
+    // On the terminal the command owns its output: nothing is captured, so nothing is redacted.
+    let out = fixture.command(&["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf %s "$DEPLOY_KEY""#]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), DEPLOY_VALUE);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("stack: fnox asked to remove PGHOST; kept"), "{stderr}");
+    assert_no_leak(&stderr, "terminal stderr");
+
+    // Inherited variables still pass through byte for byte alongside a grant.
+    use std::os::unix::ffi::OsStrExt;
+    let raw: &[u8] = b"raw\xff\xfebytes";
+    let out = fixture
+        .command(&["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", DUMP_RAW])
+        .env("UNRELATED_RAW", std::ffi::OsStr::from_bytes(raw))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(dumped(&fixture)["UNRELATED_RAW"], raw);
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn tasks_get_exactly_their_declared_secrets() {
+    let fixture = secrets_fixture("[tasks.showenv]\nrun = 'env'\nsecrets = ['DEPLOY_KEY']\n[tasks.plain]\nrun = 'true'\n");
+    let (envelope, text, out) = json_run(&fixture, &["run", "showenv"]);
+    assert!(out.status.success(), "{text}");
+    assert_no_leak(&text, "run --json");
+    let data = &envelope["data"];
+    assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]));
+    for stream in ["stdout", "stderr"] {
+        let s = data[stream].as_str().unwrap();
+        assert!(s.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n"), "{stream}: {s}");
+        assert!(!s.contains("SENTRY_DSN="), "{stream}: {s}");
+    }
+    assert_eq!(fnox_log(&fixture).len(), 2);
+    // A task without secrets runs as before: no fnox, no secrets fields.
+    let (envelope, _, out) = json_run(&fixture, &["run", "plain"]);
+    assert!(out.status.success());
+    assert!(envelope["data"].get("secrets").is_none(), "{envelope}");
+    assert_eq!(fnox_log(&fixture).len(), 2);
+
+    let results = fixture.mcp(
+        &[
+            ("stack_run", json!({ "task": "showenv" })),
+            ("stack_run", json!({ "task": "plain", "secrets": ["DEPLOY_KEY"] })),
+            ("stack_inspect", json!({})),
+        ],
+        &[],
+    );
+    assert_no_leak(&results.iter().map(Value::to_string).collect::<String>(), "MCP");
+    assert!(results[0]["structuredContent"]["data"]["stdout"].as_str().unwrap().contains("DEPLOY_KEY=[redacted:DEPLOY_KEY]"), "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(results[2]["structuredContent"]["data"]["stack"]["tasks"]["showenv"]["value"]["secrets"], json!(["DEPLOY_KEY"]));
+    let (inspect, text, _) = json_run(&fixture, &["inspect"]);
+    assert_eq!(inspect["data"]["stack"]["tasks"]["showenv"]["value"]["secrets"], json!(["DEPLOY_KEY"]));
+    assert_no_leak(&text, "inspect");
+    // The provider config never carries the grant: mise's own task `secrets` field is not used.
+    let rendered = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    assert!(!rendered.contains("secrets") && !rendered.contains("DEPLOY_KEY"), "{rendered}");
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn short_values_are_refused_when_captured_and_allowed_on_the_terminal() {
+    let fixture = secrets_fixture("");
+    let marker = fixture.dir.path().join("ran");
+    let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "SHORT_KEY", "--", "touch", marker.to_str().unwrap()]);
+    assert_eq!(envelope["error"]["code"], "secret_unsupported", "{text}");
+    assert_eq!(envelope["error"]["details"][0]["key"], "SHORT_KEY");
+    assert!(!marker.exists());
+    assert_no_leak(&text, "exec --json short");
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["true"], "secrets": ["SHORT_KEY"] }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "secret_unsupported");
+    let out = fixture.command(&["exec", "--secret", "SHORT_KEY", "--", "sh", "-c", r#"printf %s "$SHORT_KEY""#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "short77");
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn fnox_failures_map_to_codes_and_nothing_fnox_printed_is_forwarded() {
+    let fixture = secrets_fixture("");
+    let root = fixture.dir.path().to_path_buf();
+    let marker = root.join("ran");
+    let describe = |keys: &str, leases: &str| {
+        format!(r#"{{"schema":1,"fnox_version":"1.39.0","keys":[{keys}],"dynamic_leases":[{leases}]}}"#)
+    };
+    let ok_key = r#"{"key":"DEPLOY_KEY","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}}"#;
+    // (step, mode, answer file, expected code, detail field=value, fnox runs)
+    type Case<'a> = (&'a str, &'a str, Option<String>, &'a str, &'a str, usize);
+    let cases: Vec<Case> = vec![
+        ("describe", "garbage", None, "secret_unavailable", "kind=protocol", 1),
+        ("describe", "config", None, "secret_unavailable", "kind=config", 1),
+        ("describe", "oversized", None, "secret_unavailable", "kind=oversized", 1),
+        ("describe", "exit", None, "secret_unavailable", "kind=protocol", 1),
+        ("describe", "file", Some(describe(&ok_key.replace(r#""as_file":false"#, r#""as_file":true"#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe(ok_key, r#"{"name":"aws","env_vars":["DEPLOY_KEY"]}"#)), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe(&ok_key.replace(r#""exec":true"#, r#""exec":false"#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe("", "")), "secret_missing", "reason=unknown", 1),
+        ("keys", "garbage", None, "secret_unavailable", "kind=protocol", 2),
+        ("keys", "config", None, "secret_unavailable", "kind=config", 2),
+        ("keys", "oversized", None, "secret_unavailable", "kind=oversized", 2),
+        ("keys", "exit", None, "secret_unavailable", "kind=protocol", 2),
+        ("keys", "file", Some(r#"{"schema":1,"error":{"kind":"invalid_keys","message":"leak-sentinel-config-0005","unknown":["DEPLOY_KEY"]}}"#.into()), "secret_missing", "reason=unknown", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{},"files":{},"remove":[],"missing":["DEPLOY_KEY"],"leases":[]}"#.into()), "secret_missing", "reason=unresolved", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{"DEPLOY_KEY":"leak-sentinel-deploy-0001","PGHOST":"leak-sentinel-garbage-0006"},"files":{},"remove":[],"missing":[],"leases":[]}"#.into()), "invalid_secret", "operation=set", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{"DEPLOY_KEY":"leak-sentinel-deploy-0001"},"files":{"DEPLOY_KEY":"/x"},"remove":[],"missing":[],"leases":[]}"#.into()), "secret_unsupported", "key=DEPLOY_KEY", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{"DEPLOY_KEY":["leak-sentinel-deploy-0001"]}}"#.into()), "secret_unavailable", "kind=protocol", 2),
+    ];
+    for (step, mode, body, code, detail, runs) in cases {
+        for f in ["fnox.log", "fnox-describe-mode", "fnox-keys-mode", "fnox-describe.json", "fnox-keys.json"] {
+            let _ = fs::remove_file(root.join(f));
+        }
+        fs::write(root.join(format!("fnox-{step}-mode")), mode).unwrap();
+        if let Some(body) = &body {
+            fs::write(root.join(format!("fnox-{step}.json")), body).unwrap();
+            fs::write(root.join(format!("fnox-{step}-exit")), if body.contains("\"error\"") { "1" } else { "0" }).unwrap();
+        }
+        let context = format!("{step} {mode} {}", body.as_deref().unwrap_or(""));
+        let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "touch", marker.to_str().unwrap()]);
+        assert!(!out.status.success(), "{context}: {text}");
+        assert_eq!(envelope["error"]["code"], code, "{context}: {text}");
+        let (field, value) = detail.split_once('=').unwrap();
+        assert_eq!(envelope["error"]["details"][0][field], value, "{context}: {text}");
+        assert_no_leak(&text, &context);
+        assert!(!marker.exists(), "{context}: the command ran");
+        assert_eq!(fnox_log(&fixture).len(), runs, "{context}");
+        // People see the same error on stderr, equally clean.
+        let out = fixture.command(&["exec", "--secret", "DEPLOY_KEY", "--", "touch", marker.to_str().unwrap()]).output().unwrap();
+        let human = String::from_utf8_lossy(&out.stderr);
+        assert!(human.contains(&format!("error[{code}]")), "{context}: {human}");
+        assert_no_leak(&human, &context);
+    }
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn only_the_fnox_release_stack_lock_pins_is_run() {
+    let fixture = secrets_fixture("");
+    let root = fixture.dir.path().to_path_buf();
+    let impostor = format!("#!/bin/sh\ntouch \"$REVIEW_FIXTURE/impostor-ran\"\n{}", FAKE_FNOX.trim_start_matches("#!/bin/sh\n"));
+    let refused = |context: &str, kind: &str| {
+        let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "secret_unavailable", "{context}: {text}");
+        assert_eq!(envelope["error"]["details"][0]["kind"], kind, "{context}: {text}");
+        assert!(!root.join("impostor-ran").exists(), "{context}: the impostor ran");
+        assert!(fnox_log(&fixture).is_empty(), "{context}");
+        assert_no_leak(&text, context);
+    };
+    // Another release's directory first on PATH.
+    write_exe(&root.join("installs/fnox/1.38.0/.mise-bins/fnox"), &impostor);
+    path_first(&fixture, &root.join("installs/fnox/1.38.0/.mise-bins"));
+    refused("other release", "not_pinned");
+    // Another executable beside the pinned directory.
+    write_exe(&root.join("installs/fnox/evil/fnox"), &impostor);
+    path_first(&fixture, &root.join("installs/fnox/evil"));
+    refused("sibling directory", "not_pinned");
+    // A link inside the pinned directory to a file outside it.
+    let pinned_bins = root.join("installs/fnox/1.39.0/.mise-bins");
+    write_exe(&root.join("elsewhere/fnox"), &impostor);
+    fs::remove_file(pinned_bins.join("fnox")).unwrap();
+    std::os::unix::fs::symlink(root.join("elsewhere/fnox"), pinned_bins.join("fnox")).unwrap();
+    path_first(&fixture, &pinned_bins);
+    refused("link out of the pinned directory", "not_pinned");
+    fs::remove_file(pinned_bins.join("fnox")).unwrap();
+    std::os::unix::fs::symlink(root.join("installs/fnox/1.39.0/fnox"), pinned_bins.join("fnox")).unwrap();
+    // The pinned release is not installed, or not on PATH at all.
+    installed(&fixture, &[("1.39.0", false), ("1.38.0", true)]);
+    refused("not installed", "not_installed");
+    installed(&fixture, &[("1.38.0", true)]);
+    refused("only another release installed", "not_installed");
+    installed(&fixture, &[("1.39.0", true)]);
+    path_first(&fixture, &root.join("nowhere"));
+    refused("not on PATH", "not_on_path");
+    // Restored, it runs.
+    path_first(&fixture, &pinned_bins);
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(envelope["data"]["secrets"], json!(["DEPLOY_KEY"]));
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn secret_declarations_are_checked_when_the_stack_compiles() {
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app");
+    let compile = |stack: &str, bundle: &str| {
+        fs::write(fixture.dir.path().join("bundle/bundle.toml"), format!("[bundle]\nname='test'\n{bundle}")).unwrap();
+        fs::write(app.join("stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n{stack}")).unwrap();
+        json_run(&fixture, &["compile"]).0
+    };
+    let fnox = "[tools]\nfnox = \"1.39.0\"\n";
+    // A bundle may declare names; the project provides fnox.
+    let ok = compile(fnox, "[tasks.deploy]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n");
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert_eq!(ok["data"]["stack"]["tasks"]["deploy"]["value"]["secrets"], json!(["DEPLOY_KEY"]));
+    for (stack, bundle, key) in [
+        (format!("{fnox}[services.db]\npreset='postgres'\nversion='17'\n[tasks.t]\nrun='x'\nsecrets=['DATABASE_URL']\n"), "", "DATABASE_URL"),
+        (format!("{fnox}[services.api]\nrun='x'\n[tasks.t]\nrun='x'\nsecrets=['API_PORT']\n"), "", "API_PORT"),
+        (format!("{fnox}[tasks.t]\nrun='x'\nsecrets=['lower']\n"), "", "lower"),
+        (format!("{fnox}[env]\nAPP_KEY='1'\n[tasks.t]\nrun='x'\nsecrets=['APP_KEY']\n"), "", "APP_KEY"),
+        (format!("{fnox}[tasks.t]\nrun='x'\nsecrets=['MISE_ENV']\n"), "", "MISE_ENV"),
+        (format!("{fnox}[override.tasks.t]\nrun='x'\nsecrets=['STACK_SESSION']\n"), "[tasks.t]\nrun='y'\n", "STACK_SESSION"),
+        ("[tasks.t]\nrun='x'\nsecrets=['DEPLOY_KEY']\n".to_string(), "", "DEPLOY_KEY"),
+        ("[tools]\nfnox='system'\n[tasks.t]\nrun='x'\nsecrets=['DEPLOY_KEY']\n".to_string(), "", "DEPLOY_KEY"),
+        (fnox.to_string(), "[tasks.t]\nrun='x'\nsecrets=['DEPLOY_KEY', 'DEPLOY_KEY']\n", "DEPLOY_KEY"),
+    ] {
+        let failed = compile(&stack, bundle);
+        assert_eq!(failed["error"]["code"], "invalid_secret", "{stack}{bundle}: {failed}");
+        assert_eq!(failed["error"]["details"][0]["key"], key, "{stack}{bundle}: {failed}");
+        assert_eq!(failed["error"]["details"][0]["operation"], "declare");
+    }
+    // Two layers that disagree on a task's secrets conflict, as on any other field.
+    let conflict = compile(&format!("{fnox}[tasks.t]\nrun='x'\nsecrets=['A_KEY']\n"), "[tasks.t]\nrun='x'\nsecrets=['B_KEY']\n");
+    assert_eq!(conflict["error"]["code"], "conflict", "{conflict}");
+    // A command's grant is checked before any provider call answers it.
+    compile(fnox, "");
+    for key in ["PATH", "bad", "STACK_PROJECT"] {
+        let (envelope, _, _) = json_run(&fixture, &["exec", "--secret", key, "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "invalid_secret", "{key}: {envelope}");
+    }
+    assert!(!fixture.dir.path().join("ls.log").exists());
+    assert!(fnox_log(&fixture).is_empty());
+}
+
+#[test]
+fn doctor_reports_fnox_from_its_value_free_description_only() {
+    let fixture = secrets_fixture("[tasks.deploy]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n");
+    let fnox_check = |envelope: &Value| -> Value {
+        let checks = if envelope["ok"] == true { &envelope["data"] } else { &envelope["error"]["details"] };
+        checks.as_array().unwrap().iter().find(|c| c["name"] == "fnox").cloned().unwrap_or_else(|| panic!("{envelope}"))
+    };
+    let (envelope, text, _) = json_run(&fixture, &["doctor"]);
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], true, "{text}");
+    assert!(check["detail"].as_str().unwrap().contains("fnox 1.39.0 at "), "{check}");
+    assert_no_leak(&text, "doctor");
+    let log = fnox_log(&fixture);
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].starts_with("--non-interactive env --json --describe|1|"), "{log:?}");
+
+    fs::write(fixture.dir.path().join("fnox-describe-mode"), "config").unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["doctor"]);
+    assert_eq!(envelope["error"]["code"], "doctor_failed", "{text}");
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], false);
+    assert!(check["detail"].as_str().unwrap().contains("config error"), "{check}");
+    assert_no_leak(&text, "doctor with a malformed fnox config");
+
+    fs::write(fixture.dir.path().join("fnox-describe-mode"), "file").unwrap();
+    fs::write(fixture.dir.path().join("fnox-describe.json"), r#"{"schema":1,"keys":[],"dynamic_leases":[]}"#).unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["doctor"]);
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], false, "{text}");
+    assert!(check["detail"].as_str().unwrap().contains("does not know DEPLOY_KEY"), "{check}");
+
+    installed(&fixture, &[("1.39.0", false)]);
+    let (envelope, _, _) = json_run(&fixture, &["doctor"]);
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], true);
+    assert!(check["detail"].as_str().unwrap().contains("not installed"), "{check}");
+    assert!(fnox_log(&fixture).iter().all(|l| !l.contains("--keys")), "doctor resolved a value");
+    assert_no_leak_on_disk(&fixture);
 }

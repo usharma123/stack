@@ -52,6 +52,11 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             if let Some(check) = provider_release(root, &project::provider_requirements(&r.stack)) {
                 checks.push(check);
             }
+            let fnox = r.versions.iter().find(|v| v.kind == "tool" && v.name == crate::secrets::FNOX).and_then(|v| v.resolved.as_deref());
+            if let Some(f) = crate::secrets::doctor(root, cache, &r.stack, fnox) {
+                let hint = (!f.ok).then_some("run `fnox env --json --describe` in the project to see fnox's own message; stack never shows it");
+                checks.push(Check { name: "fnox", ok: f.ok, detail: f.detail, hint });
+            }
         }
         checks.push(match compiled {
             Ok(r) => Check {

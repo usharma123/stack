@@ -11,9 +11,11 @@ use crate::manifest::Service;
 use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
+use crate::secrets::{self, Grant};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json};
 use crate::timing::Timings;
+use crate::tool::ToolSpec;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1543,6 +1545,12 @@ pub struct ExecPlan {
     pub checks: Vec<Check>,
     /// Keeps TTL collection from stopping services until the command finishes.
     pub execution: Option<ExecutionGuard>,
+    /// Names of the secrets granted to the command (values are only in `env`).
+    pub secrets: Vec<String>,
+    /// Requests a grant made that stack declined, such as removing a protected variable.
+    pub secret_warnings: Vec<String>,
+    /// Replaces granted values in captured output; empty without grants.
+    pub redactor: crate::process::Redactor,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -1849,9 +1857,11 @@ pub enum Require {
 /// A declared task as a command for `plan_exec`, with every service required. `mise run`
 /// keeps the provider's task semantics (templates, shebangs, argument passing); `--skip-deps`
 /// stops it from starting the task's daemons itself, since stack verifies them instead.
-pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<String>, Require)> {
+///
+/// Also returns the task's declared secrets: `stack run` grants exactly those.
+pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<String>, Require, Vec<String>)> {
     let report = ctx.compile(false)?;
-    report.stack.tasks.get(name).ok_or_else(|| {
+    let task = report.stack.tasks.get(name).ok_or_else(|| {
         let known: Vec<&str> = report.stack.tasks.keys().map(String::as_str).collect();
         StackError::new("unknown_task", format!("no task named '{name}'")).hint(if known.is_empty() {
             "this project defines no tasks; add one under [tasks.<name>] in stack.toml".to_string()
@@ -1866,17 +1876,24 @@ pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<Strin
     command.extend(args.iter().cloned());
     // `mise run` evaluates the provider config again and would restore the endpoints that
     // `plan_exec` withholds from unverified services. Only a fully verified stack has none.
-    Ok((command, Require::All))
+    Ok((command, Require::All, task.value.secrets.clone()))
 }
 
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
+    plan_exec_with(ctx, cmd, require, &Grant::default())
+}
+
+/// [`plan_exec`], resolving `grant`'s secrets through the stack's pinned fnox once services
+/// are verified and endpoints withheld. The names are checked before any provider call.
+pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     timings.mark("lock");
     let mut session = load(ctx)?;
     let report = ctx.compile(true)?;
     timings.mark("compile");
+    secrets::validate(&grant.keys, &report.stack, secrets::Origin::Command)?;
     mise::trust(&ctx.root)?;
     timings.mark("trust");
     let (mut env, checks) = if report.stack.services.is_empty() {
@@ -1952,6 +1969,22 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     if !unverified.is_empty() {
         env.insert("STACK_UNVERIFIED".into(), unverified.join(","));
     }
+    let granted = if grant.keys.is_empty() {
+        None
+    } else {
+        let resolved = resolve_secrets(ctx, &report, &env, &removed, &checks, grant)?;
+        timings.mark("secrets");
+        Some(resolved)
+    };
+    if let Some(resolved) = &granted {
+        for var in &resolved.remove {
+            env.shift_remove(var);
+            removed.push(var.clone());
+        }
+        for (key, value) in &resolved.set {
+            env.insert(key.clone(), value.clone());
+        }
+    }
     let (head, args) = cmd
         .split_first()
         .ok_or_else(|| StackError::new("usage", "no command given"))?;
@@ -1998,6 +2031,10 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     env.insert("STACK_PROJECT".into(), ctx.root.to_string_lossy().into());
     timings.mark("reserve");
 
+    let (secrets, secret_warnings, redactor) = match granted {
+        Some(r) => (r.keys, r.warnings, r.redactor),
+        None => Default::default(),
+    };
     Ok(ExecPlan {
         program,
         args: args.to_vec(),
@@ -2005,7 +2042,42 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         removed,
         checks,
         execution,
+        secrets,
+        secret_warnings,
+        redactor,
     })
+}
+
+/// The grant's values from the fnox release stack.lock pins, validated against everything this
+/// command's environment sets or withholds: compile-time protected names, every service's
+/// withheld variables, every variable the provider set, and every variable removed.
+fn resolve_secrets(
+    ctx: &Ctx,
+    report: &Report,
+    env: &IndexMap<String, String>,
+    removed: &[String],
+    checks: &[Check],
+    grant: &Grant,
+) -> Result<secrets::Resolved> {
+    let resolved = report
+        .versions
+        .iter()
+        .find(|v| v.kind == "tool" && v.name == secrets::FNOX)
+        .and_then(|v| v.resolved.clone())
+        .ok_or_else(|| {
+            StackError::new("secret_unavailable", "stack.lock pins no fnox release")
+                .hint("run `stack compile`")
+                .with_detail(json!({ "step": "locate", "kind": "not_locked", "timed_out": false }))
+        })?;
+    let spec = report.stack.tools.get(secrets::FNOX).map(|e| e.value.at(resolved.as_str())).unwrap_or_else(|| ToolSpec::new(resolved));
+    let request = secrets::Request { root: &ctx.root, cache: &ctx.cache, pin: spec, env, removed };
+    let protected = |key: &str| {
+        secrets::protected(key, &report.stack).is_some()
+            || env.contains_key(key)
+            || removed.iter().any(|r| r == key)
+            || checks.iter().any(|c| c.withheld.iter().any(|w| w == key))
+    };
+    secrets::resolve(&request, grant, protected)
 }
 
 pub fn renew(ctx: &Ctx) -> Result<Session> {

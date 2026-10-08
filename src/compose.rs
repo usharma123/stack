@@ -141,6 +141,7 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
 
     validate_task_services(&out)?;
     validate_tool_options(&out)?;
+    crate::secrets::validate_tasks(&out)?;
     Ok(out)
 }
 

@@ -7,6 +7,7 @@ use stack::mcp::{self, parse_duration};
 use stack::oci::{self, Reference};
 use stack::project::{self, default_cache_dir, Options, Report};
 use stack::compose::LoadedBundle;
+use stack::secrets::Grant;
 use stack::session::{self, Ctx, LeaseOptions, Require};
 use stack::source::Mode;
 use stack::state::default_state_dir;
@@ -96,10 +97,16 @@ enum Cmd {
         /// Kill the command after this long (e.g. 10m) and exit 124. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Grant this fnox secret to the command (repeatable), resolved through the stack's
+        /// pinned fnox. With --json its value is redacted from the captured output (and values
+        /// under 8 bytes are refused); without --json the command owns the terminal and its
+        /// output is shown as written, unredacted
+        #[arg(long = "secret", value_name = "KEY")]
+        secret: Vec<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Run a task from stack.toml once every service verifies
+    /// Run a task from stack.toml once every service verifies, granted the secrets it declares
     Run {
         /// Task name, as in [tasks.<name>]
         task: String,
@@ -260,7 +267,7 @@ fn main() -> ExitCode {
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
-        Cmd::Exec { require, require_all, timeout, cmd } => {
+        Cmd::Exec { require, require_all, timeout, secret, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -268,10 +275,10 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            run_command(&ctx, cli.json, cmd, &req, timeout.as_deref())
+            run_command(&ctx, cli.json, cmd, &req, secret.clone(), timeout.as_deref())
         }
         Cmd::Run { task, timeout, args } => session::task_command(&ctx, task, args)
-            .and_then(|(cmd, req)| run_command(&ctx, cli.json, &cmd, &req, timeout.as_deref())),
+            .and_then(|(cmd, req, secrets)| run_command(&ctx, cli.json, &cmd, &req, secrets, timeout.as_deref())),
         Cmd::Down => session::down(&ctx).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
@@ -447,12 +454,15 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
     })
 }
 
-fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, secrets: Vec<String>, timeout: Option<&str>) -> Result<ExitCode> {
     let timeout = timeout.map(parse_duration).transpose()?.map(Duration::from_secs);
+    // Captured output is redacted, so values too short to redact are refused there; on the
+    // terminal nothing is captured or redacted.
+    let grant = Grant { keys: secrets, captured: as_json };
     if as_json {
-        exec_json(ctx, cmd, require, timeout)
+        exec_json(ctx, cmd, require, &grant, timeout)
     } else {
-        exec(ctx, cmd, require, timeout)
+        exec(ctx, cmd, require, &grant, timeout)
     }
 }
 
@@ -489,10 +499,13 @@ fn warn_changed(checks: &[session::Check]) {
     }
 }
 
-fn exec(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>) -> Result<ExitCode> {
-    let plan = session::plan_exec(ctx, cmd, require)?;
+fn exec(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant, timeout: Option<Duration>) -> Result<ExitCode> {
+    let plan = session::plan_exec_with(ctx, cmd, require, grant)?;
     warn_unverified(&plan.checks);
     warn_changed(&plan.checks);
+    for warning in &plan.secret_warnings {
+        eprintln!("stack: {warning}");
+    }
     let mut command = Command::new(&plan.program);
     for var in &plan.removed {
         command.env_remove(var);
@@ -515,10 +528,10 @@ fn exec(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>)
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
 /// The process exits with the command's code (124 on timeout, like `timeout(1)`).
-fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>) -> Result<ExitCode> {
+fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant, timeout: Option<Duration>) -> Result<ExitCode> {
     // Large enough to mean "no limit" without overflowing deadline arithmetic.
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
-    let plan = session::plan_exec(ctx, cmd, require)?;
+    let plan = session::plan_exec_with(ctx, cmd, require, grant)?;
     let result = mcp::run_captured(ctx, &plan, timeout)?;
     if result["timed_out"] == true {
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));

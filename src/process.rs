@@ -66,6 +66,149 @@ pub struct Captured {
     pub stdout_truncated: bool,
 }
 
+// ---- redaction -----------------------------------------------------------------------------
+
+/// Values that must not appear in captured output, each replaced by `[redacted:<KEY>]`.
+///
+/// Matching is on bytes, before output is bounded, so a value is caught wherever it falls in
+/// the stream. Overlapping occurrences (of one value or of several) are replaced as one run
+/// naming every key it covered. Deliberately neither `Debug` nor `Serialize` beyond key names.
+#[derive(Clone, Default)]
+pub struct Redactor {
+    values: Vec<(Vec<u8>, String)>,
+    longest: usize,
+}
+
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.values.iter().map(|(_, k)| k.as_str()).collect();
+        f.debug_struct("Redactor").field("keys", &keys).finish()
+    }
+}
+
+impl Redactor {
+    /// Add `value` under `key`. Empty values match nothing and are ignored.
+    pub fn add(&mut self, key: &str, value: &[u8]) {
+        if value.is_empty() || self.values.iter().any(|(v, k)| v == value && k == key) {
+            return;
+        }
+        self.longest = self.longest.max(value.len());
+        self.values.push((value.to_vec(), key.to_string()));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Every value replaced in a complete text (an error message, a whole stream).
+    pub fn redact(&self, text: &str) -> String {
+        let mut stream = self.stream();
+        let mut out = stream.push(text.as_bytes());
+        out.extend(stream.finish());
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    pub fn stream(&self) -> RedactStream<'_> {
+        RedactStream { redactor: self, pending: Vec::new(), cover_end: 0, run: Vec::new(), offset: 0 }
+    }
+}
+
+/// A [`Redactor`] applied to one stream that arrives in pieces. Holds back at most the longest
+/// value minus one byte (plus any run of matched bytes still open), so a value split across
+/// reads is still caught.
+pub struct RedactStream<'a> {
+    redactor: &'a Redactor,
+    /// Bytes not yet decided, starting at absolute position `offset`.
+    pending: Vec<u8>,
+    /// Absolute end of the bytes covered by matches found so far.
+    cover_end: usize,
+    /// Keys of the covered run being skipped, in the order they matched.
+    run: Vec<usize>,
+    offset: usize,
+}
+
+impl RedactStream<'_> {
+    /// Feed `bytes`; returns what can be released now.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        self.advance(false)
+    }
+
+    /// End of stream: release everything still held.
+    pub fn finish(&mut self) -> Vec<u8> {
+        let mut out = self.advance(true);
+        self.close_run(&mut out);
+        out
+    }
+
+    fn close_run(&mut self, out: &mut Vec<u8>) {
+        for key in self.run.drain(..) {
+            out.extend_from_slice(format!("[redacted:{}]", self.redactor.values[key].1).as_bytes());
+        }
+    }
+
+    fn advance(&mut self, end: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let longest = self.redactor.longest;
+        let mut i = 0;
+        while i < self.pending.len() {
+            // Every match that starts here must be decidable: either the whole value fits in
+            // what arrived, or the stream ended.
+            if !end && self.pending.len() - i < longest {
+                break;
+            }
+            let rest = &self.pending[i..];
+            let position = self.offset + i;
+            for (index, (value, _)) in self.redactor.values.iter().enumerate() {
+                if rest.starts_with(value) {
+                    self.cover_end = self.cover_end.max(position + value.len());
+                    if !self.run.contains(&index) {
+                        self.run.push(index);
+                    }
+                }
+            }
+            if position >= self.cover_end {
+                self.close_run(&mut out);
+                out.push(self.pending[i]);
+            }
+            i += 1;
+        }
+        self.pending.drain(..i);
+        self.offset += i;
+        out
+    }
+}
+
+/// Where a captured stream goes: through the redactor if there is one, then into its tail.
+struct Sink<'a> {
+    stream: Option<RedactStream<'a>>,
+    tail: Tail,
+}
+
+impl<'a> Sink<'a> {
+    fn new(limit: usize, redactor: Option<&'a Redactor>) -> Self {
+        Self { stream: redactor.filter(|r| !r.is_empty()).map(Redactor::stream), tail: Tail::new(limit) }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        match self.stream.as_mut() {
+            Some(stream) => {
+                let released = stream.push(bytes);
+                self.tail.append(&released);
+            }
+            None => self.tail.append(bytes),
+        }
+    }
+
+    fn finish(mut self) -> Tail {
+        if let Some(mut stream) = self.stream.take() {
+            let released = stream.finish();
+            self.tail.append(&released);
+        }
+        self.tail
+    }
+}
+
 struct Tail {
     bytes: VecDeque<u8>,
     limit: usize,
@@ -188,7 +331,7 @@ fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
 }
 
 /// Read what is available without blocking. Returns `false` once the pipe reached EOF.
-fn drain(pipe: &mut impl Read, tail: &mut Tail) -> io::Result<bool> {
+fn drain(pipe: &mut impl Read, tail: &mut Sink<'_>) -> io::Result<bool> {
     let mut buffer = [0; 8192];
     // Yield to deadline checks even when a child writes continuously.
     for _ in 0..16 {
@@ -243,8 +386,17 @@ fn wait_readable(fds: &[std::os::fd::RawFd], wait: Duration) -> io::Result<()> {
 /// immediately rather than at the next fixed polling tick.
 #[cfg(unix)]
 pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Captured> {
+    capture_redacted(command, timeout, limit, None)
+}
+
+/// [`capture`], with every value of `redactor` replaced in both streams before they are
+/// bounded: `limit` applies to the redacted text, and a value split across reads or across
+/// the start of the retained tail is still replaced. `None` (or an empty redactor) captures
+/// exactly as [`capture`] does.
+#[cfg(unix)]
+pub fn capture_redacted(command: &mut Command, timeout: Duration, limit: usize, redactor: Option<&Redactor>) -> io::Result<Captured> {
     let mut child = OwnedChild::new(spawn_piped(command)?);
-    let piped = collect(&mut child, bounded(timeout), limit, |child, _| child.terminate())?;
+    let piped = collect(&mut child, bounded(timeout), limit, redactor, |child, _| child.terminate())?;
     Ok(Captured {
         exit_code: if piped.timed_out { None } else { child.status.and_then(|s| s.code()) },
         timed_out: piped.timed_out,
@@ -281,6 +433,7 @@ fn collect(
     child: &mut OwnedChild,
     timeout: Duration,
     limit: usize,
+    redactor: Option<&Redactor>,
     finish: impl FnOnce(&mut OwnedChild, bool),
 ) -> io::Result<Piped> {
     use std::os::fd::AsRawFd;
@@ -297,8 +450,8 @@ fn collect(
         .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
     nonblocking(&stdout)?;
     nonblocking(&stderr)?;
-    let mut out = Tail::new(limit);
-    let mut err = Tail::new(limit);
+    let mut out = Sink::new(limit, redactor);
+    let mut err = Sink::new(limit, redactor);
     let (mut out_open, mut err_open) = (true, true);
     // After both pipes close the command is normally exiting; reap it with a short backoff.
     let mut reap_backoff = Duration::from_micros(250);
@@ -340,7 +493,7 @@ fn collect(
     if err_open {
         drain(&mut stderr, &mut err)?;
     }
-    Ok(Piped { timed_out, stdout: out, stderr: err })
+    Ok(Piped { timed_out, stdout: out.finish(), stderr: err.finish() })
 }
 
 /// Process group of the command `run_with_deadline` is waiting for, for its signal handler.
@@ -579,7 +732,7 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
         FORWARD_TO.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
     }
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
-        collect(&mut child, timeout, OUTPUT_LIMIT, |child, timed_out| {
+        collect(&mut child, timeout, OUTPUT_LIMIT, None, |child, timed_out| {
             // Stop forwarding before the group can be reaped and its ID reused.
             let _ = set_mask(libc::SIG_BLOCK, &held);
             if forwarding.is_some() {
@@ -655,7 +808,12 @@ pub fn run_with_deadline(_: &mut Command, _: Duration) -> io::Result<(Option<i32
 }
 
 #[cfg(not(unix))]
-pub fn capture(_: &mut Command, _: Duration, _: usize) -> io::Result<Captured> {
+pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Captured> {
+    capture_redacted(command, timeout, limit, None)
+}
+
+#[cfg(not(unix))]
+pub fn capture_redacted(_: &mut Command, _: Duration, _: usize, _: Option<&Redactor>) -> io::Result<Captured> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "bounded process capture currently requires Unix",
@@ -857,5 +1015,93 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    fn redactor(pairs: &[(&str, &str)]) -> Redactor {
+        let mut r = Redactor::default();
+        for (key, value) in pairs {
+            r.add(key, value.as_bytes());
+        }
+        r
+    }
+
+    /// `text` fed to a stream in pieces of `size` bytes.
+    fn streamed(r: &Redactor, text: &[u8], size: usize) -> Vec<u8> {
+        let mut stream = r.stream();
+        let mut out = Vec::new();
+        for chunk in text.chunks(size.max(1)) {
+            out.extend(stream.push(chunk));
+        }
+        out.extend(stream.finish());
+        out
+    }
+
+    #[test]
+    fn values_are_replaced_wherever_the_stream_is_split() {
+        let r = redactor(&[("API_TOKEN", "s3cr3t-value-0042"), ("OTHER", "another-secret")]);
+        let text = "a s3cr3t-value-0042 b s3cr3t-value-0042\nanother-secret!s3cr3t-value-004";
+        let expected = "a [redacted:API_TOKEN] b [redacted:API_TOKEN]\n[redacted:OTHER]!s3cr3t-value-004";
+        for size in 1..=text.len() {
+            assert_eq!(String::from_utf8(streamed(&r, text.as_bytes(), size)).unwrap(), expected, "chunks of {size}");
+        }
+        assert_eq!(r.redact(text), expected);
+    }
+
+    #[test]
+    fn overlapping_values_are_replaced_as_one_run_naming_each_key() {
+        let r = redactor(&[("A", "abcdefgh"), ("B", "efghijkl")]);
+        for size in 1..=12 {
+            let out = String::from_utf8(streamed(&r, b"<abcdefghijkl>", size)).unwrap();
+            assert_eq!(out, "<[redacted:A][redacted:B]>", "chunks of {size}");
+        }
+        // A value overlapping itself, and one value inside another.
+        let r = redactor(&[("R", "aaaaaaaa"), ("IN", "xyz12345"), ("OUT", "--xyz12345--")]);
+        assert_eq!(r.redact("aaaaaaaaaaa."), "[redacted:R].");
+        assert_eq!(r.redact("(--xyz12345--)"), "([redacted:OUT][redacted:IN])");
+        assert!(!r.redact("aaaaaaaaaaaaaaaaaaaaaaaa").contains("aaaaaaaa"));
+    }
+
+    #[test]
+    fn multibyte_values_and_context_are_matched_on_bytes() {
+        let r = redactor(&[("K", "pässwörd✓")]);
+        let text = "ü→pässwörd✓←ü".as_bytes();
+        for size in 1..=text.len() {
+            assert_eq!(String::from_utf8(streamed(&r, text, size)).unwrap(), "ü→[redacted:K]←ü", "chunks of {size}");
+        }
+    }
+
+    #[test]
+    fn an_empty_redactor_changes_nothing() {
+        let r = Redactor::default();
+        assert!(r.is_empty());
+        assert_eq!(r.redact("anything at all"), "anything at all");
+        assert_eq!(format!("{:?}", redactor(&[("KEY", "value-never-shown")])), "Redactor { keys: [\"KEY\"] }");
+    }
+
+    #[test]
+    fn capture_redacts_both_streams_before_bounding_them() {
+        let r = redactor(&[("TOKEN", "sentinel-0123456789")]);
+        // The value straddles the start of the retained tail and arrives in separate writes.
+        let script = "printf 'sentinel-01'; sleep 0.05; printf '23456789'; head -c 5000 /dev/zero | tr '\\0' x; \
+                      printf 'sentinel-0123456789'; printf 'sentinel-0123456789' >&2";
+        let out = capture_redacted(Command::new("sh").args(["-c", script]), Duration::from_secs(5), 64, Some(&r)).unwrap();
+        assert!(out.stdout_truncated);
+        assert!(out.stdout.ends_with("[redacted:TOKEN]"), "{}", out.stdout);
+        assert_eq!(out.stderr, "[redacted:TOKEN]");
+        // Exactly at the tail boundary: the redacted marker, not a fragment of the value.
+        let script = "head -c 100 /dev/zero | tr '\\0' x; printf 'sentinel-0123456789'";
+        let out = capture_redacted(Command::new("sh").args(["-c", script]), Duration::from_secs(5), 19, Some(&r)).unwrap();
+        assert!(!out.stdout.contains("sentinel"), "{}", out.stdout);
+        assert!(out.stdout.ends_with("ted:TOKEN]"), "{}", out.stdout);
+    }
+
+    #[test]
+    fn a_timed_out_capture_still_redacts_what_was_held_back() {
+        let r = redactor(&[("TOKEN", "sentinel-0123456789")]);
+        let out = capture_redacted(Command::new("sh").args(["-c", "printf 'x sentinel-0123456789'; sleep 20"]), Duration::from_millis(300), 1024, Some(&r)).unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.stdout, "x [redacted:TOKEN]");
+        let out = capture_redacted(Command::new("sh").args(["-c", "printf 'x sentinel-01234'; sleep 20"]), Duration::from_millis(300), 1024, Some(&r)).unwrap();
+        assert_eq!(out.stdout, "x sentinel-01234", "a partial value is released at the end");
     }
 }
