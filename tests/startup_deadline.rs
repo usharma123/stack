@@ -1,5 +1,6 @@
-//! `up` and `restart` timeouts, through the CLI and MCP: a timeout too long to track is refused
-//! before any work.
+//! `up` and `restart` timeouts, through the CLI and MCP: a registry host the system resolver
+//! never answers for cannot hold startup past its timeout, and a timeout too long to track is
+//! refused before any work.
 #![cfg(unix)]
 
 use serde_json::{json, Value};
@@ -131,4 +132,115 @@ fn a_timeout_too_long_to_track_is_refused_before_any_work() {
     }
     // No collection, lock, session or provider call happened.
     assert_eq!(project.written(), Vec::<PathBuf>::new());
+}
+
+/// Makes the system resolver stall for `STALLED_HOST`: each lookup of it is noted in
+/// `STALL_MARKER` and answered only after `STALL_SECS`, with a temporary failure.
+const STALLING_RESOLVER: &str = r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <netdb.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int stall(const char *node) {
+    const char *host = getenv("STALLED_HOST");
+    if (!node || !host || strcmp(node, host) != 0) return 0;
+    int fd = open(getenv("STALL_MARKER"), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { write(fd, "lookup\n", 7); close(fd); }
+    sleep(atoi(getenv("STALL_SECS")));
+    return 1;
+}
+
+#ifdef __APPLE__
+static int stalling_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+    if (stall(node)) return EAI_AGAIN;
+    return getaddrinfo(node, service, hints, res);
+}
+__attribute__((used)) static struct { const void *replacement; const void *replacee; } interpose
+    __attribute__((section("__DATA,__interpose"))) = { (const void *)stalling_getaddrinfo, (const void *)getaddrinfo };
+#else
+#include <dlfcn.h>
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+    if (stall(node)) return EAI_AGAIN;
+    int (*real)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = dlsym(RTLD_NEXT, "getaddrinfo");
+    return real(node, service, hints, res);
+}
+#endif
+"#;
+
+const STALLED_HOST: &str = "stalled-registry.invalid";
+const STALL_SECS: u64 = 8;
+
+/// `command` with the system resolver stalling for STALLED_HOST.
+fn with_stalled_resolver(project: &Project, mut command: Command) -> Command {
+    let source = project.path("stall.c");
+    fs::write(&source, STALLING_RESOLVER).unwrap();
+    let (library, flags, preload) = if cfg!(target_os = "macos") {
+        (project.path("stall.dylib"), &["-dynamiclib"][..], "DYLD_INSERT_LIBRARIES")
+    } else {
+        (project.path("stall.so"), &["-shared", "-fPIC"][..], "LD_PRELOAD")
+    };
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let built = Command::new(&cc).args(flags).arg("-o").arg(&library).arg(&source).arg("-ldl").output();
+    let built = built.unwrap_or_else(|e| panic!("this test needs a C compiler ({cc}): {e}"));
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    command
+        .env(preload, &library)
+        .env("STALLED_HOST", STALLED_HOST)
+        .env("STALL_MARKER", project.path("lookups"))
+        .env("STALL_SECS", STALL_SECS.to_string());
+    command
+}
+
+fn stalled_registry_project() -> Project {
+    let source = format!("oci:{STALLED_HOST}/team:latest");
+    Project::new(
+        &format!("[[use]]\nbundle = \"{source}\"\n"),
+        Some(&format!(
+            "version = 2\n[[bundle]]\nsource = \"{source}\"\nname = \"team\"\ndigest = \"sha256:{}\"\ncontent_hash = \"sha256:{}\"\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        )),
+    )
+}
+
+fn lookups(project: &Project) -> usize {
+    fs::read_to_string(project.path("lookups")).map_or(0, |s| s.lines().count())
+}
+
+#[test]
+fn a_registry_host_the_resolver_never_answers_cannot_hold_up_past_its_timeout() {
+    let project = stalled_registry_project();
+    let start = Instant::now();
+    let out = with_stalled_resolver(&project, project.command(&["--json", "up", "--timeout", "1s"])).output().unwrap();
+    let took = start.elapsed();
+    assert_eq!(lookups(&project), 1, "registry host lookups");
+    // The lookup itself would have taken STALL_SECS.
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert_eq!(out.status.code(), Some(124));
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "timed_out", "{error}");
+    assert_eq!(error["message"], "`stack up` did not finish within 1s");
+    assert!(error["hint"].as_str().unwrap().starts_with("nothing was started"), "{error}");
+    assert_eq!(error["details"][0]["cause"]["code"], "oci_unreachable", "{error}");
+    assert!(error["details"][0]["cause"]["message"].as_str().unwrap().contains("did not finish in time"), "{error}");
+    assert_eq!(error["details"][1]["changed"], false, "{error}");
+}
+
+#[test]
+fn mcp_up_against_a_registry_host_the_resolver_never_answers_ends_at_its_timeout() {
+    let project = stalled_registry_project();
+    let command = with_stalled_resolver(&project, project.command(&["mcp"]));
+    let (results, took) = project.mcp(command, &[("stack_up", json!({ "timeout_secs": 1 })), ("stack_gc", json!({}))]);
+    assert_eq!(lookups(&project), 1, "registry host lookups");
+    // Both calls were answered, and the server exited, before one lookup would have finished.
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    let error = &results[0]["structuredContent"]["error"];
+    assert_eq!(error["code"], "timed_out", "{error}");
+    assert_eq!(error["message"], "`stack up` did not finish within 1s");
+    assert_eq!(error["details"][0]["cause"]["code"], "oci_unreachable", "{error}");
+    assert_eq!(results[1]["isError"], false, "{}", results[1]);
 }

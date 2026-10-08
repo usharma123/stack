@@ -15,9 +15,13 @@ use flate2::{Compression, GzBuilder};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use url::Url;
 
 pub const ARTIFACT_TYPE: &str = "application/vnd.stack.bundle.v1";
@@ -25,8 +29,11 @@ pub const LAYER_TYPE: &str = "application/vnd.stack.bundle.layer.v1.tar+gzip";
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const MAX_BLOB: u64 = 256 * 1024 * 1024;
-/// Longest one registry request may take, body included.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest one registry request may take, host lookup and body included.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most registry host lookups running at once in this process, abandoned ones included.
+const MAX_LOOKUPS: usize = 4;
+static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
 
 /// How far one bundle layer may expand. Digests bound what is downloaded, not what a
 /// compressed archive expands to.
@@ -113,15 +120,100 @@ pub struct Client {
 
 impl Default for Client {
     fn default() -> Self {
+        Self::with_resolver(Resolver {
+            lookup: Arc::new(|netloc| netloc.to_socket_addrs().map(Iterator::collect)),
+            running: &LOOKUPS,
+            max: MAX_LOOKUPS,
+        })
+    }
+}
+
+impl Client {
+    fn with_resolver(resolver: Resolver) -> Self {
         Self {
             // Redirects are handled explicitly so they cannot carry auth to another origin.
             agent: ureq::AgentBuilder::new()
                 .redirects(0)
                 .timeout(REQUEST_TIMEOUT)
+                .resolver(resolver)
                 .build(),
             token: RefCell::new(None),
             credential_origin: RefCell::new(None),
         }
+    }
+}
+
+type Lookup = dyn Fn(&str) -> io::Result<Vec<SocketAddr>> + Send + Sync;
+
+/// Host lookups that end with the request making them.
+///
+/// ureq resolves a host before its request timeout applies, and the system resolver cannot be
+/// interrupted. So each lookup runs on a thread of its own while the request waits only as long
+/// as it may: REQUEST_TIMEOUT, cut short by the caller's deadline. A lookup that outlives its
+/// request finishes unread; no request is ever made with what it finds. At most `max` lookups
+/// run at once, abandoned ones included; beyond that a lookup fails rather than add a thread.
+struct Resolver {
+    lookup: Arc<Lookup>,
+    running: &'static AtomicUsize,
+    max: usize,
+}
+
+impl ureq::Resolver for Resolver {
+    // ureq calls this on the requesting thread, whose deadline it therefore sees.
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        self.resolve_within(netloc, crate::process::bounded(REQUEST_TIMEOUT))
+    }
+}
+
+impl Resolver {
+    fn resolve_within(&self, netloc: &str, within: Duration) -> io::Result<Vec<SocketAddr>> {
+        if let Ok(addr) = netloc.parse::<SocketAddr>() {
+            return Ok(vec![addr]);
+        }
+        let timed_out = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("looking up {netloc} did not finish in time"),
+            )
+        };
+        if within.is_zero() {
+            return Err(timed_out());
+        }
+        if self.running.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            return Err(io::Error::other(format!(
+                "{} earlier registry host lookups have not finished",
+                self.max
+            )));
+        }
+        let slot = LookupSlot(self.running);
+        let (lookup, host) = (self.lookup.clone(), netloc.to_owned());
+        let (found, result) = mpsc::sync_channel(1);
+        // Should the thread not start, the closure is dropped with the slot in it.
+        std::thread::Builder::new()
+            .name("registry-lookup".into())
+            .spawn(move || {
+                let addrs = lookup(&host);
+                // Freed before the answer is sent, so a caller that receives it can look up again.
+                drop(slot);
+                let _ = found.send(addrs);
+            })?;
+        match result.recv_timeout(within) {
+            Ok(addrs) => addrs,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other(format!("looking up {netloc} failed")))
+            }
+        }
+    }
+}
+
+/// One running lookup, counted until dropped.
+struct LookupSlot(&'static AtomicUsize);
+
+impl Drop for LookupSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -156,7 +248,8 @@ fn basic(user: &str, pass: &str) -> String {
     out
 }
 
-/// `req` bounded by REQUEST_TIMEOUT and by the caller's deadline, if any (as within `stack up`).
+/// `req` bounded by REQUEST_TIMEOUT and by the caller's deadline, if any (as within `stack up`):
+/// host lookup, connection, and reading the response body all end by then.
 fn bounded(req: ureq::Request) -> Result<ureq::Request> {
     if crate::process::expired() {
         return Err(StackError::new("timed_out", format!("the deadline passed before a registry {} request", req.method())));
@@ -1229,5 +1322,156 @@ mod tests {
             crate::hash::hash_dir(out.path()).unwrap(),
             crate::hash::hash_dir(dir.path()).unwrap()
         );
+    }
+
+    /// Lookups that stall like an unresponsive resolver until `open` is called.
+    struct StalledLookups {
+        open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        calls: Arc<AtomicUsize>,
+        running: &'static AtomicUsize,
+    }
+
+    impl StalledLookups {
+        fn new() -> Self {
+            Self {
+                open: Arc::default(),
+                calls: Arc::default(),
+                running: Box::leak(Box::new(AtomicUsize::new(0))),
+            }
+        }
+
+        /// A resolver answering `answered` lookups with `addr` at once, then stalling.
+        fn resolver(&self, answered: usize, addr: SocketAddr, max: usize) -> Resolver {
+            let (open, calls) = (self.open.clone(), self.calls.clone());
+            Resolver {
+                lookup: Arc::new(move |_| {
+                    if calls.fetch_add(1, Ordering::SeqCst) >= answered {
+                        let (lock, cvar) = &*open;
+                        let guard = lock.lock().unwrap();
+                        drop(cvar.wait_timeout_while(guard, Duration::from_secs(20), |open| !*open).unwrap());
+                    }
+                    Ok(vec![addr])
+                }),
+                running: self.running,
+                max,
+            }
+        }
+
+        fn open(&self) {
+            *self.open.0.lock().unwrap() = true;
+            self.open.1.notify_all();
+        }
+
+        fn wait_until_finished(&self) {
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while self.running.load(Ordering::SeqCst) > 0 {
+                assert!(std::time::Instant::now() < until, "abandoned lookups never finished");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn lookups_end_in_time_and_never_outnumber_their_limit() {
+        let lookups = StalledLookups::new();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let resolver = lookups.resolver(0, addr, 2);
+        for _ in 0..2 {
+            let start = std::time::Instant::now();
+            let err = resolver.resolve_within("stalled.test:443", Duration::from_millis(200)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+            assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        }
+        // Both abandoned lookups still run; a third is refused at once rather than add a thread.
+        let start = std::time::Instant::now();
+        let err = resolver.resolve_within("stalled.test:443", Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("have not finished"), "{err}");
+        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        assert_eq!(lookups.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(lookups.running.load(Ordering::SeqCst), 2);
+        // Addresses need no lookup, and an exhausted deadline starts none.
+        assert_eq!(resolver.resolve_within("127.0.0.1:5000", Duration::ZERO).unwrap(), ["127.0.0.1:5000".parse().unwrap()]);
+        assert_eq!(resolver.resolve_within("[::1]:5000", Duration::ZERO).unwrap(), ["[::1]:5000".parse().unwrap()]);
+        assert_eq!(resolver.resolve_within("later.test:443", Duration::ZERO).unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+        // Once the resolver answers, the abandoned lookups end and free their places.
+        lookups.open();
+        lookups.wait_until_finished();
+        assert_eq!(resolver.resolve_within("stalled.test:443", Duration::from_secs(5)).unwrap(), [addr]);
+        assert_eq!(lookups.running.load(Ordering::SeqCst), 0);
+    }
+
+    /// A registry at `127.0.0.1:<port>`, reached as `localhost:<port>`. `/auth` is challenged
+    /// by a token service on the same origin, `/redirect` moves, `/body` never sends its body.
+    /// Returns the address and every request path received.
+    fn registry() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+                    let mut header = String::new();
+                    while reader.read_line(&mut header).unwrap_or(0) > 0 && header != "\r\n" {
+                        header.clear();
+                    }
+                    log.lock().unwrap().push(path.clone());
+                    let port = addr.port();
+                    let head = if path.ends_with("/auth") {
+                        format!("401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://localhost:{port}/token\"\r\nContent-Length: 0")
+                    } else if path.ends_with("/redirect") {
+                        "307 Moved\r\nLocation: /v2/x/manifests/moved\r\nContent-Length: 0".into()
+                    } else {
+                        "200 OK\r\nContent-Length: 100".into()
+                    };
+                    let _ = write!(stream, "HTTP/1.1 {head}\r\nConnection: close\r\n\r\n");
+                    // The body is never sent; the connection stays open well past any deadline.
+                    std::thread::sleep(Duration::from_secs(10));
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    #[test]
+    fn registry_requests_end_at_the_deadline_whatever_they_wait_for() {
+        let (addr, seen) = registry();
+        let port = addr.port();
+        // (path, lookups answered before the resolver stalls, what was cut short)
+        for (path, answered, cut_short) in [
+            ("latest", 0, "did not finish in time"),
+            ("auth", 1, "did not finish in time"),
+            ("redirect", 1, "did not finish in time"),
+            ("body", 1, "timed out"),
+        ] {
+            let lookups = StalledLookups::new();
+            let client = Client::with_resolver(lookups.resolver(answered, addr, MAX_LOOKUPS));
+            let url = format!("http://localhost:{port}/v2/x/manifests/{path}");
+            let requests = seen.lock().unwrap().len();
+            let start = std::time::Instant::now();
+            let result = {
+                let _deadline = crate::process::deadline_scope(Some(start + Duration::from_millis(300)));
+                client.send("GET", &url, None, None).and_then(Client::read_limited)
+            };
+            let took = start.elapsed();
+            let err = result.unwrap_err();
+            assert!(took < Duration::from_secs(2), "{path}: {took:?}");
+            assert!(err.message.contains(cut_short), "{path}: {err:?}");
+            assert_eq!(lookups.calls.load(Ordering::SeqCst), answered + usize::from(path != "body"), "{path}");
+
+            // A lookup answering late makes no request with what it found.
+            lookups.open();
+            lookups.wait_until_finished();
+            let after = seen.lock().unwrap()[requests..].to_vec();
+            assert_eq!(after.len(), answered.max(usize::from(path == "body")), "{path}: {after:?}");
+        }
     }
 }
