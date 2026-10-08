@@ -14,7 +14,7 @@ trap 'docker rm -f stack-e2e stack-e2e-reg >/dev/null' EXIT
 docker cp "$root/tests/e2e/assert.sh" stack-e2e:/tmp/stack-e2e-assert.sh
 docker exec stack-e2e bash -c 'mkdir -p /srv && chown agent /srv'
 count=0
-for t in "$root"/tests/e2e/[0-9]-*.sh; do
+for t in "$root"/tests/e2e/[0-9]*-*.sh; do
   echo "=== $(basename "$t")"
   docker cp "$t" stack-e2e:/tmp/t.sh
   docker exec -u agent stack-e2e bash /tmp/t.sh

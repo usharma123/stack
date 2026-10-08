@@ -111,6 +111,19 @@ output (mise's answer when no release matches) is an error, not a version.
   become a URL that names only the invalid host. Only values that name no host (ports, users,
   databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
   turns this into a refusal to run.
+- **Secret grants.** A task's `secrets` names, `exec --secret` and MCP `stack_exec.secrets` are
+  resolved by stack, not by mise's native task secrets: `exec` computes the environment with
+  `mise env --json` and runs the program itself, so a mise-side grant would not reach it.
+  Names are checked at compile and plan time against every service's endpoint variables,
+  `[env]` and the variables stack and mise reserve, and at run time also against everything the
+  planned environment sets or withholds. After verification and withholding, stack locates the
+  `fnox` on the planned `PATH`, requires it to resolve inside the install directory mise reports
+  for the locked release (asked in a `[tools]`-only scratch root), and runs it twice
+  (`--describe`, then `--keys`), non-interactive and without fnox's daemon, each bounded by 30s,
+  64 KiB and a process-group kill. The whole answer is validated before anything is applied;
+  nothing fnox prints is forwarded. Captured output passes through a streaming literal matcher
+  before its tail is bounded. Values live only in the command's environment and in that
+  matcher. Details and the boundary: [secret grants](user/secrets.md).
 - **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
   `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.

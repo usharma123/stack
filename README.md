@@ -69,6 +69,7 @@ Full docs live in [docs/](https://github.com/usharma123/stack/tree/main/docs).
 - [Command reference](https://github.com/usharma123/stack/blob/main/docs/user/commands.md)
 - [Guarantees and limits](https://github.com/usharma123/stack/blob/main/docs/user/guarantees.md)
 - [Service identity probes](https://github.com/usharma123/stack/blob/main/docs/user/identity-probes.md)
+- [Secret grants](https://github.com/usharma123/stack/blob/main/docs/user/secrets.md)
 - [Publishing bundles to OCI registries](https://github.com/usharma123/stack/blob/main/docs/user/registries.md)
 - [JSON output and MCP](https://github.com/usharma123/stack/blob/main/docs/user/agents.md)
 - [Agent skills](https://github.com/usharma123/stack/blob/main/docs/user/skills.md)

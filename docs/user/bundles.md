@@ -60,6 +60,11 @@ stack exec --require postgres -- psql  # any other command
 stack down                             # succeeds only once the processes are confirmed gone
 ```
 
+A task can also list `secrets = ["DEPLOY_KEY"]`: names of fnox secrets `stack run` grants it.
+Bundles may declare names (never values); the stack must list `fnox` in `[tools]`, and a name
+may not be a service endpoint, an `[env]` key or a variable stack reserves. See
+[secret grants](secrets.md).
+
 ## Tool options
 
 A tool is a version request, or a table with `version` and options from a short allowlist:

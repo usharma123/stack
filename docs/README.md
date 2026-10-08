@@ -7,6 +7,7 @@
 - [Command reference](user/commands.md)
 - [Guarantees and limits](user/guarantees.md)
 - [Service identity probes](user/identity-probes.md)
+- [Secret grants](user/secrets.md)
 - [Publishing bundles to OCI registries](user/registries.md)
 - [JSON output and MCP](user/agents.md)
 - [Agent skills](user/skills.md)
@@ -29,5 +30,6 @@ Start with [development and validation](operations/development.md).
 - [Review resolution](eval-followup-review-resolution.md)
 - [Port conflicts, install, logs review (2026-10-06)](reviews/2026-10-06-occupied-port-install-logs.md)
 - [Agent skills real-tool receipts (2026-10-08)](reviews/2026-10-08-skills-smoke.md)
+- [fnox secret grants: real-tool receipts (2026-10-08)](reviews/2026-10-08-fnox-secrets-smoke.md)
 
 [Repository home](../README.md)

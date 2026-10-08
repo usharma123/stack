@@ -8,14 +8,14 @@
 | `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
 | `stack restart [service...] [--timeout D]` | Restart services of the running session (all when none named) and verify again |
-| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies |
-| `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies, granted the [secrets](secrets.md) it declares |
+| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run with tools and env; unverified endpoints poisoned; `--secret` grants a fnox secret |
 | `stack logs <service> [--tail N] [--since-start]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc [--watch [--interval 60s]]` | Renew this session's lease / reclaim expired and deleted-project sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
 | `stack setup [--force]` | Download stack's pinned mise unless one is on `PATH` (`--force`: install it anyway) |
-| `stack doctor` | Check mise, git and tar, Pitchfork's socket path, that the project compiles, and that mise is new enough for its tool options |
+| `stack doctor` | Check mise, git and tar, Pitchfork's socket path, that the project compiles, that mise is new enough for its tool options, and fnox's value-free description when the stack uses fnox |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
@@ -86,6 +86,13 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   captured output is the error's only detail. Without `--json` the command keeps stdout and
   stderr; with `--timeout` it also runs in its own process group, so its stdin is empty, and
   interrupt, terminate and hangup signals are passed on to it.
+- `exec --secret KEY` (repeatable) and a task's `secrets = [...]` grant named fnox secrets,
+  resolved through the fnox release `stack.lock` pins once services verify. Names are checked
+  before any provider call (`invalid_secret`). With `--json` granted values are replaced by
+  `[redacted:KEY]` in the captured output before it is bounded, and values under 8 bytes are
+  refused (`secret_unsupported`); without `--json` the command's output reaches the terminal
+  unredacted. The result lists granted names under `secrets` and declined removals under
+  `warnings`. See [secret grants](secrets.md) for the rules, codes and boundary.
 - `restart [service...]` stops the named services (every service when none are named), waits
   until their recorded processes are gone and ports closed, starts them again and verifies the
   whole stack, like `up`. Other services keep running and the session keeps its id. Use it
