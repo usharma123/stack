@@ -13,6 +13,9 @@ use std::path::Path;
 use std::time::Duration;
 
 const FAKE_MISE: &str = include_str!("fakes/mise.sh");
+
+#[path = "support/python.rs"]
+mod python;
 const FAKE_FNOX: &str = include_str!("fakes/fnox.sh");
 const SENTINELS: &[&str] = &["leak-sentinel-deploy-0001", "leak-sentinel-sentry-0002", "leak-sentinel-dependency-0003"];
 
@@ -66,6 +69,7 @@ fn a_saved_task_plan_runs_its_planned_definition_and_grant_after_a_later_compile
     // The only test in this binary: nothing else reads the environment while it changes.
     std::env::set_var("PATH", &path);
     std::env::set_var("REVIEW_FIXTURE", &fixture);
+    std::env::set_var("REVIEW_PYTHON", python::python());
 
     let root = fixture.join("app");
     let ctx = Ctx { root: root.clone(), cache: fixture.join("cache"), state: fixture.join("state") };

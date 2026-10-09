@@ -9,6 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[path = "support/python.rs"]
+mod python;
+
 /// mise as stack drives it: answers from files a test writes under `$REVIEW_FIXTURE`.
 const FAKE_MISE: &str = include_str!("fakes/mise.sh");
 
@@ -88,6 +91,7 @@ esac
                 ),
             )
             .env("REVIEW_FIXTURE", self.dir.path())
+            .env("REVIEW_PYTHON", python::python())
             .env("STACK_STATE_DIR", self.dir.path().join("state"))
             .env("STACK_CACHE_DIR", self.dir.path().join("cache"));
         command

@@ -1,5 +1,7 @@
 #!/bin/sh
 echo "$*" >>"$REVIEW_FIXTURE/mise.log"
+# The Python the test found on its own PATH before narrowing stack's (see tests/support/python.rs).
+py=${REVIEW_PYTHON:-python3}
 # Which file ran, however PATH named it: a relative entry is found from the working directory.
 case $0 in */*) self=${0%/*} ;; *) self=. ;; esac
 echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
@@ -29,7 +31,7 @@ case "$1 $2" in
     else
       # Every release the configuration names, installed when an install recorded it (or a
       # test listed it) in `installed`; `ls.json` stands for fnox's rows when a test gives them.
-      python3 -c '
+      "$py" -c '
 import json, os, sys, tomllib
 fixture = sys.argv[1]
 try:
@@ -61,7 +63,7 @@ print(json.dumps(out))' "$REVIEW_FIXTURE"
     # Record what was installed: the named tools (every one when none is named), each at every
     # version the configuration gives it.
     shift 1
-    python3 -c '
+    "$py" -c '
 import os, sys, tomllib
 try:
     config = tomllib.load(open(".config/mise/conf.d/stack.toml", "rb"))
@@ -96,7 +98,7 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     # A supervised listener (see `daemons start`) is reported with its real PID while alive.
     if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
+      "$py" -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
     else
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
@@ -105,12 +107,12 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     # A request client that would launch a service later, after the request gave up. Like a
     # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
     if test -f "$REVIEW_FIXTURE/late-client"; then
-      python3 -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
+      "$py" -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
     fi
     if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
+      "$py" -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
       echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
       sleep 0.3
     fi
@@ -160,6 +162,6 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
     # A stopped supervised listener is reported stopped, like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port"; then
-      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
+      "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
     fi ;;
 esac
