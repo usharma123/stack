@@ -554,6 +554,37 @@ fn a_link_made_in_one_checkout_never_hides_the_same_path_in_another() {
 }
 
 #[test]
+fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let link = app.join(".claude/skills/fnox");
+    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new());
+    // A skill the user writes in its place: visible after a routine compile, no install needed.
+    fs::remove_file(&link).unwrap();
+    fs::create_dir(&link).unwrap();
+    fs::write(link.join("SKILL.md"), "the user's\n").unwrap();
+    let out = f.command_at(&app, &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(untracked_in(&app, ".claude/"), [".claude/skills/fnox/SKILL.md"]);
+    // A link of the user's own, pointing elsewhere: theirs too.
+    fs::remove_dir_all(&link).unwrap();
+    let theirs = f.path("theirs");
+    fs::create_dir_all(&theirs).unwrap();
+    std::os::unix::fs::symlink(&theirs, &link).unwrap();
+    let out = f.command_at(&app, &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(untracked_in(&app, ".claude/"), [".claude/skills/fnox"]);
+    // Removed: nothing left to name.
+    fs::remove_file(&link).unwrap();
+    f.command_at(&app, &["compile"]).output().unwrap();
+    let ignore = fs::read_to_string(app.join(".claude/skills/.gitignore")).unwrap();
+    assert!(!ignore.contains("/fnox"), "{ignore}");
+}
+
+#[test]
 fn a_skills_dir_written_with_dot_or_doubled_separators_is_ignored_where_the_links_are() {
     for dir in ["./.claude/skills", ".claude//skills/", "./.claude/./skills"] {
         let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}")));

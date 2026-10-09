@@ -725,9 +725,22 @@ fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str
     }
 }
 
-/// The link names stack recorded in `dir`'s registry; none when it cannot be read.
+/// The link names stack recorded in `dir`'s registry that are still its links: a symbolic
+/// link (never followed) pointing exactly where it was recorded. A name since removed,
+/// replaced (by a directory or file the user wrote, or a link of their own) or pointed
+/// elsewhere is not stack's. None when the registry cannot be read.
 pub fn linked(dir: &Path) -> Vec<String> {
-    read_registry(dir).map(|r| r.links.into_keys().collect()).unwrap_or_default()
+    let Ok(registry) = read_registry(dir) else { return Vec::new() };
+    registry
+        .links
+        .into_iter()
+        .filter(|(name, recorded)| {
+            let link = dir.join(name);
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
+                && std::fs::read_link(&link).ok().as_ref() == Some(recorded)
+        })
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The ownership record, refusing anything stack cannot trust: a link (which could redirect a

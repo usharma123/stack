@@ -80,7 +80,10 @@ The links point into one user's mise installs. In a git checkout stack lists eac
 made, and `.stack-skills.json`, by exact name in a `.gitignore` of its own in that directory
 (which also ignores itself), so they stay out of version control in this checkout while
 skills you add to the directory yourself, and the same names in other worktrees, do not. A
-`.gitignore` of yours there is left as it is, with a warning naming the links it misses.
+link is listed only while it is still the link stack made, pointing where it recorded: once
+you replace it with a skill directory or a link of your own, or remove it, the next `compile`
+stops ignoring that name. A `.gitignore` of yours there is left as it is, with a warning
+naming the links it misses.
 
 - Project only: a bundle cannot set `[skills]`.
 - `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no
