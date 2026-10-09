@@ -53,9 +53,12 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
             }
         }
     }
-    // A directory stack would refuse to link into holds nothing of stack's. Its normalized form
-    // (`./a//b` is `a/b`) is where the links are.
-    if let Some(dir) = skills_dir.and_then(|dir| crate::skills::validate_dir(dir).ok()).filter(|dir| contained(root, dir, &mut warnings, &mut planned)) {
+    // A directory stack would refuse to link into, such as `.stack` by another name, holds
+    // nothing of stack's. Its normalized form (`./a//b` is `a/b`) is where the links are.
+    if let Some(dir) = skills_dir
+        .and_then(|dir| crate::skills::validate_dir(dir).ok())
+        .filter(|dir| !crate::skills::reserved(root, dir) && contained(root, dir, &mut warnings, &mut planned))
+    {
         let dir = root.join(dir);
         match crate::skills::linked(&dir) {
             Ok(links) => {

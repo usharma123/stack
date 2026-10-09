@@ -244,6 +244,28 @@ fn generated_files_are_ignored_by_each_checkouts_own_gitignore_and_user_files_ar
 }
 
 #[test]
+fn stacks_own_directory_stays_ignored_after_up_and_through_the_old_exclude_migration() {
+    let fixture = Fixture::new();
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    fixture.ok(&["up"]);
+    let stack_warning = |out: &Output| json_result(out)["data"].get("warnings").filter(|w| w.to_string().contains(".stack")).cloned();
+    assert_eq!(stack_warning(&fixture.ok(&["--json", "compile"])), None);
+    assert_eq!(untracked(top, "app/.stack"), Vec::<String>::new());
+    // A session from a release that hid .stack with a block in the shared exclude instead.
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    fs::remove_file(app.join(".stack/.gitignore")).unwrap();
+    let exclude = top.join(".git/info/exclude");
+    fs::write(&exclude, format!("# mine\n\n# stack: generated files of {a}\n/app/.stack/\n# stack: end of {a}\n", a = app.display())).unwrap();
+    assert_eq!(untracked(top, "app/.stack"), Vec::<String>::new());
+    assert_eq!(stack_warning(&fixture.ok(&["--json", "compile"])), None);
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), "# mine\n");
+    assert!(app.join(".stack/.gitignore").is_file());
+    assert_eq!(untracked(top, "app/.stack"), Vec::<String>::new(), "the session shows in git");
+    fixture.ok(&["down"]);
+}
+
+#[test]
 fn concurrent_compiles_of_many_projects_in_one_repository_each_keep_their_files_ignored() {
     let fixture = Fixture::new();
     let top = fixture.dir.path();

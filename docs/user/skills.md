@@ -89,8 +89,11 @@ symbolic link is refused, and stack's file in the directory it leads to is left 
 `.gitignore` of yours there is left as it is, with a warning naming the links it misses.
 
 - Project only: a bundle cannot set `[skills]`.
-- `dir` must be relative and stay inside the project, outside `.stack` and `.git` (however
-  they are spelled), with no symbolic link along the path (`invalid_path`).
+- `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no
+  symbolic link along the path (`invalid_path`). Any spelling the file system resolves to the
+  same directory as `.stack` or `.git` is refused too, whether or not that directory existed
+  first: `.Stack` on a case-insensitive file system, but not on a case-sensitive one, where it
+  is a directory of its own.
 - After the install step, a `skills` step links every `available` skill to `<dir>/<name>` and
   records its links in `<dir>/.stack-skills.json`. Stack replaces or removes only a link it
   recorded that still points where it left it. Anything else at that name is left alone and

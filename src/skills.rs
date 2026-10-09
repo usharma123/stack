@@ -694,16 +694,50 @@ pub fn sync(root: &Path, dir: &Path, discovery: &Discovery) -> SyncReport {
 }
 
 /// Create `<root>/<dir>` component by component. Every component must be a real directory:
-/// a symbolic link anywhere in the path could lead outside the project, so it is refused.
+/// a symbolic link anywhere in the path could lead outside the project, so it is refused. So is
+/// `.stack` or `.git` by another name: its first component is created alone and checked before
+/// anything inside it, and removed again when it was new.
 fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str, String)> {
+    let Some(first) = dir.components().next() else { return real_dir(root, dir, true).map(drop) };
+    let first = root.join(first);
+    let new = std::fs::symlink_metadata(&first).is_err();
+    real_dir(root, Path::new(first.file_name().unwrap_or_default()), true)?;
+    if reserved(root, dir) {
+        if new {
+            let _ = std::fs::remove_dir(&first);
+        }
+        return Err(("invalid_path", format!("{} is .stack or .git on this file system; stack never links skills inside either", first.display())));
+    }
     real_dir(root, dir, true).map(drop)
+}
+
+/// Whether `<root>/<dir>` is inside `.stack` or `.git` as the file system resolves names:
+/// its first component is the same directory as either. Where the file system ignores case
+/// `.Stack` is `.stack`, whichever was created first; where it does not, `.Stack` is its own
+/// directory. [`validate_dir`] already refused the names as written.
+pub(crate) fn reserved(root: &Path, dir: &Path) -> bool {
+    let Some(Component::Normal(first)) = dir.components().next() else { return false };
+    let Some(first) = file_id(&root.join(first)) else { return false };
+    [".stack", ".git"].iter().any(|name| file_id(&root.join(name)).as_ref() == Some(&first))
+}
+
+/// What `path` is, following links: its device and inode.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
 }
 
 /// Whether `<root>/<dir>` is a real directory inside the project, checked component by
 /// component without following a symbolic link: `Ok(false)` when a component does not exist
 /// (created instead, with `create`), and an error for a link, a non-directory, or a path that
 /// does not resolve inside the project. Skill links and stack's ignore files are written only
-/// into a directory this accepts.
+/// into a directory this accepts; skill links only where [`reserved`] is false too.
 pub(crate) fn real_dir(root: &Path, dir: &Path, create: bool) -> std::result::Result<bool, (&'static str, String)> {
     let mut at = root.to_path_buf();
     for component in dir.components() {
@@ -730,13 +764,10 @@ pub(crate) fn real_dir(root: &Path, dir: &Path, create: bool) -> std::result::Re
     }
     // No component is a link, so the path cannot resolve outside the project. Where the file
     // system ignores case, the stored spelling (`.config` for `.Config`) may differ from the one
-    // written: the directory is the same, but its real name must not be `.stack` or `.git`.
-    let outside = || ("invalid_path", format!("{} does not resolve inside the project", at.display()));
-    let (Ok(real), Ok(real_root)) = (at.canonicalize(), root.canonicalize()) else { return Err(outside()) };
-    let Ok(inside) = real.strip_prefix(&real_root) else { return Err(outside()) };
-    match inside.components().next() {
-        Some(Component::Normal(first)) if first != ".stack" && first != ".git" => Ok(true),
-        _ => Err(("invalid_path", format!("{} is {}, inside .stack or .git", at.display(), real.display()))),
+    // written: the directory is the same.
+    match (at.canonicalize(), root.canonicalize()) {
+        (Ok(real), Ok(real_root)) if real.starts_with(&real_root) => Ok(true),
+        _ => Err(("invalid_path", format!("{} does not resolve inside the project", at.display()))),
     }
 }
 
@@ -1001,14 +1032,27 @@ mod tests {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         assert_eq!(real_dir(&root, Path::new(".config/mise"), false), Ok(true));
+        // stack's own directory is a real one inside the project: only skills stay out of it.
+        assert_eq!(real_dir(&root, Path::new(".stack"), false), Ok(true));
+        assert!(reserved(&root, Path::new(".stack/skills")) && reserved(&root, Path::new(".git")));
+        assert!(!reserved(&root, Path::new(".config/mise")) && !reserved(&root, Path::new("a/.stack")));
         // Only where the file system ignores case do these name the directories above.
         if !root.join(".CONFIG").exists() {
+            assert!(!reserved(&root, Path::new(".Stack/skills")));
             return;
         }
         assert_eq!(real_dir(&root, Path::new(".Config/MISE"), false), Ok(true));
         for alias in [".Stack/skills", ".GIT/skills"] {
-            assert_eq!(real_dir(&root, Path::new(alias), true).unwrap_err().0, "invalid_path", "{alias}");
+            assert!(reserved(&root, Path::new(alias)), "{alias}");
+            assert_eq!(prepare_dir(&root, Path::new(alias)).unwrap_err().0, "invalid_path", "{alias}");
         }
+        // Before `.stack` exists, its alias is refused as well, and not left behind.
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh = fresh.path().canonicalize().unwrap();
+        assert_eq!(prepare_dir(&fresh, Path::new(".Stack/skills")).unwrap_err().0, "invalid_path");
+        assert!(!fresh.join(".stack").exists());
+        prepare_dir(&fresh, Path::new(".Config/mise")).unwrap();
+        assert!(fresh.join(".config/mise").is_dir());
     }
 
     #[test]

@@ -716,6 +716,36 @@ fn a_skills_dir_written_with_dot_or_doubled_separators_is_ignored_where_the_link
 }
 
 #[test]
+fn skills_are_never_linked_into_stack_or_git_under_another_spelling() {
+    for (alias, reserved) in [(".Stack", ".stack"), (".GIT", ".git")] {
+        // Whether the reserved directory came first or not.
+        for existing in [false, true] {
+            let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = \"{alias}/skills\"")));
+            let app = f.path("app");
+            fs::create_dir(app.join("Probe")).unwrap();
+            let ignores_case = app.join("probe").exists();
+            fs::remove_dir(app.join("Probe")).unwrap();
+            if existing {
+                fs::create_dir(app.join(reserved)).unwrap();
+            }
+            let v = f.json(&["install"]);
+            let skills = &step(&v, "skills")["detail"];
+            let case = format!("{alias}, {reserved} existing: {existing}: {v}");
+            if ignores_case {
+                assert_eq!(skills["warnings"][0]["code"], "invalid_path", "{case}");
+                assert_eq!(skills["linked"], json!([]), "{case}");
+                assert!(!app.join(reserved).join("skills").exists(), "{case}");
+                assert_eq!(app.join(reserved).exists(), existing, "the refused directory is not left behind: {case}");
+            } else {
+                // Where case matters, the alias is a directory of its own.
+                assert_eq!(names(&skills["linked"]), ["fnox", "mbx", "mbx-advanced"], "{case}");
+                assert_eq!(app.join(reserved).exists(), existing, "{case}");
+            }
+        }
+    }
+}
+
+#[test]
 fn up_succeeds_with_a_warning_when_skills_cannot_be_linked() {
     let project = "[tools]\nfnox = \"1.39\"\n\n[skills]\ndir = \"agents/skills\"\n";
     let f = Fixture::new(project);
