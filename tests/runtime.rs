@@ -4442,6 +4442,28 @@ fn a_tasks_missing_pins_install_from_its_copy_before_it_runs_and_a_warm_run_inst
 }
 
 #[test]
+fn a_cold_tasks_install_is_given_the_planned_env_its_copy_declares_and_nothing_else() {
+    // mise renders the copy's `{{ env["KEY"] }}` declarations while installing, as when running.
+    let (fixture, _) = artifact_fixture("[env]\nTASK_ENV='from-project'\n[tasks.q]\nrun='echo $TASK_ENV'\n");
+    let dir = fixture.dir.path();
+    let routes = ["cli", "mcp", "terminal"];
+    for route in routes {
+        let _ = fs::remove_file(dir.join("installed"));
+        let _ = fs::remove_file(dir.join("install-env.log"));
+        fixture.set_env(&[("TASK_ENV", "from-project".into()), ("UNDECLARED", "not-for-install".into())]);
+        let ran = match route {
+            "cli" => json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"]["exit_code"] == 0,
+            "mcp" => fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"]["data"]["exit_code"] == 0,
+            _ => fixture.command(&["run", "q"]).output().unwrap().status.success(),
+        };
+        assert!(ran, "{route}: {}", fs::read_to_string(dir.join("mise.log")).unwrap_or_default());
+        // Exactly the declared names, with the values planning read; nothing it did not declare.
+        let given = fs::read_to_string(dir.join("install-env.log")).unwrap();
+        assert!(given.lines().all(|l| l == "TASK_ENV=from-project") && !given.is_empty(), "{route}: {given}");
+    }
+}
+
+#[test]
 fn a_task_whose_pins_mise_refuses_fails_with_stacks_remedy_before_it_runs() {
     let (fixture, platform) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
     let dir = fixture.dir.path();

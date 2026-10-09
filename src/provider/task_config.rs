@@ -28,7 +28,10 @@
 //! anything but ASCII letters, digits, `_`, `-` and `.`) are left out, as values the command
 //! inherits. Everything else is copied unchanged: tools, tasks, services and the generated `_`
 //! directives (such as `_.path`), which mise still applies. A value is never written into the
-//! copy, only its name.
+//! copy, only its name. Whatever loads the copy must therefore be given each declared value
+//! ([`TaskConfig::declared`]): the task's environment holds them, and the install of its
+//! missing pins before it starts is given the same planned values (never a granted secret,
+//! which planning resolves only after that install).
 //!
 //! [`TaskConfig::env`] points mise at the copy as its global configuration, with
 //! `MISE_GLOBAL_CONFIG_ROOT` set to the project root, and at a project configuration that
@@ -63,6 +66,8 @@ pub struct TaskConfig {
     parent: PathBuf,
     /// mise's `tracked-configs` directory, as the command's environment names it.
     tracked: Option<PathBuf>,
+    /// The `[env]` variables the copy declares as inherited (see [`TaskConfig::declared`]).
+    declared: Vec<String>,
 }
 
 impl TaskConfig {
@@ -82,7 +87,7 @@ impl TaskConfig {
     ) -> Result<Self> {
         let path = super::mise::output_path(root);
         let config = std::fs::read(&path).map_err(|e| io_error(path.display(), e))?;
-        let config = inheriting_planned_env(&config, planned, shell_expands, &path)?;
+        let (config, declared) = inheriting_planned_env(&config, planned, shell_expands, &path)?;
         let parent = cache.join(PURPOSE);
         std::fs::create_dir_all(&parent).map_err(|e| io_error(parent.display(), e))?;
         // Absolute: the command runs from the project root, not from where stack started.
@@ -109,7 +114,7 @@ impl TaskConfig {
         if let Some(lock) = lock {
             write_new(&dir.path().join(LOCK), lock.as_bytes())?;
         }
-        Ok(Self { dir, root: root.to_path_buf(), parent, tracked: None })
+        Ok(Self { dir, root: root.to_path_buf(), parent, tracked: None, declared })
     }
 
     /// The copied configuration.
@@ -120,6 +125,13 @@ impl TaskConfig {
     /// The directory holding the copy, removed on drop.
     pub fn dir(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The `[env]` variables the copy declares as the value the process loading it inherits.
+    /// Every mise command that loads the copy (the install before the task as well as `mise
+    /// run`) must be given each, or mise fails to render it.
+    pub fn declared(&self) -> &[String] {
+        &self.declared
     }
 
     /// Provider variables that make `mise run` load the copy and nothing else, resolving it
@@ -163,14 +175,15 @@ impl Drop for TaskConfig {
 }
 
 /// `config` with each plain `[env]` value `planned` gives declared as the inherited value (see
-/// the module documentation); unchanged if it gives none. Directives (the `_` table) and every
-/// other table are kept. `path` names the generated configuration in errors.
+/// the module documentation), and the names so declared; unchanged if it gives none.
+/// Directives (the `_` table) and every other table are kept. `path` names the generated
+/// configuration in errors.
 fn inheriting_planned_env(
     config: &[u8],
     planned: impl Fn(&str) -> Option<String>,
     shell_expands: impl FnOnce() -> Result<bool>,
     path: &Path,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<String>)> {
     let unreadable = |e: String| {
         StackError::new("provider_failed", format!("cannot read the generated configuration {}: {e}", path.display()))
             .hint("run `stack compile` to regenerate it")
@@ -178,7 +191,7 @@ fn inheriting_planned_env(
     let text = std::str::from_utf8(config).map_err(|e| unreadable(e.to_string()))?;
     let mut doc: toml::Table = toml::from_str(text).map_err(|e| unreadable(e.message().trim().to_string()))?;
     let Some(toml::Value::Table(env)) = doc.get_mut("env") else {
-        return Ok(config.to_vec());
+        return Ok((config.to_vec(), Vec::new()));
     };
     let held: Vec<(String, String)> = env
         .iter()
@@ -186,23 +199,29 @@ fn inheriting_planned_env(
         .filter_map(|(key, _)| Some((key.clone(), planned(key)?)))
         .collect();
     if held.is_empty() {
-        return Ok(config.to_vec());
+        return Ok((config.to_vec(), Vec::new()));
     }
     let expands = match held.iter().any(|(_, value)| value.contains('$')) {
         true => shell_expands()?,
         false => false,
     };
+    let mut declared = Vec::new();
     for (key, value) in &held {
         match inherited(key, value, expands) {
-            Some(declared) => env.insert(key.clone(), toml::Value::String(declared)),
-            None => env.remove(key),
-        };
+            Some(template) => {
+                env.insert(key.clone(), toml::Value::String(template));
+                declared.push(key.clone());
+            }
+            None => {
+                env.remove(key);
+            }
+        }
     }
     if env.is_empty() {
         doc.remove("env");
     }
     let body = toml::to_string_pretty(&doc).map_err(|e| unreadable(e.to_string()))?;
-    Ok(format!("# Copied by stack for one task run, declaring the [env] values the run inherits.\n{body}").into_bytes())
+    Ok((format!("# Copied by stack for one task run, declaring the [env] values the run inherits.\n{body}").into_bytes(), declared))
 }
 
 /// The declaration that gives `key` the `value` the command inherits, or `None` to leave it
@@ -384,10 +403,13 @@ mod tests {
         assert_eq!(held, expected);
         let keys: Vec<&String> = held["env"].as_table().unwrap().keys().collect();
         assert_eq!(keys, ["ASSET", "KEPT", "_"]);
+        // Only what the copy declares must be given to whatever loads it.
+        assert_eq!(copy.declared(), ["ASSET"]);
 
         // Nothing planned: the bytes compile wrote. Only PATH planned: no `[env]` at all.
         let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), config);
+        assert!(copy.declared().is_empty());
         let root = project("[env]\nPATH = \"a\"\n[tasks.a]\nrun = \"x\"\n", None);
         let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| Some("a".into()), never).unwrap();
         let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();

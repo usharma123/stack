@@ -68,11 +68,19 @@ print(json.dumps(out))' "$REVIEW_FIXTURE"
     # version the configuration gives it.
     shift 1
     "$py" -c '
-import os, sys, tomllib
+import os, re, sys, tomllib
 try:
     config = tomllib.load(open(sys.argv[2], "rb"))
 except FileNotFoundError:
     config = {}
+# Like mise, every [env] value is rendered when the configuration loads: a variable the copy
+# declares as inherited must be in the environment, or nothing installs.
+for key, value in config.get("env", {}).items():
+    for name in re.findall(r"env\[\"([^\"]+)\"\]", value if isinstance(value, str) else ""):
+        if name not in os.environ:
+            sys.exit("mise ERROR Failed to render [env] %s: Tried to render a variable that is undefined" % key)
+        with open(os.path.join(sys.argv[1], "install-env.log"), "a") as f:
+            f.write("%s=%s\n" % (name, os.environ[name]))
 tools = {k: v if isinstance(v, list) else [v] for k, v in config.get("tools", {}).items()}
 # A preset service installs its tool at the version the daemon names.
 for daemon in config.get("daemons", {}).values():

@@ -2112,7 +2112,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         Target::Command { .. } => None,
     };
     if let Some(config) = &task_config {
-        install_task_tools(ctx, &report, config, &missing)?;
+        install_task_tools(ctx, &report, config, &env, &missing)?;
         // Set before secrets resolve, so no grant can replace them.
         env.extend(config.env());
     }
@@ -2268,7 +2268,11 @@ fn check_services_host(report: &Report) -> Result<()> {
 /// here and plain `mise install` for the rest. A refused download is `artifact_mismatch` with
 /// stack's remedy, before the task runs, whether its output is captured or not; nothing here
 /// reads the task's own output. With every pin installed this asks nothing more of mise.
-fn install_task_tools(ctx: &Ctx, report: &Report, config: &TaskConfig, missing: &[scratch::Pin]) -> Result<()> {
+///
+/// The copy declares its `[env]` variables as inherited, so the install is given the values
+/// `planned` (the environment planning read, before any grant resolves) holds for exactly
+/// those names; the variables that select the copy are set last and cannot be replaced.
+fn install_task_tools(ctx: &Ctx, report: &Report, config: &TaskConfig, planned: &IndexMap<String, String>, missing: &[scratch::Pin]) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
@@ -2282,7 +2286,9 @@ fn install_task_tools(ctx: &Ctx, report: &Report, config: &TaskConfig, missing: 
             plain.push(pin.tool.clone());
         }
     }
-    let overrides = config.env();
+    let mut overrides: Vec<(String, String)> =
+        config.declared().iter().filter_map(|key| Some((key.clone(), planned.get(key)?.clone()))).collect();
+    overrides.extend(config.env());
     if !locked.is_empty() {
         mise::install_tools_with(&ctx.root, &overrides, &locked, true)?;
     }
