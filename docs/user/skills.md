@@ -52,8 +52,13 @@ in `skills`, never returned by `stack_skill`, and never linked. People can see i
 ## Reading a skill over MCP
 
 `stack_skill { tool, name }` returns `{ tool, version, name, entrypoint, bytes, text }` for one
-`available` skill from `skills`. The MCP server's instructions mention it, so agents find it
-without being told.
+`available` skill from `skills`. `name` may be left out when the tool has exactly one available
+skill; with several, the `usage` error lists their names. The MCP server's instructions
+mention it, so agents find it without being told.
+
+Stack returns the text as the release ships it, without edits. fnox 1.39.0's skill, for
+example, is one `SKILL.md` whose provider details are links to <https://fnox.jdx.dev>; the
+release carries no provider pages, so an agent without network access cannot follow them.
 
 | Error | When |
 |---|---|

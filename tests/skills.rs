@@ -397,7 +397,7 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     ));
     let tools = mcp.request("tools/list", json!({}));
     let skill_tool = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "stack_skill").unwrap().clone();
-    assert_eq!(skill_tool["inputSchema"]["required"], json!(["tool", "name"]));
+    assert_eq!(skill_tool["inputSchema"]["required"], json!(["tool"]));
 
     let inspect = mcp.call("stack_inspect", json!({}));
     assert_eq!(statuses(&inspect["data"]["skills"]), EXPECTED);
@@ -420,7 +420,18 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
         let r = mcp.call("stack_skill", json!({ "tool": tool, "name": name }));
         assert_eq!(r["error"]["code"], "skill_not_found", "{why}: {r}");
     }
+    // Without a name: a tool's one available skill, or the choice when it has several.
     let r = mcp.call("stack_skill", json!({ "tool": "fnox" }));
+    assert_eq!((r["data"]["name"].as_str(), r["data"]["version"].as_str()), (Some("fnox"), Some("1.39.0")), "{r}");
+    let r = mcp.call("stack_skill", json!({ "tool": "mbx" }));
+    assert_eq!(r["error"]["code"], "usage", "{r}");
+    assert_eq!(r["error"]["details"][0]["names"], json!(["mbx", "mbx-advanced"]), "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains("mbx, mbx-advanced"), "{r}");
+    for tool in ["jq", "pitchfork", "postgres"] {
+        let r = mcp.call("stack_skill", json!({ "tool": tool }));
+        assert_eq!(r["error"]["code"], "skill_not_found", "{tool}: {r}");
+    }
+    let r = mcp.call("stack_skill", json!({ "tool": "fnox", "name": "" }));
     assert_eq!(r["error"]["code"], "usage");
 
     let entry = f.path("store/fnox/1.39.0/.mise-packslip/repo/skills/fnox/SKILL.md");

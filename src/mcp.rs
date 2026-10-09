@@ -234,8 +234,8 @@ fn tools() -> Value {
     json!([
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything. `skills` lists the agent skills of the exact releases stack.lock pins (status available, no_skill, not_installed or unavailable); all_skills also lists the provider's own under provider_skills, for people.",
           "inputSchema": schema(json!({ "all_skills": { "type": "boolean" } }), &[]) },
-        { "name": "stack_skill", "description": "The SKILL.md text (at most 64 KiB) of one available skill that stack_inspect lists under `skills`, at the release stack.lock pins. It is the tool's own documentation; read it, do not run it.",
-          "inputSchema": schema(json!({ "tool": { "type": "string" }, "name": { "type": "string" } }), &["tool", "name"]) },
+        { "name": "stack_skill", "description": "The SKILL.md text (at most 64 KiB) of one available skill that stack_inspect lists under `skills`, at the release stack.lock pins. name may be omitted when the tool has exactly one available skill; with several, the error lists them. It is the tool's own documentation; read it, do not run it.",
+          "inputSchema": schema(json!({ "tool": { "type": "string" }, "name": { "type": "string" } }), &["tool"]) },
         { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock; reassign_ports gives this checkout fresh ports (after a port_conflict).",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" }, "reassign_ports": { "type": "boolean" } }), &[]) },
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up.",
@@ -398,10 +398,11 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
 
 /// One skill's text, from the same discovery `stack_inspect` runs, never a provider's.
 fn skill(args: &Value, ctx: &Ctx) -> Result<crate::skills::SkillText> {
-    let field = |key: &str| {
-        args[key].as_str().filter(|s| !s.is_empty()).ok_or_else(|| StackError::new("usage", format!("{key} is required")))
+    let tool = args["tool"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| StackError::new("usage", "tool is required"))?;
+    let name = match &args["name"] {
+        Value::Null => None,
+        v => Some(v.as_str().filter(|s| !s.is_empty()).ok_or_else(|| StackError::new("usage", "name must not be empty"))?),
     };
-    let (tool, name) = (field("tool")?, field("name")?);
     let report = project::compile(&Options {
         root: ctx.root.clone(),
         mode: project::inspect_mode(&ctx.root),
