@@ -214,3 +214,27 @@ Parent integration checks passed 11 binary skills tests and 17 skills unit tests
 also passed its complete 344-test Rust suite, Clippy, and 14 documentation tests. These new
 failure-path results use the fake provider, including a replay of Astra's proof; no additional
 real-tool smoke is claimed. Template and artifact-policy remediation remain in progress.
+
+### Round 1 template remediation
+
+Worker commit `fa40f2c` was integrated as `729d9a8`. Service versions and preset names reject
+all three template delimiters during validation in projects, bundles, and overrides. The
+shared scratch writer independently rejects templated tool names, versions, and option
+strings before creating trusted configuration. Existing guards for edited locks remain.
+
+Parent checks passed three binary boundary regressions, three scratch tests, and ten manifest
+tests. The binary regressions cover project/bundle/override declarations, ordinary and update
+compile, inspection and runtime commands, edited tool/service pins, and direct resolver calls.
+They assert provider calls and publication do not occur. The worker passed its full 346-test
+Rust suite and Clippy; these counts precede the separately integrated skills remediation.
+
+Real mise 2026.10.3 controls in an isolated root evaluated a harmless sentinel template from
+trusted tools configuration. The pre-fix Stack reproduction did not execute it on that mise
+release: argument parsing rejected the templated request before configuration loading. The
+fake-provider regression established the unsafe handoff, and the fixed real Stack run refused
+it before any scratch configuration. The correction removes dependence on mise's parsing
+order; no successful pre-fix end-to-end execution is claimed. Receipts:
+`/tmp/jdx-template-real.OyU3sq/REPORT.md`.
+
+Artifact-policy, provider-preflight, and changed-option reconciliation fixes are still in
+progress. The next Astra round will review all remediation together.
