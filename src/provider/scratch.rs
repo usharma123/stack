@@ -193,7 +193,7 @@ impl Drop for ScratchRoot {
 /// finds it: `MISE_STATE_DIR`, else `$XDG_STATE_HOME/mise`, else `~/.local/state/mise`. An
 /// empty value counts as unset, a leading `~` is the home directory, and a relative path is
 /// read from the working directory.
-fn tracked_configs(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+pub(super) fn tracked_configs(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let set = |key: &str| var(key).filter(|v| !v.is_empty());
     let home = set("HOME").map(|h| cwd.join(h)).or_else(std::env::home_dir);
     let path = |value: String| -> Option<PathBuf> {

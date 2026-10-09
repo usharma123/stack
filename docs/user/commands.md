@@ -88,12 +88,15 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the change. mise loads the copy as its only configuration, rooted at the project, so the
   working directory, relative paths and `{{config_root}}` are the project's. Its `[env]` values
   are the ones evaluated against the project's own generated file when the task was planned,
-  so a value built from `{{config_source}}` names the project's file, not the copy: the copy
-  leaves out each value the task already receives, and keeps tools, `_.path` and tasks, which
-  mise applies as usual. A template such as `{{exec(...)}}` is evaluated once, when the task
-  is planned. The copy is kept in
+  so a value built from `{{config_source}}` names the project's file, not the copy, and an
+  explicit value such as `JAVA_HOME` or `GOROOT` still takes precedence over the one a tool
+  sets, as it does for `exec`. The copy declares each value the task already receives by name
+  (`{{ env["JAVA_HOME"] }}`), never the value itself, and keeps tools, `_.path` and tasks,
+  which mise applies as usual. `PATH`, and a variable whose name has characters other than
+  letters, digits, `_`, `-` and `.`, are left out of the copy and simply inherited. A template
+  such as `{{exec(...)}}` is evaluated once, when the task is planned. The copy is kept in
   a private directory under stack's cache and removed when the task ends, fails to plan or times
-  out, along with the link mise records to it under `$MISE_STATE_DIR/tracked-configs`.
+  out, along with the link mise records to it in its state directory's `tracked-configs`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code. When `--timeout` expires the command's process group is killed and stack
   exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the

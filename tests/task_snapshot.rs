@@ -79,13 +79,15 @@ fn a_saved_task_plan_runs_its_planned_definition_and_grant_after_a_later_compile
     let held = fs::read_to_string(copy.config()).unwrap();
     assert!(held.contains("old-definition") && SENTINELS.iter().all(|s| !held.contains(s)), "{held}");
     assert_eq!(saved.env["MISE_GLOBAL_CONFIG_ROOT"], root.to_string_lossy());
-    // The planned value of a variable is not declared again for mise to evaluate against the
-    // copy; one planning did not report, the `_.path` directive and the tools are kept.
+    // A planned variable is declared as the value the command inherits, not as the template
+    // mise would evaluate against the copy; one planning did not report, the `_.path`
+    // directive and the tools are kept.
     let planned_asset = format!("{}/app/.config/mise/conf.d/stack.toml-v1", fixture.display());
     assert_eq!(saved.env["ASSET"], planned_asset);
     let doc: toml::Table = toml::from_str(&held).unwrap();
     let env = doc["env"].as_table().unwrap();
-    assert!(!env.contains_key("ASSET") && env["KEPT"].as_str() == Some("unplanned"), "{held}");
+    assert_eq!(env["ASSET"].as_str(), Some(r#"{{ env["ASSET"] }}"#), "{held}");
+    assert_eq!(env["KEPT"].as_str(), Some("unplanned"), "{held}");
     assert_eq!(env["_"]["path"][0].as_str(), Some(fixture.join("bundle/bin").to_str().unwrap()), "{held}");
     assert_eq!(doc["tools"]["fnox"].as_str(), Some("1.39.0"), "{held}");
     assert!(!held.contains(&planned_asset), "a planned value is never written into the copy: {held}");
@@ -111,7 +113,7 @@ fn a_saved_task_plan_runs_its_planned_definition_and_grant_after_a_later_compile
     let fresh = session::plan_task(&ctx, "showenv", &[], true).unwrap();
     assert_eq!(fresh.secrets, ["SENTRY_DSN"]);
     let (stdout, ran) = run(&ctx, &fresh, &fixture);
-    assert!(ran.contains("new-definition") && !ran.contains("ASSET ="), "{ran}");
+    assert!(ran.contains("new-definition") && !ran.contains("config_source"), "{ran}");
     assert!(stdout.contains("\nSENTRY_DSN=[redacted:SENTRY_DSN]\n") && !stdout.contains("DEPLOY_KEY="), "{stdout}");
     assert!(stdout.contains("/app/.config/mise/conf.d/stack.toml-v2\n"), "{stdout}");
 

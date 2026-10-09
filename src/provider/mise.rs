@@ -783,6 +783,20 @@ pub fn env(root: &Path) -> Result<IndexMap<String, String>> {
     Ok(env)
 }
 
+/// Whether mise expands `$VAR` in `[env]` values after rendering their templates (its
+/// `env_shell_expand` setting), as it reads its settings for `root`.
+pub fn shell_expands(root: &Path) -> Result<bool> {
+    let out = checked(root, &["settings", "get", "env_shell_expand"], "provider_failed")?;
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(StackError::new(
+            "provider_failed",
+            format!("unexpected `mise settings get env_shell_expand` output: {other:?}"),
+        )),
+    }
+}
+
 pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
     let out = checked(root, &["daemons", "--json"], "provider_failed")?;
     serde_json::from_slice(&out.stdout)

@@ -1,7 +1,8 @@
 #![cfg(unix)]
 //! A task's `[env]` values with real mise: `stack run` runs mise against a copy of the
 //! generated configuration, and a value evaluated against the configuration that declares it
-//! (`{{config_source}}`) must be the one planning read from the project's own file.
+//! (`{{config_source}}`) must be the one planning read from the project's own file. An
+//! explicit value keeps its precedence over the one a tool sets (`JAVA_HOME`, `GOROOT`).
 //!
 //! Opt-in, since it needs a real provider: `STACK_TEST_MISE=/path/to/mise cargo test --test
 //! task_env_provenance`. Without it the test reports itself skipped and passes.
@@ -31,7 +32,8 @@ const SHOW: &str = r#"printf 'source=%s\nroot=%s\nchained=%s\nbraces=%s\n' "$SOU
 
 fn stack(work: &Path, mise: &Path, args: &[&str]) -> (i32, Value) {
     let dir = |name: &str| work.join(name).to_string_lossy().into_owned();
-    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", mise.parent().unwrap().display());
+    // A `mise` wrapper (see `observe`) comes first when the test installs one.
+    let path = format!("{}:{}:/usr/bin:/bin:/usr/sbin:/sbin", dir("observer"), mise.parent().unwrap().display());
     let out = Command::new(env!("CARGO_BIN_EXE_stack"))
         .args(["-C", &dir("app"), "--json"])
         .args(args)
@@ -113,6 +115,104 @@ fn a_task_sees_the_env_values_planning_read_from_the_project_configuration() {
         ],
         "{ran:?}"
     );
+    let copies: Vec<_> = fs::read_dir(work.join("cache/task-config")).unwrap().collect();
+    assert!(copies.is_empty(), "{copies:?}");
+}
+
+/// Install a `mise` that keeps a copy of the configuration each `mise run` is given in
+/// `<work>/seen/`, then runs the real one offline (the tools are local directories).
+fn observe(work: &Path, mise: &Path) {
+    fs::create_dir_all(work.join("observer")).unwrap();
+    fs::create_dir_all(work.join("seen")).unwrap();
+    let wrapper = work.join("observer/mise");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = run ] && [ -n \"$MISE_GLOBAL_CONFIG_FILE\" ]; then cp \"$MISE_GLOBAL_CONFIG_FILE\" \"{seen}/$$.toml\"; fi\nMISE_OFFLINE=1 exec \"{mise}\" \"$@\"\n",
+        seen = work.join("seen").display(),
+        mise = mise.display(),
+    );
+    fs::write(&wrapper, script).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const TOOL_SHOW: &str = r#"printf 'java=%s\ngo=%s\ndollar=%s\n' "$JAVA_HOME" "$GOROOT" "$DOLLAR"; cat "$JAVA_HOME/marker.txt" "$GOROOT/marker.txt""#;
+
+#[test]
+fn explicit_env_values_keep_their_precedence_over_a_tools_environment_in_a_task() {
+    let Some(mise) = std::env::var_os("STACK_TEST_MISE") else {
+        eprintln!("skipped: set STACK_TEST_MISE to a real mise binary");
+        return;
+    };
+    let mise = Path::new(&mise).canonicalize().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().canonicalize().unwrap();
+    for sub in ["app", "home", "state", "cache", "mise/data", "mise/cache", "mise/state"] {
+        fs::create_dir_all(work.join(sub)).unwrap();
+    }
+    // Two local tool directories mise's Java and Go backends export as JAVA_HOME and GOROOT,
+    // and the explicit directories `[env]` names instead; each holds a marker naming itself.
+    for name in ["java-install", "go-install", "explicit-java", "explicit-go"] {
+        fs::create_dir_all(work.join(name).join("bin")).unwrap();
+        fs::write(work.join(name).join("marker.txt"), format!("{name}\n")).unwrap();
+    }
+    let at = |name: &str| work.join(name).display().to_string();
+    let manifest = format!(
+        r#"[tools]
+java = "path:{java}"
+go = "path:{go}"
+[env]
+JAVA_HOME = "{explicit_java}"
+GOROOT = "{explicit_go}"
+DOLLAR = 'cost $$HOME {{% raw %}}{{{{ env.HOME }}}}{{% endraw %}}'
+[tasks.probe]
+run = """
+{show}
+printf 'template-java=%s\ntemplate-go=%s\n' '{{{{ env.JAVA_HOME }}}}' '{{{{ env.GOROOT }}}}'
+"""
+"#,
+        java = at("java-install"),
+        go = at("go-install"),
+        explicit_java = at("explicit-java"),
+        explicit_go = at("explicit-go"),
+        show = TOOL_SHOW,
+    );
+    fs::write(work.join("app/stack.toml"), manifest).unwrap();
+    observe(&work, &mise);
+
+    let (code, compiled) = stack(&work, &mise, &["compile"]);
+    assert_eq!(code, 0, "{compiled}");
+    let planned_lines = [
+        format!("java={}", at("explicit-java")),
+        format!("go={}", at("explicit-go")),
+        "dollar=cost $HOME {{ env.HOME }}".to_string(),
+        "explicit-java".to_string(),
+        "explicit-go".to_string(),
+    ];
+    let (code, planned) = stack(&work, &mise, &["exec", "--", "sh", "-c", TOOL_SHOW]);
+    assert_eq!((code, &planned["data"]["exit_code"]), (0, &Value::from(0)), "{planned}");
+    assert_eq!(lines(&planned), planned_lines);
+    let templates = [format!("template-java={}", at("explicit-java")), format!("template-go={}", at("explicit-go"))];
+    let expected: Vec<String> = planned_lines.iter().chain(&templates).cloned().collect();
+
+    // Control: mise running the task from the project's own configuration.
+    let control = ["exec", "--", "mise", "run", "--skip-deps", "--no-timings", "probe", "--"];
+    let (code, original) = stack(&work, &mise, &control);
+    assert_eq!((code, &original["data"]["exit_code"]), (0, &Value::from(0)), "{original}");
+    assert_eq!(lines(&original), expected, "{original}");
+
+    let (code, ran) = stack(&work, &mise, &["run", "probe"]);
+    assert_eq!((code, &ran["data"]["exit_code"]), (0, &Value::from(0)), "{ran}");
+    assert_eq!(lines(&ran), expected, "{ran}");
+
+    // The copy `mise run` read names each variable; it holds none of the planned values.
+    let seen: Vec<String> = fs::read_dir(work.join("seen"))
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .filter(|config| config.contains("Copied by stack"))
+        .collect();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    for value in [at("explicit-java"), at("explicit-go"), "cost".to_string()] {
+        assert!(!seen[0].contains(&value), "{value} written into the copy: {}", seen[0]);
+    }
     let copies: Vec<_> = fs::read_dir(work.join("cache/task-config")).unwrap().collect();
     assert!(copies.is_empty(), "{copies:?}");
 }
