@@ -14,7 +14,8 @@ pub const PROJECT_FILE: &str = "stack.toml";
 pub struct BundleManifest {
     pub bundle: BundleMeta,
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    /// Version requests, as written: a string or a table (see `tool::ToolSpec::parse`).
+    pub tools: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub env: IndexMap<String, String>,
     #[serde(default)]
@@ -117,6 +118,10 @@ pub struct Task {
     /// Services that must be running and ready before the task starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
+    /// Names of fnox secrets the task is granted (never values). Resolved by stack when the
+    /// task runs; see `secrets.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -125,7 +130,8 @@ pub struct ProjectManifest {
     #[serde(rename = "use", default)]
     pub uses: Vec<UseEntry>,
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    /// Version requests, as written: a string or a table (see `tool::ToolSpec::parse`).
+    pub tools: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub env: IndexMap<String, String>,
     #[serde(default)]
@@ -135,6 +141,34 @@ pub struct ProjectManifest {
     /// Explicit resolutions. The only way to replace a value another layer defines.
     #[serde(rename = "override", default)]
     pub overrides: Overrides,
+    /// Opt-in links to the stack's agent skills. Project only: a bundle cannot write into a
+    /// project's tree.
+    #[serde(default)]
+    pub skills: Option<SkillsConfig>,
+    /// Artifact locking: which platforms stack.lock covers and whether coverage is required.
+    /// Project only; a bundle cannot set it.
+    #[serde(default)]
+    pub lock: LockSettings,
+}
+
+/// `[skills]` in stack.toml.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Directory, relative to the project root, where `up` and `install` link available skills.
+    pub dir: String,
+}
+
+/// `[lock]` as written; see `artifacts::Policy` for defaults and validation.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockSettings {
+    /// mise platform names (`macos-arm64`, `linux-x64`), or `current`.
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
+    /// `best-effort` (default) or `required`.
+    #[serde(default)]
+    pub artifacts: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,7 +182,8 @@ pub struct UseEntry {
 #[serde(deny_unknown_fields)]
 pub struct Overrides {
     #[serde(default)]
-    pub tools: IndexMap<String, String>,
+    /// Version requests, as written: a string or a table (see `tool::ToolSpec::parse`).
+    pub tools: IndexMap<String, toml::Value>,
     #[serde(default)]
     pub env: IndexMap<String, String>,
     #[serde(default)]
@@ -164,6 +199,19 @@ impl Service {
                 "invalid_service",
                 format!("service '{name}' in {origin} must set exactly one of `preset` or `run`"),
             ));
+        }
+        // A preset service's version becomes a `[tools]` version mise renders as a template
+        // wherever it loads the config (resolution and locking included), so it must be literal
+        // like any tool request. The preset is a name, rendered beside it.
+        for (field, value) in [("version", &self.version), ("preset", &self.preset)] {
+            if value.as_deref().is_some_and(crate::tool::templated) {
+                return Err(StackError::new(
+                    "invalid_service",
+                    format!("service '{name}' in {origin}: `{field}` must not contain template syntax (`{{{{`, `{{%` or `{{#`)"),
+                )
+                .hint("mise evaluates templates in tool versions; write the literal version request")
+                .with_detail(serde_json::json!({ "service": name, "origin": origin, "field": field })));
+            }
         }
         if let Some(probe) = &self.identity {
             if matches!(self.preset.as_deref(), Some("postgres" | "redis")) {
@@ -411,6 +459,32 @@ mod tests {
         // The caret is under the last character shown.
         assert_eq!(lines[2].chars().count(), lines[1].chars().count());
         assert_eq!(at.column, long.chars().count());
+    }
+
+    #[test]
+    fn service_versions_and_presets_with_template_syntax_are_refused() {
+        let service = |text: &str| -> Service { toml::from_str(text).unwrap() };
+        for (field, text) in [
+            ("version", "preset = 'postgres'\nversion = \"{{ exec(command='touch x') }}\""),
+            ("version", "preset = 'redis'\nversion = '{% if true %}8{% endif %}'"),
+            ("version", "preset = 'cockroachdb'\nversion = '25{# c #}'"),
+            ("version", "run = 'serve'\nversion = '{{ env.V }}'"),
+            ("preset", "preset = \"{{ exec(command='touch x') }}\""),
+        ] {
+            for origin in ["project", "bundle:pybase", "[override.services]"] {
+                let e = service(text).validate("db", origin).unwrap_err();
+                assert_eq!(e.code, "invalid_service", "{text}");
+                assert!(
+                    e.message.starts_with(&format!("service 'db' in {origin}: `{field}` must not contain template syntax")),
+                    "{text}: {}",
+                    e.message
+                );
+                assert_eq!(e.details[0], serde_json::json!({ "service": "db", "origin": origin, "field": field }));
+            }
+        }
+        for text in ["preset = 'postgres'\nversion = '17'", "preset = 'postgres'\nversion = 'prefix:17'", "preset = 'redis'", "run = 'x'\nversion = '1{2}'"] {
+            service(text).validate("db", "project").unwrap();
+        }
     }
 
     #[test]

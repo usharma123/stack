@@ -1,5 +1,6 @@
 //! `stack compile`: resolve bundles → lock → compose → render provider config.
 
+use crate::artifacts::{self, PinKey};
 use crate::compose::{compose, Composed, LoadedBundle};
 use crate::error::{io_error, Result, StackError};
 use crate::lock::{self, LockedBundle, LockedVersion, Lockfile};
@@ -7,6 +8,7 @@ use crate::manifest::{read_bundle, read_project};
 use crate::ports::{self, Request};
 use crate::provider::mise;
 use crate::source::{Mode, Source};
+use crate::tool::{ToolOptions, ToolSpec};
 use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -26,6 +28,8 @@ pub struct Options {
     pub reassign_ports: bool,
     /// Resolves version requests to exact versions. `None` uses mise.
     pub resolver: Option<Arc<dyn mise::Resolver>>,
+    /// Locks artifacts and reports the provider release. `None` uses mise.
+    pub locker: Option<Arc<dyn mise::Locker>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,12 +56,23 @@ pub struct VersionReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     pub requested: String,
+    /// Allowlisted provider options declared with the request; omitted when there are none.
+    #[serde(skip_serializing_if = "ToolOptions::is_empty")]
+    pub options: ToolOptions,
     /// `None` only when nothing is locked yet and the command may not resolve (`inspect`).
     pub resolved: Option<String>,
     /// `bundle:<name>`, `project`, `override`, or `provider` for tools stack adds itself.
     pub origin: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moved_from: Option<String>,
+    /// The backend the provider installs the release through, as its lock records it (or as
+    /// the name says, before anything is locked).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Artifact coverage per `[lock] platforms` entry; absent for requests that name no
+    /// release and before anything is resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<IndexMap<String, artifacts::PlatformReport>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +93,54 @@ pub struct Report {
     /// Valid but risky choices, such as tools that are not pinned to a version.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Agent skills of the pinned releases (`inspect`, `compile`); see `skills::discover`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<crate::skills::Skill>>,
+    /// Skills of tools stack adds for its provider, listed only when asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_skills: Option<Vec<crate::skills::Skill>>,
+    /// `[skills] dir`: where `up` and `install` link the stack's skills.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_dir: Option<String>,
+    /// The lock this report was compiled against (as written, when the command writes).
+    #[serde(skip)]
+    pub lock: Option<Lockfile>,
+    /// `[lock]` of the project.
+    #[serde(skip)]
+    pub artifact_policy: artifacts::Policy,
+}
+
+impl Report {
+    /// Discover skills from the committed or newly written pins. A fresh checkout has none.
+    pub fn discover_skills(&self, cache: &Path) -> crate::skills::Discovery {
+        let empty = Lockfile::new(Vec::new(), Vec::new(), Vec::new());
+        crate::skills::discover(cache, self.lock.as_ref().unwrap_or(&empty), &self.versions)
+    }
+
+    /// Add the skills of the releases this report pins. `all` also lists the provider's.
+    pub fn attach_skills(&mut self, cache: &Path, all: bool) {
+        let found = self.discover_skills(cache);
+        self.warnings.extend(found.warnings);
+        self.skills = Some(found.skills);
+        if all {
+            self.provider_skills = Some(found.provider_skills);
+        }
+    }
+
+    /// Every release the lock pins, as the provider names it.
+    pub fn pins(&self) -> Vec<PinKey> {
+        self.lock.as_ref().map(artifacts::pin_keys).unwrap_or_default()
+    }
+
+    /// The embedded provider lock, if the lock is version 3 and has one.
+    pub fn provider_lock(&self) -> Option<&toml::Table> {
+        self.lock.as_ref().and_then(|l| l.provider_lock.as_ref())
+    }
+
+    /// Coverage on the platform this process runs on.
+    pub fn current_artifacts(&self) -> artifacts::PlatformSummary {
+        artifacts::summary(self.provider_lock(), &self.pins(), &artifacts::current_platform())
+    }
 }
 
 /// `stack inspect` previews a project that has no lock yet; once locked it reports drift.
@@ -120,11 +183,54 @@ fn unpinnable_tools(stack: &Composed) -> Vec<String> {
     stack
         .tools
         .iter()
-        .filter(|(_, e)| mise::unversioned(&e.value))
+        .filter(|(_, e)| mise::unversioned(&e.value.version))
         .map(|(name, e)| {
-            format!("tools.{name} = \"{}\" ({}) names no release; stack.lock cannot pin it", e.value, e.origin)
+            format!("tools.{name} = \"{}\" ({}) names no release; stack.lock cannot pin it", e.value.version, e.origin)
         })
         .collect()
+}
+
+/// The provider releases this stack needs, beyond what any stack needs. Commands that install
+/// (`install`, `up`) and `doctor` check them; an older mise would silently ignore what the
+/// configuration asked for.
+pub fn provider_requirements(stack: &Composed) -> Vec<mise::Requirement> {
+    let mut out = Vec::new();
+    for (name, e) in &stack.tools {
+        if e.value.mr_boxington() {
+            out.push(mise::Requirement {
+                minimum: mise::MR_BOXINGTON_MISE,
+                reason: format!("tools.{name} ({}) sets mr_boxington", e.origin),
+            });
+        }
+        if e.value.has_packslip_options() {
+            out.push(mise::Requirement {
+                minimum: mise::PACKSLIP_OPTIONS_MISE,
+                reason: format!("tools.{name} ({}) sets packslip trust options", e.origin),
+            });
+        }
+    }
+    out
+}
+
+/// The provider release the embedded artifact lock needs, when there is one to render.
+pub fn lock_requirement(lock: Option<&Lockfile>) -> Option<mise::Requirement> {
+    artifacts::has_entries(lock.and_then(|l| l.provider_lock.as_ref())).then(|| lock_requirement_for("stack.lock's embedded artifact lock (mise.lock version 3)"))
+}
+
+fn lock_requirement_for(reason: &str) -> mise::Requirement {
+    mise::Requirement { minimum: artifacts::LOCK_MISE, reason: reason.into() }
+}
+
+/// Everything `install`, `up` and `doctor` check `mise version` against for this report.
+pub fn install_requirements(report: &Report) -> Vec<mise::Requirement> {
+    requirements(&report.stack, report.lock.as_ref())
+}
+
+/// What the configuration and the lock it is compiled against need of mise.
+pub fn requirements(stack: &Composed, lock: Option<&Lockfile>) -> Vec<mise::Requirement> {
+    let mut out = provider_requirements(stack);
+    out.extend(lock_requirement(lock));
+    out
 }
 
 pub fn default_cache_dir() -> PathBuf {
@@ -146,12 +252,42 @@ pub fn compile(opts: &Options) -> Result<Report> {
         return compile_locked(opts);
     }
     let _guard = crate::state::project_lock(&opts.state, &opts.root)?;
-    compile_locked(opts)
+    if opts.mode != Mode::Frozen {
+        return compile_locked(opts);
+    }
+    // `compile --locked` renders the provider's lock from stack.lock as ordinary compile does,
+    // after checking that mise can read it, before anything is written.
+    let locker = locker(opts);
+    let report = compile_checked(opts, &|_, lock| match lock_requirement(Some(lock)) {
+        Some(requirement) => mise::check_requirements(locker.version(&opts.root)?, &[requirement]),
+        None => Ok(()),
+    })?;
+    artifacts::write_rendered(&opts.root, report.lock.as_ref())?;
+    Ok(report)
 }
+
+fn locker(opts: &Options) -> Arc<dyn mise::Locker> {
+    opts.locker.clone().unwrap_or_else(|| Arc::new(mise::MiseLocker))
+}
+
+/// Checked by a writing compile once stack.toml, stack.lock and the policy are validated and
+/// before anything is written: port and identity reservations, stack.lock, the generated config
+/// and the rendered lock. Given the composed stack and the lock about to be described.
+pub(crate) type Preflight<'a> = &'a dyn Fn(&Composed, &Lockfile) -> Result<()>;
 
 /// The caller holds the project lock when publishing configuration or changing a session.
 pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
+    compile_checked(opts, &|_, _| Ok(()))
+}
+
+/// [`compile_locked`], running `preflight` before the first write.
+pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Report> {
     let project = read_project(&opts.root)?;
+    if let Some(skills) = &project.skills {
+        crate::skills::validate_dir(&skills.dir)?;
+    }
+    let host = locker(opts).host();
+    let policy = artifacts::Policy::from_settings_on(&project.lock, &host)?;
     let previous = lock::read(&opts.root)?;
     if opts.mode == Mode::Frozen && previous.is_none() {
         return Err(
@@ -165,6 +301,11 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
             "stack.lock is version 1 and records no exact tool or service versions",
         )
         .hint("run `stack compile` once to resolve and record them (bundle pins are kept), then commit stack.lock"));
+    }
+    // Every locked operation (`compile --locked`, inspect with a lock, install, up, exec, run,
+    // status) passes through here, before any bundle fetch or provider call.
+    if opts.mode == Mode::Frozen {
+        policy.check_host(&host)?;
     }
 
     let mut loaded = Vec::new();
@@ -207,9 +348,22 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
     }
 
     let stack = compose(&loaded, &project)?;
+    reserved_env(&stack)?;
     let probed = probed_services(&stack)?;
-    let (tools, services, versions) = lock_versions(&stack, previous.as_ref(), opts)?;
-    let new_lock = Lockfile::new(locked, tools.clone(), services.clone());
+    let (tools, services, mut versions) = lock_versions(&stack, previous.as_ref(), opts)?;
+    let mut new_lock = Lockfile::new(locked, tools.clone(), services.clone());
+    let pins = artifacts::pin_keys(&new_lock);
+    let mut outcome = ArtifactOutcome::default();
+    if opts.mode == Mode::Frozen {
+        // Locked operations never lock artifacts; they read what stack.lock embeds.
+        if let Some(prev) = &previous {
+            new_lock.version = prev.version;
+            new_lock.provider_lock = prev.provider_lock.clone();
+        }
+    } else if opts.write {
+        outcome = lock_artifacts(previous.as_ref(), &new_lock, &pins, &policy, opts)?;
+        new_lock.provider_lock = outcome.provider_lock.take();
+    }
     let lock_changed = previous.as_ref() != Some(&new_lock);
     if opts.mode == Mode::Frozen && lock_changed {
         return Err(
@@ -217,6 +371,26 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
                 .hint("run `stack compile` and commit stack.lock"),
         );
     }
+    if opts.mode == Mode::Frozen {
+        check_committed_artifacts(&new_lock, &pins, &policy, &host)?;
+    }
+    if policy.required() && opts.mode != Mode::Frozen && opts.write {
+        let unchecked = artifacts::unchecked_targets(new_lock.provider_lock.as_ref(), &pins, &policy.platforms, &outcome.reasons);
+        if !unchecked.is_empty() {
+            return Err(artifacts::unlocked_error(unchecked));
+        }
+    }
+    // A report reads the lock it describes: the one written, or the committed one.
+    let described = if opts.write || opts.mode == Mode::Frozen { Some(&new_lock) } else { previous.as_ref() };
+    let embedded = described.and_then(|l| l.provider_lock.as_ref());
+    for v in versions.iter_mut() {
+        let Some(resolved) = v.resolved.as_ref().filter(|r| !mise::unversioned(r)) else { continue };
+        let pin = PinKey { tool: v.tool.clone().unwrap_or_else(|| v.name.clone()), version: resolved.clone() };
+        v.backend = artifacts::backend(embedded, &pin);
+        v.artifacts = Some(artifacts::report(embedded, &pin, &policy.platforms, &outcome.events));
+    }
+
+    preflight(&stack, &new_lock)?;
 
     let output = mise::output_path(&opts.root);
     let (ports, identities) = if opts.write {
@@ -232,6 +406,9 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         if lock_changed {
             lock::write(&opts.root, &new_lock)?;
         }
+        if opts.mode != Mode::Frozen {
+            artifacts::write_rendered(&opts.root, Some(&new_lock))?;
+        }
         let exact = mise::Versions {
             tools: tools.iter().map(|t| (t.name.clone(), t.resolved.clone())).collect(),
             services: services.iter().map(|t| (t.name.clone(), t.resolved.clone())).collect(),
@@ -245,8 +422,12 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         (ports::lookup(&opts.state, &opts.root)?, identities)
     };
 
-    let warnings = warnings(&stack);
+    let mut warnings = warnings(&stack);
+    warnings.extend(outcome.warnings);
+    let lock = if opts.write || opts.mode == Mode::Frozen { Some(new_lock) } else { previous };
     Ok(Report {
+        lock,
+        artifact_policy: policy,
         bundles: reports,
         warnings,
         stack,
@@ -257,7 +438,23 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         provider: "mise",
         output,
         written: opts.write,
+        skills: None,
+        provider_skills: None,
+        skills_dir: project.skills.map(|s| s.dir),
     })
+}
+
+/// `STACK_SESSION` is stack's: `run` and `exec` set it to the session's id and remove it when
+/// there is none, so a declared value would be overridden or left dangling.
+fn reserved_env(stack: &Composed) -> Result<()> {
+    match stack.env.get("STACK_SESSION") {
+        Some(e) => Err(StackError::new(
+            "invalid_env",
+            format!("env.STACK_SESSION ({}) is reserved; stack sets it to the running session's id", e.origin),
+        )
+        .hint("remove STACK_SESSION from [env]; tasks and `stack exec` receive it while a session is up")),
+        None => Ok(()),
+    }
 }
 
 /// Services with identity probes. Their token variables must not collide with each other or
@@ -282,9 +479,10 @@ fn probed_services(stack: &Composed) -> Result<Vec<String>> {
     Ok(seen.into_values().cloned().collect())
 }
 
-/// The platform a resolution ran on, recorded for reviewers of stack.lock.
+/// The platform a resolution ran on, recorded for reviewers of stack.lock, in mise's names
+/// (`<os>-<arch>`; the C library and CPU do not change what a version request resolves to).
 fn platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    artifacts::Host::current().base()
 }
 
 struct VersionRequest {
@@ -292,6 +490,7 @@ struct VersionRequest {
     name: String,
     tool: Option<String>,
     requested: String,
+    options: ToolOptions,
     origin: String,
 }
 
@@ -312,7 +511,7 @@ fn lock_versions(
     let mut requests: Vec<VersionRequest> = stack
         .tools
         .iter()
-        .map(|(name, e)| VersionRequest { kind: "tool", name: name.clone(), tool: None, requested: e.value.clone(), origin: e.origin.clone() })
+        .map(|(name, e)| VersionRequest { kind: "tool", name: name.clone(), tool: None, requested: e.value.version.clone(), options: e.value.options.clone(), origin: e.origin.clone() })
         .collect();
     if !stack.services.is_empty() && !stack.tools.contains_key("pitchfork") {
         requests.push(VersionRequest {
@@ -320,13 +519,14 @@ fn lock_versions(
             name: "pitchfork".into(),
             tool: None,
             requested: mise::PITCHFORK_VERSION.into(),
+            options: ToolOptions::new(),
             origin: "provider".into(),
         });
     }
     for (name, e) in &stack.services {
         let Some(preset) = e.value.preset.as_deref() else { continue };
         if let Some(tool) = mise::preset_tool(preset) {
-            requests.push(VersionRequest { kind: "service", name: name.clone(), tool: Some(tool.into()), requested: e.value.version.clone().unwrap_or_else(|| "latest".into()), origin: e.origin.clone() });
+            requests.push(VersionRequest { kind: "service", name: name.clone(), tool: Some(tool.into()), requested: e.value.version.clone().unwrap_or_else(|| "latest".into()), options: ToolOptions::new(), origin: e.origin.clone() });
         } else if opts.mode == Mode::Frozen {
             return Err(StackError::new("unlocked_service", format!("services.{name} uses unsupported preset {preset:?}; locked mode cannot establish its tool or version")));
         }
@@ -338,15 +538,19 @@ fn lock_versions(
     let resolver: &dyn mise::Resolver = match &opts.resolver {
         Some(r) => r.as_ref(),
         None => {
-            default_resolver = mise::MiseResolver { cwd: opts.cache.join("resolve") };
+            default_resolver = mise::MiseResolver { cache: opts.cache.clone() };
             &default_resolver
         }
     };
+    // Whenever requests may be resolved; locked and read-only modes reuse what compile checked.
+    if opts.write && opts.mode != Mode::Frozen {
+        check_packslip_backends(stack, resolver)?;
+    }
     let (mut tools, mut services, mut reports) = (Vec::new(), Vec::new(), Vec::new());
     let (mut stale, mut failed) = (Vec::new(), Vec::new());
     for r in requests {
         let prior = previous.and_then(|l| if r.kind == "tool" { l.tool(&r.name) } else { l.service(&r.name) });
-        let same = prior.filter(|p| p.requested == r.requested && p.tool == r.tool);
+        let same = prior.filter(|p| p.requested == r.requested && p.tool == r.tool && p.options == r.options);
         if !mise::unversioned(&r.requested) && opts.mode != Mode::Update {
             if let Some(pin) = same {
                 if !mise::exact_release(r.tool.as_deref().unwrap_or(&r.name), &pin.resolved) {
@@ -362,16 +566,23 @@ fn lock_versions(
             match same {
                 Some(p) => Some((p.resolved.clone(), p.resolved_on.clone())),
                 None => {
-                    stale.push(serde_json::json!({ "kind": r.kind, "name": r.name, "requested": r.requested, "locked": prior.map(|p| &p.requested) }));
+                    let mut detail = serde_json::json!({ "kind": r.kind, "name": r.name, "requested": r.requested, "locked": prior.map(|p| &p.requested) });
+                    if !r.options.is_empty() || prior.is_some_and(|p| !p.options.is_empty()) {
+                        detail["options"] = serde_json::json!(r.options);
+                        detail["locked_options"] = serde_json::json!(prior.map(|p| &p.options));
+                    }
+                    stale.push(detail);
                     continue;
                 }
             }
         } else if let (Mode::UseLock, Some(p)) = (opts.mode, same) {
-            Some((p.resolved.clone(), p.resolved_on.clone()))
+            // Version 2 recorded Rust's platform names; version 3 writes mise's.
+            Some((p.resolved.clone(), p.resolved_on.as_deref().map(artifacts::canonical_platform)))
         } else if !opts.write {
             None
         } else {
-            match resolver.resolve(r.tool.as_deref().unwrap_or(&r.name), &r.requested) {
+            let spec = ToolSpec { version: r.requested.clone(), options: r.options.clone() };
+            match resolver.resolve_spec(r.tool.as_deref().unwrap_or(&r.name), &spec) {
                 Ok(v) if mise::exact_release(r.tool.as_deref().unwrap_or(&r.name), &v) => {
                     moved_from = prior.map(|p| p.resolved.clone()).filter(|p| *p != v);
                     Some((v, Some(platform())))
@@ -393,6 +604,7 @@ fn lock_versions(
                 requested: r.requested.clone(),
                 resolved: version.clone(),
                 resolved_on: resolved_on.clone(),
+                options: r.options.clone(),
             };
             if r.kind == "tool" { tools.push(entry) } else { services.push(entry) }
         }
@@ -401,9 +613,12 @@ fn lock_versions(
             name: r.name,
             tool: r.tool,
             requested: r.requested,
+            options: r.options,
             resolved: resolved.map(|(v, _)| v),
             origin: r.origin,
             moved_from,
+            backend: None,
+            artifacts: None,
         });
     }
     if !stale.is_empty() {
@@ -425,6 +640,28 @@ fn lock_versions(
     Ok((tools, services, reports))
 }
 
+/// Packslip trust options on a registry name (`fnox = { version, identity }`) are valid only
+/// when mise's registry installs that tool through packslip; mise would otherwise ignore them.
+fn check_packslip_backends(stack: &Composed, resolver: &dyn mise::Resolver) -> Result<()> {
+    for (name, e) in stack.tools.iter().filter(|(name, e)| e.value.needs_packslip_backend(name)) {
+        let backend = resolver.registry_backend(name)?;
+        if backend.as_deref().is_some_and(crate::tool::is_packslip) {
+            continue;
+        }
+        let why = match &backend {
+            Some(b) => format!("mise's registry installs it through {b}"),
+            None => "mise's registry does not say which backend installs it".to_string(),
+        };
+        return Err(StackError::new(
+            "invalid_tool",
+            format!("tools.{name} ({}) sets packslip trust options, but {why}", e.origin),
+        )
+        .hint(format!("{}; to name the backend yourself, use `\"packslip:<host>/<owner>/<repo>\"` as the tool name", crate::tool::accepted(name)))
+        .with_detail(serde_json::json!({ "tool": name, "origin": e.origin, "backend": backend })));
+    }
+    Ok(())
+}
+
 fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
     if fs::read_to_string(path).ok().as_deref() == Some(contents) {
         return Ok(());
@@ -433,4 +670,125 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
         fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
     }
     fs::write(path, contents).map_err(|e| io_error(path.display(), e))
+}
+
+/// What locking artifacts produced for one compile.
+#[derive(Default)]
+struct ArtifactOutcome {
+    /// The embedded lock for stack.lock; `None` when nothing is locked.
+    provider_lock: Option<toml::Table>,
+    events: artifacts::Events,
+    reasons: artifacts::Reasons,
+    warnings: Vec<String>,
+}
+
+/// Locked operations: the embedded lock must agree with its pins, and the policy must be met on
+/// every listed platform and, under the key mise looks each pin up by, on this machine.
+fn check_committed_artifacts(lock: &Lockfile, pins: &[PinKey], policy: &artifacts::Policy, host: &artifacts::Host) -> Result<()> {
+    if let Some(embedded) = &lock.provider_lock {
+        artifacts::validate(embedded, pins)?;
+    }
+    if !policy.required() {
+        return Ok(());
+    }
+    if lock.is_v2() {
+        return Err(StackError::new(
+            "lock_outdated",
+            "[lock] artifacts = \"required\", but stack.lock is version 2 and records no artifact checksums",
+        )
+        .hint("run `stack compile` (it needs network access to lock artifacts), then commit stack.lock"));
+    }
+    let mut unchecked = artifacts::unchecked_targets(lock.provider_lock.as_ref(), pins, &policy.platforms, &Default::default());
+    if unchecked.is_empty() {
+        // Listed platforms are covered; this machine may still need a key none of them is
+        // (`linux-x64-musl` for Node when only `linux-x64` is listed).
+        unchecked = artifacts::unchecked(lock.provider_lock.as_ref(), pins, std::slice::from_ref(host), &Default::default());
+    }
+    if unchecked.is_empty() {
+        return Ok(());
+    }
+    Err(artifacts::unlocked_error(unchecked))
+}
+
+/// Ordinary compile and `--update`: lock the artifacts of the pins that need entries in a
+/// scratch root of their own, and merge the result against what stack.lock commits.
+///
+/// Nothing in the project directory is touched here. Committed values change only under
+/// `--update`; every difference is reported either way. `mise lock` exiting nonzero is not a
+/// failure (mise reports a tool it cannot lock that way and still writes the others);
+/// `artifact_lock_failed` is for mise not running, the deadline, or an unreadable lock.
+fn lock_artifacts(previous: Option<&Lockfile>, new_lock: &Lockfile, pins: &[PinKey], policy: &artifacts::Policy, opts: &Options) -> Result<ArtifactOutcome> {
+    let update = opts.mode == Mode::Update;
+    let platforms = &policy.platforms;
+    let mut committed = previous.filter(|l| !l.is_legacy()).and_then(|l| l.provider_lock.clone());
+    if let (Some(embedded), Some(prev)) = (&committed, previous) {
+        if let Err(e) = artifacts::validate(embedded, &artifacts::pin_keys(prev)) {
+            if !update {
+                return Err(e);
+            }
+            // `--update` locks every pin again; an inconsistent commitment is not kept.
+            committed = None;
+        }
+    }
+    if let Some(embedded) = committed.as_mut() {
+        artifacts::retain(embedded, pins, platforms);
+    }
+    // A pin whose options changed can resolve to the release it had; its committed entry was
+    // locked for the earlier request, so it is locked again and compared like any other.
+    let changed = artifacts::changed_pins(previous, new_lock);
+    let targets = artifacts::targets(committed.as_ref(), pins, platforms, update, &changed);
+    let locker = locker(opts);
+    if !targets.is_empty() || artifacts::has_entries(committed.as_ref()) {
+        mise::check_requirements(locker.version(&opts.root)?, &[lock_requirement_for("stack.lock's embedded artifact lock (mise.lock version 3)")])?;
+    }
+    let mut outcome = ArtifactOutcome::default();
+    if targets.is_empty() {
+        outcome.provider_lock = committed.filter(|e| artifacts::has_entries(Some(e)));
+        return Ok(outcome);
+    }
+
+    let failed = |why: String| {
+        StackError::new("artifact_lock_failed", why).hint("check mise and network access; stack.lock, the provider config and the rendered lock were not changed")
+    };
+    let scratch_pins = crate::provider::scratch::pins(new_lock);
+    artifacts::check_pins_untemplated(&scratch_pins)?;
+    let scratch = mise::ScratchRoot::create(&opts.cache, "lock")?;
+    scratch.write_tools(&scratch_pins)?;
+    let committed_mise = committed.as_ref().map(artifacts::to_mise);
+    let seeded = artifacts::rendered_path(scratch.path());
+    fs::write(&seeded, artifacts::seed(committed_mise.as_ref(), &targets, platforms)).map_err(|e| io_error(seeded.display(), e))?;
+    let names: Vec<String> = targets.iter().cloned().collect();
+    let run = locker.lock(&scratch, platforms, &names)?;
+    let text = fs::read_to_string(&seeded).map_err(|e| {
+        failed(format!("`mise lock` left no readable lock: {e}"))
+            .with_detail(serde_json::json!({ "exit_code": run.exit_code, "output": mise::text_tail(&run.stderr) }))
+    })?;
+    let (fresh, stripped) = artifacts::capture(&text).map_err(|why| {
+        failed(format!("`mise lock` wrote a lock stack cannot read: {why}"))
+            .with_detail(serde_json::json!({ "exit_code": run.exit_code, "output": mise::text_tail(&run.stderr) }))
+    })?;
+    let reasons = artifacts::reasons(&run.stderr, &targets, platforms);
+    let merged = artifacts::Merge {
+        committed: committed_mise.as_ref(),
+        fresh,
+        targets: &targets,
+        pins,
+        platforms,
+        update,
+        reasons: &reasons,
+        changed: &changed,
+    }
+    .run()?;
+    let embedded = artifacts::finish(merged.lock, committed.as_ref(), stripped, pins, platforms);
+    outcome.provider_lock = Some(embedded).filter(|e| artifacts::has_entries(Some(e)));
+    outcome.events = merged.events;
+    outcome.warnings = merged.warnings;
+    outcome.reasons = reasons;
+    if run.exit_code != Some(0) {
+        outcome.warnings.push(format!(
+            "`mise lock` exited {}; pins it could not lock are reported `missing` with its reason",
+            run.exit_code.map_or("abnormally".to_string(), |c| format!("with status {c}"))
+        ));
+    }
+    Ok(outcome)
 }

@@ -2,28 +2,38 @@
 
 | Command | Does |
 |---|---|
-| `stack compile [--update \| --locked] [--reassign-ports]` | Resolve, lock, assign ports, write provider config |
-| `stack inspect` | Show the composed stack, origins and ports; writes nothing |
+| `stack compile [--update \| --locked] [--reassign-ports]` | Resolve, lock versions and [artifact checksums](#artifact-checksums), assign ports, write provider config |
+| `stack inspect [--all-skills]` | Show the composed stack, origins, ports and the pinned releases' [agent skills](skills.md); writes nothing |
 | `stack install` | Install the locked tools and service binaries; start nothing, record nothing |
 | `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now; session and lease state (exit 1 if unhealthy) |
 | `stack restart [service...] [--timeout D]` | Restart services of the running session (all when none named) and verify again |
-| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies |
-| `stack exec [--require S \| --require-all] [--timeout D] -- <cmd>` | Run with tools and env; unverified endpoints poisoned |
+| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` command once every service verifies, granted the [secrets](secrets.md) it declares |
+| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run with tools and env; unverified endpoints poisoned; `--secret` grants a fnox secret |
 | `stack logs <service> [--tail N] [--since-start]` | Last N lines (default 100, at most 10000) the supervisor kept for a service |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` / `stack gc [--watch [--interval 60s]]` | Renew this session's lease / reclaim expired and deleted-project sessions machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle as an OCI artifact |
 | `stack setup [--force]` | Download stack's pinned mise unless one is on `PATH` (`--force`: install it anyway) |
-| `stack doctor` | Check mise, git and tar, Pitchfork's socket path, and that the project compiles |
+| `stack doctor` | Check mise, git and tar, Pitchfork's socket path, that the project compiles, that mise is new enough for its tool options and stack.lock, and fnox's value-free description when the stack uses fnox |
 | `stack mcp` | MCP server (stdio) exposing the same operations |
 
 All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project directory.
 
 - `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
+- `inspect` and `compile` list the [agent skills](skills.md) of the releases stack.lock pins
+  under `skills`. They install nothing and write nothing into the project. When mise cannot
+  answer, every entry is `unavailable` with a `skills_unavailable` warning and the command
+  still succeeds. `--all-skills` also lists Pitchfork's under `provider_skills`.
+- With `[skills] dir` in stack.toml, `install` and `up` add a `skills` step that links available
+  skills into that directory. Its problems are warnings, never failures. See
+  [agent skills](skills.md).
+
 - `install` is `up` without the start: compile in locked mode, trust the generated config, check
-  the supervisor socket path, install every pinned tool and preset service binary. Use it to warm
-  a checkout (CI caches, disposable worktrees) without a session; `exec` then has the tools.
+  the supervisor socket path, install every pinned tool and preset service binary, checked
+  against stack.lock's artifact checksums where it has them (see
+  [Artifact checksums](#artifact-checksums)). Use it to warm a checkout (CI caches, disposable
+  worktrees) without a session; `exec` then has the tools.
 - Errors from `up` that happen once its steps have begun end their `details` with a progress
   record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
   come before it. Invalid arguments, an unreadable session, and a failed initial GC pass
@@ -70,13 +80,23 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the services itself. Every service must verify first, whatever the task's `services` list:
   mise hands a task every service's endpoint, including any stack would withhold. For commands
   that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
-  than services to skip. `unknown_task` lists the tasks the project defines.
+  than services to skip. `unknown_task` lists the tasks the project defines. The task runs from
+  the configuration as it was when the run was planned, so a `compile` while it starts or runs
+  does not change its body, env or tools; the next run sees the change. Tasks and `exec`
+  receive `STACK_SESSION` only while a session exists; an `[env]` that declares it is refused
+  with `invalid_env`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code. When `--timeout` expires the command's process group is killed and stack
   exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the
   captured output is the error's only detail. Without `--json` the command keeps stdout and
   stderr; with `--timeout` it also runs in its own process group, so its stdin is empty, and
   interrupt, terminate and hangup signals are passed on to it.
+- `exec --secret KEY` (repeatable) and a task's `secrets = [...]` grant named fnox secrets,
+  resolved through the fnox release `stack.lock` pins once services verify. With `--json`,
+  granted values are replaced by `[redacted:KEY]` in the captured output, and values under 8
+  bytes are refused; without `--json` output reaches the terminal unredacted. See
+  [secret grants](secrets.md).
+
 - `restart [service...]` stops the named services (every service when none are named), waits
   until their recorded processes are gone and ports closed, starts them again and verifies the
   whole stack, like `up`. Other services keep running and the session keeps its id. Use it
@@ -121,7 +141,9 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   `install_failed` that `up` reports for a release that cannot be installed on this platform.
 - `stack.lock` version 1 (stack 0.1.3 and earlier) has no exact versions. `stack compile`
   migrates it, keeping every bundle pin; `compile --locked`, `inspect`, `up`, `exec` and
-  `status` refuse it with `lock_outdated` until then. Older stack releases cannot read version 2.
+  `status` refuse it with `lock_outdated` until then. Version 2 locks (exact versions, no
+  artifact checksums) remain usable; see [Artifact checksums](#artifact-checksums). A stack release older than the
+  lock it reads fails with `lock_invalid` ("written by a newer stack").
 - `up` checks, before any download, that Pitchfork's supervisor socket
   (`$PITCHFORK_STATE_DIR`, else `$XDG_STATE_HOME/pitchfork` on Linux, else
   `$HOME/.local/state/pitchfork`, then `/sock/main.sock`) fits the platform's 104 (macOS) or 108
@@ -130,7 +152,12 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
 - Supported presets are postgres, redis, cockroachdb, nats and spicedb. Omitted service
   versions resolve `latest` once and get an exact pin. `prefix:` and `sub-` selectors resolve
-  to releases too. Unknown presets fail in locked mode (`unlocked_service`).
+  to releases too. Unknown presets fail in locked mode (`unlocked_service`). A service `version`
+  or `preset` with template syntax (`{{`, `{%`, `{#`) is `invalid_service`, in any layer.
+- `tools.<name>` accepts a table with `version` and [allowlisted options](bundles.md#tool-options)
+  (`mr_boxington` on `rust`; `pubkey`, `identity`, `identity_prefix`, `issuer` on packslip-backed
+  tools). Anything else is `invalid_tool`. `install`, `up` and `doctor` fail with
+  `provider_outdated` when an option needs a newer mise (2026.9.2).
 - Requests that name no release (`system`, `path:`, `ref:`) remain explicitly nonreproducible
   and produce warnings for both tools and services. Damaged release pins fail with `lock_invalid`.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
@@ -149,5 +176,63 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   answers when Pitchfork's proxy is running.
 - A custom service's `run` should `exec` its server (`run = "exec python3 -m http.server $PORT"`),
   so the supervisor stops the server itself rather than a wrapping shell.
+
+## Artifact checksums
+
+`stack.lock` version 3 embeds mise's own lock (`mise.lock`) under `[provider_lock]`. A machine
+that downloads a locked release gets the bytes stack.lock records for its platform, or the
+install fails naming the tool. Stack never hashes artifacts itself: mise records a checksum, and
+for packslip-backed tools a signer, when it locks, and checks them when it downloads.
+
+```toml
+# stack.toml, project only (a bundle cannot set it)
+[lock]
+platforms = ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]   # the default
+artifacts = "best-effort"                                             # or "required"
+```
+
+`platforms` uses mise's names, including qualifiers such as `linux-x64-musl`; `"current"` means
+the compiling machine. mise looks a release up under one key per machine and backend: Node on
+Alpine needs `linux-x64-musl` listed, while Bun's per-CPU and musl builds are locked with their
+unqualified platform.
+
+Coverage is reported for every pin and listed platform:
+
+| State | Meaning |
+|---|---|
+| `verified` | the entry has a checksum and URL for the platform, plus a signer for packslip |
+| `exempt` | the backend records no download URL and mise accepts it as is (`core:rust`, `cargo`, `go`, `gem`, `ubi`, ...) |
+| `unsupported` | the backend locks a dependency graph stack does not carry (`npm`, `pypi`, `pipx`) |
+| `missing` | no entry for the platform: mise publishes no artifact, could not lock it, or nothing was locked yet |
+
+`compile --json` and `inspect --json` add `backend` and `artifacts` to each `versions[]` entry.
+`status --json` and the `install` step of `install` and `up` report this machine's coverage.
+
+`compile` locks only pins that need it (all of them under `--update`), in a scratch directory
+under stack's cache, without evaluating anything else from the project. A committed checksum is
+kept unless you run `compile --update`: an upstream difference is a warning, and under
+`--update` each change is reported with the old value. When `--update` gets no fresh answer
+(offline, for example) the committed value is kept and reported `retained`. With full coverage,
+`compile` makes no `mise lock` call.
+
+Locked operations never run `mise lock`. `install` and `up` render `.config/mise/mise.lock` from
+stack.lock, then run `mise install --locked` for pins that are `verified` or `exempt` here and a
+plain `mise install` for the rest. mise checks what it downloads: a release already installed on
+the machine is not checked again.
+
+| Code | When |
+|---|---|
+| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected |
+| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed |
+| `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read; nothing was changed |
+| `lock_invalid` | the embedded lock disagrees with the pins or is malformed; `compile --update` replaces it |
+| `lock_outdated` | `artifacts = "required"` with a version 2 lock |
+| `provider_outdated` | mise is older than 2026.9.16, which the embedded lock needs |
+| `install_failed` | any other install failure, with mise's output |
+
+Migration: version 2 locks stay valid under `best-effort`, with every pin `missing`. The next
+`compile` writes version 3 and needs network access for `mise lock`. Because a session's
+configuration includes stack.lock, the first `up` after migrating restarts services once. Keep
+`.config/mise/mise.lock` and `.config/mise/locks/` out of version control: they are generated.
 
 [All docs](../README.md)

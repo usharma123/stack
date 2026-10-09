@@ -5,6 +5,7 @@
 
 use crate::error::{Result, StackError};
 use crate::manifest::{BundleManifest, Overrides, ProjectManifest, Service, Task};
+use crate::tool::{self, ToolSpec};
 use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::json;
@@ -29,7 +30,7 @@ pub struct OverrideRecord {
 
 #[derive(Debug, Default, Serialize)]
 pub struct Composed {
-    pub tools: IndexMap<String, Entry<String>>,
+    pub tools: IndexMap<String, Entry<ToolSpec>>,
     pub env: IndexMap<String, Entry<String>>,
     pub services: IndexMap<String, Entry<Service>>,
     pub tasks: IndexMap<String, Entry<Task>>,
@@ -95,7 +96,8 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
 
     for b in bundles {
         let origin = format!("bundle:{}", b.manifest.bundle.name);
-        merge("tools", &mut out.tools, &b.manifest.tools, &origin, &mut conflicts);
+        let tools = tool_specs(&b.manifest.tools, &origin)?;
+        merge("tools", &mut out.tools, &tools, &origin, &mut conflicts);
         merge("env", &mut out.env, &b.manifest.env, &origin, &mut conflicts);
         merge("services", &mut out.services, &b.manifest.services, &origin, &mut conflicts);
         merge("tasks", &mut out.tasks, &b.manifest.tasks, &origin, &mut conflicts);
@@ -106,7 +108,8 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
     for (name, service) in &project.services {
         service.validate(name, "project")?;
     }
-    merge("tools", &mut out.tools, &project.tools, "project", &mut conflicts);
+    let tools = tool_specs(&project.tools, "project")?;
+    merge("tools", &mut out.tools, &tools, "project", &mut conflicts);
     merge("env", &mut out.env, &project.env, "project", &mut conflicts);
     merge("services", &mut out.services, &project.services, "project", &mut conflicts);
     merge("tasks", &mut out.tasks, &project.tasks, "project", &mut conflicts);
@@ -137,7 +140,32 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
     }
 
     validate_task_services(&out)?;
+    validate_tool_options(&out)?;
+    crate::secrets::validate_tasks(&out)?;
     Ok(out)
+}
+
+/// Each `tools.<name>` of one layer in canonical form; a value outside the allowlist is
+/// `invalid_tool` naming the layer.
+fn tool_specs(tools: &IndexMap<String, toml::Value>, origin: &str) -> Result<IndexMap<String, ToolSpec>> {
+    tools.iter().map(|(name, value)| Ok((name.clone(), ToolSpec::parse(name, value, origin)?))).collect()
+}
+
+/// Options that only take effect together with another tool. mise ignores `mr_boxington`
+/// unless Mr Boxington is among the active tools, and the user asked for caching.
+fn validate_tool_options(out: &Composed) -> Result<()> {
+    let has_mbx = out.tools.keys().any(|name| tool::is_mr_boxington(name));
+    if let Some((name, e)) = out.tools.iter().find(|(_, e)| e.value.mr_boxington()) {
+        if !has_mbx {
+            return Err(StackError::new(
+                "invalid_tool",
+                format!("tools.{name} ({}) sets mr_boxington, but no layer adds Mr Boxington; mise requires mr-boxington in the active tools", e.origin),
+            )
+            .hint("add `mbx = \"<version>\"` to [tools], or use the rust-mbx bundle")
+            .with_detail(json!({ "tool": name, "origin": e.origin, "option": tool::MR_BOXINGTON })));
+        }
+    }
+    Ok(())
 }
 
 fn merge<T: Clone + PartialEq>(
@@ -172,7 +200,8 @@ fn apply_overrides(out: &mut Composed, o: &Overrides, conflicts: &mut Vec<Confli
     for (name, service) in &o.services {
         service.validate(name, "[override.services]")?;
     }
-    override_kind("tools", &mut out.tools, &o.tools, conflicts, &mut out.overrides);
+    let tools = tool_specs(&o.tools, "[override.tools]")?;
+    override_kind("tools", &mut out.tools, &tools, conflicts, &mut out.overrides);
     override_kind("env", &mut out.env, &o.env, conflicts, &mut out.overrides);
     override_kind("services", &mut out.services, &o.services, conflicts, &mut out.overrides);
     override_kind("tasks", &mut out.tasks, &o.tasks, conflicts, &mut out.overrides);

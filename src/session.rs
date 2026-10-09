@@ -7,13 +7,18 @@
 
 use crate::error::{Result, StackError};
 use crate::hash::sha256_hex;
-use crate::manifest::Service;
+use crate::compose::{Composed, Entry};
+use crate::manifest::{Service, Task};
+use crate::artifacts;
 use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
+pub use crate::provider::task_config::TaskConfig;
+use crate::secrets::{self, Grant};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json};
 use crate::timing::Timings;
+use crate::tool::ToolSpec;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,8 +44,8 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn compile(&self, write: bool) -> Result<Report> {
-        project::compile_locked(&Options {
+    fn options(&self, write: bool) -> Options {
+        Options {
             root: self.root.clone(),
             mode: Mode::Frozen,
             write,
@@ -48,7 +53,26 @@ impl Ctx {
             state: self.state.clone(),
             reassign_ports: false,
             resolver: None,
+            locker: None,
+        }
+    }
+
+    fn compile(&self, write: bool) -> Result<Report> {
+        project::compile_locked(&self.options(write))
+    }
+
+    /// The locked, writing compile of `install` and `up`. mise must be new enough for the
+    /// configuration and the embedded lock before anything is published: port and identity
+    /// reservations, the generated config. A provider failure belongs to the `install` step,
+    /// whose requirement it is; anything else to `compile`.
+    fn compile_to_install(&self) -> std::result::Result<Report, (&'static str, StackError)> {
+        let provider_failed = std::cell::Cell::new(false);
+        project::compile_checked(&self.options(true), &|stack, lock| {
+            let checked = mise::require(&self.root, &project::requirements(stack, Some(lock))).map(drop);
+            provider_failed.set(checked.is_err());
+            checked
         })
+        .map_err(|e| (if provider_failed.get() { "install" } else { "compile" }, e))
     }
 
     fn session_file(&self) -> PathBuf {
@@ -527,6 +551,28 @@ impl Steps {
             .push(json!({ "step": step, "status": "ok", "detail": detail }));
     }
 
+    /// A step that completed with warnings: the command still succeeds.
+    fn warn(&mut self, step: &str, detail: Value) {
+        self.0
+            .push(json!({ "step": step, "status": "warning", "detail": detail }));
+    }
+
+    /// `[skills] dir`: link the stack's skills after install. Every outcome is a warning at
+    /// worst; the returned messages are the result's `warnings`.
+    fn skills(&mut self, ctx: &Ctx, report: &Report) -> Vec<String> {
+        let Some(dir) = report.skills_dir.as_deref() else { return Vec::new() };
+        let empty = crate::lock::Lockfile::new(Vec::new(), Vec::new(), Vec::new());
+        let sync = crate::skills::sync_step(&ctx.cache, &ctx.root, dir, report.lock.as_ref().unwrap_or(&empty), &report.versions);
+        let warnings: Vec<String> = sync
+            .warnings
+            .iter()
+            .map(|w| format!("skills: {}: {}", w["code"].as_str().unwrap_or_default(), w["message"].as_str().unwrap_or_default()))
+            .collect();
+        let detail = serde_json::to_value(&sync).expect("sync report serializes");
+        if warnings.is_empty() { self.ok("skills", detail) } else { self.warn("skills", detail) }
+        warnings
+    }
+
     /// Attach the steps that already ran, and whether repeating the command is safe.
     fn fail(mut self, step: &str, err: StackError, changed: bool) -> StackError {
         self.0
@@ -573,6 +619,9 @@ pub struct UpReport {
     pub checks: Vec<Check>,
     pub steps: Vec<Value>,
     pub reaped: Vec<GcEntry>,
+    /// Problems that did not stop startup (the `skills` step).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Preserve every observed launch identity before further provider calls can fail.
@@ -618,12 +667,19 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             false,
         ));
     }
-    let report = match ctx.compile(true) {
+    // A mise too old for what the configuration asks would silently ignore it: checked before
+    // the compile writes anything. The artifact policy is checked, and the provider's lock
+    // rendered from stack.lock, before any install.
+    let report = match ctx.compile_to_install() {
         Ok(r) => r,
-        Err(e) => return Err(steps.fail("compile", e, false)),
+        Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
 
+    let plan = match prepare_install(ctx, &report) {
+        Ok(plan) => plan,
+        Err(e) => return Err(steps.fail("install", e, false)),
+    };
     if let Err(e) = mise::trust(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
@@ -639,10 +695,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
-    if let Err(e) = mise::install(&ctx.root) {
-        return Err(steps.fail("install", e, false));
+    match install_partitioned(ctx, &plan) {
+        Ok(detail) => steps.ok("install", detail),
+        Err(e) => return Err(steps.fail("install", e, false)),
     }
-    steps.ok("install", json!(null));
+    let warnings = steps.skills(ctx, &report);
     // Recorded before anything starts, so a deleted project's services can still be found.
     let provider = socket.and_then(|socket| {
         let state_dir = socket.path.parent()?.parent()?.to_path_buf();
@@ -783,6 +840,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         checks,
         steps: steps.0,
         reaped,
+        warnings,
     })
 }
 
@@ -1012,6 +1070,9 @@ pub struct InstallReport {
     pub steps: Vec<Value>,
     pub ports: IndexMap<String, u16>,
     pub versions: Vec<project::VersionReport>,
+    /// Problems that did not stop installation (the `skills` step).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Install every locked tool and service binary without starting anything or recording a
@@ -1020,11 +1081,15 @@ pub struct InstallReport {
 pub fn install(ctx: &Ctx) -> Result<InstallReport> {
     let mut steps = Steps::default();
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    let report = match ctx.compile(true) {
+    let report = match ctx.compile_to_install() {
         Ok(r) => r,
-        Err(e) => return Err(steps.fail("compile", e, false)),
+        Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    let plan = match prepare_install(ctx, &report) {
+        Ok(plan) => plan,
+        Err(e) => return Err(steps.fail("install", e, false)),
+    };
     if let Err(e) = mise::trust(&ctx.root) {
         return Err(steps.fail("install", e, false));
     }
@@ -1034,11 +1099,73 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
-    if let Err(e) = mise::install(&ctx.root) {
-        return Err(steps.fail("install", e, false));
+    match install_partitioned(ctx, &plan) {
+        Ok(detail) => steps.ok("install", detail),
+        Err(e) => return Err(steps.fail("install", e, false)),
     }
-    steps.ok("install", json!(null));
-    Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions })
+    let warnings = steps.skills(ctx, &report);
+    Ok(InstallReport { steps: steps.0, ports: report.ports, versions: report.versions, warnings })
+}
+
+/// What the install step will do, decided before anything is installed.
+struct InstallPlan {
+    artifacts: artifacts::PlatformSummary,
+    partition: artifacts::Partition,
+    /// A service preset whose tool stack does not know: plain `mise install` of everything
+    /// left, as before artifact locking.
+    everything: bool,
+}
+
+/// Stated with every install: what `verified` means for releases already on the machine.
+const INSTALL_BOUNDARY: &str = "mise checks the recorded checksum (and packslip signer) of artifacts it downloads; a release already installed on this machine is reported installed without being checked again";
+
+/// Before anything installs: the artifact policy met on this platform, and
+/// `.config/mise/mise.lock` rendered from stack.lock. The provider release was checked before
+/// the compile wrote anything (`Ctx::compile_to_install`).
+fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
+    let platform = artifacts::current_platform();
+    let policy = &report.artifact_policy;
+    let pins = report.pins();
+    let lock = report.provider_lock();
+    // The locked compile already refused an unlisted platform and unchecked listed ones; this
+    // platform's coverage is checked again here because it is what the install relies on.
+    if policy.required() {
+        policy.check_runtime_platform()?;
+        let unchecked = artifacts::unchecked(lock, &pins, std::slice::from_ref(&platform), &Default::default());
+        if !unchecked.is_empty() {
+            return Err(artifacts::unlocked_error(unchecked));
+        }
+    }
+    let mut partition = artifacts::partition(lock, &pins, &platform);
+    // Requests that name no release are not pins; they install as they always did.
+    for (name, e) in &report.stack.tools {
+        if mise::unversioned(&e.value.version) && !partition.plain.contains(name) && !partition.locked.contains(name) {
+            partition.plain.push(name.clone());
+        }
+    }
+    let everything = report.stack.services.values().any(|e| e.value.preset.as_deref().is_some_and(|p| mise::preset_tool(p).is_none()));
+    artifacts::write_rendered(&ctx.root, report.lock.as_ref())?;
+    Ok(InstallPlan { artifacts: artifacts::summary(lock, &pins, &platform), partition, everything })
+}
+
+/// `mise install --locked` for pins whose coverage here is verified or exempt, then plain
+/// `mise install` for the rest; an empty partition is skipped.
+fn install_partitioned(ctx: &Ctx, plan: &InstallPlan) -> Result<Value> {
+    if !plan.partition.locked.is_empty() {
+        mise::install_tools(&ctx.root, &plan.partition.locked, true)?;
+    }
+    if !plan.partition.plain.is_empty() {
+        mise::install_tools(&ctx.root, &plan.partition.plain, false)?;
+    }
+    if plan.everything {
+        mise::install_tools(&ctx.root, &[], false)?;
+    }
+    Ok(json!({
+        "artifacts": plan.artifacts,
+        "locked": plan.partition.locked,
+        "plain": plan.partition.plain,
+        "boundary": INSTALL_BOUNDARY,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -1422,6 +1549,10 @@ pub struct StatusReport {
     pub stale: bool,
     /// Every service verified and the session is current; `stack status` exits 1 otherwise.
     pub healthy: bool,
+    /// Artifact coverage of the locked releases on this machine's platform. Read from
+    /// stack.lock; nothing is fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<artifacts::PlatformSummary>,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
@@ -1447,7 +1578,9 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let stale = session
         .as_ref()
         .is_some_and(|s| s.config_digest != config_digest(ctx, &report));
+    let artifacts = (!report.pins().is_empty()).then(|| report.current_artifacts());
     Ok(StatusReport {
+        artifacts,
         healthy: !stale && checks.iter().all(|c| c.ready),
         stale,
         lease_expired: session
@@ -1506,6 +1639,15 @@ pub struct ExecPlan {
     pub checks: Vec<Check>,
     /// Keeps TTL collection from stopping services until the command finishes.
     pub execution: Option<ExecutionGuard>,
+    /// Names of the secrets granted to the command (values are only in `env`).
+    pub secrets: Vec<String>,
+    /// Requests a grant made that stack declined, such as removing a protected variable.
+    pub secret_warnings: Vec<String>,
+    /// Replaces granted values in captured output; empty without grants.
+    pub redactor: crate::process::Redactor,
+    /// A task's copy of the provider configuration it was planned from, which `env` points
+    /// `mise run` at. Removed when the plan is dropped, after the command finishes.
+    pub task_config: Option<TaskConfig>,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -1809,37 +1951,85 @@ pub enum Require {
     Only(Vec<String>),
 }
 
-/// A declared task as a command for `plan_exec`, with every service required. `mise run`
-/// keeps the provider's task semantics (templates, shebangs, argument passing); `--skip-deps`
-/// stops it from starting the task's daemons itself, since stack verifies them instead.
-pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<String>, Require)> {
-    let report = ctx.compile(false)?;
-    report.stack.tasks.get(name).ok_or_else(|| {
-        let known: Vec<&str> = report.stack.tasks.keys().map(String::as_str).collect();
+/// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
+pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
+    plan_exec_with(ctx, cmd, require, &Grant::default())
+}
+
+/// [`plan_exec`], resolving `grant`'s secrets through the stack's pinned fnox once services
+/// are verified and endpoints withheld. The names are checked before any provider call.
+pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant) -> Result<ExecPlan> {
+    plan(ctx, Target::Command { cmd, require, grant })
+}
+
+/// A declared task, planned with every service required. `mise run` keeps the provider's task
+/// semantics (templates, shebangs, argument passing); `--skip-deps` stops it from starting the
+/// task's daemons itself, since stack verifies them instead.
+///
+/// The task is granted exactly the secrets it declares, read from the same compile, under the
+/// same project lock, as the command and environment: a task edited while this invocation
+/// waits for the lock runs with its new definition's grant, never its old one.
+///
+/// The lock is released before the task runs, and an ordinary compile may then rewrite the
+/// generated configuration. `mise run` therefore reads a copy taken under the lock (see
+/// [`TaskConfig`]): the plan runs the body, env and tool pins it was planned and granted for,
+/// whatever is compiled while it waits or runs. Its `[env]` values are the ones planning read
+/// from the project's own file, not evaluated again against the copy, and they still take
+/// precedence over the environment a tool sets.
+pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Result<ExecPlan> {
+    plan(ctx, Target::Task { name, args, captured })
+}
+
+/// What [`plan`] prepares: an explicit command with its own grant, or a declared task whose
+/// command and grant come from the compile that plans it.
+enum Target<'a> {
+    Command { cmd: &'a [String], require: &'a Require, grant: &'a Grant },
+    Task { name: &'a str, args: &'a [String], captured: bool },
+}
+
+fn declared_task<'a>(stack: &'a Composed, name: &str) -> Result<&'a Entry<Task>> {
+    stack.tasks.get(name).ok_or_else(|| {
+        let known: Vec<&str> = stack.tasks.keys().map(String::as_str).collect();
         StackError::new("unknown_task", format!("no task named '{name}'")).hint(if known.is_empty() {
             "this project defines no tasks; add one under [tasks.<name>] in stack.toml".to_string()
         } else {
             format!("tasks: {}", known.join(", "))
         })
-    })?;
-    let mut command: Vec<String> = ["mise", "run", "--skip-deps", "--no-timings", name, "--"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-    command.extend(args.iter().cloned());
-    // `mise run` evaluates the provider config again and would restore the endpoints that
-    // `plan_exec` withholds from unverified services. Only a fully verified stack has none.
-    Ok((command, Require::All))
+    })
 }
 
-/// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
-pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
+fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     timings.mark("lock");
     let mut session = load(ctx)?;
-    let report = ctx.compile(true)?;
+    let report = match target {
+        Target::Command { .. } => ctx.compile(true)?,
+        // An unknown task is refused before the compile writes anything.
+        Target::Task { name, .. } => {
+            project::compile_checked(&ctx.options(true), &|stack, _| declared_task(stack, name).map(drop))?
+        }
+    };
     timings.mark("compile");
+    let all = Require::All;
+    let task_grant;
+    let task_cmd: Vec<String>;
+    let (cmd, require, grant, origin) = match target {
+        Target::Command { cmd, require, grant } => (cmd, require, grant, secrets::Origin::Command),
+        Target::Task { name, args, captured } => {
+            let task = declared_task(&report.stack, name)?;
+            task_cmd = ["mise", "run", "--skip-deps", "--no-timings", name, "--"]
+                .into_iter()
+                .map(String::from)
+                .chain(args.iter().cloned())
+                .collect();
+            task_grant = Grant { keys: task.value.secrets.clone(), captured };
+            // `mise run` evaluates the provider config again and would restore the endpoints
+            // that are withheld from unverified services. Only a fully verified stack has none.
+            (task_cmd.as_slice(), &all, &task_grant, secrets::Origin::Task(name))
+        }
+    };
+    secrets::validate(&grant.keys, &report.stack, origin)?;
     mise::trust(&ctx.root)?;
     timings.mark("trust");
     let (mut env, checks) = if report.stack.services.is_empty() {
@@ -1853,6 +2043,25 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         timings.mark("verify");
         (env, checks)
     };
+    // Under the lock, from what this compile wrote; removed if planning fails after this. The
+    // `[env]` values just read from the project's file stay authoritative: the copy declares
+    // each one the plan holds (not the provider selection stack sets itself) as the value the
+    // command inherits, so `mise run` neither evaluates it again against the copy nor lets a
+    // tool's environment replace it.
+    let selection = mise::config_env(&ctx.root);
+    let mut task_config = match target {
+        Target::Task { .. } => Some(TaskConfig::capture(
+            &ctx.root,
+            &ctx.cache,
+            |key| env.get(key).filter(|_| !selection.contains_key(key)).cloned(),
+            || mise::shell_expands(&ctx.root),
+        )?),
+        Target::Command { .. } => None,
+    };
+    // Set before secrets resolve, so no grant can replace them.
+    if let Some(config) = &task_config {
+        env.extend(config.env());
+    }
 
     let required: Vec<&String> = match require {
         Require::Nothing => Vec::new(),
@@ -1915,6 +2124,29 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     if !unverified.is_empty() {
         env.insert("STACK_UNVERIFIED".into(), unverified.join(","));
     }
+    let granted = if grant.keys.is_empty() {
+        None
+    } else {
+        let resolved = resolve_secrets(ctx, &report, &env, &removed, &checks, grant)?;
+        timings.mark("secrets");
+        Some(resolved)
+    };
+    if let Some(resolved) = &granted {
+        for var in &resolved.remove {
+            env.shift_remove(var);
+            removed.push(var.clone());
+        }
+        for (key, value) in &resolved.set {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(config) = task_config.as_mut() {
+        config.track_with(|key| match env.get(key) {
+            Some(value) => Some(value.clone()),
+            None if removed.iter().any(|r| r == key) => None,
+            None => std::env::var(key).ok(),
+        });
+    }
     let (head, args) = cmd
         .split_first()
         .ok_or_else(|| StackError::new("usage", "no command given"))?;
@@ -1961,6 +2193,10 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
     env.insert("STACK_PROJECT".into(), ctx.root.to_string_lossy().into());
     timings.mark("reserve");
 
+    let (secrets, secret_warnings, redactor) = match granted {
+        Some(r) => (r.keys, r.warnings, r.redactor),
+        None => Default::default(),
+    };
     Ok(ExecPlan {
         program,
         args: args.to_vec(),
@@ -1968,7 +2204,43 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
         removed,
         checks,
         execution,
+        secrets,
+        secret_warnings,
+        redactor,
+        task_config,
     })
+}
+
+/// The grant's values from the fnox release stack.lock pins, validated against everything this
+/// command's environment sets or withholds: compile-time protected names, every service's
+/// withheld variables, every variable the provider set, and every variable removed.
+fn resolve_secrets(
+    ctx: &Ctx,
+    report: &Report,
+    env: &IndexMap<String, String>,
+    removed: &[String],
+    checks: &[Check],
+    grant: &Grant,
+) -> Result<secrets::Resolved> {
+    let resolved = report
+        .versions
+        .iter()
+        .find(|v| v.kind == "tool" && v.name == secrets::FNOX)
+        .and_then(|v| v.resolved.clone())
+        .ok_or_else(|| {
+            StackError::new("secret_unavailable", "stack.lock pins no fnox release")
+                .hint("run `stack compile`")
+                .with_detail(json!({ "step": "locate", "kind": "not_locked", "timed_out": false }))
+        })?;
+    let spec = report.stack.tools.get(secrets::FNOX).map(|e| e.value.at(resolved.as_str())).unwrap_or_else(|| ToolSpec::new(resolved));
+    let request = secrets::Request { root: &ctx.root, cache: &ctx.cache, pin: spec, env, removed };
+    let protected = |key: &str| {
+        secrets::protected(key, &report.stack).is_some()
+            || env.contains_key(key)
+            || removed.iter().any(|r| r == key)
+            || checks.iter().any(|c| c.withheld.iter().any(|w| w == key))
+    };
+    secrets::resolve(&request, grant, protected)
 }
 
 pub fn renew(ctx: &Ctx) -> Result<Session> {

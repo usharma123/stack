@@ -66,7 +66,7 @@ trap cleanup EXIT
 cat "$work/versions.txt"
 scenarios=("$@")
 if [ ${#scenarios[@]} -eq 0 ]; then
-  for t in "$root"/tests/e2e/[0-9]-*.sh; do scenarios+=("$(basename "$t" .sh)"); done
+  for t in "$root"/tests/e2e/[0-9]*-*.sh; do scenarios+=("$(basename "$t" .sh)"); done
 fi
 failed=0
 for name in "${scenarios[@]}"; do

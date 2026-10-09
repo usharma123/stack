@@ -1,0 +1,8 @@
+[bundle]
+name = "rust-mbx"
+version = "1.0.0"
+description = "Rust toolchain with shared Cargo build caching through Mr Boxington"
+
+[tools]
+rust = { version = "1.93", mr_boxington = true }
+mbx = "1.22.0"

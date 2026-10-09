@@ -7,6 +7,7 @@ use stack::mcp::{self, parse_duration};
 use stack::oci::{self, Reference};
 use stack::project::{self, default_cache_dir, Options, Report};
 use stack::compose::LoadedBundle;
+use stack::secrets::Grant;
 use stack::session::{self, Ctx, LeaseOptions, Require};
 use stack::source::Mode;
 use stack::state::default_state_dir;
@@ -42,7 +43,12 @@ enum Cmd {
         reassign_ports: bool,
     },
     /// Show the composed stack without writing anything
-    Inspect,
+    Inspect {
+        /// Also list skills of tools stack adds for its provider (Pitchfork), under
+        /// `provider_skills`. For people: an agent should not drive the supervisor directly
+        #[arg(long)]
+        all_skills: bool,
+    },
     /// Install the locked tools and service binaries without starting anything
     Install,
     /// Show the last lines a service wrote, as kept by the supervisor
@@ -91,10 +97,16 @@ enum Cmd {
         /// Kill the command after this long (e.g. 10m) and exit 124. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Grant this fnox secret to the command (repeatable), resolved through the stack's
+        /// pinned fnox. With --json its value is redacted from the captured output (and values
+        /// under 8 bytes, or ones a redaction marker could spell out, are refused); without --json the command owns the terminal and its
+        /// output is shown as written, unredacted
+        #[arg(long = "secret", value_name = "KEY")]
+        secret: Vec<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Run a task from stack.toml once every service verifies
+    /// Run a task from stack.toml once every service verifies, granted the secrets it declares
     Run {
         /// Task name, as in [tasks.<name>]
         task: String,
@@ -169,15 +181,20 @@ fn main() -> ExitCode {
         state: ctx.state.clone(),
         reassign_ports,
         resolver: None,
+        locker: None,
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
         Cmd::Compile { update, locked, reassign_ports } => {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
-            project::compile(&opts(mode, true, *reassign_ports)).map(|r| report(cli.json, &r))
+            project::compile(&opts(mode, true, *reassign_ports)).map(|mut r| {
+                r.attach_skills(&ctx.cache, false);
+                report(cli.json, &r)
+            })
         }
-        Cmd::Inspect => project::compile(&opts(project::inspect_mode(&root), false, false)).map(|mut r| {
+        Cmd::Inspect { all_skills } => project::compile(&opts(project::inspect_mode(&root), false, false)).map(|mut r| {
             r.warnings.extend(session::stale_session(&ctx, &r));
+            r.attach_skills(&ctx.cache, *all_skills);
             report(cli.json, &r)
         }),
         Cmd::Up { ttl, owner_pid, timeout } => ttl
@@ -192,6 +209,9 @@ fn main() -> ExitCode {
                         println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
                     }
                     println!("session {}", r.session.id);
+                    for w in &r.warnings {
+                        eprintln!("warning: {w}");
+                    }
                 })
             }),
         Cmd::Install => session::install(&ctx).map(|r| {
@@ -199,7 +219,15 @@ fn main() -> ExitCode {
                 for v in &r.versions {
                     println!("{:<12} {}", v.name, v.resolved.as_deref().unwrap_or("-"));
                 }
+                if let Some(detail) = r.steps.iter().find(|s| s["step"] == "install").map(|s| &s["detail"]) {
+                    let names = |key: &str| detail[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                    println!("checked (mise install --locked): {}", names("locked"));
+                    println!("unchecked (mise install): {}", names("plain"));
+                }
                 println!("installed; nothing started");
+                for w in &r.warnings {
+                    eprintln!("warning: {w}");
+                }
             })
         }),
         Cmd::Logs { service, tail, since_start } => session::logs(&ctx, service, *tail as usize, *since_start).map(|r| {
@@ -245,7 +273,7 @@ fn main() -> ExitCode {
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
-        Cmd::Exec { require, require_all, timeout, cmd } => {
+        Cmd::Exec { require, require_all, timeout, secret, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -253,10 +281,13 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            run_command(&ctx, cli.json, cmd, &req, timeout.as_deref())
+            run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
+                session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured })
+            })
         }
-        Cmd::Run { task, timeout, args } => session::task_command(&ctx, task, args)
-            .and_then(|(cmd, req)| run_command(&ctx, cli.json, &cmd, &req, timeout.as_deref())),
+        Cmd::Run { task, timeout, args } => {
+            run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
+        }
         Cmd::Down => session::down(&ctx).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
@@ -396,6 +427,13 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             let resolved = v.resolved.as_deref().unwrap_or("(not locked yet)");
             let moved = v.moved_from.as_deref().map(|m| format!("  (moved from {m})")).unwrap_or_default();
             println!("{} {} {} -> {resolved}{moved}", v.kind, v.name, v.requested);
+            if let Some(artifacts) = &v.artifacts {
+                let states: Vec<String> = artifacts
+                    .iter()
+                    .map(|(platform, a)| format!("{platform} {}{}", a.state.name(), a.change.map(|c| format!(" ({c})")).unwrap_or_default()))
+                    .collect();
+                println!("  artifacts: {}", states.join(", "));
+            }
         }
         // Custom services have no release to resolve; list them too.
         for (name, entry) in &s.services {
@@ -411,6 +449,18 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
             let replaced = if o.replaced.is_empty() { "nothing".into() } else { o.replaced.join(", ") };
             println!("override {}.{} (replaced: {replaced})", o.kind, o.key);
         }
+        for (list, label) in [(&r.skills, "skill"), (&r.provider_skills, "provider skill")] {
+            for k in list.iter().flatten() {
+                let at = k.version.as_deref().map(|v| format!("@{v}")).unwrap_or_default();
+                let status = serde_json::to_value(k.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+                match (&k.name, &k.entrypoint) {
+                    (Some(name), Some(entry)) if k.status == stack::skills::Status::Available => {
+                        println!("{label} {}{at} {name}: {}", k.tool, entry.display())
+                    }
+                    _ => println!("{label} {}{at} {status}{}", k.tool, k.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
+                }
+            }
+        }
         for w in &r.warnings {
             eprintln!("warning: {w}");
         }
@@ -420,12 +470,20 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
     })
 }
 
-fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, timeout: Option<&str>) -> Result<ExitCode> {
+/// `plan` is told whether output is captured.
+fn run_command(
+    ctx: &Ctx,
+    as_json: bool,
+    timeout: Option<&str>,
+    plan: impl FnOnce(bool) -> Result<session::ExecPlan>,
+) -> Result<ExitCode> {
     let timeout = timeout.map(parse_duration).transpose()?.map(Duration::from_secs);
+    // Captured output is redacted, so values too short to redact are refused there; on the
+    // terminal nothing is captured or redacted.
     if as_json {
-        exec_json(ctx, cmd, require, timeout)
+        exec_json(ctx, plan(true)?, timeout)
     } else {
-        exec(ctx, cmd, require, timeout)
+        exec(ctx, plan(false)?, timeout)
     }
 }
 
@@ -462,10 +520,12 @@ fn warn_changed(checks: &[session::Check]) {
     }
 }
 
-fn exec(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>) -> Result<ExitCode> {
-    let plan = session::plan_exec(ctx, cmd, require)?;
+fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     warn_unverified(&plan.checks);
     warn_changed(&plan.checks);
+    for warning in &plan.secret_warnings {
+        eprintln!("stack: {warning}");
+    }
     let mut command = Command::new(&plan.program);
     for var in &plan.removed {
         command.env_remove(var);
@@ -488,10 +548,9 @@ fn exec(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>)
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
 /// The process exits with the command's code (124 on timeout, like `timeout(1)`).
-fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, timeout: Option<Duration>) -> Result<ExitCode> {
+fn exec_json(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     // Large enough to mean "no limit" without overflowing deadline arithmetic.
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
-    let plan = session::plan_exec(ctx, cmd, require)?;
     let result = mcp::run_captured(ctx, &plan, timeout)?;
     if result["timed_out"] == true {
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));

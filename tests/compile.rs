@@ -5,6 +5,7 @@ use stack::lock;
 use stack::project::{compile, Options, Report};
 use stack::provider::mise::{self, Resolver};
 use stack::source::Mode;
+use stack::tool::{OptionValue, ToolSpec};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ use tempfile::TempDir;
 struct Upstream {
     releases: Mutex<BTreeMap<String, Vec<String>>>,
     calls: Mutex<Vec<String>>,
+    /// Every request as the resolver received it, options included.
+    specs: Mutex<Vec<(String, ToolSpec)>>,
 }
 
 impl Upstream {
@@ -33,6 +36,10 @@ impl Upstream {
             ("cockroach", &["25.2.0"]),
             ("nats-server", &["2.11.0"]),
             ("spicedb", &["1.45.0"]),
+            ("rust", &["1.92.0", "1.93.0", "1.93.1"]),
+            ("mbx", &["1.22.0"]),
+            ("packslip:example.com/acme/tool", &["2.0.0", "2.1.0"]),
+            ("fnox", &["1.39.0"]),
         ] {
             up.publish(tool, versions);
         }
@@ -64,6 +71,34 @@ impl Resolver for Upstream {
             .max_by_key(|v| numeric(v))
             .cloned()
             .ok_or_else(|| fail("no release matches"))
+    }
+
+    fn resolve_spec(&self, tool: &str, spec: &ToolSpec) -> Result<String, StackError> {
+        self.specs.lock().unwrap().push((tool.to_string(), spec.clone()));
+        self.resolve(tool, &spec.version)
+    }
+
+    fn registry_backend(&self, tool: &str) -> Result<Option<String>, StackError> {
+        self.calls.lock().unwrap().push(format!("registry {tool}"));
+        Ok(match tool {
+            "fnox" => Some("packslip:github.com/jdx/fnox".into()),
+            "jq" => Some("aqua:jqlang/jq".into()),
+            _ => None,
+        })
+    }
+}
+
+/// mise for artifact locking: a current release whose `mise lock` adds nothing, as offline.
+/// Artifact behaviour itself is tested in `tests/artifacts.rs`.
+struct QuietLocker;
+
+impl mise::Locker for QuietLocker {
+    fn version(&self, _: &Path) -> Result<mise::CalVer, StackError> {
+        Ok(mise::CalVer(2026, 10, 3))
+    }
+
+    fn lock(&self, _: &mise::ScratchRoot, _: &[String], _: &[String]) -> Result<mise::LockRun, StackError> {
+        Ok(mise::LockRun { exit_code: Some(0), stderr: String::new() })
     }
 }
 
@@ -127,6 +162,7 @@ impl Sandbox {
             state: self.path("state"),
             reassign_ports: false,
             resolver: Some(self.upstream.clone()),
+            locker: Some(Arc::new(QuietLocker)),
         }
     }
 
@@ -558,7 +594,7 @@ fn exact_tool_and_service_versions_survive_upstream_releases_and_a_fresh_cache()
         assert_eq!(resolved(&first, name), version, "{name}");
     }
     let locked = lock::read(&root).unwrap().unwrap();
-    assert_eq!(locked.version, 2);
+    assert_eq!(locked.version, 3);
     let pg = locked.service("postgres").unwrap();
     assert_eq!((pg.tool.as_deref(), pg.requested.as_str(), pg.resolved.as_str()), (Some("postgres"), "17", "17.2"));
     assert_eq!(locked.tool("pitchfork").unwrap().resolved, "2.29.0", "provider tools are locked too");
@@ -672,7 +708,7 @@ fn legacy_locks_keep_bundle_pins_and_migrate_only_through_compile() {
     let migrated = sb.compile(&root, Mode::UseLock).unwrap();
     assert!(migrated.lock_changed);
     let lock = lock::read(&root).unwrap().unwrap();
-    assert_eq!(lock.version, 2);
+    assert_eq!(lock.version, 3);
     assert_eq!(lock.bundles[0].commit.as_deref(), Some(v1.as_str()), "bundle pin kept");
     assert_eq!(lock.bundles[0].content_hash, hash);
     assert_eq!(lock.tool("python").unwrap().resolved, "3.13.2");
@@ -683,7 +719,7 @@ fn legacy_locks_keep_bundle_pins_and_migrate_only_through_compile() {
 fn unsupported_or_inconsistent_lock_versions_are_rejected() {
     let sb = Sandbox::new();
     let root = sb.project("[tools]\njq = \"1.7\"\n");
-    fs::write(root.join("stack.lock"), "version = 3\n").unwrap();
+    fs::write(root.join("stack.lock"), "version = 4\n").unwrap();
     assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
     fs::write(root.join("stack.lock"), "version = 1\n[[tool]]\nname = \"jq\"\nrequested = \"1.7\"\nresolved = \"1.7.1\"\n").unwrap();
     assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "lock_invalid");
@@ -714,6 +750,61 @@ fn identity_probes_are_validated() {
     fs::create_dir_all(&other).unwrap();
     fs::copy(root.join("stack.toml"), other.join("stack.toml")).unwrap();
     assert_ne!(sb.compile(&other, Mode::UseLock).unwrap().identities["w"], report.identities["w"]);
+}
+
+#[test]
+fn stack_session_is_reserved_in_every_env_layer_before_anything_is_written() {
+    let sb = Sandbox::new();
+    let uses = sb.path_bundle("b", "[bundle]\nname = \"b\"\n[env]\nSTACK_SESSION = \"fixture\"\n");
+    let clean = sb.path_bundle("c", "[bundle]\nname = \"c\"\n[env]\nMODE = \"dev\"\n");
+    let declared = [
+        ("[env]\nSTACK_SESSION = \"fixture\"\n[tasks.t]\nrun = \"printf ok\"\n".to_string(), "project"),
+        (uses.clone(), "bundle:b"),
+        (format!("{uses}[override.env]\nSTACK_SESSION = \"mine\"\n"), "override"),
+        (format!("{clean}[override.env]\nSTACK_SESSION = \"mine\"\n"), "override"),
+    ];
+    let refused = |root: &Path, toml: &str, origin: &str, modes: &[(Mode, bool)]| {
+        fs::write(root.join("stack.toml"), toml).unwrap();
+        for (mode, write) in modes {
+            let err = compile(&sb.options(root, *mode, *write)).unwrap_err();
+            assert_eq!(err.code, "invalid_env", "{toml}");
+            assert!(err.message.contains("env.STACK_SESSION") && err.message.contains(origin), "{origin}: {}", err.message);
+            assert!(err.hint.as_deref().unwrap_or("").contains("remove STACK_SESSION"), "{err:?}");
+        }
+    };
+
+    // A fresh project: no lock, generated configuration or provider call.
+    let root = sb.project("");
+    for (toml, origin) in &declared {
+        refused(&root, toml, origin, &[(Mode::UseLock, true), (Mode::Update, true), (Mode::UseLock, false)]);
+        assert!(!root.join("stack.lock").exists(), "{toml}");
+        assert!(!mise::output_path(&root).exists(), "{toml}");
+        assert_eq!(sb.upstream.calls(), 0, "the provider is never asked for {toml}");
+    }
+
+    // A compiled project: locked operations (exec, run, up) and inspect refuse a declaration
+    // added to its layers, and nothing already generated changes. (A bundle new to stack.lock
+    // is refused as `lock_outdated` before composition.)
+    fs::write(root.join("stack.toml"), format!("{clean}[tasks.t]\nrun = \"printf ok\"\n")).unwrap();
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let lock_before = lock_text(&root);
+    let output_before = fs::read(mise::output_path(&root)).unwrap();
+    let calls = sb.upstream.calls();
+    for (toml, origin) in [
+        (format!("{clean}[env]\nSTACK_SESSION = \"fixture\"\n[tasks.t]\nrun = \"printf ok\"\n"), "project"),
+        (format!("{clean}[override.env]\nSTACK_SESSION = \"mine\"\n[tasks.t]\nrun = \"printf ok\"\n"), "override"),
+    ] {
+        refused(&root, &toml, origin, &[(Mode::Frozen, true), (Mode::UseLock, true), (stack::project::inspect_mode(&root), false)]);
+        assert_eq!(lock_text(&root), lock_before, "{toml}");
+        assert_eq!(fs::read(mise::output_path(&root)).unwrap(), output_before, "{toml}");
+        assert_eq!(sb.upstream.calls(), calls, "{toml}");
+    }
+
+    // Only the exact name is reserved; the session itself is still handed to tasks at run time.
+    fs::write(root.join("stack.toml"), "[env]\nSTACK_SESSION_LABEL = \"x\"\nSTACK_SESSIONS = \"y\"\n[tasks.t]\nrun = \"printf ok\"\n").unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(report.stack.env.contains_key("STACK_SESSION_LABEL"));
+    sb.compile(&root, Mode::Frozen).unwrap();
 }
 
 #[test]
@@ -787,4 +878,211 @@ fn malformed_manifests_are_located_by_file_line_and_column() {
     assert!(err.message.contains("bundle.toml:5:1: unknown field `reddy_port`"), "{}", err.message);
     assert!(err.message.ends_with("5 | reddy_port = 3\n  | ^"), "{}", err.message);
     assert_eq!(err.details[0]["source"], source.as_str());
+}
+
+// ---- tool options (route 2) ------------------------------------------------------------------
+
+const RUST_MBX: &str = r#"
+[bundle]
+name = "rust-mbx"
+version = "1.0.0"
+
+[tools]
+rust = { version = "1.93", mr_boxington = true }
+mbx = "1.22.0"
+"#;
+
+impl Sandbox {
+    /// A local bundle directory, used through `path:`.
+    fn path_bundle(&self, name: &str, manifest: &str) -> String {
+        let dir = self.path(&format!("local/{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bundle.toml"), manifest).unwrap();
+        format!("[[use]]\nbundle = \"path:{}\"\n", dir.display())
+    }
+}
+
+#[test]
+fn string_and_optionless_table_requests_compose_lock_and_render_alike() {
+    let sb = Sandbox::new();
+    let uses = sb.path_bundle("b", "[bundle]\nname = \"b\"\n[tools]\njq = \"1.7\"\n");
+    let root = sb.project(&format!("{uses}[tools]\njq = {{ version = \"1.7\" }}\n"));
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.stack.tools["jq"].origin, "bundle:b", "agreeing layers are not a conflict");
+    let table_lock = lock_text(&root);
+    let table_render = fs::read_to_string(mise::output_path(&root)).unwrap();
+    assert!(table_render.contains("jq = \"1.7.1\""), "{table_render}");
+    assert!(!table_lock.contains("options"), "{table_lock}");
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["stack"]["tools"]["jq"]["value"], "1.7", "optionless requests read as strings");
+    assert!(json["versions"][0].get("options").is_none(), "{json}");
+
+    fs::write(root.join("stack.toml"), format!("{uses}[tools]\njq = \"1.7\"\n")).unwrap();
+    sb.compile(&root, Mode::Frozen).unwrap();
+    assert_eq!(lock_text(&root), table_lock);
+    assert_eq!(fs::read_to_string(mise::output_path(&root)).unwrap(), table_render);
+}
+
+#[test]
+fn rust_mbx_bundle_locks_renders_and_reports_its_options() {
+    let sb = Sandbox::new();
+    let root = sb.project(&sb.path_bundle("rust-mbx", RUST_MBX));
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+
+    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
+    let doc: toml::Table = toml::from_str(&rendered).unwrap();
+    assert_eq!(doc["tools"]["rust"]["version"].as_str(), Some("1.93.1"), "{rendered}");
+    assert_eq!(doc["tools"]["rust"]["mr_boxington"].as_bool(), Some(true), "{rendered}");
+    assert_eq!(doc["tools"]["mbx"].as_str(), Some("1.22.0"));
+
+    let lock = lock::read(&root).unwrap().unwrap();
+    let rust = lock.tool("rust").unwrap();
+    assert_eq!((rust.requested.as_str(), rust.resolved.as_str()), ("1.93", "1.93.1"));
+    assert_eq!(rust.options.get("mr_boxington"), Some(&OptionValue::Bool(true)));
+    assert!(lock.tool("mbx").unwrap().options.is_empty());
+    assert_eq!(lock.version, 3, "options extend version 2 and survive into version 3");
+    assert!(lock_text(&root).contains("[tool.options]\nmr_boxington = true"), "{}", lock_text(&root));
+
+    // The resolver was asked with the options, so a backend that needs them can list releases.
+    let specs = sb.upstream.specs.lock().unwrap().clone();
+    let (_, spec) = specs.iter().find(|(tool, _)| tool == "rust").unwrap();
+    assert!(spec.mr_boxington() && spec.version == "1.93");
+
+    let json = serde_json::to_value(&report).unwrap();
+    let rust_report = json["versions"].as_array().unwrap().iter().find(|v| v["name"] == "rust").unwrap();
+    assert_eq!(rust_report["options"], serde_json::json!({ "mr_boxington": true }));
+    assert_eq!(rust_report["resolved"], "1.93.1");
+    assert_eq!(json["stack"]["tools"]["rust"]["value"], serde_json::json!({ "version": "1.93", "mr_boxington": true }));
+
+    // Inspect reads the same options back from the lock without resolving.
+    let calls = sb.upstream.calls();
+    let inspected = compile(&sb.options(&root, Mode::Frozen, false)).unwrap();
+    let rust_inspected = inspected.versions.iter().find(|v| v.name == "rust").unwrap();
+    assert!(rust_inspected.options.contains_key("mr_boxington"));
+    assert_eq!(sb.upstream.calls(), calls);
+    assert_eq!(stack::project::provider_requirements(&inspected.stack).len(), 1);
+}
+
+#[test]
+fn a_changed_option_is_a_changed_request() {
+    let sb = Sandbox::new();
+    let uses = sb.path_bundle("rust-mbx", RUST_MBX);
+    let root = sb.project(&uses);
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let before = lock_text(&root);
+
+    fs::write(root.join("stack.toml"), format!("{uses}[override.tools]\nrust = \"1.93\"\n")).unwrap();
+    let e = sb.compile(&root, Mode::Frozen).unwrap_err();
+    assert_eq!(e.code, "lock_outdated", "{e:?}");
+    let detail = e.details.iter().find(|d| d["name"] == "rust").unwrap();
+    assert_eq!(detail["options"], serde_json::json!({}));
+    assert_eq!(detail["locked_options"], serde_json::json!({ "mr_boxington": true }));
+    assert_eq!(lock_text(&root), before, "locked mode changes nothing");
+
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(report.lock_changed);
+    assert!(lock::read(&root).unwrap().unwrap().tool("rust").unwrap().options.is_empty());
+    assert!(fs::read_to_string(mise::output_path(&root)).unwrap().contains("rust = \"1.93.1\""));
+    let record = report.stack.overrides.iter().find(|o| o.key == "rust").unwrap();
+    assert_eq!(record.replaced, ["bundle:rust-mbx"]);
+}
+
+#[test]
+fn layers_that_disagree_on_an_option_conflict_until_overridden() {
+    let sb = Sandbox::new();
+    let uses = sb.path_bundle("rust-mbx", RUST_MBX);
+    let root = sb.project(&format!("{uses}[tools]\nrust = \"1.93\"\n"));
+    let e = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(e.code, "conflict", "{e:?}");
+    assert_eq!(e.details[0]["key"], "rust");
+    assert_eq!(e.details[0]["defined_by"], serde_json::json!(["bundle:rust-mbx", "project"]));
+    assert!(!root.join("stack.lock").exists());
+
+    // The override replaces the whole value and records both layers it replaced.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{uses}[tools]\nrust = \"1.93\"\n[override.tools]\nrust = {{ version = \"1.92\", mr_boxington = true }}\n"),
+    )
+    .unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    let rust = &report.stack.tools["rust"];
+    assert_eq!((rust.origin.as_str(), rust.value.version.as_str()), ("override", "1.92"));
+    assert!(rust.value.mr_boxington());
+    let record = report.stack.overrides.iter().find(|o| o.key == "rust").unwrap();
+    assert_eq!(record.replaced, ["bundle:rust-mbx", "project"]);
+    assert_eq!(lock::read(&root).unwrap().unwrap().tool("rust").unwrap().resolved, "1.92.0");
+}
+
+#[test]
+fn options_outside_the_allowlist_are_invalid_tool_naming_the_layer() {
+    let sb = Sandbox::new();
+    let key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    for (tools, origin, why) in [
+        ("rust = { version = \"1.93\", pin = \"x\" }\nmbx = \"1.22.0\"", "project", "`pin` is not supported"),
+        ("rust = { version = \"1.93\", mr_boxington = 1 }\nmbx = \"1.22.0\"", "project", "must be a boolean"),
+        ("rust = { mr_boxington = true }\nmbx = \"1.22.0\"", "project", "must set `version`"),
+        ("jq = { version = \"1.7\", nested = { a = 1 } }", "project", "`nested` is not supported"),
+        ("\"packslip:example.com/acme/tool\" = { version = \"2\", pubkey = \"keys/tool.pub\" }", "project", "literal minisign"),
+        ("\"github:jdx/fnox\" = { version = \"1\", identity = \"x\" }", "project", "packslip backend"),
+        ("jq = { version = \"1.7\", identity = \"x\" }", "project", "installs it through aqua:jqlang/jq"),
+        ("unlisted = { version = \"1\", issuer = \"x\" }", "project", "does not say which backend"),
+        ("rust = { version = \"1.93\", mr_boxington = true }", "project", "no layer adds Mr Boxington"),
+    ] {
+        let root = sb.project(&format!("[tools]\n{tools}\n"));
+        let e = sb.compile(&root, Mode::UseLock).unwrap_err();
+        assert_eq!(e.code, "invalid_tool", "{tools}: {e:?}");
+        assert!(e.message.contains(why) && e.message.contains(origin), "{tools}: {}", e.message);
+        assert!(e.hint.is_some(), "{tools}");
+        assert!(!root.join("stack.lock").exists(), "{tools}");
+    }
+    // A bundle's own invalid option is reported against the bundle.
+    let uses = sb.path_bundle("bad", "[bundle]\nname = \"bad\"\n[tools]\nrust = { version = \"1.93\", mr_boxington = \"yes\" }\n");
+    let e = sb.compile(&sb.project(&uses), Mode::UseLock).unwrap_err();
+    assert!(e.code == "invalid_tool" && e.message.starts_with("tools.rust in bundle:bad: "), "{e:?}");
+
+    // The packslip trust options are accepted on a packslip-named tool and reach resolution.
+    let root = sb.project(&format!(
+        "[tools]\n\"packslip:example.com/acme/tool\" = {{ version = \"2\", pubkey = \"{key}\", identity = \"https://ci.example.com/acme\", issuer = \"https://token.example.com\" }}\n"
+    ));
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let pin = lock::read(&root).unwrap().unwrap().tool("packslip:example.com/acme/tool").unwrap().clone();
+    assert_eq!(pin.resolved, "2.1.0");
+    assert_eq!(pin.options.get("pubkey"), Some(&OptionValue::String(key.into())));
+    let specs = sb.upstream.specs.lock().unwrap().clone();
+    assert!(specs.iter().any(|(t, s)| t == "packslip:example.com/acme/tool" && s.options.len() == 3));
+}
+
+#[test]
+fn locked_pins_become_a_tools_only_scratch_configuration() {
+    use stack::provider::scratch;
+    let sb = Sandbox::new();
+    let uses = sb.path_bundle("rust-mbx", RUST_MBX);
+    let root = sb.project(&format!("{uses}[env]\nX = \"{{{{ exec(command='touch never') }}}}\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n"));
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let pins = scratch::pins(&lock::read(&root).unwrap().unwrap());
+    let names: Vec<String> = pins.iter().map(|p| format!("{}@{}", p.tool, p.spec.version)).collect();
+    assert_eq!(names, ["rust@1.93.1", "mbx@1.22.0", "pitchfork@2.29.0", "postgres@17.2"]);
+    let root_a = scratch::ScratchRoot::create(&sb.path("cache"), "skills").unwrap();
+    let written = fs::read_to_string(root_a.write_tools(&pins).unwrap()).unwrap();
+    let doc: toml::Table = toml::from_str(&written).unwrap();
+    assert_eq!(doc.keys().collect::<Vec<_>>(), ["tools"], "{written}");
+    assert!(!written.contains("exec("), "{written}");
+    assert_eq!(doc["tools"]["rust"]["mr_boxington"].as_bool(), Some(true));
+}
+
+#[test]
+fn trust_options_on_a_registry_name_need_mises_packslip_backend() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\nfnox = { version = \"1.39.0\", identity = \"https://github.com/jdx/fnox/.github/workflows/release.yml@refs/tags/v1.39.0\" }\n");
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(sb.upstream.calls.lock().unwrap().contains(&"registry fnox".to_string()));
+    let lock = lock::read(&root).unwrap().unwrap();
+    assert!(lock.tool("fnox").unwrap().options.contains_key("identity"));
+    let reasons: Vec<String> = stack::project::provider_requirements(&report.stack).into_iter().map(|r| r.reason).collect();
+    assert_eq!(reasons, ["tools.fnox (project) sets packslip trust options"]);
+    // Locked and read-only modes never ask the registry again.
+    sb.upstream.calls.lock().unwrap().clear();
+    sb.compile(&root, Mode::Frozen).unwrap();
+    compile(&sb.options(&root, Mode::Frozen, false)).unwrap();
+    assert_eq!(sb.upstream.calls(), 0);
 }

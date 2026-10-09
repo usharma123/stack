@@ -66,6 +66,274 @@ pub struct Captured {
     pub stdout_truncated: bool,
 }
 
+// ---- redaction -----------------------------------------------------------------------------
+
+/// Prefixed to a captured stream that kept only its last `limit` bytes.
+pub const TRUNCATED: &str = "…[truncated]…";
+
+/// The marker for a value whose key cannot be shown in it.
+pub const REDACTED: &str = "[redacted]";
+
+/// What lossy decoding writes in place of bytes that are not UTF-8.
+const REPLACEMENT: &str = "\u{FFFD}";
+
+/// Longest key shown in a marker.
+const MAX_LABEL: usize = 128;
+
+/// Values that must not appear in captured output, each replaced by a marker:
+/// `[redacted:<KEY>]`, or [`REDACTED`] when the key cannot be shown.
+///
+/// Matching is on bytes, before output is bounded, so a value is caught wherever it falls in
+/// the stream. Overlapping occurrences (of one value or of several) are replaced as one run
+/// naming every key it covered. Deliberately neither `Debug` nor `Serialize` beyond key names.
+///
+/// Replacing one value must never write another, or itself. Text stack inserts (markers, the
+/// [`TRUNCATED`] notice, the replacement character of lossy decoding) is the only text in a
+/// result the command did not write, and every value occurrence the command wrote is replaced,
+/// so a value can only reappear across inserted text. Hence:
+///
+/// - a key is shown only if it is a variable name (`[A-Z_][A-Z0-9_]*`, at most 128 bytes) and
+///   no value could be read across its marker; otherwise its marker is [`REDACTED`];
+/// - a value that could still be read across a marker in use, the notice or the replacement
+///   character is a [conflict](Self::conflicts). A redactor with conflicts fails closed: its
+///   streams release nothing and [`capture_redacted`] refuses to run the command. Callers
+///   refuse such grants before that.
+#[derive(Clone, Default)]
+pub struct Redactor {
+    entries: Vec<Redacted>,
+    longest: usize,
+    /// Indexes of entries whose value could be read across inserted text.
+    conflicts: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct Redacted {
+    value: Vec<u8>,
+    key: String,
+    marker: String,
+}
+
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.entries.iter().map(|e| e.key.as_str()).collect();
+        f.debug_struct("Redactor").field("keys", &keys).finish()
+    }
+}
+
+impl Redactor {
+    /// Add `value` under `key`. Empty values match nothing and are ignored. Check
+    /// [`conflicts`](Self::conflicts) afterwards: a value that cannot be replaced safely makes
+    /// the redactor withhold everything.
+    pub fn add(&mut self, key: &str, value: &[u8]) {
+        if value.is_empty() || self.entries.iter().any(|e| e.value == value && e.key == key) {
+            return;
+        }
+        self.longest = self.longest.max(value.len());
+        self.entries.push(Redacted { value: value.to_vec(), key: key.to_string(), marker: String::new() });
+        self.settle();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Keys whose value could be read across text stack inserts, in the order added. Empty
+    /// for a redactor that is safe to use.
+    pub fn conflicts(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = Vec::new();
+        for &i in &self.conflicts {
+            if !keys.contains(&self.entries[i].key.as_str()) {
+                keys.push(&self.entries[i].key);
+            }
+        }
+        keys
+    }
+
+    /// Choose every marker and find the conflicts, for the values added so far.
+    fn settle(&mut self) {
+        let values: Vec<&[u8]> = self.entries.iter().map(|e| e.value.as_slice()).collect();
+        let markers: Vec<String> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let labeled = format!("[redacted:{}]", e.key);
+                if showable(&e.key) && !values.iter().any(|v| overlaps(v, labeled.as_bytes())) {
+                    labeled
+                } else {
+                    REDACTED.to_string()
+                }
+            })
+            .collect();
+        let mut used: Vec<&str> = Vec::new();
+        for marker in &markers {
+            if !used.contains(&marker.as_str()) {
+                used.push(marker);
+            }
+        }
+        self.conflicts = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| {
+                used.iter().any(|m| overlaps(v, m.as_bytes()))
+                    || overlaps(v, REPLACEMENT.as_bytes())
+                    || starts_inside(v, TRUNCATED.as_bytes())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for (entry, marker) in self.entries.iter_mut().zip(markers) {
+            entry.marker = marker;
+        }
+    }
+
+    /// Every value replaced in a complete text (an error message, a whole stream). Empty when
+    /// the redactor has [conflicts](Self::conflicts).
+    pub fn redact(&self, text: &str) -> String {
+        let mut stream = self.stream();
+        let mut out = stream.push(text.as_bytes());
+        out.extend(stream.finish());
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    pub fn stream(&self) -> RedactStream<'_> {
+        RedactStream { redactor: self, pending: Vec::new(), cover_end: 0, run: Vec::new(), offset: 0 }
+    }
+}
+
+/// A key shown in its marker: a variable name of reasonable length. Anything else (a
+/// dependency name fnox reported, say) is not echoed into output.
+fn showable(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    key.len() <= MAX_LABEL
+        && bytes.next().is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The shorter of `a` and `b` is a prefix of the other.
+fn agree(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().min(b.len());
+    a[..n] == b[..n]
+}
+
+/// `value` could be read starting inside `inserted`: within it, or running on past its end.
+fn starts_inside(value: &[u8], inserted: &[u8]) -> bool {
+    (0..inserted.len()).any(|s| agree(&inserted[s..], value))
+}
+
+/// `value` could be read across some byte of `inserted`, whatever text surrounds it: starting
+/// inside it, or starting before it and reaching into (or past) it.
+fn overlaps(value: &[u8], inserted: &[u8]) -> bool {
+    starts_inside(value, inserted) || (1..value.len()).any(|j| value[j] == inserted[0] && agree(&value[j..], inserted))
+}
+
+/// A [`Redactor`] applied to one stream that arrives in pieces. Holds back at most the longest
+/// value minus one byte (plus any run of matched bytes still open), so a value split across
+/// reads is still caught. A redactor with conflicts releases nothing.
+pub struct RedactStream<'a> {
+    redactor: &'a Redactor,
+    /// Bytes not yet decided, starting at absolute position `offset`.
+    pending: Vec<u8>,
+    /// Absolute end of the bytes covered by matches found so far.
+    cover_end: usize,
+    /// Entries of the covered run being skipped, in the order they matched.
+    run: Vec<usize>,
+    offset: usize,
+}
+
+impl RedactStream<'_> {
+    /// Feed `bytes`; returns what can be released now.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if !self.redactor.conflicts.is_empty() {
+            return Vec::new();
+        }
+        self.pending.extend_from_slice(bytes);
+        self.advance(false)
+    }
+
+    /// End of stream: release everything still held.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if !self.redactor.conflicts.is_empty() {
+            return Vec::new();
+        }
+        let mut out = self.advance(true);
+        self.close_run(&mut out);
+        out
+    }
+
+    /// One marker per distinct marker text of the run, in the order they matched.
+    fn close_run(&mut self, out: &mut Vec<u8>) {
+        let redactor = self.redactor;
+        let mut written: Vec<&str> = Vec::new();
+        for index in self.run.drain(..) {
+            let marker = redactor.entries[index].marker.as_str();
+            if !written.contains(&marker) {
+                written.push(marker);
+                out.extend_from_slice(marker.as_bytes());
+            }
+        }
+    }
+
+    fn advance(&mut self, end: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let longest = self.redactor.longest;
+        let mut i = 0;
+        while i < self.pending.len() {
+            // Every match that starts here must be decidable: either the whole value fits in
+            // what arrived, or the stream ended.
+            if !end && self.pending.len() - i < longest {
+                break;
+            }
+            let rest = &self.pending[i..];
+            let position = self.offset + i;
+            for (index, entry) in self.redactor.entries.iter().enumerate() {
+                if rest.starts_with(&entry.value) {
+                    self.cover_end = self.cover_end.max(position + entry.value.len());
+                    if !self.run.contains(&index) {
+                        self.run.push(index);
+                    }
+                }
+            }
+            if position >= self.cover_end {
+                self.close_run(&mut out);
+                out.push(self.pending[i]);
+            }
+            i += 1;
+        }
+        self.pending.drain(..i);
+        self.offset += i;
+        out
+    }
+}
+
+/// Where a captured stream goes: through the redactor if there is one, then into its tail.
+struct Sink<'a> {
+    stream: Option<RedactStream<'a>>,
+    tail: Tail,
+}
+
+impl<'a> Sink<'a> {
+    fn new(limit: usize, redactor: Option<&'a Redactor>) -> Self {
+        Self { stream: redactor.filter(|r| !r.is_empty()).map(Redactor::stream), tail: Tail::new(limit) }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        match self.stream.as_mut() {
+            Some(stream) => {
+                let released = stream.push(bytes);
+                self.tail.append(&released);
+            }
+            None => self.tail.append(bytes),
+        }
+    }
+
+    fn finish(mut self) -> Tail {
+        if let Some(mut stream) = self.stream.take() {
+            let released = stream.finish();
+            self.tail.append(&released);
+        }
+        self.tail
+    }
+}
+
 struct Tail {
     bytes: VecDeque<u8>,
     limit: usize,
@@ -101,7 +369,7 @@ impl Tail {
         let bytes: Vec<u8> = self.bytes.into_iter().collect();
         let text = String::from_utf8_lossy(&bytes);
         if self.truncated {
-            format!("…[truncated]…{text}")
+            format!("{TRUNCATED}{text}")
         } else {
             text.into_owned()
         }
@@ -188,7 +456,7 @@ fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
 }
 
 /// Read what is available without blocking. Returns `false` once the pipe reached EOF.
-fn drain(pipe: &mut impl Read, tail: &mut Tail) -> io::Result<bool> {
+fn drain(pipe: &mut impl Read, tail: &mut Sink<'_>) -> io::Result<bool> {
     let mut buffer = [0; 8192];
     // Yield to deadline checks even when a child writes continuously.
     for _ in 0..16 {
@@ -243,8 +511,21 @@ fn wait_readable(fds: &[std::os::fd::RawFd], wait: Duration) -> io::Result<()> {
 /// immediately rather than at the next fixed polling tick.
 #[cfg(unix)]
 pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Captured> {
+    capture_redacted(command, timeout, limit, None)
+}
+
+/// [`capture`], with every value of `redactor` replaced in both streams before they are
+/// bounded: `limit` applies to the redacted text, and a value split across reads or across
+/// the start of the retained tail is still replaced. `None` (or an empty redactor) captures
+/// exactly as [`capture`] does. A redactor with [conflicts](Redactor::conflicts) is refused
+/// before anything runs: its output could not be shown without a value.
+#[cfg(unix)]
+pub fn capture_redacted(command: &mut Command, timeout: Duration, limit: usize, redactor: Option<&Redactor>) -> io::Result<Captured> {
+    if redactor.is_some_and(|r| !r.conflicts.is_empty()) {
+        return Err(io::Error::other("a granted value could be reproduced by its redaction marker, so output cannot be captured safely"));
+    }
     let mut child = OwnedChild::new(spawn_piped(command)?);
-    let piped = collect(&mut child, bounded(timeout), limit, |child, _| child.terminate())?;
+    let piped = collect(&mut child, bounded(timeout), limit, redactor, |child, _| child.terminate())?;
     Ok(Captured {
         exit_code: if piped.timed_out { None } else { child.status.and_then(|s| s.code()) },
         timed_out: piped.timed_out,
@@ -281,6 +562,7 @@ fn collect(
     child: &mut OwnedChild,
     timeout: Duration,
     limit: usize,
+    redactor: Option<&Redactor>,
     finish: impl FnOnce(&mut OwnedChild, bool),
 ) -> io::Result<Piped> {
     use std::os::fd::AsRawFd;
@@ -297,8 +579,8 @@ fn collect(
         .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
     nonblocking(&stdout)?;
     nonblocking(&stderr)?;
-    let mut out = Tail::new(limit);
-    let mut err = Tail::new(limit);
+    let mut out = Sink::new(limit, redactor);
+    let mut err = Sink::new(limit, redactor);
     let (mut out_open, mut err_open) = (true, true);
     // After both pipes close the command is normally exiting; reap it with a short backoff.
     let mut reap_backoff = Duration::from_micros(250);
@@ -340,7 +622,7 @@ fn collect(
     if err_open {
         drain(&mut stderr, &mut err)?;
     }
-    Ok(Piped { timed_out, stdout: out, stderr: err })
+    Ok(Piped { timed_out, stdout: out.finish(), stderr: err.finish() })
 }
 
 /// Process group of the command `run_with_deadline` is waiting for, for its signal handler.
@@ -579,7 +861,7 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
         FORWARD_TO.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
     }
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
-        collect(&mut child, timeout, OUTPUT_LIMIT, |child, timed_out| {
+        collect(&mut child, timeout, OUTPUT_LIMIT, None, |child, timed_out| {
             // Stop forwarding before the group can be reaped and its ID reused.
             let _ = set_mask(libc::SIG_BLOCK, &held);
             if forwarding.is_some() {
@@ -655,7 +937,12 @@ pub fn run_with_deadline(_: &mut Command, _: Duration) -> io::Result<(Option<i32
 }
 
 #[cfg(not(unix))]
-pub fn capture(_: &mut Command, _: Duration, _: usize) -> io::Result<Captured> {
+pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Captured> {
+    capture_redacted(command, timeout, limit, None)
+}
+
+#[cfg(not(unix))]
+pub fn capture_redacted(_: &mut Command, _: Duration, _: usize, _: Option<&Redactor>) -> io::Result<Captured> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "bounded process capture currently requires Unix",
@@ -857,5 +1144,254 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    fn redactor(pairs: &[(&str, &str)]) -> Redactor {
+        let mut r = Redactor::default();
+        for (key, value) in pairs {
+            r.add(key, value.as_bytes());
+        }
+        r
+    }
+
+    /// `text` fed to a stream in pieces of `size` bytes.
+    fn streamed(r: &Redactor, text: &[u8], size: usize) -> Vec<u8> {
+        let mut stream = r.stream();
+        let mut out = Vec::new();
+        for chunk in text.chunks(size.max(1)) {
+            out.extend(stream.push(chunk));
+        }
+        out.extend(stream.finish());
+        out
+    }
+
+    #[test]
+    fn values_are_replaced_wherever_the_stream_is_split() {
+        let r = redactor(&[("API_TOKEN", "s3cr3t-value-0042"), ("OTHER", "another-secret")]);
+        let text = "a s3cr3t-value-0042 b s3cr3t-value-0042\nanother-secret!s3cr3t-value-004";
+        let expected = "a [redacted:API_TOKEN] b [redacted:API_TOKEN]\n[redacted:OTHER]!s3cr3t-value-004";
+        for size in 1..=text.len() {
+            assert_eq!(String::from_utf8(streamed(&r, text.as_bytes(), size)).unwrap(), expected, "chunks of {size}");
+        }
+        assert_eq!(r.redact(text), expected);
+    }
+
+    #[test]
+    fn overlapping_values_are_replaced_as_one_run_naming_each_key() {
+        let r = redactor(&[("A", "abcdefgh"), ("B", "efghijkl")]);
+        for size in 1..=12 {
+            let out = String::from_utf8(streamed(&r, b"<abcdefghijkl>", size)).unwrap();
+            assert_eq!(out, "<[redacted:A][redacted:B]>", "chunks of {size}");
+        }
+        // A value overlapping itself, and one value inside another.
+        let r = redactor(&[("R", "aaaaaaaa"), ("IN", "xyz12345"), ("OUT", "--xyz12345--")]);
+        assert_eq!(r.redact("aaaaaaaaaaa."), "[redacted:R].");
+        assert_eq!(r.redact("(--xyz12345--)"), "([redacted:OUT][redacted:IN])");
+        assert!(!r.redact("aaaaaaaaaaaaaaaaaaaaaaaa").contains("aaaaaaaa"));
+    }
+
+    #[test]
+    fn multibyte_values_and_context_are_matched_on_bytes() {
+        let r = redactor(&[("K", "pässwörd✓")]);
+        let text = "ü→pässwörd✓←ü".as_bytes();
+        for size in 1..=text.len() {
+            assert_eq!(String::from_utf8(streamed(&r, text, size)).unwrap(), "ü→[redacted:K]←ü", "chunks of {size}");
+        }
+    }
+
+    #[test]
+    fn an_empty_redactor_changes_nothing() {
+        let r = Redactor::default();
+        assert!(r.is_empty());
+        assert_eq!(r.redact("anything at all"), "anything at all");
+        assert_eq!(format!("{:?}", redactor(&[("KEY", "value-never-shown")])), "Redactor { keys: [\"KEY\"] }");
+    }
+
+    #[test]
+    fn capture_redacts_both_streams_before_bounding_them() {
+        let r = redactor(&[("TOKEN", "sentinel-0123456789")]);
+        // The value straddles the start of the retained tail and arrives in separate writes.
+        let script = "printf 'sentinel-01'; sleep 0.05; printf '23456789'; head -c 5000 /dev/zero | tr '\\0' x; \
+                      printf 'sentinel-0123456789'; printf 'sentinel-0123456789' >&2";
+        let out = capture_redacted(Command::new("sh").args(["-c", script]), Duration::from_secs(5), 64, Some(&r)).unwrap();
+        assert!(out.stdout_truncated);
+        assert!(out.stdout.ends_with("[redacted:TOKEN]"), "{}", out.stdout);
+        assert_eq!(out.stderr, "[redacted:TOKEN]");
+        // Exactly at the tail boundary: the redacted marker, not a fragment of the value.
+        let script = "head -c 100 /dev/zero | tr '\\0' x; printf 'sentinel-0123456789'";
+        let out = capture_redacted(Command::new("sh").args(["-c", script]), Duration::from_secs(5), 19, Some(&r)).unwrap();
+        assert!(!out.stdout.contains("sentinel"), "{}", out.stdout);
+        assert!(out.stdout.ends_with("ted:TOKEN]"), "{}", out.stdout);
+    }
+
+    #[test]
+    fn a_timed_out_capture_still_redacts_what_was_held_back() {
+        let r = redactor(&[("TOKEN", "sentinel-0123456789")]);
+        let out = capture_redacted(Command::new("sh").args(["-c", "printf 'x sentinel-0123456789'; sleep 20"]), Duration::from_millis(300), 1024, Some(&r)).unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.stdout, "x [redacted:TOKEN]");
+        let out = capture_redacted(Command::new("sh").args(["-c", "printf 'x sentinel-01234'; sleep 20"]), Duration::from_millis(300), 1024, Some(&r)).unwrap();
+        assert_eq!(out.stdout, "x sentinel-01234", "a partial value is released at the end");
+    }
+
+    /// `text` streamed in pieces of `size` through `r` into a tail of `limit`, as a captured
+    /// stream is.
+    fn sanitized(r: &Redactor, text: &[u8], size: usize, limit: usize) -> String {
+        let mut sink = Sink::new(limit, Some(r));
+        for chunk in text.chunks(size.max(1)) {
+            sink.append(chunk);
+        }
+        sink.finish().text()
+    }
+
+    #[test]
+    fn a_marker_never_spells_out_the_value_it_replaces() {
+        // The marker word itself: no marker can be written without it, so nothing is released.
+        let r = redactor(&[("TOKEN", "redacted")]);
+        assert_eq!(r.conflicts(), ["TOKEN"]);
+        assert_eq!(r.redact("redacted"), "");
+        assert_eq!(r.redact("anything else"), "");
+        // A value equal to its key: the key is not shown.
+        let r = redactor(&[("SECRETKEY", "SECRETKEY")]);
+        assert!(r.conflicts().is_empty());
+        assert_eq!(r.redact("x SECRETKEY y"), "x [redacted] y");
+        // Values the labeled marker (or text around it) would spell out: the key is hidden.
+        for value in ["[redacted:K]x", "redacted:K", "d:K]tail", "x[redacted:K"] {
+            let r = redactor(&[("K", value)]);
+            assert!(r.conflicts().is_empty(), "{value}");
+            assert_eq!(r.redact(&format!("<{value}>")), "<[redacted]>", "{value}");
+        }
+        // Values any marker would spell out, with whatever the command writes around it.
+        for value in ["]-starts-with-a-close", "ends-with-an-open[", "ends-in-[reda", "redacted"] {
+            assert_eq!(redactor(&[("K", value)]).conflicts(), ["K"], "{value}");
+        }
+    }
+
+    #[test]
+    fn a_key_naming_another_value_is_not_shown() {
+        // OTHER's value is DEPLOY_KEY's name.
+        let r = redactor(&[("DEPLOY_KEY", "deploy-value-123"), ("OTHER", "DEPLOY_KEY")]);
+        assert!(r.conflicts().is_empty());
+        assert_eq!(r.redact("deploy-value-123 DEPLOY_KEY"), "[redacted] [redacted:OTHER]");
+        // A dependency fnox reports under a name that contains a granted value.
+        let r = redactor(&[("DEPLOY_KEY", "LEAKVALUE9"), ("DEP_LEAKVALUE9_X", "dependency-value-9")]);
+        assert_eq!(r.redact("LEAKVALUE9 dependency-value-9"), "[redacted:DEPLOY_KEY] [redacted]");
+        // Names that are not variable names are never echoed into output.
+        let long = "K".repeat(129);
+        for key in ["dep key", "lower_case", "NEW\nLINE", "Ä", "", long.as_str()] {
+            assert_eq!(redactor(&[(key, "some-long-value")]).redact("<some-long-value>"), "<[redacted]>", "{key:?}");
+        }
+        assert_eq!(redactor(&[(&"K".repeat(128), "some-long-value")]).redact("some-long-value"), format!("[redacted:{}]", "K".repeat(128)));
+    }
+
+    #[test]
+    fn replacing_one_value_never_writes_another_across_the_marker() {
+        // B's value would be read across A's labeled marker and the text after it.
+        let r = redactor(&[("A", "value-of-a-1"), ("B", "d:A]tail-xyz")]);
+        assert!(r.conflicts().is_empty());
+        for size in 1..=20 {
+            assert_eq!(String::from_utf8(streamed(&r, b"value-of-a-1tail-xyz", size)).unwrap(), "[redacted]tail-xyz", "chunks of {size}");
+        }
+        // Identical values under two keys, and overlapping ones whose markers are both hidden.
+        let r = redactor(&[("A", "same-value-1"), ("B", "same-value-1")]);
+        assert_eq!(r.redact("<same-value-1>"), "<[redacted:A][redacted:B]>");
+        let r = redactor(&[("dep a", "abcdefgh"), ("dep b", "efghijkl")]);
+        assert_eq!(r.redact("<abcdefghijkl>"), "<[redacted]>");
+        // The restriction is narrow: brackets, the word, and ellipses elsewhere are fine.
+        for value in ["notredacted123", "[redacted]", "a]b[c-long", "pass[word]x", "tail…ends…", "[]{}()<>"] {
+            assert!(redactor(&[("K", value)]).conflicts().is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_truncation_notice_and_lossy_decoding_never_spell_out_a_value() {
+        for value in ["truncated]…rest", "…[truncated]…x", "[truncated]", "…starts-with-an-ellipsis", "pass\u{FFFD}word"] {
+            assert_eq!(redactor(&[("K", value)]).conflicts(), ["K"], "{value}");
+        }
+        // What those values guard against: inserted text completing what the command wrote.
+        let r = redactor(&[("K", "value-long-enough")]);
+        assert_eq!(sanitized(&r, b"xxxxtruncated]\xe2\x80\xa6rest", 4, 17), "…[truncated]…truncated]…rest");
+        assert_eq!(sanitized(&r, b"pass\xffword", 3, 1024), "pass\u{FFFD}word");
+    }
+
+    #[test]
+    fn no_value_survives_any_split_or_bound() {
+        // Value sets around markers, keys, the notice and invalid bytes; inputs are random
+        // sequences of values, their pieces, and the text stack inserts.
+        let sets: &[&[(&str, &str)]] = &[
+            &[("A", "value-of-a-1"), ("B", "d:A]tail-xyz")],
+            &[("SECRETKEY", "SECRETKEY"), ("OTHER", "SECRETKEY-2")],
+            &[("DEPLOY_KEY", "deploy-value-123"), ("OTHER", "DEPLOY_KEY")],
+            &[("A", "same-value-1"), ("B", "same-value-1"), ("C", "value-1same")],
+            &[("R", "aaaaaaaa"), ("IN", "xyz12345"), ("OUT", "--xyz12345--")],
+            &[("dep a", "abcdefgh"), ("dep b", "efghijkl"), ("K", "hijk[]{}")],
+            &[("K", "pässwörd✓"), ("L", "mid…ellipsis…")],
+        ];
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let mut checked = 0;
+        for set in sets {
+            let r = redactor(set);
+            assert!(r.conflicts().is_empty(), "{set:?}");
+            let mut pieces: Vec<Vec<u8>> = vec![b"x".to_vec(), b"\xff".to_vec(), b"\xe2".to_vec(), TRUNCATED.into(), REDACTED.into(), b"]".to_vec(), b"[".to_vec()];
+            for (key, value) in *set {
+                let marker = format!("[redacted:{key}]");
+                for text in [value.as_bytes(), marker.as_bytes()] {
+                    pieces.push(text.to_vec());
+                    pieces.push(text[..text.len() / 2].to_vec());
+                    pieces.push(text[text.len() / 2..].to_vec());
+                }
+            }
+            for _ in 0..400 {
+                let input: Vec<u8> = (0..1 + next(6)).flat_map(|_| pieces[next(pieces.len())].clone()).collect();
+                for (size, limit) in [(1, 1 << 20), (3, 7), (5, 13), (64, 24), (2, 40), (input.len(), 1 << 20)] {
+                    let out = sanitized(&r, &input, size, limit);
+                    for (_, value) in *set {
+                        assert!(!out.contains(value), "{set:?} {:?} chunks of {size}, limit {limit}: {out:?}", String::from_utf8_lossy(&input));
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, sets.len() * 400 * 6);
+    }
+
+    #[test]
+    fn a_redactor_with_conflicts_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let r = redactor(&[("SAFE", "safe-value-1"), ("TOKEN", "redacted")]);
+        assert_eq!(r.conflicts(), ["TOKEN"]);
+        let e = capture_redacted(Command::new("touch").arg(&ran), Duration::from_secs(5), 1024, Some(&r)).err().unwrap();
+        assert!(!e.to_string().contains("safe-value-1") && !e.to_string().contains("redacted\""), "{e}");
+        assert!(!ran.exists(), "the command ran");
+    }
+
+    #[test]
+    fn the_bound_applies_to_the_sanitized_stream() {
+        let r = redactor(&[("A", "value-of-a-1"), ("B", "d:A]tail-xyz")]);
+        // Each value is shorter than its replacement: 1000 of them still fit the bound.
+        let script = "i=0; while [ $i -lt 1000 ]; do printf 'value-of-a-1tail-xyz'; printf 'value-of-a-1tail-xyz' >&2; i=$((i+1)); done";
+        let out = capture_redacted(Command::new("sh").args(["-c", script]), Duration::from_secs(10), 100, Some(&r)).unwrap();
+        assert!(out.stdout_truncated);
+        for stream in [&out.stdout, &out.stderr] {
+            assert_eq!(stream.len(), TRUNCATED.len() + 100, "{stream}");
+            assert!(stream.ends_with("[redacted]tail-xyz") && !stream.contains("d:A]tail-xyz") && !stream.contains("value-of-a-1"), "{stream}");
+        }
+        // Every cut of the tail, including inside a marker.
+        for limit in 1..=40 {
+            let out = capture_redacted(Command::new("sh").args(["-c", "printf 'xx value-of-a-1tail-xyz' | tee /dev/stderr"]), Duration::from_secs(5), limit, Some(&r)).unwrap();
+            for stream in [&out.stdout, &out.stderr] {
+                let body = stream.strip_prefix(TRUNCATED).unwrap_or(stream);
+                assert!(body.len() <= limit && !stream.contains("d:A]tail-xyz") && !stream.contains("value-of-a-1"), "{limit}: {stream}");
+            }
+        }
+        // A timed-out capture releases what it held back the same way.
+        let out = capture_redacted(Command::new("sh").args(["-c", "printf 'value-of-a-1tail-xyz'; sleep 20"]), Duration::from_millis(300), 1024, Some(&r)).unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.stdout, "[redacted]tail-xyz");
     }
 }

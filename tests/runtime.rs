@@ -9,6 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// mise as stack drives it: answers from files a test writes under `$REVIEW_FIXTURE`.
+const FAKE_MISE: &str = include_str!("fakes/mise.sh");
+
 struct Fixture {
     dir: TempDir,
 }
@@ -41,90 +44,7 @@ impl Fixture {
         )
         .unwrap();
         let mise = dir.path().join("bin/mise");
-        fs::write(
-            &mise,
-            r#"#!/bin/sh
-echo "$*" >>"$REVIEW_FIXTURE/mise.log"
-# Which file ran, however PATH named it: a relative entry is found from the working directory.
-case $0 in */*) self=${0%/*} ;; *) self=. ;; esac
-echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
-# A supervisor stand-in that runs until killed, started only when none runs. `$1` records who
-# started it: `mise x` in stack's own session, or a request client in its killable group.
-supervise() {
-  if test -f "$REVIEW_FIXTURE/supervisor-process" && ! kill -0 "$(cut -d' ' -f1 "$REVIEW_FIXTURE/supervisor-pid" 2>/dev/null)" 2>/dev/null; then
-    sleep 60 </dev/null >/dev/null 2>&1 &
-    echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
-  fi
-}
-case "$1 $2" in
-  'latest '*)
-    if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
-    v=${2#*@}; if test "$v" = "$2"; then v=1.0.0; fi
-    case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; esac
-    echo "$v" ;;
-  'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
-  'env --json')
-    if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
-    # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
-    if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
-      touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
-    fi
-    cat "$REVIEW_FIXTURE/env.json" ;;
-  'daemons --json')
-    if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
-      if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
-      touch "$REVIEW_FIXTURE/query-observed"
-    fi
-    if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
-    # A supervised listener (see `daemons start`) is reported with its real PID while alive.
-    if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
-    else
-      cat "$REVIEW_FIXTURE/daemons.json"
-    fi ;;
-  'daemons start')
-    supervise request
-    # A request client that would launch a service later, after the request gave up. Like a
-    # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
-    if test -f "$REVIEW_FIXTURE/late-client"; then
-      python3 -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
-    fi
-    if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
-    # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
-    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
-      echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
-      sleep 0.3
-    fi
-    if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
-      cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
-      touch "$REVIEW_FIXTURE/started"
-    fi
-    if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi ;;
-  'run --skip-deps')
-    # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
-    shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
-    if test "$task" = fail; then exit 3; fi ;;
-  'x --')
-    # The supervisor stack starts on its own: which mise it is told to run daemons with.
-    echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log"
-    # A start that hangs for `x-hang` seconds (its PID recorded to end it) or fails, as asked.
-    if test -f "$REVIEW_FIXTURE/x-hang"; then echo $$ >"$REVIEW_FIXTURE/x-hang-pid"; exec sleep "$(cat "$REVIEW_FIXTURE/x-hang")"; fi
-    if test -f "$REVIEW_FIXTURE/x-fail"; then echo 'cannot start the supervisor' >&2; exit 1; fi
-    supervise detached ;;
-  'daemons logs')
-    if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
-  'daemons stop')
-    if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
-    if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
-    # A stopped supervised listener is reported stopped, like a real daemon.
-    if test -f "$REVIEW_FIXTURE/listen-port"; then
-      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
-    fi ;;
-esac
-"#,
-        )
-        .unwrap();
+        fs::write(&mise, FAKE_MISE).unwrap();
         fs::set_permissions(mise, fs::Permissions::from_mode(0o755)).unwrap();
         // The supervisor as stack reaches it without a project: answers from files the test
         // controls, and "stops" a daemon by killing the PID it was told it tracks.
@@ -2796,6 +2716,45 @@ fn run_hands_a_declared_task_to_mise_without_its_daemon_startup() {
 }
 
 #[test]
+fn tasks_get_the_real_session_or_none_and_a_declared_stack_session_is_refused_first() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.showenv]\nrun='env'\n");
+    let show = "printf '%s' \"${STACK_SESSION-unset}\"";
+    let session_of = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("STACK_SESSION=").map(str::to_string))
+    };
+
+    // No session: neither exec nor a task receives one, and the task still runs.
+    assert_eq!(String::from_utf8_lossy(&fixture.ok(&["exec", "--", "sh", "-c", show]).stdout), "unset");
+    assert_eq!(session_of(&fixture.ok(&["run", "showenv"])), None);
+
+    // A session: both receive its id.
+    let up = json_result(&fixture.ok(&["--json", "up"]));
+    let id = up["data"]["session"]["id"].as_str().unwrap().to_string();
+    assert_eq!(String::from_utf8_lossy(&fixture.ok(&["exec", "--", "sh", "-c", show]).stdout), id);
+    assert_eq!(session_of(&fixture.ok(&["run", "showenv"])).as_deref(), Some(id.as_str()));
+    fixture.ok(&["down"]);
+
+    // Declaring it is refused before mise is asked for anything.
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        "[[use]]\nbundle='path:../bundle'\n[env]\nSTACK_SESSION='fixture'\n",
+    )
+    .unwrap();
+    let log = fixture.dir.path().join("mise.log");
+    let calls = fs::read_to_string(&log).unwrap();
+    for args in [&["--json", "run", "showenv"][..], &["--json", "exec", "--", "true"], &["--json", "compile"]] {
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let error = &json_result(&out)["error"];
+        assert_eq!(error["code"], "invalid_env", "{args:?}: {error}");
+        assert!(error["message"].as_str().unwrap().contains("env.STACK_SESSION (project)"), "{error}");
+    }
+    assert_eq!(fs::read_to_string(&log).unwrap(), calls, "mise is never run");
+}
+
+#[test]
 fn run_refuses_while_any_service_is_unverified() {
     // Even a task that names no services: `mise run` would hand it every service's endpoint
     // again, including the ones stack withholds.
@@ -3112,4 +3071,1248 @@ fn startup_timeouts_are_checked_before_any_lifecycle_work() {
     assert!(!log.contains("daemons"), "{log}");
     assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
     assert_eq!(fixture.index_files(), 0);
+}
+
+// ---- Rust build caching through Mr Boxington (route 2) ---------------------------------------
+
+const RUST_MBX: &str = "[bundle]\nname = 'rust-mbx'\n[tools]\nrust = { version = '1.93', mr_boxington = true }\nmbx = '1.22.0'\n[tasks.build]\nrun = 'cargo build'\n";
+
+#[test]
+fn resolution_sees_only_a_tools_configuration_in_a_scratch_root_of_its_own() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    let app = fixture.dir.path().join("app");
+    fs::write(app.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nSECRET = \"{{ exec(command='touch ran') }}\"\n").unwrap();
+    let _ = fs::remove_file(fixture.dir.path().join("latest.log"));
+    fixture.ok(&["compile", "--update"]);
+    let log = fs::read_to_string(fixture.dir.path().join("latest.log")).unwrap();
+    let cache = fs::canonicalize(fixture.dir.path().join("cache")).unwrap();
+    let dirs: Vec<&str> = log.lines().filter_map(|l| l.strip_prefix("dir=")).map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(dirs.len(), 2, "rust and mbx: {log}");
+    assert_ne!(dirs[0], dirs[1], "each resolution gets its own root: {log}");
+    for dir in &dirs {
+        assert!(Path::new(dir).starts_with(cache.join("resolve")), "{dir}");
+        assert!(!Path::new(dir).exists(), "scratch roots are removed: {dir}");
+        assert!(log.contains(&format!("dir={dir} trusted={dir} no_config=unset")) || {
+            // The trusted path may be spelled through a symlink (/var vs /private/var).
+            let line = log.lines().find(|l| l.starts_with(&format!("dir={dir} "))).unwrap();
+            let trusted = line.split("trusted=").nth(1).unwrap().split(' ').next().unwrap();
+            fs::canonicalize(Path::new(trusted).parent().unwrap()).unwrap() == Path::new(dir).parent().unwrap()
+        }, "{log}");
+    }
+    assert!(log.contains("[tools.rust]\nversion = \"1.93\"\nmr_boxington = true\n"), "{log}");
+    assert!(log.contains("[tools]\nmbx = \"1.22.0\"\n"), "{log}");
+    assert!(!log.contains("[env]") && !log.contains("exec("), "{log}");
+    assert!(!app.join("ran").exists());
+    let lock = fs::read_to_string(app.join("stack.lock")).unwrap();
+    assert!(lock.contains("resolved = \"1.93.1\"") && lock.contains("mr_boxington = true"), "{lock}");
+}
+
+#[test]
+fn install_and_up_refuse_a_mise_too_old_for_mr_boxington_before_installing() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    let log = fixture.dir.path().join("mise.log");
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.1 macos-arm64 (2026-09-01)\n").unwrap();
+    for args in [&["install", "--json"][..], &["up", "--json"]] {
+        let _ = fs::remove_file(&log);
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(err["error"]["code"], "provider_outdated", "{err}");
+        assert!(err["error"]["message"].as_str().unwrap().contains("older than 2026.9.2"), "{err}");
+        assert_eq!(err["error"]["details"][0]["actual"], "2026.9.1", "{err}");
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("install") && !calls.contains("trust"), "{args:?}: {calls}");
+    }
+    let version_log = fs::read_to_string(fixture.dir.path().join("version.log")).unwrap();
+    assert!(version_log.lines().all(|l| l == "no_config=1"), "{version_log}");
+
+    let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "mise_release").cloned();
+    assert_eq!(check.as_ref().unwrap()["ok"], false, "{doctor}");
+
+    // The release that introduced the option is enough; stderr's update notice is ignored.
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.2 macos-arm64 (2026-09-02)\n").unwrap();
+    let _ = fs::remove_file(&log);
+    fixture.ok(&["install", "--json"]);
+    assert!(fs::read_to_string(&log).unwrap().contains("install --yes --quiet"));
+    let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let checks = doctor["data"].as_array().or(doctor["error"]["details"].as_array()).unwrap().clone();
+    let check = checks.iter().find(|c| c["name"] == "mise_release").unwrap();
+    assert_eq!(check["ok"], true, "{doctor}");
+    assert!(check["detail"].as_str().unwrap().starts_with("mise 2026.9.2; needs 2026.9.2 (tools.rust (bundle:rust-mbx) sets mr_boxington)"), "{doctor}");
+}
+
+#[test]
+fn stacks_without_mr_boxington_never_ask_for_the_provider_release() {
+    let fixture = Fixture::new();
+    fs::write(fixture.dir.path().join("mise-version"), "2020.1.1\n").unwrap();
+    fixture.ok(&["install", "--json"]);
+    fixture.ok(&["up", "--json"]);
+    let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!doctor.to_string().contains("mise_release"), "{doctor}");
+    assert!(!fixture.dir.path().join("version.log").exists());
+}
+
+#[test]
+fn exec_finds_cargo_through_the_wrapper_mise_puts_first_and_run_passes_through() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    let wrappers = fixture.dir.path().join("command-wrappers/bin");
+    fs::create_dir_all(&wrappers).unwrap();
+    fs::write(wrappers.join("cargo"), "#!/bin/sh\necho \"wrapped cargo $*\"\n").unwrap();
+    fs::set_permissions(wrappers.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}:{}", wrappers.display(), fixture.dir.path().join("bin").display(), std::env::var("PATH").unwrap());
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
+    let out = fixture.ok(&["--json", "exec", "--", "cargo", "build"]);
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["data"]["stdout"], "wrapped cargo build\n", "{result}");
+    let out = fixture.ok(&["--json", "run", "build"]);
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["data"]["stdout"], "build|", "the task goes to `mise run` unchanged: {result}");
+    let rendered = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    let doc: toml::Table = toml::from_str(&rendered).unwrap();
+    assert_eq!(doc["tools"]["rust"]["version"].as_str(), Some("1.93.1"), "{rendered}");
+    assert_eq!(doc["tools"]["rust"]["mr_boxington"].as_bool(), Some(true), "{rendered}");
+}
+
+// ---- secret grants -----------------------------------------------------------------------
+
+const DEPLOY_VALUE: &str = "leak-sentinel-deploy-0001";
+/// Every value the fake fnox can print, on any stream; none may reach a result or a file.
+const SENTINELS: &[&str] = &[
+    DEPLOY_VALUE,
+    "leak-sentinel-sentry-0002",
+    "leak-sentinel-dependency-0003",
+    "leak-sentinel-stderr-0004",
+    "leak-sentinel-config-0005",
+    "leak-sentinel-garbage-0006",
+    "short77",
+];
+
+/// fnox as mise installs it: the executable in the release directory and a link to it in
+/// `.mise-bins`, which is what the stack's PATH names. Steps answer from files the test writes
+/// (`fnox-<step>-mode`, `fnox-<step>.json`); every run logs its arguments and prints a
+/// diagnostic quoting a secret on stderr, as fnox does for a malformed configuration.
+const FAKE_FNOX: &str = include_str!("fakes/fnox.sh");
+
+
+fn write_exe(path: &Path, script: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A project with fnox 1.39.0 in its tools, installed (as mise reports it) under
+/// `installs/fnox/1.39.0`, plus `extra` in stack.toml. The stack's PATH starts with the
+/// `.mise-bins` directory of `path_install` (the pinned release unless a test says otherwise).
+fn secrets_fixture(extra: &str) -> Fixture {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let install = root.join("installs/fnox/1.39.0");
+    write_exe(&install.join("fnox"), FAKE_FNOX);
+    fs::create_dir_all(install.join(".mise-bins")).unwrap();
+    std::os::unix::fs::symlink(install.join("fnox"), install.join(".mise-bins/fnox")).unwrap();
+    installed(&fixture, &[("1.39.0", true)]);
+    path_first(&fixture, &install.join(".mise-bins"));
+    fs::write(
+        root.join("app/stack.toml"),
+        format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n{extra}"),
+    )
+    .unwrap();
+    fixture.ok(&["compile"]);
+    fixture
+}
+
+/// What `mise ls --json fnox` reports: these releases, installed or not.
+fn installed(fixture: &Fixture, releases: &[(&str, bool)]) {
+    let root = fixture.dir.path();
+    let rows: Vec<Value> = releases
+        .iter()
+        .map(|(v, installed)| json!({ "version": v, "install_path": root.join("installs/fnox").join(v), "installed": installed, "active": true }))
+        .collect();
+    fs::write(root.join("ls.json"), Value::Array(rows).to_string()).unwrap();
+}
+
+/// The stack's PATH (as `mise env` reports it) with `dir` first.
+fn path_first(fixture: &Fixture, dir: &Path) {
+    let path = format!("{}:{}:{}", dir.display(), fixture.dir.path().join("bin").display(), std::env::var("PATH").unwrap());
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
+}
+
+fn assert_no_leak(text: &str, context: &str) {
+    for sentinel in SENTINELS {
+        assert!(!text.contains(sentinel), "{context}: {sentinel} leaked into {text}");
+    }
+}
+
+/// No sentinel in anything stack wrote: the project's `.stack/`, generated config, stack.lock,
+/// the machine state and the cache.
+fn assert_no_leak_on_disk(fixture: &Fixture) {
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                walk(&path, files);
+            } else if kind.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for dir in ["app", "state", "cache"] {
+        walk(&fixture.dir.path().join(dir), &mut files);
+    }
+    assert!(files.iter().any(|f| f.ends_with("stack.lock")), "{files:?}");
+    for file in files {
+        let text = String::from_utf8_lossy(&fs::read(&file).unwrap()).into_owned();
+        assert_no_leak(&text, &file.display().to_string());
+    }
+}
+
+/// `stack --json <args>`: the envelope, and both streams for leak checks.
+fn json_run(fixture: &Fixture, args: &[&str]) -> (Value, String, Output) {
+    let mut full = vec!["--json"];
+    full.extend_from_slice(args);
+    let out = fixture.command(&full).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{args:?}: {text}"));
+    (envelope, text, out)
+}
+
+fn fnox_log(fixture: &Fixture) -> Vec<String> {
+    fs::read_to_string(fixture.dir.path().join("fnox.log")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+#[test]
+fn a_grant_reaches_only_its_command_and_is_redacted_from_captured_output() {
+    let fixture = secrets_fixture("[services.db]\npreset = 'postgres'\nversion = '17'\n");
+    let script = r#"printf '%s\n' "$DEPLOY_KEY"; printf 'x%sy\n' "$DEPLOY_KEY" >&2; env | sort"#;
+    let mut command = fixture.command(&["--json", "exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", script]);
+    let out = command.env("HIDDEN", "inherited-hidden").env("DATABASE_URL", "postgresql://u@127.0.0.1:5432/db").output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert_no_leak(&text, "exec --json");
+    let data = &serde_json::from_slice::<Value>(&out.stdout).unwrap()["data"];
+    assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]));
+    let stdout = data["stdout"].as_str().unwrap();
+    assert!(stdout.starts_with("[redacted:DEPLOY_KEY]\n"), "{stdout}");
+    assert!(stdout.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n"), "{stdout}");
+    assert_eq!(data["stderr"], "x[redacted:DEPLOY_KEY]y\n");
+    // Unrequested keys and dependencies are dropped; fnox's removal applies where stack allows.
+    for absent in ["SENTRY_DSN=", "SHORT_KEY=", "DEP=", "HIDDEN="] {
+        assert!(!stdout.contains(&format!("\n{absent}")), "{absent} in {stdout}");
+    }
+    // Protected variables keep what stack decided (withheld, poisoned, set) and are reported.
+    assert!(stdout.contains(&format!("\nPGHOST={UNVERIFIED}\n")), "{stdout}");
+    assert!(stdout.contains(&format!("\nDATABASE_URL=postgresql://u@{UNVERIFIED}:5432/")), "{stdout}");
+    assert!(stdout.contains("\nPATH=") && stdout.contains("\nSTACK_PROJECT="), "{stdout}");
+    let warnings: Vec<&str> = data["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap()).collect();
+    for name in ["PGHOST", "DATABASE_URL", "PATH", "MISE_SHELL", "__MISE_DIFF", "STACK_PROJECT"] {
+        assert!(warnings.contains(&format!("fnox asked to remove {name}; kept").as_str()), "{name}: {warnings:?}");
+    }
+    // Describe first, then only the granted keys; never interactive; in the project.
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let log = fnox_log(&fixture);
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[0], format!("--non-interactive --no-daemon env --json --describe|1|{}", app.display()));
+    assert_eq!(log[1], format!("--non-interactive --no-daemon env --json --keys DEPLOY_KEY|1|{}", app.display()));
+    // The release was located in a scratch root that names fnox and nothing else, now gone.
+    let ls = fs::read_to_string(fixture.dir.path().join("fnox-ls.log")).unwrap();
+    assert!(ls.contains(&format!("dir={}", fixture.dir.path().join("cache/secrets").canonicalize().unwrap().display())), "{ls}");
+    let config: String = ls.lines().filter(|l| !l.starts_with("dir=") && !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+    assert_eq!(config.trim(), "[tools]\nfnox = \"1.39.0\"", "{ls}");
+    assert_eq!(fs::read_dir(fixture.dir.path().join("cache/secrets")).unwrap().count(), 0);
+
+    // A timed-out capture is redacted too, on the CLI and over MCP.
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--timeout", "1s", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"echo "$DEPLOY_KEY"; sleep 5"#]);
+    assert_eq!(out.status.code(), Some(124), "{text}");
+    assert_eq!(envelope["error"]["code"], "timed_out");
+    assert_eq!(envelope["error"]["details"][0]["stdout"], "[redacted:DEPLOY_KEY]\n");
+    assert_no_leak(&text, "exec --json timeout");
+
+    let results = fixture.mcp(
+        &[
+            ("stack_exec", json!({ "command": ["sh", "-c", script], "secrets": ["DEPLOY_KEY"] })),
+            ("stack_exec", json!({ "command": ["sh", "-c", r#"echo "$DEPLOY_KEY"; sleep 5"#], "secrets": ["DEPLOY_KEY"], "timeout_secs": 1 })),
+            ("stack_exec", json!({ "command": ["true"], "secrets": "DEPLOY_KEY" })),
+            ("stack_exec", json!({ "command": ["true"], "secrets": [7] })),
+            ("stack_exec", json!({ "command": ["true"], "secrets": ["PGHOST"] })),
+        ],
+        &[],
+    );
+    assert_no_leak(&results.iter().map(Value::to_string).collect::<String>(), "MCP");
+    let data = &results[0]["structuredContent"]["data"];
+    assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]), "{}", results[0]);
+    assert!(data["stdout"].as_str().unwrap().contains("DEPLOY_KEY=[redacted:DEPLOY_KEY]"));
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "timed_out");
+    assert_eq!(results[1]["structuredContent"]["error"]["details"][0]["stdout"], "[redacted:DEPLOY_KEY]\n");
+    assert_eq!(results[2]["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(results[3]["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(results[4]["structuredContent"]["error"]["code"], "invalid_secret");
+
+    // On the terminal the command owns its output: nothing is captured, so nothing is redacted.
+    let out = fixture.command(&["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf %s "$DEPLOY_KEY""#]).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), DEPLOY_VALUE);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("stack: fnox asked to remove PGHOST; kept"), "{stderr}");
+    assert_no_leak(&stderr, "terminal stderr");
+
+    // Inherited variables still pass through byte for byte alongside a grant.
+    use std::os::unix::ffi::OsStrExt;
+    let raw: &[u8] = b"raw\xff\xfebytes";
+    let out = fixture
+        .command(&["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", DUMP_RAW])
+        .env("UNRELATED_RAW", std::ffi::OsStr::from_bytes(raw))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(dumped(&fixture)["UNRELATED_RAW"], raw);
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn tasks_get_exactly_their_declared_secrets() {
+    let fixture = secrets_fixture("[tasks.showenv]\nrun = 'env'\nsecrets = ['DEPLOY_KEY']\n[tasks.plain]\nrun = 'true'\n");
+    let (envelope, text, out) = json_run(&fixture, &["run", "showenv"]);
+    assert!(out.status.success(), "{text}");
+    assert_no_leak(&text, "run --json");
+    let data = &envelope["data"];
+    assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]));
+    for stream in ["stdout", "stderr"] {
+        let s = data[stream].as_str().unwrap();
+        assert!(s.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n"), "{stream}: {s}");
+        assert!(!s.contains("SENTRY_DSN="), "{stream}: {s}");
+    }
+    assert_eq!(fnox_log(&fixture).len(), 2);
+    // A task without secrets runs as before: no fnox, no secrets fields.
+    let (envelope, _, out) = json_run(&fixture, &["run", "plain"]);
+    assert!(out.status.success());
+    assert!(envelope["data"].get("secrets").is_none(), "{envelope}");
+    assert_eq!(fnox_log(&fixture).len(), 2);
+
+    let results = fixture.mcp(
+        &[
+            ("stack_run", json!({ "task": "showenv" })),
+            ("stack_run", json!({ "task": "plain", "secrets": ["DEPLOY_KEY"] })),
+            ("stack_inspect", json!({})),
+        ],
+        &[],
+    );
+    assert_no_leak(&results.iter().map(Value::to_string).collect::<String>(), "MCP");
+    assert!(results[0]["structuredContent"]["data"]["stdout"].as_str().unwrap().contains("DEPLOY_KEY=[redacted:DEPLOY_KEY]"), "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(results[2]["structuredContent"]["data"]["stack"]["tasks"]["showenv"]["value"]["secrets"], json!(["DEPLOY_KEY"]));
+    let (inspect, text, _) = json_run(&fixture, &["inspect"]);
+    assert_eq!(inspect["data"]["stack"]["tasks"]["showenv"]["value"]["secrets"], json!(["DEPLOY_KEY"]));
+    assert_no_leak(&text, "inspect");
+    // The provider config never carries the grant: mise's own task `secrets` field is not used.
+    let rendered = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    assert!(!rendered.contains("secrets") && !rendered.contains("DEPLOY_KEY"), "{rendered}");
+    assert_no_leak_on_disk(&fixture);
+}
+
+/// A `stack run` (or MCP `stack_run`) started while another command holds the project lock.
+/// Killed if the test fails before it finishes.
+struct Queued(Option<std::process::Child>);
+
+impl Queued {
+    /// Start `command` while `lock` is held, and wait until it has had time to read the
+    /// project, still blocked on the lock.
+    fn start(mut command: Command, mcp_call: Option<Value>) -> Self {
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if let Some(call) = mcp_call {
+            use std::io::Write;
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})).unwrap();
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":call}})).unwrap();
+        }
+        drop(stdin);
+        thread::sleep(Duration::from_millis(750));
+        let mut queued = Self(Some(child));
+        assert!(queued.0.as_mut().unwrap().try_wait().unwrap().is_none(), "the run must wait for the held project lock");
+        queued
+    }
+
+    fn finish(mut self) -> Output {
+        let mut child = self.0.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the queued run did not finish once the lock was released");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Hold the project lock as another stack command would, queue `stack run <task>` (CLI) or
+/// `stack_run` (MCP) behind it, write `edited` as stack.toml while it waits, then release.
+/// Returns the run's result envelope.
+fn run_queued_behind_an_edit(fixture: &Fixture, task: &str, edited: &str, mcp: bool) -> Value {
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let held = stack::state::project_lock(&fixture.dir.path().join("state"), &app).unwrap();
+    let queued = if mcp {
+        Queued::start(fixture.command(&["mcp"]), Some(json!({ "dir": app, "task": task })))
+    } else {
+        Queued::start(fixture.command(&["--json", "run", task]), None)
+    };
+    fs::write(app.join("stack.toml"), edited).unwrap();
+    drop(held);
+    let out = queued.finish();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !mcp {
+        return serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{stdout} {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let response = stdout.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["id"] == 1).unwrap();
+    response["result"]["structuredContent"].clone()
+}
+
+#[test]
+fn a_task_edited_while_its_run_waits_for_the_lock_runs_with_its_new_definition_and_grant() {
+    let manifest = |body: &str, secret: &str| {
+        format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n[tasks.showenv]\nrun = '{body}'\nsecrets = ['{secret}']\n")
+    };
+    let (old, new) = (manifest("old-definition", "DEPLOY_KEY"), manifest("new-definition", "SENTRY_DSN"));
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app");
+    for mcp in [false, true] {
+        let context = if mcp { "MCP" } else { "CLI" };
+        fs::write(app.join("stack.toml"), &old).unwrap();
+        fixture.ok(&["compile"]);
+        let before = fnox_log(&fixture).len();
+        let envelope = run_queued_behind_an_edit(&fixture, "showenv", &new, mcp);
+        assert_no_leak(&envelope.to_string(), context);
+        let data = &envelope["data"];
+        assert_eq!(envelope["ok"], true, "{context}: {envelope}");
+        // The grant is the definition that ran, not the one read before the lock was free.
+        assert_eq!(data["secrets"], json!(["SENTRY_DSN"]), "{context}: {envelope}");
+        let stdout = data["stdout"].as_str().unwrap();
+        assert!(stdout.contains("\nSENTRY_DSN=[redacted:SENTRY_DSN]\n"), "{context}: {stdout}");
+        assert!(!stdout.contains("DEPLOY_KEY="), "{context}: the old grant reached the task: {stdout}");
+        let ran = fs::read_to_string(fixture.dir.path().join("run-config")).unwrap();
+        assert!(ran.contains("new-definition") && !ran.contains("old-definition"), "{context}: {ran}");
+        let log = fnox_log(&fixture);
+        assert_eq!(log.len(), before + 2, "{context}: {log:?}");
+        assert!(log[before + 1].contains("--keys SENTRY_DSN|"), "{context}: {log:?}");
+    }
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn a_task_deleted_or_ungranted_while_its_run_waits_is_refused_or_runs_without_secrets() {
+    let head = "[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n";
+    let granted = format!("{head}[tasks.showenv]\nrun = 'old-definition'\nsecrets = ['DEPLOY_KEY']\n[tasks.plain]\nrun = 'true'\n");
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app");
+    let generated = app.join(".config/mise/conf.d/stack.toml");
+    for mcp in [false, true] {
+        let context = if mcp { "MCP" } else { "CLI" };
+
+        // Deleted: refused as unknown, before the compile writes anything, fnox, or the task.
+        fs::write(app.join("stack.toml"), &granted).unwrap();
+        fixture.ok(&["compile"]);
+        let config = fs::read_to_string(&generated).unwrap();
+        let (fnox_before, mise_before) = (fnox_log(&fixture).len(), fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap());
+        let deleted = format!("{head}[tasks.plain]\nrun = 'renamed'\n");
+        let envelope = run_queued_behind_an_edit(&fixture, "showenv", &deleted, mcp);
+        assert_eq!(envelope["error"]["code"], "unknown_task", "{context}: {envelope}");
+        assert_eq!(envelope["error"]["hint"], "tasks: plain", "{context}");
+        assert_eq!(fs::read_to_string(&generated).unwrap(), config, "{context}: the refused run wrote the generated config");
+        assert_eq!(fnox_log(&fixture).len(), fnox_before, "{context}");
+        let mise_log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+        assert!(!mise_log[mise_before.len()..].contains("run --skip-deps"), "{context}: {mise_log}");
+
+        // Ungranted: runs its new definition with no secrets and no fnox call.
+        fs::write(app.join("stack.toml"), &granted).unwrap();
+        fixture.ok(&["compile"]);
+        let fnox_before = fnox_log(&fixture).len();
+        let ungranted = format!("{head}[tasks.showenv]\nrun = 'new-definition'\n");
+        let envelope = run_queued_behind_an_edit(&fixture, "showenv", &ungranted, mcp);
+        assert_eq!(envelope["ok"], true, "{context}: {envelope}");
+        assert!(envelope["data"].get("secrets").is_none(), "{context}: {envelope}");
+        assert!(!envelope["data"]["stdout"].as_str().unwrap().contains("DEPLOY_KEY="), "{context}: {envelope}");
+        assert!(fs::read_to_string(fixture.dir.path().join("run-config")).unwrap().contains("new-definition"), "{context}");
+        assert_eq!(fnox_log(&fixture).len(), fnox_before, "{context}: fnox ran for a task that declares no secrets");
+    }
+    assert_no_leak_on_disk(&fixture);
+}
+
+/// The copies of the provider configuration task runs hold (`<cache>/task-config/*`).
+fn task_configs(fixture: &Fixture) -> Vec<std::path::PathBuf> {
+    fs::read_dir(fixture.dir.path().join("cache/task-config"))
+        .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default()
+}
+
+/// Start `stack run <task>` (CLI) or `stack_run` (MCP) with the fake provider's gate held, and
+/// return once `mise run` is waiting at it: stack has planned the task and released the project
+/// lock, mise has not read its configuration. Then write `edited` as stack.toml and compile it
+/// as any other command would, check the copy the run holds, open the gate and return the run's
+/// result envelope.
+fn run_gated_across_a_compile(fixture: &Fixture, task: &str, edited: &str, mcp: bool) -> Value {
+    let root = fixture.dir.path();
+    let app = root.join("app").canonicalize().unwrap();
+    let (gate, waiting) = (root.join("run-gate"), root.join("run-waiting"));
+    let _ = fs::remove_file(&waiting);
+    fs::write(&gate, "").unwrap();
+    let mut command = if mcp { fixture.command(&["mcp"]) } else { fixture.command(&["--json", "run", task]) };
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    if mcp {
+        use std::io::Write;
+        writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})).unwrap();
+        writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":{"dir": app, "task": task}}})).unwrap();
+    }
+    drop(stdin);
+    let queued = Queued(Some(child));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !waiting.exists() {
+        assert!(Instant::now() < deadline, "mise run never reached the gate");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The copy the planned run holds: one private directory, the definition it was planned
+    // from, and nothing granted.
+    let copies = task_configs(fixture);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(fs::metadata(&copies[0]).unwrap().permissions().mode() & 0o777, 0o700);
+    let held = fs::read_to_string(copies[0].join(".config/mise/conf.d/stack.toml")).unwrap();
+    assert_eq!(held, fs::read_to_string(app.join(".config/mise/conf.d/stack.toml")).unwrap());
+    assert_no_leak(&held, "the task's configuration copy");
+    // The lock is free: an ordinary compile publishes the edit while the run waits.
+    fs::write(app.join("stack.toml"), edited).unwrap();
+    fixture.ok(&["compile"]);
+    assert_ne!(fs::read_to_string(app.join(".config/mise/conf.d/stack.toml")).unwrap(), held, "the compile must change the generated config");
+    fs::remove_file(&gate).unwrap();
+    let out = queued.finish();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !mcp {
+        return serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{stdout} {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let response = stdout.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["id"] == 1).unwrap();
+    response["result"]["structuredContent"].clone()
+}
+
+#[test]
+fn a_planned_task_runs_the_definition_and_grant_it_was_planned_with_whatever_is_compiled_before_mise_starts() {
+    let head = "[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n";
+    let manifest = |body: &str, secret: &str| format!("{head}[tasks.showenv]\nrun = '{body}'\nsecrets = ['{secret}']\n[tasks.other]\nrun = 'other'\n");
+    let (old, new) = (manifest("old-definition", "DEPLOY_KEY"), manifest("new-definition", "SENTRY_DSN"));
+    let deleted = format!("{head}[tasks.other]\nrun = 'other'\n");
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    for mcp in [false, true] {
+        for (edit, edited) in [("edited", &new), ("deleted", &deleted)] {
+            let context = format!("{} {edit}", if mcp { "MCP" } else { "CLI" });
+            fs::write(app.join("stack.toml"), &old).unwrap();
+            fixture.ok(&["compile"]);
+            let envelope = run_gated_across_a_compile(&fixture, "showenv", edited, mcp);
+            assert_no_leak(&envelope.to_string(), &context);
+            assert_eq!(envelope["ok"], true, "{context}: {envelope}");
+            let data = &envelope["data"];
+            // The body and the grant both come from the plan, not from the later compile.
+            let ran = fs::read_to_string(fixture.dir.path().join("run-config")).unwrap();
+            assert!(ran.contains("old-definition") && !ran.contains("new-definition"), "{context}: {ran}");
+            assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]), "{context}: {envelope}");
+            let stdout = data["stdout"].as_str().unwrap();
+            assert!(stdout.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n"), "{context}: {stdout}");
+            assert!(!stdout.contains("SENTRY_DSN="), "{context}: {stdout}");
+            // mise loaded the copy as its only configuration, rooted at the project, from it.
+            let run_log = fs::read_to_string(fixture.dir.path().join("run.log")).unwrap();
+            let last = run_log.lines().last().unwrap();
+            let copies = std::fs::canonicalize(fixture.dir.path().join("cache/task-config")).unwrap();
+            assert!(last.starts_with(&format!("config={}/", copies.display())), "{context}: {last}");
+            assert!(last.ends_with(&format!("/.config/mise/conf.d/stack.toml root={} dir={}", app.display(), app.display())), "{context}: {last}");
+            assert!(stdout.contains(&format!("\nMISE_GLOBAL_CONFIG_ROOT={}\n", app.display())), "{context}: {stdout}");
+            assert!(task_configs(&fixture).is_empty(), "{context}: the copy outlived its run");
+
+            // Planned after the compile: what it published.
+            let (envelope, text, _) = json_run(&fixture, &["run", "showenv"]);
+            assert_no_leak(&text, &context);
+            if edit == "edited" {
+                assert_eq!(envelope["data"]["secrets"], json!(["SENTRY_DSN"]), "{context}: {envelope}");
+                let stdout = envelope["data"]["stdout"].as_str().unwrap();
+                assert!(stdout.contains("\nSENTRY_DSN=[redacted:SENTRY_DSN]\n") && !stdout.contains("DEPLOY_KEY="), "{context}: {stdout}");
+                assert!(fs::read_to_string(fixture.dir.path().join("run-config")).unwrap().contains("new-definition"), "{context}");
+            } else {
+                assert_eq!(envelope["error"]["code"], "unknown_task", "{context}: {envelope}");
+            }
+        }
+    }
+    assert!(task_configs(&fixture).is_empty());
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn a_task_configuration_copy_is_removed_after_a_timeout_a_failed_plan_and_a_terminal_run() {
+    let fixture = secrets_fixture("[tasks.hang]\nrun = 'sleep'\n[tasks.showenv]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n");
+    // Timed out: the run's process group is killed, then the copy removed.
+    let (envelope, text, out) = json_run(&fixture, &["run", "--timeout", "1s", "hang"]);
+    assert_eq!(out.status.code(), Some(124), "{text}");
+    assert_eq!(envelope["error"]["code"], "timed_out", "{text}");
+    assert!(task_configs(&fixture).is_empty(), "CLI timeout");
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "hang", "timeout_secs": 1 }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "timed_out", "{}", results[0]);
+    assert!(task_configs(&fixture).is_empty(), "MCP timeout");
+    // Planning fails after the copy was made: fnox cannot answer for the grant.
+    fs::write(fixture.dir.path().join("fnox-keys-mode"), "exit").unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["run", "showenv"]);
+    assert_eq!(envelope["ok"], false, "{text}");
+    assert_no_leak(&text, "failed plan");
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "showenv" }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["ok"], false, "{}", results[0]);
+    // Only the two timed-out runs reached mise; the failed plans did not.
+    assert_eq!(fs::read_to_string(fixture.dir.path().join("run.log")).unwrap().lines().count(), 2);
+    assert!(task_configs(&fixture).is_empty(), "failed plan");
+    fs::remove_file(fixture.dir.path().join("fnox-keys-mode")).unwrap();
+    // On the terminal: the copy is removed once the task exits, with the link mise made to it
+    // and the one left by a run killed before it could clean up. Others are kept.
+    let state = fixture.dir.path().join("mise-state");
+    let tracked = state.join("tracked-configs");
+    fs::create_dir_all(&tracked).unwrap();
+    fs::write(fixture.dir.path().join("track-configs"), "").unwrap();
+    let copies = fixture.dir.path().join("cache/task-config").canonicalize().unwrap();
+    std::os::unix::fs::symlink(copies.join("999999999-killed/.config/mise/conf.d/stack.toml"), tracked.join("killed")).unwrap();
+    let project_config = fixture.dir.path().join("app/.config/mise/conf.d/stack.toml");
+    std::os::unix::fs::symlink(&project_config, tracked.join("project")).unwrap();
+    let out = fixture.command(&["run", "showenv"]).env("MISE_STATE_DIR", &state).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(task_configs(&fixture).is_empty(), "terminal run");
+    let run_log = fs::read_to_string(fixture.dir.path().join("run.log")).unwrap();
+    assert!(run_log.lines().last().unwrap().starts_with(&format!("config={}/", copies.display())), "{run_log}");
+    let left: Vec<_> = fs::read_dir(&tracked).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["project"], "mise's links to removed copies must go with them");
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn short_values_are_refused_when_captured_and_allowed_on_the_terminal() {
+    let fixture = secrets_fixture("");
+    let marker = fixture.dir.path().join("ran");
+    let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "SHORT_KEY", "--", "touch", marker.to_str().unwrap()]);
+    assert_eq!(envelope["error"]["code"], "secret_unsupported", "{text}");
+    assert_eq!(envelope["error"]["details"][0]["key"], "SHORT_KEY");
+    assert!(!marker.exists());
+    assert_no_leak(&text, "exec --json short");
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["true"], "secrets": ["SHORT_KEY"] }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "secret_unsupported");
+    let out = fixture.command(&["exec", "--secret", "SHORT_KEY", "--", "sh", "-c", r#"printf %s "$SHORT_KEY""#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "short77");
+    assert_no_leak_on_disk(&fixture);
+}
+
+/// fnox answers `--keys` with `set`, whatever keys were asked for.
+fn answer_keys(fixture: &Fixture, set: Value) {
+    let root = fixture.dir.path();
+    fs::write(root.join("fnox-keys-mode"), "file").unwrap();
+    fs::write(root.join("fnox-keys.json"), json!({ "schema": 1, "set": set, "files": {}, "remove": [], "missing": [], "leases": [] }).to_string()).unwrap();
+}
+
+/// No `values` in either captured stream of `data`, for every way of returning a result.
+fn assert_streams_clean(data: &Value, values: &[&str], context: &str) {
+    for stream in ["stdout", "stderr"] {
+        let text = data[stream].as_str().unwrap_or_else(|| panic!("{context}: no {stream} in {data}"));
+        for value in values {
+            assert!(!text.contains(value), "{context}: {value} in {stream}: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_redaction_marker_never_reproduces_a_granted_value() {
+    let fixture = secrets_fixture("");
+    let marker = fixture.dir.path().join("ran");
+
+    // The marker word: refused before the command runs, on the CLI and over MCP.
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": "redacted" }));
+    let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "touch", marker.to_str().unwrap()]);
+    assert_eq!(envelope["error"]["code"], "secret_unsupported", "{text}");
+    assert_eq!(envelope["error"]["details"][0]["key"], "DEPLOY_KEY");
+    assert!(!marker.exists(), "the command ran");
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["touch", marker.to_str().unwrap()], "secrets": ["DEPLOY_KEY"] }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "secret_unsupported", "{}", results[0]);
+    assert!(!marker.exists(), "the command ran");
+    // The terminal captures nothing, so the value is granted there.
+    let out = fixture.command(&["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf %s "$DEPLOY_KEY""#]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "redacted");
+
+    // SENTRY_DSN's value is what DEPLOY_KEY's labeled marker and the text after it would spell,
+    // and DEPLOY_KEY's value is its own name: neither key is shown, and neither value appears.
+    let tail = "d:DEPLOY_KEY]-tail-0007";
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": DEPLOY_VALUE, "SENTRY_DSN": tail }));
+    let script = r#"printf '%s-tail-0007\n' "$DEPLOY_KEY"; printf '%s-tail-0007\n' "$DEPLOY_KEY" >&2; printf '%s\n' "$SENTRY_DSN""#;
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--secret", "SENTRY_DSN", "--", "sh", "-c", script]);
+    assert!(out.status.success(), "{text}");
+    assert_streams_clean(&envelope["data"], &[DEPLOY_VALUE, tail], "exec --json");
+    assert_eq!(envelope["data"]["stdout"], "[redacted]-tail-0007\n[redacted:SENTRY_DSN]\n");
+    assert_eq!(envelope["data"]["stderr"], "[redacted]-tail-0007\n");
+    assert_no_leak(&text, "exec --json");
+    let results = fixture.mcp(
+        &[
+            ("stack_exec", json!({ "command": ["sh", "-c", script], "secrets": ["DEPLOY_KEY", "SENTRY_DSN"] })),
+            ("stack_exec", json!({ "command": ["sh", "-c", format!("{script}; sleep 5")], "secrets": ["DEPLOY_KEY", "SENTRY_DSN"], "timeout_secs": 1 })),
+        ],
+        &[],
+    );
+    assert_streams_clean(&results[0]["structuredContent"]["data"], &[DEPLOY_VALUE, tail], "MCP");
+    assert_eq!(results[1]["structuredContent"]["error"]["code"], "timed_out", "{}", results[1]);
+    assert_streams_clean(&results[1]["structuredContent"]["error"]["details"][0], &[DEPLOY_VALUE, tail], "MCP timeout");
+
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": "DEPLOY_KEY" }));
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf '%s\n' "$DEPLOY_KEY" | tee /dev/stderr"#]);
+    assert!(out.status.success(), "{text}");
+    assert_eq!((envelope["data"]["stdout"].as_str(), envelope["data"]["stderr"].as_str()), (Some("[redacted]\n"), Some("[redacted]\n")));
+
+    // A dependency named after a granted value is replaced without its name.
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": "LEAKSENTINEL0008", "DEP_LEAKSENTINEL0008": "leak-sentinel-dependency-0003" }));
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "sh", "-c", r#"printf '%s leak-sentinel-dependency-0003\n' "$DEPLOY_KEY""#]);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(envelope["data"]["stdout"], "[redacted:DEPLOY_KEY] [redacted]\n");
+    assert_streams_clean(&envelope["data"], &["LEAKSENTINEL0008", "leak-sentinel-dependency-0003"], "dependency");
+
+    // The 64 KiB bound applies to the replaced stream: markers longer than the value they
+    // replace do not let it grow, and a cut through a marker spells nothing.
+    answer_keys(&fixture, json!({ "DEPLOY_KEY": DEPLOY_VALUE, "SENTRY_DSN": tail }));
+    let script = r#"i=0; while [ $i -lt 4000 ]; do printf '%s-tail-0007' "$DEPLOY_KEY"; i=$((i+1)); done"#;
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--secret", "SENTRY_DSN", "--", "sh", "-c", script]);
+    assert!(out.status.success(), "{text}");
+    let stdout = envelope["data"]["stdout"].as_str().unwrap();
+    let body = stdout.strip_prefix("…[truncated]…").unwrap_or_else(|| panic!("not truncated: {} bytes", stdout.len()));
+    assert_eq!(body.len(), 64 * 1024);
+    assert!(body.ends_with("[redacted]-tail-0007"), "{}", &body[body.len() - 40..]);
+    assert_streams_clean(&envelope["data"], &[DEPLOY_VALUE, tail], "bounded");
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn fnox_failures_map_to_codes_and_nothing_fnox_printed_is_forwarded() {
+    let fixture = secrets_fixture("");
+    let root = fixture.dir.path().to_path_buf();
+    let marker = root.join("ran");
+    let describe = |keys: &str, leases: &str| {
+        format!(r#"{{"schema":1,"fnox_version":"1.39.0","keys":[{keys}],"dynamic_leases":[{leases}]}}"#)
+    };
+    let ok_key = r#"{"key":"DEPLOY_KEY","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}}"#;
+    // (step, mode, answer file, expected code, detail field=value, fnox runs)
+    type Case<'a> = (&'a str, &'a str, Option<String>, &'a str, &'a str, usize);
+    let cases: Vec<Case> = vec![
+        ("describe", "garbage", None, "secret_unavailable", "kind=protocol", 1),
+        ("describe", "config", None, "secret_unavailable", "kind=config", 1),
+        ("describe", "oversized", None, "secret_unavailable", "kind=oversized", 1),
+        ("describe", "exit", None, "secret_unavailable", "kind=protocol", 1),
+        ("describe", "file", Some(describe(&ok_key.replace(r#""as_file":false"#, r#""as_file":true"#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe(&ok_key.replace(r#""kind":"secret""#, r#""kind":"lease","lease":"aws""#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe(&ok_key.replace(r#""exec":true"#, r#""exec":false"#), "")), "secret_unsupported", "key=DEPLOY_KEY", 1),
+        ("describe", "file", Some(describe("", "")), "secret_missing", "reason=unknown", 1),
+        ("keys", "garbage", None, "secret_unavailable", "kind=protocol", 2),
+        ("keys", "config", None, "secret_unavailable", "kind=config", 2),
+        ("keys", "oversized", None, "secret_unavailable", "kind=oversized", 2),
+        ("keys", "exit", None, "secret_unavailable", "kind=protocol", 2),
+        ("keys", "file", Some(r#"{"schema":1,"error":{"kind":"invalid_keys","message":"leak-sentinel-config-0005","unknown":["DEPLOY_KEY"]}}"#.into()), "secret_missing", "reason=unknown", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{},"files":{},"remove":[],"missing":["DEPLOY_KEY"],"leases":[]}"#.into()), "secret_missing", "reason=unresolved", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{"DEPLOY_KEY":"leak-sentinel-deploy-0001","PGHOST":"leak-sentinel-garbage-0006"},"files":{},"remove":[],"missing":[],"leases":[]}"#.into()), "invalid_secret", "operation=set", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{"DEPLOY_KEY":"leak-sentinel-deploy-0001"},"files":{"DEPLOY_KEY":"/x"},"remove":[],"missing":[],"leases":[]}"#.into()), "secret_unsupported", "key=DEPLOY_KEY", 2),
+        ("keys", "file", Some(r#"{"schema":1,"set":{"DEPLOY_KEY":["leak-sentinel-deploy-0001"]}}"#.into()), "secret_unavailable", "kind=protocol", 2),
+    ];
+    for (step, mode, body, code, detail, runs) in cases {
+        for f in ["fnox.log", "fnox-describe-mode", "fnox-keys-mode", "fnox-describe.json", "fnox-keys.json"] {
+            let _ = fs::remove_file(root.join(f));
+        }
+        fs::write(root.join(format!("fnox-{step}-mode")), mode).unwrap();
+        if let Some(body) = &body {
+            fs::write(root.join(format!("fnox-{step}.json")), body).unwrap();
+            fs::write(root.join(format!("fnox-{step}-exit")), if body.contains("\"error\"") { "1" } else { "0" }).unwrap();
+        }
+        let context = format!("{step} {mode} {}", body.as_deref().unwrap_or(""));
+        let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "touch", marker.to_str().unwrap()]);
+        assert!(!out.status.success(), "{context}: {text}");
+        assert_eq!(envelope["error"]["code"], code, "{context}: {text}");
+        let (field, value) = detail.split_once('=').unwrap();
+        assert_eq!(envelope["error"]["details"][0][field], value, "{context}: {text}");
+        assert_no_leak(&text, &context);
+        assert!(!marker.exists(), "{context}: the command ran");
+        assert_eq!(fnox_log(&fixture).len(), runs, "{context}");
+        // People see the same error on stderr, equally clean.
+        let out = fixture.command(&["exec", "--secret", "DEPLOY_KEY", "--", "touch", marker.to_str().unwrap()]).output().unwrap();
+        let human = String::from_utf8_lossy(&out.stderr);
+        assert!(human.contains(&format!("error[{code}]")), "{context}: {human}");
+        assert_no_leak(&human, &context);
+    }
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn only_the_fnox_release_stack_lock_pins_is_run() {
+    let fixture = secrets_fixture("");
+    let root = fixture.dir.path().to_path_buf();
+    let impostor = format!("#!/bin/sh\ntouch \"$REVIEW_FIXTURE/impostor-ran\"\n{}", FAKE_FNOX.trim_start_matches("#!/bin/sh\n"));
+    let refused = |context: &str, kind: &str| {
+        let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "secret_unavailable", "{context}: {text}");
+        assert_eq!(envelope["error"]["details"][0]["kind"], kind, "{context}: {text}");
+        assert!(!root.join("impostor-ran").exists(), "{context}: the impostor ran");
+        assert!(fnox_log(&fixture).is_empty(), "{context}");
+        assert_no_leak(&text, context);
+    };
+    // Another release's directory first on PATH.
+    write_exe(&root.join("installs/fnox/1.38.0/.mise-bins/fnox"), &impostor);
+    path_first(&fixture, &root.join("installs/fnox/1.38.0/.mise-bins"));
+    refused("other release", "not_pinned");
+    // Another executable beside the pinned directory.
+    write_exe(&root.join("installs/fnox/evil/fnox"), &impostor);
+    path_first(&fixture, &root.join("installs/fnox/evil"));
+    refused("sibling directory", "not_pinned");
+    // A link inside the pinned directory to a file outside it.
+    let pinned_bins = root.join("installs/fnox/1.39.0/.mise-bins");
+    write_exe(&root.join("elsewhere/fnox"), &impostor);
+    fs::remove_file(pinned_bins.join("fnox")).unwrap();
+    std::os::unix::fs::symlink(root.join("elsewhere/fnox"), pinned_bins.join("fnox")).unwrap();
+    path_first(&fixture, &pinned_bins);
+    refused("link out of the pinned directory", "not_pinned");
+    fs::remove_file(pinned_bins.join("fnox")).unwrap();
+    std::os::unix::fs::symlink(root.join("installs/fnox/1.39.0/fnox"), pinned_bins.join("fnox")).unwrap();
+    // The pinned release is not installed, or not on PATH at all.
+    installed(&fixture, &[("1.39.0", false), ("1.38.0", true)]);
+    refused("not installed", "not_installed");
+    installed(&fixture, &[("1.38.0", true)]);
+    refused("only another release installed", "not_installed");
+    installed(&fixture, &[("1.39.0", true)]);
+    path_first(&fixture, &root.join("nowhere"));
+    refused("not on PATH", "not_on_path");
+    // Restored, it runs.
+    path_first(&fixture, &pinned_bins);
+    let (envelope, text, out) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(envelope["data"]["secrets"], json!(["DEPLOY_KEY"]));
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn secret_declarations_are_checked_when_the_stack_compiles() {
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app");
+    let compile = |stack: &str, bundle: &str| {
+        fs::write(fixture.dir.path().join("bundle/bundle.toml"), format!("[bundle]\nname='test'\n{bundle}")).unwrap();
+        fs::write(app.join("stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n{stack}")).unwrap();
+        json_run(&fixture, &["compile"]).0
+    };
+    let fnox = "[tools]\nfnox = \"1.39.0\"\n";
+    // A bundle may declare names; the project provides fnox.
+    let ok = compile(fnox, "[tasks.deploy]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n");
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert_eq!(ok["data"]["stack"]["tasks"]["deploy"]["value"]["secrets"], json!(["DEPLOY_KEY"]));
+    for (stack, bundle, key) in [
+        (format!("{fnox}[services.db]\npreset='postgres'\nversion='17'\n[tasks.t]\nrun='x'\nsecrets=['DATABASE_URL']\n"), "", "DATABASE_URL"),
+        (format!("{fnox}[services.api]\nrun='x'\n[tasks.t]\nrun='x'\nsecrets=['API_PORT']\n"), "", "API_PORT"),
+        (format!("{fnox}[tasks.t]\nrun='x'\nsecrets=['lower']\n"), "", "lower"),
+        (format!("{fnox}[env]\nAPP_KEY='1'\n[tasks.t]\nrun='x'\nsecrets=['APP_KEY']\n"), "", "APP_KEY"),
+        (format!("{fnox}[tasks.t]\nrun='x'\nsecrets=['MISE_ENV']\n"), "", "MISE_ENV"),
+        (format!("{fnox}[override.tasks.t]\nrun='x'\nsecrets=['STACK_SESSION']\n"), "[tasks.t]\nrun='y'\n", "STACK_SESSION"),
+        ("[tasks.t]\nrun='x'\nsecrets=['DEPLOY_KEY']\n".to_string(), "", "DEPLOY_KEY"),
+        ("[tools]\nfnox='system'\n[tasks.t]\nrun='x'\nsecrets=['DEPLOY_KEY']\n".to_string(), "", "DEPLOY_KEY"),
+        (fnox.to_string(), "[tasks.t]\nrun='x'\nsecrets=['DEPLOY_KEY', 'DEPLOY_KEY']\n", "DEPLOY_KEY"),
+    ] {
+        let failed = compile(&stack, bundle);
+        assert_eq!(failed["error"]["code"], "invalid_secret", "{stack}{bundle}: {failed}");
+        assert_eq!(failed["error"]["details"][0]["key"], key, "{stack}{bundle}: {failed}");
+        assert_eq!(failed["error"]["details"][0]["operation"], "declare");
+    }
+    // Two layers that disagree on a task's secrets conflict, as on any other field.
+    let conflict = compile(&format!("{fnox}[tasks.t]\nrun='x'\nsecrets=['A_KEY']\n"), "[tasks.t]\nrun='x'\nsecrets=['B_KEY']\n");
+    assert_eq!(conflict["error"]["code"], "conflict", "{conflict}");
+    // A command's grant is checked before any provider call answers it.
+    compile(fnox, "");
+    for key in ["PATH", "bad", "STACK_PROJECT"] {
+        let (envelope, _, _) = json_run(&fixture, &["exec", "--secret", key, "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "invalid_secret", "{key}: {envelope}");
+    }
+    assert!(!fixture.dir.path().join("fnox-ls.log").exists());
+    assert!(fnox_log(&fixture).is_empty());
+}
+
+#[test]
+fn doctor_reports_fnox_from_its_value_free_description_only() {
+    let fixture = secrets_fixture("[tasks.deploy]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n");
+    let fnox_check = |envelope: &Value| -> Value {
+        let checks = if envelope["ok"] == true { &envelope["data"] } else { &envelope["error"]["details"] };
+        checks.as_array().unwrap().iter().find(|c| c["name"] == "fnox").cloned().unwrap_or_else(|| panic!("{envelope}"))
+    };
+    let (envelope, text, _) = json_run(&fixture, &["doctor"]);
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], true, "{text}");
+    assert!(check["detail"].as_str().unwrap().contains("fnox 1.39.0 at "), "{check}");
+    assert_no_leak(&text, "doctor");
+    let log = fnox_log(&fixture);
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].starts_with("--non-interactive --no-daemon env --json --describe|1|"), "{log:?}");
+
+    fs::write(fixture.dir.path().join("fnox-describe-mode"), "config").unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["doctor"]);
+    assert_eq!(envelope["error"]["code"], "doctor_failed", "{text}");
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], false);
+    assert!(check["detail"].as_str().unwrap().contains("config error"), "{check}");
+    assert_no_leak(&text, "doctor with a malformed fnox config");
+
+    fs::write(fixture.dir.path().join("fnox-describe-mode"), "file").unwrap();
+    fs::write(fixture.dir.path().join("fnox-describe.json"), r#"{"schema":1,"keys":[],"dynamic_leases":[]}"#).unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["doctor"]);
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], false, "{text}");
+    assert!(check["detail"].as_str().unwrap().contains("does not know DEPLOY_KEY"), "{check}");
+
+    installed(&fixture, &[("1.39.0", false)]);
+    let (envelope, _, _) = json_run(&fixture, &["doctor"]);
+    let check = fnox_check(&envelope);
+    assert_eq!(check["ok"], true);
+    assert!(check["detail"].as_str().unwrap().contains("not installed"), "{check}");
+    assert!(fnox_log(&fixture).iter().all(|l| !l.contains("--keys")), "doctor resolved a value");
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn templated_fnox_pins_never_reach_the_release_query() {
+    let fixture = secrets_fixture("");
+    let root = fixture.dir.path().to_path_buf();
+    let marker = root.join("template-ran");
+    let template = format!("{{{{ exec(command='touch {}') }}}}", marker.display());
+    // A stack.lock whose fnox pin was edited to a template is refused before any provider call.
+    let lock_path = root.join("app/stack.lock");
+    let lock = fs::read_to_string(&lock_path).unwrap();
+    assert!(lock.contains("resolved = \"1.39.0\""), "{lock}");
+    fs::write(&lock_path, lock.replace("resolved = \"1.39.0\"", &format!("resolved = {:?}", template))).unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+    assert_eq!(envelope["error"]["code"], "lock_invalid", "{text}");
+    fs::write(&lock_path, &lock).unwrap();
+    // An option carrying a template is refused: `invalid_tool` at compile once tool options are
+    // checked for templates, and in any case never written into the fnox release query.
+    fs::write(
+        root.join("app/stack.toml"),
+        format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = {{ version = \"1.39.0\", identity = {:?} }}\n", template),
+    )
+    .unwrap();
+    let (compiled, text, _) = json_run(&fixture, &["compile"]);
+    if compiled["ok"] == true {
+        let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "secret_unavailable", "{text}");
+        assert_eq!(envelope["error"]["details"][0]["kind"], "templated", "{text}");
+    } else {
+        assert_eq!(compiled["error"]["code"], "invalid_tool", "{text}");
+    }
+    assert!(!fs::read_to_string(root.join("ls.log")).unwrap_or_default().contains("exec("), "a template reached `mise ls`");
+    assert!(fnox_log(&fixture).is_empty());
+    assert!(!marker.exists());
+}
+
+// ---- artifact locking ----------------------------------------------------------------------
+
+const TOOLS_BUNDLE: &str = "[bundle]\nname='test'\n[tools]\njq='1.7.1'\nrust='1.93.1'\n'npm:prettier'='3.6.2'\nuv='0.9.0'\n[env]\nHOOK=\"{{ exec(command='touch hook-ran') }}\"\n";
+
+/// A lock `mise lock` hands back: jq checked on this platform, rust exempt, prettier with a
+/// sidecar reference, uv not lockable.
+fn tool_lock(platform: &str) -> String {
+    format!(
+        r#"lockfile_version = 3
+[[tools.jq]]
+version = "1.7.1"
+backend = "aqua:jqlang/jq"
+specifiers = ["1.7.1"]
+[tools.jq."platforms.{platform}"]
+checksum = "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a"
+url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64"
+[[tools.rust]]
+version = "1.93.1"
+backend = "core:rust"
+specifiers = ["1.93.1"]
+[[tools."npm:prettier"]]
+version = "3.6.2"
+aube = {{ path = "locks/npm-prettier/3.6.2", digest = "sha256:0b89" }}
+backend = "npm:prettier"
+specifiers = ["3.6.2"]
+"#
+    )
+}
+
+/// The project locked for this platform only, with `extra` appended to stack.toml.
+fn artifact_fixture(extra: &str) -> (Fixture, String) {
+    let fixture = Fixture::with_bundle(TOOLS_BUNDLE);
+    let platform = stack::artifacts::current_platform();
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(&platform)).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\n{extra}")).unwrap();
+    fixture.ok(&["compile"]);
+    (fixture, platform)
+}
+
+fn mise_log(fixture: &Fixture) -> String {
+    fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap_or_default()
+}
+
+#[test]
+fn compile_locks_in_a_tools_only_scratch_root_and_install_partitions_by_coverage() {
+    let (fixture, platform) = artifact_fixture("");
+    let lock_log = fs::read_to_string(fixture.dir.path().join("lock.log")).unwrap();
+    assert!(lock_log.contains(&format!("args=lock --platform {platform} ")), "{lock_log}");
+    let last = lock_log.rsplit("dir=").next().unwrap();
+    assert!(last.contains("[tools]") && !last.contains("[env]") && !last.contains("HOOK"), "{last}");
+    assert!(!last.contains("/app"), "never in the project: {last}");
+    assert!(!fixture.dir.path().join("app/hook-ran").exists());
+    let stack_lock = fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap();
+    assert!(stack_lock.contains("version = 3") && stack_lock.contains("[provider_lock]") && !stack_lock.contains("aube"), "{stack_lock}");
+
+    let before = mise_log(&fixture).len();
+    let result = json_result(&fixture.ok(&["install", "--json"]));
+    let calls: Vec<String> = mise_log(&fixture)[before..].lines().filter(|l| l.starts_with("install")).map(|l| l.trim().to_string()).collect();
+    assert_eq!(calls, ["install --locked --yes --quiet jq rust", "install --yes --quiet npm:prettier uv"], "{result}");
+    let detail = &result["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "install").unwrap()["detail"];
+    assert_eq!(detail["locked"], json!(["jq", "rust"]));
+    assert_eq!(detail["plain"], json!(["npm:prettier", "uv"]));
+    assert_eq!(detail["artifacts"]["platform"], platform.as_str());
+    assert_eq!(detail["artifacts"]["verified"], json!(["jq@1.7.1"]));
+    assert_eq!(detail["artifacts"]["exempt"], json!(["rust@1.93.1"]));
+    assert_eq!(detail["artifacts"]["unsupported"], json!(["npm:prettier@3.6.2"]));
+    assert_eq!(detail["artifacts"]["missing"], json!(["uv@0.9.0"]));
+    assert!(detail["boundary"].as_str().unwrap().contains("already installed"));
+    // The lock mise checked against was rendered from stack.lock before the install.
+    let rendered = fs::read_to_string(fixture.dir.path().join("rendered-at-install")).unwrap();
+    assert!(rendered.contains("sha256:0bbe619e") && !rendered.contains("aube") && !rendered.contains("provider ="), "{rendered}");
+
+    // status reports this platform's coverage; exec neither installs nor renders.
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["artifacts"]["verified"], json!(["jq@1.7.1"]), "{status}");
+    fs::remove_file(fixture.dir.path().join("app/.config/mise/mise.lock")).unwrap();
+    let before = mise_log(&fixture).len();
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.command(&["status", "--json"]).output().unwrap();
+    assert!(!fixture.dir.path().join("app/.config/mise/mise.lock").exists());
+    assert!(!mise_log(&fixture)[before..].contains("install") && !mise_log(&fixture)[before..].contains("lock --platform"));
+    // A second ordinary compile with nothing new to lock asks mise for nothing.
+    fs::remove_file(fixture.dir.path().join("lock.log")).unwrap();
+    let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
+    let jq = inspect["data"]["versions"].as_array().unwrap().iter().find(|v| v["name"] == "jq").unwrap().clone();
+    assert_eq!(jq["backend"], "aqua:jqlang/jq");
+    assert_eq!(jq["artifacts"][platform.as_str()]["state"], "verified", "{jq}");
+}
+
+#[test]
+fn refused_downloads_and_signers_are_artifact_mismatch_and_other_failures_install_failed() {
+    let (fixture, platform) = artifact_fixture("");
+    let checksum = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/x/jq-macos-arm64:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:1111\n");
+    fs::write(fixture.dir.path().join("install-locked-fail"), &checksum).unwrap();
+    let before = mise_log(&fixture).len();
+    let out = fixture.command(&["install", "--json"]).output().unwrap();
+    let e = &json_result(&out)["error"];
+    assert_eq!(e["code"], "artifact_mismatch", "{e}");
+    assert_eq!(e["details"][0], json!({ "kind": "checksum", "name": "jq@1.7.1", "platform": platform, "expected": "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a", "actual": "sha256:1111", "url": "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64" }));
+    assert!(e["hint"].as_str().unwrap().contains("compile --update"));
+    assert!(!mise_log(&fixture)[before..].contains("install --yes"), "nothing else is installed after a refusal");
+
+    fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says sigstore-oidc:a signed fnox@1.39.0, but this release is signed by sigstore-oidc:b; remove the entry from mise.lock to accept the new signer\n").unwrap();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!((e["code"].as_str(), e["details"][0]["kind"].as_str(), e["details"][0]["expected"].as_str()), (Some("artifact_mismatch"), Some("signer"), Some("sigstore-oidc:a")));
+
+    fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR network unreachable\n").unwrap();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "install_failed");
+}
+
+#[test]
+fn version_2_locks_install_plainly_and_required_policies_refuse_before_any_install() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    // The lock the fixture compiled, turned into version 2.
+    let v3 = fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap();
+    let v2 = v3.replace("version = 3", "version = 2");
+    let v2 = v2.split("[provider_lock]").next().unwrap().to_string();
+    fs::write(fixture.dir.path().join("app/stack.lock"), &v2).unwrap();
+    let before = mise_log(&fixture).len();
+    let result = json_result(&fixture.ok(&["install", "--json"]));
+    let log = &mise_log(&fixture)[before..];
+    assert!(log.contains("install --yes --quiet jq") && !log.contains("--locked"), "{log}");
+    let detail = &result["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "install").unwrap()["detail"];
+    assert_eq!(detail["artifacts"]["missing"], json!(["jq@1.7.1"]));
+    assert!(!fixture.dir.path().join("app/.config/mise/mise.lock").exists(), "nothing to render from version 2");
+    assert_eq!(fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap(), v2, "install never rewrites it");
+
+    let required = |extra: &str| fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nartifacts='required'\n{extra}")).unwrap();
+    required("");
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "lock_outdated", "{e}");
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+
+    // A version 3 lock that leaves a pin unsupported, or this platform unlisted.
+    let (fixture, _) = artifact_fixture("");
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\nartifacts='required'\n").unwrap();
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "artifact_unlocked", "{e}");
+    assert!(e["details"].as_array().unwrap().iter().any(|d| d["name"] == "npm:prettier@3.6.2" && d["state"] == "unsupported"), "{e}");
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    let other = if stack::artifacts::current_platform() == "linux-x64" { "linux-arm64" } else { "linux-x64" };
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(other).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['{other}']\nartifacts='required'\n")).unwrap();
+    fixture.ok(&["compile"]);
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "artifact_unlocked", "{e}");
+    assert_eq!(e["details"][0]["state"], "unlisted");
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+}
+
+/// stack.lock, the generated config, the rendered lock and the machine state, byte for byte.
+fn snapshot(fixture: &Fixture) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+    let root = fixture.dir.path();
+    let mut files: std::collections::BTreeMap<String, Option<Vec<u8>>> = ["app/stack.lock", "app/.config/mise/conf.d/stack.toml", "app/.config/mise/mise.lock", "app/.stack/session.json"]
+        .iter()
+        .map(|f| (f.to_string(), fs::read(root.join(f)).ok()))
+        .collect();
+    for dir in ["state", "state/sessions"] {
+        for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten().filter(|e| e.path().is_file()) {
+            let name = entry.path().strip_prefix(root).unwrap().display().to_string();
+            files.insert(name, fs::read(entry.path()).ok());
+        }
+    }
+    files
+}
+
+#[test]
+fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordinary_compile_does_not() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[tasks.lint]\nrun='true'\n");
+    let other = if stack::artifacts::current_platform() == "linux-x64" { "linux-arm64" } else { "linux-x64" };
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(other).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['{other}']\nartifacts='required'\n")).unwrap();
+    // Locking for another platform is ordinary compile's job, from any machine.
+    let compiled = json_result(&fixture.ok(&["compile", "--json"]));
+    let jq = compiled["data"]["versions"].as_array().unwrap().iter().find(|v| v["name"] == "jq").unwrap().clone();
+    assert_eq!(jq["artifacts"][other]["state"], "verified", "{jq}");
+
+    let before = snapshot(&fixture);
+    let calls = mise_log(&fixture).len();
+    let refused = |e: &Value, context: &str| {
+        assert_eq!(e["code"], "artifact_unlocked", "{context}: {e}");
+        let detail = e["details"].as_array().unwrap().iter().find(|d| d["state"] == "unlisted").unwrap_or_else(|| panic!("{context}: {e}"));
+        assert_eq!(detail["platform"], stack::artifacts::current_platform().as_str(), "{context}");
+        assert_eq!(detail["platforms"], json!([other]), "{context}");
+    };
+    for args in [
+        &["--json", "install"][..],
+        &["--json", "up"],
+        &["--json", "exec", "--", "touch", "ran"],
+        &["--json", "run", "lint"],
+        &["--json", "status"],
+        &["--json", "inspect"],
+        &["--json", "compile", "--locked"],
+    ] {
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        refused(&json_result(&out)["error"], &format!("{args:?}"));
+    }
+    let results = fixture.mcp(
+        &[
+            ("stack_install", json!({})),
+            ("stack_up", json!({})),
+            ("stack_exec", json!({ "command": ["touch", "ran"] })),
+            ("stack_run", json!({ "task": "lint" })),
+            ("stack_status", json!({})),
+            ("stack_inspect", json!({})),
+            ("stack_compile", json!({ "locked": true })),
+        ],
+        &[],
+    );
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(result["isError"], true, "{i}: {result}");
+        refused(&result["structuredContent"]["error"], &format!("mcp call {i}"));
+    }
+    assert!(!fixture.dir.path().join("app/ran").exists(), "the command never ran");
+    let log = &mise_log(&fixture)[calls..];
+    assert!(log.is_empty(), "no provider call before the refusal:\n{log}");
+    assert_eq!(snapshot(&fixture), before, "nothing was written");
+}
+
+#[test]
+fn a_mise_too_old_for_the_lock_fails_install_and_up_before_ports_identities_or_config_change() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[services.web]\nrun='true'\n");
+    let platform = stack::artifacts::current_platform();
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(&platform).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\n").unwrap();
+    fixture.ok(&["compile"]);
+    // A fresh machine with a committed v3 lock: no reservations, an earlier generated config.
+    for f in ["state/ports.json", "state/identities.json", "app/.config/mise/mise.lock"] {
+        let _ = fs::remove_file(fixture.dir.path().join(f));
+    }
+    let config = fixture.dir.path().join("app/.config/mise/conf.d/stack.toml");
+    fs::write(&config, "# an earlier generated config must survive the failure\n").unwrap();
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.15 macos-arm64 (2026-09-15)\n").unwrap();
+    let before = snapshot(&fixture);
+    assert!(before.keys().all(|f| !f.ends_with("ports.json")), "{:?}", before.keys());
+
+    let check = |e: &Value, context: &str| {
+        assert_eq!(e["code"], "provider_outdated", "{context}: {e}");
+        assert!(e["message"].as_str().unwrap().contains("2026.9.16"), "{context}: {e}");
+        let progress = e["details"].as_array().unwrap().iter().find(|d| d.get("steps").is_some()).unwrap_or_else(|| panic!("{context}: {e}"));
+        assert_eq!(progress["changed"], false, "{context}");
+        let last = progress["steps"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["step"].as_str(), last["status"].as_str()), (Some("install"), Some("failed")), "{context}: {e}");
+        assert!(progress["steps"].as_array().unwrap().iter().all(|s| s["step"] != "compile"), "compile never completed: {e}");
+    };
+    let calls = mise_log(&fixture).len();
+    for args in [&["--json", "install"][..], &["--json", "up"]] {
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        check(&json_result(&out)["error"], &format!("{args:?}"));
+    }
+    let results = fixture.mcp(&[("stack_install", json!({})), ("stack_up", json!({}))], &[]);
+    for (i, result) in results.iter().enumerate() {
+        check(&result["structuredContent"]["error"], &format!("mcp call {i}"));
+    }
+    let log = &mise_log(&fixture)[calls..];
+    assert_eq!(log.lines().collect::<Vec<_>>(), ["version"; 4], "one release check per command and nothing else");
+    assert_eq!(snapshot(&fixture), before, "no reservation, generated config, rendered lock or session");
+
+    // The release the lock needs: the same install now publishes and installs.
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.16 macos-arm64 (2026-09-16)\n").unwrap();
+    fixture.ok(&["install"]);
+    assert!(fixture.dir.path().join("state/ports.json").exists());
+    assert!(!fs::read_to_string(&config).unwrap().contains("earlier"));
+    assert!(fixture.dir.path().join("app/.config/mise/mise.lock").exists());
+}
+
+#[test]
+fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so() {
+    let (fixture, _) = artifact_fixture("");
+    fs::remove_file(fixture.dir.path().join("app/.config/mise/mise.lock")).unwrap();
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.15 macos-arm64 (2026-09-15)\n").unwrap();
+    let before = mise_log(&fixture).len();
+    let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "provider_outdated", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("2026.9.16"));
+    assert!(!fixture.dir.path().join("app/.config/mise/mise.lock").exists());
+    assert!(!mise_log(&fixture)[before..].contains("install"));
+    let doctor = json_result(&fixture.command(&["doctor", "--json"]).output().unwrap());
+    let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "mise_release").unwrap().clone();
+    assert_eq!(check["ok"], false, "{doctor}");
+    assert!(check["detail"].as_str().unwrap().contains("2026.9.16"), "{check}");
+    let e = json_result(&fixture.command(&["compile", "--locked", "--json"]).output().unwrap())["error"].clone();
+    assert_eq!(e["code"], "provider_outdated");
 }

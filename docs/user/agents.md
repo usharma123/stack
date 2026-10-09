@@ -12,6 +12,9 @@ stack exec --require-all -- <command>    # anything else, with the stack's tools
 stack down                               # before you finish or remove the checkout
 ```
 
+Tools the stack pins may ship agent skills for exactly that release: `stack --json inspect`
+lists them under `skills`, and MCP `stack_skill` returns one's text. See [agent skills](skills.md).
+
 Every checkout, including each Git worktree, gets its own ports and data, so parallel agents
 do not share databases. Connection strings arrive in the environment (`DATABASE_URL`,
 `REDIS_URL`, `<NAME>_PORT`); do not hardcode ports. Prefer `--ttl` over `--owner-pid` unless
@@ -43,6 +46,11 @@ When that fails (`mise x -- pitchfork supervisor start` exits non-zero, or mise 
 found or run), the supervisor is not asked and the error is `start_failed`, `stop_failed`
 or `provider_unavailable`; one still running at the deadline is left to finish.
 
+`install` and `up` report this machine's artifact coverage, and `compile`/`inspect` report it per
+pin and platform. `artifact_mismatch` means mise refused a download that differs from
+stack.lock: do not work around it. Report it, and run `stack compile --update` only when the
+change is expected upstream.
+
 `stack up` does not restart a service whose configuration is unchanged, so after editing code a
 service loaded, run `stack restart <service>`. Declare `watch = [...]` on the service and
 `status`, `exec` and `run` tell you when that is needed. `stack logs <service> --since-start`
@@ -54,7 +62,12 @@ Start the stdio MCP server with:
 stack mcp
 ```
 
-Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc` and `stack_doctor`.
+Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc`, `stack_doctor` and `stack_skill`, which returns one skill's `SKILL.md`.
+
+`stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command, and
+`stack_run` grants exactly the task's declared `secrets`. Granted values are replaced by
+`[redacted:KEY]` in `stdout` and `stderr`, and the result lists the granted names under
+`secrets`. See [secret grants](secrets.md).
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep

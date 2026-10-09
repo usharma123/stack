@@ -8,7 +8,26 @@
   the exact release, so a fresh machine installs the same versions after upstream releases.
   `compile` resolves only new or changed requests, `--update` re-resolves all of them and
   reports moves, and `--locked` (and `up`, `exec`, `status`) refuse missing or stale pins.
-  An exact version names a release; it is not a checksum of the downloaded artifact.
+  An exact version names a release; the artifact checksums below are what pin the bytes.
+  A tool's [allowlisted options](bundles.md#tool-options) are part of its pin: stack.lock
+  records them, and changing one is a changed request (`lock_outdated` in locked mode).
+- **Artifact checksums.** `stack.lock` embeds mise's lock for every pin on each `[lock]
+  platforms` entry. A release downloaded where its coverage is `verified` has the checksum
+  stack.lock records, and for packslip-backed tools the recorded signer, or `install` and `up`
+  fail with `artifact_mismatch`. Committed checksums change only through `compile --update`,
+  which reports every change. Not covered: releases or platforms mise cannot lock, backends
+  without download URLs, npm and Python dependency graphs, and releases already installed on
+  the machine. `[lock] artifacts = "required"` turns any gap into `artifact_unlocked`. See
+  [Artifact checksums](commands.md#artifact-checksums).
+- **Secrets by name, only where granted.** A task or command receives exactly the fnox secrets
+  it is granted, from the fnox release `stack.lock` pins. A grant never sets or removes a
+  service endpoint or other variable stack controls. Values never enter `stack.lock`, generated
+  configuration, session records or reports, and captured output (`--json`, MCP) never contains
+  a granted value literally. Terminal output is not redacted and inherited variables pass
+  through: see [secret grants](secrets.md#boundary).
+- **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
+  stack.lock pins. Pitchfork's own skill is never surfaced to agents. Skill links are opt-in,
+  and stack only replaces or removes a link it made that still points where it left it.
 - **No silent conflicts.** If two layers define the same key differently, compile fails with every
   conflict listed. Only `[override.*]` resolves one, and the output records what it replaced.
 - **Bundles carry files.** `{{bundle_dir}}` and `paths.bin` resolve to the bundle's own files.
@@ -32,10 +51,24 @@
   records only after shutdown is confirmed; it never signals a replacement service. Its
   recovery commands let you inspect the recorded supervisor and explicitly stop a service
   only after checking its recorded PID still matches.
+- **Secrets by name, only where granted.** A task or command receives exactly the fnox secrets it
+  is granted, resolved at start from the fnox release `stack.lock` pins; a grant never sets or
+  removes a service endpoint or other variable stack controls. Values never enter `stack.lock`,
+  generated configuration, session records, timings or reports, and captured `stdout` and
+  `stderr` (`--json`, MCP; the strings as a JSON parser returns them) never contain a granted
+  value literally, including through stack's own markers (values of at least 8 bytes that no
+  marker could spell out; others are refused there). Key names are not secret and appear in the
+  result. Terminal output is not redacted, transformed values are not caught, and inherited
+  variables pass through: see [secret grants](secrets.md#boundary).
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe. `up` and `restart` have a 10m startup deadline, configurable with
   `--timeout`. Expiry retains launch records and reports `timed_out`; recording the partial
   launch can take up to 10s beyond the deadline, plus connection checks.
+- **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
+  stack.lock pins (mise lists skills per active release, and stack's scratch configuration
+  activates only the pinned ones). The provider's own skill is never surfaced to agents. Skill
+  links are opt-in, and stack only ever replaces or removes a link it recorded and that still
+  points where it left it.
 - **Agent-friendly.** `--json` emits one object on stdout, including for argument errors and
   `exec` (whose output is captured into the object); errors have a stable `code`, a `hint` and
   `details`. A command that could not do its job reports `ok: false`. `stack mcp` serves the same
@@ -45,7 +78,12 @@
 
 Stack provider commands use only the generated Stack mise configuration. Project, parent
 and global mise aliases cannot reinterpret locked releases. Put application variables and
-tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected.
+tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected, as
+is `STACK_SESSION`, which stack sets itself.
+Version resolution, artifact locking and skills discovery each run mise in a scratch directory
+under stack's cache that names only the pinned tools, so nothing in the project's `[env]` or
+tasks is evaluated there. Versions and options containing template syntax are refused before
+mise could evaluate them.
 `stack exec` carries this same boundary into nested mise commands. Direct mise invocations
 outside `stack exec` still follow mise's normal configuration rules.
 

@@ -7,8 +7,10 @@
 - [Command reference](user/commands.md)
 - [Guarantees and limits](user/guarantees.md)
 - [Service identity probes](user/identity-probes.md)
+- [Secret grants](user/secrets.md)
 - [Publishing bundles to OCI registries](user/registries.md)
 - [JSON output and MCP](user/agents.md)
+- [Agent skills](user/skills.md)
 - [Worktree and agent-sandbox integration](user/worktrees.md)
 
 ## Working on Stack
@@ -16,6 +18,7 @@
 Start with [development and validation](operations/development.md).
 
 - [Design and implementation scope](DESIGN.md)
+- [jdx tool integration design](design/jdx-expansion.md)
 - [Release guide](RELEASING.md)
 - [Competitor evaluation](../eval/REPORT.md)
 - [Pilot protocol](pilot-protocol.md)
