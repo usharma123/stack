@@ -74,7 +74,8 @@ the hint. `command` must be an argv list; a string is refused, not split. An arg
 `stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command, and
 `stack_run` grants exactly the task's declared `secrets`. Granted values are replaced by
 `[redacted:KEY]` in `stdout` and `stderr`, and the result lists the granted names under
-`secrets`. See [secret grants](secrets.md).
+`secrets`. A grant is not access control: the command can run fnox itself to read secrets it
+was not granted, and those values are not redacted. See [secret grants](secrets.md).
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep

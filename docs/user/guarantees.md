@@ -21,15 +21,6 @@
   without download URLs, npm and Python dependency graphs, and releases already installed on
   the machine. `[lock] artifacts = "required"` turns any gap into `artifact_unlocked`. See
   [Artifact checksums](commands.md#artifact-checksums).
-- **Secrets by name, only where granted.** A task or command receives exactly the fnox secrets
-  it is granted, from the fnox release `stack.lock` pins. A grant never sets or removes a
-  service endpoint or other variable stack controls. Values never enter `stack.lock`, generated
-  configuration, session records or reports, and captured output (`--json`, MCP) never contains
-  a granted value literally. Terminal output is not redacted and inherited variables pass
-  through: see [secret grants](secrets.md#boundary).
-- **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
-  stack.lock pins. Pitchfork's own skill is never surfaced to agents. Skill links are opt-in,
-  and stack only replaces or removes a link it made that still points where it left it.
 - **No silent conflicts.** If two layers define the same key differently, compile fails with every
   conflict listed. Only `[override.*]` resolves one, and the output records what it replaced.
 - **Bundles carry files.** `{{bundle_dir}}` and `paths.bin` resolve to the bundle's own files.
@@ -53,15 +44,18 @@
   records only after shutdown is confirmed; it never signals a replacement service. Its
   recovery commands let you inspect the recorded supervisor and explicitly stop a service
   only after checking its recorded PID still matches.
-- **Secrets by name, only where granted.** A task or command receives exactly the fnox secrets it
-  is granted, resolved at start from the fnox release `stack.lock` pins; a grant never sets or
-  removes a service endpoint or other variable stack controls. Values never enter `stack.lock`,
+- **Secrets by name, injected only where granted.** A task or command receives in its
+  environment exactly the fnox secrets it is granted, resolved at start from the fnox release
+  `stack.lock` pins; a grant never sets or removes a service endpoint or other variable stack
+  controls. Values never enter `stack.lock`,
   generated configuration, session records, timings or reports, and captured `stdout` and
   `stderr` (`--json`, MCP; the strings as a JSON parser returns them) never contain a granted
   value literally, including through stack's own markers (values of at least 8 bytes that no
   marker could spell out; others are refused there). Key names are not secret and appear in the
   result. Terminal output is not redacted, transformed values are not caught, and inherited
-  variables pass through: see [secret grants](secrets.md#boundary).
+  variables pass through. A grant is injection and redaction, not access control: the command
+  can call fnox itself to read secrets it was not granted, and those values are not redacted.
+  See [secret grants](secrets.md#boundary).
 - **Honest failures.** `up` reports the steps it completed, whether anything changed, and whether
   retrying is safe. `up` and `restart` have a 10m startup deadline, configurable with
   `--timeout`. Expiry retains launch records and reports `timed_out`; recording the partial

@@ -100,7 +100,8 @@ enum Cmd {
         /// Grant this fnox secret to the command (repeatable), resolved through the stack's
         /// pinned fnox. With --json its value is redacted from the captured output (and values
         /// under 8 bytes, or ones a redaction marker could spell out, are refused); without --json the command owns the terminal and its
-        /// output is shown as written, unredacted
+        /// output is shown as written, unredacted. Not access control: the command can still run
+        /// fnox itself to read ungranted secrets, which are not redacted
         #[arg(long = "secret", value_name = "KEY")]
         secret: Vec<String>,
         #[arg(trailing_var_arg = true, required = true)]
