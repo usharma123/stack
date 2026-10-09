@@ -3975,6 +3975,76 @@ fn version_2_locks_install_plainly_and_required_policies_refuse_before_any_insta
     assert!(!mise_log(&fixture)[before..].contains("install"));
 }
 
+/// stack.lock, the generated config, the rendered lock and the machine state, byte for byte.
+fn snapshot(fixture: &Fixture) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+    let root = fixture.dir.path();
+    let mut files: std::collections::BTreeMap<String, Option<Vec<u8>>> = ["app/stack.lock", "app/.config/mise/conf.d/stack.toml", "app/.config/mise/mise.lock", "app/.stack/session.json"]
+        .iter()
+        .map(|f| (f.to_string(), fs::read(root.join(f)).ok()))
+        .collect();
+    for dir in ["state", "state/sessions"] {
+        for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten().filter(|e| e.path().is_file()) {
+            let name = entry.path().strip_prefix(root).unwrap().display().to_string();
+            files.insert(name, fs::read(entry.path()).ok());
+        }
+    }
+    files
+}
+
+#[test]
+fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordinary_compile_does_not() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[tasks.lint]\nrun='true'\n");
+    let other = if stack::artifacts::current_platform() == "linux-x64" { "linux-arm64" } else { "linux-x64" };
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(other).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['{other}']\nartifacts='required'\n")).unwrap();
+    // Locking for another platform is ordinary compile's job, from any machine.
+    let compiled = json_result(&fixture.ok(&["compile", "--json"]));
+    let jq = compiled["data"]["versions"].as_array().unwrap().iter().find(|v| v["name"] == "jq").unwrap().clone();
+    assert_eq!(jq["artifacts"][other]["state"], "verified", "{jq}");
+
+    let before = snapshot(&fixture);
+    let calls = mise_log(&fixture).len();
+    let refused = |e: &Value, context: &str| {
+        assert_eq!(e["code"], "artifact_unlocked", "{context}: {e}");
+        let detail = e["details"].as_array().unwrap().iter().find(|d| d["state"] == "unlisted").unwrap_or_else(|| panic!("{context}: {e}"));
+        assert_eq!(detail["platform"], stack::artifacts::current_platform().as_str(), "{context}");
+        assert_eq!(detail["platforms"], json!([other]), "{context}");
+    };
+    for args in [
+        &["--json", "install"][..],
+        &["--json", "up"],
+        &["--json", "exec", "--", "touch", "ran"],
+        &["--json", "run", "lint"],
+        &["--json", "status"],
+        &["--json", "inspect"],
+        &["--json", "compile", "--locked"],
+    ] {
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        refused(&json_result(&out)["error"], &format!("{args:?}"));
+    }
+    let results = fixture.mcp(
+        &[
+            ("stack_install", json!({})),
+            ("stack_up", json!({})),
+            ("stack_exec", json!({ "command": ["touch", "ran"] })),
+            ("stack_run", json!({ "task": "lint" })),
+            ("stack_status", json!({})),
+            ("stack_inspect", json!({})),
+            ("stack_compile", json!({ "locked": true })),
+        ],
+        &[],
+    );
+    for (i, result) in results.iter().enumerate() {
+        assert_eq!(result["isError"], true, "{i}: {result}");
+        refused(&result["structuredContent"]["error"], &format!("mcp call {i}"));
+    }
+    assert!(!fixture.dir.path().join("app/ran").exists(), "the command never ran");
+    let log = &mise_log(&fixture)[calls..];
+    assert!(log.is_empty(), "no provider call before the refusal:\n{log}");
+    assert_eq!(snapshot(&fixture), before, "nothing was written");
+}
+
 #[test]
 fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so() {
     let (fixture, _) = artifact_fixture("");

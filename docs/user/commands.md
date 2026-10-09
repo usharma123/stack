@@ -265,7 +265,7 @@ Errors:
 | Code | When |
 |---|---|
 | `artifact_mismatch` | mise refused a download (checksum) or a packslip signer or repository identity that differs from stack.lock. `details`: `[{ kind: "checksum" \| "signer" \| "repository", name, platform?, expected?, actual?, url? }]`, then mise's output. Verify upstream; `compile --update` and review the diff if the change is expected |
-| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform, or this machine's platform is not listed (`state: "unlisted"`). `details`: `[{ name, platform, state, reason? }]`. Nothing is written or installed |
+| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform (`details`: `[{ name, platform, state, reason? }]`), or this machine's platform is not listed (`details`: `[{ platform, state: "unlisted", platforms }]`). Every locked operation (`compile --locked`, `inspect` with a lock, `install`, `up`, `exec`, `run`, `status`, and their MCP tools) refuses an unlisted platform before any provider call; ordinary `compile` may lock other platforms from any machine. Nothing is written or installed |
 | `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read. stack.lock, the provider config and the rendered lock are unchanged |
 | `lock_invalid` | embedded entries disagree with the pins (an entry for a version stack.lock does not pin), a malformed `[provider_lock]`, a dangling `conda_deps` name, or a value with template syntax (`{{`, `{%`, `{#`). `compile --update` replaces a bad embedded lock |
 | `lock_outdated` | `artifacts = "required"` with a version 2 lock |

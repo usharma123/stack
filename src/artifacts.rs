@@ -145,6 +145,25 @@ impl Policy {
     pub fn required(&self) -> bool {
         self.artifacts == Requirement::Required
     }
+
+    /// Locked operations under `required` refuse a machine whose platform `platforms` does not
+    /// list: stack.lock commits nothing that says what may be installed or run there. Ordinary
+    /// compile is not a locked operation and may lock other platforms from any machine.
+    pub fn check_runtime_platform(&self) -> Result<()> {
+        self.check_platform(&current_platform())
+    }
+
+    fn check_platform(&self, platform: &str) -> Result<()> {
+        if !self.required() || self.platforms.iter().any(|p| p == platform) {
+            return Ok(());
+        }
+        Err(StackError::new(
+            "artifact_unlocked",
+            format!("[lock] artifacts = \"required\", but this machine's platform {platform} is not in [lock] platforms ({})", self.platforms.join(", ")),
+        )
+        .hint("add the platform to `[lock] platforms` and run `stack compile`, or relax `[lock] artifacts`")
+        .with_detail(json!({ "platform": platform, "state": "unlisted", "platforms": self.platforms })))
+    }
 }
 
 // ---- shape ---------------------------------------------------------------------------------

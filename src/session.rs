@@ -1106,15 +1106,10 @@ fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
     let policy = &report.artifact_policy;
     let pins = report.pins();
     let lock = report.provider_lock();
+    // The locked compile already refused an unlisted platform and unchecked listed ones; this
+    // platform's coverage is checked again here because it is what the install relies on.
     if policy.required() {
-        if !policy.platforms.contains(&platform) {
-            return Err(StackError::new(
-                "artifact_unlocked",
-                format!("[lock] artifacts = \"required\", but this machine's platform {platform} is not in [lock] platforms ({})", policy.platforms.join(", ")),
-            )
-            .hint("add the platform to `[lock] platforms` and run `stack compile`, or relax `[lock] artifacts`")
-            .with_detail(json!({ "platform": platform, "state": "unlisted" })));
-        }
+        policy.check_runtime_platform()?;
         let unchecked = artifacts::unchecked(lock, &pins, std::slice::from_ref(&platform), &Default::default());
         if !unchecked.is_empty() {
             return Err(artifacts::unlocked_error(unchecked));

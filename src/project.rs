@@ -252,11 +252,11 @@ pub fn compile(opts: &Options) -> Result<Report> {
     }
     // `compile --locked` renders the provider's lock from stack.lock as ordinary compile does,
     // after checking that mise can read it, before anything is written.
-    let committed = lock::read(&opts.root)?;
-    if let Some(requirement) = lock_requirement(committed.as_ref()) {
-        mise::check_requirements(locker(opts).version(&opts.root)?, &[requirement])?;
-    }
-    let report = compile_locked(opts)?;
+    let locker = locker(opts);
+    let report = compile_checked(opts, &|_, lock| match lock_requirement(Some(lock)) {
+        Some(requirement) => mise::check_requirements(locker.version(&opts.root)?, &[requirement]),
+        None => Ok(()),
+    })?;
     artifacts::write_rendered(&opts.root, report.lock.as_ref())?;
     Ok(report)
 }
@@ -265,8 +265,18 @@ fn locker(opts: &Options) -> Arc<dyn mise::Locker> {
     opts.locker.clone().unwrap_or_else(|| Arc::new(mise::MiseLocker))
 }
 
+/// Checked by a writing compile once stack.toml, stack.lock and the policy are validated and
+/// before anything is written: port and identity reservations, stack.lock, the generated config
+/// and the rendered lock. Given the composed stack and the lock about to be described.
+pub(crate) type Preflight<'a> = &'a dyn Fn(&Composed, &Lockfile) -> Result<()>;
+
 /// The caller holds the project lock when publishing configuration or changing a session.
 pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
+    compile_checked(opts, &|_, _| Ok(()))
+}
+
+/// [`compile_locked`], running `preflight` before the first write.
+pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Report> {
     let project = read_project(&opts.root)?;
     if let Some(skills) = &project.skills {
         crate::skills::validate_dir(&skills.dir)?;
@@ -285,6 +295,11 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
             "stack.lock is version 1 and records no exact tool or service versions",
         )
         .hint("run `stack compile` once to resolve and record them (bundle pins are kept), then commit stack.lock"));
+    }
+    // Every locked operation (`compile --locked`, inspect with a lock, install, up, exec, run,
+    // status) passes through here, before any bundle fetch or provider call.
+    if opts.mode == Mode::Frozen {
+        policy.check_runtime_platform()?;
     }
 
     let mut loaded = Vec::new();
@@ -367,6 +382,8 @@ pub(crate) fn compile_locked(opts: &Options) -> Result<Report> {
         v.backend = artifacts::backend(embedded, &pin);
         v.artifacts = Some(artifacts::report(embedded, &pin, &policy.platforms, &outcome.events));
     }
+
+    preflight(&stack, &new_lock)?;
 
     let output = mise::output_path(&opts.root);
     let (ports, identities) = if opts.write {

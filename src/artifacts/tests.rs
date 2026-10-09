@@ -439,6 +439,22 @@ fn policy_defaults_to_the_release_matrix_and_validates_names() {
 }
 
 #[test]
+fn required_policies_refuse_an_unlisted_runtime_platform_and_best_effort_ones_never_do() {
+    use crate::manifest::LockSettings;
+    let required = Policy::from_settings(&LockSettings { platforms: Some(vec!["linux-x64".into()]), artifacts: Some("required".into()) }).unwrap();
+    required.check_platform("linux-x64").unwrap();
+    let e = required.check_platform("macos-arm64").unwrap_err();
+    assert_eq!(e.code, "artifact_unlocked");
+    assert!(e.message.contains("macos-arm64") && e.message.contains("linux-x64"), "{e:?}");
+    assert_eq!(e.details, vec![json!({ "platform": "macos-arm64", "state": "unlisted", "platforms": ["linux-x64"] })]);
+    let best_effort = Policy::from_settings(&LockSettings { platforms: Some(vec!["linux-x64".into()]), artifacts: None }).unwrap();
+    best_effort.check_platform("macos-arm64").unwrap();
+    // `current` always lists the machine it was expanded on.
+    let current = Policy::from_settings(&LockSettings { platforms: Some(vec!["current".into()]), artifacts: Some("required".into()) }).unwrap();
+    current.check_runtime_platform().unwrap();
+}
+
+#[test]
 fn rendering_writes_only_with_entries_and_removes_a_stale_file() {
     let dir = tempfile::tempdir().unwrap();
     let (lock, stripped) = captured();
