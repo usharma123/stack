@@ -389,9 +389,25 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         "checks": plan.checks,
     });
     // Names only, and only for commands granted secrets, so other results keep their shape.
+    let mut warnings = Vec::new();
     if !plan.secrets.is_empty() {
         result["secrets"] = json!(plan.secrets);
-        result["warnings"] = json!(plan.secret_warnings);
+        warnings.extend(plan.secret_warnings.iter().cloned());
+    }
+    // `mise run` installs a task's missing tools against the rendered lock, and a refusal ends
+    // in mise's advice to edit that lock. The output stays as the task wrote it; this says what
+    // the remedy is under stack.
+    if plan.task_config.is_some() && output.exit_code != Some(0) {
+        if let Some(first) = crate::provider::mise::refusals(&output.stderr).first() {
+            warnings.push(format!(
+                "artifact_mismatch: {} (while `mise run` installed the task's tools); mise.lock is rendered from stack.lock, so do not edit it: {}",
+                crate::provider::mise::refusal_message(first),
+                crate::provider::mise::MISMATCH_HINT
+            ));
+        }
+    }
+    if !plan.secrets.is_empty() || !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
     }
     Ok(result)
 }

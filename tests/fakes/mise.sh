@@ -142,6 +142,8 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     fi
     if test "$task" = hang; then sleep 30; fi
     if test "$task" = fail; then exit 3; fi
+    # A task whose tools mise could not install: what mise printed, as a test gives it.
+    if test "$task" = refused; then cat "$REVIEW_FIXTURE/run-refusal" >&2; exit 1; fi
     # A task that shows the environment it was given, on both streams.
     if test "$task" = showenv; then echo; env | sort; env | sort >&2; fi ;;
   'x --')

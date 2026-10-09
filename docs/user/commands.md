@@ -228,7 +228,7 @@ the machine is not checked again.
 
 | Code | When |
 |---|---|
-| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected |
+| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected. `details` give `expected`, `actual` and `url`, and `upstream` when mise compared the asset with GitHub's digest; mise's own advice to edit `mise.lock` is left out, since stack renders that file from stack.lock. A task whose tools `mise run` fails to install this way keeps mise's output and gets the same remedy as an `artifact_mismatch` warning (captured runs only) |
 | `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed. A pin `compile` just failed to lock usually has no artifact for that platform upstream: drop the platform, pin another release, or use `best-effort` |
 | `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read; nothing was changed |
 | `lock_invalid` | the embedded lock disagrees with the pins or is malformed; `compile --update` replaces it |

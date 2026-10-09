@@ -4159,23 +4159,49 @@ fn compile_locks_in_a_tools_only_scratch_root_and_install_partitions_by_coverage
 #[test]
 fn refused_downloads_and_signers_are_artifact_mismatch_and_other_failures_install_failed() {
     let (fixture, platform) = artifact_fixture("");
-    let checksum = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/x/jq-macos-arm64:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:1111\n");
+    let checksum = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/x/jq-macos-arm64:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:1111\nhint: GitHub's current digest for jq-macos-arm64 in jqlang/jq jq-1.7.1 matches this download (asset updated 2026-06-20T14:10:29Z, release published 2026-06-20T14:11:27Z), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n");
     fs::write(fixture.dir.path().join("install-locked-fail"), &checksum).unwrap();
     let before = mise_log(&fixture).len();
     let out = fixture.command(&["install", "--json"]).output().unwrap();
     let e = &json_result(&out)["error"];
     assert_eq!(e["code"], "artifact_mismatch", "{e}");
-    assert_eq!(e["details"][0], json!({ "kind": "checksum", "name": "jq@1.7.1", "platform": platform, "expected": "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a", "actual": "sha256:1111", "url": "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64" }));
+    assert_eq!(e["details"][0], json!({ "kind": "checksum", "name": "jq@1.7.1", "platform": platform, "expected": "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a", "actual": "sha256:1111", "url": "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64", "upstream": "GitHub's current digest for jq-macos-arm64 in jqlang/jq jq-1.7.1 matches this download (asset updated 2026-06-20T14:10:29Z, release published 2026-06-20T14:11:27Z)" }));
     assert!(e["hint"].as_str().unwrap().contains("compile --update"));
+    // mise renders its lock from stack.lock: its advice to edit that lock is not passed on.
+    let output = e["details"][1]["output"].as_str().unwrap();
+    assert!(output.contains("Expected: sha256:0bbe") && output.contains("Actual:   sha256:1111"), "{output}");
+    assert!(!output.contains("mise.lock") && !output.contains("re-uploaded"), "{output}");
     assert!(!mise_log(&fixture)[before..].contains("install --yes"), "nothing else is installed after a refusal");
 
     fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says sigstore-oidc:a signed fnox@1.39.0, but this release is signed by sigstore-oidc:b; remove the entry from mise.lock to accept the new signer\n").unwrap();
     let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
     assert_eq!((e["code"].as_str(), e["details"][0]["kind"].as_str(), e["details"][0]["expected"].as_str()), (Some("artifact_mismatch"), Some("signer"), Some("sigstore-oidc:a")));
+    assert!(!e["details"][1]["output"].as_str().unwrap().contains("remove the entry"), "{e}");
 
     fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR network unreachable\n").unwrap();
     let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
     assert_eq!(e["code"], "install_failed");
+}
+
+#[test]
+fn a_task_whose_tools_mise_refuses_gets_stacks_remedy_beside_mises_own_output() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n[tasks.fail]\nrun='false'\n");
+    let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: GitHub's current digest for jq matches this download (asset updated t1, release published t2), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n";
+    fs::write(fixture.dir.path().join("run-refusal"), refusal).unwrap();
+    for data in [
+        json_result(&fixture.command(&["--json", "run", "refused"]).output().unwrap())["data"].clone(),
+        fixture.mcp(&[("stack_run", json!({ "task": "refused" }))], &[])[0]["structuredContent"]["data"].clone(),
+    ] {
+        assert_eq!(data["exit_code"], 1, "{data}");
+        assert_eq!(data["stderr"], refusal, "the task's output is not rewritten");
+        let warnings = data["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{data}");
+        let warning = warnings[0].as_str().unwrap();
+        assert!(warning.starts_with("artifact_mismatch: mise refused a download for jq@1.7.1 on macos-arm64") && warning.contains("do not edit it") && warning.contains("stack compile --update"), "{warning}");
+    }
+    // Other failures keep their usual shape.
+    let data = &json_result(&fixture.command(&["--json", "run", "fail"]).output().unwrap())["data"];
+    assert!(data.get("warnings").is_none(), "{data}");
 }
 
 #[test]
