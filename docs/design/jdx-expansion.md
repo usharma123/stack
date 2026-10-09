@@ -85,7 +85,9 @@ Observed:
   jq, fnox, packslip, mbx, postgres, cockroach, nats-server and spicedb all lock. pitchfork locks
   on three (no macos-x64 artifact; mise says "1 skipped", exit 0). redis (`conda:redis-server`)
   fails to lock on every platform ("failed to solve redis-server") although it installs; mise
-  then exits nonzero but still writes the other tools' entries.
+  then exits nonzero but still writes the other tools' entries. This was a design-time
+  observation, not a backend guarantee: implementation validation later locked Redis 8.10.2
+  on all four platforms with mise 2026.9.18.
 - A tool can have several entries for one version when its artifact identity depends on options
   (documented, Swift's `swift_platform`); entries match on options exactly. The `options` mise
   writes are its own, not the project's: `rust = { mr_boxington = true }` and a fnox entry with
@@ -269,7 +271,7 @@ Compile (`stack compile`, ordinary and `--update`):
    were, as [DESIGN.md](../DESIGN.md) promises for `resolve_failed`.
 
 `mise lock` exiting nonzero is not by itself `artifact_lock_failed`: mise reports a tool it
-cannot lock that way and still writes the others (redis today). `artifact_lock_failed` is for
+cannot lock that way and still writes the others (as observed for Redis during design). `artifact_lock_failed` is for
 mise not running, the deadline passing, or the scratch lock being unreadable or malformed.
 Under `artifacts = "required"` a `missing` state after merge is `artifact_unlocked`.
 
@@ -326,7 +328,7 @@ or identity options on the tool; those are typed tool options (route 2).
 - Committed checksums change only through `compile --update`, and every change is reported.
 - Coverage is explicit per tool and platform in every version report; nothing is called
   verified that mise did not check for.
-- Not covered: tools mise cannot lock (redis today), URL-exempt backends (core:rust), dependency
+- Not covered: releases or platforms mise cannot lock, URL-exempt backends (core:rust), dependency
   graphs of npm and Python tools, and releases already installed on the machine.
 
 ### Failure modes and codes

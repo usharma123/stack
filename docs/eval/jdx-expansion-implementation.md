@@ -141,8 +141,27 @@ All nine runnable native scenarios passed with real mise, Pitchfork, fnox, Postg
 in isolated state. The native OCI service scenario was skipped because that runner had no
 registry; the separate OCI CI scenario above passed. The run also covered identity probes,
 occupied-port recovery, locked install without a session, and hanging Redis readiness.
-Linux real-tool validation is delegated to GPT-6.1-Sol with isolated containers. No remote
-CI run or four-platform result is claimed. `cargo fmt --check` reports formatting differences
+Linux ARM64 validation at the same implementation commit passed all ten real-tool scenarios,
+including OCI, plus all 341 Rust tests and Clippy. It used mise 2026.9.18, fnox 1.39.0,
+Pitchfork 2.29.0, Rust 1.98.1 for the Stack build, and Rust 1.93.1 / mbx 1.22.0 for the Rust
+bundle smoke. Additional real probes passed cold fnox checksum rejection, v2 migration,
+required policy, exact skill retrieval and sync, provider exclusion, and two-copy mbx cache
+sharing. All provider state and Docker resources were isolated and this run's resources
+were removed.
+
+The original Linux image lacked system Python for scenario 9's listener fixture. After adding
+a container-only link to the run's installed Python, that scenario passed. An initial mbx
+recording shim lost Cargo's argv[0]; an independent bounded investigation established the
+shim error and the corrected real-mise build controls passed. Root-run Rust fixture failures
+and a timing-sensitive test were retained in the receipts; the final full unprivileged run
+passed. These failed attempts are not product failures or passing-run evidence.
+
+Real Redis 8.10.2 locked on all four requested platforms, correcting the design-time blanket
+Redis example in current user docs. Requested-platform metadata coverage is separate from
+installation: only Linux ARM64 and macOS ARM64 were executed. No remote CI run or four-platform
+installation result is claimed. Linux report and complete receipts:
+`/tmp/jdx-linux-e90a7fe.yYLzUp/REPORT.md`; argv[0] investigation:
+`/tmp/jdx-argv0-research.OVp98d/REPORT.md`. `cargo fmt --check` reports formatting differences
 in both inherited code and additions; it is not a repository CI gate.
 
 ## Review results

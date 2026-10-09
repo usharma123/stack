@@ -18,7 +18,7 @@
   `compile --update`, which reports every change; ordinary `compile` keeps them and warns when
   upstream differs. Coverage (`verified`, `exempt`, `unsupported`, `missing`) is reported per
   tool and platform, and nothing is called verified that mise did not check. Not covered: tools
-  mise cannot lock (redis today), backends without download URLs (`core:rust`, `cargo`, `go`),
+  mise cannot lock for a particular release or platform, backends without download URLs (`core:rust`, `cargo`, `go`),
   npm and Python dependency graphs, and releases already installed on the machine, which mise
   does not re-check. `[lock] artifacts = "required"` turns any gap on a listed platform into
   `artifact_unlocked`. See [Artifact checksums](commands.md#artifact-checksums).

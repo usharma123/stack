@@ -220,8 +220,8 @@ entry: `artifacts.<platform>` has `state`, and `checksum` and `signer` when veri
 
 - Locks only pins that need it: every pin under `--update`, otherwise pins with a `missing`
   state on a listed platform (new and changed pins have no entry yet). With full coverage it
-  makes no `mise lock` call and needs no network for artifacts. A pin mise cannot lock (redis
-  today, or Pitchfork on macos-x64, which has no artifact) stays `missing`, so every ordinary
+  makes no `mise lock` call and needs no network for artifacts. A pin mise cannot lock
+  (for example, Pitchfork 2.29.0 on macos-x64, which has no artifact) stays `missing`, so every ordinary
   `compile` of such a project asks mise again; `mise lock` skips it without failing.
 - Runs `mise lock --platform <list> <tools>...` in a scratch root of its own under stack's cache
   (`lock/`), removed afterwards. Its configuration is `[tools]` with every pin at its exact
