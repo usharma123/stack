@@ -307,3 +307,23 @@ proven with fake providers, not a real-provider claim. Evidence:
 No separate native-option/backend defect or general template evaluation of tool-name keys
 was established. Real outdated-provider and signer/trust-option installations remain outside
 the saved runtime evidence.
+
+### Round 2 task-grant remediation
+
+Worker commit `d7e53cc` was integrated as `6a0a209`. Task planning now acquires the project
+lock before selecting its command, all-services requirement, and secret list from the same
+validated report used for environment, endpoint verification, fnox lookup, and execution
+reservation. CLI and MCP use the same task planning API. Explicit command grants retain their
+existing path. Deleted tasks fail during preflight without publishing config; removing a
+task's grant runs the new definition without a fnox query.
+
+Parent integration passed both CLI/MCP lock-wait regressions and the existing exact-grants
+regression, three tests total. The first attempted filter matched zero tests; the named
+regressions above were then run and are the passing evidence. The worker passed its full Rust
+suite, Clippy, and documentation tests, and replayed Astra's proof at
+`/tmp/taskgrant-replay.umPi`. These added regressions use fake providers; no real installation
+claim is made.
+
+A focused Sol high investigation is checking whether the generated task configuration can
+still change after planning releases its lock and before mise loads the task. This is an
+unverified related boundary concern. Platform-variant remediation is also still in progress.
