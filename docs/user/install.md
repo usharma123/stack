@@ -8,6 +8,9 @@ stack setup
 ```
 
 Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
+On Intel Macs stack runs tools-only stacks: Pitchfork, which supervises services, publishes no
+Intel macOS build, so `install`, `up`, `exec` and `run` refuse a stack with services there
+(`services_unsupported`) before installing anything.
 Stack needs [mise](https://mise.jdx.dev); it installs everything else, including Pitchfork,
 through it. `stack setup` uses a mise already on `PATH`; otherwise it downloads the pinned release
 stack is tested against (checked by SHA-256) into `~/.local/share/stack/bin` (`$STACK_DATA_DIR/bin`

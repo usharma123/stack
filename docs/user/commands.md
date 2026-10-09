@@ -191,12 +191,14 @@ for packslip-backed tools a signer, when it locks, and checks them when it downl
 ```toml
 # stack.toml, project only (a bundle cannot set it)
 [lock]
-platforms = ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]   # the default
+platforms = ["macos-arm64", "linux-x64", "linux-arm64"]   # the default
 artifacts = "best-effort"                                             # or "required"
 ```
 
 `platforms` uses mise's names, including qualifiers such as `linux-x64-musl`; `"current"` means
-the compiling machine. mise looks a release up under one key per machine and backend: Node on
+the compiling machine. The default leaves out `macos-x64`: Pitchfork publishes no Intel macOS
+build, so stacks with services cannot run there. A tools-only project can list `macos-x64` (or
+`"current"` on an Intel Mac) itself. mise looks a release up under one key per machine and backend: Node on
 Alpine needs `linux-x64-musl` listed, while Bun's per-CPU and musl builds are locked with their
 unqualified platform.
 
@@ -227,7 +229,7 @@ the machine is not checked again.
 | Code | When |
 |---|---|
 | `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected |
-| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed |
+| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed. A pin `compile` just failed to lock usually has no artifact for that platform upstream: drop the platform, pin another release, or use `best-effort` |
 | `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read; nothing was changed |
 | `lock_invalid` | the embedded lock disagrees with the pins or is malformed; `compile --update` replaces it |
 | `lock_outdated` | `artifacts = "required"` with a version 2 lock |

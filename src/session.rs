@@ -676,6 +676,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = check_services_host(&report) {
+        return Err(steps.fail("install", e, false));
+    }
 
     let plan = match prepare_install(ctx, &report) {
         Ok(plan) => plan,
@@ -967,6 +970,7 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
         return Err(StackError::new("session_busy", "commands are still executing in this session"));
     }
     let report = ctx.compile(true)?;
+    check_services_host(&report)?;
     mise::trust(&ctx.root)?;
     if session.launching {
         return Err(StackError::new("session_stale", "the last start or restart of this session did not finish verifying")
@@ -1087,6 +1091,9 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
         Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = check_services_host(&report) {
+        return Err(steps.fail("install", e, false));
+    }
     let plan = match prepare_install(ctx, &report) {
         Ok(plan) => plan,
         Err(e) => return Err(steps.fail("install", e, false)),
@@ -1134,7 +1141,7 @@ fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
         policy.check_runtime_platform()?;
         let unchecked = artifacts::unchecked(lock, &pins, std::slice::from_ref(&platform), &Default::default());
         if !unchecked.is_empty() {
-            return Err(artifacts::unlocked_error(unchecked));
+            return Err(artifacts::unlocked_error(unchecked, false));
         }
     }
     let mut partition = artifacts::partition(lock, &pins, &platform);
@@ -2044,6 +2051,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     // A pin that is not installed leaves its directory off the provider's PATH, and the
     // command (or anything it starts) would find whatever release is next on PATH. A task is
     // left to `mise run`, which installs what its configuration names.
+    check_services_host(&report)?;
     if let Target::Command { .. } = target {
         require_installed(ctx, &report)?;
         timings.mark("installed");
@@ -2217,6 +2225,12 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         redactor,
         task_config,
     })
+}
+
+/// Refuse a stack with services on a machine its supervisor cannot be installed on.
+fn check_services_host(report: &Report) -> Result<()> {
+    let services: Vec<&String> = report.stack.services.keys().collect();
+    mise::check_services_host(&artifacts::Host::current(), &services)
 }
 
 /// Every release stack.lock pins is installed, as mise reports it, or `tools_not_installed`

@@ -10,6 +10,26 @@ use toml::{Table, Value};
 /// Pinned so service behaviour only changes when stack is upgraded.
 pub const PITCHFORK_VERSION: &str = "2.29.0";
 
+/// Machines Pitchfork publishes no build for. Its 2.29.0 release has macOS builds for Apple
+/// silicon only, so an Intel Mac runs tools-only stacks.
+const NO_SUPERVISOR: &[&str] = &["macos-x64"];
+
+/// Services need Pitchfork, which cannot be installed on `host`: refused before anything is
+/// installed or any supervisor is asked, naming the services that need it.
+pub fn check_services_host(host: &crate::artifacts::Host, services: &[&String]) -> crate::error::Result<()> {
+    let base = host.base();
+    if services.is_empty() || !NO_SUPERVISOR.contains(&base.as_str()) {
+        return Ok(());
+    }
+    let names: Vec<&str> = services.iter().map(|s| s.as_str()).collect();
+    Err(crate::error::StackError::new(
+        "services_unsupported",
+        format!("services ({}) need Pitchfork, which publishes no {base} build; stack runs only tools-only stacks here", names.join(", ")),
+    )
+    .hint("run services on Apple silicon or Linux; on this machine use a project without [services] (`stack install` and `stack exec` work for tools)")
+    .with_detail(serde_json::json!({ "platform": base, "services": names })))
+}
+
 /// mise auto-loads `conf.d/*.toml`, so plain `mise` commands see the stack too.
 pub fn output_path(root: &Path) -> PathBuf {
     root.join(".config/mise/conf.d/stack.toml")
@@ -1026,6 +1046,19 @@ pitchfork ERROR Daemon app-9df2/api failed to start
         let tail = readable_tail(&text, TAIL_LINES);
         assert_eq!(tail.lines().count(), TAIL_LINES);
         assert!(tail.starts_with("line 12\n") && tail.ends_with("line 30\nError: final"), "{tail}");
+    }
+
+    #[test]
+    fn services_are_refused_on_intel_macos_and_tools_only_stacks_are_not() {
+        use crate::artifacts::Host;
+        let host = |os: &str, arch: &str| Host { os: os.into(), arch: arch.into(), libc: None, avx2: true };
+        let db = "db".to_string();
+        let e = check_services_host(&host("macos", "x64"), &[&db]).unwrap_err();
+        assert_eq!(e.code, "services_unsupported");
+        assert_eq!(e.details[0], serde_json::json!({ "platform": "macos-x64", "services": ["db"] }));
+        assert!(check_services_host(&host("macos", "x64"), &[]).is_ok(), "tools only");
+        assert!(check_services_host(&host("macos", "arm64"), &[&db]).is_ok());
+        assert!(check_services_host(&host("linux", "x64"), &[&db]).is_ok());
     }
 
     #[test]
