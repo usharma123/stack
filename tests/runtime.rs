@@ -559,6 +559,44 @@ fn a_command_without_a_timeout_does_not_wait_unbounded_to_finish_its_record() {
     assert_eq!(fs::read_dir(completions(&fixture)).unwrap().count(), 0);
 }
 
+#[test]
+fn a_finished_command_that_cannot_be_recorded_says_so_and_keeps_the_session_busy() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    // No completion record can be written: where they go is a file.
+    fs::write(state.join("completed"), "").unwrap();
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(3));
+    let mut server = Server::start(&fixture);
+    let result = server.call("stack_exec", json!({ "command": ["sh", "-c", "sleep 0.5; exit 3"] }));
+    holder.join().unwrap();
+    // The command's own result stands, with the warning beside it.
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["exit_code"], 3, "{result}");
+    let warning = result["data"]["warnings"][0].as_str().unwrap_or_else(|| panic!("{result}"));
+    assert!(warning.contains("still recorded as running") && warning.contains("stack down"), "{warning}");
+    // Nothing claims it finished: the session stays busy while the server lives.
+    assert_eq!(read_value(&session_file)["active_executions"].as_object().unwrap().len(), 1);
+    let result = server.call("stack_up", json!({}));
+    assert_eq!(result["error"]["code"], "session_busy", "{result}");
+    server.close();
+    // The same through `exec --json`, whose command's exit code is kept.
+    let mut session = read_value(&session_file);
+    session["active_executions"] = json!({});
+    for path in fixture.session_paths() {
+        fs::write(&path, session.to_string()).unwrap();
+    }
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(3));
+    let out = fixture.command(&["--json", "exec", "--", "sh", "-c", "sleep 0.5; exit 3"]).output().unwrap();
+    holder.join().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let result = json_result(&out);
+    assert!(result["data"]["warnings"][0].as_str().is_some_and(|w| w.contains("still recorded as running")), "{result}");
+    fixture.ok(&["down"]);
+}
+
 /// Record `token` as executing for this (live) test process, in both session files.
 fn record_execution(fixture: &Fixture, token: &str, renewed_at: Option<u64>) -> Value {
     let mut session = read_value(&fixture.session_paths().pop().unwrap());

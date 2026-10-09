@@ -123,7 +123,10 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the session. A command that finished while another command held the project lock for more
   than a second records that it finished under the state directory's `completed/`; the next
   `up`, `restart`, `exec`, `run` or `gc` for the project applies it, forgetting that command
-  only and renewing the lease to when it finished. `status` may list it until then. Over MCP,
+  only and renewing the lease to when it finished. `status` may list it until then. When
+  even that record cannot be written, the result of `exec --json`, MCP `stack_exec` and
+  `stack_run` carries a `warnings` entry beside the command's own outcome, and the session
+  stays busy while that process lives (`stack down` clears it). Over MCP,
   `services` must be an array of names; omitting it restarts every
   service.
 - A service can list `watch = ["app.py", "src"]`: files or directories (walked recursively,

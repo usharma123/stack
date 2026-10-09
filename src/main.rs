@@ -559,10 +559,11 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
 /// The process exits with the command's code (124 on timeout, like `timeout(1)`).
-fn exec_json(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
+fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     // Large enough to mean "no limit" without overflowing deadline arithmetic.
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
-    let result = mcp::run_captured(ctx, &plan, timeout)?;
+    let mut result = mcp::run_captured(ctx, &plan, timeout)?;
+    mcp::finish(&mut plan, &mut result);
     if result["timed_out"] == true {
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
         return Ok(ExitCode::from(124));

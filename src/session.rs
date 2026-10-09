@@ -1421,7 +1421,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
 
     remove_if_exists(&ctx.session_file())?;
     remove_if_exists(&ctx.index_file())?;
-    remove_dir_if_exists(&completions_dir(&ctx.state, &ctx.root))?;
+    forget_project_completions(&ctx.state, &ctx.root);
     // Everything stack owned is gone, so whatever still answers on a reserved port is foreign.
     let pinned = pinned_ports(ctx);
     let conflicts = reserved
@@ -2267,6 +2267,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             state: ctx.state.clone(),
             session_id: session.id.clone(),
             token,
+            released: false,
         });
         env.insert("STACK_SESSION".into(), session.id.clone());
     } else {
@@ -2559,8 +2560,9 @@ fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str) -> G
         }
     }
     if problems.is_empty() {
-        if let Err(e) = remove_if_exists(index).and_then(|()| remove_dir_if_exists(&completions_dir(state, &session.project))) {
-            problems.push(e.to_string());
+        match remove_if_exists(index) {
+            Ok(()) => forget_project_completions(state, &session.project),
+            Err(e) => problems.push(e.to_string()),
         }
     }
     GcEntry {
@@ -2801,12 +2803,10 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn remove_dir_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(crate::error::io_error(path.display(), e)),
-    }
+/// Remove a project's completion records with its session. Best effort: one left behind
+/// names a generation that is gone, so it never applies and the next reconcile removes it.
+fn forget_project_completions(state: &Path, root: &Path) {
+    let _ = fs::remove_dir_all(completions_dir(state, root));
 }
 
 /// A command that finished while another command held the project lock, so it could not
@@ -3028,10 +3028,17 @@ pub struct ExecutionGuard {
     state: PathBuf,
     session_id: String,
     token: String,
+    released: bool,
 }
 
-impl Drop for ExecutionGuard {
-    fn drop(&mut self) {
+impl ExecutionGuard {
+    /// Forget this execution: in its session under the project lock, or, when another command
+    /// holds the lock, by a completion record for the next lifecycle command. An error means
+    /// the execution may still be recorded, keeping the session busy while this process lives.
+    fn release(&mut self) -> Result<()> {
+        if std::mem::replace(&mut self.released, true) {
+            return Ok(());
+        }
         let _timings = Timings::new("release");
         let _grace = crate::process::grace_scope(RECORD_GRACE);
         let ctx = Ctx {
@@ -3049,34 +3056,47 @@ impl Drop for ExecutionGuard {
         let _guard = match locked {
             Ok(guard) => guard,
             // Another command holds the lock past RELEASE_GRACE: the next lifecycle command
-            // applies this record. Without it the execution stays recorded (and the session
-            // busy) while this process lives.
+            // applies this record.
             Err(e) if e.code == "lock_busy" => {
                 let completion = Completion { session: self.session_id.clone(), token: self.token.clone(), pid: std::process::id(), completed_at };
                 let path = completions_dir(&ctx.state, &ctx.root).join(format!("{}.json", self.token));
-                if let Err(e) = write_json(&path, &completion) {
-                    eprintln!("stack: cannot record that this command finished: {e}");
-                }
-                return;
+                return write_json(&path, &completion);
             }
-            Err(e) => {
-                eprintln!("stack: cannot finish execution lease: {e}");
-                return;
-            }
+            Err(e) => return Err(e),
         };
-        let Ok(Some(mut session)) = load(&ctx) else {
-            return;
+        // No session, or another generation's: nothing of this execution is recorded.
+        let Some(mut session) = load(&ctx)? else {
+            return Ok(());
         };
         if session.id != self.session_id {
-            return;
+            return Ok(());
         }
         session.active_executions.shift_remove(&self.token);
         if let Some(lease) = session.lease.as_mut() {
             lease.renewed_at = completed_at;
         }
-        if let Err(e) = save(&ctx, &session) {
-            eprintln!("stack: cannot finish execution lease: {e}");
+        save(&ctx, &session)
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.release() {
+            eprintln!("stack: {}", unreleased(&e));
         }
+    }
+}
+
+/// What a failed release means for the caller.
+pub fn unreleased(e: &StackError) -> String {
+    format!("this command is still recorded as running ({e}); `up` and `restart` report session_busy while this process lives, and `stack down` clears it")
+}
+
+impl ExecPlan {
+    /// Forget the execution now, before reporting the command's result: an error says the
+    /// session may still record it.
+    pub fn finish(&mut self) -> Result<()> {
+        self.execution.as_mut().map_or(Ok(()), ExecutionGuard::release)
     }
 }
 

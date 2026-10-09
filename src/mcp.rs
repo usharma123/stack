@@ -465,14 +465,22 @@ fn captured(args: &Value, ctx: &Ctx, plan: impl FnOnce() -> Result<session::Exec
             .unwrap_or(DEFAULT_EXEC_TIMEOUT),
     );
     let (plan, _deadline) = session::plan_within(Some(timeout), "raise timeout_secs", plan)?;
-    let result = run_captured(ctx, &plan, timeout)?;
-    // Released here, under the call's deadline (with the grace the release takes for itself),
-    // before the result is returned and the next call can start the stack again.
-    drop(plan);
+    let mut plan = plan;
+    let mut result = run_captured(ctx, &plan, timeout)?;
+    // Released here, before the result is returned and the next call can start the stack
+    // again; a release that could not be recorded is reported with the command's own result.
+    finish(&mut plan, &mut result);
     if result["timed_out"] == true {
         return Err(timed_out(timeout, result, "raise timeout_secs"));
     }
     Ok(result)
+}
+
+/// Release `plan`'s execution, adding a warning to `result` when that could not be recorded.
+pub fn finish(plan: &mut session::ExecPlan, result: &mut Value) {
+    if let Err(e) = plan.finish() {
+        result["warnings"] = json!([session::unreleased(&e)]);
+    }
 }
 
 /// A command stack killed at its deadline did not do its job: `timed_out`, with the captured
