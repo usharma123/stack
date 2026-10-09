@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all four routes and skills sync are integrated. Independent review is in progress.
+Status: all routes are integrated; remediation of Astra round 1 is in progress.
 
 ## Scope and base
 
@@ -169,4 +169,26 @@ in both inherited code and additions; it is not a repository CI gate.
 Astra round 1 reviews exact implementation commit `e90a7fe` against the DX base in a separate,
 read-only checkout. The brief includes all four routes, skills sync, integration validation,
 prior template and redaction findings, responses, and unresolved installation and sync
-failure questions. Its verdict and any subsequent remediation rounds are pending.
+failure questions. Astra requested changes with five findings:
+
+| Finding | Evidence | Remediation ownership |
+|---|---|---|
+| P1 service-version template boundary | Source-confirmed service validation and scratch-write gap; prior real-mise template behavior | Opus template-boundary worker |
+| P2 skill links deleted on discovery failure | Repeated install with fake-provider query failure removed link and registry record | Opus skills worker |
+| P2 required runtime platform checked only at install | Fake-provider fixture allowed exec, status, and inspect on an unlisted runtime | Opus artifact-policy worker |
+| P2 provider gate after writing frozen compile | Fake mise 2026.9.15 refused install after replacing generated config | Opus artifact-policy worker |
+| P2 changed options skip artifact reconciliation | Changed fnox identity kept the release and omitted a mise lock request | Opus artifact-policy worker |
+
+The skills worker also aligns the MCP description with the documented parsed stdout/stderr
+redaction guarantee. Public key-name metadata can coincide with a value; the current blanket
+promise about all result fields is inaccurate. Astra's focused redaction probes found no
+additional leak in the parsed streams.
+
+All three remediation workers start from `32484f0` in isolated worktrees. They add regressions
+and atomic commits before parent integration and a new Astra round. Review evidence is retained
+at `/tmp/stack-astra-r1.3yPpUt/proofs.json` and `probe.py`. The first finding remains source-
+confirmed rather than a claimed fresh end-to-end exploit reproduction.
+
+Astra's independent narrow suites passed 327 tests. Its optional upstream investigation
+returned no findings because the provider refused that research task. Backend/native-option
+identity and libc/platform questions are unverified concerns, not established defects.
