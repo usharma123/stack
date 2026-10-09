@@ -4046,6 +4046,54 @@ fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordina
 }
 
 #[test]
+fn a_mise_too_old_for_the_lock_fails_install_and_up_before_ports_identities_or_config_change() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[services.web]\nrun='true'\n");
+    let platform = stack::artifacts::current_platform();
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(&platform).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\n").unwrap();
+    fixture.ok(&["compile"]);
+    // A fresh machine with a committed v3 lock: no reservations, an earlier generated config.
+    for f in ["state/ports.json", "state/identities.json", "app/.config/mise/mise.lock"] {
+        let _ = fs::remove_file(fixture.dir.path().join(f));
+    }
+    let config = fixture.dir.path().join("app/.config/mise/conf.d/stack.toml");
+    fs::write(&config, "# an earlier generated config must survive the failure\n").unwrap();
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.15 macos-arm64 (2026-09-15)\n").unwrap();
+    let before = snapshot(&fixture);
+    assert!(before.keys().all(|f| !f.ends_with("ports.json")), "{:?}", before.keys());
+
+    let check = |e: &Value, context: &str| {
+        assert_eq!(e["code"], "provider_outdated", "{context}: {e}");
+        assert!(e["message"].as_str().unwrap().contains("2026.9.16"), "{context}: {e}");
+        let progress = e["details"].as_array().unwrap().iter().find(|d| d.get("steps").is_some()).unwrap_or_else(|| panic!("{context}: {e}"));
+        assert_eq!(progress["changed"], false, "{context}");
+        let last = progress["steps"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["step"].as_str(), last["status"].as_str()), (Some("install"), Some("failed")), "{context}: {e}");
+        assert!(progress["steps"].as_array().unwrap().iter().all(|s| s["step"] != "compile"), "compile never completed: {e}");
+    };
+    let calls = mise_log(&fixture).len();
+    for args in [&["--json", "install"][..], &["--json", "up"]] {
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        check(&json_result(&out)["error"], &format!("{args:?}"));
+    }
+    let results = fixture.mcp(&[("stack_install", json!({})), ("stack_up", json!({}))], &[]);
+    for (i, result) in results.iter().enumerate() {
+        check(&result["structuredContent"]["error"], &format!("mcp call {i}"));
+    }
+    let log = &mise_log(&fixture)[calls..];
+    assert_eq!(log.lines().collect::<Vec<_>>(), ["version"; 4], "one release check per command and nothing else");
+    assert_eq!(snapshot(&fixture), before, "no reservation, generated config, rendered lock or session");
+
+    // The release the lock needs: the same install now publishes and installs.
+    fs::write(fixture.dir.path().join("mise-version"), "2026.9.16 macos-arm64 (2026-09-16)\n").unwrap();
+    fixture.ok(&["install"]);
+    assert!(fixture.dir.path().join("state/ports.json").exists());
+    assert!(!fs::read_to_string(&config).unwrap().contains("earlier"));
+    assert!(fixture.dir.path().join("app/.config/mise/mise.lock").exists());
+}
+
+#[test]
 fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so() {
     let (fixture, _) = artifact_fixture("");
     fs::remove_file(fixture.dir.path().join("app/.config/mise/mise.lock")).unwrap();

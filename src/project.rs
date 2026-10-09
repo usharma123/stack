@@ -223,8 +223,13 @@ fn lock_requirement_for(reason: &str) -> mise::Requirement {
 
 /// Everything `install`, `up` and `doctor` check `mise version` against for this report.
 pub fn install_requirements(report: &Report) -> Vec<mise::Requirement> {
-    let mut out = provider_requirements(&report.stack);
-    out.extend(lock_requirement(report.lock.as_ref()));
+    requirements(&report.stack, report.lock.as_ref())
+}
+
+/// What the configuration and the lock it is compiled against need of mise.
+pub fn requirements(stack: &Composed, lock: Option<&Lockfile>) -> Vec<mise::Requirement> {
+    let mut out = provider_requirements(stack);
+    out.extend(lock_requirement(lock));
     out
 }
 

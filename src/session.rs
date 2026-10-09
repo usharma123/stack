@@ -42,8 +42,8 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn compile(&self, write: bool) -> Result<Report> {
-        project::compile_locked(&Options {
+    fn options(&self, write: bool) -> Options {
+        Options {
             root: self.root.clone(),
             mode: Mode::Frozen,
             write,
@@ -52,7 +52,25 @@ impl Ctx {
             reassign_ports: false,
             resolver: None,
             locker: None,
+        }
+    }
+
+    fn compile(&self, write: bool) -> Result<Report> {
+        project::compile_locked(&self.options(write))
+    }
+
+    /// The locked, writing compile of `install` and `up`. mise must be new enough for the
+    /// configuration and the embedded lock before anything is published: port and identity
+    /// reservations, the generated config. A provider failure belongs to the `install` step,
+    /// whose requirement it is; anything else to `compile`.
+    fn compile_to_install(&self) -> std::result::Result<Report, (&'static str, StackError)> {
+        let provider_failed = std::cell::Cell::new(false);
+        project::compile_checked(&self.options(true), &|stack, lock| {
+            let checked = mise::require(&self.root, &project::requirements(stack, Some(lock))).map(drop);
+            provider_failed.set(checked.is_err());
+            checked
         })
+        .map_err(|e| (if provider_failed.get() { "install" } else { "compile" }, e))
     }
 
     fn session_file(&self) -> PathBuf {
@@ -647,14 +665,15 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             false,
         ));
     }
-    let report = match ctx.compile(true) {
+    // A mise too old for what the configuration asks would silently ignore it: checked before
+    // the compile writes anything. The artifact policy is checked, and the provider's lock
+    // rendered from stack.lock, before any install.
+    let report = match ctx.compile_to_install() {
         Ok(r) => r,
-        Err(e) => return Err(steps.fail("compile", e, false)),
+        Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
 
-    // A mise too old for what the configuration asks would silently ignore it. The artifact
-    // policy is checked, and the provider's lock rendered from stack.lock, before any install.
     let plan = match prepare_install(ctx, &report) {
         Ok(plan) => plan,
         Err(e) => return Err(steps.fail("install", e, false)),
@@ -1060,9 +1079,9 @@ pub struct InstallReport {
 pub fn install(ctx: &Ctx) -> Result<InstallReport> {
     let mut steps = Steps::default();
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    let report = match ctx.compile(true) {
+    let report = match ctx.compile_to_install() {
         Ok(r) => r,
-        Err(e) => return Err(steps.fail("compile", e, false)),
+        Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
     let plan = match prepare_install(ctx, &report) {
@@ -1098,10 +1117,10 @@ struct InstallPlan {
 /// Stated with every install: what `verified` means for releases already on the machine.
 const INSTALL_BOUNDARY: &str = "mise checks the recorded checksum (and packslip signer) of artifacts it downloads; a release already installed on this machine is reported installed without being checked again";
 
-/// Before anything installs: mise new enough for the configuration and the lock, the artifact
-/// policy met on this platform, and `.config/mise/mise.lock` rendered from stack.lock.
+/// Before anything installs: the artifact policy met on this platform, and
+/// `.config/mise/mise.lock` rendered from stack.lock. The provider release was checked before
+/// the compile wrote anything (`Ctx::compile_to_install`).
 fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
-    mise::require(&ctx.root, &project::install_requirements(report))?;
     let platform = artifacts::current_platform();
     let policy = &report.artifact_policy;
     let pins = report.pins();
