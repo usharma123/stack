@@ -192,3 +192,25 @@ confirmed rather than a claimed fresh end-to-end exploit reproduction.
 Astra's independent narrow suites passed 327 tests. Its optional upstream investigation
 returned no findings because the provider refused that research task. Backend/native-option
 identity and libc/platform questions are unverified concerns, not established defects.
+
+### Round 1 skills remediation
+
+Worker commits `0f1b481` and `ca6b72d` were integrated as `3a223fe` and `8b4e221`.
+Sync now distinguishes releases whose skills were established from ones a failed query,
+missing install, or missing pin leaves unsettled. While any release is unsettled, intact
+owned links absent from the available list remain owned and are reported under `preserved`.
+Authoritative duplicate names can still be removed, available skills can still be linked,
+and foreign/retargeted paths retain their existing protection. When discovery recovers,
+stale owned links are pruned. A failed discovery with no other changes leaves registry bytes
+unchanged.
+
+The ownership registry has no per-tool attribution, so one unsettled release conservatively
+defers removal of every otherwise stale link. This favors retained, reported links during
+provider trouble; a later settled sync completes pruning. No registry-format migration was
+added. MCP and user-documentation redaction promises now name parsed stdout/stderr and public
+key metadata explicitly.
+
+Parent integration checks passed 11 binary skills tests and 17 skills unit tests. The worker
+also passed its complete 344-test Rust suite, Clippy, and 14 documentation tests. These new
+failure-path results use the fake provider, including a replay of Astra's proof; no additional
+real-tool smoke is claimed. Template and artifact-policy remediation remain in progress.
