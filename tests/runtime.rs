@@ -4338,6 +4338,36 @@ fn refused_downloads_and_signers_are_artifact_mismatch_and_other_failures_instal
 }
 
 #[test]
+fn a_task_runs_against_the_lock_rendered_from_stack_lock_never_a_missing_or_stale_project_file() {
+    let (fixture, _) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let app = fixture.dir.path().join("app");
+    let expected = stack::artifacts::rendered(stack::lock::read(&app).unwrap().as_ref()).unwrap();
+    assert!(expected.contains("sha256:0bbe619e"), "{expected}");
+    let project_lock = app.join(".config/mise/mise.lock");
+    let run_lock = fixture.dir.path().join("run-lock");
+    // A fresh checkout (nothing rendered), then a lock rendered from an earlier stack.lock.
+    for project in [None, Some("# stale\n[[tools.jq]]\nversion = \"1.7.1\"\n")] {
+        match project {
+            None => {
+                let _ = fs::remove_file(&project_lock);
+            }
+            Some(text) => fs::write(&project_lock, text).unwrap(),
+        }
+        for route in ["cli", "mcp"] {
+            let _ = fs::remove_file(&run_lock);
+            let data = match route {
+                "cli" => json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"].clone(),
+                _ => fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"]["data"].clone(),
+            };
+            assert_eq!(data["exit_code"], 0, "{route}: {data}");
+            assert_eq!(fs::read_to_string(&run_lock).unwrap(), expected, "{route}, project lock {project:?}");
+        }
+        // The project's own file is left as it was.
+        assert_eq!(fs::read_to_string(&project_lock).ok().as_deref(), project);
+    }
+}
+
+#[test]
 fn a_task_whose_tools_mise_refuses_gets_stacks_remedy_beside_mises_own_output() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n[tasks.fail]\nrun='false'\n");
     let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: GitHub's current digest for jq matches this download (asset updated t1, release published t2), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n";

@@ -2085,16 +2085,18 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             checks
         }
     };
-    // Under the lock, from what this compile wrote; removed if planning fails after this. The
-    // `[env]` values just read from the project's file stay authoritative: the copy declares
-    // each one the plan holds (not the provider selection stack sets itself) as the value the
-    // command inherits, so `mise run` neither evaluates it again against the copy nor lets a
-    // tool's environment replace it.
+    // Under the lock, from what this compile wrote, with the provider lock rendered from the
+    // stack.lock it validated (never the project's rendered file, which may be missing or
+    // stale); removed if planning fails after this. The `[env]` values just read from the
+    // project's file stay authoritative: the copy declares each one the plan holds (not the
+    // provider selection stack sets itself) as the value the command inherits, so `mise run`
+    // neither evaluates it again against the copy nor lets a tool's environment replace it.
     let selection = mise::config_env(&ctx.root);
     let mut task_config = match target {
         Target::Task { .. } => Some(TaskConfig::capture(
             &ctx.root,
             &ctx.cache,
+            artifacts::rendered(report.lock.as_ref()).as_deref(),
             |key| env.get(key).filter(|_| !selection.contains_key(key)).cloned(),
             || mise::shell_expands(&ctx.root),
         )?),

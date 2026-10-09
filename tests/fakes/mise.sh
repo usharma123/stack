@@ -137,6 +137,9 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     echo "config=$config root=${MISE_GLOBAL_CONFIG_ROOT-unset} dir=$(pwd -P)" >>"$REVIEW_FIXTURE/run.log"
     # The generated config the task ran from: its definition as stack planned it.
     cp "$config" "$REVIEW_FIXTURE/run-config" 2>/dev/null
+    # The provider lock mise finds beside it, if any.
+    rm -f "$REVIEW_FIXTURE/run-lock"
+    cp "${config%/conf.d/*}/mise.lock" "$REVIEW_FIXTURE/run-lock" 2>/dev/null
     # Like mise, link the configuration it loaded under its state directory, when a test asks.
     if test -f "$REVIEW_FIXTURE/track-configs"; then
       mkdir -p "$MISE_STATE_DIR/tracked-configs"

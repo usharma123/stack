@@ -1034,19 +1034,22 @@ pub fn has_entries(embedded: Option<&Table>) -> bool {
     embedded.and_then(|e| e.get(TOOLS)).and_then(Value::as_table).is_some_and(|t| !t.is_empty())
 }
 
+/// The mise.lock `lock` stands for, or `None` when it embeds nothing (version 2, or no pins).
+pub fn rendered(lock: Option<&Lockfile>) -> Option<String> {
+    lock.and_then(|l| l.provider_lock.as_ref()).filter(|e| has_entries(Some(e))).map(render)
+}
+
 /// Write `.config/mise/mise.lock` from the committed lock, or remove a stale one when the lock
 /// embeds nothing (version 2, or no pins). The file is stack's, generated and gitignored.
 pub fn write_rendered(root: &Path, lock: Option<&Lockfile>) -> Result<()> {
     let path = rendered_path(root);
-    let embedded = lock.and_then(|l| l.provider_lock.as_ref()).filter(|e| has_entries(Some(e)));
-    let Some(embedded) = embedded else {
+    let Some(text) = rendered(lock) else {
         return match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io_error(path.display(), e)),
         };
     };
-    let text = render(embedded);
     if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
         return Ok(());
     }

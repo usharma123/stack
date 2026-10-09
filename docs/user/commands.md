@@ -86,7 +86,9 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
   than services to skip. `unknown_task` lists the tasks the project defines. The task runs from
   the configuration as it was when the run was planned, so a `compile` while it starts or runs
-  does not change its body, env or tools; the next run sees the change. Tasks and `exec`
+  does not change its body, env or tools; the next run sees the change. Its provider lock is
+  rendered from the stack.lock that plan validated, never read from a `.config/mise/mise.lock`
+  left in the project (missing in a fresh checkout, stale after a pull). Tasks and `exec`
   receive `STACK_SESSION` only while a session exists; an `[env]` that declares it is refused
   with `invalid_env`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the

@@ -6,13 +6,15 @@
 //! file in between. Without a copy, a saved plan would run whatever definition is current then,
 //! with the grant and service checks of the one it was planned from.
 //!
-//! [`TaskConfig::capture`] copies the generated configuration, and the provider lock rendered
-//! next to it, under the planning lock, to `<cache>/task-config/<pid>-<random>/` (a directory
-//! only this user can read, removed when the [`TaskConfig`] is dropped: at command completion,
-//! timeout or error, or when planning fails after the copy). The copy keeps the layout of the
-//! project's files (`.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`), so mise finds
-//! the lock beside it as it would in the project. Only what compile already wrote is copied:
-//! granted values are never in either file.
+//! [`TaskConfig::capture`] copies the generated configuration under the planning lock to
+//! `<cache>/task-config/<pid>-<random>/` (a directory only this user can read, removed when the
+//! [`TaskConfig`] is dropped: at command completion, timeout or error, or when planning fails
+//! after the copy), with the provider lock beside it rendered from the stack.lock the same
+//! compile validated. The project's own `.config/mise/mise.lock` is never read: it may be
+//! missing (a fresh checkout) or stale (written from an earlier stack.lock), and mise checks
+//! downloads against whatever lock it finds. The copy keeps the layout of the project's files
+//! (`.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`), so mise finds the lock beside
+//! it as it would in the project. Granted values are never in either file.
 //!
 //! The copy keeps every plain `[env]` variable the plan holds, but declares it as the value
 //! the command inherits (`{{ env["KEY"] }}`), never as the project's template. Planning read
@@ -64,26 +66,23 @@ pub struct TaskConfig {
 }
 
 impl TaskConfig {
-    /// Copy `root`'s generated configuration and rendered lock. Call it under the project lock,
-    /// after the compile that planned the task and the environment read from what it wrote, so
-    /// the copy is what that compile wrote. `planned` gives the value the plan holds (and the
+    /// Copy `root`'s generated configuration, with `lock` (the provider lock rendered from the
+    /// validated stack.lock, `None` when it embeds nothing) beside it. Call it under the project
+    /// lock, after the compile that planned the task and the environment read from what it
+    /// wrote, so the copy is what that compile wrote and validated. `planned` gives the value the plan holds (and the
     /// command inherits) for an `[env]` variable mise evaluated; such a variable is declared as
     /// that inherited value. `shell_expands` answers whether mise expands `$VAR` in `[env]`
     /// values; it is asked only when a planned value contains a `$`.
     pub fn capture(
         root: &Path,
         cache: &Path,
+        lock: Option<&str>,
         planned: impl Fn(&str) -> Option<String>,
         shell_expands: impl FnOnce() -> Result<bool>,
     ) -> Result<Self> {
         let path = super::mise::output_path(root);
         let config = std::fs::read(&path).map_err(|e| io_error(path.display(), e))?;
         let config = inheriting_planned_env(&config, planned, shell_expands, &path)?;
-        let lock = match std::fs::read(crate::artifacts::rendered_path(root)) {
-            Ok(lock) => Some(lock),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(io_error(crate::artifacts::rendered_path(root).display(), e)),
-        };
         let parent = cache.join(PURPOSE);
         std::fs::create_dir_all(&parent).map_err(|e| io_error(parent.display(), e))?;
         // Absolute: the command runs from the project root, not from where stack started.
@@ -108,7 +107,7 @@ impl TaskConfig {
             .map_err(|e| io_error(parent.display(), e))?;
         write_new(&dir.path().join(CONFIG), &config)?;
         if let Some(lock) = lock {
-            write_new(&dir.path().join(LOCK), &lock)?;
+            write_new(&dir.path().join(LOCK), lock.as_bytes())?;
         }
         Ok(Self { dir, root: root.to_path_buf(), parent, tracked: None })
     }
@@ -271,7 +270,7 @@ mod tests {
     fn the_copy_is_private_unchanged_by_later_compiles_and_removed_on_drop() {
         let root = project("[tasks.a]\nrun = 'version-one'\n", Some("lockfile_version = 3\n"));
         let cache = tempfile::tempdir().unwrap();
-        let copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), Some("lockfile_version = 3\n"), |_| None, never).unwrap();
         std::fs::write(root.path().join(CONFIG), "[tasks.a]\nrun = 'version-two'\n").unwrap();
         std::fs::remove_file(root.path().join(LOCK)).unwrap();
         assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), "[tasks.a]\nrun = 'version-one'\n");
@@ -292,10 +291,26 @@ mod tests {
     }
 
     #[test]
+    fn the_lock_beside_the_copy_is_the_one_given_never_the_projects_rendered_file() {
+        // A stale rendered lock in the project (an earlier stack.lock's checksum) is not copied.
+        let root = project("[tasks.a]\nrun = 'x'\n", Some("stale = 'project file'\n"));
+        let cache = tempfile::tempdir().unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), Some("validated = 'stack.lock'\n"), |_| None, never).unwrap();
+        assert_eq!(std::fs::read_to_string(copy.dir().join(LOCK)).unwrap(), "validated = 'stack.lock'\n");
+        // A stack.lock that embeds nothing gives no lock, whatever the project holds.
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
+        assert!(!copy.dir().join(LOCK).exists());
+        // None rendered in the project (a fresh checkout): the given lock is still beside the copy.
+        std::fs::remove_file(root.path().join(LOCK)).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), Some("validated = 'stack.lock'\n"), |_| None, never).unwrap();
+        assert_eq!(std::fs::read_to_string(copy.dir().join(LOCK)).unwrap(), "validated = 'stack.lock'\n");
+    }
+
+    #[test]
     fn concurrent_copies_are_distinct_and_a_missing_lock_is_not_invented() {
         let root = project("[tasks.a]\nrun = 'x'\n", None);
         let cache = tempfile::tempdir().unwrap();
-        let (a, b) = (TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap(), TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap());
+        let (a, b) = (TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap(), TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap());
         assert_ne!(a.dir(), b.dir());
         assert!(!a.dir().join(LOCK).exists());
         drop(a);
@@ -315,7 +330,7 @@ mod tests {
         let mut live = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         std::fs::create_dir_all(parent.join(format!("{}-running", live.id()))).unwrap();
         std::fs::create_dir_all(parent.join("unrelated")).unwrap();
-        let _copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let _copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         let kept = parent.join(format!("{}-running", live.id())).exists();
         let _ = live.kill();
         let _ = live.wait();
@@ -338,7 +353,7 @@ mod tests {
         link("killed", &parent.join("1-gone/.config/mise/conf.d/stack.toml"));
         link("project", &root.path().join(CONFIG));
         link("elsewhere", &state.path().join("missing.toml"));
-        let mut copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let mut copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         let state_dir = state.path().to_string_lossy().into_owned();
         copy.track_with(|key| (key == "MISE_STATE_DIR").then(|| state_dir.clone()));
         assert!(!tracked.join("killed").exists() && tracked.join("killed").symlink_metadata().is_err());
@@ -355,7 +370,7 @@ mod tests {
         let root = project(config, None);
         let cache = tempfile::tempdir().unwrap();
         let planned = |key: &str| ["ASSET", "PATH", "x\"y", "_", "MISSING"].contains(&key).then(|| format!("{key}-secret-planned-value"));
-        let copy = TaskConfig::capture(root.path(), cache.path(), planned, never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, planned, never).unwrap();
         let text = std::fs::read_to_string(copy.config()).unwrap();
         assert!(!text.contains("planned-value"), "a value is never written into the copy: {text}");
         let held: toml::Table = toml::from_str(&text).unwrap();
@@ -371,10 +386,10 @@ mod tests {
         assert_eq!(keys, ["ASSET", "KEPT", "_"]);
 
         // Nothing planned: the bytes compile wrote. Only PATH planned: no `[env]` at all.
-        let copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), config);
         let root = project("[env]\nPATH = \"a\"\n[tasks.a]\nrun = \"x\"\n", None);
-        let copy = TaskConfig::capture(root.path(), cache.path(), |_| Some("a".into()), never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| Some("a".into()), never).unwrap();
         let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
         assert!(!held.contains_key("env") && held["tasks"]["a"]["run"].as_str() == Some("x"));
     }
@@ -385,7 +400,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let planned = |key: &str| Some(if key == "A" { "${HOME}".to_string() } else { "plain".into() });
         let declared = |expands: bool| {
-            let copy = TaskConfig::capture(root.path(), cache.path(), planned, || Ok(expands)).unwrap();
+            let copy = TaskConfig::capture(root.path(), cache.path(), None, planned, || Ok(expands)).unwrap();
             let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
             let env = held["env"].as_table().unwrap();
             (env["A"].as_str().unwrap().to_string(), env["B"].as_str().unwrap().to_string())
@@ -393,8 +408,8 @@ mod tests {
         assert_eq!(declared(true), (r#"{{ env["A"] | replace(from="$", to="$$") }}"#.into(), r#"{{ env["B"] }}"#.into()));
         assert_eq!(declared(false), (r#"{{ env["A"] }}"#.into(), r#"{{ env["B"] }}"#.into()));
         // No `$` in any planned value: the setting is not asked. A failure to ask is the error.
-        assert!(TaskConfig::capture(root.path(), cache.path(), |_| Some("plain".into()), never).is_ok());
-        let err = TaskConfig::capture(root.path(), cache.path(), planned, || Err(StackError::new("provider_failed", "asked"))).unwrap_err();
+        assert!(TaskConfig::capture(root.path(), cache.path(), None, |_| Some("plain".into()), never).is_ok());
+        let err = TaskConfig::capture(root.path(), cache.path(), None, planned, || Err(StackError::new("provider_failed", "asked"))).unwrap_err();
         assert_eq!((err.code, err.message.as_str()), ("provider_failed", "asked"));
         assert!(std::fs::read_dir(cache.path().join(PURPOSE)).unwrap().next().is_none());
     }
@@ -403,7 +418,7 @@ mod tests {
     fn an_unreadable_generated_configuration_is_refused_before_anything_is_copied() {
         let root = project("[env\n", None);
         let cache = tempfile::tempdir().unwrap();
-        let err = TaskConfig::capture(root.path(), cache.path(), |_| Some("v".into()), never).unwrap_err();
+        let err = TaskConfig::capture(root.path(), cache.path(), None, |_| Some("v".into()), never).unwrap_err();
         assert_eq!(err.code, "provider_failed");
         assert!(!cache.path().join(PURPOSE).exists());
     }
@@ -415,7 +430,7 @@ mod tests {
         let home = home.path().canonicalize().unwrap();
         let tracked = home.join("mise-state/tracked-configs");
         std::fs::create_dir_all(&tracked).unwrap();
-        let mut copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let mut copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         let home_dir = home.to_string_lossy().into_owned();
         // A literal `~`, as mise reads it: beneath HOME, not beneath the project root.
         copy.track_with(|key| match key {
@@ -435,7 +450,7 @@ mod tests {
     fn a_missing_generated_configuration_is_an_error_and_leaves_nothing() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let err = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap_err();
+        let err = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap_err();
         assert_eq!(err.code, "io");
         assert!(!cache.path().join(PURPOSE).exists());
     }
