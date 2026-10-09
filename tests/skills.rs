@@ -436,7 +436,7 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
 const SYNC_PROJECT: &str = "[tools]\nfnox = \"1.39\"\nmbx = \"1.22.0\"\n\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n\n[skills]\ndir = \".claude/skills\"\n";
 
 fn step<'a>(report: &'a Value, name: &str) -> &'a Value {
-    report["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == name).unwrap_or_else(|| panic!("no {name} step: {report}"))
+    report["data"]["steps"].as_array().unwrap_or_else(|| panic!("no steps: {report}")).iter().find(|s| s["step"] == name).unwrap_or_else(|| panic!("no {name} step: {report}"))
 }
 
 #[test]
@@ -508,4 +508,76 @@ fn skills_dir_is_project_only_and_must_stay_inside_the_project() {
     let v = f.json(&["compile"]);
     assert_eq!(v["error"]["code"], "bundle_invalid", "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("skills"), "{v}");
+}
+
+fn names(list: &Value) -> Vec<&str> {
+    list.as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap()).collect()
+}
+
+#[test]
+fn repeated_installs_keep_stacks_links_until_discovery_settles_then_prune() {
+    let project = "[tools]\nfnox = \"1.39\"\nmbx = \"1.22.0\"\n\n[skills]\ndir = \".claude/skills\"\n";
+    let f = Fixture::new(project);
+    let v = f.json(&["install"]);
+    assert_eq!(names(&step(&v, "skills")["detail"]["linked"]), ["fnox", "mbx", "mbx-advanced"], "{v}");
+    let dir = f.path("app/.claude/skills");
+    let record = fs::read(dir.join(".stack-skills.json")).unwrap();
+    let links = || -> BTreeMap<String, PathBuf> {
+        fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_symlink()).map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), fs::read_link(&p).unwrap())).collect()
+    };
+    let linked = links();
+    assert_eq!(linked.len(), 3);
+    let unchanged = |v: &Value, why: &str| {
+        let detail = &step(v, "skills")["detail"];
+        assert_eq!(names(&detail["preserved"]), ["fnox", "mbx", "mbx-advanced"], "{why}: {v}");
+        assert!(detail["pruned"].as_array().unwrap().is_empty() && detail["kept"].as_array().unwrap().is_empty(), "{why}: {v}");
+        assert_eq!(links(), linked, "{why}: links changed");
+        assert_eq!(fs::read(dir.join(".stack-skills.json")).unwrap(), record, "{why}: the ownership record changed");
+    };
+
+    // The provider fails, twice: install still succeeds and removes nothing.
+    f.touch("skills-fail");
+    for _ in 0..2 {
+        let v = f.json(&["install"]);
+        assert_eq!(step(&v, "skills")["status"], "warning", "{v}");
+        assert_eq!(step(&v, "skills")["detail"]["warnings"][0]["code"], "skills_unavailable");
+        unchanged(&v, "provider failure");
+    }
+    fs::remove_file(f.path("skills-fail")).unwrap();
+
+    // The provider hangs past its deadline: the same.
+    f.touch("skills-hang");
+    let v = f.json(&["install"]);
+    assert!(step(&v, "skills")["detail"]["warnings"][0]["message"].as_str().unwrap().contains("did not answer"), "{v}");
+    unchanged(&v, "provider timeout");
+    let pid = fs::read_to_string(f.path("skills-hang-pid")).unwrap();
+    assert!(!Command::new("kill").args(["-0", pid.trim()]).stderr(Stdio::null()).status().unwrap().success(), "the hanging query outlived its deadline");
+    fs::remove_file(f.path("skills-hang")).unwrap();
+
+    // mbx leaves the stack while the pinned fnox is not installed: whether fnox still ships the
+    // skills behind these links is unknown, so none is removed yet.
+    fs::write(f.path("app/stack.toml"), "[tools]\nfnox = \"1.39\"\n\n[skills]\ndir = \".claude/skills\"\n").unwrap();
+    f.ok(&["compile"]);
+    let ls = fs::read_to_string(f.path("ls.json")).unwrap();
+    let mut missing: Value = serde_json::from_str(&ls).unwrap();
+    for release in missing["fnox"].as_array_mut().unwrap() {
+        release["installed"] = json!(false);
+    }
+    fs::write(f.path("ls.json"), missing.to_string()).unwrap();
+    let v = f.json(&["install"]);
+    let detail = &step(&v, "skills")["detail"];
+    assert!(detail["preserved"][0]["reason"].as_str().unwrap().contains("fnox@1.39.0"), "{v}");
+    unchanged(&v, "pinned release not installed");
+
+    // Discovery answers for every pin again: stack's links to mbx's skills go, fnox's stays.
+    fs::write(f.path("ls.json"), ls).unwrap();
+    let v = f.json(&["install"]);
+    let detail = &step(&v, "skills")["detail"];
+    assert_eq!(step(&v, "skills")["status"], "ok", "{v}");
+    assert_eq!(names(&detail["pruned"]), ["mbx", "mbx-advanced"], "{v}");
+    assert!(detail["preserved"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(detail["unchanged"], json!(["fnox"]));
+    assert_eq!(links().keys().collect::<Vec<_>>(), ["fnox"]);
+    let registry: Value = serde_json::from_slice(&fs::read(dir.join(".stack-skills.json")).unwrap()).unwrap();
+    assert_eq!(registry["links"].as_object().unwrap().keys().collect::<Vec<_>>(), ["fnox"]);
 }

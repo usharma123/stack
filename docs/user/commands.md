@@ -29,7 +29,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   `--all-skills` also lists the provider's (Pitchfork's) under `provider_skills`.
 - With `[skills] dir` in stack.toml, `install` and `up` add a `skills` step after installing
   that links available skills into that directory. Its problems are warnings (step status
-  `warning`, top-level `warnings`), never failures. See [agent skills](skills.md).
+  `warning`, top-level `warnings`), never failures. While mise cannot answer for every pinned
+  release, it removes none of its links (`preserved`). See [agent skills](skills.md).
 - `install` is `up` without the start: compile in locked mode, trust the generated config, check
   the supervisor socket path, install every pinned tool and preset service binary, checked
   against stack.lock's artifact checksums where it has them (see

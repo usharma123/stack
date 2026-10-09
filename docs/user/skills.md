@@ -101,6 +101,14 @@ and keep the links out of version control; they point into one user's mise insta
   under `skipped`.
 - Links to skills no longer available (a tool removed, a release changed) are removed if they
   are still stack's (`pruned`). A directory with nothing to link is not created.
+- Removal needs discovery to have settled every pinned release: the release is installed and
+  mise listed its skills, or it declares none. When mise does not answer (an older mise, a
+  timeout, unreadable output), a pinned release is not installed, or stack.lock pins nothing
+  yet, stack's links that no available skill names are left in place, stay stack's, and are
+  listed under `preserved` with the releases that were not settled; `.stack-skills.json` is
+  not rewritten for them. Stack does not record which release a link came from, so one
+  unsettled release defers every removal until a sync that settles them all. New skills are
+  still linked, and a name two releases declare is still removed.
 - A `.stack-skills.json` that is a link, not a regular file, malformed, of an unknown version,
   or naming something other than a plain skill name makes stack change nothing in the
   directory; move it aside to start afresh.

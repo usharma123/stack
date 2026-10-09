@@ -14,7 +14,9 @@
 //!
 //! Sync (`[skills] dir`, project only) links each available skill into a directory inside the
 //! project and records what it linked in `<dir>/.stack-skills.json`. Only a symbolic link whose
-//! current target is the one recorded is ever replaced or removed; anything else is kept.
+//! current target is the one recorded is ever replaced or removed; anything else is kept. A link
+//! is removed only when discovery established every pinned release's skills: a provider that did
+//! not answer, or a pinned release not installed, is no evidence that a skill went away.
 
 use crate::error::{Result, StackError};
 use crate::lock::Lockfile;
@@ -93,6 +95,9 @@ pub struct Discovery {
     pub provider_skills: Vec<Skill>,
     /// `skills_unavailable: ...` when entries are unavailable.
     pub warnings: Vec<String>,
+    /// Pinned, non-provider releases whose skills discovery could not establish (`tool@version`,
+    /// or the tool when stack.lock pins none yet). Sync removes none of its links while any are.
+    pub unsettled: Vec<String>,
 }
 
 /// A pinned release and every report entry that names it.
@@ -105,6 +110,8 @@ struct Target {
     reason: Option<String>,
     /// No pin yet (as opposed to a request that names no release).
     unlocked: bool,
+    /// Never queried, but not because the pin names no release: no pin yet, or a templated one.
+    unsettled: bool,
 }
 
 /// Every tool and preset service of the report, matched to the pin stack.lock records for it.
@@ -141,6 +148,7 @@ fn targets(lock: &Lockfile, versions: &[VersionReport]) -> Vec<Target> {
         };
         out.push(Target {
             unlocked: pin.is_none() && locked.is_none(),
+            unsettled: pin.is_none() && (locked.is_none() || templated),
             version: pin.as_ref().map(|p| p.spec.version.clone()),
             pin,
             tool,
@@ -186,7 +194,15 @@ fn discover_with(
         }
     };
     let mut skills = Vec::new();
+    let mut unsettled = Vec::new();
     for t in targets {
+        // A request naming no release (`system`, `path:`) settles that it has no skill; every
+        // other entry discovery could not answer for might still declare one.
+        let label = t.version.as_ref().map_or_else(|| t.tool.clone(), |v| format!("{}@{v}", t.tool));
+        let answered = t.pin.is_some() && answer.as_ref().is_some_and(|a| a.installed(&t.tool, t.version.as_deref().unwrap_or_default()).is_some());
+        if t.origin != "provider" && (t.unsettled || (t.pin.is_some() && !answered)) {
+            unsettled.push(label);
+        }
         let base = Skill {
             tool: t.tool.clone(),
             version: t.version.clone(),
@@ -235,7 +251,7 @@ fn discover_with(
         }
     }
     let (provider_skills, skills) = skills.into_iter().partition(Skill::provider);
-    Discovery { skills, provider_skills, warnings }
+    Discovery { skills, provider_skills, warnings, unsettled }
 }
 
 /// A skill name stack accepts: it becomes a path component when linked.
@@ -478,6 +494,9 @@ pub struct SyncReport {
     pub unchanged: Vec<String>,
     /// Stack's own links to skills no longer available, removed.
     pub pruned: Vec<Value>,
+    /// Stack's own links no wanted skill names, left in place and still stack's because
+    /// discovery could not establish every pinned release's skills (`unsettled`).
+    pub preserved: Vec<Value>,
     /// Paths stack did not create, or that changed since: left alone.
     pub kept: Vec<Value>,
     /// Skills not linked, with why (duplicate names across tools).
@@ -517,8 +536,10 @@ pub fn sync(root: &Path, dir: &Path, discovery: &Discovery) -> SyncReport {
         }
     }
     let mut targets: BTreeMap<String, (&Skill, PathBuf)> = BTreeMap::new();
+    let mut duplicates = std::collections::BTreeSet::new();
     for (name, skills) in wanted {
         if skills.len() > 1 {
+            duplicates.insert(name.clone());
             let by: Vec<String> = skills.iter().map(|s| format!("{}@{}", s.tool, s.version.as_deref().unwrap_or("?"))).collect();
             report.skipped.push(json!({ "name": name, "tools": by, "reason": "more than one pinned release declares a skill by this name; neither is linked" }));
             continue;
@@ -606,11 +627,23 @@ pub fn sync(root: &Path, dir: &Path, discovery: &Discovery) -> SyncReport {
             }
         }
     }
-    // Stack's links that no wanted skill names any more.
+    // Stack's links that no wanted skill names any more. Unless discovery settled every pinned
+    // release, such a link may name a skill that is still there: it stays, and stays stack's.
+    // Which release a link came from is not recorded, so one unsettled release defers every
+    // removal until a sync that settles them all. A name two releases declare is settled.
+    let unsettled = discovery.unsettled.join(", ");
     for (name, recorded) in registry.links.iter().filter(|(n, _)| !targets.contains_key(*n)) {
         let link = path.join(name);
         match std::fs::symlink_metadata(&link) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(meta) if meta.file_type().is_symlink() && std::fs::read_link(&link).ok().as_ref() == Some(recorded) && !unsettled.is_empty() && !duplicates.contains(name) => {
+                owned.insert(name.clone(), recorded.clone());
+                report.preserved.push(json!({
+                    "name": name,
+                    "target": recorded,
+                    "reason": format!("the skills of {unsettled} could not be established; stack's link stays until a sync establishes them"),
+                }));
+            }
             Ok(meta) if meta.file_type().is_symlink() && std::fs::read_link(&link).ok().as_ref() == Some(recorded) => {
                 match std::fs::remove_file(&link) {
                     Ok(()) => report.pruned.push(json!({ "name": name, "target": recorded })),
@@ -947,7 +980,7 @@ mod tests {
 
     fn discovery(skills: Vec<Skill>) -> Discovery {
         let (provider_skills, skills) = skills.into_iter().partition(Skill::provider);
-        Discovery { skills, provider_skills, warnings: vec![] }
+        Discovery { skills, provider_skills, warnings: vec![], unsettled: vec![] }
     }
 
     fn names(values: &[Value]) -> Vec<String> {
@@ -1092,6 +1125,80 @@ mod tests {
             let path = skills.join(REGISTRY);
             if std::fs::symlink_metadata(&path).unwrap().is_dir() { std::fs::remove_dir(&path).unwrap() } else { std::fs::remove_file(&path).unwrap() }
         }
+    }
+
+    #[test]
+    fn only_releases_discovery_answered_for_are_settled() {
+        let rel = release(&["fnox"]);
+        let lock = Lockfile::new(vec![], vec![locked("fnox", None, "1.39.0"), locked("jq", None, "1.7.1"), locked("pitchfork", None, "2.29.0"), locked("node", None, "system")], vec![]);
+        let versions = [
+            version("tool", "fnox", None, Some("1.39.0"), "project"),
+            version("tool", "jq", None, Some("1.7.1"), "project"),
+            version("tool", "pitchfork", None, Some("2.29.0"), "provider"),
+            version("tool", "node", None, Some("system"), "project"),
+            version("tool", "mbx", None, None, "project"),
+        ];
+        // The provider failed: every queried release is unsettled, but not the provider's, a
+        // request naming no release, or nothing at all.
+        let d = discover_with(&lock, &versions, |_| Err("mise did not answer".into()));
+        assert_eq!(d.unsettled, ["fnox@1.39.0", "jq@1.7.1", "mbx"]);
+        // Answered: an installed release is settled with or without skills; one not installed is not.
+        let d = discover_with(&lock, &versions[..4], |_| {
+            let mut a = answer(&rel, "fnox", "1.39.0", &["fnox"]);
+            a.releases.insert("jq".into(), vec![super::Release { version: "1.7.1".into(), install_path: Some(rel.install.clone()), installed: false }]);
+            Ok(a)
+        });
+        assert_eq!(d.skills.iter().map(|s| s.status).collect::<Vec<_>>(), [Status::Available, Status::NotInstalled, Status::Unavailable]);
+        assert_eq!(d.unsettled, ["jq@1.7.1"]);
+        let d = discover_with(&lock, &versions[..1], |_| Ok(answer(&rel, "fnox", "1.39.0", &[])));
+        assert_eq!(d.skills[0].status, Status::NoSkill);
+        assert!(d.unsettled.is_empty());
+    }
+
+    #[test]
+    fn an_unsettled_discovery_removes_nothing_and_keeps_the_record_byte_for_byte() {
+        let p = project();
+        let dir = Path::new("skills");
+        let skills = p.root.join(dir);
+        let a = available("t", "a", &p.store.join("a"), "project");
+        let b = available("t", "b", &p.store.join("b"), "project");
+        sync(&p.root, dir, &discovery(vec![a.clone(), b.clone()]));
+        let record = std::fs::read(skills.join(REGISTRY)).unwrap();
+        // The provider did not answer: nothing is wanted, and nothing is known to be gone.
+        let mut failed = discovery(vec![]);
+        failed.warnings.push("skills_unavailable: mise did not answer; every skill is listed as unavailable".into());
+        failed.unsettled.push("t@1.0.0".into());
+        for _ in 0..2 {
+            let r = sync(&p.root, dir, &failed);
+            assert!(r.pruned.is_empty() && r.kept.is_empty(), "{r:?}");
+            assert_eq!(names(&r.preserved), ["a", "b"], "{r:?}");
+            assert!(r.preserved[0]["reason"].as_str().unwrap().contains("t@1.0.0"), "{r:?}");
+            assert_eq!(r.warnings[0]["code"], "skills_unavailable");
+            assert_eq!(std::fs::read_link(skills.join("a")).unwrap(), p.store.join("a"));
+            assert_eq!(std::fs::read_link(skills.join("b")).unwrap(), p.store.join("b"));
+            assert_eq!(std::fs::read(skills.join(REGISTRY)).unwrap(), record, "the record changed");
+        }
+        // Partly answered: what is available is still linked, and a name two releases declare
+        // is settled and removed; the rest waits.
+        let mut partial = discovery(vec![available("u", "c", &p.store.join("c"), "project"), available("u", "b", &p.store.join("c"), "project"), b.clone()]);
+        partial.unsettled.push("t@1.0.0".into());
+        let r = sync(&p.root, dir, &partial);
+        assert_eq!(names(&r.linked), ["c"], "{r:?}");
+        assert_eq!(names(&r.skipped), ["b"]);
+        assert_eq!(names(&r.pruned), ["b"]);
+        assert_eq!(names(&r.preserved), ["a"]);
+        assert_eq!(registry(&p, "skills").keys().collect::<Vec<_>>(), ["a", "c"]);
+        // A user's change is still theirs, settled or not.
+        std::fs::remove_file(skills.join("a")).unwrap();
+        std::fs::create_dir(skills.join("a")).unwrap();
+        let r = sync(&p.root, dir, &failed);
+        assert_eq!(names(&r.kept), ["a"]);
+        assert!(skills.join("a").is_dir());
+        // Settled again: stack's stale link goes.
+        let r = sync(&p.root, dir, &discovery(vec![]));
+        assert_eq!(names(&r.pruned), ["c"]);
+        assert!(r.preserved.is_empty());
+        assert!(!skills.join(REGISTRY).exists());
     }
 
     #[test]
