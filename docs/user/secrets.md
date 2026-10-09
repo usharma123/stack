@@ -6,6 +6,11 @@ through the fnox release `stack.lock` pins, after services verify, and keeps the
 everything it writes. With `--json` and over MCP, granted values are replaced in the captured
 output.
 
+A grant decides what stack injects and what it redacts. It is not access control: any command
+stack runs can call fnox (or the provider behind it) itself and read every secret your user and
+that provider can, granted or not, and a value read that way is not redacted. See
+[Boundary](#boundary).
+
 ```toml
 # stack.toml
 [tools]
@@ -44,7 +49,8 @@ Checked when the stack compiles and, for `--secret`, before any provider call. E
 Only for a command with at least one grant, after services verify:
 
 1. The `fnox` on the command's `PATH` must be the release `stack.lock` pins. Otherwise the
-   command does not run (`secret_unavailable`; run `stack install` if it is not installed).
+   command does not run (`secret_unavailable`). A pinned fnox that is not installed stops
+   `exec` earlier, with `tools_not_installed`; run `stack install`.
 2. Stack runs `fnox env --json --describe`, which reads no values, then `fnox env --json --keys
    <names>`, both non-interactive and bounded by 30 seconds. File secrets, leases and keys that
    cannot be injected into an environment are refused before any value is requested.
@@ -80,6 +86,10 @@ also key names.
 
 ## Boundary
 
+- **Grants are not access control.** Stack does not sandbox the command. It, or anything it
+  starts, can run `fnox get`, `fnox exec` or the provider's own CLI and read any secret the
+  user and provider allow, including ones never granted. Only granted values are redacted:
+  an ungranted value the command reads itself appears in captured output as it was printed.
 - **Terminal output is not redacted.** Without `--json` the command owns the terminal and a
   command that prints a value prints it.
 - **Transformed values are not caught.** A value the program encodes, hashes or splits no longer

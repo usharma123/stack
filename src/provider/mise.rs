@@ -10,6 +10,26 @@ use toml::{Table, Value};
 /// Pinned so service behaviour only changes when stack is upgraded.
 pub const PITCHFORK_VERSION: &str = "2.29.0";
 
+/// Machines Pitchfork publishes no build for. Its 2.29.0 release has macOS builds for Apple
+/// silicon only, so an Intel Mac runs tools-only stacks.
+const NO_SUPERVISOR: &[&str] = &["macos-x64"];
+
+/// Services need Pitchfork, which cannot be installed on `host`: refused before anything is
+/// installed or any supervisor is asked, naming the services that need it.
+pub fn check_services_host(host: &crate::artifacts::Host, services: &[&String]) -> crate::error::Result<()> {
+    let base = host.base();
+    if services.is_empty() || !NO_SUPERVISOR.contains(&base.as_str()) {
+        return Ok(());
+    }
+    let names: Vec<&str> = services.iter().map(|s| s.as_str()).collect();
+    Err(crate::error::StackError::new(
+        "services_unsupported",
+        format!("services ({}) need Pitchfork, which publishes no {base} build; stack runs only tools-only stacks here", names.join(", ")),
+    )
+    .hint("run services on Apple silicon or Linux; on this machine use a project without [services] (`stack install` and `stack exec` work for tools)")
+    .with_detail(serde_json::json!({ "platform": base, "services": names })))
+}
+
 /// mise auto-loads `conf.d/*.toml`, so plain `mise` commands see the stack too.
 pub fn output_path(root: &Path) -> PathBuf {
     root.join(".config/mise/conf.d/stack.toml")
@@ -172,7 +192,7 @@ pub fn lock_run(out: crate::process::Captured) -> Result<LockRun> {
 
 /// The last lines of provider text in readable form, as kept in error details.
 pub fn text_tail(text: &str) -> String {
-    readable_tail(text, TAIL_LINES)
+    without_lock_advice(&readable_tail(text, TAIL_LINES))
 }
 
 /// What `mise latest` answered, as an exact release or `resolve_failed`.
@@ -523,8 +543,15 @@ pub fn configure_command(command: &mut Command, root: &Path) {
 
 /// A mise command, bounded by the caller's deadline (see `process::output`).
 fn mise(root: &Path, args: &[&str]) -> Result<Output> {
+    mise_with(root, args, &[])
+}
+
+/// [`mise`], with `overrides` set after the provider selection (to point mise at another
+/// configuration, such as a task's copy).
+fn mise_with(root: &Path, args: &[&str], overrides: &[(String, String)]) -> Result<Output> {
     let mut command = Command::new("mise");
     configure_command(&mut command, root);
+    command.envs(overrides.iter().map(|(k, v)| (k, v)));
     command.args(args)
         .current_dir(root)
         .env("MISE_YES", "1")
@@ -598,10 +625,11 @@ fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
 /// Lines of provider output kept in an error: enough for a traceback and the final error.
 const TAIL_LINES: usize = 20;
 
-/// Last lines of combined output, as a terminal would have left them.
+/// Last lines of combined output, as a terminal would have left them, without mise's advice to
+/// edit mise.lock (see [`without_lock_advice`]).
 pub fn tail(out: &Output) -> String {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    readable_tail(&text, TAIL_LINES)
+    without_lock_advice(&readable_tail(&text, TAIL_LINES))
 }
 
 /// The last `max` lines of terminal output in readable form: escape sequences removed, each
@@ -671,13 +699,18 @@ pub fn trust(root: &Path) -> Result<()> {
 /// A download mise refuses because it does not match the rendered lock is `artifact_mismatch`
 /// with what mise said parsed into details; any other failure is `install_failed`.
 pub fn install_tools(root: &Path, tools: &[String], locked: bool) -> Result<()> {
+    install_tools_with(root, &[], tools, locked)
+}
+
+/// [`install_tools`] with `overrides` naming the configuration (see [`mise_with`]).
+pub fn install_tools_with(root: &Path, overrides: &[(String, String)], tools: &[String], locked: bool) -> Result<()> {
     let mut args = vec!["install"];
     if locked {
         args.push("--locked");
     }
     args.extend(["--yes", "--quiet"]);
     args.extend(tools.iter().map(String::as_str));
-    let out = mise(root, &args)?;
+    let out = mise_with(root, &args, overrides)?;
     if out.status.success() {
         return Ok(());
     }
@@ -687,20 +720,43 @@ pub fn install_tools(root: &Path, tools: &[String], locked: bool) -> Result<()> 
     if let Some(first) = refused.first() {
         let mut details: Vec<serde_json::Value> = refused.iter().map(|r| serde_json::to_value(r).expect("refusal serializes")).collect();
         details.push(serde_json::json!({ "output": tail(&out) }));
-        return Err(StackError::new(
-            "artifact_mismatch",
-            format!(
-                "mise refused {} for {}{}: it does not match stack.lock",
-                match first.kind { "checksum" => "a download", "signer" => "the signer", _ => "the signing repository" },
-                first.name,
-                first.platform.as_deref().map(|p| format!(" on {p}")).unwrap_or_default()
-            ),
-        )
-        .hint("verify the release upstream; if the change is expected, run `stack compile --update` and review the stack.lock diff")
-        .details(details));
+        return Err(StackError::new("artifact_mismatch", refusal_message(first)).hint(MISMATCH_HINT).details(details));
     }
     Err(StackError::new("install_failed", format!("mise {} {failed}", args.join(" ")))
         .details(vec![serde_json::json!({ "output": tail(&out) })]))
+}
+
+/// What to do about a refusal. mise.lock is rendered from stack.lock, so mise's own advice to
+/// edit it is never the remedy.
+pub const MISMATCH_HINT: &str = "verify the release upstream; if the change is expected, run `stack compile --update` and review the stack.lock diff";
+
+/// `mise refused a download for jq@1.7.1 on macos-arm64: it does not match stack.lock`.
+pub fn refusal_message(refusal: &Refusal) -> String {
+    format!(
+        "mise refused {} for {}{}: it does not match stack.lock",
+        match refusal.kind { "checksum" => "a download", "signer" => "the signer", _ => "the signing repository" },
+        refusal.name,
+        refusal.platform.as_deref().map(|p| format!(" on {p}")).unwrap_or_default()
+    )
+}
+
+/// mise's output without its advice to edit `mise.lock` (a `hint:` line, or a `; remove the
+/// entry from mise.lock ...` clause), which stack renders from stack.lock and replaces on every
+/// install. What mise observed is kept; a refusal also carries GitHub's digest note as `upstream`.
+pub fn without_lock_advice(text: &str) -> String {
+    let advice = |clause: &str| {
+        let first = clause.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+        clause.contains("mise.lock") && matches!(first.as_str(), "remove" | "update" | "edit" | "delete" | "change")
+    };
+    text.lines()
+        .filter(|line| !(line.trim_start().starts_with("hint:") && line.contains("mise.lock")))
+        .map(|line| {
+            let mut clauses = line.split("; ");
+            let head = clauses.next().unwrap_or_default().to_string();
+            clauses.filter(|c| !advice(c)).fold(head, |kept, c| format!("{kept}; {c}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One download or signer mise refused against the lock.
@@ -717,6 +773,10 @@ pub struct Refusal {
     pub actual: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// What mise found upstream, as it said it: GitHub's current digest for the asset and when
+    /// it was updated. Its advice to edit mise.lock is not kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
 }
 
 /// Checksum and signer refusals in mise's install output (mise 2026.10.3). A locked download
@@ -747,20 +807,26 @@ pub fn refusals(text: &str) -> Vec<Refusal> {
                 url = rest.split(": ").next().map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
             }
             let field = |key: &str| lines[i..].iter().take(6).find_map(|l| l.trim().strip_prefix(key)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-            name.or(installing).map(|name| Refusal { kind: "checksum", name, platform, expected: field("Expected:"), actual: field("Actual:"), url })
+            // `hint: GitHub's current digest for <asset> ... matches this download (asset updated
+            // <t>, release published <t>), so the expected checksum is out of date: ...`
+            let upstream = field("hint:").filter(|h| h.contains("matches this download")).map(|h| {
+                let observed = h.split(", so ").next().unwrap_or(&h);
+                observed.trim_end_matches('.').to_string()
+            });
+            name.or(installing).map(|name| Refusal { kind: "checksum", name, platform, expected: field("Expected:"), actual: field("Actual:"), url, upstream })
         } else if let Some(rest) = line.split("checksum mismatch for ").nth(1) {
             let (url, expected) = rest.rsplit_once(": expected ").map_or((rest, None), |(u, e)| (u, Some(e.trim().to_string())));
-            installing.map(|name| Refusal { kind: "checksum", name, platform: None, expected, actual: None, url: Some(url.trim().to_string()) })
+            installing.map(|name| Refusal { kind: "checksum", name, platform: None, expected, actual: None, url: Some(url.trim().to_string()), upstream: None })
         } else if let Some(rest) = line.split("mise.lock says ").nth(1).filter(|r| r.contains(" but this release is signed by ")) {
             let (expected, rest) = rest.split_once(" signed ").unwrap_or((rest, ""));
             let (name, rest) = rest.split_once(", but this release is signed by ").unwrap_or((rest, ""));
             let actual = rest.split("; ").next().unwrap_or(rest);
-            Some(Refusal { kind: "signer", name: name.trim().to_string(), platform: None, expected: Some(expected.trim().to_string()), actual: Some(actual.trim().to_string()), url: None })
+            Some(Refusal { kind: "signer", name: name.trim().to_string(), platform: None, expected: Some(expected.trim().to_string()), actual: Some(actual.trim().to_string()), url: None, upstream: None })
         } else if line.contains("this release was signed by ") && line.contains(", but mise.lock pins ") {
             let name = line.split("packslip:").nth(1).and_then(|r| r.split(": ").next()).map(|n| format!("packslip:{}", n.trim())).or(installing);
             let actual = line.split(" as ").nth(1).and_then(|r| r.split(", but").next()).map(|a| a.trim().to_string());
             let expected = line.split(", but mise.lock pins ").nth(1).and_then(|r| r.split(" for it").next()).map(|e| e.trim().to_string());
-            name.map(|name| Refusal { kind: "repository", name, platform: None, expected, actual, url: None })
+            name.map(|name| Refusal { kind: "repository", name, platform: None, expected, actual, url: None, upstream: None })
         } else {
             None
         };
@@ -804,10 +870,15 @@ pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
 }
 
 /// `env` and `daemons` at once. Both only read provider state for the same configuration, so
-/// they run concurrently; errors are reported in the order the two used to run.
+/// they run concurrently, both within the caller's deadline; errors are reported in the order
+/// the two used to run.
 pub fn env_and_daemons(root: &Path) -> Result<(IndexMap<String, String>, Vec<DaemonStatus>)> {
+    let deadline = crate::process::deadline();
     let (env, daemons) = std::thread::scope(|scope| {
-        let statuses = scope.spawn(|| daemons(root));
+        let statuses = scope.spawn(|| {
+            let _deadline = crate::process::deadline_scope(deadline);
+            daemons(root)
+        });
         let env = env(root);
         let statuses = statuses
             .join()
@@ -1029,6 +1100,19 @@ pitchfork ERROR Daemon app-9df2/api failed to start
     }
 
     #[test]
+    fn services_are_refused_on_intel_macos_and_tools_only_stacks_are_not() {
+        use crate::artifacts::Host;
+        let host = |os: &str, arch: &str| Host { os: os.into(), arch: arch.into(), libc: None, avx2: true };
+        let db = "db".to_string();
+        let e = check_services_host(&host("macos", "x64"), &[&db]).unwrap_err();
+        assert_eq!(e.code, "services_unsupported");
+        assert_eq!(e.details[0], serde_json::json!({ "platform": "macos-x64", "services": ["db"] }));
+        assert!(check_services_host(&host("macos", "x64"), &[]).is_ok(), "tools only");
+        assert!(check_services_host(&host("macos", "arm64"), &[&db]).is_ok());
+        assert!(check_services_host(&host("linux", "x64"), &[&db]).is_ok());
+    }
+
+    #[test]
     fn provider_releases_are_read_from_the_first_stdout_line_only() {
         assert_eq!(CalVer::parse("2026.10.3 macos-arm64 (2026-10-05)\n"), Some(CalVer(2026, 10, 3)));
         assert_eq!(CalVer::parse("\nv2026.9.2 linux-x64\n"), Some(CalVer(2026, 9, 2)));
@@ -1085,6 +1169,7 @@ mise \u{2717} jq@1.7.1  467ms \u{b7} failed: lockfile entry for jq@1.7.1 on maco
 mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/d/downloads/jq/1.7.1/jq-macos-arm64:
 Expected: sha256:0000000000000000000000000000000000000000000000000000000000000000
 Actual:   sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a
+hint: GitHub's current digest for jq-macos-arm64 in jqlang/jq jq-1.7.1 matches this download (asset updated 2023-12-13T19:19:09Z, release published 2023-12-13T19:22:49Z), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.
 mise ERROR Version: 2026.10.3 macos-arm64 (2026-10-05)";
 
     #[test]
@@ -1098,7 +1183,21 @@ mise ERROR Version: 2026.10.3 macos-arm64 (2026-10-05)";
             expected: Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".into()),
             actual: Some("sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a".into()),
             url: Some("https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64".into()),
+            upstream: Some("GitHub's current digest for jq-macos-arm64 in jqlang/jq jq-1.7.1 matches this download (asset updated 2023-12-13T19:19:09Z, release published 2023-12-13T19:22:49Z)".into()),
         });
+    }
+
+    #[test]
+    fn mise_advice_to_edit_its_lock_is_dropped_and_what_it_observed_is_kept() {
+        let kept = without_lock_advice(CHECKSUM_REFUSAL);
+        assert!(!kept.contains("mise.lock") && !kept.contains("hint:"), "{kept}");
+        for line in ["Expected: sha256:0000", "Actual:   sha256:0bbe", "Checksum mismatch for file", "mise ERROR Version"] {
+            assert!(kept.contains(line), "{line} in {kept}");
+        }
+        let signer = "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says a signed fnox@1.39.0, but this release is signed by b; remove the entry from mise.lock to accept the new signer";
+        assert_eq!(without_lock_advice(signer), "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says a signed fnox@1.39.0, but this release is signed by b");
+        let plain = "hint: try again later; check the network";
+        assert_eq!(without_lock_advice(plain), plain, "other hints are mise's to give");
     }
 
     /// Formats from mise 2026.10.3's source (`backend/conda.rs`, `backend/packslip.rs`,

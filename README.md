@@ -16,7 +16,7 @@ npm install -g @ushawarma/stack
 stack setup
 ```
 
-Requires Node.js 22.14+ and supports macOS 13+ and Linux on x64 and arm64.
+Requires Node.js 22.14+ and supports macOS 13+ and Linux on x64 and arm64 (services need Apple silicon or Linux; Intel Macs run tools-only stacks).
 `stack setup` downloads the [mise](https://mise.jdx.dev) release stack is tested against, unless
 mise is already on `PATH`. Stack installs Pitchfork through mise.
 

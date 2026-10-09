@@ -52,8 +52,13 @@ in `skills`, never returned by `stack_skill`, and never linked. People can see i
 ## Reading a skill over MCP
 
 `stack_skill { tool, name }` returns `{ tool, version, name, entrypoint, bytes, text }` for one
-`available` skill from `skills`. The MCP server's instructions mention it, so agents find it
-without being told.
+`available` skill from `skills`. `name` may be left out when the tool has exactly one available
+skill; with several, the `usage` error lists their names. The MCP server's instructions
+mention it, so agents find it without being told.
+
+Stack returns the text as the release ships it, without edits. fnox 1.39.0's skill, for
+example, is one `SKILL.md` whose provider details are links to <https://fnox.jdx.dev>; the
+release carries no provider pages, so an agent without network access cannot follow them.
 
 | Error | When |
 |---|---|
@@ -71,15 +76,24 @@ To have `stack up` and `stack install` link skills where an agent looks for them
 dir = ".claude/skills"
 ```
 
-and keep the links out of version control; they point into one user's mise installs:
-
-```gitignore
-.claude/skills/
-```
+The links point into one user's mise installs. In a git checkout stack lists each link it
+made, and `.stack-skills.json`, by exact name in a `.gitignore` of its own in that directory
+(which also ignores itself), so they stay out of version control in this checkout while
+skills you add to the directory yourself, and the same names in other worktrees, do not. A
+link is listed only while it is still the link stack made, pointing where it recorded: once
+you replace it with a skill directory or a link of your own, or remove it, the next `compile`
+stops ignoring that name. A skills dir that is also `.config/mise`, under any spelling the
+file system treats as the same directory (`.Config/mise` on a case-insensitive one), gets one
+`.gitignore` naming both the provider files and the links. A skills dir reached through a
+symbolic link is refused, and stack's file in the directory it leads to is left as it is. A
+`.gitignore` of yours there is left as it is, with a warning naming the links it misses.
 
 - Project only: a bundle cannot set `[skills]`.
 - `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no
-  symbolic link along the path (`invalid_path`).
+  symbolic link along the path (`invalid_path`). Any spelling the file system resolves to the
+  same directory as `.stack` or `.git` is refused too, whether or not that directory existed
+  first: `.Stack` on a case-insensitive file system, but not on a case-sensitive one, where it
+  is a directory of its own.
 - After the install step, a `skills` step links every `available` skill to `<dir>/<name>` and
   records its links in `<dir>/.stack-skills.json`. Stack replaces or removes only a link it
   recorded that still points where it left it. Anything else at that name is left alone and

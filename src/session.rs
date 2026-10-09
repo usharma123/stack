@@ -13,6 +13,7 @@ use crate::artifacts;
 use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
+use crate::provider::scratch;
 pub use crate::provider::task_config::TaskConfig;
 use crate::secrets::{self, Grant};
 use crate::source::Mode;
@@ -36,6 +37,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 /// Time allowed past an expired deadline to record what a cut-short start launched.
 const RECORD_GRACE: Duration = Duration::from_secs(10);
+/// How long a finished command waits for a project lock another command holds, with or
+/// without a deadline, before leaving a completion record for the next lifecycle command.
+const RELEASE_GRACE: Duration = Duration::from_secs(1);
 
 pub struct Ctx {
     pub root: PathBuf,
@@ -99,7 +103,8 @@ pub struct Session {
     /// Complete compiled configuration and ports at launch, including project overrides.
     #[serde(default)]
     pub config_digest: String,
-    /// Coordinators currently executing against this generation. Dead entries are ignored.
+    /// Coordinators currently executing against this generation. The next lifecycle command
+    /// forgets those that have exited.
     #[serde(default)]
     pub active_executions: IndexMap<String, u32>,
     pub started_at: u64,
@@ -563,11 +568,13 @@ impl Steps {
         let Some(dir) = report.skills_dir.as_deref() else { return Vec::new() };
         let empty = crate::lock::Lockfile::new(Vec::new(), Vec::new(), Vec::new());
         let sync = crate::skills::sync_step(&ctx.cache, &ctx.root, dir, report.lock.as_ref().unwrap_or(&empty), &report.versions);
-        let warnings: Vec<String> = sync
+        let mut warnings: Vec<String> = sync
             .warnings
             .iter()
             .map(|w| format!("skills: {}: {}", w["code"].as_str().unwrap_or_default(), w["message"].as_str().unwrap_or_default()))
             .collect();
+        // The links just made or removed.
+        warnings.extend(crate::ignore::update(&ctx.root, Some(dir)).map(|w| format!("skills: {w}")));
         let detail = serde_json::to_value(&sync).expect("sync report serializes");
         if warnings.is_empty() { self.ok("skills", detail) } else { self.warn("skills", detail) }
         warnings
@@ -656,7 +663,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     steps.ok("gc", json!({ "reaped": reaped.len() }));
 
     let _guard = project_lock(&ctx.state, &ctx.root).map_err(|e| steps.clone().fail("lock", e, false))?;
-    let previous = load(ctx)?;
+    let mut previous = load(ctx)?;
+    if let Some(session) = previous.as_mut() {
+        settle_executions(ctx, session).map_err(|e| steps.clone().fail("session", e, false))?;
+    }
+    let previous = previous;
     if previous.as_ref().is_some_and(has_active_executions) {
         return Err(steps.fail(
             "session",
@@ -675,6 +686,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = check_services_host(&report) {
+        return Err(steps.fail("install", e, false));
+    }
 
     let plan = match prepare_install(ctx, &report) {
         Ok(plan) => plan,
@@ -962,10 +976,12 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     let mut session = load(ctx)?.ok_or_else(|| {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
+    settle_executions(ctx, &mut session)?;
     if has_active_executions(&session) {
         return Err(StackError::new("session_busy", "commands are still executing in this session"));
     }
     let report = ctx.compile(true)?;
+    check_services_host(&report)?;
     mise::trust(&ctx.root)?;
     if session.launching {
         return Err(StackError::new("session_stale", "the last start or restart of this session did not finish verifying")
@@ -1086,6 +1102,9 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
         Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    if let Err(e) = check_services_host(&report) {
+        return Err(steps.fail("install", e, false));
+    }
     let plan = match prepare_install(ctx, &report) {
         Ok(plan) => plan,
         Err(e) => return Err(steps.fail("install", e, false)),
@@ -1123,6 +1142,14 @@ const INSTALL_BOUNDARY: &str = "mise checks the recorded checksum (and packslip 
 /// `.config/mise/mise.lock` rendered from stack.lock. The provider release was checked before
 /// the compile wrote anything (`Ctx::compile_to_install`).
 fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
+    let plan = install_plan(report)?;
+    artifacts::write_rendered(&ctx.root, report.lock.as_ref())?;
+    Ok(plan)
+}
+
+/// The artifact policy met on this platform, and how each tool installs here. Nothing is
+/// written.
+fn install_plan(report: &Report) -> Result<InstallPlan> {
     let platform = artifacts::current_platform();
     let policy = &report.artifact_policy;
     let pins = report.pins();
@@ -1133,7 +1160,7 @@ fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
         policy.check_runtime_platform()?;
         let unchecked = artifacts::unchecked(lock, &pins, std::slice::from_ref(&platform), &Default::default());
         if !unchecked.is_empty() {
-            return Err(artifacts::unlocked_error(unchecked));
+            return Err(artifacts::unlocked_error(unchecked, false));
         }
     }
     let mut partition = artifacts::partition(lock, &pins, &platform);
@@ -1144,7 +1171,6 @@ fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
         }
     }
     let everything = report.stack.services.values().any(|e| e.value.preset.as_deref().is_some_and(|p| mise::preset_tool(p).is_none()));
-    artifacts::write_rendered(&ctx.root, report.lock.as_ref())?;
     Ok(InstallPlan { artifacts: artifacts::summary(lock, &pins, &platform), partition, everything })
 }
 
@@ -1396,6 +1422,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
 
     remove_if_exists(&ctx.session_file())?;
     remove_if_exists(&ctx.index_file())?;
+    forget_project_completions(&ctx.state, &ctx.root);
     // Everything stack owned is gone, so whatever still answers on a reserved port is foreign.
     let pinned = pinned_ports(ctx);
     let conflicts = reserved
@@ -1973,11 +2000,41 @@ pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Gran
 /// The lock is released before the task runs, and an ordinary compile may then rewrite the
 /// generated configuration. `mise run` therefore reads a copy taken under the lock (see
 /// [`TaskConfig`]): the plan runs the body, env and tool pins it was planned and granted for,
-/// whatever is compiled while it waits or runs. Its `[env]` values are the ones planning read
+/// whatever is compiled while it waits or runs. Pins that are not installed are installed from
+/// that copy before the task starts (see [`install_task_tools`]). Its `[env]` values are the ones planning read
 /// from the project's own file, not evaluated again against the copy, and they still take
 /// precedence over the environment a tool sets.
 pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Result<ExecPlan> {
     plan(ctx, Target::Task { name, args, captured })
+}
+
+/// Plan an exec or task (`plan`) under a deadline of `timeout` from now, which bounds the whole
+/// call: waiting for the project lock, compiling, reading the environment, verifying, installing
+/// a task's missing pins and resolving grants, then the command. The deadline stays set on this
+/// thread while the returned scope lives: keep it while the command runs, which then gets only
+/// the time left. Each subprocess planning starts is bounded by it and killed with its process
+/// group when it passes, the project lock is released and a task's copy removed. Planning cut
+/// short, or finished with no time left for the command, is `timed_out` with nothing run and
+/// what was cut short as the `cause`. Without a timeout this is `plan()` with no deadline.
+pub fn plan_within(
+    timeout: Option<Duration>,
+    raise: &str,
+    plan: impl FnOnce() -> Result<ExecPlan>,
+) -> Result<(ExecPlan, crate::process::DeadlineScope)> {
+    // A timeout too long to fix as a point in time cannot pass: no deadline, as without one.
+    let at = timeout.and_then(|t| Instant::now().checked_add(t));
+    let scope = crate::process::deadline_scope(at);
+    let planned = plan();
+    let Some(timeout) = timeout.filter(|_| crate::process::expired()) else {
+        return planned.map(|plan| (plan, scope));
+    };
+    let details = match planned {
+        Ok(_) => Vec::new(),
+        Err(cause) => vec![json!({ "cause": cause })],
+    };
+    Err(StackError::new("timed_out", format!("the command did not start within {}s; nothing ran", timeout.as_secs()))
+        .hint(format!("{raise}: the time counts from the call, including waiting for the project lock, compiling and installing missing pins"))
+        .details(details))
 }
 
 /// What [`plan`] prepares: an explicit command with its own grant, or a declared task whose
@@ -2030,39 +2087,6 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         }
     };
     secrets::validate(&grant.keys, &report.stack, origin)?;
-    mise::trust(&ctx.root)?;
-    timings.mark("trust");
-    let (mut env, checks) = if report.stack.services.is_empty() {
-        let env = mise::env(&ctx.root)?;
-        timings.mark("env");
-        (env, Vec::new())
-    } else {
-        let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
-        timings.mark("env_daemons");
-        let checks = verify_session(ctx, &report, &env, &statuses, session.as_ref(), &timings);
-        timings.mark("verify");
-        (env, checks)
-    };
-    // Under the lock, from what this compile wrote; removed if planning fails after this. The
-    // `[env]` values just read from the project's file stay authoritative: the copy declares
-    // each one the plan holds (not the provider selection stack sets itself) as the value the
-    // command inherits, so `mise run` neither evaluates it again against the copy nor lets a
-    // tool's environment replace it.
-    let selection = mise::config_env(&ctx.root);
-    let mut task_config = match target {
-        Target::Task { .. } => Some(TaskConfig::capture(
-            &ctx.root,
-            &ctx.cache,
-            |key| env.get(key).filter(|_| !selection.contains_key(key)).cloned(),
-            || mise::shell_expands(&ctx.root),
-        )?),
-        Target::Command { .. } => None,
-    };
-    // Set before secrets resolve, so no grant can replace them.
-    if let Some(config) = &task_config {
-        env.extend(config.env());
-    }
-
     let required: Vec<&String> = match require {
         Require::Nothing => Vec::new(),
         Require::All => report.stack.services.keys().collect(),
@@ -2073,6 +2097,65 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             return Err(unknown_service(&report, name));
         }
     }
+    check_services_host(&report)?;
+    // A pin that is not installed leaves its directory off the provider's PATH, and the
+    // command (or anything it starts) would find whatever release is next on PATH. Asked while
+    // the provider prepares the environment, and answered before anything runs on that PATH
+    // (identity probes included). A command is refused; a task's missing pins are installed
+    // from its configuration copy below, before it starts.
+    let installed = {
+        let (cache, pins) = (ctx.cache.clone(), report.lock.as_ref().map(scratch::pins).unwrap_or_default());
+        let deadline = crate::process::deadline();
+        std::thread::spawn(move || {
+            let _deadline = crate::process::deadline_scope(deadline);
+            scratch::not_installed(&cache, &pins)
+        })
+    };
+    let provided = mise::trust(&ctx.root).and_then(|()| {
+        timings.mark("trust");
+        if report.stack.services.is_empty() {
+            mise::env(&ctx.root).map(|env| (env, None))
+        } else {
+            mise::env_and_daemons(&ctx.root).map(|(env, statuses)| (env, Some(statuses)))
+        }
+    });
+    let missing = installed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+    if let Target::Command { .. } = target {
+        require_installed(&missing)?;
+    }
+    let (mut env, statuses) = provided?;
+    timings.mark("env");
+    let checks = match statuses {
+        None => Vec::new(),
+        Some(statuses) => {
+            let checks = verify_session(ctx, &report, &env, &statuses, session.as_ref(), &timings);
+            timings.mark("verify");
+            checks
+        }
+    };
+    // Under the lock, from what this compile wrote, with the provider lock rendered from the
+    // stack.lock it validated (never the project's rendered file, which may be missing or
+    // stale); removed if planning fails after this. The `[env]` values just read from the
+    // project's file stay authoritative: the copy declares each one the plan holds (not the
+    // provider selection stack sets itself) as the value the command inherits, so `mise run`
+    // neither evaluates it again against the copy nor lets a tool's environment replace it.
+    let selection = mise::config_env(&ctx.root);
+    let mut task_config = match target {
+        Target::Task { .. } => Some(TaskConfig::capture(
+            &ctx.root,
+            &ctx.cache,
+            artifacts::rendered(report.lock.as_ref()).as_deref(),
+            |key| env.get(key).filter(|_| !selection.contains_key(key)).cloned(),
+            || mise::shell_expands(&ctx.root),
+        )?),
+        Target::Command { .. } => None,
+    };
+    if let Some(config) = task_config.as_mut() {
+        install_task_tools(ctx, &report, config, &env, &selection, &missing)?;
+        // Set before secrets resolve, so no grant can replace them.
+        env.extend(config.env());
+    }
+
     let unavailable: Vec<Value> = checks
         .iter()
         .filter(|c| !c.ready && required.contains(&&c.service))
@@ -2168,7 +2251,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             lease.renewed_at = now();
         }
         let token = sha256_hex(format!("{:?}{}", Instant::now(), std::process::id()).as_bytes());
-        session.active_executions.retain(|_, pid| pid_alive(*pid));
+        let consumed = reconcile_executions(&ctx.state, &ctx.root, session);
         session
             .active_executions
             .insert(token.clone(), std::process::id());
@@ -2179,11 +2262,13 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             let _ = write_json(&ctx.index_file(), session);
             return Err(e);
         }
+        forget_completions(&consumed);
         execution = Some(ExecutionGuard {
             root: ctx.root.clone(),
             state: ctx.state.clone(),
             session_id: session.id.clone(),
             token,
+            released: false,
         });
         env.insert("STACK_SESSION".into(), session.id.clone());
     } else {
@@ -2209,6 +2294,83 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         redactor,
         task_config,
     })
+}
+
+/// Refuse a stack with services on a machine its supervisor cannot be installed on.
+fn check_services_host(report: &Report) -> Result<()> {
+    let services: Vec<&String> = report.stack.services.keys().collect();
+    mise::check_services_host(&artifacts::Host::current(), &services)
+}
+
+/// Install a task's `missing` pins before it starts, so `mise run` has nothing to install.
+/// Run against the task's configuration copy and the lock beside it (rendered from the
+/// validated stack.lock), with `stack install`'s checks and split: the provider release, the
+/// artifact policy on this platform, then `mise install --locked` for pins checked or exempt
+/// here and plain `mise install` for the rest. A refused download is `artifact_mismatch` with
+/// stack's remedy, before the task runs, whether its output is captured or not; nothing here
+/// reads the task's own output. With every pin installed this asks nothing more of mise.
+///
+/// The copy declares its `[env]` variables as inherited, so the install is given the values
+/// `planned` (the environment planning read, before any grant resolves) holds for exactly
+/// those names; the variables that select the copy are set last and cannot be replaced.
+///
+/// The install's provider state directory is tracked before it runs, so a refused, failed or
+/// cut-short install leaves no link to the copy behind it (`selection` is the provider
+/// selection every mise command is given).
+fn install_task_tools(
+    ctx: &Ctx,
+    report: &Report,
+    config: &mut TaskConfig,
+    planned: &IndexMap<String, String>,
+    selection: &IndexMap<String, String>,
+    missing: &[scratch::Pin],
+) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    mise::require(&ctx.root, &project::install_requirements(report))?;
+    let plan = install_plan(report)?;
+    let wanted = |tools: &[String]| -> Vec<String> { tools.iter().filter(|t| missing.iter().any(|p| &p.tool == *t)).cloned().collect() };
+    let locked = wanted(&plan.partition.locked);
+    let mut plain = wanted(&plan.partition.plain);
+    for pin in missing {
+        if !locked.contains(&pin.tool) && !plain.contains(&pin.tool) {
+            plain.push(pin.tool.clone());
+        }
+    }
+    let mut overrides: Vec<(String, String)> =
+        config.declared().iter().filter_map(|key| Some((key.clone(), planned.get(key)?.clone()))).collect();
+    overrides.extend(config.env());
+    // What the install sees: the overrides, then the selection, then stack's own environment
+    // without the provider settings it does not pass on.
+    config.track_with(|key| match overrides.iter().rev().find(|(k, _)| k == key) {
+        Some((_, value)) => Some(value.clone()),
+        None if selection.contains_key(key) => selection.get(key).cloned(),
+        None if mise::inherited_config_keys().iter().any(|k| k == key) => None,
+        None => std::env::var(key).ok(),
+    });
+    if !locked.is_empty() {
+        mise::install_tools_with(&ctx.root, &overrides, &locked, true)?;
+    }
+    if !plain.is_empty() {
+        mise::install_tools_with(&ctx.root, &overrides, &plain, false)?;
+    }
+    Ok(())
+}
+
+/// `tools_not_installed` naming the pins mise does not report installed, if any. Nothing is
+/// installed here.
+fn require_installed(missing: &[scratch::Pin]) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = missing.iter().map(|p| format!("{}@{}", p.tool, p.spec.version)).collect();
+    Err(StackError::new(
+        "tools_not_installed",
+        format!("pinned release(s) not installed: {}", names.join(", ")),
+    )
+    .hint("run `stack install`; exec does not fall back to another release on PATH")
+    .details(missing.iter().map(|p| json!({ "tool": p.tool, "version": p.spec.version })).collect()))
 }
 
 /// The grant's values from the fnox release stack.lock pins, validated against everything this
@@ -2333,7 +2495,14 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         if !path.exists() {
             continue;
         }
-        let session: Session = read_json(&path)?;
+        let mut session: Session = read_json(&path)?;
+        let consumed = reconcile_executions(state, &ctx.root, &mut session);
+        // Saved only for a project still there: a save would recreate a deleted checkout's
+        // `.stack/`. A gone project's completion records go with its index.
+        if !consumed.is_empty() && project_gone(&session).is_none() {
+            save(&ctx, &session)?;
+            forget_completions(&consumed);
+        }
         // TTL describes idle time; an executing command is not idle. Owner death still
         // follows the explicit runner policy even if one of its commands has survived.
         let owner_dead = session
@@ -2344,7 +2513,7 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         let busy = !owner_dead && has_active_executions(&session);
         if let Some(reason) = project_gone(&session) {
             if !busy {
-                out.push(reclaim_gone(&path, session, reason));
+                out.push(reclaim_gone(state, &path, session, reason));
             }
             continue;
         }
@@ -2378,7 +2547,7 @@ fn project_gone(session: &Session) -> Option<&'static str> {
 /// Reconcile a gone project without signalling a daemon whose identity can be replaced.
 /// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
 /// their ownership record. Only confirmed terminal state permits releasing the record.
-fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
+fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
@@ -2392,8 +2561,9 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
         }
     }
     if problems.is_empty() {
-        if let Err(e) = remove_if_exists(index) {
-            problems.push(e.to_string());
+        match remove_if_exists(index) {
+            Ok(()) => forget_project_completions(state, &session.project),
+            Err(e) => problems.push(e.to_string()),
         }
     }
     GcEntry {
@@ -2634,11 +2804,112 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn has_active_executions(session: &Session) -> bool {
-    session
+/// Remove a project's completion records with its session. Best effort: one left behind
+/// names a generation that is gone, so it never applies and the next reconcile removes it.
+fn forget_project_completions(state: &Path, root: &Path) {
+    let _ = fs::remove_dir_all(completions_dir(state, root));
+}
+
+/// A command that finished while another command held the project lock, so it could not
+/// remove its execution itself. Written without the lock; applied under it by the next
+/// lifecycle command, to this execution of this session only.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Completion {
+    session: String,
+    token: String,
+    pid: u32,
+    completed_at: u64,
+}
+
+/// Where a project's completion records are: `<state>/completed/<project key>/<token>.json`.
+fn completions_dir(state: &Path, root: &Path) -> PathBuf {
+    state.join("completed").join(project_key(root))
+}
+
+/// An execution token as [`plan`] makes it: a SHA-256 in lowercase hex.
+fn is_token(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Under the project lock: forget executions whose completion record names this session, the
+/// token and the PID recorded for it, renewing the lease to when each finished, then those
+/// whose coordinator had exited before the records were read. Returns the records applied;
+/// the caller removes them only once a record without those executions is saved, so a crash
+/// in between applies them again. A record that can never apply (another generation's, or for
+/// a token no longer recorded) is removed; one stack did not write (another name, unreadable,
+/// naming another token) is left alone and never applied.
+///
+/// Records are written without the lock, so the order matters. A coordinator writes its
+/// record before it exits: one seen exited before the read has left any record it ever will,
+/// and the read finds it. One seen running may write its record and exit after the read; it
+/// stays recorded, and the session busy, until the next reconcile applies that record. A
+/// liveness check after the read would forget it with its renewal unapplied.
+fn reconcile_executions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
+    let exited: Vec<String> = session
         .active_executions
-        .values()
-        .any(|pid| pid_alive(*pid))
+        .iter()
+        .filter(|(_, pid)| !pid_alive(**pid))
+        .map(|(token, _)| token.clone())
+        .collect();
+    let consumed = apply_completions(state, root, session);
+    for token in &exited {
+        session.active_executions.shift_remove(token);
+    }
+    consumed
+}
+
+fn apply_completions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
+    let entries = fs::read_dir(completions_dir(state, root));
+    #[cfg(test)]
+    tests::after_completions_read();
+    let Ok(entries) = entries else { return Vec::new() };
+    let mut consumed = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        let Some(token) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".json")).filter(|t| is_token(t)) else {
+            continue;
+        };
+        let Ok(completion) = fs::read(&path).map_err(drop).and_then(|b| serde_json::from_slice::<Completion>(&b).map_err(drop)) else {
+            continue;
+        };
+        if completion.token != token {
+            continue;
+        }
+        let recorded = session.active_executions.get(token).copied();
+        if completion.session == session.id && recorded == Some(completion.pid) {
+            session.active_executions.shift_remove(token);
+            if let Some(lease) = session.lease.as_mut() {
+                lease.renewed_at = lease.renewed_at.max(completion.completed_at);
+            }
+            consumed.push(path);
+        } else if completion.session != session.id || recorded.is_none() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    consumed
+}
+
+fn forget_completions(consumed: &[PathBuf]) {
+    for path in consumed {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// [`reconcile_executions`] for a decision that may not save otherwise: the record is saved
+/// when a completion applied, then the completions are removed.
+fn settle_executions(ctx: &Ctx, session: &mut Session) -> Result<()> {
+    let consumed = reconcile_executions(&ctx.state, &ctx.root, session);
+    if !consumed.is_empty() {
+        save(ctx, session)?;
+        forget_completions(&consumed);
+    }
+    Ok(())
+}
+
+/// After [`reconcile_executions`], whose liveness observation this keeps: every execution
+/// still recorded was running when its records were read. Checking its PID again here could
+/// find it exited after writing a record that read missed.
+fn has_active_executions(session: &Session) -> bool {
+    !session.active_executions.is_empty()
 }
 
 /// A note when this checkout's running session was started from a configuration other than
@@ -2774,37 +3045,82 @@ fn changed_since(root: &Path, watch: &[String], started_at_ms: u64) -> (Vec<Stri
 
 /// An execution is registered under the lifecycle lock and removed at command completion.
 /// A crashed coordinator is ignored by GC through its PID, without a background heartbeat.
+/// One whose removal cannot have the lock in time leaves a [`Completion`] instead.
 pub struct ExecutionGuard {
     root: PathBuf,
     state: PathBuf,
     session_id: String,
     token: String,
+    released: bool,
 }
 
-impl Drop for ExecutionGuard {
-    fn drop(&mut self) {
+impl ExecutionGuard {
+    /// Forget this execution: in its session under the project lock, or, when another command
+    /// holds the lock, by a completion record for the next lifecycle command. An error means
+    /// the execution may still be recorded, keeping the session busy while this process lives.
+    fn release(&mut self) -> Result<()> {
+        if std::mem::replace(&mut self.released, true) {
+            return Ok(());
+        }
         let _timings = Timings::new("release");
+        let _grace = crate::process::grace_scope(RECORD_GRACE);
         let ctx = Ctx {
             root: self.root.clone(),
             cache: PathBuf::new(),
             state: self.state.clone(),
         };
-        let Ok(_guard) = project_lock(&ctx.state, &ctx.root) else {
-            return;
+        let completed_at = now();
+        // The lock is waited for briefly whatever the call's deadline: an expired one still
+        // gets the chance, and none (a CLI `exec` without `--timeout`) never waits unbounded.
+        let locked = {
+            let _bound = crate::process::deadline_scope(Some(Instant::now() + RELEASE_GRACE));
+            project_lock(&ctx.state, &ctx.root)
         };
-        let Ok(Some(mut session)) = load(&ctx) else {
-            return;
+        let _guard = match locked {
+            Ok(guard) => guard,
+            // Another command holds the lock past RELEASE_GRACE: the next lifecycle command
+            // applies this record.
+            Err(e) if e.code == "lock_busy" => {
+                let completion = Completion { session: self.session_id.clone(), token: self.token.clone(), pid: std::process::id(), completed_at };
+                let path = completions_dir(&ctx.state, &ctx.root).join(format!("{}.json", self.token));
+                return write_json(&path, &completion);
+            }
+            Err(e) => return Err(e),
+        };
+        // No session, or another generation's: nothing of this execution is recorded.
+        let Some(mut session) = load(&ctx)? else {
+            return Ok(());
         };
         if session.id != self.session_id {
-            return;
+            return Ok(());
         }
         session.active_executions.shift_remove(&self.token);
+        // A `renew` that took the lock while this waited for it may have renewed later.
         if let Some(lease) = session.lease.as_mut() {
-            lease.renewed_at = now();
+            lease.renewed_at = lease.renewed_at.max(completed_at);
         }
-        if let Err(e) = save(&ctx, &session) {
-            eprintln!("stack: cannot finish execution lease: {e}");
+        save(&ctx, &session)
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.release() {
+            eprintln!("stack: {}", unreleased(&e));
         }
+    }
+}
+
+/// What a failed release means for the caller.
+pub fn unreleased(e: &StackError) -> String {
+    format!("this command is still recorded as running ({e}); `up` and `restart` report session_busy while this process lives, and `stack down` clears it")
+}
+
+impl ExecPlan {
+    /// Forget the execution now, before reporting the command's result: an error says the
+    /// session may still record it.
+    pub fn finish(&mut self) -> Result<()> {
+        self.execution.as_mut().map_or(Ok(()), ExecutionGuard::release)
     }
 }
 
@@ -2823,6 +3139,144 @@ fn lock_digest(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_COMPLETIONS_READ: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Runs, once, what a test scheduled for just after the completion records directory is
+    /// read, before anything is decided from it.
+    pub(super) fn after_completions_read() {
+        if let Some(hook) = AFTER_COMPLETIONS_READ.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[test]
+    fn a_completion_applies_only_to_the_execution_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("app"));
+        let dir = completions_dir(&state, &root);
+        fs::create_dir_all(&dir).unwrap();
+        let token = |c: char| c.to_string().repeat(64);
+        let me = std::process::id();
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        for t in ['1', '2', '4', '6'] {
+            session.active_executions.insert(token(t), me);
+        }
+        let write = |name: &str, session: &str, token: &str, pid: u32| {
+            write_json(&dir.join(name), &Completion { session: session.into(), token: token.into(), pid, completed_at: 500 }).unwrap();
+        };
+        let json = |t: char| format!("{}.json", token(t));
+        write(&json('1'), "s1", &token('1'), me); // applies
+        write(&json('2'), "s1", &token('2'), me + 1); // another process's PID: never applies
+        write(&json('3'), "s1", &token('3'), me); // no longer recorded: removed
+        write(&json('5'), "s0", &token('5'), me); // another generation's: removed
+        write(&json('4'), "s1", &token('6'), me); // names another token: left alone
+        fs::write(dir.join(json('6')), "{ not json").unwrap(); // unreadable: left alone
+        write("short.json", "s1", "short", me); // not a token's name: left alone
+        write(&json('7').to_uppercase(), "s1", &token('7').to_uppercase(), me); // nor this
+        let consumed = reconcile_executions(&state, &root, &mut session);
+        assert_eq!(consumed, [dir.join(json('1'))]);
+        assert_eq!(session.active_executions.keys().cloned().collect::<Vec<_>>(), [token('2'), token('4'), token('6')]);
+        assert_eq!(session.lease.as_ref().unwrap().renewed_at, 500, "renewed to when it finished");
+        forget_completions(&consumed);
+        let mut left: Vec<String> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        let mut expected = vec![json('2'), json('4'), json('6'), json('7').to_uppercase(), "short.json".to_string()];
+        expected.sort();
+        assert_eq!(left, expected);
+        // A record whose PID does not match is removed once its token is no longer recorded,
+        // and a lease is never moved back.
+        session.active_executions.shift_remove(&token('2'));
+        session.lease.as_mut().unwrap().renewed_at = 900;
+        assert!(reconcile_executions(&state, &root, &mut session).is_empty());
+        assert!(!dir.join(json('2')).exists());
+        assert_eq!(session.lease.as_ref().unwrap().renewed_at, 900);
+    }
+
+    #[test]
+    fn a_completion_applies_after_its_coordinator_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("app"));
+        let dir = completions_dir(&state, &root);
+        fs::create_dir_all(&dir).unwrap();
+        let exited = |_| {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let (finished, crashed) = ("f".repeat(64), "c".repeat(64));
+        let (finished_pid, crashed_pid): (u32, u32) = (exited(()), exited(()));
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        session.active_executions.insert(finished.clone(), finished_pid);
+        session.active_executions.insert(crashed.clone(), crashed_pid);
+        let path = dir.join(format!("{finished}.json"));
+        write_json(&path, &Completion { session: "s1".into(), token: finished, pid: finished_pid, completed_at: 500 }).unwrap();
+        assert_eq!(reconcile_executions(&state, &root, &mut session), [path]);
+        assert_eq!(session.lease.as_ref().unwrap().renewed_at, 500, "renewed to when it finished");
+        assert!(session.active_executions.is_empty(), "the one that left no record is forgotten too");
+    }
+
+    #[test]
+    fn a_command_finishing_while_gc_reads_the_records_keeps_the_session_until_its_record_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("app"));
+        fs::create_dir_all(&root).unwrap();
+        let dir = completions_dir(&state, &root);
+        let (go, staged) = (tmp.path().join("go"), tmp.path().join("staged.json"));
+        // A coordinator that, once told, publishes its record atomically and exits, as one
+        // that could not take the lock does.
+        let mut coordinator = std::process::Command::new("sh")
+            .args(["-c", r#"i=0; while [ ! -e "$1" ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; mkdir -p "$2" && mv "$3" "$2/$4""#, "sh"])
+            .arg(&go)
+            .arg(&dir)
+            .arg(&staged)
+            .arg(format!("{}.json", "f".repeat(64)))
+            .spawn()
+            .unwrap();
+        let crashed = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let renewed_at = now() - 120;
+        let mut session = Session {
+            id: "s1".into(),
+            project: root.clone(),
+            lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at }),
+            ..Session::default()
+        };
+        session.active_executions.insert("f".repeat(64), coordinator.id());
+        session.active_executions.insert("c".repeat(64), crashed);
+        let index = index_path(&state, &root);
+        write_json(&index, &session).unwrap();
+        let completed_at = now();
+        write_json(&staged, &Completion { session: "s1".into(), token: "f".repeat(64), pid: coordinator.id(), completed_at }).unwrap();
+
+        // The command finishes and its coordinator exits just after GC read the records,
+        // before GC decides which executions are gone or whether the session is idle.
+        AFTER_COMPLETIONS_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                fs::write(&go, "").unwrap();
+                assert!(coordinator.wait().unwrap().success());
+            }))
+        });
+        assert!(gc(&state).unwrap().is_empty(), "seen running when the records were read, so still busy");
+        assert!(AFTER_COMPLETIONS_READ.with(|h| h.borrow().is_none()), "the coordinator finished inside that window");
+        let record = dir.join(format!("{}.json", "f".repeat(64)));
+        assert!(record.exists(), "its record waits for the next reconcile");
+        assert_eq!(read_json::<Session>(&index).unwrap().lease.unwrap().renewed_at, renewed_at);
+
+        // The next one applies it: the lease counts from when the command finished.
+        assert!(gc(&state).unwrap().is_empty());
+        for saved in [read_json::<Session>(&index).unwrap(), read_json(&root.join(".stack/session.json")).unwrap()] {
+            assert_eq!(saved.lease.unwrap().renewed_at, completed_at);
+            assert!(saved.active_executions.is_empty(), "the crashed one is forgotten with it");
+        }
+        assert!(!record.exists());
+    }
 
     #[test]
     fn an_expired_startup_reports_timed_out_with_the_cut_short_step_and_its_progress() {

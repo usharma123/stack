@@ -65,6 +65,36 @@ Bundles may declare names (never values); the stack must list `fnox` in `[tools]
 may not be a service endpoint, an `[env]` key or a variable stack reserves. See
 [secret grants](secrets.md).
 
+## Services
+
+A service is a preset (`postgres`, `redis`, `cockroachdb`, `nats`, `spicedb`) or a command of
+your own. Pitchfork supervises both through mise.
+
+```toml
+[services.web]
+run = "exec python3 -m http.server $PORT --bind 127.0.0.1"   # `exec`: stopping it stops the server
+ready_cmd = "curl -fsS http://127.0.0.1:$PORT/ >/dev/null"
+port = "auto"                                                  # the default
+watch = ["index.html"]
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `preset` | none | Use mise's preset for that server; `version` picks its release (default `latest`, pinned in stack.lock) |
+| `version` | `latest` | Preset services only |
+| `run` | the preset's | Shell command Pitchfork starts. It gets `$PORT`, the port stack assigned; the app gets it as `$<NAME>_PORT` |
+| `ready_cmd` | none | Command Pitchfork runs until it succeeds before it reports the service started |
+| `ready_port` | none (postgres and redis: the assigned port) | A port Pitchfork waits to accept connections before it reports the service started |
+| `port` | `"auto"` | `"auto"` takes a free port from this machine's registry (40000-49999), stable per checkout; a number pins it, in the project's `stack.toml` or `[override.services]` only (`bundle_fixed_port` in a bundle) |
+| `identity` | none | An [identity probe](identity-probes.md): without one a custom service is verified for liveness only |
+| `watch` | `[]` | Files whose change after start `status`, `exec` and `run` report, with a `stack restart` hint |
+
+Whatever the readiness settings, `up` verifies every service itself: Pitchfork reports it
+running, its process is alive, and the assigned port accepts connections, plus the preset's
+instance check or the identity probe. `{{bundle_dir}}` expands in `run`, `ready_cmd`,
+`identity.command` and `watch`. Services need Pitchfork, which has no Intel macOS build (see
+[install](install.md)).
+
 ## Tool options
 
 A tool is a version request, or a table with `version` and options from a short allowlist:

@@ -36,8 +36,10 @@ const PLATFORM_PREFIX: &str = "platforms.";
 /// Entry-level keys that point at a sidecar file beside mise.lock, which stack does not carry.
 const SIDECAR_KEYS: &[&str] = &["aube", "uv"];
 
-/// Stack's own release matrix: what `[lock] platforms` means when a project does not say.
-pub const DEFAULT_PLATFORMS: &[&str] = &["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"];
+/// What `[lock] platforms` means when a project does not say: the platforms stacks with services
+/// run on. Intel macOS is not among them (Pitchfork publishes no build for it); a tools-only
+/// project lists `macos-x64` (or `"current"`) itself.
+pub const DEFAULT_PLATFORMS: &[&str] = &["macos-arm64", "linux-x64", "linux-arm64"];
 /// The first mise release that reads and writes the lock format stack embeds (`mise.lock` v3).
 pub const LOCK_MISE: CalVer = CalVer(2026, 9, 16);
 
@@ -838,8 +840,20 @@ impl Place for Key {
     }
 }
 
-pub fn unlocked_error(details: Vec<Json>) -> StackError {
+/// `artifact_unlocked` for `details` (from [`unchecked`]). `locked_now` says the pairs are what a
+/// `mise lock` just left: running compile again would not cover them.
+pub fn unlocked_error(details: Vec<Json>, locked_now: bool) -> StackError {
     let first = &details[0];
+    let unsupported = details.iter().any(|d| d["state"] == "unsupported");
+    let mut hint = if locked_now {
+        "mise could not lock these: the release likely publishes no artifact for the platform (check its upstream assets)".to_string()
+    } else {
+        "stack.lock has no checked entry for these; `stack compile` locks them, and if it reports them `missing` again the release publishes no artifact for the platform".to_string()
+    };
+    if unsupported {
+        hint.push_str("; `unsupported` backends (npm, pypi, pipx) are never locked");
+    }
+    hint.push_str(". Remove the platform from `[lock] platforms`, pin a release that has the artifact, or set `[lock] artifacts = \"best-effort\"`; stack.lock and the provider config were not changed");
     StackError::new(
         "artifact_unlocked",
         format!(
@@ -850,7 +864,7 @@ pub fn unlocked_error(details: Vec<Json>) -> StackError {
             if details.len() > 1 { format!(" ({} pin/platform pairs in all)", details.len()) } else { String::new() }
         ),
     )
-    .hint("lock the platform (`stack compile`), relax `[lock] artifacts`, or change `[lock] platforms`; stack.lock and the provider config were not changed")
+    .hint(hint)
     .details(details)
 }
 
@@ -945,6 +959,24 @@ pub fn retain(lock: &mut Table, pins: &[PinKey], platforms: &[String]) {
     prune_deps(lock, platforms);
 }
 
+/// Platforms whose tables pinned entries carry but `[lock] platforms` no longer asks for:
+/// what [`retain`] drops from them.
+pub fn unlisted_platforms(lock: &Table, pins: &[PinKey], platforms: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (tool, entry) in all_entries(lock) {
+        if !pins.iter().any(|p| p.tool == tool && p.version == version_of(entry)) {
+            continue;
+        }
+        let backend = str_field(entry, "backend");
+        for key in entry.keys() {
+            if let Some(platform) = key.strip_prefix(PLATFORM_PREFIX).filter(|p| !requested(backend, tool, p, platforms)) {
+                out.insert(platform.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// An entry without platform tables `[lock] platforms` does not ask for.
 fn restricted(tool: &str, entry: &Table, platforms: &[String]) -> Table {
     let backend = str_field(entry, "backend");
@@ -1002,19 +1034,22 @@ pub fn has_entries(embedded: Option<&Table>) -> bool {
     embedded.and_then(|e| e.get(TOOLS)).and_then(Value::as_table).is_some_and(|t| !t.is_empty())
 }
 
+/// The mise.lock `lock` stands for, or `None` when it embeds nothing (version 2, or no pins).
+pub fn rendered(lock: Option<&Lockfile>) -> Option<String> {
+    lock.and_then(|l| l.provider_lock.as_ref()).filter(|e| has_entries(Some(e))).map(render)
+}
+
 /// Write `.config/mise/mise.lock` from the committed lock, or remove a stale one when the lock
 /// embeds nothing (version 2, or no pins). The file is stack's, generated and gitignored.
 pub fn write_rendered(root: &Path, lock: Option<&Lockfile>) -> Result<()> {
     let path = rendered_path(root);
-    let embedded = lock.and_then(|l| l.provider_lock.as_ref()).filter(|e| has_entries(Some(e)));
-    let Some(embedded) = embedded else {
+    let Some(text) = rendered(lock) else {
         return match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(io_error(path.display(), e)),
         };
     };
-    let text = render(embedded);
     if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
         return Ok(());
     }

@@ -291,7 +291,7 @@ fn ordinary_compile_locks_needed_pins_in_a_unique_tools_only_scratch_root_and_th
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
     assert_eq!(call.tools, ["fnox", "jq", "pitchfork", "postgres"]);
-    assert_eq!(call.platforms, ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]);
+    assert_eq!(call.platforms, ["macos-arm64", "linux-x64", "linux-arm64"]);
     let config: Table = toml::from_str(&call.config).unwrap();
     assert_eq!(config.keys().collect::<Vec<_>>(), ["tools"], "only [tools]: {}", call.config);
     assert_eq!(config["tools"]["postgres"].as_str(), Some("17.6"), "a service pin under its preset tool");
@@ -536,10 +536,52 @@ fn required_coverage_fails_before_anything_is_written() {
     assert_eq!(e.code, "artifact_unlocked");
     assert!(e.details.iter().any(|d| d["name"] == "redis@8.2.1" && d["platform"] == "linux-x64" && d["state"] == "missing" && d["reason"].as_str().unwrap().contains("failed to solve")), "{e:?}");
     assert_eq!(sb.files(), vec![None, None, None]);
+    // What mise just could not lock is not fixed by compiling again.
+    let hint = e.hint.as_deref().unwrap();
+    assert!(hint.contains("publishes no artifact") && hint.contains("Remove the platform") && !hint.contains("`stack compile`"), "{hint}");
     // Unsupported pins fail too.
     sb.write("[tools]\n\"npm:prettier\" = \"3.6.2\"\n[lock]\nplatforms = [\"linux-x64\"]\nartifacts = \"required\"\n");
     let e = sb.compile(Mode::UseLock).unwrap_err();
     assert_eq!((e.code, e.details[0]["state"].as_str()), ("artifact_unlocked", Some("unsupported")));
+    assert!(e.hint.as_deref().unwrap().contains("never locked"), "{e:?}");
+}
+
+#[test]
+fn checksums_of_a_platform_no_longer_listed_are_dropped_with_a_warning() {
+    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\n");
+    sb.compile(Mode::UseLock).unwrap();
+    assert!(sb.embedded()["tools"]["jq"][0].get("platforms.macos-x64").is_some());
+    // As a project relying on the default that once listed macos-x64.
+    sb.write("[tools]\njq = \"1.7.1\"\n");
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert!(sb.embedded()["tools"]["jq"][0].get("platforms.macos-x64").is_none());
+    assert!(report.warnings.iter().any(|w| w.contains("checksums for macos-x64 were dropped") && w.contains("lists it to keep them")), "{:?}", report.warnings);
+    // Nothing more to say once they are gone.
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert!(!report.warnings.iter().any(|w| w.contains("dropped")), "{:?}", report.warnings);
+}
+
+#[test]
+fn required_artifacts_under_the_default_platforms_cover_a_stack_with_a_service() {
+    // Pitchfork publishes no Intel macOS build, as for its real 2.29.0 release.
+    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n[lock]\nartifacts = \"required\"\n");
+    sb.mise.unpublished.lock().unwrap().push(("pitchfork".into(), "macos-x64".into()));
+    let report = sb.compile(Mode::UseLock).unwrap();
+    for name in ["jq", "pitchfork", "db"] {
+        let covered = artifacts(&report, name);
+        assert_eq!(covered.keys().collect::<Vec<_>>(), ["macos-arm64", "linux-x64", "linux-arm64"], "{name}");
+        assert!(covered.values().all(|a| a.state == stack::artifacts::State::Verified), "{name}: {covered:?}");
+    }
+    sb.compile(Mode::Frozen).unwrap();
+    // A tools-only project may still list Intel macOS itself.
+    sb.write("[tools]\njq = \"1.7.1\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\nartifacts = \"required\"\n");
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(artifacts(&report, "jq")["macos-x64"].state, stack::artifacts::State::Verified);
+    // A service stack that lists it fails on Pitchfork, with a hint that does not repeat the compile.
+    sb.write("[tools]\njq = \"1.7.1\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\nartifacts = \"required\"\n");
+    let e = sb.compile(Mode::UseLock).unwrap_err();
+    assert_eq!(e.code, "artifact_unlocked");
+    assert_eq!(e.details.iter().map(|d| (d["name"].as_str().unwrap(), d["platform"].as_str().unwrap())).collect::<Vec<_>>(), [("pitchfork@2.29.0", "macos-x64")]);
 }
 
 #[test]

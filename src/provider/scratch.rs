@@ -98,6 +98,46 @@ pub fn check_literal(pins: &[Pin]) -> Result<()> {
     Ok(())
 }
 
+/// `mise ls --json` gets this long (less when the command's deadline is nearer).
+const LS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// `mise ls --json` lists every installed release on the machine; more than this is not read.
+const LS_LIMIT: usize = 4 * 1024 * 1024;
+
+/// The pins mise does not report installed, asked with `mise ls --json` in a scratch root that
+/// names exactly `pins` (with their options). A pin counts as installed only when mise lists
+/// that exact release as installed; anything mise cannot answer is an error, never "installed".
+pub fn not_installed(cache: &Path, pins: &[Pin]) -> Result<Vec<Pin>> {
+    if pins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let failed = |why: String| {
+        StackError::new("provider_failed", format!("cannot tell whether the pinned tools are installed: {why}"))
+            .hint("check `stack doctor`; `stack install` installs the pinned tools")
+    };
+    let root = ScratchRoot::create(cache, "installed")?;
+    root.write_tools(pins)?;
+    let mut command = root.command(&["ls", "--json"]);
+    let out = crate::process::capture(&mut command, LS_TIMEOUT, LS_LIMIT).map_err(|e| failed(format!("cannot run mise: {e}")))?;
+    if out.timed_out {
+        return Err(failed("`mise ls --json` did not answer in time".into()));
+    }
+    if out.exit_code != Some(0) || out.stdout_truncated {
+        let code = out.exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+        return Err(failed(format!("`mise ls --json` failed (exit {code})")));
+    }
+    let listed: IndexMap<String, Vec<serde_json::Value>> =
+        serde_json::from_str(out.stdout.trim()).map_err(|_| failed("`mise ls --json` printed something stack cannot read".into()))?;
+    Ok(pins
+        .iter()
+        .filter(|pin| {
+            !listed.get(&pin.tool).is_some_and(|rows| {
+                rows.iter().any(|r| r["version"].as_str() == Some(pin.spec.version.as_str()) && r["installed"] == true)
+            })
+        })
+        .cloned()
+        .collect())
+}
+
 /// A private provider root, removed on drop with the links mise made to it.
 #[derive(Debug)]
 pub struct ScratchRoot {

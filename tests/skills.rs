@@ -115,9 +115,13 @@ impl Fixture {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_at(&self.path("app"), args)
+    }
+
+    fn command_at(&self, dir: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stack"));
         command
-            .args(["-C", self.path("app").to_str().unwrap()])
+            .args(["-C", dir.to_str().unwrap()])
             .args(args)
             .env("PATH", format!("{}:/usr/bin:/bin", self.path("bin").display()))
             .env("HOME", self.path("home"))
@@ -397,7 +401,7 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     ));
     let tools = mcp.request("tools/list", json!({}));
     let skill_tool = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "stack_skill").unwrap().clone();
-    assert_eq!(skill_tool["inputSchema"]["required"], json!(["tool", "name"]));
+    assert_eq!(skill_tool["inputSchema"]["required"], json!(["tool"]));
 
     let inspect = mcp.call("stack_inspect", json!({}));
     assert_eq!(statuses(&inspect["data"]["skills"]), EXPECTED);
@@ -420,7 +424,18 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
         let r = mcp.call("stack_skill", json!({ "tool": tool, "name": name }));
         assert_eq!(r["error"]["code"], "skill_not_found", "{why}: {r}");
     }
+    // Without a name: a tool's one available skill, or the choice when it has several.
     let r = mcp.call("stack_skill", json!({ "tool": "fnox" }));
+    assert_eq!((r["data"]["name"].as_str(), r["data"]["version"].as_str()), (Some("fnox"), Some("1.39.0")), "{r}");
+    let r = mcp.call("stack_skill", json!({ "tool": "mbx" }));
+    assert_eq!(r["error"]["code"], "usage", "{r}");
+    assert_eq!(r["error"]["details"][0]["names"], json!(["mbx", "mbx-advanced"]), "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains("mbx, mbx-advanced"), "{r}");
+    for tool in ["jq", "pitchfork", "postgres"] {
+        let r = mcp.call("stack_skill", json!({ "tool": tool }));
+        assert_eq!(r["error"]["code"], "skill_not_found", "{tool}: {r}");
+    }
+    let r = mcp.call("stack_skill", json!({ "tool": "fnox", "name": "" }));
     assert_eq!(r["error"]["code"], "usage");
 
     let entry = f.path("store/fnox/1.39.0/.mise-packslip/repo/skills/fnox/SKILL.md");
@@ -461,6 +476,273 @@ fn install_links_available_skills_into_the_configured_directory() {
     assert_eq!(detail["kept"][0]["name"], "mbx", "{detail}");
     assert_eq!(detail["unchanged"], json!(["fnox", "mbx-advanced"]));
     assert!(dir.join("mbx").is_dir());
+}
+
+#[test]
+fn skill_links_and_their_registry_are_excluded_from_git_but_a_users_own_skills_are_not() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(f.path("app")).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    let dir = f.path("app/.claude/skills");
+    fs::create_dir_all(dir.join("mine")).unwrap();
+    fs::write(dir.join("mine/SKILL.md"), "mine\n").unwrap();
+    f.json(&["install"]);
+    let untracked = || -> Vec<String> {
+        git(&["status", "--porcelain", "--untracked-files=all"]).lines().filter_map(|l| l.strip_prefix("?? ")).filter(|p| p.starts_with(".claude/")).map(String::from).collect()
+    };
+    assert!(dir.join("fnox").exists() && dir.join(".stack-skills.json").exists());
+    assert_eq!(untracked(), [".claude/skills/mine/SKILL.md"]);
+    // A name stack no longer links is no longer excluded: a user's own skill there shows.
+    fs::remove_file(dir.join("mbx")).unwrap();
+    fs::create_dir(dir.join("mbx")).unwrap();
+    fs::write(dir.join("mbx/SKILL.md"), "mine too\n").unwrap();
+    f.json(&["install"]);
+    assert_eq!(untracked(), [".claude/skills/mbx/SKILL.md", ".claude/skills/mine/SKILL.md"]);
+}
+
+/// `git <args>` in `dir`, which must succeed; its stdout.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Untracked paths under `dir` starting with `under`, ignored ones left out.
+fn untracked_in(dir: &Path, under: &str) -> Vec<String> {
+    git_in(dir, &["status", "--porcelain", "--untracked-files=all"]).lines().filter_map(|l| l.strip_prefix("?? ")).filter(|p| p.starts_with(under)).map(String::from).collect()
+}
+
+#[test]
+fn a_link_made_in_one_checkout_never_hides_the_same_path_in_another() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    // An earlier release's block in the shared exclude, naming this link for checkout A.
+    let exclude = app.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, format!("*.log\n\n# stack: generated files of {a}\n/.claude/skills/fnox\n# stack: end of {a}\n", a = app.display())).unwrap();
+    f.json(&["install"]);
+    assert!(app.join(".claude/skills/fnox").exists());
+    assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new());
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), "*.log\n", "the shared block is gone");
+    let ignore = fs::read_to_string(app.join(".claude/skills/.gitignore")).unwrap();
+    assert!(ignore.contains("\n/.stack-skills.json\n") && ignore.contains("\n/fnox\n") && !ignore.contains("\n/*\n"), "{ignore}");
+
+    // Checkout B, a linked worktree without [skills]: a skill the user writes at the same path.
+    git_in(&app, &["add", "stack.toml", "stack.lock"]);
+    git_in(&app, &["commit", "-qm", "stack"]);
+    let b = f.path("b");
+    git_in(&app, &["worktree", "add", "-q", b.to_str().unwrap()]);
+    fs::write(b.join("stack.toml"), SYNC_PROJECT.replace("\n[skills]\ndir = \".claude/skills\"\n", "")).unwrap();
+    let out = f.command_at(&b, &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    fs::create_dir_all(b.join(".claude/skills/fnox")).unwrap();
+    fs::write(b.join(".claude/skills/fnox/SKILL.md"), "the user's\n").unwrap();
+    assert_eq!(untracked_in(&b, ".claude/"), [".claude/skills/fnox/SKILL.md"]);
+    // And in A, still ignored.
+    assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new());
+}
+
+#[test]
+fn a_skills_dir_linked_into_another_checkout_leaves_that_checkouts_files_alone() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let theirs = app.join(".config/mise/.gitignore");
+    let original = fs::read_to_string(&theirs).unwrap();
+    git_in(&app, &["add", "stack.toml", "stack.lock"]);
+    git_in(&app, &["commit", "-qm", "stack"]);
+    // Checkout B's skills dir is a link to A's generated provider directory.
+    let b = f.path("b");
+    git_in(&app, &["worktree", "add", "-q", b.to_str().unwrap()]);
+    std::os::unix::fs::symlink(app.join(".config/mise"), b.join("linked-skills")).unwrap();
+    fs::write(b.join("stack.toml"), SYNC_PROJECT.replace("dir = \".claude/skills\"", "dir = \"linked-skills\"")).unwrap();
+    let out = f.command_at(&b, &["--json", "compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("symbolic link"), "an honest warning: {text}");
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), original, "A's generated .gitignore is untouched");
+    assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new());
+    // The same for a provider directory that is itself a link into A.
+    let c = f.path("c");
+    git_in(&app, &["worktree", "add", "-q", c.to_str().unwrap()]);
+    fs::create_dir_all(c.join(".config")).unwrap();
+    std::os::unix::fs::symlink(app.join(".config/mise"), c.join(".config/mise")).unwrap();
+    fs::write(c.join("stack.toml"), SYNC_PROJECT.replace("\n[skills]\ndir = \".claude/skills\"\n", "")).unwrap();
+    let _ = f.command_at(&c, &["--json", "compile"]).output().unwrap();
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), original, "A's generated .gitignore is untouched");
+}
+
+#[test]
+fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both() {
+    use std::os::unix::fs::MetadataExt;
+    let project = |dir: &str| SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}"));
+    // Installed under each spelling, and a working install changed to the other spelling only.
+    // `.Config/mise` is `.config/mise` where the file system ignores case (macOS's default).
+    for (first, then) in [(".config/mise", None), (".Config/mise", None), (".config/mise", Some(".Config/mise"))] {
+        let case = format!("{first} then {then:?}");
+        let f = Fixture::new(&project(first));
+        let app = f.path("app");
+        git_in(&app, &["init", "-q"]);
+        let v = f.json(&["install"]);
+        assert_eq!(step(&v, "skills")["status"], "ok", "{case}: {v}");
+        let mut dir = first;
+        if let Some(alias) = then {
+            fs::write(app.join("stack.toml"), project(alias)).unwrap();
+            let v = f.json(&["compile"]);
+            assert!(v["data"].get("warnings").is_none(), "{case}: {v}");
+            dir = alias;
+        }
+        let one = fs::metadata(app.join(".config/mise")).unwrap().ino() == fs::metadata(app.join(dir)).unwrap().ino();
+        assert_eq!(one, dir == ".config/mise" || app.join(".CONFIG").exists(), "{case}");
+        // The links and their registry are where the skills dir names, and stack's file in that
+        // physical directory names them along with the provider's files.
+        let skills = app.join(dir);
+        assert!(fs::symlink_metadata(skills.join("fnox")).unwrap().file_type().is_symlink(), "{case}");
+        assert!(skills.join(".stack-skills.json").is_file(), "{case}");
+        let text = fs::read_to_string(skills.join(".gitignore")).unwrap();
+        let entries: &[&str] = if one { &["/conf.d/stack.toml", "/mise.lock", "/locks/", "/.stack-skills.json", "/fnox", "/mbx"] } else { &["/.stack-skills.json", "/fnox", "/mbx"] };
+        for entry in entries {
+            assert!(text.lines().any(|l| l == *entry), "{case}: {entry} missing: {text}");
+        }
+        assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new(), "{case}: {text}");
+        assert_eq!(untracked_in(&app, ".Config/"), Vec::<String>::new(), "{case}: {text}");
+        for command in ["compile", "install"] {
+            let v = f.json(&[command]);
+            assert_eq!(v["ok"], true, "{case}: {v}");
+            assert!(!v.to_string().contains("invalid_path") && !v.to_string().contains("left"), "{case}: {command} warns: {v}");
+            assert_eq!(fs::read_to_string(skills.join(".gitignore")).unwrap(), text, "{case}: a {command} publishes the same file");
+        }
+    }
+}
+
+#[test]
+fn a_skills_dir_linked_to_the_provider_directory_keeps_the_file_there_as_it_is() {
+    let project = |dir: &str| SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}"));
+    let f = Fixture::new(&project(".config/mise"));
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let ignore = app.join(".config/mise/.gitignore");
+    let text = fs::read_to_string(&ignore).unwrap();
+    assert!(text.lines().any(|l| l == "/fnox"), "{text}");
+    // The same directory, now named through a link: refused, so the file there, with the skill
+    // links' entries, is kept as the warning says rather than rewritten with the provider's alone.
+    std::os::unix::fs::symlink(".config/mise", app.join("linked")).unwrap();
+    fs::write(app.join("stack.toml"), project("linked")).unwrap();
+    let v = f.json(&["compile"]);
+    assert!(v.to_string().contains("symbolic link") && v.to_string().contains("left any ignore file there alone"), "{v}");
+    assert_eq!(fs::read_to_string(&ignore).unwrap(), text);
+    assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new());
+}
+
+#[test]
+fn an_unreadable_skills_registry_keeps_stacks_ignore_file_as_it_is() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let ignore = app.join(".claude/skills/.gitignore");
+    let text = fs::read_to_string(&ignore).unwrap();
+    let registry = app.join(".claude/skills/.stack-skills.json");
+    let elsewhere = f.path("elsewhere.json");
+    fs::copy(&registry, &elsewhere).unwrap();
+    for (what, break_it) in [
+        ("malformed", Box::new(|| fs::write(&registry, "{ not json").unwrap()) as Box<dyn Fn()>),
+        ("link", Box::new(|| std::os::unix::fs::symlink(&elsewhere, &registry).unwrap())),
+    ] {
+        let _ = fs::remove_file(&registry);
+        break_it();
+        let out = f.command_at(&app, &["--json", "compile"]).output().unwrap();
+        assert!(out.status.success(), "{what}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("left as it is"), "{what}: a warning says why");
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), text, "{what}: stack's file is kept");
+        assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new(), "{what}");
+    }
+}
+
+#[test]
+fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let link = app.join(".claude/skills/fnox");
+    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new());
+    // A skill the user writes in its place: visible after a routine compile, no install needed.
+    fs::remove_file(&link).unwrap();
+    fs::create_dir(&link).unwrap();
+    fs::write(link.join("SKILL.md"), "the user's\n").unwrap();
+    let out = f.command_at(&app, &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(untracked_in(&app, ".claude/"), [".claude/skills/fnox/SKILL.md"]);
+    // A link of the user's own, pointing elsewhere: theirs too.
+    fs::remove_dir_all(&link).unwrap();
+    let theirs = f.path("theirs");
+    fs::create_dir_all(&theirs).unwrap();
+    std::os::unix::fs::symlink(&theirs, &link).unwrap();
+    let out = f.command_at(&app, &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(untracked_in(&app, ".claude/"), [".claude/skills/fnox"]);
+    // Removed: nothing left to name.
+    fs::remove_file(&link).unwrap();
+    f.command_at(&app, &["compile"]).output().unwrap();
+    let ignore = fs::read_to_string(app.join(".claude/skills/.gitignore")).unwrap();
+    assert!(!ignore.contains("/fnox"), "{ignore}");
+}
+
+#[test]
+fn a_skills_dir_written_with_dot_or_doubled_separators_is_ignored_where_the_links_are() {
+    for dir in ["./.claude/skills", ".claude//skills/", "./.claude/./skills"] {
+        let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}")));
+        let app = f.path("app");
+        git_in(&app, &["init", "-q"]);
+        f.json(&["install"]);
+        assert!(app.join(".claude/skills/fnox").exists() && app.join(".claude/skills/.gitignore").exists(), "{dir}");
+        assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new(), "{dir}");
+    }
+}
+
+#[test]
+fn skills_are_never_linked_into_stack_or_git_under_another_spelling() {
+    for (alias, reserved) in [(".Stack", ".stack"), (".GIT", ".git")] {
+        // Whether the reserved directory came first or not.
+        for existing in [false, true] {
+            let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = \"{alias}/skills\"")));
+            let app = f.path("app");
+            fs::create_dir(app.join("Probe")).unwrap();
+            let ignores_case = app.join("probe").exists();
+            fs::remove_dir(app.join("Probe")).unwrap();
+            if existing {
+                fs::create_dir(app.join(reserved)).unwrap();
+            }
+            let v = f.json(&["install"]);
+            let skills = &step(&v, "skills")["detail"];
+            let case = format!("{alias}, {reserved} existing: {existing}: {v}");
+            if ignores_case {
+                assert_eq!(skills["warnings"][0]["code"], "invalid_path", "{case}");
+                assert_eq!(skills["linked"], json!([]), "{case}");
+                assert!(!app.join(reserved).join("skills").exists(), "{case}");
+                assert_eq!(app.join(reserved).exists(), existing, "the refused directory is not left behind: {case}");
+            } else {
+                // Where case matters, the alias is a directory of its own.
+                assert_eq!(names(&skills["linked"]), ["fnox", "mbx", "mbx-advanced"], "{case}");
+                assert_eq!(app.join(reserved).exists(), existing, "{case}");
+            }
+        }
+    }
 }
 
 #[test]

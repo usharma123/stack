@@ -34,6 +34,13 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   against stack.lock's artifact checksums where it has them (see
   [Artifact checksums](#artifact-checksums)). Use it to warm a checkout (CI caches, disposable
   worktrees) without a session; `exec` then has the tools.
+- `exec` refuses with `tools_not_installed` (naming each release) when a release stack.lock
+  pins is not installed, before anything runs, so neither the command nor anything it starts
+  can pick up another release from `PATH`. Run `stack install`. `run` installs a task's missing
+  pins itself before the task starts, from the task's configuration copy and the lock rendered
+  from stack.lock, with `install`'s checks and locked/plain split; a refused download is
+  `artifact_mismatch`, and the task does not run. With every pin installed nothing more is
+  asked of mise.
 - Errors from `up` that happen once its steps have begun end their `details` with a progress
   record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
   come before it. Invalid arguments, an unreadable session, and a failed initial GC pass
@@ -82,11 +89,18 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
   than services to skip. `unknown_task` lists the tasks the project defines. The task runs from
   the configuration as it was when the run was planned, so a `compile` while it starts or runs
-  does not change its body, env or tools; the next run sees the change. Tasks and `exec`
+  does not change its body, env or tools; the next run sees the change. Its provider lock is
+  rendered from the stack.lock that plan validated, never read from a `.config/mise/mise.lock`
+  left in the project (missing in a fresh checkout, stale after a pull). Tasks and `exec`
   receive `STACK_SESSION` only while a session exists; an `[env]` that declares it is refused
   with `invalid_env`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
-  command's code. When `--timeout` expires the command's process group is killed and stack
+  command's code. `--timeout` (and MCP `timeout_secs`) counts from the call: waiting for the
+  project lock, compiling, reading the environment, installing a task's missing pins and
+  resolving grants share it with the command, which gets what is left. Planning cut short
+  (its subprocess killed with its process group, the lock released, the task's copy removed)
+  fails with `timed_out` before anything runs, exit 124, with the cut-short step's error as
+  `cause`. When `--timeout` expires while the command runs, its process group is killed and stack
   exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the
   captured output is the error's only detail. Without `--json` the command keeps stdout and
   stderr; with `--timeout` it also runs in its own process group, so its stdin is empty, and
@@ -106,7 +120,17 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the session unverified (run `up`) without losing track of what it started. It fails with
   `no_session` before `up`, `session_stale` when the configuration changed since `up` or the
   last start did not finish verifying (run `up`), and `session_busy` while commands run in
-  the session. Over MCP, `services` must be an array of names; omitting it restarts every
+  the session. A command that finished while another command held the project lock for more
+  than a second records that it finished under the state directory's `completed/`; the next
+  `up`, `restart`, `exec`, `run` or `gc` for the project applies it, forgetting that command
+  only and renewing the lease to when it finished, even once that process has exited. One
+  that finishes while that command reads the records still counts as running for it, and the
+  command after applies it. `status` may list it until then. When
+  even that record cannot be written, the result of `exec --json`, MCP `stack_exec` and
+  `stack_run` carries a `warnings` entry beside the command's own outcome (or, when the
+  command could not be started, in a detail of its `exec_failed` error), and the session
+  stays busy while that process lives (`stack down` clears it). Over MCP,
+  `services` must be an array of names; omitting it restarts every
   service.
 - A service can list `watch = ["app.py", "src"]`: files or directories (walked recursively,
   skipping hidden, `node_modules`, `target` and `__pycache__` entries), relative to the
@@ -128,6 +152,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the recorded supervisor, or `ps` when only a PID was recorded. `recovery.stop` is offered
   only when the supervisor still reports the recorded PID and port. Run inspect first and
   stop only if the PID still matches; these two operations are not atomic. Then retry GC.
+  GC holds the project's lock, so no stack command can start another generation meanwhile,
+  but `pitchfork stop <id>` (Pitchfork 2.29.0) signals whatever process group runs under the
+  id when it arrives: one started by hand with `pitchfork` or `mise daemons`, or a supervisor
+  restart, would be stopped instead. Automatic cleanup needs a stop that takes the expected
+  PID and refuses otherwise, which Pitchfork does not offer.
   Unknown, starting, stopping and retrying states retain the record. Data directories are kept.
 - Malformed `stack.toml` and `bundle.toml` errors name the file, line and character column,
   with the offending line and a caret. JSON details repeat the location and the bundle source.
@@ -187,12 +216,14 @@ for packslip-backed tools a signer, when it locks, and checks them when it downl
 ```toml
 # stack.toml, project only (a bundle cannot set it)
 [lock]
-platforms = ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]   # the default
+platforms = ["macos-arm64", "linux-x64", "linux-arm64"]   # the default
 artifacts = "best-effort"                                             # or "required"
 ```
 
 `platforms` uses mise's names, including qualifiers such as `linux-x64-musl`; `"current"` means
-the compiling machine. mise looks a release up under one key per machine and backend: Node on
+the compiling machine. The default leaves out `macos-x64`: Pitchfork publishes no Intel macOS
+build, so stacks with services cannot run there. A tools-only project can list `macos-x64` (or
+`"current"` on an Intel Mac) itself. mise looks a release up under one key per machine and backend: Node on
 Alpine needs `linux-x64-musl` listed, while Bun's per-CPU and musl builds are locked with their
 unqualified platform.
 
@@ -222,17 +253,24 @@ the machine is not checked again.
 
 | Code | When |
 |---|---|
-| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected |
-| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed |
+| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected. `details` give `expected`, `actual` and `url`, and `upstream` when mise compared the asset with GitHub's digest; mise's own advice to edit `mise.lock` is left out, since stack renders that file from stack.lock. `run` reports it the same way, before the task starts |
+| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed. A pin `compile` just failed to lock usually has no artifact for that platform upstream: drop the platform, pin another release, or use `best-effort` |
 | `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read; nothing was changed |
 | `lock_invalid` | the embedded lock disagrees with the pins or is malformed; `compile --update` replaces it |
 | `lock_outdated` | `artifacts = "required"` with a version 2 lock |
 | `provider_outdated` | mise is older than 2026.9.16, which the embedded lock needs |
 | `install_failed` | any other install failure, with mise's output |
 
+Conda-backed releases, such as the Postgres preset (`conda:postgresql`), record every
+dependency package mise downloads under `[provider_lock.conda-packages]`, one checksum per
+package and platform: some 25 per platform for Postgres 17. They are what mise checks those
+downloads against, so stack keeps them; listing fewer `[lock] platforms` is what makes the
+section smaller.
+
 Migration: version 2 locks stay valid under `best-effort`, with every pin `missing`. The next
 `compile` writes version 3 and needs network access for `mise lock`. Because a session's
-configuration includes stack.lock, the first `up` after migrating restarts services once. Keep
-`.config/mise/mise.lock` and `.config/mise/locks/` out of version control: they are generated.
+configuration includes stack.lock, the first `up` after migrating restarts services once.
+`.config/mise/mise.lock` and `.config/mise/locks/` are generated; in a git checkout stack
+ignores them through its own `.config/mise/.gitignore` (see [Install](install.md#first-run)).
 
 [All docs](../README.md)

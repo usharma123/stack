@@ -6,13 +6,15 @@
 //! file in between. Without a copy, a saved plan would run whatever definition is current then,
 //! with the grant and service checks of the one it was planned from.
 //!
-//! [`TaskConfig::capture`] copies the generated configuration, and the provider lock rendered
-//! next to it, under the planning lock, to `<cache>/task-config/<pid>-<random>/` (a directory
-//! only this user can read, removed when the [`TaskConfig`] is dropped: at command completion,
-//! timeout or error, or when planning fails after the copy). The copy keeps the layout of the
-//! project's files (`.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`), so mise finds
-//! the lock beside it as it would in the project. Only what compile already wrote is copied:
-//! granted values are never in either file.
+//! [`TaskConfig::capture`] copies the generated configuration under the planning lock to
+//! `<cache>/task-config/<pid>-<random>/` (a directory only this user can read, removed when the
+//! [`TaskConfig`] is dropped: at command completion, timeout or error, or when planning fails
+//! after the copy), with the provider lock beside it rendered from the stack.lock the same
+//! compile validated. The project's own `.config/mise/mise.lock` is never read: it may be
+//! missing (a fresh checkout) or stale (written from an earlier stack.lock), and mise checks
+//! downloads against whatever lock it finds. The copy keeps the layout of the project's files
+//! (`.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`), so mise finds the lock beside
+//! it as it would in the project. Granted values are never in either file.
 //!
 //! The copy keeps every plain `[env]` variable the plan holds, but declares it as the value
 //! the command inherits (`{{ env["KEY"] }}`), never as the project's template. Planning read
@@ -26,7 +28,10 @@
 //! anything but ASCII letters, digits, `_`, `-` and `.`) are left out, as values the command
 //! inherits. Everything else is copied unchanged: tools, tasks, services and the generated `_`
 //! directives (such as `_.path`), which mise still applies. A value is never written into the
-//! copy, only its name.
+//! copy, only its name. Whatever loads the copy must therefore be given each declared value
+//! ([`TaskConfig::declared`]): the task's environment holds them, and the install of its
+//! missing pins before it starts is given the same planned values (never a granted secret,
+//! which planning resolves only after that install).
 //!
 //! [`TaskConfig::env`] points mise at the copy as its global configuration, with
 //! `MISE_GLOBAL_CONFIG_ROOT` set to the project root, and at a project configuration that
@@ -36,9 +41,11 @@
 //! mise trusts its global configuration, so the copy is never registered as trusted.
 //!
 //! mise links every configuration it loads under `$MISE_STATE_DIR/tracked-configs`, and only
-//! `mise prune` removes links whose file is gone. Once [`TaskConfig::track_with`] has named the
-//! command's environment, dropping the copy removes the links that point into it, and links
-//! into copies of runs killed before they could are removed by the next run.
+//! `mise prune` removes links whose file is gone. [`TaskConfig::track_with`] names each
+//! environment that loads the copy (the install of missing pins, then the task) before it
+//! runs, so dropping the copy, on success, failure or timeout alike, removes the links that
+//! point into it; links into copies of runs killed before they could are removed by the next
+//! run.
 
 use crate::error::{io_error, Result, StackError};
 use std::path::{Path, PathBuf};
@@ -59,31 +66,30 @@ pub struct TaskConfig {
     root: PathBuf,
     /// `<cache>/task-config`, where every copy is made.
     parent: PathBuf,
-    /// mise's `tracked-configs` directory, as the command's environment names it.
-    tracked: Option<PathBuf>,
+    /// mise's `tracked-configs` directories, as each environment that loads the copy names it.
+    tracked: Vec<PathBuf>,
+    /// The `[env]` variables the copy declares as inherited (see [`TaskConfig::declared`]).
+    declared: Vec<String>,
 }
 
 impl TaskConfig {
-    /// Copy `root`'s generated configuration and rendered lock. Call it under the project lock,
-    /// after the compile that planned the task and the environment read from what it wrote, so
-    /// the copy is what that compile wrote. `planned` gives the value the plan holds (and the
+    /// Copy `root`'s generated configuration, with `lock` (the provider lock rendered from the
+    /// validated stack.lock, `None` when it embeds nothing) beside it. Call it under the project
+    /// lock, after the compile that planned the task and the environment read from what it
+    /// wrote, so the copy is what that compile wrote and validated. `planned` gives the value the plan holds (and the
     /// command inherits) for an `[env]` variable mise evaluated; such a variable is declared as
     /// that inherited value. `shell_expands` answers whether mise expands `$VAR` in `[env]`
     /// values; it is asked only when a planned value contains a `$`.
     pub fn capture(
         root: &Path,
         cache: &Path,
+        lock: Option<&str>,
         planned: impl Fn(&str) -> Option<String>,
         shell_expands: impl FnOnce() -> Result<bool>,
     ) -> Result<Self> {
         let path = super::mise::output_path(root);
         let config = std::fs::read(&path).map_err(|e| io_error(path.display(), e))?;
-        let config = inheriting_planned_env(&config, planned, shell_expands, &path)?;
-        let lock = match std::fs::read(crate::artifacts::rendered_path(root)) {
-            Ok(lock) => Some(lock),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(io_error(crate::artifacts::rendered_path(root).display(), e)),
-        };
+        let (config, declared) = inheriting_planned_env(&config, planned, shell_expands, &path)?;
         let parent = cache.join(PURPOSE);
         std::fs::create_dir_all(&parent).map_err(|e| io_error(parent.display(), e))?;
         // Absolute: the command runs from the project root, not from where stack started.
@@ -108,9 +114,9 @@ impl TaskConfig {
             .map_err(|e| io_error(parent.display(), e))?;
         write_new(&dir.path().join(CONFIG), &config)?;
         if let Some(lock) = lock {
-            write_new(&dir.path().join(LOCK), &lock)?;
+            write_new(&dir.path().join(LOCK), lock.as_bytes())?;
         }
-        Ok(Self { dir, root: root.to_path_buf(), parent, tracked: None })
+        Ok(Self { dir, root: root.to_path_buf(), parent, tracked: Vec::new(), declared })
     }
 
     /// The copied configuration.
@@ -121,6 +127,13 @@ impl TaskConfig {
     /// The directory holding the copy, removed on drop.
     pub fn dir(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The `[env]` variables the copy declares as the value the process loading it inherits.
+    /// Every mise command that loads the copy (the install before the task as well as `mise
+    /// run`) must be given each, or mise fails to render it.
+    pub fn declared(&self) -> &[String] {
+        &self.declared
     }
 
     /// Provider variables that make `mise run` load the copy and nothing else, resolving it
@@ -134,23 +147,28 @@ impl TaskConfig {
         .map(|(key, value)| (key.to_string(), value.to_string_lossy().into_owned()))
     }
 
-    /// Name the environment the command runs with (`var` answers what it sees for a variable),
-    /// so the links mise makes to the copy can be removed with it. Links to copies that no
-    /// longer exist, left by runs killed before they cleaned up, are removed now.
+    /// Name an environment a mise command loading the copy runs with (`var` answers what it
+    /// sees for a variable), before that command runs, so the links mise makes to the copy can
+    /// be removed with it whatever ends the run: the install of the task's missing pins as well
+    /// as the task. Links to copies that no longer exist, left by runs killed before they
+    /// cleaned up, are removed now.
     pub fn track_with(&mut self, var: impl Fn(&str) -> Option<String>) {
         // As mise finds it, run from the root: the same rules as a scratch root's commands.
-        self.tracked = super::scratch::tracked_configs(&self.root, var);
+        let Some(tracked) = super::scratch::tracked_configs(&self.root, var) else { return };
+        if !self.tracked.contains(&tracked) {
+            self.tracked.push(tracked);
+        }
         self.unlink(|target| target.starts_with(&self.parent) && !target.exists());
     }
 
     /// Remove mise's tracking links whose target `matches`. Only links are touched.
     fn unlink(&self, matches: impl Fn(&Path) -> bool) {
-        let Some(entries) = self.tracked.as_ref().and_then(|t| std::fs::read_dir(t).ok()) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if std::fs::read_link(entry.path()).is_ok_and(|target| matches(&target)) {
-                let _ = std::fs::remove_file(entry.path());
+        for tracked in &self.tracked {
+            let Ok(entries) = std::fs::read_dir(tracked) else { continue };
+            for entry in entries.flatten() {
+                if std::fs::read_link(entry.path()).is_ok_and(|target| matches(&target)) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
     }
@@ -164,14 +182,15 @@ impl Drop for TaskConfig {
 }
 
 /// `config` with each plain `[env]` value `planned` gives declared as the inherited value (see
-/// the module documentation); unchanged if it gives none. Directives (the `_` table) and every
-/// other table are kept. `path` names the generated configuration in errors.
+/// the module documentation), and the names so declared; unchanged if it gives none.
+/// Directives (the `_` table) and every other table are kept. `path` names the generated
+/// configuration in errors.
 fn inheriting_planned_env(
     config: &[u8],
     planned: impl Fn(&str) -> Option<String>,
     shell_expands: impl FnOnce() -> Result<bool>,
     path: &Path,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<String>)> {
     let unreadable = |e: String| {
         StackError::new("provider_failed", format!("cannot read the generated configuration {}: {e}", path.display()))
             .hint("run `stack compile` to regenerate it")
@@ -179,7 +198,7 @@ fn inheriting_planned_env(
     let text = std::str::from_utf8(config).map_err(|e| unreadable(e.to_string()))?;
     let mut doc: toml::Table = toml::from_str(text).map_err(|e| unreadable(e.message().trim().to_string()))?;
     let Some(toml::Value::Table(env)) = doc.get_mut("env") else {
-        return Ok(config.to_vec());
+        return Ok((config.to_vec(), Vec::new()));
     };
     let held: Vec<(String, String)> = env
         .iter()
@@ -187,23 +206,29 @@ fn inheriting_planned_env(
         .filter_map(|(key, _)| Some((key.clone(), planned(key)?)))
         .collect();
     if held.is_empty() {
-        return Ok(config.to_vec());
+        return Ok((config.to_vec(), Vec::new()));
     }
     let expands = match held.iter().any(|(_, value)| value.contains('$')) {
         true => shell_expands()?,
         false => false,
     };
+    let mut declared = Vec::new();
     for (key, value) in &held {
         match inherited(key, value, expands) {
-            Some(declared) => env.insert(key.clone(), toml::Value::String(declared)),
-            None => env.remove(key),
-        };
+            Some(template) => {
+                env.insert(key.clone(), toml::Value::String(template));
+                declared.push(key.clone());
+            }
+            None => {
+                env.remove(key);
+            }
+        }
     }
     if env.is_empty() {
         doc.remove("env");
     }
     let body = toml::to_string_pretty(&doc).map_err(|e| unreadable(e.to_string()))?;
-    Ok(format!("# Copied by stack for one task run, declaring the [env] values the run inherits.\n{body}").into_bytes())
+    Ok((format!("# Copied by stack for one task run, declaring the [env] values the run inherits.\n{body}").into_bytes(), declared))
 }
 
 /// The declaration that gives `key` the `value` the command inherits, or `None` to leave it
@@ -271,7 +296,7 @@ mod tests {
     fn the_copy_is_private_unchanged_by_later_compiles_and_removed_on_drop() {
         let root = project("[tasks.a]\nrun = 'version-one'\n", Some("lockfile_version = 3\n"));
         let cache = tempfile::tempdir().unwrap();
-        let copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), Some("lockfile_version = 3\n"), |_| None, never).unwrap();
         std::fs::write(root.path().join(CONFIG), "[tasks.a]\nrun = 'version-two'\n").unwrap();
         std::fs::remove_file(root.path().join(LOCK)).unwrap();
         assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), "[tasks.a]\nrun = 'version-one'\n");
@@ -292,10 +317,26 @@ mod tests {
     }
 
     #[test]
+    fn the_lock_beside_the_copy_is_the_one_given_never_the_projects_rendered_file() {
+        // A stale rendered lock in the project (an earlier stack.lock's checksum) is not copied.
+        let root = project("[tasks.a]\nrun = 'x'\n", Some("stale = 'project file'\n"));
+        let cache = tempfile::tempdir().unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), Some("validated = 'stack.lock'\n"), |_| None, never).unwrap();
+        assert_eq!(std::fs::read_to_string(copy.dir().join(LOCK)).unwrap(), "validated = 'stack.lock'\n");
+        // A stack.lock that embeds nothing gives no lock, whatever the project holds.
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
+        assert!(!copy.dir().join(LOCK).exists());
+        // None rendered in the project (a fresh checkout): the given lock is still beside the copy.
+        std::fs::remove_file(root.path().join(LOCK)).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), Some("validated = 'stack.lock'\n"), |_| None, never).unwrap();
+        assert_eq!(std::fs::read_to_string(copy.dir().join(LOCK)).unwrap(), "validated = 'stack.lock'\n");
+    }
+
+    #[test]
     fn concurrent_copies_are_distinct_and_a_missing_lock_is_not_invented() {
         let root = project("[tasks.a]\nrun = 'x'\n", None);
         let cache = tempfile::tempdir().unwrap();
-        let (a, b) = (TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap(), TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap());
+        let (a, b) = (TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap(), TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap());
         assert_ne!(a.dir(), b.dir());
         assert!(!a.dir().join(LOCK).exists());
         drop(a);
@@ -315,7 +356,7 @@ mod tests {
         let mut live = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         std::fs::create_dir_all(parent.join(format!("{}-running", live.id()))).unwrap();
         std::fs::create_dir_all(parent.join("unrelated")).unwrap();
-        let _copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let _copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         let kept = parent.join(format!("{}-running", live.id())).exists();
         let _ = live.kill();
         let _ = live.wait();
@@ -338,7 +379,7 @@ mod tests {
         link("killed", &parent.join("1-gone/.config/mise/conf.d/stack.toml"));
         link("project", &root.path().join(CONFIG));
         link("elsewhere", &state.path().join("missing.toml"));
-        let mut copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let mut copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         let state_dir = state.path().to_string_lossy().into_owned();
         copy.track_with(|key| (key == "MISE_STATE_DIR").then(|| state_dir.clone()));
         assert!(!tracked.join("killed").exists() && tracked.join("killed").symlink_metadata().is_err());
@@ -355,7 +396,7 @@ mod tests {
         let root = project(config, None);
         let cache = tempfile::tempdir().unwrap();
         let planned = |key: &str| ["ASSET", "PATH", "x\"y", "_", "MISSING"].contains(&key).then(|| format!("{key}-secret-planned-value"));
-        let copy = TaskConfig::capture(root.path(), cache.path(), planned, never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, planned, never).unwrap();
         let text = std::fs::read_to_string(copy.config()).unwrap();
         assert!(!text.contains("planned-value"), "a value is never written into the copy: {text}");
         let held: toml::Table = toml::from_str(&text).unwrap();
@@ -369,12 +410,15 @@ mod tests {
         assert_eq!(held, expected);
         let keys: Vec<&String> = held["env"].as_table().unwrap().keys().collect();
         assert_eq!(keys, ["ASSET", "KEPT", "_"]);
+        // Only what the copy declares must be given to whatever loads it.
+        assert_eq!(copy.declared(), ["ASSET"]);
 
         // Nothing planned: the bytes compile wrote. Only PATH planned: no `[env]` at all.
-        let copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), config);
+        assert!(copy.declared().is_empty());
         let root = project("[env]\nPATH = \"a\"\n[tasks.a]\nrun = \"x\"\n", None);
-        let copy = TaskConfig::capture(root.path(), cache.path(), |_| Some("a".into()), never).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, |_| Some("a".into()), never).unwrap();
         let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
         assert!(!held.contains_key("env") && held["tasks"]["a"]["run"].as_str() == Some("x"));
     }
@@ -385,7 +429,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let planned = |key: &str| Some(if key == "A" { "${HOME}".to_string() } else { "plain".into() });
         let declared = |expands: bool| {
-            let copy = TaskConfig::capture(root.path(), cache.path(), planned, || Ok(expands)).unwrap();
+            let copy = TaskConfig::capture(root.path(), cache.path(), None, planned, || Ok(expands)).unwrap();
             let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
             let env = held["env"].as_table().unwrap();
             (env["A"].as_str().unwrap().to_string(), env["B"].as_str().unwrap().to_string())
@@ -393,8 +437,8 @@ mod tests {
         assert_eq!(declared(true), (r#"{{ env["A"] | replace(from="$", to="$$") }}"#.into(), r#"{{ env["B"] }}"#.into()));
         assert_eq!(declared(false), (r#"{{ env["A"] }}"#.into(), r#"{{ env["B"] }}"#.into()));
         // No `$` in any planned value: the setting is not asked. A failure to ask is the error.
-        assert!(TaskConfig::capture(root.path(), cache.path(), |_| Some("plain".into()), never).is_ok());
-        let err = TaskConfig::capture(root.path(), cache.path(), planned, || Err(StackError::new("provider_failed", "asked"))).unwrap_err();
+        assert!(TaskConfig::capture(root.path(), cache.path(), None, |_| Some("plain".into()), never).is_ok());
+        let err = TaskConfig::capture(root.path(), cache.path(), None, planned, || Err(StackError::new("provider_failed", "asked"))).unwrap_err();
         assert_eq!((err.code, err.message.as_str()), ("provider_failed", "asked"));
         assert!(std::fs::read_dir(cache.path().join(PURPOSE)).unwrap().next().is_none());
     }
@@ -403,7 +447,7 @@ mod tests {
     fn an_unreadable_generated_configuration_is_refused_before_anything_is_copied() {
         let root = project("[env\n", None);
         let cache = tempfile::tempdir().unwrap();
-        let err = TaskConfig::capture(root.path(), cache.path(), |_| Some("v".into()), never).unwrap_err();
+        let err = TaskConfig::capture(root.path(), cache.path(), None, |_| Some("v".into()), never).unwrap_err();
         assert_eq!(err.code, "provider_failed");
         assert!(!cache.path().join(PURPOSE).exists());
     }
@@ -415,7 +459,7 @@ mod tests {
         let home = home.path().canonicalize().unwrap();
         let tracked = home.join("mise-state/tracked-configs");
         std::fs::create_dir_all(&tracked).unwrap();
-        let mut copy = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap();
+        let mut copy = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap();
         let home_dir = home.to_string_lossy().into_owned();
         // A literal `~`, as mise reads it: beneath HOME, not beneath the project root.
         copy.track_with(|key| match key {
@@ -435,7 +479,7 @@ mod tests {
     fn a_missing_generated_configuration_is_an_error_and_leaves_nothing() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let err = TaskConfig::capture(root.path(), cache.path(), |_| None, never).unwrap_err();
+        let err = TaskConfig::capture(root.path(), cache.path(), None, |_| None, never).unwrap_err();
         assert_eq!(err.code, "io");
         assert!(!cache.path().join(PURPOSE).exists());
     }

@@ -9,6 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[path = "support/python.rs"]
+mod python;
+
 /// mise as stack drives it: answers from files a test writes under `$REVIEW_FIXTURE`.
 const FAKE_MISE: &str = include_str!("fakes/mise.sh");
 
@@ -88,6 +91,7 @@ esac
                 ),
             )
             .env("REVIEW_FIXTURE", self.dir.path())
+            .env("REVIEW_PYTHON", python::python())
             .env("STACK_STATE_DIR", self.dir.path().join("state"))
             .env("STACK_CACHE_DIR", self.dir.path().join("cache"));
         command
@@ -126,6 +130,223 @@ fn cli_exec_runs_in_the_selected_project_directory() {
         actual,
         fixture.dir.path().join("app").canonicalize().unwrap()
     );
+}
+
+#[test]
+fn exec_refuses_a_pin_that_is_not_installed_instead_of_running_another_release_on_path() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.8.2'\n[tasks.q]\nrun='jq --version'\n");
+    // Another jq on the stack's PATH, as a system one would be when the pin is missing.
+    write_exe(&fixture.dir.path().join("bin/jq"), "#!/bin/sh\ntouch \"$REVIEW_FIXTURE/fallback-ran\"\necho jq-1.7.1\n");
+    let ran = fixture.dir.path().join("fallback-ran");
+    for cmd in [&["jq", "--version"][..], &["sh", "-c", "jq --version"]] {
+        let mut args = vec!["--json", "exec", "--"];
+        args.extend_from_slice(cmd);
+        let out = fixture.command(&args).output().unwrap();
+        let error = &json_result(&out)["error"];
+        assert_eq!(error["code"], "tools_not_installed", "{cmd:?}: {error}");
+        assert_eq!(error["details"], json!([{ "tool": "jq", "version": "1.8.2" }]), "{cmd:?}");
+        assert!(error["hint"].as_str().unwrap().contains("stack install"), "{error}");
+        assert!(!ran.exists(), "{cmd:?}: the unpinned jq ran");
+    }
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", "jq --version"] }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "tools_not_installed", "{}", results[0]);
+    assert!(!ran.exists(), "MCP: the unpinned jq ran");
+    // A task is still handed to `mise run`, which installs what its configuration names.
+    assert_eq!(String::from_utf8_lossy(&fixture.ok(&["run", "q"]).stdout), "q|");
+
+    fixture.ok(&["install"]);
+    let out = fixture.ok(&["--json", "exec", "--", "sh", "-c", "jq --version"]);
+    assert_eq!(json_result(&out)["data"]["exit_code"], 0);
+    // What mise was asked: the pin as stack.lock records it, from a scratch root.
+    let ls = fs::read_to_string(fixture.dir.path().join("ls.log")).unwrap();
+    assert!(ls.contains("jq = \"1.8.2\"") && !ls.contains(&format!("dir={}", fixture.dir.path().join("app").canonicalize().unwrap().display())), "{ls}");
+}
+
+/// `git <args>` in `dir`, which must succeed; its stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Untracked paths git reports under `dir`, ignored ones left out.
+fn untracked(dir: &Path, under: &str) -> Vec<String> {
+    git(dir, &["status", "--porcelain", "--untracked-files=all"])
+        .lines()
+        .filter_map(|l| l.strip_prefix("?? "))
+        .filter(|p| p.starts_with(under))
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn generated_files_are_ignored_by_each_checkouts_own_gitignore_and_user_files_are_not() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    let exclude = top.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    // The user's lines, and a block an earlier release kept for another checkout, which hid a
+    // file of the user's in this one.
+    let mine = "# mine\n*.log\n";
+    fs::write(&exclude, format!("{mine}\n# stack: generated files of /elsewhere/app\n/app/.claude/skills/mine/\n/app/.config/mise/config.toml\n# stack: end of /elsewhere/app\n")).unwrap();
+    // Files of the user's own beside stack's: a mise config and a hand-written skill.
+    fs::write(top.join("app/.config/mise/config.toml"), "[tools]\n").unwrap();
+    fs::create_dir_all(top.join("app/.claude/skills/mine")).unwrap();
+    fs::write(top.join("app/.claude/skills/mine/SKILL.md"), "mine\n").unwrap();
+    fs::write(top.join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[skills]\ndir='.claude/skills'\n").unwrap();
+    fixture.ok(&["up"]);
+    // What mise writes beside them when a lock is rendered (this fake locks nothing).
+    fs::write(top.join("app/.config/mise/mise.lock"), "").unwrap();
+    fs::create_dir_all(top.join("app/.config/mise/locks")).unwrap();
+    fs::write(top.join("app/.config/mise/locks/x"), "").unwrap();
+    assert!(top.join("app/.config/mise/conf.d/stack.toml").exists() && top.join("app/.stack").exists());
+    assert_eq!(
+        untracked(top, "app/"),
+        ["app/.claude/skills/mine/SKILL.md", "app/.config/mise/config.toml", "app/stack.lock", "app/stack.toml"],
+    );
+    // The shared exclude holds the user's lines only: the old block, and what it hid, are gone.
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), mine);
+    assert!(!top.join(".git/info/exclude.lock").exists());
+    let ignore = fs::read_to_string(top.join("app/.config/mise/.gitignore")).unwrap();
+    assert!(ignore.starts_with("# Generated by stack") && ignore.contains("\n/.gitignore\n/conf.d/stack.toml\n/mise.lock\n/locks/\n"), "{ignore}");
+
+    // A worktree of the same repository: its own ignore files; the shared exclude is untouched.
+    git(top, &["add", "bundle", "app/stack.toml", "app/stack.lock"]);
+    git(top, &["commit", "-qm", "stack"]);
+    let wt = top.join("wt");
+    git(top, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let out = fixture.command_at(&wt.join("app"), &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(wt.join("app/.config/mise/conf.d/stack.toml").exists() && wt.join("app/.config/mise/.gitignore").exists());
+    assert_eq!(untracked(&wt, "app/"), Vec::<String>::new());
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), mine);
+
+    // A .gitignore of the user's is never changed: stack warns about what it leaves unignored.
+    fs::write(top.join("app/.config/mise/.gitignore"), "# mine\n/conf.d/stack.toml\n").unwrap();
+    let report = json_result(&fixture.ok(&["--json", "compile"]));
+    let warnings = report["data"]["warnings"].to_string();
+    // (compile removed the empty mise.lock: this fake locks nothing.)
+    assert!(warnings.contains("is not stack's") && warnings.contains("generated locks") && !warnings.contains("conf.d/stack.toml"), "{warnings}");
+    assert_eq!(fs::read_to_string(top.join("app/.config/mise/.gitignore")).unwrap(), "# mine\n/conf.d/stack.toml\n");
+
+    // Outside a repository nothing is written anywhere.
+    fs::remove_dir_all(top.join(".git")).unwrap();
+    fs::remove_file(top.join("app/.config/mise/.gitignore")).unwrap();
+    fixture.ok(&["compile"]);
+    assert!(!top.join(".git").exists() && !top.join("app/.config/mise/.gitignore").exists());
+}
+
+#[test]
+fn stacks_own_directory_stays_ignored_after_up_and_through_the_old_exclude_migration() {
+    let fixture = Fixture::new();
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    fixture.ok(&["up"]);
+    let stack_warning = |out: &Output| json_result(out)["data"].get("warnings").filter(|w| w.to_string().contains(".stack")).cloned();
+    assert_eq!(stack_warning(&fixture.ok(&["--json", "compile"])), None);
+    assert_eq!(untracked(top, "app/.stack"), Vec::<String>::new());
+    // A session from a release that hid .stack with a block in the shared exclude instead.
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    fs::remove_file(app.join(".stack/.gitignore")).unwrap();
+    let exclude = top.join(".git/info/exclude");
+    fs::write(&exclude, format!("# mine\n\n# stack: generated files of {a}\n/app/.stack/\n# stack: end of {a}\n", a = app.display())).unwrap();
+    assert_eq!(untracked(top, "app/.stack"), Vec::<String>::new());
+    assert_eq!(stack_warning(&fixture.ok(&["--json", "compile"])), None);
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), "# mine\n");
+    assert!(app.join(".stack/.gitignore").is_file());
+    assert_eq!(untracked(top, "app/.stack"), Vec::<String>::new(), "the session shows in git");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn concurrent_compiles_of_many_projects_in_one_repository_each_keep_their_files_ignored() {
+    let fixture = Fixture::new();
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    let exclude = top.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    // Old per-checkout blocks, removed once whichever compile gets git's lock first.
+    let mine = "# mine\n*.log\n";
+    let mut text = mine.to_string();
+    for i in 0..32 {
+        text.push_str(&format!("\n# stack: generated files of {top}/p{i}\n/p{i}/.stack/\n# stack: end of {top}/p{i}\n", top = top.display()));
+    }
+    fs::write(&exclude, text).unwrap();
+    let projects: Vec<std::path::PathBuf> = (0..32).map(|i| top.join(format!("p{i}"))).collect();
+    for p in &projects {
+        fs::create_dir_all(p).unwrap();
+        fs::write(p.join("stack.toml"), "[[use]]\nbundle='path:../bundle'\n").unwrap();
+    }
+    let outs: Vec<Output> = thread::scope(|scope| {
+        let handles: Vec<_> = projects.iter().map(|p| scope.spawn(|| fixture.command_at(p, &["--json", "compile"]).output().unwrap())).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for out in &outs {
+        let result = json_result(out);
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["data"].get("warnings").map_or(true, |w| !w.to_string().contains("exclude")), "{result}");
+    }
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), mine);
+    assert!(!top.join(".git/info/exclude.lock").exists());
+    for (i, p) in projects.iter().enumerate() {
+        assert!(p.join(".config/mise/.gitignore").exists(), "p{i}");
+        let left = untracked(top, &format!("p{i}/"));
+        assert!(left.iter().all(|f| f.ends_with("stack.toml") && !f.contains(".config") || f.ends_with("stack.lock")), "p{i}: {left:?}");
+    }
+}
+
+#[test]
+fn a_contended_old_exclude_migration_ends_with_the_calls_deadline_and_changes_nothing() {
+    let fixture = Fixture::new();
+    fixture.ok(&["compile"]);
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    let exclude = top.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let old = "# mine\n\n# stack: generated files of /elsewhere/app\n/app/.stack/\n# stack: end of /elsewhere/app\n";
+    fs::write(&exclude, old).unwrap();
+    // Another writer holds git's lock on the file, for longer than any call here allows.
+    let lock = top.join(".git/info/exclude.lock");
+    fs::write(&lock, "another writer's\n").unwrap();
+    let marker = top.join("ran");
+    let cmd = format!("touch '{}'", marker.display());
+    let check = |route: &str, error: &Value, elapsed: Duration| {
+        assert_eq!(error["code"], "timed_out", "{route}: {error}");
+        assert!(elapsed < Duration::from_secs(3), "{route}: the 5s migration wait outlived the 1s call: {elapsed:?}");
+        assert!(!marker.exists(), "{route}: the command ran");
+        assert_eq!(fs::read_to_string(&exclude).unwrap(), old, "{route}");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "another writer's\n", "{route}");
+    };
+    let started = Instant::now();
+    let out = fixture.command(&["--json", "exec", "--timeout", "1s", "--", "sh", "-c", &cmd]).output().unwrap();
+    check("cli", &json_result(&out)["error"], started.elapsed());
+    let started = Instant::now();
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", cmd], "timeout_secs": 1 }))], &[]);
+    check("mcp", &results[0]["structuredContent"]["error"], started.elapsed());
+    // Without a deadline the migration still waits its own while for the lock, then removes the block.
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        fs::remove_file(&lock).unwrap();
+    });
+    fixture.ok(&["compile"]);
+    release.join().unwrap();
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), "# mine\n");
+}
+
+#[test]
+fn install_prints_only_the_kinds_of_install_that_ran() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    let text = String::from_utf8(fixture.ok(&["install"]).stdout).unwrap();
+    assert!(text.contains("unchecked (mise install): jq\n") && !text.contains("checked (mise install --locked)"), "{text}");
+    let text = String::from_utf8(Fixture::new().ok(&["install"]).stdout).unwrap();
+    assert!(!text.contains("mise install"), "nothing was installed: {text}");
 }
 
 #[test]
@@ -218,6 +439,408 @@ fn concurrent_renewals_keep_both_records_valid_and_consistent() {
         .map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap())
         .collect();
     assert_eq!(records[0], records[1]);
+}
+
+#[test]
+fn a_timed_out_command_releases_its_execution_even_while_the_project_is_locked() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    // Another command holds the project lock when the timed-out command ends and its
+    // execution is released, after the run's deadline has passed.
+    let holder = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&session_file).is_ok_and(|s| s.contains("active_executions\": {\n    \"")) {
+            assert!(Instant::now() < deadline, "execution never registered");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _lock = stack::state::project_lock(&state, &app).unwrap();
+        thread::sleep(Duration::from_millis(2500));
+    });
+    // The same server then starts the stack again: no execution of its own is left behind.
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sleep", "5"], "timeout_secs": 1 })), ("stack_up", json!({}))], &[]);
+    holder.join().unwrap();
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "timed_out", "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["ok"], true, "{}", results[1]);
+}
+
+/// One interactive `stack mcp` server: each call is answered before the next is sent.
+struct Server {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+    app: std::path::PathBuf,
+    id: u32,
+}
+
+impl Server {
+    fn start(fixture: &Fixture) -> Self {
+        let mut child = fixture.command(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        Server { child, input, output, app: fixture.dir.path().join("app"), id: 0 }
+    }
+
+    fn call(&mut self, name: &str, mut args: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.id += 1;
+        args["dir"] = json!(self.app);
+        writeln!(self.input, "{}", json!({"jsonrpc":"2.0","id":self.id,"method":"tools/call","params":{"name":name,"arguments":args}})).unwrap();
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()["result"]["structuredContent"].clone()
+    }
+
+    fn close(self) {
+        let Server { mut child, input, .. } = self;
+        drop(input);
+        assert!(child.wait().unwrap().success());
+    }
+}
+
+fn read_value(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// Wait until `session_file` records an execution, then hold the project lock for `hold`.
+fn hold_project_lock_once_executing(state: &Path, app: &Path, session_file: &Path, hold: Duration) -> thread::JoinHandle<()> {
+    let (state, app, session_file) = (state.to_path_buf(), app.to_path_buf(), session_file.to_path_buf());
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+            assert!(Instant::now() < deadline, "execution never registered");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _lock = stack::state::project_lock(&state, &app).unwrap();
+        thread::sleep(hold);
+    })
+}
+
+/// This fixture's completion records: `state/completed/<project key>/`.
+fn completions(fixture: &Fixture) -> std::path::PathBuf {
+    let index = fixture.session_paths().pop().unwrap();
+    fixture.dir.path().join("state/completed").join(index.file_stem().unwrap())
+}
+
+#[test]
+fn a_timed_out_command_whose_release_outwaits_its_grace_still_frees_the_session() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let records = completions(&fixture);
+    // Another command holds the project lock for longer than the release waits for it.
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(5));
+    let mut server = Server::start(&fixture);
+    let started = Instant::now();
+    let result = server.call("stack_exec", json!({ "command": ["sleep", "30"], "timeout_secs": 1 }));
+    let elapsed = started.elapsed();
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    assert!(elapsed < Duration::from_secs(4), "the call stays bounded: {elapsed:?}");
+    // While the lock is still held: the execution is recorded, with a record that it finished.
+    let recorded = read_value(&session_file)["active_executions"].clone();
+    let (token, pid) = recorded.as_object().unwrap().iter().next().unwrap_or_else(|| panic!("{recorded}"));
+    let completion = read_value(&records.join(format!("{token}.json")));
+    assert_eq!(completion["token"], json!(token));
+    assert_eq!(completion["pid"], *pid);
+    assert_eq!(completion["pid"], server.child.id());
+    assert_eq!(completion["session"], read_value(&session_file)["id"]);
+    holder.join().unwrap();
+    // Neither another process, while the server lives, nor the same server sees it as busy.
+    let out = fixture.command(&["--json", "up"]).output().unwrap();
+    assert_eq!(json_result(&out)["ok"], true, "another process: {}", String::from_utf8_lossy(&out.stdout));
+    let result = server.call("stack_up", json!({}));
+    assert_eq!(result["ok"], true, "the same server: {result}");
+    assert_eq!(read_value(&session_file)["active_executions"], json!({}));
+    assert_eq!(fs::read_dir(&records).unwrap().count(), 0, "the applied record is removed");
+    server.close();
+    fixture.ok(&["down"]);
+    assert!(!records.exists(), "down removes the project's completion records");
+}
+
+#[test]
+fn a_command_without_a_timeout_does_not_wait_unbounded_to_finish_its_record() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(8));
+    let started = Instant::now();
+    let out = fixture.command(&["--json", "exec", "--", "sleep", "1"]).output().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(json_result(&out)["ok"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(elapsed < Duration::from_secs(5), "waited for the lock: {elapsed:?}");
+    assert_eq!(fs::read_dir(completions(&fixture)).unwrap().count(), 1);
+    holder.join().unwrap();
+    fixture.ok(&["up"]);
+    assert_eq!(read_value(&session_file)["active_executions"], json!({}));
+    assert_eq!(fs::read_dir(completions(&fixture)).unwrap().count(), 0);
+}
+
+#[test]
+fn a_renewal_made_while_a_finished_command_waits_for_the_lock_is_kept() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "1s"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let exec = fixture
+        .command(&["--json", "exec", "--", "sh", "-c", "while test ! -e finish; do sleep 0.01; done"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+        assert!(Instant::now() < deadline, "execution never registered");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let renew = {
+        let _lock = stack::state::project_lock(&state, &app).unwrap();
+        // The command finishes late in one second; `renew` waits for the lock with its
+        // release, and gets it first, in the next second.
+        while !(700..740).contains(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis()) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        fs::write(app.join("finish"), "").unwrap();
+        let renew = fixture.command(&["--json", "renew"]).stdout(Stdio::piped()).spawn().unwrap();
+        thread::sleep(Duration::from_millis(480));
+        renew
+    };
+    let renewed = json_result(&renew.wait_with_output().unwrap())["data"]["lease"]["renewed_at"].as_u64().unwrap();
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(json_result(&out)["ok"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    let lease = read_value(&session_file)["lease"].clone();
+    assert!(lease["renewed_at"].as_u64().unwrap() >= renewed, "renewed at {renewed}, then moved back: {lease}");
+    // One second after that renewal the session is not yet idle past its TTL.
+    while unix_now() < renewed + 1 {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(json_result(&out)["data"], json!([]), "reclaimed one second after a renewal");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_finished_command_that_cannot_be_recorded_says_so_and_keeps_the_session_busy() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    // No completion record can be written: where they go is a file.
+    fs::write(state.join("completed"), "").unwrap();
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(3));
+    let mut server = Server::start(&fixture);
+    let result = server.call("stack_exec", json!({ "command": ["sh", "-c", "sleep 0.5; exit 3"] }));
+    holder.join().unwrap();
+    // The command's own result stands, with the warning beside it.
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["data"]["exit_code"], 3, "{result}");
+    let warning = result["data"]["warnings"][0].as_str().unwrap_or_else(|| panic!("{result}"));
+    assert!(warning.contains("still recorded as running") && warning.contains("stack down"), "{warning}");
+    // Nothing claims it finished: the session stays busy while the server lives.
+    assert_eq!(read_value(&session_file)["active_executions"].as_object().unwrap().len(), 1);
+    let result = server.call("stack_up", json!({}));
+    assert_eq!(result["error"]["code"], "session_busy", "{result}");
+    server.close();
+    // The same through `exec --json`, whose command's exit code is kept.
+    let mut session = read_value(&session_file);
+    session["active_executions"] = json!({});
+    for path in fixture.session_paths() {
+        fs::write(&path, session.to_string()).unwrap();
+    }
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(3));
+    let out = fixture.command(&["--json", "exec", "--", "sh", "-c", "sleep 0.5; exit 3"]).output().unwrap();
+    holder.join().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let result = json_result(&out);
+    assert!(result["data"]["warnings"][0].as_str().is_some_and(|w| w.contains("still recorded as running")), "{result}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_command_that_cannot_start_and_cannot_be_recorded_says_so_with_its_error() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let index = fixture.session_paths().pop().unwrap();
+    fs::write(state.join("completed"), "").unwrap();
+    let missing = "/nonexistent/stack-review-command";
+    // The command fails to start at once, so the lock is taken the moment it is registered.
+    let hold = || {
+        let (state, app, index) = (state.clone(), app.clone(), index.clone());
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read_value(&index)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+                assert!(Instant::now() < deadline, "execution never registered");
+            }
+            let _lock = stack::state::project_lock(&state, &app).unwrap();
+            thread::sleep(Duration::from_secs(3));
+        })
+    };
+    // Should the release take the lock first all the same, it is recorded at once, so the case
+    // is tried again: a release that failed leaves its execution recorded.
+    let contended = |run: &mut dyn FnMut() -> Value| -> Value {
+        for _ in 0..5 {
+            let holder = hold();
+            let error = run();
+            holder.join().unwrap();
+            if !read_value(&index)["active_executions"].as_object().unwrap().is_empty() || !error["details"].is_null() {
+                return error;
+            }
+        }
+        panic!("the release always took the lock first");
+    };
+    let check = |route: &str, error: &Value| {
+        assert_eq!(error["code"], "exec_failed", "{route}: {error}");
+        assert!(error["message"].as_str().unwrap().contains(missing), "{route}: {error}");
+        let warning = error["details"][0]["warnings"][0].as_str().unwrap_or_else(|| panic!("{route}: {error}"));
+        assert!(warning.contains("still recorded as running") && warning.contains("stack down"), "{route}: {warning}");
+        assert_eq!(read_value(&index)["active_executions"].as_object().unwrap().len(), 1, "{route}");
+    };
+    let mut server = Server::start(&fixture);
+    let error = contended(&mut || server.call("stack_exec", json!({ "command": [missing] }))["error"].clone());
+    check("mcp", &error);
+    let result = server.call("stack_up", json!({}));
+    assert_eq!(result["error"]["code"], "session_busy", "{result}");
+    server.close();
+    // The same through `exec --json`.
+    let mut session = read_value(&index);
+    session["active_executions"] = json!({});
+    for path in fixture.session_paths() {
+        fs::write(&path, session.to_string()).unwrap();
+    }
+    let error = contended(&mut || {
+        let out = fixture.command(&["--json", "exec", "--", missing]).output().unwrap();
+        assert!(!out.status.success());
+        json_result(&out)["error"].clone()
+    });
+    check("cli", &error);
+    fixture.ok(&["down"]);
+}
+
+/// Record `token` as executing for this (live) test process, in both session files.
+fn record_execution(fixture: &Fixture, token: &str, renewed_at: Option<u64>) -> Value {
+    let mut session = read_value(&fixture.session_paths().pop().unwrap());
+    session["active_executions"][token] = json!(std::process::id());
+    if let Some(at) = renewed_at {
+        session["lease"]["renewed_at"] = json!(at);
+    }
+    for path in fixture.session_paths() {
+        if path.parent().unwrap().exists() {
+            fs::write(&path, session.to_string()).unwrap();
+        }
+    }
+    session
+}
+
+/// The completion record that execution would have left.
+fn complete(fixture: &Fixture, session: &Value, token: &str, completed_at: u64) -> std::path::PathBuf {
+    let dir = completions(fixture);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{token}.json"));
+    let record = json!({ "session": session["id"], "token": token, "pid": std::process::id(), "completed_at": completed_at });
+    fs::write(&path, record.to_string()).unwrap();
+    path
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+#[test]
+fn a_finished_execution_is_settled_and_a_running_one_still_keeps_the_session_busy() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let session_file = fixture.dir.path().join("app/.stack/session.json");
+    // Another process's command, still running.
+    let mut running = fixture.command(&["exec", "--", "sleep", "4"]).stdout(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+        assert!(Instant::now() < deadline, "execution never registered");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let other = read_value(&session_file)["active_executions"].as_object().unwrap().keys().next().unwrap().clone();
+    // And one that finished but could not remove itself.
+    let done = "d".repeat(64);
+    let session = record_execution(&fixture, &done, None);
+    let record = complete(&fixture, &session, &done, unix_now());
+    let out = fixture.command(&["--json", "up"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "session_busy", "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(read_value(&session_file)["active_executions"], json!({ other.clone(): running.id() }), "only the finished one is forgotten");
+    assert!(!record.exists());
+    assert!(running.wait().unwrap().success());
+    fixture.ok(&["up"]);
+}
+
+#[test]
+fn gc_applies_a_completion_renewing_the_lease_and_reclaims_a_deleted_project_it_unblocks() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "30s"]);
+    let index = fixture.session_paths().pop().unwrap();
+    let token = "e".repeat(64);
+    // Idle long past the TTL by the record, but its command finished just now.
+    let session = record_execution(&fixture, &token, Some(unix_now() - 120));
+    let finished = unix_now();
+    let record = complete(&fixture, &session, &token, finished);
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(json_result(&out)["data"], json!([]), "the lease counts from when the command finished");
+    let saved = read_value(&index);
+    assert_eq!(saved["active_executions"], json!({}));
+    assert!(saved["lease"]["renewed_at"].as_u64().unwrap() >= finished, "{saved}");
+    assert!(!record.exists());
+
+    // A deleted project whose only execution finished is reclaimed, not kept as busy, and
+    // nothing recreates the directory.
+    let session = record_execution(&fixture, &token, None);
+    let record = complete(&fixture, &session, &token, unix_now());
+    let app = fixture.dir.path().join("app");
+    fs::remove_dir_all(&app).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    let reclaimed = result["data"].clone();
+    assert_eq!(reclaimed[0]["reason"], "project directory deleted", "{reclaimed}");
+    assert_eq!(reclaimed[0]["stopped"], true, "{reclaimed}");
+    assert!(!index.exists() && !record.parent().unwrap().exists());
+    assert!(!app.exists(), "gc recreated the deleted project");
+}
+
+#[test]
+fn a_completion_left_by_a_command_that_has_exited_still_renews_the_lease() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "4s"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let index = fixture.session_paths().pop().unwrap();
+    // The command finishes while another command holds the lock, so its release leaves a
+    // record; then the CLI process exits before anything applies it.
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_millis(5500));
+    let exec = fixture.command(&["--json", "exec", "--", "sleep", "3"]).stdout(Stdio::piped()).spawn().unwrap();
+    let pid = exec.id();
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(json_result(&out)["ok"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    let session = read_value(&session_file);
+    let (token, recorded) = session["active_executions"].as_object().unwrap().iter().next().unwrap_or_else(|| panic!("{session}"));
+    assert_eq!(*recorded, json!(pid), "recorded for the coordinator, which has exited");
+    let record = completions(&fixture).join(format!("{token}.json"));
+    let completed_at = read_value(&record)["completed_at"].as_u64().unwrap();
+    assert!(completed_at >= session["lease"]["renewed_at"].as_u64().unwrap() + 3, "{session}");
+    holder.join().unwrap();
+    // Idle more than the TTL since the command started, but not since it finished.
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(json_result(&out)["data"], json!([]), "the lease counts from when the command finished");
+    let saved = read_value(&index);
+    assert_eq!(saved["active_executions"], json!({}));
+    assert_eq!(saved["lease"]["renewed_at"], json!(completed_at));
+    assert_eq!(read_value(&session_file)["lease"]["renewed_at"], json!(completed_at));
+    assert!(!record.exists(), "removed once the renewal is saved");
+    fixture.ok(&["down"]);
 }
 
 #[test]
@@ -369,6 +992,7 @@ fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
     let fixture = Fixture::with_bundle(
         "[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n[services.redis]\npreset='redis'\n",
     );
+    fixture.ok(&["install"]);
     // The caller's own values must not leak through either, whether poisoned or removed.
     let caller = [
         ("DATABASE_URL", "postgresql://caller@localhost:5432/caller"),
@@ -593,6 +1217,7 @@ fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing()
     // and unrelated ones still pass through untouched.
     let fixture =
         Fixture::with_bundle("[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n");
+    fixture.ok(&["install"]);
     let check_withheld = |context: &str| {
         let seen = dumped(&fixture);
         assert_eq!(seen["UNRELATED_RAW"], unrelated, "{context}");
@@ -709,6 +1334,7 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
     let fixture =
         Fixture::with_bundle("[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n");
     let listeners = Listeners::start();
+    fixture.ok(&["install"]);
     let (port, dir) = (
         listeners.port.to_string(),
         listeners.socket_dir.path().display().to_string(),
@@ -827,6 +1453,74 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
             "{name}: a withheld endpoint was reached"
         );
     }
+}
+
+#[test]
+fn mcp_rejects_malformed_arguments_before_any_work() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.t]\nrun='true'\n");
+    let root = fixture.dir.path();
+    let _ = fs::remove_file(root.join("mise.log"));
+    let ran = ["sh", "-c", "touch \"$REVIEW_FIXTURE/ran\""];
+    // (tool, arguments, what the message names, what the hint says)
+    let cases: Vec<(&str, Value, &str, &str)> = vec![
+        ("stack_exec", json!({ "command": ran, "secret": ["DEPLOY_KEY"] }), "unknown argument `secret`", "did you mean `secrets`?"),
+        ("stack_exec", json!({ "command": ran, "timeout": "1s" }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_exec", json!({ "command": "echo hi" }), "`command` must be an array", r#"["sh", "-c", "echo hi"]"#),
+        ("stack_exec", json!({ "command": ["echo", 1] }), "`command` item 1: must be a string", ""),
+        ("stack_exec", json!({ "command": [] }), "`command` must not be empty", ""),
+        ("stack_exec", json!({}), "`command` is required", ""),
+        ("stack_exec", json!({ "command": null }), "`command` is required", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_secs": "1s" }), "`timeout_secs` must be a whole number", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_secs": 0 }), "`timeout_secs` must be at least 1", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_secs": 1.5 }), "`timeout_secs` must be a whole number", ""),
+        ("stack_exec", json!({ "command": ran, "require": "db" }), "`require` must be an array", ""),
+        ("stack_exec", json!({ "command": ran, "require": [null] }), "`require` item null", ""),
+        ("stack_exec", json!({ "command": ran, "require": ["db"], "require_all": true }), "`require` and `require_all` cannot be given together", ""),
+        ("stack_exec", json!({ "command": ran, "require_all": "yes" }), "`require_all` must be true or false", ""),
+        ("stack_exec", json!({ "command": ran, "secrets": "DEPLOY_KEY" }), "`secrets` must be an array", ""),
+        ("stack_exec", json!({ "command": ran, "secrets": ["deploy_key"] }), "is not a secret name", ""),
+        ("stack_run", json!({ "task": "t", "secrets": ["A"] }), "unknown argument `secrets`", "secrets the task declares"),
+        ("stack_run", json!({ "task": "t", "args": "a b" }), "`args` must be an array", ""),
+        ("stack_run", json!({ "task": "t", "args": ["a", false] }), "`args` item false", ""),
+        ("stack_run", json!({ "task": 5 }), "`task` must be a string", ""),
+        ("stack_run", json!({ "task": "t", "timeout": 5 }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_compile", json!({ "update": true, "locked": true }), "`update` and `locked` cannot be given together", ""),
+        ("stack_compile", json!({ "update": "yes" }), "`update` must be true or false", ""),
+        ("stack_up", json!({ "ttl": 30 }), "`ttl` must be a string", ""),
+        ("stack_up", json!({ "owner": 1 }), "unknown argument `owner`", "did you mean `owner_pid`?"),
+        ("stack_restart", json!({ "services": "web" }), "`services` must be an array", ""),
+        ("stack_logs", json!({ "service": "web", "tail": 0 }), "`tail` must be from 1 to 10000", ""),
+        ("stack_logs", json!({ "tail": 5 }), "`service` is required", ""),
+        ("stack_inspect", json!({ "all_skills": 1 }), "`all_skills` must be true or false", ""),
+        ("stack_skill", json!({ "tool": "jq", "name": 3 }), "`name` must be a string", ""),
+        ("stack_status", json!({ "verbose": true }), "unknown argument `verbose`", "stack_status accepts: dir"),
+        ("stack_gc", json!({ "force": true }), "unknown argument `force`", ""),
+        ("stack_down", json!({ "dir_": "x" }), "unknown argument `dir_`", "did you mean `dir`?"),
+    ];
+    let calls: Vec<(&str, Value)> = cases.iter().map(|(tool, args, _, _)| (*tool, args.clone())).collect();
+    for (result, (tool, args, message, hint)) in fixture.mcp(&calls, &[]).iter().zip(&cases) {
+        let error = &result["structuredContent"]["error"];
+        assert_eq!((result["isError"].as_bool(), error["code"].as_str()), (Some(true), Some("usage")), "{tool} {args}: {result}");
+        assert!(error["message"].as_str().unwrap().contains(message), "{tool} {args}: {error}");
+        assert!(error["hint"].as_str().unwrap_or_default().contains(hint), "{tool} {args}: {error}");
+    }
+    assert!(!root.join("ran").exists(), "a command ran");
+    assert!(!root.join("mise.log").exists(), "provider work ran: {}", fs::read_to_string(root.join("mise.log")).unwrap_or_default());
+    assert!(!root.join("app/.stack/session.json").exists() && !root.join("state/sessions").exists());
+
+    // `null` still means omitted, and well-formed calls run.
+    let results = fixture.mcp(
+        &[
+            ("stack_exec", json!({ "command": ran, "secrets": null, "require": null, "require_all": null, "timeout_secs": null })),
+            ("stack_exec", json!({ "command": ["true"], "require": [], "require_all": true, "timeout_secs": u64::MAX })),
+            ("stack_run", json!({ "task": "t", "args": null })),
+        ],
+        &[],
+    );
+    for result in &results {
+        assert_eq!(result["structuredContent"]["data"]["exit_code"], 0, "{result}");
+    }
+    assert!(root.join("ran").exists());
 }
 
 #[test]
@@ -3160,6 +3854,7 @@ fn stacks_without_mr_boxington_never_ask_for_the_provider_release() {
 fn exec_finds_cargo_through_the_wrapper_mise_puts_first_and_run_passes_through() {
     let fixture = Fixture::with_bundle(RUST_MBX);
     let wrappers = fixture.dir.path().join("command-wrappers/bin");
+    fixture.ok(&["install"]);
     fs::create_dir_all(&wrappers).unwrap();
     fs::write(wrappers.join("cargo"), "#!/bin/sh\necho \"wrapped cargo $*\"\n").unwrap();
     fs::set_permissions(wrappers.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -3222,6 +3917,7 @@ fn secrets_fixture(extra: &str) -> Fixture {
     )
     .unwrap();
     fixture.ok(&["compile"]);
+    fixture.ok(&["install"]);
     fixture
 }
 
@@ -3891,11 +4587,19 @@ fn only_the_fnox_release_stack_lock_pins_is_run() {
     refused("link out of the pinned directory", "not_pinned");
     fs::remove_file(pinned_bins.join("fnox")).unwrap();
     std::os::unix::fs::symlink(root.join("installs/fnox/1.39.0/fnox"), pinned_bins.join("fnox")).unwrap();
-    // The pinned release is not installed, or not on PATH at all.
+    // The pinned release is not installed: exec refuses before any secret is looked up.
+    let not_installed = |context: &str| {
+        let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "tools_not_installed", "{context}: {text}");
+        assert_eq!(envelope["error"]["details"], json!([{ "tool": "fnox", "version": "1.39.0" }]), "{context}: {text}");
+        assert!(!root.join("impostor-ran").exists(), "{context}: the impostor ran");
+        assert!(fnox_log(&fixture).is_empty(), "{context}");
+    };
     installed(&fixture, &[("1.39.0", false), ("1.38.0", true)]);
-    refused("not installed", "not_installed");
+    not_installed("not installed");
     installed(&fixture, &[("1.38.0", true)]);
-    refused("only another release installed", "not_installed");
+    not_installed("only another release installed");
+    // Or not on PATH at all.
     installed(&fixture, &[("1.39.0", true)]);
     path_first(&fixture, &root.join("nowhere"));
     refused("not on PATH", "not_on_path");
@@ -4116,23 +4820,222 @@ fn compile_locks_in_a_tools_only_scratch_root_and_install_partitions_by_coverage
 #[test]
 fn refused_downloads_and_signers_are_artifact_mismatch_and_other_failures_install_failed() {
     let (fixture, platform) = artifact_fixture("");
-    let checksum = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/x/jq-macos-arm64:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:1111\n");
+    let checksum = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64: Checksum mismatch for file /tmp/x/jq-macos-arm64:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:1111\nhint: GitHub's current digest for jq-macos-arm64 in jqlang/jq jq-1.7.1 matches this download (asset updated 2026-06-20T14:10:29Z, release published 2026-06-20T14:11:27Z), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n");
     fs::write(fixture.dir.path().join("install-locked-fail"), &checksum).unwrap();
     let before = mise_log(&fixture).len();
     let out = fixture.command(&["install", "--json"]).output().unwrap();
     let e = &json_result(&out)["error"];
     assert_eq!(e["code"], "artifact_mismatch", "{e}");
-    assert_eq!(e["details"][0], json!({ "kind": "checksum", "name": "jq@1.7.1", "platform": platform, "expected": "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a", "actual": "sha256:1111", "url": "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64" }));
+    assert_eq!(e["details"][0], json!({ "kind": "checksum", "name": "jq@1.7.1", "platform": platform, "expected": "sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a", "actual": "sha256:1111", "url": "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64", "upstream": "GitHub's current digest for jq-macos-arm64 in jqlang/jq jq-1.7.1 matches this download (asset updated 2026-06-20T14:10:29Z, release published 2026-06-20T14:11:27Z)" }));
     assert!(e["hint"].as_str().unwrap().contains("compile --update"));
+    // mise renders its lock from stack.lock: its advice to edit that lock is not passed on.
+    let output = e["details"][1]["output"].as_str().unwrap();
+    assert!(output.contains("Expected: sha256:0bbe") && output.contains("Actual:   sha256:1111"), "{output}");
+    assert!(!output.contains("mise.lock") && !output.contains("re-uploaded"), "{output}");
     assert!(!mise_log(&fixture)[before..].contains("install --yes"), "nothing else is installed after a refusal");
 
     fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR Failed to install packslip:github.com/jdx/fnox@1.39.0: mise.lock says sigstore-oidc:a signed fnox@1.39.0, but this release is signed by sigstore-oidc:b; remove the entry from mise.lock to accept the new signer\n").unwrap();
     let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
     assert_eq!((e["code"].as_str(), e["details"][0]["kind"].as_str(), e["details"][0]["expected"].as_str()), (Some("artifact_mismatch"), Some("signer"), Some("sigstore-oidc:a")));
+    assert!(!e["details"][1]["output"].as_str().unwrap().contains("remove the entry"), "{e}");
 
     fs::write(fixture.dir.path().join("install-locked-fail"), "mise ERROR network unreachable\n").unwrap();
     let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
     assert_eq!(e["code"], "install_failed");
+}
+
+#[test]
+fn a_task_runs_against_the_lock_rendered_from_stack_lock_never_a_missing_or_stale_project_file() {
+    let (fixture, _) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let app = fixture.dir.path().join("app");
+    let expected = stack::artifacts::rendered(stack::lock::read(&app).unwrap().as_ref()).unwrap();
+    assert!(expected.contains("sha256:0bbe619e"), "{expected}");
+    let project_lock = app.join(".config/mise/mise.lock");
+    let run_lock = fixture.dir.path().join("run-lock");
+    // A fresh checkout (nothing rendered), then a lock rendered from an earlier stack.lock.
+    for project in [None, Some("# stale\n[[tools.jq]]\nversion = \"1.7.1\"\n")] {
+        match project {
+            None => {
+                let _ = fs::remove_file(&project_lock);
+            }
+            Some(text) => fs::write(&project_lock, text).unwrap(),
+        }
+        for route in ["cli", "mcp"] {
+            let _ = fs::remove_file(&run_lock);
+            let data = match route {
+                "cli" => json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"].clone(),
+                _ => fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"]["data"].clone(),
+            };
+            assert_eq!(data["exit_code"], 0, "{route}: {data}");
+            assert_eq!(fs::read_to_string(&run_lock).unwrap(), expected, "{route}, project lock {project:?}");
+        }
+        // The project's own file is left as it was.
+        assert_eq!(fs::read_to_string(&project_lock).ok().as_deref(), project);
+    }
+}
+
+#[test]
+fn a_tasks_missing_pins_install_from_its_copy_before_it_runs_and_a_warm_run_installs_nothing() {
+    let (fixture, _) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    let _ = fs::remove_file(dir.join("app/.config/mise/mise.lock"));
+    let before = mise_log(&fixture).len();
+    let data = json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"].clone();
+    assert_eq!(data["exit_code"], 0, "{data}");
+    let calls: Vec<String> = mise_log(&fixture)[before..].lines().filter(|l| l.starts_with("install") || l.starts_with("run")).map(|l| l.trim().to_string()).collect();
+    // stack install's split, before the task starts: checked pins locked, the rest plain.
+    assert_eq!(calls, ["install --locked --yes --quiet jq rust", "install --yes --quiet npm:prettier uv", "run --skip-deps --no-timings q --"], "{data}");
+    // From the task's copy, with the lock rendered from stack.lock beside it.
+    let install_log = fs::read_to_string(dir.join("install.log")).unwrap();
+    assert!(install_log.lines().all(|l| l.contains("/task-config/")), "{install_log}");
+    let expected = stack::artifacts::rendered(stack::lock::read(&dir.join("app")).unwrap().as_ref()).unwrap();
+    assert_eq!(fs::read_to_string(dir.join("rendered-at-install")).unwrap(), expected);
+    assert!(!dir.join("app/.config/mise/mise.lock").exists(), "the project's files are not written");
+    // Everything installed: only the installed query, beside the environment.
+    for route in ["cli", "mcp"] {
+        let before = mise_log(&fixture).len();
+        let data = match route {
+            "cli" => json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"].clone(),
+            _ => fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"]["data"].clone(),
+        };
+        assert_eq!(data["exit_code"], 0, "{route}: {data}");
+        assert!(!mise_log(&fixture)[before..].lines().any(|l| l.starts_with("install") || l.starts_with("version")), "{route}");
+    }
+}
+
+#[test]
+fn a_cold_tasks_install_is_given_the_planned_env_its_copy_declares_and_nothing_else() {
+    // mise renders the copy's `{{ env["KEY"] }}` declarations while installing, as when running.
+    let (fixture, _) = artifact_fixture("[env]\nTASK_ENV='from-project'\n[tasks.q]\nrun='echo $TASK_ENV'\n");
+    let dir = fixture.dir.path();
+    let routes = ["cli", "mcp", "terminal"];
+    for route in routes {
+        let _ = fs::remove_file(dir.join("installed"));
+        let _ = fs::remove_file(dir.join("install-env.log"));
+        fixture.set_env(&[("TASK_ENV", "from-project".into()), ("UNDECLARED", "not-for-install".into())]);
+        let ran = match route {
+            "cli" => json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"]["exit_code"] == 0,
+            "mcp" => fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"]["data"]["exit_code"] == 0,
+            _ => fixture.command(&["run", "q"]).output().unwrap().status.success(),
+        };
+        assert!(ran, "{route}: {}", fs::read_to_string(dir.join("mise.log")).unwrap_or_default());
+        // Exactly the declared names, with the values planning read; nothing it did not declare.
+        let given = fs::read_to_string(dir.join("install-env.log")).unwrap();
+        assert!(given.lines().all(|l| l == "TASK_ENV=from-project") && !given.is_empty(), "{route}: {given}");
+    }
+}
+
+#[test]
+fn a_task_whose_pins_mise_refuses_fails_with_stacks_remedy_before_it_runs() {
+    let (fixture, platform) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    let refusal = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:11\nhint: GitHub's current digest for jq matches this download (asset updated t1, release published t2), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n");
+    fs::write(dir.join("install-locked-fail"), &refusal).unwrap();
+    let before = mise_log(&fixture).len();
+    let cli = fixture.command(&["--json", "run", "q"]).output().unwrap();
+    let mcp = fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"].clone();
+    for e in [json_result(&cli)["error"].clone(), mcp["error"].clone()] {
+        assert_eq!(e["code"], "artifact_mismatch", "{e}");
+        assert_eq!(e["details"][0]["name"], "jq@1.7.1", "{e}");
+        assert!(e["hint"].as_str().unwrap().contains("stack compile --update"), "{e}");
+        assert!(!e.to_string().contains("update the checksum in mise.lock"), "{e}");
+    }
+    // In a terminal: stack's error, never mise's advice to edit the lock.
+    let terminal = fixture.command(&["run", "q"]).output().unwrap();
+    assert!(!terminal.status.success());
+    let text = format!("{}{}", String::from_utf8_lossy(&terminal.stdout), String::from_utf8_lossy(&terminal.stderr));
+    assert!(text.contains("artifact_mismatch") || text.contains("does not match stack.lock"), "{text}");
+    assert!(text.contains("stack compile --update") && !text.contains("mise.lock"), "{text}");
+    assert!(!mise_log(&fixture)[before..].contains("run --skip-deps"), "the task never started");
+}
+
+#[test]
+fn a_refused_cold_install_leaves_no_tracking_link_to_the_removed_task_copy() {
+    let (fixture, platform) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    fs::write(dir.join("install-locked-fail"), format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\n")).unwrap();
+    let state = dir.join("mise-state");
+    let tracked = state.join("tracked-configs");
+    fs::create_dir_all(&tracked).unwrap();
+    fs::write(dir.join("track-configs"), "").unwrap();
+    let project_config = dir.join("app/.config/mise/conf.d/stack.toml");
+    std::os::unix::fs::symlink(&project_config, tracked.join("project")).unwrap();
+    for route in ["cli", "terminal"] {
+        let mut command = fixture.command(&if route == "cli" { vec!["--json", "run", "q"] } else { vec!["run", "q"] });
+        let out = command.env("MISE_STATE_DIR", &state).output().unwrap();
+        assert!(!out.status.success(), "{route}");
+        assert!(fs::read_to_string(dir.join("install.log")).unwrap().contains("/task-config/"), "{route}: the install loaded the copy");
+        let left: Vec<_> = fs::read_dir(&tracked).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["project"], "{route}: the refused install's link to its copy must go with it");
+    }
+}
+
+#[test]
+fn a_stalled_cold_install_is_cut_short_by_the_runs_timeout_and_the_next_call_runs() {
+    let (fixture, _) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    let stalled_ended = || {
+        let pid: i32 = fs::read_to_string(dir.join("install-stalled-pid")).unwrap().trim().parse().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(pid, 0) != 0 }
+    };
+    let ran = || fs::read_to_string(dir.join("mise.log")).unwrap().lines().filter(|l| l.starts_with("run --skip-deps")).count();
+    let task_configs = || fs::read_dir(dir.join("cache/task-config")).map(|d| d.count()).unwrap_or(0);
+    for route in ["cli", "terminal", "mcp"] {
+        let _ = fs::remove_file(dir.join("installed"));
+        let _ = fs::remove_file(dir.join("install-stalled-pid"));
+        fs::write(dir.join("install-stall"), "30").unwrap();
+        let before = ran();
+        let start = Instant::now();
+        let error = match route {
+            "cli" => {
+                let out = fixture.command(&["--json", "run", "--timeout", "1s", "q"]).output().unwrap();
+                assert_eq!(out.status.code(), Some(124), "{route}");
+                json_result(&out)["error"].clone()
+            }
+            "terminal" => {
+                let out = fixture.command(&["run", "--timeout", "1s", "q"]).output().unwrap();
+                assert_eq!(out.status.code(), Some(124), "{route}: {}", String::from_utf8_lossy(&out.stderr));
+                assert!(String::from_utf8_lossy(&out.stderr).contains("timed_out"), "{route}");
+                json!({ "code": "timed_out", "details": [{ "cause": {} }] })
+            }
+            _ => {
+                // The same server answers the next call once the stalled one gave up.
+                let results = fixture.mcp(&[("stack_run", json!({ "task": "q", "timeout_secs": 1 })), ("stack_status", json!({}))], &[]);
+                assert_eq!(results[1]["structuredContent"]["ok"], true, "{route}: {}", results[1]);
+                results[0]["structuredContent"]["error"].clone()
+            }
+        };
+        assert!(start.elapsed() < Duration::from_secs(8), "{route}: took {:?}", start.elapsed());
+        assert_eq!(error["code"], "timed_out", "{route}: {error}");
+        assert!(error["details"][0].get("cause").is_some(), "{route}: what was cut short: {error}");
+        assert!(stalled_ended(), "{route}: the installer's group is killed");
+        assert_eq!(ran(), before, "{route}: the task never started");
+        assert_eq!(task_configs(), 0, "{route}: the task's copy is removed");
+        // The project lock was released: a call without the stall installs and runs.
+        fs::remove_file(dir.join("install-stall")).unwrap();
+        let data = json_result(&fixture.command(&["--json", "run", "--timeout", "30s", "q"]).output().unwrap())["data"].clone();
+        assert_eq!(data["exit_code"], 0, "{route}: {data}");
+    }
+}
+
+#[test]
+fn a_tasks_own_output_is_returned_as_it_wrote_it_and_never_read_for_refusals() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n");
+    let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: update the checksum in mise.lock.\n";
+    fs::write(fixture.dir.path().join("run-refusal"), refusal).unwrap();
+    for data in [
+        json_result(&fixture.command(&["--json", "run", "refused"]).output().unwrap())["data"].clone(),
+        fixture.mcp(&[("stack_run", json!({ "task": "refused" }))], &[])[0]["structuredContent"]["data"].clone(),
+    ] {
+        assert_eq!(data["exit_code"], 1, "{data}");
+        assert_eq!(data["stderr"], refusal, "the task's output is not rewritten");
+        assert!(data.get("warnings").is_none(), "{data}");
+    }
 }
 
 #[test]
