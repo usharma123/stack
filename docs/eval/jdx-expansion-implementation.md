@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and remediation are integrated; final Linux validation passed and Astra round 4 is in progress.
+Status: all routes are integrated; final Linux validation passed and Astra round 4 remediation is in progress.
 
 ## Scope and base
 
@@ -440,3 +440,24 @@ scratch roots; task-snapshot links were cleaned correctly. This broader scratch 
 issue was sent to Astra for assessment. The musl build also emitted a `libc::time_t`
 deprecation warning; no musl strict-Clippy pass is claimed. All owned containers and the
 Cargo volume were removed, with other resources untouched.
+
+### Astra round 4 and environment provenance remediation
+
+Astra reviewed `06dc7c3` and requested one P2 correction. The snapshot preserves
+`config_root`, but `config_source` names its relocated copy. Mise reevaluates scalar `[env]`
+entries during task execution and overwrites values captured correctly from the project
+configuration. An accepted template locating `message.txt` relative to `config_source`
+therefore succeeds through project-config execution and fails through `stack run`. Fresh
+Stack CLI and public-API reproductions confirmed this on mise 2026.9.18 and 2026.10.3.
+Evidence: `/tmp/stack-config-source-verify.1BJcnh/REPORT.md`.
+
+An Opus remediation task will keep evaluated scalar environment values authoritative while
+retaining immutable task definitions, tool/lock configuration, generated directives, PATH,
+secret grants and snapshot cleanup. A separate Opus task will remove only mise tracking
+links owned by retiring scratch roots. Astra classified those links as nonblocking metadata
+accumulation, with no observed command failure or cross-project interference.
+
+Astra confirmed the five round-one corrections, task/grant planning race correction and
+platform variant corrections. Its 33 focused tests passed. The post-planning body race is
+closed, subject to the remaining environment provenance correction. No final approval is
+claimed; a fresh review will receive both remediation responses and prior findings.
