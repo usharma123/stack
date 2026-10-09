@@ -1,6 +1,7 @@
 # Stack and the jdx tool ecosystem: selective integration
 
-Status: design, not implemented. Drafted by Claude Fable 5.1, critiqued over two rounds by
+Status: implemented on `feat/jdx-expansion`; see the [implementation and validation record](../eval/jdx-expansion-implementation.md).
+Original design drafted by Claude Fable 5.1, critiqued over two rounds by
 GPT-6-Astra; disagreements and resolutions are in [Fable vs Astra](#fable-vs-astra). Facts
 about upstream tools were checked against mise 2026.10.3, fnox 1.39.0, packslip 1.6.0, mbx
 1.22.0 and pitchfork 2.29.0 on macOS arm64 unless a line says otherwise. "Observed" means run
