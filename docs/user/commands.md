@@ -152,7 +152,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - `publish` refuses to move an existing tag to different content (`tag_exists`) unless `--force`.
 - Supported presets are postgres, redis, cockroachdb, nats and spicedb. Omitted service
   versions resolve `latest` once and get an exact pin. `prefix:` and `sub-` selectors resolve
-  to releases too. Unknown presets fail in locked mode (`unlocked_service`).
+  to releases too. Unknown presets fail in locked mode (`unlocked_service`). A service `version`
+  or `preset` with template syntax (`{{`, `{%`, `{#`) is `invalid_service`, in any layer.
 - `tools.<name>` accepts a table with `version` and [allowlisted options](bundles.md#tool-options)
   (`mr_boxington` on `rust`; `pubkey`, `identity`, `identity_prefix`, `issuer` on packslip-backed
   tools). Anything else is `invalid_tool`, as is template syntax (`{{`, `{%`, `{#`) in a version

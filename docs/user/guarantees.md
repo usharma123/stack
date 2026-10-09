@@ -75,7 +75,9 @@ and global mise aliases cannot reinterpret locked releases. Put application vari
 tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected.
 Version resolution runs `mise latest` in a scratch provider root of its own under stack's
 cache, whose only configuration is the one tool and its options; nothing in the project's
-`[env]` or tasks is evaluated, and the root is removed afterwards. Artifact locking does the
+`[env]` or tasks is evaluated, and the root is removed afterwards. No scratch configuration is
+written for a pin with template syntax in its name, version or options, however the pin
+arrived (a manifest, a service version, an edited stack.lock). Artifact locking does the
 same with one scratch root per `compile` naming every pin at its exact version; values with
 template syntax are refused before mise could evaluate them.
 Skills discovery (`inspect`, `compile`, the `skills` step) works the same way, in a scratch
