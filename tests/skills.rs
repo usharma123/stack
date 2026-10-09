@@ -586,25 +586,44 @@ fn a_skills_dir_linked_into_another_checkout_leaves_that_checkouts_files_alone()
 
 #[test]
 fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both() {
-    // `.Config/mise` is the same directory where the file system ignores case.
-    for dir in [".config/mise", ".Config/mise"] {
-        let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}")));
+    use std::os::unix::fs::MetadataExt;
+    let project = |dir: &str| SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}"));
+    // Installed under each spelling, and a working install changed to the other spelling only.
+    // `.Config/mise` is `.config/mise` where the file system ignores case (macOS's default).
+    for (first, then) in [(".config/mise", None), (".Config/mise", None), (".config/mise", Some(".Config/mise"))] {
+        let case = format!("{first} then {then:?}");
+        let f = Fixture::new(&project(first));
         let app = f.path("app");
         git_in(&app, &["init", "-q"]);
-        f.json(&["install"]);
-        let ignore = app.join(".config/mise/.gitignore");
-        let text = fs::read_to_string(&ignore).unwrap();
-        for entry in ["/conf.d/stack.toml", "/mise.lock", "/locks/"] {
-            assert!(text.lines().any(|l| l == entry), "{dir}: provider entry {entry} lost: {text}");
+        let v = f.json(&["install"]);
+        assert_eq!(step(&v, "skills")["status"], "ok", "{case}: {v}");
+        let mut dir = first;
+        if let Some(alias) = then {
+            fs::write(app.join("stack.toml"), project(alias)).unwrap();
+            let v = f.json(&["compile"]);
+            assert!(v["data"].get("warnings").is_none(), "{case}: {v}");
+            dir = alias;
         }
-        if dir == ".config/mise" {
-            assert!(text.lines().any(|l| l == "/.stack-skills.json") && text.lines().any(|l| l == "/fnox"), "{dir}: {text}");
+        let one = fs::metadata(app.join(".config/mise")).unwrap().ino() == fs::metadata(app.join(dir)).unwrap().ino();
+        assert_eq!(one, dir == ".config/mise" || app.join(".CONFIG").exists(), "{case}");
+        // The links and their registry are where the skills dir names, and stack's file in that
+        // physical directory names them along with the provider's files.
+        let skills = app.join(dir);
+        assert!(fs::symlink_metadata(skills.join("fnox")).unwrap().file_type().is_symlink(), "{case}");
+        assert!(skills.join(".stack-skills.json").is_file(), "{case}");
+        let text = fs::read_to_string(skills.join(".gitignore")).unwrap();
+        let entries: &[&str] = if one { &["/conf.d/stack.toml", "/mise.lock", "/locks/", "/.stack-skills.json", "/fnox", "/mbx"] } else { &["/.stack-skills.json", "/fnox", "/mbx"] };
+        for entry in entries {
+            assert!(text.lines().any(|l| l == *entry), "{case}: {entry} missing: {text}");
         }
-        assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new(), "{dir}: {text}");
-        let out = f.command_at(&app, &["compile"]).output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(fs::read_to_string(&ignore).unwrap(), text, "{dir}: a compile publishes the same file");
-        assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new(), "{dir}");
+        assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new(), "{case}: {text}");
+        assert_eq!(untracked_in(&app, ".Config/"), Vec::<String>::new(), "{case}: {text}");
+        for command in ["compile", "install"] {
+            let v = f.json(&[command]);
+            assert_eq!(v["ok"], true, "{case}: {v}");
+            assert!(!v.to_string().contains("invalid_path") && !v.to_string().contains("left"), "{case}: {command} warns: {v}");
+            assert_eq!(fs::read_to_string(skills.join(".gitignore")).unwrap(), text, "{case}: a {command} publishes the same file");
+        }
     }
 }
 

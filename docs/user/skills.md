@@ -82,13 +82,13 @@ made, and `.stack-skills.json`, by exact name in a `.gitignore` of its own in th
 skills you add to the directory yourself, and the same names in other worktrees, do not. A
 link is listed only while it is still the link stack made, pointing where it recorded: once
 you replace it with a skill directory or a link of your own, or remove it, the next `compile`
-stops ignoring that name. A skills dir that is also `.config/mise` gets one `.gitignore`
-naming both the provider files and the links. A `.gitignore` of yours there is left as it is,
-with a warning naming the links it misses.
+stops ignoring that name. A skills dir that is also `.config/mise`, under any spelling the file system treats
+as the same directory (`.Config/mise` on a case-insensitive one), gets one `.gitignore`
+naming both the provider files and the links. A `.gitignore` of yours there is left as it is, with a warning naming the links it misses.
 
 - Project only: a bundle cannot set `[skills]`.
-- `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no
-  symbolic link along the path (`invalid_path`).
+- `dir` must be relative and stay inside the project, outside `.stack` and `.git` (however
+  they are spelled), with no symbolic link along the path (`invalid_path`).
 - After the install step, a `skills` step links every `available` skill to `<dir>/<name>` and
   records its links in `<dir>/.stack-skills.json`. Stack replaces or removes only a link it
   recorded that still points where it left it. Anything else at that name is left alone and

@@ -728,10 +728,15 @@ pub(crate) fn real_dir(root: &Path, dir: &Path, create: bool) -> std::result::Re
             return Err(("invalid_path", format!("{} is not a directory", at.display())));
         }
     }
-    // No component is a link, so the path cannot resolve outside the project.
-    match at.canonicalize() {
-        Ok(real) if real == at && real.starts_with(root) => Ok(true),
-        _ => Err(("invalid_path", format!("{} does not resolve inside the project", at.display()))),
+    // No component is a link, so the path cannot resolve outside the project. Where the file
+    // system ignores case, the stored spelling (`.config` for `.Config`) may differ from the one
+    // written: the directory is the same, but its real name must not be `.stack` or `.git`.
+    let outside = || ("invalid_path", format!("{} does not resolve inside the project", at.display()));
+    let (Ok(real), Ok(real_root)) = (at.canonicalize(), root.canonicalize()) else { return Err(outside()) };
+    let Ok(inside) = real.strip_prefix(&real_root) else { return Err(outside()) };
+    match inside.components().next() {
+        Some(Component::Normal(first)) if first != ".stack" && first != ".git" => Ok(true),
+        _ => Err(("invalid_path", format!("{} is {}, inside .stack or .git", at.display(), real.display()))),
     }
 }
 
@@ -985,6 +990,24 @@ mod tests {
         assert_eq!(validate_dir("./agents/skills/").unwrap(), PathBuf::from("agents/skills"));
         for bad in ["", " ", "/abs", "../x", "a/../../b", "a/..", ".", ".stack/skills", ".git/skills", "\\x"] {
             assert_eq!(validate_dir(bad).unwrap_err().code, "invalid_path", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_case_alias_is_its_real_directory_and_never_one_inside_stack_or_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in [".config/mise", ".stack/skills", ".git/skills"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        assert_eq!(real_dir(&root, Path::new(".config/mise"), false), Ok(true));
+        // Only where the file system ignores case do these name the directories above.
+        if !root.join(".CONFIG").exists() {
+            return;
+        }
+        assert_eq!(real_dir(&root, Path::new(".Config/MISE"), false), Ok(true));
+        for alias in [".Stack/skills", ".GIT/skills"] {
+            assert_eq!(real_dir(&root, Path::new(alias), true).unwrap_err().0, "invalid_path", "{alias}");
         }
     }
 
