@@ -41,9 +41,11 @@
 //! mise trusts its global configuration, so the copy is never registered as trusted.
 //!
 //! mise links every configuration it loads under `$MISE_STATE_DIR/tracked-configs`, and only
-//! `mise prune` removes links whose file is gone. Once [`TaskConfig::track_with`] has named the
-//! command's environment, dropping the copy removes the links that point into it, and links
-//! into copies of runs killed before they could are removed by the next run.
+//! `mise prune` removes links whose file is gone. [`TaskConfig::track_with`] names each
+//! environment that loads the copy (the install of missing pins, then the task) before it
+//! runs, so dropping the copy, on success, failure or timeout alike, removes the links that
+//! point into it; links into copies of runs killed before they could are removed by the next
+//! run.
 
 use crate::error::{io_error, Result, StackError};
 use std::path::{Path, PathBuf};
@@ -64,8 +66,8 @@ pub struct TaskConfig {
     root: PathBuf,
     /// `<cache>/task-config`, where every copy is made.
     parent: PathBuf,
-    /// mise's `tracked-configs` directory, as the command's environment names it.
-    tracked: Option<PathBuf>,
+    /// mise's `tracked-configs` directories, as each environment that loads the copy names it.
+    tracked: Vec<PathBuf>,
     /// The `[env]` variables the copy declares as inherited (see [`TaskConfig::declared`]).
     declared: Vec<String>,
 }
@@ -114,7 +116,7 @@ impl TaskConfig {
         if let Some(lock) = lock {
             write_new(&dir.path().join(LOCK), lock.as_bytes())?;
         }
-        Ok(Self { dir, root: root.to_path_buf(), parent, tracked: None, declared })
+        Ok(Self { dir, root: root.to_path_buf(), parent, tracked: Vec::new(), declared })
     }
 
     /// The copied configuration.
@@ -145,23 +147,28 @@ impl TaskConfig {
         .map(|(key, value)| (key.to_string(), value.to_string_lossy().into_owned()))
     }
 
-    /// Name the environment the command runs with (`var` answers what it sees for a variable),
-    /// so the links mise makes to the copy can be removed with it. Links to copies that no
-    /// longer exist, left by runs killed before they cleaned up, are removed now.
+    /// Name an environment a mise command loading the copy runs with (`var` answers what it
+    /// sees for a variable), before that command runs, so the links mise makes to the copy can
+    /// be removed with it whatever ends the run: the install of the task's missing pins as well
+    /// as the task. Links to copies that no longer exist, left by runs killed before they
+    /// cleaned up, are removed now.
     pub fn track_with(&mut self, var: impl Fn(&str) -> Option<String>) {
         // As mise finds it, run from the root: the same rules as a scratch root's commands.
-        self.tracked = super::scratch::tracked_configs(&self.root, var);
+        let Some(tracked) = super::scratch::tracked_configs(&self.root, var) else { return };
+        if !self.tracked.contains(&tracked) {
+            self.tracked.push(tracked);
+        }
         self.unlink(|target| target.starts_with(&self.parent) && !target.exists());
     }
 
     /// Remove mise's tracking links whose target `matches`. Only links are touched.
     fn unlink(&self, matches: impl Fn(&Path) -> bool) {
-        let Some(entries) = self.tracked.as_ref().and_then(|t| std::fs::read_dir(t).ok()) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if std::fs::read_link(entry.path()).is_ok_and(|target| matches(&target)) {
-                let _ = std::fs::remove_file(entry.path());
+        for tracked in &self.tracked {
+            let Ok(entries) = std::fs::read_dir(tracked) else { continue };
+            for entry in entries.flatten() {
+                if std::fs::read_link(entry.path()).is_ok_and(|target| matches(&target)) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
     }

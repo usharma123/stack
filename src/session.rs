@@ -2111,8 +2111,8 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         )?),
         Target::Command { .. } => None,
     };
-    if let Some(config) = &task_config {
-        install_task_tools(ctx, &report, config, &env, &missing)?;
+    if let Some(config) = task_config.as_mut() {
+        install_task_tools(ctx, &report, config, &env, &selection, &missing)?;
         // Set before secrets resolve, so no grant can replace them.
         env.extend(config.env());
     }
@@ -2272,7 +2272,18 @@ fn check_services_host(report: &Report) -> Result<()> {
 /// The copy declares its `[env]` variables as inherited, so the install is given the values
 /// `planned` (the environment planning read, before any grant resolves) holds for exactly
 /// those names; the variables that select the copy are set last and cannot be replaced.
-fn install_task_tools(ctx: &Ctx, report: &Report, config: &TaskConfig, planned: &IndexMap<String, String>, missing: &[scratch::Pin]) -> Result<()> {
+///
+/// The install's provider state directory is tracked before it runs, so a refused, failed or
+/// cut-short install leaves no link to the copy behind it (`selection` is the provider
+/// selection every mise command is given).
+fn install_task_tools(
+    ctx: &Ctx,
+    report: &Report,
+    config: &mut TaskConfig,
+    planned: &IndexMap<String, String>,
+    selection: &IndexMap<String, String>,
+    missing: &[scratch::Pin],
+) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
@@ -2289,6 +2300,14 @@ fn install_task_tools(ctx: &Ctx, report: &Report, config: &TaskConfig, planned: 
     let mut overrides: Vec<(String, String)> =
         config.declared().iter().filter_map(|key| Some((key.clone(), planned.get(key)?.clone()))).collect();
     overrides.extend(config.env());
+    // What the install sees: the overrides, then the selection, then stack's own environment
+    // without the provider settings it does not pass on.
+    config.track_with(|key| match overrides.iter().rev().find(|(k, _)| k == key) {
+        Some((_, value)) => Some(value.clone()),
+        None if selection.contains_key(key) => selection.get(key).cloned(),
+        None if mise::inherited_config_keys().iter().any(|k| k == key) => None,
+        None => std::env::var(key).ok(),
+    });
     if !locked.is_empty() {
         mise::install_tools_with(&ctx.root, &overrides, &locked, true)?;
     }

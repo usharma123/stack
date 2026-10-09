@@ -63,6 +63,11 @@ print(json.dumps(out))' "$REVIEW_FIXTURE"
     test -f "$config" || config=$MISE_GLOBAL_CONFIG_FILE
     echo "config=$config $*" >>"$REVIEW_FIXTURE/install.log"
     if test -f "${config%/conf.d/*}/mise.lock"; then cp "${config%/conf.d/*}/mise.lock" "$REVIEW_FIXTURE/rendered-at-install"; fi
+    # Like mise, link the configuration it loaded under its state directory, when a test asks.
+    if test -f "$REVIEW_FIXTURE/track-configs"; then
+      mkdir -p "$MISE_STATE_DIR/tracked-configs"
+      ln -sf "$config" "$MISE_STATE_DIR/tracked-configs/install-$(printf %s "$config" | cksum | cut -d' ' -f1)"
+    fi
     if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi
     # Record what was installed: the named tools (every one when none is named), each at every
     # version the configuration gives it.

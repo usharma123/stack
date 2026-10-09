@@ -4488,6 +4488,27 @@ fn a_task_whose_pins_mise_refuses_fails_with_stacks_remedy_before_it_runs() {
 }
 
 #[test]
+fn a_refused_cold_install_leaves_no_tracking_link_to_the_removed_task_copy() {
+    let (fixture, platform) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    fs::write(dir.join("install-locked-fail"), format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\n")).unwrap();
+    let state = dir.join("mise-state");
+    let tracked = state.join("tracked-configs");
+    fs::create_dir_all(&tracked).unwrap();
+    fs::write(dir.join("track-configs"), "").unwrap();
+    let project_config = dir.join("app/.config/mise/conf.d/stack.toml");
+    std::os::unix::fs::symlink(&project_config, tracked.join("project")).unwrap();
+    for route in ["cli", "terminal"] {
+        let mut command = fixture.command(&if route == "cli" { vec!["--json", "run", "q"] } else { vec!["run", "q"] });
+        let out = command.env("MISE_STATE_DIR", &state).output().unwrap();
+        assert!(!out.status.success(), "{route}");
+        assert!(fs::read_to_string(dir.join("install.log")).unwrap().contains("/task-config/"), "{route}: the install loaded the copy");
+        let left: Vec<_> = fs::read_dir(&tracked).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["project"], "{route}: the refused install's link to its copy must go with it");
+    }
+}
+
+#[test]
 fn a_tasks_own_output_is_returned_as_it_wrote_it_and_never_read_for_refusals() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n");
     let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: update the checksum in mise.lock.\n";
