@@ -2050,26 +2050,40 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             return Err(unknown_service(&report, name));
         }
     }
-    // A pin that is not installed leaves its directory off the provider's PATH, and the
-    // command (or anything it starts) would find whatever release is next on PATH. A task is
-    // left to `mise run`, which installs what its configuration names.
     check_services_host(&report)?;
-    if let Target::Command { .. } = target {
-        require_installed(ctx, &report)?;
-        timings.mark("installed");
+    // A pin that is not installed leaves its directory off the provider's PATH, and the
+    // command (or anything it starts) would find whatever release is next on PATH. Asked while
+    // the provider prepares the environment, and answered before anything runs on that PATH
+    // (identity probes included). A task is left to `mise run`, which installs what its
+    // configuration names.
+    let installed = matches!(target, Target::Command { .. }).then(|| {
+        let (cache, pins) = (ctx.cache.clone(), report.lock.as_ref().map(scratch::pins).unwrap_or_default());
+        let deadline = crate::process::deadline();
+        std::thread::spawn(move || {
+            let _deadline = crate::process::deadline_scope(deadline);
+            scratch::not_installed(&cache, &pins)
+        })
+    });
+    let provided = mise::trust(&ctx.root).and_then(|()| {
+        timings.mark("trust");
+        if report.stack.services.is_empty() {
+            mise::env(&ctx.root).map(|env| (env, None))
+        } else {
+            mise::env_and_daemons(&ctx.root).map(|(env, statuses)| (env, Some(statuses)))
+        }
+    });
+    if let Some(handle) = installed {
+        require_installed(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?)?;
     }
-    mise::trust(&ctx.root)?;
-    timings.mark("trust");
-    let (mut env, checks) = if report.stack.services.is_empty() {
-        let env = mise::env(&ctx.root)?;
-        timings.mark("env");
-        (env, Vec::new())
-    } else {
-        let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
-        timings.mark("env_daemons");
-        let checks = verify_session(ctx, &report, &env, &statuses, session.as_ref(), &timings);
-        timings.mark("verify");
-        (env, checks)
+    let (mut env, statuses) = provided?;
+    timings.mark("env");
+    let checks = match statuses {
+        None => Vec::new(),
+        Some(statuses) => {
+            let checks = verify_session(ctx, &report, &env, &statuses, session.as_ref(), &timings);
+            timings.mark("verify");
+            checks
+        }
     };
     // Under the lock, from what this compile wrote; removed if planning fails after this. The
     // `[env]` values just read from the project's file stay authoritative: the copy declares
@@ -2235,11 +2249,9 @@ fn check_services_host(report: &Report) -> Result<()> {
     mise::check_services_host(&artifacts::Host::current(), &services)
 }
 
-/// Every release stack.lock pins is installed, as mise reports it, or `tools_not_installed`
-/// naming the ones that are not. Nothing is installed here.
-fn require_installed(ctx: &Ctx, report: &Report) -> Result<()> {
-    let pins = report.lock.as_ref().map(scratch::pins).unwrap_or_default();
-    let missing = scratch::not_installed(&ctx.cache, &pins)?;
+/// `tools_not_installed` naming the pins mise does not report installed, if any. Nothing is
+/// installed here.
+fn require_installed(missing: Vec<scratch::Pin>) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
