@@ -393,6 +393,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     preflight(&stack, &new_lock)?;
 
     let output = mise::output_path(&opts.root);
+    let mut ignore_warning = None;
     let (ports, identities) = if opts.write {
         let requests: Vec<Request> = stack
             .services
@@ -415,6 +416,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         };
         let identities = crate::identity::assign(&opts.state, &opts.root, &probed)?;
         write_if_changed(&output, &mise::render(&stack, &ports, &exact, &identities))?;
+        ignore_warning = crate::ignore::update(&opts.root, project.skills.as_ref().map(|s| s.dir.as_str()));
         (ports, identities)
     } else {
         let mut identities = crate::identity::lookup(&opts.state, &opts.root)?;
@@ -424,6 +426,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
 
     let mut warnings = warnings(&stack);
     warnings.extend(outcome.warnings);
+    warnings.extend(ignore_warning);
     let lock = if opts.write || opts.mode == Mode::Frozen { Some(new_lock) } else { previous };
     Ok(Report {
         lock,

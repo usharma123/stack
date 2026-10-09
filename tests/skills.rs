@@ -464,6 +464,32 @@ fn install_links_available_skills_into_the_configured_directory() {
 }
 
 #[test]
+fn skill_links_and_their_registry_are_excluded_from_git_but_a_users_own_skills_are_not() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(f.path("app")).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    let dir = f.path("app/.claude/skills");
+    fs::create_dir_all(dir.join("mine")).unwrap();
+    fs::write(dir.join("mine/SKILL.md"), "mine\n").unwrap();
+    f.json(&["install"]);
+    let untracked = || -> Vec<String> {
+        git(&["status", "--porcelain", "--untracked-files=all"]).lines().filter_map(|l| l.strip_prefix("?? ")).filter(|p| p.starts_with(".claude/")).map(String::from).collect()
+    };
+    assert!(dir.join("fnox").exists() && dir.join(".stack-skills.json").exists());
+    assert_eq!(untracked(), [".claude/skills/mine/SKILL.md"]);
+    // A name stack no longer links is no longer excluded: a user's own skill there shows.
+    fs::remove_file(dir.join("mbx")).unwrap();
+    fs::create_dir(dir.join("mbx")).unwrap();
+    fs::write(dir.join("mbx/SKILL.md"), "mine too\n").unwrap();
+    f.json(&["install"]);
+    assert_eq!(untracked(), [".claude/skills/mbx/SKILL.md", ".claude/skills/mine/SKILL.md"]);
+}
+
+#[test]
 fn up_succeeds_with_a_warning_when_skills_cannot_be_linked() {
     let project = "[tools]\nfnox = \"1.39\"\n\n[skills]\ndir = \"agents/skills\"\n";
     let f = Fixture::new(project);

@@ -238,7 +238,8 @@ the machine is not checked again.
 
 Migration: version 2 locks stay valid under `best-effort`, with every pin `missing`. The next
 `compile` writes version 3 and needs network access for `mise lock`. Because a session's
-configuration includes stack.lock, the first `up` after migrating restarts services once. Keep
-`.config/mise/mise.lock` and `.config/mise/locks/` out of version control: they are generated.
+configuration includes stack.lock, the first `up` after migrating restarts services once.
+`.config/mise/mise.lock` and `.config/mise/locks/` are generated; in a git checkout stack
+excludes them (see [Install](install.md#first-run)).
 
 [All docs](../README.md)

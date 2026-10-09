@@ -704,6 +704,11 @@ fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str
 /// The ownership record, refusing anything stack cannot trust: a link (which could redirect a
 /// write), something other than a regular file, an oversized or malformed record, or names
 /// that are not plain skill names.
+/// The link names stack recorded in `dir`'s registry; none when it cannot be read.
+pub fn linked(dir: &Path) -> Vec<String> {
+    read_registry(dir).map(|r| r.links.into_keys().collect()).unwrap_or_default()
+}
+
 fn read_registry(dir: &Path) -> std::result::Result<Registry, String> {
     let path = dir.join(REGISTRY);
     let refuse = |why: String| format!("{} {why}; nothing was linked or removed (move it aside to let stack start afresh)", path.display());

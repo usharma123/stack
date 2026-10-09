@@ -71,11 +71,9 @@ To have `stack up` and `stack install` link skills where an agent looks for them
 dir = ".claude/skills"
 ```
 
-and keep the links out of version control; they point into one user's mise installs:
-
-```gitignore
-.claude/skills/
-```
+The links point into one user's mise installs. In a git checkout stack lists each link it
+made, and `.stack-skills.json`, in the repository's local `.git/info/exclude`, so they stay
+out of version control while skills you add to the directory yourself do not.
 
 - Project only: a bundle cannot set `[skills]`.
 - `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no

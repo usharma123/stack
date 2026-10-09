@@ -47,7 +47,7 @@ stack down
 
 `compile` records exact versions in `stack.lock` and assigns this checkout its own ports. `up` installs the tools and starts Redis. `exec` verifies Redis before exposing its connection URL. `down` confirms the service has stopped.
 
-Commit `stack.toml` and `stack.lock`. Keep generated machine-specific files out of version control, including `.stack/`, `.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock` and `.config/mise/locks/` (the last two are rendered from `stack.lock` and written by mise). Stack writes `.stack/.gitignore` itself; a `.stack/session.json` copied in from another directory (committed by an earlier release, or a duplicated checkout) is ignored.
+Commit `stack.toml` and `stack.lock`. The rest stack generates is machine-specific: `.stack/`, `.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`, `.config/mise/locks/` and the [skill links](skills.md#linking-skills-into-the-project) with their `.stack-skills.json`. In a git checkout, `compile` (and every command that compiles) lists exactly those paths in the repository's local `.git/info/exclude`, one block per checkout, which every worktree reads and nobody commits. Your own lines there, your other files under `.config/` and your own skills stay as they are, and a file you already track stays tracked. Stack also writes `.stack/.gitignore`; a `.stack/session.json` copied in from another directory (committed by an earlier release, or a duplicated checkout) is ignored.
 
 > Stack is an early prototype. Review bundles before using them: their commands run as trusted code. A TTL is reclaimed by `stack gc` or a later `stack up`; unattended cleanup requires running `stack gc --watch` under a supervisor.
 

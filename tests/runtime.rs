@@ -158,6 +158,79 @@ fn exec_refuses_a_pin_that_is_not_installed_instead_of_running_another_release_o
     assert!(ls.contains("jq = \"1.8.2\"") && !ls.contains(&format!("dir={}", fixture.dir.path().join("app").canonicalize().unwrap().display())), "{ls}");
 }
 
+/// `git <args>` in `dir`, which must succeed; its stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Untracked paths git reports under `dir`, ignored ones left out.
+fn untracked(dir: &Path, under: &str) -> Vec<String> {
+    git(dir, &["status", "--porcelain", "--untracked-files=all"])
+        .lines()
+        .filter_map(|l| l.strip_prefix("?? "))
+        .filter(|p| p.starts_with(under))
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn generated_files_are_excluded_from_git_in_clones_and_worktrees_and_user_files_are_not() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    let exclude = top.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "# mine\n*.log\n").unwrap();
+    // Files of the user's own beside stack's: a mise config and a hand-written skill.
+    fs::write(top.join("app/.config/mise/config.toml"), "[tools]\n").unwrap();
+    fs::create_dir_all(top.join("app/.claude/skills/mine")).unwrap();
+    fs::write(top.join("app/.claude/skills/mine/SKILL.md"), "mine\n").unwrap();
+    fs::write(top.join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[skills]\ndir='.claude/skills'\n").unwrap();
+    fixture.ok(&["up"]);
+    // What mise writes beside them when a lock is rendered (this fake locks nothing).
+    fs::write(top.join("app/.config/mise/mise.lock"), "").unwrap();
+    fs::create_dir_all(top.join("app/.config/mise/locks")).unwrap();
+    fs::write(top.join("app/.config/mise/locks/x"), "").unwrap();
+    assert!(top.join("app/.config/mise/conf.d/stack.toml").exists() && top.join("app/.stack").exists());
+    assert_eq!(
+        untracked(top, "app/"),
+        ["app/.claude/skills/mine/SKILL.md", "app/.config/mise/config.toml", "app/stack.lock", "app/stack.toml"],
+    );
+    let text = fs::read_to_string(&exclude).unwrap();
+    assert!(text.starts_with("# mine\n*.log\n"), "{text}");
+    assert!(text.contains("\n/app/.claude/skills/.stack-skills.json\n") && !text.contains("/app/.claude/skills/\n"), "{text}");
+
+    // A worktree of the same repository: its own block, and nothing of stack's shows there.
+    git(top, &["add", "bundle", "app/stack.toml", "app/stack.lock"]);
+    git(top, &["commit", "-qm", "stack"]);
+    let wt = top.join("wt");
+    git(top, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let out = fixture.command_at(&wt.join("app"), &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(wt.join("app/.config/mise/conf.d/stack.toml").exists());
+    assert_eq!(untracked(&wt, "app/"), Vec::<String>::new());
+    let wt_root = wt.join("app").canonicalize().unwrap();
+    assert!(fs::read_to_string(&exclude).unwrap().contains(&format!("# stack: generated files of {}\n", wt_root.display())));
+    // A deleted worktree's block goes the next time any checkout of the repository compiles.
+    fs::remove_dir_all(&wt).unwrap();
+    fixture.ok(&["compile"]);
+    let text = fs::read_to_string(&exclude).unwrap();
+    assert!(!text.contains(&wt_root.display().to_string()) && text.starts_with("# mine\n*.log\n"), "{text}");
+
+    // Outside a repository nothing is written anywhere.
+    fs::remove_dir_all(top.join(".git")).unwrap();
+    fixture.ok(&["compile"]);
+    assert!(!top.join(".git").exists());
+}
+
 #[test]
 fn project_overrides_change_the_session_generation_even_when_bundle_pins_do_not() {
     let fixture = Fixture::new();

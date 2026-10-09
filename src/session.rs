@@ -564,11 +564,13 @@ impl Steps {
         let Some(dir) = report.skills_dir.as_deref() else { return Vec::new() };
         let empty = crate::lock::Lockfile::new(Vec::new(), Vec::new(), Vec::new());
         let sync = crate::skills::sync_step(&ctx.cache, &ctx.root, dir, report.lock.as_ref().unwrap_or(&empty), &report.versions);
-        let warnings: Vec<String> = sync
+        let mut warnings: Vec<String> = sync
             .warnings
             .iter()
             .map(|w| format!("skills: {}: {}", w["code"].as_str().unwrap_or_default(), w["message"].as_str().unwrap_or_default()))
             .collect();
+        // The links just made or removed.
+        warnings.extend(crate::ignore::update(&ctx.root, Some(dir)).map(|w| format!("skills: {w}")));
         let detail = serde_json::to_value(&sync).expect("sync report serializes");
         if warnings.is_empty() { self.ok("skills", detail) } else { self.warn("skills", detail) }
         warnings
