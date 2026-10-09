@@ -37,6 +37,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 /// Time allowed past an expired deadline to record what a cut-short start launched.
 const RECORD_GRACE: Duration = Duration::from_secs(10);
+/// How long a finished command waits for a project lock another command holds, with or
+/// without a deadline, before leaving a completion record for the next lifecycle command.
+const RELEASE_GRACE: Duration = Duration::from_secs(1);
 
 pub struct Ctx {
     pub root: PathBuf,
@@ -3030,8 +3033,6 @@ pub struct ExecutionGuard {
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
         let _timings = Timings::new("release");
-        // A run whose deadline passed still waits briefly for a contended project lock: an
-        // execution left recorded for a live process (an MCP server) makes `up` session_busy.
         let _grace = crate::process::grace_scope(RECORD_GRACE);
         let ctx = Ctx {
             root: self.root.clone(),
@@ -3039,9 +3040,15 @@ impl Drop for ExecutionGuard {
             state: self.state.clone(),
         };
         let completed_at = now();
-        let _guard = match project_lock(&ctx.state, &ctx.root) {
+        // The lock is waited for briefly whatever the call's deadline: an expired one still
+        // gets the chance, and none (a CLI `exec` without `--timeout`) never waits unbounded.
+        let locked = {
+            let _bound = crate::process::deadline_scope(Some(Instant::now() + RELEASE_GRACE));
+            project_lock(&ctx.state, &ctx.root)
+        };
+        let _guard = match locked {
             Ok(guard) => guard,
-            // Another command holds the lock past the grace: the next lifecycle command
+            // Another command holds the lock past RELEASE_GRACE: the next lifecycle command
             // applies this record. Without it the execution stays recorded (and the session
             // busy) while this process lives.
             Err(e) if e.code == "lock_busy" => {

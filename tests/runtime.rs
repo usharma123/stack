@@ -511,13 +511,13 @@ fn a_timed_out_command_whose_release_outwaits_its_grace_still_frees_the_session(
     let session_file = app.join(".stack/session.json");
     let records = completions(&fixture);
     // Another command holds the project lock for longer than the release waits for it.
-    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(12));
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(5));
     let mut server = Server::start(&fixture);
     let started = Instant::now();
     let result = server.call("stack_exec", json!({ "command": ["sleep", "30"], "timeout_secs": 1 }));
     let elapsed = started.elapsed();
     assert_eq!(result["error"]["code"], "timed_out", "{result}");
-    assert!(elapsed < Duration::from_secs(12), "the call stays bounded: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(4), "the call stays bounded: {elapsed:?}");
     // While the lock is still held: the execution is recorded, with a record that it finished.
     let recorded = read_value(&session_file)["active_executions"].clone();
     let (token, pid) = recorded.as_object().unwrap().iter().next().unwrap_or_else(|| panic!("{recorded}"));
@@ -537,6 +537,26 @@ fn a_timed_out_command_whose_release_outwaits_its_grace_still_frees_the_session(
     server.close();
     fixture.ok(&["down"]);
     assert!(!records.exists(), "down removes the project's completion records");
+}
+
+#[test]
+fn a_command_without_a_timeout_does_not_wait_unbounded_to_finish_its_record() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(8));
+    let started = Instant::now();
+    let out = fixture.command(&["--json", "exec", "--", "sleep", "1"]).output().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(json_result(&out)["ok"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(elapsed < Duration::from_secs(5), "waited for the lock: {elapsed:?}");
+    assert_eq!(fs::read_dir(completions(&fixture)).unwrap().count(), 1);
+    holder.join().unwrap();
+    fixture.ok(&["up"]);
+    assert_eq!(read_value(&session_file)["active_executions"], json!({}));
+    assert_eq!(fs::read_dir(completions(&fixture)).unwrap().count(), 0);
 }
 
 /// Record `token` as executing for this (live) test process, in both session files.

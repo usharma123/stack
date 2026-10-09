@@ -120,10 +120,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the session unverified (run `up`) without losing track of what it started. It fails with
   `no_session` before `up`, `session_stale` when the configuration changed since `up` or the
   last start did not finish verifying (run `up`), and `session_busy` while commands run in
-  the session. A command that finished while another command held the project lock records
-  that it finished under the state directory's `completed/`; the next `up`, `restart`,
-  `exec`, `run` or `gc` for the project applies it, forgetting that command only and
-  renewing the lease to when it finished. `status` may list it until then. Over MCP, `services` must be an array of names; omitting it restarts every
+  the session. A command that finished while another command held the project lock for more
+  than a second records that it finished under the state directory's `completed/`; the next
+  `up`, `restart`, `exec`, `run` or `gc` for the project applies it, forgetting that command
+  only and renewing the lease to when it finished. `status` may list it until then. Over MCP,
+  `services` must be an array of names; omitting it restarts every
   service.
 - A service can list `watch = ["app.py", "src"]`: files or directories (walked recursively,
   skipping hidden, `node_modules`, `target` and `__pycache__` entries), relative to the
