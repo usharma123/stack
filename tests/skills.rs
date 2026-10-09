@@ -585,6 +585,30 @@ fn a_skills_dir_linked_into_another_checkout_leaves_that_checkouts_files_alone()
 }
 
 #[test]
+fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both() {
+    // `.Config/mise` is the same directory where the file system ignores case.
+    for dir in [".config/mise", ".Config/mise"] {
+        let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}")));
+        let app = f.path("app");
+        git_in(&app, &["init", "-q"]);
+        f.json(&["install"]);
+        let ignore = app.join(".config/mise/.gitignore");
+        let text = fs::read_to_string(&ignore).unwrap();
+        for entry in ["/conf.d/stack.toml", "/mise.lock", "/locks/"] {
+            assert!(text.lines().any(|l| l == entry), "{dir}: provider entry {entry} lost: {text}");
+        }
+        if dir == ".config/mise" {
+            assert!(text.lines().any(|l| l == "/.stack-skills.json") && text.lines().any(|l| l == "/fnox"), "{dir}: {text}");
+        }
+        assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new(), "{dir}: {text}");
+        let out = f.command_at(&app, &["compile"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), text, "{dir}: a compile publishes the same file");
+        assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new(), "{dir}");
+    }
+}
+
+#[test]
 fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");

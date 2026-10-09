@@ -39,10 +39,11 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
     warnings.extend(drop_shared_blocks(&exclude));
     // Each directory is checked before anything in it is read, written or removed: a symbolic
     // link anywhere on the way may lead to another checkout, whose files are never touched.
-    let mise = root.join(".config/mise");
+    // What each directory's file names is gathered first, then each file is written once.
+    let mut planned = Planned::default();
     let generated = [".config/mise/conf.d/stack.toml", ".config/mise/mise.lock", ".config/mise/locks"];
     if generated.iter().any(|p| std::fs::symlink_metadata(root.join(p)).is_ok()) && contained(root, Path::new(".config/mise"), &mut warnings) {
-        warnings.extend(own(root, &mise, &["conf.d/stack.toml", "mise.lock", "locks/"].map(String::from)));
+        planned.add(root.join(".config/mise"), ["conf.d/stack.toml", "mise.lock", "locks/"].map(String::from).to_vec());
     }
     if contained(root, Path::new(".stack"), &mut warnings) {
         let ignore = root.join(".stack/.gitignore");
@@ -63,9 +64,46 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
             entries.push(crate::skills::REGISTRY.to_string());
         }
         entries.extend(links);
+        planned.add(dir, entries);
+    }
+    for (dir, entries) in planned.0 {
         warnings.extend(own(root, &dir, &entries));
     }
     (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
+/// The entries of each directory's `.gitignore`, one per physical directory: a skills dir
+/// that is also the provider directory (`.config/mise`, or the same directory named otherwise
+/// on a case-insensitive file system) gets one file naming both, never one replacing the other.
+#[derive(Default)]
+struct Planned(Vec<(PathBuf, Vec<String>)>);
+
+impl Planned {
+    fn add(&mut self, dir: PathBuf, entries: Vec<String>) {
+        match self.0.iter_mut().find(|(other, _)| same_dir(other, &dir)) {
+            Some((_, held)) => {
+                for entry in entries {
+                    if !held.contains(&entry) {
+                        held.push(entry);
+                    }
+                }
+            }
+            None => self.0.push((dir, entries)),
+        }
+    }
+}
+
+/// Whether two existing directories are one, by device and inode.
+#[cfg(unix)]
+fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    id(a).is_some_and(|a| Some(a) == id(b))
+}
+
+#[cfg(not(unix))]
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a.canonicalize().ok().is_some_and(|a| Some(a) == b.canonicalize().ok())
 }
 
 /// Whether `root/dir` exists as a real directory inside the project, by the rule skill links
