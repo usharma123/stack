@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and round 5 corrections are integrated; Linux validation and Astra round 6 are in progress.
+Status: Astra approved `12b7215`; its nonblocking reserved-session correction and Linux validation are in progress.
 
 ## Scope and base
 
@@ -572,3 +572,22 @@ and all seven scratch tests with real mise 2026.10.3. Logs: `/tmp/stack-jdx-r6-r
 `stack-jdx-r6-scratch.log`. A fresh Linux run and Astra round 6 review the same frozen
 implementation with all earlier findings, responses, current receipts and remaining limits.
 No final approval is claimed yet.
+
+### Astra round 6 approval and reserved-session edge case
+
+Astra approved exact `12b7215`, finding no remaining blocker. Its 58 focused test invocations
+passed. Additional real-provider proofs on mise 2026.9.18 and 2026.10.3 confirmed held plans
+retain body, explicit Java environment, project `config_source`, literal dollars, chained
+values and task-template values across concurrent compile; new plans use the new configuration.
+Copies and tracking links were removed, including literal tilde state paths. Sol high verified
+upstream evaluation order, dollar escaping and settings isolation, with no additional finding.
+Review report: `/tmp/stack-astra-r6.Qu5kX3/REPORT.md`; research:
+`/tmp/stack-r6-research.43pnfozw/REPORT.md`.
+
+One nonblocking P3 remains: explicitly declaring `[env] STACK_SESSION` produces a snapshot
+self-reference, but Stack removes the inherited value when no session exists. This makes
+`stack run` fail before its body on both mise versions. An Opus task will reject this exact
+Stack-owned declaration early with `invalid_env`, without fabricating a session or banning
+other Stack-prefixed inputs. This narrow validation correction will receive a focused review.
+Current-head Linux validation was still pending when Astra issued its approval; older Linux
+and Alpine results remain labeled by their tested implementation.
