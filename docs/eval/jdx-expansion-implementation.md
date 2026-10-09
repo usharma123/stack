@@ -348,3 +348,28 @@ semantics, provider isolation, lock metadata where needed, and cleanup, without 
 project lock through the long task or persisting granted values. This extends the earlier
 queued-task correction to the confirmed post-planning window. Evidence:
 `/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/stack-task-config-proof-ep4ay0jl/README.md`.
+
+### Round 2 platform remediation
+
+Worker commits `355e6b6` and `64d3407` were integrated as `0fd873f` and `fe49035`.
+Runtime coverage now uses the exact per-backend key mise selects: host libc qualifies Linux
+keys, and Bun additionally selects its AVX2/baseline variant. Host detection follows mise's
+os-release and dynamic-loader precedence rather than treating Stack's build target as host
+libc. Unknown libc leaves URL coverage missing with a reason. Generated Bun variants belonging
+to requested targets survive retention, seed, merge, update, and render; checksums stay attached
+to their own keys. Required frozen operations validate actual runtime keys as well as listed
+targets. The default four lock targets remain unchanged.
+
+Parent checks passed eight simulated-host tests and six captured-real-lock variant tests.
+The worker passed 376 Rust tests, Clippy, and 41 Node tests before the separately integrated
+task changes. All six new variant regressions failed against old code. Sol high compared
+primary mise 2026.9.18 and 2026.10.3 sources in `/tmp/jdx-platform-research-r2/REPORT.md`.
+Real isolated macOS checks retained all generated Bun tables and exercised mise's own
+platform-override dry runs, plus required Bun install/exec. These controls are not native
+Alpine or non-AVX2 installation evidence. Receipts: `/tmp/jdx-platform-smoke-r2.GT4Jdy/`.
+
+Detection parity assumes native execution on the same architecture and normal CPU feature
+build settings. Unknown-libc fallback, mixed translated/native binaries, and custom AVX2
+mise builds remain documented limits for the next review. `resolved_on` continues to identify
+OS/architecture, while coverage identifies effective artifact keys. Snapshot remediation
+remains in progress before final combined validation and Astra round 3.
