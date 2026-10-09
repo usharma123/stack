@@ -126,7 +126,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   only and renewing the lease to when it finished, even once that process has exited.
   `status` may list it until then. When
   even that record cannot be written, the result of `exec --json`, MCP `stack_exec` and
-  `stack_run` carries a `warnings` entry beside the command's own outcome, and the session
+  `stack_run` carries a `warnings` entry beside the command's own outcome (or, when the
+  command could not be started, in a detail of its `exec_failed` error), and the session
   stays busy while that process lives (`stack down` clears it). Over MCP,
   `services` must be an array of names; omitting it restarts every
   service.

@@ -466,20 +466,35 @@ fn captured(args: &Value, ctx: &Ctx, plan: impl FnOnce() -> Result<session::Exec
     );
     let (plan, _deadline) = session::plan_within(Some(timeout), "raise timeout_secs", plan)?;
     let mut plan = plan;
-    let mut result = run_captured(ctx, &plan, timeout)?;
-    // Released here, before the result is returned and the next call can start the stack
-    // again; a release that could not be recorded is reported with the command's own result.
-    finish(&mut plan, &mut result);
+    let result = run_and_finish(ctx, &mut plan, timeout)?;
     if result["timed_out"] == true {
         return Err(timed_out(timeout, result, "raise timeout_secs"));
     }
     Ok(result)
 }
 
-/// Release `plan`'s execution, adding a warning to `result` when that could not be recorded.
-pub fn finish(plan: &mut session::ExecPlan, result: &mut Value) {
-    if let Err(e) = plan.finish() {
-        result["warnings"] = json!([session::unreleased(&e)]);
+/// [`run_captured`], then release `plan`'s execution, before the result is returned and the
+/// next call can start the stack again: also when the command could not be run at all.
+pub fn run_and_finish(ctx: &Ctx, plan: &mut session::ExecPlan, timeout: Duration) -> Result<Value> {
+    let outcome = run_captured(ctx, plan, timeout);
+    reported(outcome, plan.finish())
+}
+
+/// A captured run's outcome as it is reported, with a release that could not be recorded
+/// added to it: a warning beside the command's result and any warnings it has, or a detail
+/// of the error that kept it from running, whose code and message stay as they are.
+fn reported(outcome: Result<Value>, released: Result<()>) -> Result<Value> {
+    let Err(e) = released else { return outcome };
+    let warning = json!(session::unreleased(&e));
+    match outcome {
+        Ok(mut result) => {
+            match result["warnings"].as_array_mut() {
+                Some(warnings) => warnings.push(warning),
+                None => result["warnings"] = json!([warning]),
+            }
+            Ok(result)
+        }
+        Err(error) => Err(error.with_detail(json!({ "warnings": [warning] }))),
     }
 }
 
@@ -491,7 +506,8 @@ pub fn timed_out(timeout: Duration, result: Value, raise: &str) -> StackError {
         .details(vec![result])
 }
 
-/// Run a planned command with bounded output capture; shared by MCP and `stack exec --json`.
+/// Run a planned command with bounded output capture; MCP and `stack exec --json` call it
+/// through [`run_and_finish`], which also releases the execution.
 pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> Result<Value> {
     // Inherit the server's environment as raw bytes, like `stack exec`; `std::env::vars`
     // panics on values that are not Unicode.
@@ -557,6 +573,21 @@ pub fn parse_duration(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unrecorded_release_is_added_to_what_the_run_reports() {
+        let unrecorded = || Err(StackError::new("io", "no record"));
+        assert_eq!(reported(Ok(json!({ "exit_code": 0 })), Ok(())).unwrap(), json!({ "exit_code": 0 }));
+        let result = reported(Ok(json!({ "exit_code": 3, "warnings": ["a secret was not granted"] })), unrecorded()).unwrap();
+        let warnings = result["warnings"].as_array().unwrap();
+        assert_eq!(warnings[0], "a secret was not granted", "the command's own warnings are kept");
+        assert!(warnings[1].as_str().unwrap().contains("still recorded as running"), "{result}");
+        assert_eq!(result["exit_code"], 3);
+        let error = reported(Err(StackError::new("exec_failed", "cannot execute x").with_detail(json!({ "kept": true }))), unrecorded()).unwrap_err();
+        assert_eq!((error.code, error.message.as_str(), error.hint.as_deref()), ("exec_failed", "cannot execute x", None));
+        assert_eq!(error.details[0], json!({ "kept": true }));
+        assert!(error.details[1]["warnings"][0].as_str().unwrap().contains("stack down"), "{:?}", error.details);
+    }
 
     #[test]
     fn startup_timeouts_are_whole_seconds_of_at_least_one() {

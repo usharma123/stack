@@ -562,8 +562,7 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
 fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     // Large enough to mean "no limit" without overflowing deadline arithmetic.
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
-    let mut result = mcp::run_captured(ctx, &plan, timeout)?;
-    mcp::finish(&mut plan, &mut result);
+    let result = mcp::run_and_finish(ctx, &mut plan, timeout)?;
     if result["timed_out"] == true {
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
         return Ok(ExitCode::from(124));

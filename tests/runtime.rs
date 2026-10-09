@@ -662,6 +662,68 @@ fn a_finished_command_that_cannot_be_recorded_says_so_and_keeps_the_session_busy
     fixture.ok(&["down"]);
 }
 
+#[test]
+fn a_command_that_cannot_start_and_cannot_be_recorded_says_so_with_its_error() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let index = fixture.session_paths().pop().unwrap();
+    fs::write(state.join("completed"), "").unwrap();
+    let missing = "/nonexistent/stack-review-command";
+    // The command fails to start at once, so the lock is taken the moment it is registered.
+    let hold = || {
+        let (state, app, index) = (state.clone(), app.clone(), index.clone());
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read_value(&index)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+                assert!(Instant::now() < deadline, "execution never registered");
+            }
+            let _lock = stack::state::project_lock(&state, &app).unwrap();
+            thread::sleep(Duration::from_secs(3));
+        })
+    };
+    // Should the release take the lock first all the same, it is recorded at once, so the case
+    // is tried again: a release that failed leaves its execution recorded.
+    let contended = |run: &mut dyn FnMut() -> Value| -> Value {
+        for _ in 0..5 {
+            let holder = hold();
+            let error = run();
+            holder.join().unwrap();
+            if !read_value(&index)["active_executions"].as_object().unwrap().is_empty() || !error["details"].is_null() {
+                return error;
+            }
+        }
+        panic!("the release always took the lock first");
+    };
+    let check = |route: &str, error: &Value| {
+        assert_eq!(error["code"], "exec_failed", "{route}: {error}");
+        assert!(error["message"].as_str().unwrap().contains(missing), "{route}: {error}");
+        let warning = error["details"][0]["warnings"][0].as_str().unwrap_or_else(|| panic!("{route}: {error}"));
+        assert!(warning.contains("still recorded as running") && warning.contains("stack down"), "{route}: {warning}");
+        assert_eq!(read_value(&index)["active_executions"].as_object().unwrap().len(), 1, "{route}");
+    };
+    let mut server = Server::start(&fixture);
+    let error = contended(&mut || server.call("stack_exec", json!({ "command": [missing] }))["error"].clone());
+    check("mcp", &error);
+    let result = server.call("stack_up", json!({}));
+    assert_eq!(result["error"]["code"], "session_busy", "{result}");
+    server.close();
+    // The same through `exec --json`.
+    let mut session = read_value(&index);
+    session["active_executions"] = json!({});
+    for path in fixture.session_paths() {
+        fs::write(&path, session.to_string()).unwrap();
+    }
+    let error = contended(&mut || {
+        let out = fixture.command(&["--json", "exec", "--", missing]).output().unwrap();
+        assert!(!out.status.success());
+        json_result(&out)["error"].clone()
+    });
+    check("cli", &error);
+    fixture.ok(&["down"]);
+}
+
 /// Record `token` as executing for this (live) test process, in both session files.
 fn record_execution(fixture: &Fixture, token: &str, renewed_at: Option<u64>) -> Value {
     let mut session = read_value(&fixture.session_paths().pop().unwrap());
