@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and Astra round 1 fixes are integrated; round 2 review is in progress.
+Status: all routes and round 1 fixes are integrated; round 2 remediation is in progress.
 
 ## Scope and base
 
@@ -264,7 +264,7 @@ implementer's response, prior validation, and unresolved objections. Final combi
 All ten macOS real-tool scenarios passed, including OCI, with an isolated local registry.
 The normally optional real-mise configuration-isolation test also passed separately. Logs:
 `/tmp/stack-jdx-r2-rust.log`, `stack-jdx-r2-clippy.log`, `stack-jdx-r2-node.log`,
-`stack-jdx-r2-boundary.log`, and `stack-jdx-r2-native-all.log`. Astra's verdict is pending.
+`stack-jdx-r2-boundary.log`, and `stack-jdx-r2-native-all.log`. Astra's round 2 verdict and new findings are recorded below.
 
 Linux ARM64 remediation validation at `d8df870` passed all 357 Rust tests and the release
 build on its first invocation, with no transient or product failures. All 16 real-mise
@@ -278,5 +278,32 @@ were removed. Full report: `/tmp/jdx-linux-d8df870.9y_merg3/REPORT.md`.
 This Linux rerun does not relabel the earlier complete ten-scenario run, checksum tamper,
 migration, or mbx cache evidence as new-head runtime checks. It did not rerun Linux Clippy,
 Node, or real old-mise/signer-change tests. MacOS Clippy/Node and the normally optional
-real-mise boundary test passed at the combined head as recorded above. Astra round 2 is the
-remaining sign-off before completion.
+real-mise boundary test passed at the combined head as recorded above. Round 2 review results are recorded below; further fixes and a fresh review are required.
+
+### Astra round 2 findings
+
+Astra requested changes at `d8df870`, confirming that all five first-round findings were
+addressed and identifying two additional P2 issues:
+
+| Finding | Evidence | Remediation ownership |
+|---|---|---|
+| Queued task uses grants from its old definition | CLI/MCP lock-wait race executes the new body with old grants | Opus task-grant planning worker |
+| Effective provider platform and generated variants omitted | Primary mise source and captured real Bun lock show musl/baseline requirements; Stack discards generated variants | Opus platform worker with GPT-6.1-Sol high investigation |
+
+The task worker will derive task body planning and grants from the same validated report
+under the project lock. The platform worker will correct runtime coverage/policy selection
+and preserve variants belonging to requested targets, while retaining the four default lock
+targets and explicit checksum-update rule. Both start from `4c37137` in isolated worktrees.
+A new Astra round will receive both previous reviews and implementer responses.
+
+Astra independently passed 343 narrow tests and replayed the first-round proofs. Its upstream
+investigation established libc and Bun CPU variant selection in mise 2026.9.18 and 2026.10.3.
+These findings are closed installation refusals and inaccurate coverage claims, not a proven
+checksum bypass. Native Alpine and non-AVX2 installations have not been run. The task race is
+proven with fake providers, not a real-provider claim. Evidence:
+`/tmp/stack-astra-r2.yzQ9UU/task-race/proof.json`, `task_race.py`, and
+`bun-variants/proof.json`.
+
+No separate native-option/backend defect or general template evaluation of tool-name keys
+was established. Real outdated-provider and signer/trust-option installations remain outside
+the saved runtime evidence.
