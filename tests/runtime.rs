@@ -684,6 +684,39 @@ fn gc_applies_a_completion_renewing_the_lease_and_reclaims_a_deleted_project_it_
 }
 
 #[test]
+fn a_completion_left_by_a_command_that_has_exited_still_renews_the_lease() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "4s"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let index = fixture.session_paths().pop().unwrap();
+    // The command finishes while another command holds the lock, so its release leaves a
+    // record; then the CLI process exits before anything applies it.
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_millis(5500));
+    let exec = fixture.command(&["--json", "exec", "--", "sleep", "3"]).stdout(Stdio::piped()).spawn().unwrap();
+    let pid = exec.id();
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(json_result(&out)["ok"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    let session = read_value(&session_file);
+    let (token, recorded) = session["active_executions"].as_object().unwrap().iter().next().unwrap_or_else(|| panic!("{session}"));
+    assert_eq!(*recorded, json!(pid), "recorded for the coordinator, which has exited");
+    let record = completions(&fixture).join(format!("{token}.json"));
+    let completed_at = read_value(&record)["completed_at"].as_u64().unwrap();
+    assert!(completed_at >= session["lease"]["renewed_at"].as_u64().unwrap() + 3, "{session}");
+    holder.join().unwrap();
+    // Idle more than the TTL since the command started, but not since it finished.
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(json_result(&out)["data"], json!([]), "the lease counts from when the command finished");
+    let saved = read_value(&index);
+    assert_eq!(saved["active_executions"], json!({}));
+    assert_eq!(saved["lease"]["renewed_at"], json!(completed_at));
+    assert_eq!(read_value(&session_file)["lease"]["renewed_at"], json!(completed_at));
+    assert!(!record.exists(), "removed once the renewal is saved");
+    fixture.ok(&["down"]);
+}
+
+#[test]
 fn active_exec_protects_ttl_until_completion_then_the_session_can_expire() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "1s"]);

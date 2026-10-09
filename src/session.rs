@@ -2830,15 +2830,21 @@ fn is_token(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Under the project lock: forget executions whose coordinator died, and those whose
-/// completion record names this session, the token and the PID recorded for it, renewing the
-/// lease to when each finished. Returns the records applied; the caller removes them only
-/// once a record without those executions is saved, so a crash in between applies them again.
-/// A record that can never apply (another generation's, or for a token no longer recorded)
-/// is removed; one stack did not write (another name, unreadable, naming another token) is
-/// left alone and never applied.
+/// Under the project lock: forget executions whose completion record names this session, the
+/// token and the PID recorded for it, renewing the lease to when each finished, then those
+/// whose coordinator died. Records are matched first: a coordinator that wrote one has
+/// usually exited since, and its command still finished when the record says. Returns the
+/// records applied; the caller removes them only once a record without those executions is
+/// saved, so a crash in between applies them again. A record that can never apply (another
+/// generation's, or for a token no longer recorded) is removed; one stack did not write
+/// (another name, unreadable, naming another token) is left alone and never applied.
 fn reconcile_executions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
+    let consumed = apply_completions(state, root, session);
     session.active_executions.retain(|_, pid| pid_alive(*pid));
+    consumed
+}
+
+fn apply_completions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(completions_dir(state, root)) else { return Vec::new() };
     let mut consumed = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
@@ -3157,6 +3163,29 @@ mod tests {
         assert!(reconcile_executions(&state, &root, &mut session).is_empty());
         assert!(!dir.join(json('2')).exists());
         assert_eq!(session.lease.as_ref().unwrap().renewed_at, 900);
+    }
+
+    #[test]
+    fn a_completion_applies_after_its_coordinator_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("app"));
+        let dir = completions_dir(&state, &root);
+        fs::create_dir_all(&dir).unwrap();
+        let exited = |_| {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let (finished, crashed) = ("f".repeat(64), "c".repeat(64));
+        let (finished_pid, crashed_pid): (u32, u32) = (exited(()), exited(()));
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        session.active_executions.insert(finished.clone(), finished_pid);
+        session.active_executions.insert(crashed.clone(), crashed_pid);
+        let path = dir.join(format!("{finished}.json"));
+        write_json(&path, &Completion { session: "s1".into(), token: finished, pid: finished_pid, completed_at: 500 }).unwrap();
+        assert_eq!(reconcile_executions(&state, &root, &mut session), [path]);
+        assert_eq!(session.lease.as_ref().unwrap().renewed_at, 500, "renewed to when it finished");
+        assert!(session.active_executions.is_empty(), "the one that left no record is forgotten too");
     }
 
     #[test]
