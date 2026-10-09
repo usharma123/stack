@@ -241,6 +241,12 @@ the machine is not checked again.
 | `provider_outdated` | mise is older than 2026.9.16, which the embedded lock needs |
 | `install_failed` | any other install failure, with mise's output |
 
+Conda-backed releases, such as the Postgres preset (`conda:postgresql`), record every
+dependency package mise downloads under `[provider_lock.conda-packages]`, one checksum per
+package and platform: some 25 per platform for Postgres 17. They are what mise checks those
+downloads against, so stack keeps them; listing fewer `[lock] platforms` is what makes the
+section smaller.
+
 Migration: version 2 locks stay valid under `best-effort`, with every pin `missing`. The next
 `compile` writes version 3 and needs network access for `mise lock`. Because a session's
 configuration includes stack.lock, the first `up` after migrating restarts services once.
