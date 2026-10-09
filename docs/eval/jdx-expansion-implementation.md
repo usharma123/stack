@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and round 1 fixes are integrated; round 2 remediation is in progress.
+Status: all routes and remediation are integrated; Astra round 3 is in progress.
 
 ## Scope and base
 
@@ -373,3 +373,34 @@ build settings. Unknown-libc fallback, mixed translated/native binaries, and cus
 mise builds remain documented limits for the next review. `resolved_on` continues to identify
 OS/architecture, while coverage identifies effective artifact keys. Snapshot remediation
 remains in progress before final combined validation and Astra round 3.
+
+### Immutable task configuration and round 3
+
+Worker commit `aa153bf` was integrated as `06dc7c3`. Under the planning lock, each task copies
+its generated config and rendered provider lock into a unique private cache directory. The
+execution plan owns the snapshot until completion/error/timeout. Mise selects it as global
+configuration with the project as configuration root, preserving working directory and
+relative path behavior while excluding project, parent, user-global, and inherited selector
+configuration. Snapshot files copy already-published configuration, never resolved granted
+values. Normal cleanup removes the copy and its tracked-config links; subsequent task runs
+reclaim copies left by dead processes. Explicit exec planning retains its existing behavior.
+
+New public-API and CLI/MCP regressions cover saved plans across normal compile, task deletion,
+grant/body binding, planning failure, terminal output, timeout cleanup, ownership/private
+permissions, tracking-link cleanup, and absence of granted values on disk. The worker's
+real-mise 2026.10.3 control preserves old task bodies across compile and checks project roots,
+relative scripts, arguments, inherited config isolation, and cleanup. Those worker controls
+had no pinned-tool/service/fnox integration; the parent's new native scenario 1 and 10 results
+cover that combined path with real tools.
+
+At exact implementation `06dc7c3`, parent full checks passed 386 Rust tests, Clippy, and 41 Node
+tests. The optional real-mise configuration-isolation test and all ten macOS native scenarios
+are running separately. Linux ARM64 validation is checking the updated tests and snapshots
+with mise 2026.9.18. Astra round 3 receives the full original brief, both earlier reviews,
+all implementer responses, the independent post-planning proof, and unresolved platform and
+snapshot lifecycle limits. No sign-off is claimed yet.
+
+Snapshot limits under review include its global/project config distinction, delayed cleanup
+for killed parents, background commands that invoke mise after the owning task exits, private
+`mise use` writes, and translated/custom CPU builds. Earlier head counts remain labeled by
+commit and platform. Real snapshot controls: `/tmp/stack-task-config-real2.G2WV`.
