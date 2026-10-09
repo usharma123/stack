@@ -132,6 +132,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the recorded supervisor, or `ps` when only a PID was recorded. `recovery.stop` is offered
   only when the supervisor still reports the recorded PID and port. Run inspect first and
   stop only if the PID still matches; these two operations are not atomic. Then retry GC.
+  GC holds the project's lock, so no stack command can start another generation meanwhile,
+  but `pitchfork stop <id>` (Pitchfork 2.29.0) signals whatever process group runs under the
+  id when it arrives: one started by hand with `pitchfork` or `mise daemons`, or a supervisor
+  restart, would be stopped instead. Automatic cleanup needs a stop that takes the expected
+  PID and refuses otherwise, which Pitchfork does not offer.
   Unknown, starting, stopping and retrying states retain the record. Data directories are kept.
 - Malformed `stack.toml` and `bundle.toml` errors name the file, line and character column,
   with the offending line and a caret. JSON details repeat the location and the bundle source.
