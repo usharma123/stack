@@ -7,6 +7,12 @@
 //! `[env]`, `[tasks]` or `[daemons]`, so no template or task of the project's is evaluated
 //! (any mise command that loads a config evaluates its `[env]` templates). Commands run under
 //! the same isolation as every other provider call, pointed at the scratch root.
+//!
+//! mise links every configuration it loads under `<state>/tracked-configs`, and only `mise
+//! prune` removes links whose file is gone. Each [`ScratchRoot::command`] notes the state
+//! directory its environment names, and dropping the root removes the links there that point
+//! into it, and nothing else. A root whose process is killed before it drops leaves both the
+//! root and its links.
 
 use crate::error::{io_error, Result, StackError};
 use crate::lock::Lockfile;
@@ -14,6 +20,7 @@ use crate::tool::{templated, OptionValue, ToolSpec};
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use toml::{Table, Value};
 
 /// One tool the scratch configuration names: a provider tool (a service's preset tool for
@@ -91,10 +98,12 @@ pub fn check_literal(pins: &[Pin]) -> Result<()> {
     Ok(())
 }
 
-/// A private provider root, removed on drop.
+/// A private provider root, removed on drop with the links mise made to it.
 #[derive(Debug)]
 pub struct ScratchRoot {
     dir: tempfile::TempDir,
+    /// mise's `tracked-configs` directories, as the root's commands name them.
+    tracked: Mutex<Vec<PathBuf>>,
 }
 
 impl ScratchRoot {
@@ -107,7 +116,7 @@ impl ScratchRoot {
         // (`/tmp` on macOS) the ceiling would never match and mise would search above the root.
         let parent = parent.canonicalize().map_err(|e| io_error(parent.display(), e))?;
         let dir = tempfile::Builder::new().prefix("q-").tempdir_in(&parent).map_err(|e| io_error(parent.display(), e))?;
-        Ok(Self { dir })
+        Ok(Self { dir, tracked: Mutex::default() })
     }
 
     pub fn path(&self) -> &Path {
@@ -133,7 +142,17 @@ impl ScratchRoot {
     /// `mise <args>` in this root, under the provider isolation pointed at it. The root is
     /// trusted for this command only (`MISE_TRUSTED_CONFIG_PATHS`), so mise neither prompts nor
     /// records trust for a directory about to disappear. Bound it with `process::capture`.
+    ///
+    /// The state directory is read from the command as returned (see [`ScratchRoot`]'s drop);
+    /// a caller must not change `MISE_STATE_DIR`, `XDG_STATE_HOME` or `HOME` on it.
     pub fn command(&self, args: &[&str]) -> Command {
+        let command = self.untracked(args);
+        self.track(&command);
+        command
+    }
+
+    /// [`ScratchRoot::command`] before its state directory is noted.
+    fn untracked(&self, args: &[&str]) -> Command {
         let mut command = Command::new("mise");
         super::mise::configure_command(&mut command, self.path());
         command
@@ -143,6 +162,69 @@ impl ScratchRoot {
             .env("MISE_YES", "1")
             .env("NO_COLOR", "1");
         command
+    }
+
+    /// Note where `command`'s mise keeps tracking links: what the command sets or removes,
+    /// otherwise what stack inherited.
+    fn track(&self, command: &Command) {
+        let var = |key: &str| match command.get_envs().find(|(k, _)| *k == key) {
+            Some((_, value)) => value.and_then(|v| v.to_str()).map(str::to_string),
+            None => std::env::var(key).ok(),
+        };
+        let Some(dir) = tracked_configs(self.path(), var) else { return };
+        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        if !tracked.contains(&dir) {
+            tracked.push(dir);
+        }
+    }
+}
+
+impl Drop for ScratchRoot {
+    fn drop(&mut self) {
+        // The directory itself is removed after this, when `dir` is dropped.
+        let tracked = self.tracked.get_mut().unwrap_or_else(|e| e.into_inner());
+        for dir in tracked.iter() {
+            unlink_into(dir, self.dir.path());
+        }
+    }
+}
+
+/// mise's `tracked-configs` directory for a command run in `cwd` that sees `var`, as mise
+/// finds it: `MISE_STATE_DIR`, else `$XDG_STATE_HOME/mise`, else `~/.local/state/mise`. An
+/// empty value counts as unset, a leading `~` is the home directory, and a relative path is
+/// read from the working directory.
+fn tracked_configs(cwd: &Path, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let set = |key: &str| var(key).filter(|v| !v.is_empty());
+    let home = set("HOME").map(|h| cwd.join(h)).or_else(std::env::home_dir);
+    let path = |value: String| -> Option<PathBuf> {
+        let path = match value.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => home.clone()?.join(rest.trim_start_matches('/')),
+            _ => PathBuf::from(value),
+        };
+        Some(cwd.join(path))
+    };
+    let state = match set("MISE_STATE_DIR") {
+        Some(dir) => path(dir)?,
+        None => match set("XDG_STATE_HOME") {
+            Some(dir) => path(dir)?.join("mise"),
+            None => home?.join(".local/state/mise"),
+        },
+    };
+    Some(state.join("tracked-configs"))
+}
+
+/// Remove the links in `tracked` that point into `root`. Regular files, directories and links
+/// to anything else are left alone.
+fn unlink_into(tracked: &Path, root: &Path) {
+    let Ok(entries) = std::fs::read_dir(tracked) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
+        // mise writes absolute targets; a relative one is read from the link's directory.
+        if std::fs::read_link(entry.path()).is_ok_and(|target| tracked.join(target).starts_with(root)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -235,5 +317,123 @@ mod tests {
         drop(a);
         drop(b);
         assert!(!pa.exists() && !pb.exists());
+    }
+
+    #[test]
+    fn the_tracking_directory_is_where_mise_keeps_it() {
+        let cwd = Path::new("/work/root");
+        let at = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            tracked_configs(cwd, |key| vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())).unwrap()
+        };
+        let home = ("HOME", "/home/u");
+        assert_eq!(at(&[home, ("XDG_STATE_HOME", "/x"), ("MISE_STATE_DIR", "/s")]), Path::new("/s/tracked-configs"));
+        assert_eq!(at(&[home, ("MISE_STATE_DIR", "rel")]), Path::new("/work/root/rel/tracked-configs"));
+        assert_eq!(at(&[home, ("MISE_STATE_DIR", "~/st")]), Path::new("/home/u/st/tracked-configs"));
+        assert_eq!(at(&[home, ("MISE_STATE_DIR", ""), ("XDG_STATE_HOME", "/x")]), Path::new("/x/mise/tracked-configs"));
+        assert_eq!(at(&[home, ("XDG_STATE_HOME", "relx")]), Path::new("/work/root/relx/mise/tracked-configs"));
+        assert_eq!(at(&[home, ("XDG_STATE_HOME", "")]), Path::new("/home/u/.local/state/mise/tracked-configs"));
+        assert_eq!(at(&[("HOME", "relhome")]), Path::new("/work/root/relhome/.local/state/mise/tracked-configs"));
+    }
+
+    /// A command whose mise keeps its state in `state`, noted by `root` as `command` does.
+    fn tracked_command(root: &ScratchRoot, state: &Path) -> Command {
+        let mut command = root.untracked(&["ls", "--json"]);
+        command.env("MISE_STATE_DIR", state);
+        root.track(&command);
+        command
+    }
+
+    #[test]
+    fn dropping_a_root_removes_only_the_links_into_it() {
+        let (cache, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let tracked = state.path().join("tracked-configs");
+        std::fs::create_dir_all(&tracked).unwrap();
+        let (a, b) = (ScratchRoot::create(cache.path(), "lock").unwrap(), ScratchRoot::create(cache.path(), "lock").unwrap());
+        // Commands run at once from one root, as skills discovery does, note the directory once.
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| tracked_command(&a, state.path()));
+            }
+        });
+        tracked_command(&b, state.path());
+        assert_eq!(*a.tracked.lock().unwrap(), std::slice::from_ref(&tracked));
+        let link = |name: &str, target: &Path| std::os::unix::fs::symlink(target, tracked.join(name)).unwrap();
+        link("owned", &a.config_path());
+        link("owned-dir", a.path());
+        link("sibling", &b.config_path());
+        // A path that only shares the root's name as a prefix, a removed root of another run
+        // (left for `mise prune`), the user's project, and a link once into the root, retargeted.
+        link("prefix", Path::new(&format!("{}x/.config/mise/conf.d/stack.toml", a.path().display())));
+        link("killed", &a.path().with_file_name("q-gone").join(".config/mise/conf.d/stack.toml"));
+        link("project", &project.path().join("mise.toml"));
+        link("retargeted", &a.config_path());
+        std::fs::remove_file(tracked.join("retargeted")).unwrap();
+        link("retargeted", &project.path().join("mise.toml"));
+        std::fs::write(tracked.join("regular"), a.config_path().to_string_lossy().as_bytes()).unwrap();
+        // Trust mise records elsewhere in its state is not tracking.
+        std::fs::create_dir_all(state.path().join("trusted-configs")).unwrap();
+        std::os::unix::fs::symlink(a.config_path(), state.path().join("trusted-configs/user")).unwrap();
+        let names = || {
+            let mut left: Vec<String> = std::fs::read_dir(&tracked).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            left.sort();
+            left
+        };
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        assert!(!a_path.exists());
+        assert_eq!(names(), ["killed", "prefix", "project", "regular", "retargeted", "sibling"]);
+        assert!(state.path().join("trusted-configs/user").symlink_metadata().is_ok());
+        drop(b);
+        assert_eq!(names(), ["killed", "prefix", "project", "regular", "retargeted"]);
+    }
+
+    #[test]
+    fn a_root_that_ran_no_command_touches_no_tracking() {
+        let (cache, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let root = ScratchRoot::create(cache.path(), "resolve").unwrap();
+        let tracked = state.path().join("tracked-configs");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::os::unix::fs::symlink(root.config_path(), tracked.join("noted-elsewhere")).unwrap();
+        drop(root);
+        assert!(tracked.join("noted-elsewhere").symlink_metadata().is_ok());
+    }
+
+    /// Against the mise named by `STACK_TEST_MISE`: the links it makes for concurrent roots in
+    /// one cache land where the root looks, and each root's drop removes its own.
+    #[test]
+    fn real_mise_tracking_links_are_removed_with_their_roots() {
+        let Some(mise) = std::env::var_os("STACK_TEST_MISE").map(PathBuf::from) else {
+            eprintln!("skipped: set STACK_TEST_MISE to a mise binary");
+            return;
+        };
+        let (cache, work) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let state = work.path().join("mise-state");
+        let tracked = state.join("tracked-configs");
+        let path = std::env::join_paths(std::iter::once(mise.parent().unwrap().to_path_buf()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap();
+        let run = |root: &ScratchRoot| {
+            root.write_tools(&[Pin { tool: "jq".into(), spec: ToolSpec::new("1.7.1") }]).unwrap();
+            let mut command = tracked_command(root, &state);
+            command.env("PATH", &path).env("MISE_DATA_DIR", work.path().join("data")).env("MISE_CACHE_DIR", work.path().join("cache"));
+            let out = command.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        let (a, b) = (ScratchRoot::create(cache.path(), "skills").unwrap(), ScratchRoot::create(cache.path(), "skills").unwrap());
+        std::thread::scope(|scope| {
+            scope.spawn(|| run(&a));
+            run(&b);
+        });
+        let targets = || -> Vec<PathBuf> {
+            std::fs::read_dir(&tracked).unwrap().map(|e| std::fs::read_link(e.unwrap().path()).unwrap()).collect()
+        };
+        assert_eq!(*a.tracked.lock().unwrap(), std::slice::from_ref(&tracked));
+        let left = targets();
+        assert!(left.contains(&a.config_path()) && left.contains(&b.config_path()), "{left:?}");
+        let b_config = b.config_path();
+        drop(a);
+        assert_eq!(targets(), [b_config]);
+        drop(b);
+        assert_eq!(targets(), Vec::<PathBuf>::new());
+        assert!(!state.join("trusted-configs").exists(), "the roots are trusted per command, never recorded");
     }
 }
