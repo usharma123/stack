@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes are integrated; remediation of Astra round 1 is in progress.
+Status: all routes and Astra round 1 fixes are integrated; round 2 review is in progress.
 
 ## Scope and base
 
@@ -236,5 +236,31 @@ it before any scratch configuration. The correction removes dependence on mise's
 order; no successful pre-fix end-to-end execution is claimed. Receipts:
 `/tmp/jdx-template-real.OyU3sq/REPORT.md`.
 
-Artifact-policy, provider-preflight, and changed-option reconciliation fixes are still in
-progress. The next Astra round will review all remediation together.
+Artifact-policy, provider-preflight, and changed-option reconciliation fixes are now integrated.
+Astra round 2 reviews all remediation together.
+
+### Round 1 artifact remediation and round 2 review
+
+Worker commits `fa8ab73`, `c0a0adf`, and `8c6ea4e` were integrated as `aae779b`, `59a58ad`,
+and `d8df870`. Required-policy runtime-platform checks now run in common frozen validation,
+before provider calls. Install/up run provider requirements through a validated compile's
+pre-write hook, before port/identity reservation and publication. Provider failures remain
+install-step errors with no completed compile step. Changed options for the same exact release
+trigger targeted reconciliation of verified entries. Ordinary compile retains committed
+checksums/signers and reports upstream conflicts; a missing fresh answer is reported as
+`retained`, not a completed comparison. Update accepts fresh commitments explicitly.
+
+Worker regressions sweep CLI/MCP locked entry points, compare project and state files across
+provider refusal, and cover option changes, request-only changes, duplicate tool/service pins,
+retained entries, and failed locking. They fail on the relevant pre-fix code. The worker passed
+its 349-test full Rust suite, Clippy, and Node tests. Its replay of Astra's proofs confirms
+common platform refusal, unchanged config under an outdated provider, and targeted fnox locking.
+These added proofs use fake providers; no real signer bypass or changed signer is claimed.
+Evidence replay: `/tmp/jdx-artifacts-r1-probe.TztsE0`.
+
+Astra round 2 reviews exact combined implementation `d8df870` against the approved DX base.
+The new delegate request includes the complete original brief, first review findings, every
+implementer's response, prior validation, and unresolved objections. Final combined Rust and
+real macOS scenarios are running; Clippy and 41 Node tests have passed. The native rerun uses
+an isolated local registry so all ten scenarios can run. Its result and Astra's verdict are
+pending.
