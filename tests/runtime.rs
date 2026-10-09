@@ -232,6 +232,15 @@ fn generated_files_are_excluded_from_git_in_clones_and_worktrees_and_user_files_
 }
 
 #[test]
+fn install_prints_only_the_kinds_of_install_that_ran() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    let text = String::from_utf8(fixture.ok(&["install"]).stdout).unwrap();
+    assert!(text.contains("unchecked (mise install): jq\n") && !text.contains("checked (mise install --locked)"), "{text}");
+    let text = String::from_utf8(Fixture::new().ok(&["install"]).stdout).unwrap();
+    assert!(!text.contains("mise install"), "nothing was installed: {text}");
+}
+
+#[test]
 fn project_overrides_change_the_session_generation_even_when_bundle_pins_do_not() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);

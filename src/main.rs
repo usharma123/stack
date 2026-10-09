@@ -222,8 +222,13 @@ fn main() -> ExitCode {
                 }
                 if let Some(detail) = r.steps.iter().find(|s| s["step"] == "install").map(|s| &s["detail"]) {
                     let names = |key: &str| detail[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
-                    println!("checked (mise install --locked): {}", names("locked"));
-                    println!("unchecked (mise install): {}", names("plain"));
+                    // A line for each kind of install that ran; an empty one says nothing.
+                    for (label, key) in [("checked (mise install --locked)", "locked"), ("unchecked (mise install)", "plain")] {
+                        let names = names(key);
+                        if !names.is_empty() {
+                            println!("{label}: {names}");
+                        }
+                    }
                 }
                 println!("installed; nothing started");
                 for w in &r.warnings {
