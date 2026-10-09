@@ -382,6 +382,31 @@ fn concurrent_renewals_keep_both_records_valid_and_consistent() {
 }
 
 #[test]
+fn a_timed_out_command_releases_its_execution_even_while_the_project_is_locked() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    // Another command holds the project lock when the timed-out command ends and its
+    // execution is released, after the run's deadline has passed.
+    let holder = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&session_file).is_ok_and(|s| s.contains("active_executions\": {\n    \"")) {
+            assert!(Instant::now() < deadline, "execution never registered");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _lock = stack::state::project_lock(&state, &app).unwrap();
+        thread::sleep(Duration::from_millis(2500));
+    });
+    // The same server then starts the stack again: no execution of its own is left behind.
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sleep", "5"], "timeout_secs": 1 })), ("stack_up", json!({}))], &[]);
+    holder.join().unwrap();
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "timed_out", "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["ok"], true, "{}", results[1]);
+}
+
+#[test]
 fn active_exec_protects_ttl_until_completion_then_the_session_can_expire() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "1s"]);

@@ -466,6 +466,9 @@ fn captured(args: &Value, ctx: &Ctx, plan: impl FnOnce() -> Result<session::Exec
     );
     let (plan, _deadline) = session::plan_within(Some(timeout), "raise timeout_secs", plan)?;
     let result = run_captured(ctx, &plan, timeout)?;
+    // Released here, under the call's deadline (with the grace the release takes for itself),
+    // before the result is returned and the next call can start the stack again.
+    drop(plan);
     if result["timed_out"] == true {
         return Err(timed_out(timeout, result, "raise timeout_secs"));
     }

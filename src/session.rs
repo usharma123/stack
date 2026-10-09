@@ -2934,6 +2934,9 @@ pub struct ExecutionGuard {
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
         let _timings = Timings::new("release");
+        // A run whose deadline passed still waits briefly for a contended project lock: an
+        // execution left recorded for a live process (an MCP server) makes `up` session_busy.
+        let _grace = crate::process::grace_scope(RECORD_GRACE);
         let ctx = Ctx {
             root: self.root.clone(),
             cache: PathBuf::new(),
