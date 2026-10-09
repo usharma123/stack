@@ -173,8 +173,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   `options`. `install`, `up` and `doctor` run `mise version` when an option needs a newer mise
   (2026.9.2) and fail with `provider_outdated` before installing anything.
 - `compile` resolves each version request in its own scratch directory under stack's cache
-  (`resolve/`), configured with that one tool only, and removes it afterwards. mise records
-  each such configuration among its tracked configs; the entries point at removed files.
+  (`resolve/`), configured with that one tool only, and removes it afterwards along with
+  mise's tracking links into that directory. Other tracking entries and trust records are kept.
 - Requests that name no release (`system`, `path:`, `ref:`) remain explicitly nonreproducible
   and produce warnings for both tools and services. Damaged release pins fail with `lock_invalid`.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
@@ -313,6 +313,7 @@ rewrites `resolved_on` in mise's platform names. Under `required` a version 2 lo
 migrating restarts services once. Keep `.config/mise/mise.lock` and `.config/mise/locks/` out of
 version control with the generated config: they are rendered from stack.lock.
 
-mise records each scratch configuration it loads among its tracked configs; the entries point
-at removed files.
+mise records each scratch configuration it loads among its tracked configs. Stack removes
+links into a scratch directory when that directory is dropped, on success or error, and keeps
+other entries. A process killed before cleanup can leave its scratch directory and links.
 

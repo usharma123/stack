@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and round 4 corrections are integrated; combined Linux validation and Astra round 5 are in progress.
+Status: all routes and round 4 corrections are integrated; combined Linux validation passed and Astra round 5 is in progress.
 
 ## Scope and base
 
@@ -504,3 +504,23 @@ enabled the real environment provenance regression and all seven scratch tests o
 A fresh Linux validation and Astra round 5 review the same frozen combined implementation.
 The review receives the full original brief, all prior findings and responses, both new
 worker responses, current receipts and unresolved evidence limits. Approval remains pending.
+
+### Combined Linux round 5 validation
+
+At exact `639f1b8`, Linux ARM64 passed all 393 Rust tests, the release build, separately
+enabled real mise 2026.9.18 environment-provenance and scratch cleanup tests, and native
+scenarios 1 and 10. A held task retained its original body and project-evaluated environment
+after another compile; a fresh plan received the new values. Pinned Python, bundle PATH,
+project asset lookup, private snapshot permissions, timeout cleanup and unchanged rendered
+lock bytes passed. The persistence check scanned 71 generated files without finding fixture
+secret values.
+
+Real resolution, locking, discovery and fnox queries left no links into retired scratch
+roots. Foreign dangling links, regular tracking files, project links and trust entries were
+preserved. Compile/inspect succeeded; inspect left project/state content and tracking entries
+unchanged. This establishes Linux cleanup for the earlier nonblocking observation.
+Evidence: `/tmp/jdx-linux-639f1b8.u4atuw8w/REPORT.md`. Two corrected harness errors and their
+original logs were retained. Source mounts were read-only; only owned Docker resources were
+removed. The user docs' three stale descriptions of leftover tracking links were corrected.
+Broader platform and Alpine runs remain explicitly prior-head evidence; implementation
+platform code has not changed. Astra received these results for its ongoing round 5 review.

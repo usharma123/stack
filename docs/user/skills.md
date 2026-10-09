@@ -38,8 +38,9 @@ there (10 seconds each, at the same time), and removes the directory. Rows for t
 releases stack.lock does not pin are ignored, so the answer is the same in a fresh worktree
 without a generated config and in one whose generated config is stale. No `[env]` template or
 task of the project's is evaluated, nothing is installed, and nothing is written into the
-project. mise does record each scratch configuration among its tracked configs (entries that
-point at removed files).
+project. Stack removes mise's tracking links into the scratch directory with the directory,
+on success or error, and keeps other tracking entries and trust records. A process killed
+before cleanup can leave its directory and links.
 
 A skill is `available` only when its name matches `[a-z0-9][a-z0-9_-]*` and its directory and
 `SKILL.md`, with links resolved, lie inside the install directory mise reports for the pinned
