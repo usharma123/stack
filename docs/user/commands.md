@@ -221,8 +221,11 @@ entry: `artifacts.<platform>` has `state`, and `checksum` and `signer` when veri
 `compile` (ordinary and `--update`):
 
 - Locks only pins that need it: every pin under `--update`, otherwise pins with a `missing`
-  state on a listed platform (new and changed pins have no entry yet). With full coverage it
-  makes no `mise lock` call and needs no network for artifacts. A pin mise cannot lock
+  state on a listed platform (new releases have no entry yet) and pins whose declared options
+  changed while they resolve to the release they had (its entry was locked for the earlier
+  options). A request that changes but names the same release and options, or a tool that pins
+  the same release as a service, needs no locking. With full coverage it makes no `mise lock`
+  call and needs no network for artifacts. A pin mise cannot lock
   (for example, Pitchfork 2.29.0 on macos-x64, which has no artifact) stays `missing`, so every ordinary
   `compile` of such a project asks mise again; `mise lock` skips it without failing.
 - Runs `mise lock --platform <list> <tools>...` in a scratch root of its own under stack's cache
@@ -236,7 +239,10 @@ entry: `artifacts.<platform>` has `state`, and `checksum` and `signer` when veri
   `--update` the new value replaces it and is reported as `change: "artifact_changed"` with
   `checksum_was`, `url_was` and `signer_was`. When `--update` gets nothing fresh for a committed
   value (offline, skipped) the value is kept and reported `change: "retained"` with mise's reason
-  if it gave one, never as refreshed. New values are `change: "added"`.
+  if it gave one, never as refreshed; so is a pin whose options changed when ordinary `compile`
+  gets nothing fresh for it, with a warning (`artifacts.<tool>@<version>.<platform>: its request
+  changed, but mise produced no fresh entry to compare; the committed value is kept`). New
+  values are `change: "added"`.
 - Conda dependency records (`conda-packages`) shared between tools follow the same rule per
   (platform, package) and are reported under `deps` on each pin that references them. Records no
   entry references are pruned; a `conda_deps` name without a record is `lock_invalid`.

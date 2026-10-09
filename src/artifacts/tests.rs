@@ -247,7 +247,7 @@ fn retain_drops_unpinned_entries_unlisted_platforms_and_unreferenced_records() {
 fn merge(committed: Option<&Table>, fresh: &str, targets: &[&str], pins: &[PinKey], update: bool, reasons: &Reasons) -> Result<Merged> {
     let (fresh, _) = capture(fresh).unwrap();
     let targets: BTreeSet<String> = targets.iter().map(|t| t.to_string()).collect();
-    Merge { committed, fresh, targets: &targets, pins, platforms: &platforms(&["macos-arm64", "linux-x64"]), update, reasons }.run()
+    Merge { committed, fresh, targets: &targets, pins, platforms: &platforms(&["macos-arm64", "linux-x64"]), update, reasons, changed: &BTreeSet::new() }.run()
 }
 
 const JQ_FRESH: &str = r#"lockfile_version = 3
@@ -372,12 +372,70 @@ fn targets_are_pins_with_missing_coverage_or_everything_under_update() {
     let (lock, stripped) = captured();
     let embedded = finish(lock, None, stripped, &real_pins(), &platforms(&["macos-arm64", "linux-x64"]));
     let two = platforms(&["macos-arm64", "linux-x64"]);
-    let t = targets(Some(&embedded), &real_pins(), &two, false);
+    let t = targets(Some(&embedded), &real_pins(), &two, false, &BTreeSet::new());
     // postgres has no linux-x64 entry; the rest are covered, exempt (rust, swift) or
     // unsupported (npm).
     assert_eq!(t.into_iter().collect::<Vec<_>>(), ["postgres"]);
-    assert_eq!(targets(Some(&embedded), &real_pins(), &two, true).len(), 7);
-    assert_eq!(targets(Some(&embedded), &[pin("jq", "1.7.1")], &platforms(&["linux-arm64"]), false).len(), 1, "a newly listed platform");
+    assert_eq!(targets(Some(&embedded), &real_pins(), &two, true, &BTreeSet::new()).len(), 7);
+    assert_eq!(targets(Some(&embedded), &[pin("jq", "1.7.1")], &platforms(&["linux-arm64"]), false, &BTreeSet::new()).len(), 1, "a newly listed platform");
+}
+
+#[test]
+fn changed_pins_are_targeted_when_their_checked_entry_was_locked_for_another_request() {
+    let (lock, stripped) = captured();
+    let two = platforms(&["macos-arm64", "linux-x64"]);
+    let embedded = finish(lock, None, stripped, &real_pins(), &two);
+    // jq is verified on both platforms and rust is exempt: neither is a target until changed,
+    // and an exempt pin has no checked entry to reconcile even then.
+    let changed: BTreeSet<PinKey> = [pin("jq", "1.7.1"), pin("rust", "1.93.1")].into();
+    let t = targets(Some(&embedded), &real_pins(), &two, false, &changed);
+    assert_eq!(t.into_iter().collect::<Vec<_>>(), ["jq", "postgres"]);
+}
+
+#[test]
+fn a_pin_changes_with_its_options_or_release_but_not_with_its_request_alone() {
+    use crate::lock::{LockedVersion, Lockfile};
+    use crate::tool::OptionValue;
+    let version = |name: &str, tool: Option<&str>, requested: &str, resolved: &str, identity: Option<&str>| {
+        let mut options = crate::tool::ToolOptions::new();
+        if let Some(id) = identity {
+            options.insert("identity".into(), OptionValue::String(id.into()));
+        }
+        LockedVersion { name: name.into(), tool: tool.map(Into::into), requested: requested.into(), resolved: resolved.into(), resolved_on: None, options }
+    };
+    let lock = |tools: Vec<LockedVersion>, services: Vec<LockedVersion>| Lockfile::new(vec![], tools, services);
+    let before = lock(vec![version("fnox", None, "1.39.0", "1.39.0", Some("old")), version("jq", None, "1.7", "1.7.1", None)], vec![version("db", Some("postgres"), "17", "17.6", None)]);
+    assert!(changed_pins(Some(&before), &before).is_empty());
+    // The same releases asked for differently, and a tool that duplicates a service's pin.
+    let same = lock(
+        vec![version("fnox", None, "1.39", "1.39.0", Some("old")), version("jq", None, "1.7.1", "1.7.1", None), version("postgres", None, "17.6", "17.6", None)],
+        vec![version("db", Some("postgres"), "17.6", "17.6", None)],
+    );
+    assert!(changed_pins(Some(&before), &same).is_empty());
+    let options = lock(vec![version("fnox", None, "1.39.0", "1.39.0", Some("new")), version("jq", None, "1.7", "1.7.1", None)], vec![version("db", Some("postgres"), "17", "17.6", None)]);
+    assert_eq!(changed_pins(Some(&before), &options).into_iter().collect::<Vec<_>>(), [pin("fnox", "1.39.0")]);
+    let release = lock(vec![version("fnox", None, "1.39.0", "1.39.0", Some("old")), version("jq", None, "1.7", "1.7.1", None)], vec![version("db", Some("postgres"), "17", "17.7", None)]);
+    assert_eq!(changed_pins(Some(&before), &release).into_iter().collect::<Vec<_>>(), [pin("postgres", "17.7")]);
+    assert_eq!(changed_pins(None, &before).len(), 3);
+}
+
+#[test]
+fn a_changed_pin_without_a_fresh_value_is_retained_and_said_to_be() {
+    let (committed, _) = captured();
+    let targets: BTreeSet<String> = ["jq".to_string()].into();
+    let changed: BTreeSet<PinKey> = [pin("jq", "1.7.1")].into();
+    let (fresh, _) = capture("lockfile_version = 3\n").unwrap();
+    let pins = real_pins();
+    let m = Merge { committed: Some(&committed), fresh, targets: &targets, pins: &pins, platforms: &platforms(&["macos-arm64", "linux-x64"]), update: false, reasons: &Reasons::new(), changed: &changed }.run().unwrap();
+    assert_eq!(m.lock["tools"]["jq"], committed["tools"]["jq"], "the commitment is kept");
+    for platform in ["macos-arm64", "linux-x64"] {
+        assert_eq!(m.events[&(pin("jq", "1.7.1"), platform.into())].change, Some("retained"), "{platform}");
+        assert!(m.warnings.contains(&format!("artifacts.jq@1.7.1.{platform}: its request changed, but mise produced no fresh entry to compare; the committed value is kept")), "{:?}", m.warnings);
+    }
+    // An unchanged pin without a fresh value is simply kept, as before.
+    let (fresh, _) = capture("lockfile_version = 3\n").unwrap();
+    let m = Merge { committed: Some(&committed), fresh, targets: &targets, pins: &pins, platforms: &platforms(&["macos-arm64", "linux-x64"]), update: false, reasons: &Reasons::new(), changed: &BTreeSet::new() }.run().unwrap();
+    assert!(m.events.is_empty() && m.warnings.is_empty());
 }
 
 #[test]

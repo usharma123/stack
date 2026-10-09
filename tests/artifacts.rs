@@ -430,6 +430,92 @@ fn removed_pins_and_unlisted_platforms_are_dropped_without_asking_mise() {
 }
 
 #[test]
+fn changed_options_on_the_same_release_lock_it_again_and_keep_the_commitment_until_update() {
+    let toml = |identity: &str| format!("[tools]\njq = \"1.7.1\"\nfnox = {{ version = \"1.39.0\", identity = \"{identity}\" }}\n[lock]\nplatforms = [\"linux-x64\"]\n");
+    let sb = Sandbox::new(&toml("https://ci/old"));
+    sb.compile(Mode::UseLock).unwrap();
+    let committed = checksum(&sb.embedded(), "fnox", "linux-x64");
+    let signer = sb.embedded()["tools"]["fnox"][0]["platforms.linux-x64"]["signer"].clone();
+
+    // Same release, same upstream answer: locked again (fnox only), nothing to report.
+    sb.write(&toml("https://ci/new"));
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(sb.mise.calls().len(), 2, "the changed pin is locked again");
+    let call = sb.mise.calls().last().unwrap().clone();
+    assert_eq!(call.tools, ["fnox"]);
+    assert!(call.config.contains("https://ci/new"), "locked with the new options: {}", call.config);
+    let seed: Table = toml::from_str(&call.seed).unwrap();
+    assert!(seed["tools"].get("fnox").is_none() && seed["tools"].get("jq").is_some(), "only the changed pin is unseeded: {seed:?}");
+    assert!(report.warnings.iter().all(|w| !w.contains("artifacts.")), "{:?}", report.warnings);
+    assert!(artifacts(&report, "fnox")["linux-x64"].change.is_none());
+    assert_eq!(sb.lock().tool("fnox").unwrap().options["identity"], stack::tool::OptionValue::String("https://ci/new".into()));
+
+    // A different upstream answer for the new request is kept out and reported, as for any pin.
+    *sb.mise.generation.lock().unwrap() = 2;
+    sb.write(&toml("https://ci/newer"));
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(checksum(&sb.embedded(), "fnox", "linux-x64"), committed, "the commitment is kept");
+    assert_eq!(sb.embedded()["tools"]["fnox"][0]["platforms.linux-x64"]["signer"], signer);
+    assert!(report.warnings.iter().any(|w| w == "artifacts.fnox@1.39.0.linux-x64 differs upstream; run `stack compile --update` to accept"), "{:?}", report.warnings);
+    assert_eq!(artifacts(&report, "fnox")["linux-x64"].change, Some("differs_upstream"));
+    assert_eq!(checksum(&sb.embedded(), "jq", "linux-x64"), "sha256:jq-1.7.1-linux-x64-g1", "unchanged pins are not locked again");
+
+    // No fresh answer (offline): kept, and reported as retained rather than compared.
+    sb.mise.set(Behaviour::Offline);
+    sb.write(&toml("https://ci/offline"));
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(checksum(&sb.embedded(), "fnox", "linux-x64"), committed);
+    let a = &artifacts(&report, "fnox")["linux-x64"];
+    assert_eq!((a.change, a.state), (Some("retained"), stack::artifacts::State::Verified));
+    assert!(report.warnings.iter().any(|w| w.starts_with("artifacts.fnox@1.39.0.linux-x64: its request changed")), "{:?}", report.warnings);
+
+    // Unchanged since: nothing to lock. `--update` accepts the difference and reports it.
+    sb.mise.set(Behaviour::Online);
+    let n = sb.mise.calls().len();
+    sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(sb.mise.calls().len(), n);
+    let report = sb.compile(Mode::Update).unwrap();
+    assert_eq!(checksum(&sb.embedded(), "fnox", "linux-x64"), "sha256:fnox-1.39.0-linux-x64-g2");
+    assert_eq!(artifacts(&report, "fnox")["linux-x64"].checksum_was.as_deref(), Some(committed.as_str()));
+    // A changed option is still a stale pin for locked operations.
+    sb.write(&toml("https://ci/unlocked"));
+    assert_eq!(sb.compile(Mode::Frozen).unwrap_err().code, "lock_outdated");
+    // Locking the changed pin fails: stack.lock, the config and the rendered lock stay as they were.
+    let before = sb.files();
+    sb.mise.set(Behaviour::Garbage);
+    assert_eq!(sb.compile(Mode::UseLock).unwrap_err().code, "artifact_lock_failed");
+    assert_eq!(sb.files(), before);
+}
+
+#[test]
+fn requests_that_name_a_pinned_release_again_and_duplicate_pins_need_no_locking() {
+    let svc = |version: &str| format!("[services.db]\npreset = \"postgres\"\nversion = \"{version}\"\n[lock]\nplatforms = [\"linux-x64\"]\n");
+    let sb = Sandbox::new(&svc("17"));
+    sb.compile(Mode::UseLock).unwrap();
+    let n = sb.mise.calls().len();
+    let before = sb.embedded();
+    // A different request for the release already pinned: the same question for mise.
+    sb.write(&svc("17.6"));
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert!(report.lock_changed, "the request is recorded");
+    assert_eq!(sb.mise.calls().len(), n);
+    assert_eq!(sb.embedded(), before);
+    assert_eq!(artifacts(&report, "db")["linux-x64"].state, stack::artifacts::State::Verified);
+    // A tool that pins the release a service already pins shares its entry.
+    sb.write(&format!("[tools]\npostgres = \"17.6\"\n{}", svc("17.6")));
+    let report = sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(sb.mise.calls().len(), n);
+    assert_eq!(sb.embedded(), before);
+    assert_eq!(artifacts(&report, "postgres")["linux-x64"].state, stack::artifacts::State::Verified);
+    // A new release for the service is a new pin, locked on its own.
+    sb.write(&format!("[tools]\npostgres = \"17.6\"\n{}", svc("16.4")));
+    sb.compile(Mode::UseLock).unwrap();
+    assert_eq!(sb.mise.calls().last().unwrap().tools, ["postgres"]);
+    let versions: Vec<String> = sb.embedded()["tools"]["postgres"].as_array().unwrap().iter().map(|e| e["version"].as_str().unwrap().to_string()).collect();
+    assert_eq!(versions, ["17.6", "16.4"]);
+}
+
+#[test]
 fn tools_mise_cannot_lock_are_missing_with_its_reason_and_the_rest_are_written() {
     let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\n[services.cache]\npreset = \"redis\"\nversion = \"8\"\n[lock]\nplatforms = [\"linux-x64\"]\n");
     sb.mise.unpublished.lock().unwrap().push(("pitchfork".into(), "linux-x64".into()));

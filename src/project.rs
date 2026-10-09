@@ -711,7 +711,10 @@ fn lock_artifacts(previous: Option<&Lockfile>, new_lock: &Lockfile, pins: &[PinK
     if let Some(embedded) = committed.as_mut() {
         artifacts::retain(embedded, pins, platforms);
     }
-    let targets = artifacts::targets(committed.as_ref(), pins, platforms, update);
+    // A pin whose options changed can resolve to the release it had; its committed entry was
+    // locked for the earlier request, so it is locked again and compared like any other.
+    let changed = artifacts::changed_pins(previous, new_lock);
+    let targets = artifacts::targets(committed.as_ref(), pins, platforms, update, &changed);
     let locker = locker(opts);
     if !targets.is_empty() || artifacts::has_entries(committed.as_ref()) {
         mise::check_requirements(locker.version(&opts.root)?, &[lock_requirement_for("stack.lock's embedded artifact lock (mise.lock version 3)")])?;
@@ -751,6 +754,7 @@ fn lock_artifacts(previous: Option<&Lockfile>, new_lock: &Lockfile, pins: &[PinK
         platforms,
         update,
         reasons: &reasons,
+        changed: &changed,
     }
     .run()?;
     let embedded = artifacts::finish(merged.lock, committed.as_ref(), stripped, pins, platforms);

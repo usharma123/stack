@@ -403,8 +403,9 @@ pub struct PlatformReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// What this compile did to the committed value: `added`, `artifact_changed` (accepted by
-    /// `--update`), `retained` (`--update` got no fresh value; the committed one is kept) or
-    /// `differs_upstream` (kept; `--update` would accept the difference).
+    /// `--update`), `retained` (`--update`, or a pin whose request changed, got no fresh value;
+    /// the committed one is kept) or `differs_upstream` (kept; `--update` would accept the
+    /// difference).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,6 +814,8 @@ pub struct Merge<'a> {
     pub platforms: &'a [String],
     pub update: bool,
     pub reasons: &'a Reasons,
+    /// Pins whose specification changed since the committed lock (see `changed_pins`).
+    pub changed: &'a BTreeSet<PinKey>,
 }
 
 pub struct Merged {
@@ -946,7 +949,16 @@ impl Merge<'_> {
         } else {
             for c in cs {
                 let mut entry = (*c).clone();
-                if let Some(f) = fs.iter().find(|f| options(f) == options(c)) {
+                let fresh = fs.iter().find(|f| options(f) == options(c));
+                // A changed pin's committed value was locked for its earlier request. Without a
+                // fresh value it is kept, but never as if this compile had compared it.
+                if self.changed.contains(pin) {
+                    for (platform, _) in platform_tables(c).filter(|(p, _)| !fresh.is_some_and(|f| f.contains_key(&format!("{PLATFORM_PREFIX}{p}")))) {
+                        warnings.push(format!("artifacts.{pin}.{platform}: its request changed, but mise produced no fresh entry to compare; the committed value is kept"));
+                        self.retained(pin, platform, events);
+                    }
+                }
+                if let Some(f) = fresh {
                     let fields = |e: &Table| -> Table { e.iter().filter(|(k, _)| !k.starts_with(PLATFORM_PREFIX)).map(|(k, v)| (k.clone(), v.clone())).collect() };
                     if fields(c) != fields(f) {
                         warnings.push(format!("artifacts.{pin} entry fields differ upstream; run `stack compile --update` to accept"));
@@ -1066,11 +1078,32 @@ pub fn check_pins_untemplated(pins: &[crate::provider::scratch::Pin]) -> Result<
 }
 
 /// Tool names whose pins need entries: every one under `--update`, else those with a `missing`
-/// state on a listed platform (new or changed pins have no entry yet).
-pub fn targets(committed: Option<&Table>, pins: &[PinKey], platforms: &[String], update: bool) -> BTreeSet<String> {
+/// state on a listed platform (new releases have no entry yet) and `changed` pins with a
+/// checked entry, which was locked for an earlier request of the same release.
+pub fn targets(committed: Option<&Table>, pins: &[PinKey], platforms: &[String], update: bool, changed: &BTreeSet<PinKey>) -> BTreeSet<String> {
     pins.iter()
-        .filter(|pin| update || platforms.iter().any(|p| coverage(committed, pin, p).state == State::Missing))
+        .filter(|pin| {
+            update
+                || platforms.iter().any(|p| match coverage(committed, pin, p).state {
+                    State::Missing => true,
+                    State::Verified => changed.contains(*pin),
+                    State::Exempt | State::Unsupported => false,
+                })
+        })
         .map(|pin| pin.tool.clone())
+        .collect()
+}
+
+/// Releases `new` pins whose provider specification (tool, release and allowlisted options, as
+/// the scratch configuration gives them to `mise lock`) `previous` does not record: new
+/// releases, and releases whose declared options changed. A request that changes but resolves
+/// to the same specification is not a change; locking it again would ask mise the same question.
+pub fn changed_pins(previous: Option<&Lockfile>, new: &Lockfile) -> BTreeSet<PinKey> {
+    let before = previous.filter(|l| !l.is_legacy()).map(crate::provider::scratch::pins).unwrap_or_default();
+    crate::provider::scratch::pins(new)
+        .into_iter()
+        .filter(|pin| !before.contains(pin))
+        .map(|pin| PinKey { tool: pin.tool, version: pin.spec.version })
         .collect()
 }
 
