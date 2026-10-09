@@ -92,7 +92,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   explicit value such as `JAVA_HOME` or `GOROOT` still takes precedence over the one a tool
   sets, as it does for `exec`. Tasks and `exec` receive `STACK_SESSION`, the running session's
   id, only while a session exists; an `[env]` that declares it is refused with `invalid_env`
-  before anything is written or run. The copy declares each value the task already receives
+  before generated configuration or state is written or a task/exec command runs. The copy
+  declares each value the task already receives
   by name (`{{ env["JAVA_HOME"] }}`), never the value itself, and keeps tools, `_.path` and
   tasks, which mise applies as usual. `PATH`, and a variable whose name has characters other than
   letters, digits, `_`, `-` and `.`, are left out of the copy and simply inherited. A template

@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: Astra approved `12b7215` and Linux validation passed; the nonblocking reserved-session correction is in progress.
+Status: Astra approved `12b7215` and Linux validation passed; its reserved-session correction is integrated for final focused review.
 
 ## Scope and base
 
@@ -608,3 +608,23 @@ inspect left no retired scratch links, and inspect preserved project/state conte
 Report: `/tmp/jdx-linux-12b7215.601tchep/REPORT.md`. Failed harness attempts are retained and
 separated from successful product checks. Source remained read-only and all owned Docker
 resources were removed. Broader Alpine/platform runs remain explicitly prior-head evidence.
+
+### Reserved-session correction and final focused review
+
+Worker commit `09f4d29` was integrated as `557b6ed`. Effective project, bundle or override
+environment declarations of exact `STACK_SESSION` now fail with `invalid_env` immediately
+after composition, before version queries or generated lock/config/state writes. Similar
+names remain accepted. Tasks/exec receive only Stack's actual session ID, or no value when
+no session exists; snapshot/environment-binding code is unchanged. Missing-lock and
+unlisted-bundle checks can still precede composition, and bundle source cache fetching is
+unchanged. User docs distinguish generated writes and task execution from that cache I/O.
+
+Two new regressions cover all declaration layers, non-writing/locked/update paths,
+unchanged existing outputs, no provider calls, look-alike names and valid actual/no-session
+runtime values. Mutation controls fail with validation disabled. The worker passed all
+398 Rust tests and Clippy, plus real mise 2026.9.18 and 2026.10.3 controls at
+`/tmp/stack-r6fix-real.e6heA8/receipts.json`. Parent at exact `557b6ed` passed all 398 Rust
+tests and Clippy with warnings denied, using Rust 1.93.1, the documented CI compiler.
+Logs: `/tmp/stack-jdx-r7-rust.log` and `/tmp/stack-jdx-r7-clippy.log`.
+A fresh Astra round 7 focuses on this correction, with the original brief,
+all prior findings/responses, round 6 approval and completed Linux evidence.
