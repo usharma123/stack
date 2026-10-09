@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const mise = process.env.STACK_TEST_MISE;
 const binary = process.env.STACK_TEST_BINARY;
 test('real mise cannot reinterpret locked tools through project, parent, global or inherited aliases',
-  { skip: !mise || !binary, timeout: 180000 }, () => {
+  { skip: !mise || !binary, timeout: 600000 }, () => {
   const work = realpathSync(mkdtempSync('/tmp/stack-provider-'));
   try {
     const project = path.join(work, 'parent', 'app');
@@ -27,8 +27,12 @@ test('real mise cannot reinterpret locked tools through project, parent, global 
       MISE_STATE_DIR: path.join(work, 'mise-state'), MISE_CONFIG_FILE: path.join(work, 'override.toml'),
       MISE_GLOBAL_CONFIG_FILE: path.join(home, '.config/mise/config.toml'),
       MISE_SYSTEM_CONFIG_FILE: path.join(work, 'override.toml'), MISE_YES: '1' };
-    const stack = (...args) => execFileSync(binary, ['-C', project, ...args], { env, encoding: 'utf8', timeout: 150000 });
+    const stack = (...args) => execFileSync(binary, ['-C', project, ...args], { env, encoding: 'utf8', timeout: 540000 });
     stack('compile', '--locked');
+    // exec refuses a pin that is not installed; install it through stack, under the same aliases.
+    stack('install');
+    const installed = readdirSync(path.join(work, 'data/installs/python'));
+    assert.ok(installed.includes('3.13.16') && !installed.some(v => v.startsWith('3.12')), installed.join(', '));
     const tools = JSON.parse(stack('exec', '--', mise, 'ls', '--json'));
     assert.ok(tools.python, JSON.stringify(tools));
     assert.equal(tools.python[0].version, '3.13.16');
