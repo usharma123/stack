@@ -261,9 +261,10 @@ Evidence replay: `/tmp/jdx-artifacts-r1-probe.TztsE0`.
 Astra round 2 reviews exact combined implementation `d8df870` against the approved DX base.
 The new delegate request includes the complete original brief, first review findings, every
 implementer's response, prior validation, and unresolved objections. Final combined Rust checks passed all 357 tests; Clippy and 41 Node tests passed too.
-Real macOS scenarios are running. The native rerun uses
-an isolated local registry so all ten scenarios can run. Its result and Astra's verdict are
-pending.
+All ten macOS real-tool scenarios passed, including OCI, with an isolated local registry.
+The normally optional real-mise configuration-isolation test also passed separately. Logs:
+`/tmp/stack-jdx-r2-rust.log`, `stack-jdx-r2-clippy.log`, `stack-jdx-r2-node.log`,
+`stack-jdx-r2-boundary.log`, and `stack-jdx-r2-native-all.log`. Astra's verdict is pending.
 
 Linux ARM64 remediation validation is running separately at `d8df870`, focused on the new
 regressions and affected real-tool paths. It does not reuse the earlier 341-test count as a
