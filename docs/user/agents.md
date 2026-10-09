@@ -68,8 +68,9 @@ Configure your MCP client to launch `stack` with the argument `mcp`. The server 
 
 `stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command;
 `stack_run` grants exactly the task's declared `secrets` and refuses additions. Granted values
-are replaced by `[redacted:KEY]` in `stdout` and `stderr` (also in a `timed_out` error's
-details; `[redacted]` where naming the key could spell out a value), the result lists the names
+are replaced by `[redacted:KEY]` in the parsed `stdout` and `stderr` strings (also in a
+`timed_out` error's details; `[redacted]` where naming the key could spell out a value), the
+result lists the names (key names are not secret)
 under `secrets` and declined fnox removals under `warnings`, and values under 8 bytes or ones
 stack's markers could spell out are refused with `secret_unsupported`. Failures are
 `invalid_secret`, `secret_missing`, `secret_unavailable` and `secret_unsupported`; nothing fnox

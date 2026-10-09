@@ -132,6 +132,11 @@ The JSON text of a result escapes `"`, `\` and control characters, so a value co
 backslash can appear in the raw text if the command prints the unescaped form; that is a
 transformation, like the ones below.
 
+Key names are not secret. The result lists granted names under `secrets` and names them in
+`[redacted:KEY]` markers, warnings and errors, so a value equal to its own key name (or to any
+granted name) is visible there as that name. Only the streams are checked for values; choose
+values that are not also key names.
+
 ## Boundary
 
 What a grant does and does not promise:
