@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes are integrated; combined Linux validation passed and Astra round 5 remediation is in progress.
+Status: all routes and round 5 corrections are integrated; Linux validation and Astra round 6 are in progress.
 
 ## Scope and base
 
@@ -547,3 +547,28 @@ Astra's 59 focused tests passed, with one additional gated test returning withou
 execution. Prior remediations remain supported. Bundle PATH order matched; no additional
 accepted task-template defect was verified. A failed isolated Rust-installer probe supplied
 no Rust finding. Non-AVX2 and signer-change runtime evidence remain absent.
+
+### Explicit environment precedence and tilde cleanup integration
+
+Worker commit `9cbf740` was integrated as `12b7215`. The task copy declares planned scalar
+environment values as references to their inherited names, preserving config precedence
+over tool defaults without writing evaluated values or reevaluating original templates.
+No alias variables are introduced. When planned values contain dollar signs, Stack queries
+mise's `env_shell_expand` setting and escapes dollars only if expansion is enabled.
+PATH and unusual variable names remain inherited; their limitations are documented.
+Task tracking uses the shared scratch state-path helper, including literal tilde expansion.
+
+Real macOS controls on mise 2026.9.18 and 2026.10.3 passed Java/Go shell and task-template
+precedence, the earlier project `config_source` lookup, literal braces/dollar values, and
+tilde-state cleanup on success, error and timeout. Mutation controls reopened each prior
+failure when the relevant correction was disabled. The worker passed 396 Rust tests,
+Clippy, 41 Node tests and nine macOS native scenarios; OCI was skipped without a registry.
+Receipts: `/tmp/stack-r5-prec.PTlx4Q/`.
+
+At exact `12b7215`, parent validation passed all 396 Rust tests, Clippy with warnings denied,
+41 Node tests (one normal opt-in skip), both real task-provenance tests on both mise versions,
+and all seven scratch tests with real mise 2026.10.3. Logs: `/tmp/stack-jdx-r6-rust.log`,
+`stack-jdx-r6-clippy.log`, `stack-jdx-r6-node.log`, version-qualified env logs and
+`stack-jdx-r6-scratch.log`. A fresh Linux run and Astra round 6 review the same frozen
+implementation with all earlier findings, responses, current receipts and remaining limits.
+No final approval is claimed yet.
