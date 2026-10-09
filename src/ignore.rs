@@ -244,12 +244,15 @@ fn drop_shared_blocks(exclude: &Path) -> Option<String> {
     }
     let failed = |e: std::io::Error| Some(format!("cannot remove stack's old blocks from {}: {e}", exclude.display()));
     let lock = exclude.with_file_name("exclude.lock");
+    // The wait ends with the call's own deadline too: the other writer's lock and the file are
+    // then left as they are, and what runs next reports the timeout.
     let started = Instant::now();
+    let wait = crate::process::bounded(LOCK_WAIT);
     let mut file = loop {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(file) => break file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && started.elapsed() < LOCK_WAIT => {
-                std::thread::sleep(Duration::from_millis(10));
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && started.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(10).min(wait.saturating_sub(started.elapsed())));
             }
             Err(e) => return failed(e),
         }

@@ -281,6 +281,44 @@ fn concurrent_compiles_of_many_projects_in_one_repository_each_keep_their_files_
 }
 
 #[test]
+fn a_contended_old_exclude_migration_ends_with_the_calls_deadline_and_changes_nothing() {
+    let fixture = Fixture::new();
+    fixture.ok(&["compile"]);
+    let top = fixture.dir.path();
+    git(top, &["init", "-q"]);
+    let exclude = top.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let old = "# mine\n\n# stack: generated files of /elsewhere/app\n/app/.stack/\n# stack: end of /elsewhere/app\n";
+    fs::write(&exclude, old).unwrap();
+    // Another writer holds git's lock on the file, for longer than any call here allows.
+    let lock = top.join(".git/info/exclude.lock");
+    fs::write(&lock, "another writer's\n").unwrap();
+    let marker = top.join("ran");
+    let cmd = format!("touch '{}'", marker.display());
+    let check = |route: &str, error: &Value, elapsed: Duration| {
+        assert_eq!(error["code"], "timed_out", "{route}: {error}");
+        assert!(elapsed < Duration::from_secs(3), "{route}: the 5s migration wait outlived the 1s call: {elapsed:?}");
+        assert!(!marker.exists(), "{route}: the command ran");
+        assert_eq!(fs::read_to_string(&exclude).unwrap(), old, "{route}");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "another writer's\n", "{route}");
+    };
+    let started = Instant::now();
+    let out = fixture.command(&["--json", "exec", "--timeout", "1s", "--", "sh", "-c", &cmd]).output().unwrap();
+    check("cli", &json_result(&out)["error"], started.elapsed());
+    let started = Instant::now();
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", cmd], "timeout_secs": 1 }))], &[]);
+    check("mcp", &results[0]["structuredContent"]["error"], started.elapsed());
+    // Without a deadline the migration still waits its own while for the lock, then removes the block.
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        fs::remove_file(&lock).unwrap();
+    });
+    fixture.ok(&["compile"]);
+    release.join().unwrap();
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), "# mine\n");
+}
+
+#[test]
 fn install_prints_only_the_kinds_of_install_that_ran() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
     let text = String::from_utf8(fixture.ok(&["install"]).stdout).unwrap();
