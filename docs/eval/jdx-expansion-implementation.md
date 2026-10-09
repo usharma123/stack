@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes are integrated; final Linux validation passed and Astra round 4 remediation is in progress.
+Status: all routes and round 4 corrections are integrated; combined Linux validation and Astra round 5 are in progress.
 
 ## Scope and base
 
@@ -478,3 +478,29 @@ concurrent mise queries and per-root cleanup. No Linux or mise 2026.9.18 pass is
 this correction yet. Killed processes still leave their root and links; no global sweep was
 added. Callers must keep state-directory environment variables unchanged after obtaining
 the command; current callers do so. Environment provenance remediation remains active.
+
+### Environment provenance integration and round 5
+
+Worker commit `237d976` was integrated as `639f1b8`. Under the same planning lock, Stack reads
+the environment from the project configuration, then captures its immutable task copy.
+The copy omits scalar `[env]` declarations whose evaluated values the plan already holds;
+tools, tasks, generated `_` directives and lock metadata remain declared. It writes no
+evaluated values and rewrites no templates. Task body/grant binding and lifecycle remain
+unchanged. Project environment templates are evaluated once at planning, as user docs now
+state. Unplanned variables and Stack's provider selection remain declared.
+
+The worker's real CLI controls on mise 2026.9.18 and 2026.10.3 reproduced the former failure
+with the fix disabled and passed with it enabled. Cases cover project `config_source`,
+`config_root`, chained environment references, literal template delimiters, task templates,
+bundle PATH and pinned jq. Its 389 Rust tests, Clippy, 41 Node tests and all ten macOS native
+scenarios passed before combination with scratch cleanup. Receipts:
+`/tmp/stack-r4-env.eDz5Oo/receipts.json` and neighboring logs.
+
+At the combined exact implementation `639f1b8`, parent checks passed all 393 Rust tests,
+Clippy with warnings denied, and 41 Node tests (one normal opt-in skip). Parent separately
+enabled the real environment provenance regression and all seven scratch tests on both mise
+2026.9.18 and 2026.10.3; all passed. Logs are `/tmp/stack-jdx-r5-rust.log`,
+`stack-jdx-r5-clippy.log`, `stack-jdx-r5-node.log`, and version-qualified env/scratch logs.
+A fresh Linux validation and Astra round 5 review the same frozen combined implementation.
+The review receives the full original brief, all prior findings and responses, both new
+worker responses, current receipts and unresolved evidence limits. Approval remains pending.
