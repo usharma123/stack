@@ -266,7 +266,17 @@ The normally optional real-mise configuration-isolation test also passed separat
 `/tmp/stack-jdx-r2-rust.log`, `stack-jdx-r2-clippy.log`, `stack-jdx-r2-node.log`,
 `stack-jdx-r2-boundary.log`, and `stack-jdx-r2-native-all.log`. Astra's verdict is pending.
 
-Linux ARM64 remediation validation is running separately at `d8df870`, focused on the new
-regressions and affected real-tool paths. It does not reuse the earlier 341-test count as a
-claim about the revised commit. The opt-in real-mise configuration-isolation check is rerun
-separately from the normally skipped Node test.
+Linux ARM64 remediation validation at `d8df870` passed all 357 Rust tests and the release
+build on its first invocation, with no transient or product failures. All 16 real-mise
+remediation probes passed: skills links and registry bytes survived two provider failures,
+discovery recovery restored the normal step, required/current install succeeded, and all
+probed unlisted-platform commands refused without provider calls, command execution, or
+project/state changes. Real native scenarios 1 and 10 passed against mise 2026.9.18 with
+isolated tool and service state. The checkout was read-only and its owned containers/volume
+were removed. Full report: `/tmp/jdx-linux-d8df870.9y_merg3/REPORT.md`.
+
+This Linux rerun does not relabel the earlier complete ten-scenario run, checksum tamper,
+migration, or mbx cache evidence as new-head runtime checks. It did not rerun Linux Clippy,
+Node, or real old-mise/signer-change tests. MacOS Clippy/Node and the normally optional
+real-mise boundary test passed at the combined head as recorded above. Astra round 2 is the
+remaining sign-off before completion.
