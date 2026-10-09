@@ -3078,8 +3078,9 @@ impl ExecutionGuard {
             return Ok(());
         }
         session.active_executions.shift_remove(&self.token);
+        // A `renew` that took the lock while this waited for it may have renewed later.
         if let Some(lease) = session.lease.as_mut() {
-            lease.renewed_at = completed_at;
+            lease.renewed_at = lease.renewed_at.max(completed_at);
         }
         save(&ctx, &session)
     }

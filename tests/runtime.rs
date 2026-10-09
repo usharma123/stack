@@ -560,6 +560,49 @@ fn a_command_without_a_timeout_does_not_wait_unbounded_to_finish_its_record() {
 }
 
 #[test]
+fn a_renewal_made_while_a_finished_command_waits_for_the_lock_is_kept() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "1s"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let exec = fixture
+        .command(&["--json", "exec", "--", "sh", "-c", "while test ! -e finish; do sleep 0.01; done"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+        assert!(Instant::now() < deadline, "execution never registered");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let renew = {
+        let _lock = stack::state::project_lock(&state, &app).unwrap();
+        // The command finishes late in one second; `renew` waits for the lock with its
+        // release, and gets it first, in the next second.
+        while !(700..740).contains(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis()) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        fs::write(app.join("finish"), "").unwrap();
+        let renew = fixture.command(&["--json", "renew"]).stdout(Stdio::piped()).spawn().unwrap();
+        thread::sleep(Duration::from_millis(480));
+        renew
+    };
+    let renewed = json_result(&renew.wait_with_output().unwrap())["data"]["lease"]["renewed_at"].as_u64().unwrap();
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(json_result(&out)["ok"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    let lease = read_value(&session_file)["lease"].clone();
+    assert!(lease["renewed_at"].as_u64().unwrap() >= renewed, "renewed at {renewed}, then moved back: {lease}");
+    // One second after that renewal the session is not yet idle past its TTL.
+    while unix_now() < renewed + 1 {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(json_result(&out)["data"], json!([]), "reclaimed one second after a renewal");
+    fixture.ok(&["down"]);
+}
+
+#[test]
 fn a_finished_command_that_cannot_be_recorded_says_so_and_keeps_the_session_busy() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);
