@@ -281,10 +281,13 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            run_command(&ctx, cli.json, cmd, &req, secret.clone(), timeout.as_deref())
+            run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
+                session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured })
+            })
         }
-        Cmd::Run { task, timeout, args } => session::task_command(&ctx, task, args)
-            .and_then(|(cmd, req, secrets)| run_command(&ctx, cli.json, &cmd, &req, secrets, timeout.as_deref())),
+        Cmd::Run { task, timeout, args } => {
+            run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
+        }
         Cmd::Down => session::down(&ctx).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
@@ -467,15 +470,20 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
     })
 }
 
-fn run_command(ctx: &Ctx, as_json: bool, cmd: &[String], require: &Require, secrets: Vec<String>, timeout: Option<&str>) -> Result<ExitCode> {
+/// `plan` is told whether output is captured.
+fn run_command(
+    ctx: &Ctx,
+    as_json: bool,
+    timeout: Option<&str>,
+    plan: impl FnOnce(bool) -> Result<session::ExecPlan>,
+) -> Result<ExitCode> {
     let timeout = timeout.map(parse_duration).transpose()?.map(Duration::from_secs);
     // Captured output is redacted, so values too short to redact are refused there; on the
     // terminal nothing is captured or redacted.
-    let grant = Grant { keys: secrets, captured: as_json };
     if as_json {
-        exec_json(ctx, cmd, require, &grant, timeout)
+        exec_json(ctx, plan(true)?, timeout)
     } else {
-        exec(ctx, cmd, require, &grant, timeout)
+        exec(ctx, plan(false)?, timeout)
     }
 }
 
@@ -512,8 +520,7 @@ fn warn_changed(checks: &[session::Check]) {
     }
 }
 
-fn exec(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant, timeout: Option<Duration>) -> Result<ExitCode> {
-    let plan = session::plan_exec_with(ctx, cmd, require, grant)?;
+fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     warn_unverified(&plan.checks);
     warn_changed(&plan.checks);
     for warning in &plan.secret_warnings {
@@ -541,10 +548,9 @@ fn exec(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant, timeout: Op
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
 /// The process exits with the command's code (124 on timeout, like `timeout(1)`).
-fn exec_json(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant, timeout: Option<Duration>) -> Result<ExitCode> {
+fn exec_json(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     // Large enough to mean "no limit" without overflowing deadline arithmetic.
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
-    let plan = session::plan_exec_with(ctx, cmd, require, grant)?;
     let result = mcp::run_captured(ctx, &plan, timeout)?;
     if result["timed_out"] == true {
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));

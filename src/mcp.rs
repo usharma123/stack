@@ -305,7 +305,7 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
                 .unwrap_or_default(),
         )
     };
-    captured(args, ctx, &command, &require, secrets)
+    captured(args, ctx, || session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true }))
 }
 
 /// `secrets` of `stack_exec`: omitted, or an array of names. Anything else is refused rather
@@ -331,12 +331,11 @@ fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
         return Err(StackError::new("usage", "stack_run grants exactly the secrets the task declares and accepts no others")
             .hint("declare them under [tasks.<name>] secrets = [...] in stack.toml, or use stack_exec with secrets"));
     }
-    let (command, require, secrets) = session::task_command(ctx, task, &extra)?;
-    captured(args, ctx, &command, &require, secrets)
+    captured(args, ctx, || session::plan_task(ctx, task, &extra, true))
 }
 
-fn captured(args: &Value, ctx: &Ctx, command: &[String], require: &Require, secrets: Vec<String>) -> Result<Value> {
-    let plan = session::plan_exec_with(ctx, command, require, &Grant { keys: secrets, captured: true })?;
+fn captured(args: &Value, ctx: &Ctx, plan: impl FnOnce() -> Result<session::ExecPlan>) -> Result<Value> {
+    let plan = plan()?;
     let timeout = Duration::from_secs(
         args["timeout_secs"]
             .as_u64()

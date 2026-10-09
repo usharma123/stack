@@ -24,7 +24,10 @@ stack --json exec --secret DEPLOY_KEY -- ./check.sh
 ```
 
 Over MCP, `stack_exec` takes `secrets: ["DEPLOY_KEY"]`. `stack run` and `stack_run` grant exactly
-the task's list and accept no additions (`stack_run` with `secrets` is a `usage` error).
+the task's list and accept no additions (`stack_run` with `secrets` is a `usage` error). The
+list is read from the same compile, under the project lock, as the command that runs: a task edited
+while its run waits for another stack command runs its new definition with its new list, and a
+task removed meanwhile is refused as `unknown_task`.
 `secrets` lists names, never values, so bundles may declare it; two layers defining one task must
 agree on the whole task, as for any other field.
 

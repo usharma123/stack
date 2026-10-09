@@ -7,7 +7,8 @@
 
 use crate::error::{Result, StackError};
 use crate::hash::sha256_hex;
-use crate::manifest::Service;
+use crate::compose::{Composed, Entry};
+use crate::manifest::{Service, Task};
 use crate::artifacts;
 use crate::ports;
 use crate::project::{self, Options, Report};
@@ -1946,31 +1947,6 @@ pub enum Require {
     Only(Vec<String>),
 }
 
-/// A declared task as a command for `plan_exec`, with every service required. `mise run`
-/// keeps the provider's task semantics (templates, shebangs, argument passing); `--skip-deps`
-/// stops it from starting the task's daemons itself, since stack verifies them instead.
-///
-/// Also returns the task's declared secrets: `stack run` grants exactly those.
-pub fn task_command(ctx: &Ctx, name: &str, args: &[String]) -> Result<(Vec<String>, Require, Vec<String>)> {
-    let report = ctx.compile(false)?;
-    let task = report.stack.tasks.get(name).ok_or_else(|| {
-        let known: Vec<&str> = report.stack.tasks.keys().map(String::as_str).collect();
-        StackError::new("unknown_task", format!("no task named '{name}'")).hint(if known.is_empty() {
-            "this project defines no tasks; add one under [tasks.<name>] in stack.toml".to_string()
-        } else {
-            format!("tasks: {}", known.join(", "))
-        })
-    })?;
-    let mut command: Vec<String> = ["mise", "run", "--skip-deps", "--no-timings", name, "--"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-    command.extend(args.iter().cloned());
-    // `mise run` evaluates the provider config again and would restore the endpoints that
-    // `plan_exec` withholds from unverified services. Only a fully verified stack has none.
-    Ok((command, Require::All, task.value.secrets.clone()))
-}
-
 /// Prepare a command: verify services, withhold unverified endpoints, renew the lease.
 pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPlan> {
     plan_exec_with(ctx, cmd, require, &Grant::default())
@@ -1979,13 +1955,70 @@ pub fn plan_exec(ctx: &Ctx, cmd: &[String], require: &Require) -> Result<ExecPla
 /// [`plan_exec`], resolving `grant`'s secrets through the stack's pinned fnox once services
 /// are verified and endpoints withheld. The names are checked before any provider call.
 pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Grant) -> Result<ExecPlan> {
+    plan(ctx, Target::Command { cmd, require, grant })
+}
+
+/// A declared task, planned with every service required. `mise run` keeps the provider's task
+/// semantics (templates, shebangs, argument passing); `--skip-deps` stops it from starting the
+/// task's daemons itself, since stack verifies them instead.
+///
+/// The task is granted exactly the secrets it declares, read from the same compile, under the
+/// same project lock, as the command and environment: a task edited while this invocation
+/// waits for the lock runs with its new definition's grant, never its old one.
+pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Result<ExecPlan> {
+    plan(ctx, Target::Task { name, args, captured })
+}
+
+/// What [`plan`] prepares: an explicit command with its own grant, or a declared task whose
+/// command and grant come from the compile that plans it.
+enum Target<'a> {
+    Command { cmd: &'a [String], require: &'a Require, grant: &'a Grant },
+    Task { name: &'a str, args: &'a [String], captured: bool },
+}
+
+fn declared_task<'a>(stack: &'a Composed, name: &str) -> Result<&'a Entry<Task>> {
+    stack.tasks.get(name).ok_or_else(|| {
+        let known: Vec<&str> = stack.tasks.keys().map(String::as_str).collect();
+        StackError::new("unknown_task", format!("no task named '{name}'")).hint(if known.is_empty() {
+            "this project defines no tasks; add one under [tasks.<name>] in stack.toml".to_string()
+        } else {
+            format!("tasks: {}", known.join(", "))
+        })
+    })
+}
+
+fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     timings.mark("lock");
     let mut session = load(ctx)?;
-    let report = ctx.compile(true)?;
+    let report = match target {
+        Target::Command { .. } => ctx.compile(true)?,
+        // An unknown task is refused before the compile writes anything.
+        Target::Task { name, .. } => {
+            project::compile_checked(&ctx.options(true), &|stack, _| declared_task(stack, name).map(drop))?
+        }
+    };
     timings.mark("compile");
-    secrets::validate(&grant.keys, &report.stack, secrets::Origin::Command)?;
+    let all = Require::All;
+    let task_grant;
+    let task_cmd: Vec<String>;
+    let (cmd, require, grant, origin) = match target {
+        Target::Command { cmd, require, grant } => (cmd, require, grant, secrets::Origin::Command),
+        Target::Task { name, args, captured } => {
+            let task = declared_task(&report.stack, name)?;
+            task_cmd = ["mise", "run", "--skip-deps", "--no-timings", name, "--"]
+                .into_iter()
+                .map(String::from)
+                .chain(args.iter().cloned())
+                .collect();
+            task_grant = Grant { keys: task.value.secrets.clone(), captured };
+            // `mise run` evaluates the provider config again and would restore the endpoints
+            // that are withheld from unverified services. Only a fully verified stack has none.
+            (task_cmd.as_slice(), &all, &task_grant, secrets::Origin::Task(name))
+        }
+    };
+    secrets::validate(&grant.keys, &report.stack, origin)?;
     mise::trust(&ctx.root)?;
     timings.mark("trust");
     let (mut env, checks) = if report.stack.services.is_empty() {

@@ -128,6 +128,8 @@ case "$1 $2" in
   'run --skip-deps')
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
+    # The generated config the task ran from: its definition as stack planned it.
+    cp .config/mise/conf.d/stack.toml "$REVIEW_FIXTURE/run-config" 2>/dev/null
     if test "$task" = fail; then exit 3; fi
     # A task that shows the environment it was given, on both streams.
     if test "$task" = showenv; then echo; env | sort; env | sort >&2; fi ;;
@@ -3495,6 +3497,145 @@ fn tasks_get_exactly_their_declared_secrets() {
     // The provider config never carries the grant: mise's own task `secrets` field is not used.
     let rendered = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
     assert!(!rendered.contains("secrets") && !rendered.contains("DEPLOY_KEY"), "{rendered}");
+    assert_no_leak_on_disk(&fixture);
+}
+
+/// A `stack run` (or MCP `stack_run`) started while another command holds the project lock.
+/// Killed if the test fails before it finishes.
+struct Queued(Option<std::process::Child>);
+
+impl Queued {
+    /// Start `command` while `lock` is held, and wait until it has had time to read the
+    /// project, still blocked on the lock.
+    fn start(mut command: Command, mcp_call: Option<Value>) -> Self {
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if let Some(call) = mcp_call {
+            use std::io::Write;
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})).unwrap();
+            writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":call}})).unwrap();
+        }
+        drop(stdin);
+        thread::sleep(Duration::from_millis(750));
+        let mut queued = Self(Some(child));
+        assert!(queued.0.as_mut().unwrap().try_wait().unwrap().is_none(), "the run must wait for the held project lock");
+        queued
+    }
+
+    fn finish(mut self) -> Output {
+        let mut child = self.0.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the queued run did not finish once the lock was released");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Hold the project lock as another stack command would, queue `stack run <task>` (CLI) or
+/// `stack_run` (MCP) behind it, write `edited` as stack.toml while it waits, then release.
+/// Returns the run's result envelope.
+fn run_queued_behind_an_edit(fixture: &Fixture, task: &str, edited: &str, mcp: bool) -> Value {
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let held = stack::state::project_lock(&fixture.dir.path().join("state"), &app).unwrap();
+    let queued = if mcp {
+        Queued::start(fixture.command(&["mcp"]), Some(json!({ "dir": app, "task": task })))
+    } else {
+        Queued::start(fixture.command(&["--json", "run", task]), None)
+    };
+    fs::write(app.join("stack.toml"), edited).unwrap();
+    drop(held);
+    let out = queued.finish();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !mcp {
+        return serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{stdout} {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let response = stdout.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["id"] == 1).unwrap();
+    response["result"]["structuredContent"].clone()
+}
+
+#[test]
+fn a_task_edited_while_its_run_waits_for_the_lock_runs_with_its_new_definition_and_grant() {
+    let manifest = |body: &str, secret: &str| {
+        format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n[tasks.showenv]\nrun = '{body}'\nsecrets = ['{secret}']\n")
+    };
+    let (old, new) = (manifest("old-definition", "DEPLOY_KEY"), manifest("new-definition", "SENTRY_DSN"));
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app");
+    for mcp in [false, true] {
+        let context = if mcp { "MCP" } else { "CLI" };
+        fs::write(app.join("stack.toml"), &old).unwrap();
+        fixture.ok(&["compile"]);
+        let before = fnox_log(&fixture).len();
+        let envelope = run_queued_behind_an_edit(&fixture, "showenv", &new, mcp);
+        assert_no_leak(&envelope.to_string(), context);
+        let data = &envelope["data"];
+        assert_eq!(envelope["ok"], true, "{context}: {envelope}");
+        // The grant is the definition that ran, not the one read before the lock was free.
+        assert_eq!(data["secrets"], json!(["SENTRY_DSN"]), "{context}: {envelope}");
+        let stdout = data["stdout"].as_str().unwrap();
+        assert!(stdout.contains("\nSENTRY_DSN=[redacted:SENTRY_DSN]\n"), "{context}: {stdout}");
+        assert!(!stdout.contains("DEPLOY_KEY="), "{context}: the old grant reached the task: {stdout}");
+        let ran = fs::read_to_string(fixture.dir.path().join("run-config")).unwrap();
+        assert!(ran.contains("new-definition") && !ran.contains("old-definition"), "{context}: {ran}");
+        let log = fnox_log(&fixture);
+        assert_eq!(log.len(), before + 2, "{context}: {log:?}");
+        assert!(log[before + 1].contains("--keys SENTRY_DSN|"), "{context}: {log:?}");
+    }
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn a_task_deleted_or_ungranted_while_its_run_waits_is_refused_or_runs_without_secrets() {
+    let head = "[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n";
+    let granted = format!("{head}[tasks.showenv]\nrun = 'old-definition'\nsecrets = ['DEPLOY_KEY']\n[tasks.plain]\nrun = 'true'\n");
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app");
+    let generated = app.join(".config/mise/conf.d/stack.toml");
+    for mcp in [false, true] {
+        let context = if mcp { "MCP" } else { "CLI" };
+
+        // Deleted: refused as unknown, before the compile writes anything, fnox, or the task.
+        fs::write(app.join("stack.toml"), &granted).unwrap();
+        fixture.ok(&["compile"]);
+        let config = fs::read_to_string(&generated).unwrap();
+        let (fnox_before, mise_before) = (fnox_log(&fixture).len(), fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap());
+        let deleted = format!("{head}[tasks.plain]\nrun = 'renamed'\n");
+        let envelope = run_queued_behind_an_edit(&fixture, "showenv", &deleted, mcp);
+        assert_eq!(envelope["error"]["code"], "unknown_task", "{context}: {envelope}");
+        assert_eq!(envelope["error"]["hint"], "tasks: plain", "{context}");
+        assert_eq!(fs::read_to_string(&generated).unwrap(), config, "{context}: the refused run wrote the generated config");
+        assert_eq!(fnox_log(&fixture).len(), fnox_before, "{context}");
+        let mise_log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+        assert!(!mise_log[mise_before.len()..].contains("run --skip-deps"), "{context}: {mise_log}");
+
+        // Ungranted: runs its new definition with no secrets and no fnox call.
+        fs::write(app.join("stack.toml"), &granted).unwrap();
+        fixture.ok(&["compile"]);
+        let fnox_before = fnox_log(&fixture).len();
+        let ungranted = format!("{head}[tasks.showenv]\nrun = 'new-definition'\n");
+        let envelope = run_queued_behind_an_edit(&fixture, "showenv", &ungranted, mcp);
+        assert_eq!(envelope["ok"], true, "{context}: {envelope}");
+        assert!(envelope["data"].get("secrets").is_none(), "{context}: {envelope}");
+        assert!(!envelope["data"]["stdout"].as_str().unwrap().contains("DEPLOY_KEY="), "{context}: {envelope}");
+        assert!(fs::read_to_string(fixture.dir.path().join("run-config")).unwrap().contains("new-definition"), "{context}");
+        assert_eq!(fnox_log(&fixture).len(), fnox_before, "{context}: fnox ran for a task that declares no secrets");
+    }
     assert_no_leak_on_disk(&fixture);
 }
 
