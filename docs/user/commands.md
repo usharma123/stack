@@ -86,7 +86,12 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   a copy of the generated configuration taken when it was planned, under the project lock, so a
   `compile` while it starts or runs does not change its body, env or tools; the next run sees
   the change. mise loads the copy as its only configuration, rooted at the project, so the
-  working directory, relative paths and `{{config_root}}` are the project's. The copy is kept in
+  working directory, relative paths and `{{config_root}}` are the project's. Its `[env]` values
+  are the ones evaluated against the project's own generated file when the task was planned,
+  so a value built from `{{config_source}}` names the project's file, not the copy: the copy
+  leaves out each value the task already receives, and keeps tools, `_.path` and tasks, which
+  mise applies as usual. A template such as `{{exec(...)}}` is evaluated once, when the task
+  is planned. The copy is kept in
   a private directory under stack's cache and removed when the task ends, fails to plan or times
   out, along with the link mise records to it under `$MISE_STATE_DIR/tracked-configs`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the

@@ -11,8 +11,16 @@
 //! only this user can read, removed when the [`TaskConfig`] is dropped: at command completion,
 //! timeout or error, or when planning fails after the copy). The copy keeps the layout of the
 //! project's files (`.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`), so mise finds
-//! the lock beside it as it would in the project. Only the bytes compile already wrote are
-//! copied: granted values are never in either file.
+//! the lock beside it as it would in the project. Only what compile already wrote is copied:
+//! granted values are never in either file.
+//!
+//! The copy leaves out the plain `[env]` values the plan already holds. Planning read them
+//! from the project's own file, so a template such as `{{config_source}}` named that file;
+//! `mise run` would evaluate the copy's declarations again, against the copy, and replace
+//! them. Left out, the planned value the command inherits is the one the task sees, in its
+//! shell and in `{{env.X}}` task templates. Everything else is copied unchanged: tools, tasks,
+//! services and the generated `_` directives (such as `_.path`), which mise still applies.
+//! A value is never written into the copy, only left out of it.
 //!
 //! [`TaskConfig::env`] points mise at the copy as its global configuration, with
 //! `MISE_GLOBAL_CONFIG_ROOT` set to the project root, and at a project configuration that
@@ -51,10 +59,16 @@ pub struct TaskConfig {
 
 impl TaskConfig {
     /// Copy `root`'s generated configuration and rendered lock. Call it under the project lock,
-    /// after the compile that planned the task, so the copy is what that compile wrote.
-    pub fn capture(root: &Path, cache: &Path) -> Result<Self> {
-        let config = std::fs::read(super::mise::output_path(root))
-            .map_err(|e| io_error(super::mise::output_path(root).display(), e))?;
+    /// after the compile that planned the task and the environment read from what it wrote, so
+    /// the copy is what that compile wrote. `planned` answers whether the plan holds the value
+    /// mise evaluated for an `[env]` variable; such a variable is left out of the copy.
+    pub fn capture(root: &Path, cache: &Path, planned: impl Fn(&str) -> bool) -> Result<Self> {
+        let path = super::mise::output_path(root);
+        let config = std::fs::read(&path).map_err(|e| io_error(path.display(), e))?;
+        let config = without_planned_env(&config, planned).map_err(|e| {
+            StackError::new("provider_failed", format!("cannot read the generated configuration {}: {e}", path.display()))
+                .hint("run `stack compile` to regenerate it")
+        })?;
         let lock = match std::fs::read(crate::artifacts::rendered_path(root)) {
             Ok(lock) => Some(lock),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -143,6 +157,26 @@ impl Drop for TaskConfig {
     }
 }
 
+/// `config` without the plain `[env]` values `planned` names; unchanged if it names none.
+/// Directives (the `_` table) and every other table are kept.
+fn without_planned_env(config: &[u8], planned: impl Fn(&str) -> bool) -> std::result::Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(config).map_err(|e| e.to_string())?;
+    let mut doc: toml::Table = toml::from_str(text).map_err(|e| e.message().trim().to_string())?;
+    let Some(toml::Value::Table(env)) = doc.get_mut("env") else {
+        return Ok(config.to_vec());
+    };
+    let before = env.len();
+    env.retain(|key, value| !(value.is_str() && planned(key)));
+    if env.len() == before {
+        return Ok(config.to_vec());
+    }
+    if env.is_empty() {
+        doc.remove("env");
+    }
+    let body = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    Ok(format!("# Copied by stack for one task run, without the [env] values the run inherits.\n{body}").into_bytes())
+}
+
 /// Write a file that must not exist yet, readable by its owner only.
 fn write_new(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -191,7 +225,7 @@ mod tests {
     fn the_copy_is_private_unchanged_by_later_compiles_and_removed_on_drop() {
         let root = project("[tasks.a]\nrun = 'version-one'\n", Some("lockfile_version = 3\n"));
         let cache = tempfile::tempdir().unwrap();
-        let copy = TaskConfig::capture(root.path(), cache.path()).unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap();
         std::fs::write(root.path().join(CONFIG), "[tasks.a]\nrun = 'version-two'\n").unwrap();
         std::fs::remove_file(root.path().join(LOCK)).unwrap();
         assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), "[tasks.a]\nrun = 'version-one'\n");
@@ -215,7 +249,7 @@ mod tests {
     fn concurrent_copies_are_distinct_and_a_missing_lock_is_not_invented() {
         let root = project("[tasks.a]\nrun = 'x'\n", None);
         let cache = tempfile::tempdir().unwrap();
-        let (a, b) = (TaskConfig::capture(root.path(), cache.path()).unwrap(), TaskConfig::capture(root.path(), cache.path()).unwrap());
+        let (a, b) = (TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap(), TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap());
         assert_ne!(a.dir(), b.dir());
         assert!(!a.dir().join(LOCK).exists());
         drop(a);
@@ -235,7 +269,7 @@ mod tests {
         let mut live = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         std::fs::create_dir_all(parent.join(format!("{}-running", live.id()))).unwrap();
         std::fs::create_dir_all(parent.join("unrelated")).unwrap();
-        let _copy = TaskConfig::capture(root.path(), cache.path()).unwrap();
+        let _copy = TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap();
         let kept = parent.join(format!("{}-running", live.id())).exists();
         let _ = live.kill();
         let _ = live.wait();
@@ -258,7 +292,7 @@ mod tests {
         link("killed", &parent.join("1-gone/.config/mise/conf.d/stack.toml"));
         link("project", &root.path().join(CONFIG));
         link("elsewhere", &state.path().join("missing.toml"));
-        let mut copy = TaskConfig::capture(root.path(), cache.path()).unwrap();
+        let mut copy = TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap();
         let state_dir = state.path().to_string_lossy().into_owned();
         copy.track_with(|key| (key == "MISE_STATE_DIR").then(|| state_dir.clone()));
         assert!(!tracked.join("killed").exists() && tracked.join("killed").symlink_metadata().is_err());
@@ -270,10 +304,40 @@ mod tests {
     }
 
     #[test]
+    fn planned_env_values_are_left_out_and_everything_else_is_kept() {
+        let config = "[tools]\nnode = \"24.13.0\"\n\n[env]\nASSET = \"{{ config_source }}/x\"\nKEPT = \"{{ config_root }}\"\n\n[env._]\npath = [\"bin\"]\n\n[tasks.a]\nrun = \"\"\"\necho {{env.ASSET}}\n\"\"\"\n";
+        let root = project(config, None);
+        let cache = tempfile::tempdir().unwrap();
+        let copy = TaskConfig::capture(root.path(), cache.path(), |key| ["ASSET", "_", "MISSING"].contains(&key)).unwrap();
+        let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
+        let mut expected: toml::Table = toml::from_str(config).unwrap();
+        expected["env"].as_table_mut().unwrap().remove("ASSET");
+        // Only a plain value is left out: the `_` directives stay even when asked about.
+        assert_eq!(held, expected);
+
+        // Nothing planned: the bytes compile wrote. Every value planned: no `[env]` at all.
+        let copy = TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap();
+        assert_eq!(std::fs::read_to_string(copy.config()).unwrap(), config);
+        let root = project("[env]\nA = \"a\"\n[tasks.a]\nrun = \"x\"\n", None);
+        let copy = TaskConfig::capture(root.path(), cache.path(), |_| true).unwrap();
+        let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
+        assert!(!held.contains_key("env") && held["tasks"]["a"]["run"].as_str() == Some("x"));
+    }
+
+    #[test]
+    fn an_unreadable_generated_configuration_is_refused_before_anything_is_copied() {
+        let root = project("[env\n", None);
+        let cache = tempfile::tempdir().unwrap();
+        let err = TaskConfig::capture(root.path(), cache.path(), |_| true).unwrap_err();
+        assert_eq!(err.code, "provider_failed");
+        assert!(!cache.path().join(PURPOSE).exists());
+    }
+
+    #[test]
     fn a_missing_generated_configuration_is_an_error_and_leaves_nothing() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let err = TaskConfig::capture(root.path(), cache.path()).unwrap_err();
+        let err = TaskConfig::capture(root.path(), cache.path(), |_| false).unwrap_err();
         assert_eq!(err.code, "io");
         assert!(!cache.path().join(PURPOSE).exists());
     }

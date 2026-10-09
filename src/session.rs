@@ -1973,7 +1973,8 @@ pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Gran
 /// The lock is released before the task runs, and an ordinary compile may then rewrite the
 /// generated configuration. `mise run` therefore reads a copy taken under the lock (see
 /// [`TaskConfig`]): the plan runs the body, env and tool pins it was planned and granted for,
-/// whatever is compiled while it waits or runs.
+/// whatever is compiled while it waits or runs. Its `[env]` values are the ones planning read
+/// from the project's own file, not evaluated again against the copy.
 pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Result<ExecPlan> {
     plan(ctx, Target::Task { name, args, captured })
 }
@@ -2028,11 +2029,6 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         }
     };
     secrets::validate(&grant.keys, &report.stack, origin)?;
-    // Under the lock, from what this compile wrote; removed if planning fails after this.
-    let mut task_config = match target {
-        Target::Task { .. } => Some(TaskConfig::capture(&ctx.root, &ctx.cache)?),
-        Target::Command { .. } => None,
-    };
     mise::trust(&ctx.root)?;
     timings.mark("trust");
     let (mut env, checks) = if report.stack.services.is_empty() {
@@ -2045,6 +2041,17 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         let checks = verify_session(ctx, &report, &env, &statuses, session.as_ref(), &timings);
         timings.mark("verify");
         (env, checks)
+    };
+    // Under the lock, from what this compile wrote; removed if planning fails after this. The
+    // `[env]` values just read from the project's file stay authoritative: the copy leaves out
+    // each one the plan holds (not the provider selection stack sets itself), so `mise run`
+    // does not evaluate it again against the copy.
+    let selection = mise::config_env(&ctx.root);
+    let mut task_config = match target {
+        Target::Task { .. } => Some(TaskConfig::capture(&ctx.root, &ctx.cache, |key| {
+            env.contains_key(key) && !selection.contains_key(key)
+        })?),
+        Target::Command { .. } => None,
     };
     // Set before secrets resolve, so no grant can replace them.
     if let Some(config) = &task_config {

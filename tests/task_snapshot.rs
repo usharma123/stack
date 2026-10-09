@@ -22,8 +22,16 @@ fn write_exe(path: &Path, script: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn manifest(body: &str, secret: &str) -> String {
-    format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n[tasks.showenv]\nrun = '{body}'\nsecrets = ['{secret}']\n")
+/// `ASSET` is a template mise evaluates against the configuration that declares it; `KEPT` is
+/// one the fake provider's planning environment does not report.
+fn manifest(body: &str, secret: &str, asset: &str) -> String {
+    format!("[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n[env]\nASSET = '{{{{ config_source }}}}-{asset}'\nKEPT = 'unplanned'\n[tasks.showenv]\nrun = '{body}'\nsecrets = ['{secret}']\n")
+}
+
+/// What `mise env` reports for the project's own configuration, as planning reads it.
+fn planning_env(fixture: &Path, path: &str, asset: &str) {
+    let env = json!({ "PATH": path, "ASSET": format!("{}/app/.config/mise/conf.d/stack.toml-{asset}", fixture.display()) });
+    fs::write(fixture.join("env.json"), env.to_string()).unwrap();
 }
 
 fn run(ctx: &Ctx, plan: &session::ExecPlan, fixture: &Path) -> (String, String) {
@@ -50,10 +58,10 @@ fn a_saved_task_plan_runs_its_planned_definition_and_grant_after_a_later_compile
     fs::write(fixture.join("ls.json"), rows.to_string()).unwrap();
     let path = format!("{}:{}", fixture.join("bin").display(), std::env::var("PATH").unwrap());
     let stack_path = format!("{}:{path}", install.join(".mise-bins").display());
-    fs::write(fixture.join("env.json"), json!({ "PATH": stack_path }).to_string()).unwrap();
+    planning_env(&fixture, &stack_path, "v1");
     fs::write(fixture.join("daemons.json"), "[]").unwrap();
-    fs::create_dir_all(fixture.join("bundle")).unwrap();
-    fs::write(fixture.join("bundle/bundle.toml"), "[bundle]\nname='test'\n").unwrap();
+    fs::create_dir_all(fixture.join("bundle/bin")).unwrap();
+    fs::write(fixture.join("bundle/bundle.toml"), "[bundle]\nname='test'\n[paths]\nbin=['bin']\n").unwrap();
     fs::create_dir_all(fixture.join("app")).unwrap();
     // The only test in this binary: nothing else reads the environment while it changes.
     std::env::set_var("PATH", &path);
@@ -62,7 +70,7 @@ fn a_saved_task_plan_runs_its_planned_definition_and_grant_after_a_later_compile
     let root = fixture.join("app");
     let ctx = Ctx { root: root.clone(), cache: fixture.join("cache"), state: fixture.join("state") };
     let opts = Options { root: root.clone(), mode: Mode::UseLock, write: true, cache: ctx.cache.clone(), state: ctx.state.clone(), reassign_ports: false, resolver: None, locker: None };
-    fs::write(root.join("stack.toml"), manifest("old-definition", "DEPLOY_KEY")).unwrap();
+    fs::write(root.join("stack.toml"), manifest("old-definition", "DEPLOY_KEY", "v1")).unwrap();
     project::compile(&opts).unwrap();
 
     let saved = session::plan_task(&ctx, "showenv", &[], true).unwrap();
@@ -71,27 +79,41 @@ fn a_saved_task_plan_runs_its_planned_definition_and_grant_after_a_later_compile
     let held = fs::read_to_string(copy.config()).unwrap();
     assert!(held.contains("old-definition") && SENTINELS.iter().all(|s| !held.contains(s)), "{held}");
     assert_eq!(saved.env["MISE_GLOBAL_CONFIG_ROOT"], root.to_string_lossy());
+    // The planned value of a variable is not declared again for mise to evaluate against the
+    // copy; one planning did not report, the `_.path` directive and the tools are kept.
+    let planned_asset = format!("{}/app/.config/mise/conf.d/stack.toml-v1", fixture.display());
+    assert_eq!(saved.env["ASSET"], planned_asset);
+    let doc: toml::Table = toml::from_str(&held).unwrap();
+    let env = doc["env"].as_table().unwrap();
+    assert!(!env.contains_key("ASSET") && env["KEPT"].as_str() == Some("unplanned"), "{held}");
+    assert_eq!(env["_"]["path"][0].as_str(), Some(fixture.join("bundle/bin").to_str().unwrap()), "{held}");
+    assert_eq!(doc["tools"]["fnox"].as_str(), Some("1.39.0"), "{held}");
+    assert!(!held.contains(&planned_asset), "a planned value is never written into the copy: {held}");
     // Control: run at once.
     let (stdout, ran) = run(&ctx, &saved, &fixture);
     assert!(ran.contains("old-definition"), "{ran}");
     assert!(stdout.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n") && !stdout.contains("SENTRY_DSN="), "{stdout}");
+    assert!(stdout.contains(&format!("\nASSET={planned_asset}\n")), "{stdout}");
 
-    // A normal compile on another thread publishes a new body and grant.
-    fs::write(root.join("stack.toml"), manifest("new-definition", "SENTRY_DSN")).unwrap();
+    // A normal compile on another thread publishes a new body, grant and env value.
+    fs::write(root.join("stack.toml"), manifest("new-definition", "SENTRY_DSN", "v2")).unwrap();
+    planning_env(&fixture, &stack_path, "v2");
     let published = std::thread::spawn(move || project::compile(&opts)).join().unwrap().unwrap();
     assert!(fs::read_to_string(&published.output).unwrap().contains("new-definition"));
 
-    // The saved plan still runs what it was planned and granted for.
+    // The saved plan still runs what it was planned and granted for, with its planned env.
     let (stdout, ran) = run(&ctx, &saved, &fixture);
     assert!(ran.contains("old-definition") && !ran.contains("new-definition"), "{ran}");
     assert!(stdout.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n") && !stdout.contains("SENTRY_DSN="), "{stdout}");
+    assert!(stdout.contains(&format!("\nASSET={planned_asset}\n")) && !stdout.contains("-v2\n"), "{stdout}");
 
-    // A plan made now runs the new definition with the new grant.
+    // A plan made now runs the new definition with the new grant and env value.
     let fresh = session::plan_task(&ctx, "showenv", &[], true).unwrap();
     assert_eq!(fresh.secrets, ["SENTRY_DSN"]);
     let (stdout, ran) = run(&ctx, &fresh, &fixture);
-    assert!(ran.contains("new-definition"), "{ran}");
+    assert!(ran.contains("new-definition") && !ran.contains("ASSET ="), "{ran}");
     assert!(stdout.contains("\nSENTRY_DSN=[redacted:SENTRY_DSN]\n") && !stdout.contains("DEPLOY_KEY="), "{stdout}");
+    assert!(stdout.contains("/app/.config/mise/conf.d/stack.toml-v2\n"), "{stdout}");
 
     // Deleted after planning: the plan made before still runs; planning now is refused.
     let opts = Options { root: root.clone(), mode: Mode::UseLock, write: true, cache: ctx.cache.clone(), state: ctx.state.clone(), reassign_ports: false, resolver: None, locker: None };
