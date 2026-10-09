@@ -527,3 +527,83 @@ fn rendering_writes_only_with_entries_and_removes_a_stale_file() {
     assert!(!path.exists());
     write_rendered(dir.path(), None).unwrap();
 }
+
+/// A filesystem root with the given files (empty) and os-release text.
+fn linux_root(files: &[&str], os_release: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for f in files {
+        let path = dir.path().join(f);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    if let Some(text) = os_release {
+        std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+        std::fs::write(dir.path().join("etc/os-release"), text).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn the_c_library_is_detected_in_mises_order_and_never_guessed() {
+    let gnu = linux_root(&["lib64/ld-linux-x86-64.so.2"], Some("ID=debian\n"));
+    assert_eq!(detect_libc(gnu.path()), Libc::Gnu);
+    let musl = linux_root(&["lib/ld-musl-x86_64.so.1"], None);
+    assert_eq!(detect_libc(musl.path()), Libc::Musl);
+    // Alpine with gcompat has a glibc loader too; os-release decides first, as in mise.
+    let gcompat = linux_root(&["lib/ld-linux-x86-64.so.2", "lib/ld-musl-x86_64.so.1"], Some("NAME=\"Alpine Linux\"\nID=alpine\n"));
+    assert_eq!(detect_libc(gcompat.path()), Libc::Musl);
+    let derived = linux_root(&["lib/ld-linux-aarch64.so.1"], Some("ID=\"mydistro\"\nID_LIKE='postmarketos alpine'\n"));
+    assert_eq!(detect_libc(derived.path()), Libc::Musl);
+    let both_loaders = linux_root(&["lib/ld-linux-x86-64.so.2", "lib/ld-musl-x86_64.so.1"], Some("ID=ubuntu\nID_LIKE=debian\n"));
+    assert_eq!(detect_libc(both_loaders.path()), Libc::Gnu, "a glibc loader wins over a musl one, as in mise");
+    // No ID line: os-release says nothing, even with ID_LIKE.
+    let no_id = linux_root(&[], Some("ID_LIKE=alpine\n"));
+    assert_eq!(detect_libc(no_id.path()), Libc::Undetected);
+    // A scratch container: mise would fall back to its own build target, which stack cannot see.
+    let scratch = linux_root(&["lib/libc.so"], None);
+    assert_eq!(detect_libc(scratch.path()), Libc::Undetected);
+}
+
+#[test]
+fn os_release_values_are_unquoted_as_mise_unquotes_them() {
+    assert_eq!(os_release_ids("ID=alpine\nID_LIKE=\"a b\"\n"), ["alpine", "a", "b"]);
+    assert_eq!(os_release_ids("# c\n ID = 'chimera' \n"), ["chimera"]);
+    assert_eq!(os_release_ids("ID=\"x\\\"y\" trailing\n"), ["x\"y"]);
+    assert!(os_release_ids("NAME=foo\n").is_empty());
+}
+
+#[test]
+fn this_machine_is_named_as_mise_names_it() {
+    let host = Host::current();
+    assert_eq!(current_platform(), host.name());
+    assert!(valid_platform(&host.name()), "{host:?}");
+    assert_eq!(host.base(), platform_of(std::env::consts::OS, std::env::consts::ARCH));
+    if std::env::consts::OS != "linux" {
+        assert_eq!(host.libc, None);
+        assert_eq!(host.name(), host.base());
+    }
+}
+
+#[test]
+fn bun_variants_are_generated_for_unqualified_targets_only() {
+    assert_eq!(generated_keys(Some("core:bun"), "bun", "linux-x64"), ["linux-x64", "linux-x64-baseline", "linux-x64-musl", "linux-x64-musl-baseline"]);
+    assert_eq!(generated_keys(None, "bun", "linux-arm64"), ["linux-arm64", "linux-arm64-musl"]);
+    assert_eq!(generated_keys(Some("core:bun"), "bun", "macos-x64"), ["macos-x64", "macos-x64-baseline"]);
+    assert_eq!(generated_keys(Some("core:bun"), "bun", "macos-arm64"), ["macos-arm64"]);
+    assert_eq!(generated_keys(Some("core:bun"), "bun", "linux-x64-musl"), ["linux-x64-musl"]);
+    assert_eq!(generated_keys(Some("core:node"), "node", "linux-x64"), ["linux-x64"]);
+    // The entry's backend decides, not the name.
+    assert_eq!(generated_keys(Some("aqua:oven-sh/bun"), "bun", "linux-x64"), ["linux-x64"]);
+}
+
+#[test]
+fn mises_reasons_for_a_generated_variant_are_kept() {
+    let tools: BTreeSet<String> = ["bun".to_string()].into();
+    let stderr = "mise lock            bun@1.3.0 linux-x64-musl\nmise WARN  failed to lock bun@1.3.0 for linux-x64-musl-baseline: not found\nmise WARN  bun@1.3.0 for linux-x64-alpine: nonsense\n";
+    let r = reasons(stderr, &tools, &platforms(&["linux-x64"]));
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[&("bun".into(), "linux-x64-musl-baseline".into())].contains("not found"));
+    // A qualified listed platform does not claim longer names.
+    let r = reasons("mise WARN failed bun@1.3.0 linux-x64-musl-baseline: no\n", &tools, &platforms(&["linux-x64-musl"]));
+    assert!(r.is_empty(), "{r:?}");
+}

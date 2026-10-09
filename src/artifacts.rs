@@ -54,18 +54,22 @@ const EXEMPT_BACKENDS: &[&str] = &["asdf", "cargo", "gem", "go", "spinel", "ubi"
 
 // ---- platforms and policy ------------------------------------------------------------------
 
-/// The platform this process runs on, in mise's names (`macos-arm64`, `linux-x64`).
+/// The platform this process runs on, as mise names it for every backend but Bun's:
+/// `<os>-<arch>`, with `-musl` on a musl Linux (`linux-x64-musl`). See [`Host`].
 pub fn current_platform() -> String {
-    platform_of(std::env::consts::OS, std::env::consts::ARCH)
+    Host::current().name()
 }
 
 fn platform_of(os: &str, arch: &str) -> String {
-    let arch = match arch {
+    format!("{os}-{}", arch_of(arch))
+}
+
+fn arch_of(arch: &str) -> &str {
+    match arch {
         "aarch64" => "arm64",
         "x86_64" => "x64",
         other => other,
-    };
-    format!("{os}-{arch}")
+    }
 }
 
 /// A platform name in mise's form. Version 2 locks recorded Rust's names (`macos-aarch64`).
@@ -88,6 +92,254 @@ fn valid_platform(name: &str) -> bool {
     matches!(os, "linux" | "macos" | "windows" | "android")
         && matches!(arch, "x64" | "arm64" | "x86" | "loongarch64" | "riscv64")
         && parts.next().map_or(true, |q| matches!(q, "gnu" | "glibc" | "musl" | "msvc" | "baseline" | "musl-baseline"))
+}
+
+/// The C library of a Linux machine, as mise decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Libc {
+    Gnu,
+    Musl,
+    /// Neither `/etc/os-release` nor a dynamic loader in `/lib` or `/lib64` says. mise then
+    /// falls back to the C library its own binary was built for, which stack cannot see.
+    Undetected,
+}
+
+/// The machine a locked install runs on, as far as mise's choice of lock entry depends on it.
+///
+/// mise 2026.9.18 and 2026.10.3 look up `platforms.<key>` with one key per backend
+/// (`get_platform_key`): `<os>-<arch>`, plus `-musl` on a musl Linux, for every backend but
+/// core:bun, which adds its build variant: `-baseline` on an x64 CPU without AVX2, `-musl` or
+/// `-musl-baseline` on musl. Stack withholds `MISE_OS`, `MISE_ARCH` and `MISE_LIBC` and gives
+/// mise no `[settings]` that change them, so mise detects all of this itself; [`Host::detect`]
+/// repeats its detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    pub os: String,
+    pub arch: String,
+    /// `None` off Linux.
+    pub libc: Option<Libc>,
+    /// Whether the CPU has AVX2. Only consulted on x64.
+    pub avx2: bool,
+}
+
+impl Host {
+    /// This machine, detected once per process.
+    pub fn current() -> Host {
+        static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
+        HOST.get_or_init(|| Host::detect(Path::new("/"))).clone()
+    }
+
+    /// This process's OS and architecture and CPU, with the C library read under `root` (`/`).
+    pub fn detect(root: &Path) -> Host {
+        let os = std::env::consts::OS.to_string();
+        let libc = (os == "linux").then(|| detect_libc(root));
+        Host { arch: arch_of(std::env::consts::ARCH).to_string(), os, libc, avx2: has_avx2() }
+    }
+
+    /// `<os>-<arch>`.
+    pub fn base(&self) -> String {
+        format!("{}-{}", self.os, self.arch)
+    }
+
+    /// mise's `Platform::current()`: the key every backend but core:bun requires here.
+    pub fn name(&self) -> String {
+        match self.libc {
+            Some(Libc::Musl) => format!("{}-musl", self.base()),
+            _ => self.base(),
+        }
+    }
+
+    /// Why no key can be named here, if none can.
+    fn undetermined(&self) -> Option<String> {
+        (self.libc == Some(Libc::Undetected)).then(|| {
+            format!("stack cannot tell whether this {} machine uses glibc or musl (no /etc/os-release ID and no ld-linux-* or ld-musl-* loader in /lib or /lib64), so it cannot name the lock entry mise requires here", self.base())
+        })
+    }
+
+    /// The lock entry mise requires here for a release installed through `backend`, or why it
+    /// cannot be named.
+    pub fn key(&self, backend: Option<&str>, tool: &str) -> std::result::Result<String, String> {
+        if let Some(why) = self.undetermined() {
+            return Err(why);
+        }
+        if !is_bun(backend, tool) {
+            return Ok(self.name());
+        }
+        let musl = self.libc == Some(Libc::Musl);
+        let variant = match self.arch.as_str() {
+            "x64" => match (musl, self.avx2) {
+                (true, true) => Some("musl"),
+                (true, false) => Some("musl-baseline"),
+                (false, true) => None,
+                (false, false) => Some("baseline"),
+            },
+            "arm64" => musl.then_some("musl"),
+            _ => None,
+        };
+        Ok(variant.map_or_else(|| self.base(), |v| format!("{}-{v}", self.base())))
+    }
+
+    /// Every key some backend could require here: mise's name and Bun's variant.
+    fn keys(&self) -> Vec<String> {
+        let mut out = vec![self.name()];
+        if let Ok(bun) = self.key(Some("core:bun"), "bun") {
+            if !out.contains(&bun) {
+                out.push(bun);
+            }
+        }
+        out
+    }
+}
+
+/// mise's `detect_libc` (crates/mise-util/src/platform.rs, identical in 2026.9.18 and
+/// 2026.10.3) up to its last step: a known musl distribution in `/etc/os-release` (`ID`, then
+/// `ID_LIKE`), else a glibc loader, else a musl loader in `/lib` or `/lib64`. mise's last step is
+/// the C library it was built for; stack's own build says nothing about mise's, so that case is
+/// `Undetected` rather than a guess.
+fn detect_libc(root: &Path) -> Libc {
+    const MUSL_DISTROS: &[&str] = &["alpine", "postmarketos", "chimera"];
+    let release = std::fs::read_to_string(root.join("etc/os-release")).unwrap_or_default();
+    if os_release_ids(&release).iter().any(|id| MUSL_DISTROS.contains(&id.as_str())) {
+        return Libc::Musl;
+    }
+    let has = |prefix: &str| {
+        ["lib", "lib64"].iter().any(|dir| {
+            std::fs::read_dir(root.join(dir))
+                .map(|entries| entries.flatten().any(|e| e.file_name().to_string_lossy().starts_with(prefix)))
+                .unwrap_or(false)
+        })
+    };
+    if has("ld-linux-") {
+        Libc::Gnu
+    } else if has("ld-musl-") {
+        Libc::Musl
+    } else {
+        Libc::Undetected
+    }
+}
+
+/// `ID` then each `ID_LIKE` word, unquoted as mise unquotes them. Nothing without an `ID`.
+fn os_release_ids(text: &str) -> Vec<String> {
+    let mut id = None;
+    let mut like = String::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let value = unquote(value.trim());
+        match key.trim() {
+            "ID" => id = Some(value),
+            "ID_LIKE" => like = value,
+            _ => {}
+        }
+    }
+    let Some(id) = id else { return Vec::new() };
+    std::iter::once(id).chain(like.split_whitespace().map(str::to_string)).collect()
+}
+
+fn unquote(value: &str) -> String {
+    let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else { return value.to_string() };
+    let mut out = String::new();
+    let mut chars = value[1..].chars();
+    while let Some(c) = chars.next() {
+        if c == quote {
+            break;
+        }
+        if quote == '"' && c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// mise's Bun check (`is_x86_feature_detected!("avx2")`, false on other architectures).
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// A pin installed through core:bun: its entry says so, or nothing says otherwise of `bun`.
+fn is_bun(backend: Option<&str>, tool: &str) -> bool {
+    match backend {
+        Some(b) => backend_kind(b) == "core:bun",
+        None => tool == "bun" || tool == "core:bun",
+    }
+}
+
+/// The keys `mise lock --platform <target>` writes for a release of `backend`: the target, and
+/// for an unqualified target of core:bun the variants Bun's `platform_variants` adds
+/// (identical in mise 2026.9.18 and 2026.10.3). A qualified target is written as itself.
+pub fn generated_keys(backend: Option<&str>, tool: &str, target: &str) -> Vec<String> {
+    let mut out = vec![target.to_string()];
+    if !is_bun(backend, tool) || target.splitn(3, '-').nth(2).is_some() {
+        return out;
+    }
+    let qualifiers: &[&str] = match target {
+        "linux-x64" => &["baseline", "musl", "musl-baseline"],
+        "linux-arm64" => &["musl"],
+        "macos-x64" | "windows-x64" => &["baseline"],
+        _ => &[],
+    };
+    out.extend(qualifiers.iter().map(|q| format!("{target}-{q}")));
+    out
+}
+
+/// Whether `[lock] platforms` asks for `key` for a release of `backend`.
+fn requested(backend: Option<&str>, tool: &str, key: &str, targets: &[String]) -> bool {
+    targets.iter().any(|t| t == key || generated_keys(backend, tool, t).iter().any(|k| k == key))
+}
+
+/// Where coverage is asked about: a lock key exactly (a `[lock] platforms` entry), or a machine,
+/// which resolves each pin to the key mise requires there.
+pub trait Place {
+    /// The name reported for the place: the key, or the machine's mise name.
+    fn label(&self) -> String;
+    /// The key a release of `backend` is looked up under here, or why none can be named.
+    fn key_for(&self, backend: Option<&str>, tool: &str) -> std::result::Result<String, String>;
+}
+
+impl Place for Host {
+    fn label(&self) -> String {
+        self.name()
+    }
+
+    fn key_for(&self, backend: Option<&str>, tool: &str) -> std::result::Result<String, String> {
+        self.key(backend, tool)
+    }
+}
+
+/// A platform name. The name of the machine this process runs on ([`current_platform`]) means
+/// that machine, as `install` and `status` ask; any other name is a lock key.
+impl Place for str {
+    fn label(&self) -> String {
+        self.to_string()
+    }
+
+    fn key_for(&self, backend: Option<&str>, tool: &str) -> std::result::Result<String, String> {
+        let host = Host::current();
+        if self == host.name() {
+            return host.key(backend, tool);
+        }
+        Ok(self.to_string())
+    }
+}
+
+impl Place for String {
+    fn label(&self) -> String {
+        self.clone()
+    }
+
+    fn key_for(&self, backend: Option<&str>, tool: &str) -> std::result::Result<String, String> {
+        self.as_str().key_for(backend, tool)
+    }
 }
 
 /// `[lock] artifacts`: whether every pin must be checked on every listed platform.
@@ -114,6 +366,11 @@ impl Default for Policy {
 
 impl Policy {
     pub fn from_settings(settings: &crate::manifest::LockSettings) -> Result<Self> {
+        Self::from_settings_on(settings, &Host::current())
+    }
+
+    /// `"current"` expands to `host`'s mise name (`linux-x64-musl` on a musl Linux).
+    pub fn from_settings_on(settings: &crate::manifest::LockSettings, host: &Host) -> Result<Self> {
         let invalid = |why: String| {
             StackError::new("manifest_invalid", format!("stack.toml [lock]: {why}"))
                 .hint(format!("platforms are mise's names ({}, or \"current\"); artifacts is \"best-effort\" or \"required\"", DEFAULT_PLATFORMS.join(", ")))
@@ -128,7 +385,7 @@ impl Policy {
         };
         let mut platforms: Vec<String> = Vec::new();
         for name in listed {
-            let name = if name == "current" { current_platform() } else { name.clone() };
+            let name = if name == "current" { host.name() } else { name.clone() };
             if !valid_platform(&name) {
                 return Err(invalid(format!("platform {name:?} is not a mise platform name")));
             }
@@ -146,11 +403,28 @@ impl Policy {
         self.artifacts == Requirement::Required
     }
 
-    /// Locked operations under `required` refuse a machine whose platform `platforms` does not
-    /// list: stack.lock commits nothing that says what may be installed or run there. Ordinary
-    /// compile is not a locked operation and may lock other platforms from any machine.
+    /// Locked operations under `required` refuse a machine `platforms` does not list: stack.lock
+    /// commits nothing that says what may be installed or run there. Ordinary compile is not a
+    /// locked operation and may lock other platforms from any machine.
     pub fn check_runtime_platform(&self) -> Result<()> {
-        self.check_platform(&current_platform())
+        self.check_host(&Host::current())
+    }
+
+    /// A machine is listed when a listed platform is, or generates, a key some backend requires
+    /// there: `linux-x64` lists a musl or non-AVX2 x64 Linux (it generates Bun's variants for
+    /// them); `linux-x64-musl` lists a musl x64 Linux and nothing else. Whether each pin has its
+    /// entry is coverage, checked separately. A Linux whose C library stack cannot tell is
+    /// listed by any platform of its OS and architecture; its coverage is `missing`.
+    pub fn check_host(&self, host: &Host) -> Result<()> {
+        let listed = if host.undetermined().is_some() {
+            self.platforms.iter().any(|p| *p == host.base() || p.starts_with(&format!("{}-", host.base())))
+        } else {
+            host.keys().iter().any(|k| requested(Some("core:bun"), "bun", k, &self.platforms))
+        };
+        if listed {
+            return Ok(());
+        }
+        self.check_platform(&host.name())
     }
 
     fn check_platform(&self, platform: &str) -> Result<()> {
@@ -366,6 +640,7 @@ pub struct Coverage {
     pub signer: Option<String>,
 }
 
+/// Coverage of `pin` under the lock key `platform`, exactly.
 pub fn coverage(lock: Option<&Table>, pin: &PinKey, platform: &str) -> Coverage {
     let state = |state| Coverage { state, checksum: None, signer: None };
     let backend = backend(lock, pin);
@@ -389,6 +664,30 @@ pub fn coverage(lock: Option<&Table>, pin: &PinKey, platform: &str) -> Coverage 
         }
     }
     state(State::Missing)
+}
+
+/// Coverage of `pin` at `place`: under the key mise looks it up by there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placed {
+    /// The lock key, or the place's label when none can be named.
+    pub key: String,
+    pub coverage: Coverage,
+    /// Why no key can be named here.
+    pub reason: Option<String>,
+}
+
+pub fn coverage_at<P: Place + ?Sized>(lock: Option<&Table>, pin: &PinKey, place: &P) -> Placed {
+    let backend = backend(lock, pin);
+    match place.key_for(backend.as_deref(), &pin.tool) {
+        Ok(key) => Placed { coverage: coverage(lock, pin, &key), key, reason: None },
+        Err(why) => {
+            let c = coverage(lock, pin, &place.label());
+            // Exempt and unsupported releases do not depend on the key; nothing else is checked.
+            let coverage = if c.state == State::Verified { Coverage { state: State::Missing, checksum: None, signer: None } } else { c };
+            let reason = (coverage.state == State::Missing).then_some(why);
+            Placed { key: place.label(), coverage, reason }
+        }
+    }
 }
 
 /// What one version report says about one platform.
@@ -419,12 +718,24 @@ pub struct PlatformReport {
     pub deps: Vec<Json>,
 }
 
-/// Coverage of `pin` on every listed platform, with what this compile changed.
+/// Coverage of `pin` on every listed platform, each followed by the variants mise generated
+/// for it (Bun's `linux-x64-musl` under `linux-x64`) that the lock holds or this compile
+/// touched, with what this compile changed.
 pub fn report(lock: Option<&Table>, pin: &PinKey, platforms: &[String], events: &Events) -> IndexMap<String, PlatformReport> {
-    platforms
-        .iter()
+    let backend = backend(lock, pin);
+    let mut keys: Vec<String> = Vec::new();
+    for platform in platforms {
+        for key in generated_keys(backend.as_deref(), &pin.tool, platform) {
+            let listed = key == *platform;
+            let present = listed || has_table(lock, pin, &key) || events.contains_key(&(pin.clone(), key.clone()));
+            if present && !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.into_iter()
         .map(|platform| {
-            let c = coverage(lock, pin, platform);
+            let c = coverage(lock, pin, &platform);
             let event = events.get(&(pin.clone(), platform.clone())).cloned().unwrap_or_default();
             let reason = (c.state == State::Missing).then(|| event.reason.clone()).flatten();
             let report = PlatformReport {
@@ -438,52 +749,93 @@ pub fn report(lock: Option<&Table>, pin: &PinKey, platforms: &[String], events: 
                 signer_was: event.signer_was,
                 deps: event.deps,
             };
-            (platform.clone(), report)
+            (platform, report)
         })
         .collect()
 }
 
-/// Coverage on one platform, by state: what `status` and the install step report.
+fn has_table(lock: Option<&Table>, pin: &PinKey, key: &str) -> bool {
+    let key = format!("{PLATFORM_PREFIX}{key}");
+    lock.is_some_and(|l| entries(l, &pin.tool).any(|e| version_of(e) == pin.version && e.contains_key(&key)))
+}
+
+/// Coverage on one machine, by state: what `status` and the install step report.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlatformSummary {
+    /// The machine's mise name (`linux-x64-musl` on a musl Linux).
     pub platform: String,
     pub verified: Vec<String>,
     pub exempt: Vec<String>,
     pub unsupported: Vec<String>,
     pub missing: Vec<String>,
+    /// Pins mise looks up under another key here (Bun's `linux-x64-baseline` on a CPU without
+    /// AVX2), by pin.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub keys: IndexMap<String, String>,
+    /// Why no key can be named on this machine, when none can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
-pub fn summary(lock: Option<&Table>, pins: &[PinKey], platform: &str) -> PlatformSummary {
-    let mut out = PlatformSummary { platform: platform.into(), verified: vec![], exempt: vec![], unsupported: vec![], missing: vec![] };
+pub fn summary<P: Place + ?Sized>(lock: Option<&Table>, pins: &[PinKey], place: &P) -> PlatformSummary {
+    let platform = place.label();
+    let mut out = PlatformSummary { platform: platform.clone(), verified: vec![], exempt: vec![], unsupported: vec![], missing: vec![], keys: IndexMap::new(), reason: None };
     for pin in pins {
-        let list = match coverage(lock, pin, platform).state {
+        let at = coverage_at(lock, pin, place);
+        let list = match at.coverage.state {
             State::Verified => &mut out.verified,
             State::Exempt => &mut out.exempt,
             State::Unsupported => &mut out.unsupported,
             State::Missing => &mut out.missing,
         };
         list.push(pin.to_string());
+        if at.key != platform {
+            out.keys.insert(pin.to_string(), at.key);
+        }
+        if out.reason.is_none() {
+            out.reason = at.reason;
+        }
     }
     out
 }
 
-/// Pins (as `[{ name, platform, state, reason? }]`) that are neither verified nor exempt.
-pub fn unchecked(lock: Option<&Table>, pins: &[PinKey], platforms: &[String], reasons: &Reasons) -> Vec<Json> {
+/// Pins (as `[{ name, platform, state, reason? }]`) that are neither verified nor exempt at
+/// each place; `platform` is the key mise looks the pin up by there.
+pub fn unchecked<P: Place>(lock: Option<&Table>, pins: &[PinKey], places: &[P], reasons: &Reasons) -> Vec<Json> {
     let mut out = Vec::new();
     for pin in pins {
-        for platform in platforms {
-            let state = coverage(lock, pin, platform).state;
-            if state.locked_install() {
+        for place in places {
+            let at = coverage_at(lock, pin, place);
+            if at.coverage.state.locked_install() {
                 continue;
             }
-            let mut detail = json!({ "name": pin.to_string(), "platform": platform, "state": state });
-            if let Some(reason) = reasons.get(&(pin.tool.clone(), platform.clone())) {
+            let mut detail = json!({ "name": pin.to_string(), "platform": at.key, "state": at.coverage.state });
+            if let Some(reason) = at.reason.or_else(|| reasons.get(&(pin.tool.clone(), at.key.clone())).cloned()) {
                 detail["reason"] = json!(reason);
             }
             out.push(detail);
         }
     }
     out
+}
+
+/// [`unchecked`] on lock keys exactly: what `[lock] platforms` asks for.
+pub fn unchecked_targets(lock: Option<&Table>, pins: &[PinKey], platforms: &[String], reasons: &Reasons) -> Vec<Json> {
+    let exact: Vec<Key> = platforms.iter().map(|p| Key(p.clone())).collect();
+    unchecked(lock, pins, &exact, reasons)
+}
+
+/// A lock key, never resolved against the machine.
+struct Key(String);
+
+impl Place for Key {
+    fn label(&self) -> String {
+        self.0.clone()
+    }
+
+    fn key_for(&self, _: Option<&str>, _: &str) -> std::result::Result<String, String> {
+        Ok(self.0.clone())
+    }
 }
 
 pub fn unlocked_error(details: Vec<Json>) -> StackError {
@@ -502,20 +854,21 @@ pub fn unlocked_error(details: Vec<Json>) -> StackError {
     .details(details)
 }
 
-/// Installation split for one platform: tool names installed with `mise install --locked`
+/// Installation split for one machine: tool names installed with `mise install --locked`
 /// and with plain `mise install`. A tool name is in the locked call only when every version
-/// pinned under it is verified or exempt, because mise installs every configured version of
-/// a name (with the configuration's options) when it is named.
+/// pinned under it is verified or exempt under the key mise looks it up by there, because mise
+/// installs every configured version of a name (with the configuration's options) when it is
+/// named.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Partition {
     pub locked: Vec<String>,
     pub plain: Vec<String>,
 }
 
-pub fn partition(lock: Option<&Table>, pins: &[PinKey], platform: &str) -> Partition {
+pub fn partition<P: Place + ?Sized>(lock: Option<&Table>, pins: &[PinKey], place: &P) -> Partition {
     let mut by_tool: IndexMap<&str, bool> = IndexMap::new();
     for pin in pins {
-        let ok = coverage(lock, pin, platform).state.locked_install();
+        let ok = coverage_at(lock, pin, place).coverage.state.locked_install();
         let slot = by_tool.entry(pin.tool.as_str()).or_insert(true);
         *slot &= ok;
     }
@@ -568,15 +921,16 @@ fn all_entries(lock: &Table) -> impl Iterator<Item = (&str, &Table)> {
         .flat_map(|(name, list)| list.as_array().into_iter().flatten().filter_map(move |e| Some((name.as_str(), e.as_table()?))))
 }
 
-/// Keep only entries of pinned releases, platform tables of listed platforms, sidecar records
-/// of pinned releases, and dependency records some kept entry references.
+/// Keep only entries of pinned releases, platform tables of listed platforms and of the
+/// variants mise generates for them (see [`generated_keys`]), sidecar records of pinned
+/// releases, and dependency records some kept entry references.
 pub fn retain(lock: &mut Table, pins: &[PinKey], platforms: &[String]) {
     if let Some(tools) = lock.get_mut(TOOLS).and_then(Value::as_table_mut) {
         for (tool, list) in tools.iter_mut() {
             if let Some(list) = list.as_array_mut() {
                 list.retain(|e| e.as_table().is_some_and(|e| pins.iter().any(|p| p.tool == *tool && p.version == version_of(e))));
                 for entry in list.iter_mut().filter_map(Value::as_table_mut) {
-                    entry.retain(|k, _| k.strip_prefix(PLATFORM_PREFIX).map_or(true, |p| platforms.iter().any(|l| l == p)));
+                    *entry = restricted(tool, entry, platforms);
                 }
             }
         }
@@ -591,7 +945,18 @@ pub fn retain(lock: &mut Table, pins: &[PinKey], platforms: &[String]) {
     prune_deps(lock, platforms);
 }
 
-/// Drop `conda-packages` records no entry references, and platforms not listed.
+/// An entry without platform tables `[lock] platforms` does not ask for.
+fn restricted(tool: &str, entry: &Table, platforms: &[String]) -> Table {
+    let backend = str_field(entry, "backend");
+    entry
+        .iter()
+        .filter(|(k, _)| k.strip_prefix(PLATFORM_PREFIX).map_or(true, |p| requested(backend, tool, p, platforms)))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Drop `conda-packages` records no entry references, and platforms neither listed nor
+/// referenced by a kept entry.
 fn prune_deps(lock: &mut Table, platforms: &[String]) {
     let mut referenced: BTreeSet<(String, String)> = BTreeSet::new();
     for (_, entry) in all_entries(lock) {
@@ -602,7 +967,7 @@ fn prune_deps(lock: &mut Table, platforms: &[String]) {
         }
     }
     if let Some(conda) = lock.get_mut(CONDA).and_then(Value::as_table_mut) {
-        conda.retain(|platform, _| platforms.iter().any(|p| p == platform));
+        conda.retain(|platform, _| platforms.iter().any(|p| p == platform) || referenced.iter().any(|(p, _)| p == platform));
         for (platform, packages) in conda.iter_mut() {
             if let Some(packages) = packages.as_table_mut() {
                 packages.retain(|name, _| referenced.contains(&(platform.clone(), name.to_string())));
@@ -770,8 +1135,12 @@ pub fn reasons(stderr: &str, tools: &BTreeSet<String>, platforms: &[String]) -> 
             if !named {
                 continue;
             }
-            for platform in platforms.iter().filter(|p| words.iter().any(|w| w.trim_end_matches([':', ',']) == p.as_str())) {
-                out.entry((tool.clone(), platform.clone())).or_insert_with(|| truncate(line, 300));
+            // A listed platform, or a variant mise generated for one (`linux-x64-musl`).
+            let named = words.iter().map(|w| w.trim_end_matches([':', ','])).filter(|w| {
+                platforms.iter().any(|p| p == w || (w.starts_with(&format!("{p}-")) && p.splitn(3, '-').nth(2).is_none() && valid_platform(w)))
+            });
+            for platform in named {
+                out.entry((tool.clone(), platform.to_string())).or_insert_with(|| truncate(line, 300));
             }
         }
     }
@@ -856,7 +1225,7 @@ impl Merge<'_> {
                 for version in versions {
                     let pin = PinKey { tool: tool.into(), version: version.into() };
                     let cs: Vec<&Table> = committed_entries.iter().copied().filter(|e| version_of(e) == version).collect();
-                    let fs: Vec<Table> = entries(&self.fresh, tool).filter(|e| version_of(e) == version).map(|e| self.restrict(e)).collect();
+                    let fs: Vec<Table> = entries(&self.fresh, tool).filter(|e| version_of(e) == version).map(|e| restricted(tool, e, self.platforms)).collect();
                     list.extend(self.merge_version(&pin, &cs, &fs, &mut events, &mut warnings));
                 }
                 list
@@ -877,8 +1246,9 @@ impl Merge<'_> {
         dangling_deps(&out)?;
         // Missing platforms of pins named for locking get mise's reason when it gave one.
         for pin in self.pins.iter().filter(|p| self.targets.contains(&p.tool)) {
-            for platform in self.platforms {
-                if let Some(reason) = self.reasons.get(&(pin.tool.clone(), platform.clone())) {
+            let backend = backend(Some(&out), pin);
+            for ((tool, platform), reason) in self.reasons.iter().filter(|((t, _), _)| *t == pin.tool) {
+                if requested(backend.as_deref(), tool, platform, self.platforms) {
                     events.entry((pin.clone(), platform.clone())).or_default().reason.get_or_insert_with(|| reason.clone());
                 }
             }
@@ -886,23 +1256,27 @@ impl Merge<'_> {
         Ok(Merged { lock: out, events, warnings })
     }
 
-    /// An entry without platform tables for platforms not listed.
-    fn restrict(&self, entry: &Table) -> Table {
-        entry
-            .iter()
-            .filter(|(k, _)| k.strip_prefix(PLATFORM_PREFIX).map_or(true, |p| self.platforms.iter().any(|l| l == p)))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+    /// The keys compared for one release: every listed platform, then every variant key the
+    /// committed or fresh entries hold (both already restricted to what the list asks for).
+    fn keys(&self, cs: &[&Table], fs: &[Table]) -> Vec<String> {
+        let mut out: Vec<String> = self.platforms.to_vec();
+        for (key, _) in cs.iter().flat_map(|c| platform_tables(c)).chain(fs.iter().flat_map(platform_tables)) {
+            if !out.iter().any(|k| k == key) {
+                out.push(key.to_string());
+            }
+        }
+        out
     }
 
     fn merge_version(&self, pin: &PinKey, cs: &[&Table], fs: &[Table], events: &mut Events, warnings: &mut Vec<String>) -> Vec<Table> {
         let options = |e: &Table| e.get("options").cloned();
+        let keys = self.keys(cs, fs);
         let mut out = Vec::new();
         if self.update {
             for f in fs {
                 let c = cs.iter().find(|c| options(c) == options(f));
                 let mut entry = f.clone();
-                for platform in self.platforms {
+                for platform in &keys {
                     let key = format!("{PLATFORM_PREFIX}{platform}");
                     let event = |events: &mut Events| events.entry((pin.clone(), platform.clone())).or_default().clone();
                     match (c.and_then(|c| c.get(&key)), f.get(&key)) {
@@ -963,7 +1337,7 @@ impl Merge<'_> {
                     if fields(c) != fields(f) {
                         warnings.push(format!("artifacts.{pin} entry fields differ upstream; run `stack compile --update` to accept"));
                     }
-                    for platform in self.platforms {
+                    for platform in &keys {
                         let key = format!("{PLATFORM_PREFIX}{platform}");
                         match (c.get(&key), f.get(&key)) {
                             (Some(was), Some(now)) if was != now => {
@@ -1013,7 +1387,8 @@ impl Merge<'_> {
                 .map(|(tool, e)| PinKey { tool: tool.into(), version: version_of(e).into() })
                 .collect()
         };
-        for (platform, packages) in fresh.iter().filter(|(p, _)| self.platforms.iter().any(|l| l == *p)) {
+        let kept: BTreeSet<&str> = all_entries(out).flat_map(|(_, e)| platform_tables(e).map(|(p, _)| p)).collect();
+        for (platform, packages) in fresh.iter().filter(|(p, _)| self.platforms.iter().any(|l| l == *p) || kept.contains(p.as_str())) {
             let Some(packages) = packages.as_table() else { continue };
             let slot = merged.entry(platform.clone()).or_insert_with(|| Value::Table(Table::new()));
             let Some(slot) = slot.as_table_mut() else { continue };
@@ -1078,13 +1453,15 @@ pub fn check_pins_untemplated(pins: &[crate::provider::scratch::Pin]) -> Result<
 }
 
 /// Tool names whose pins need entries: every one under `--update`, else those with a `missing`
-/// state on a listed platform (new releases have no entry yet) and `changed` pins with a
-/// checked entry, which was locked for an earlier request of the same release.
+/// state on a listed platform or a variant mise generates for one (new releases have no entry
+/// yet; a lock written before variants were kept has only the listed key) and `changed` pins
+/// with a checked entry, which was locked for an earlier request of the same release.
 pub fn targets(committed: Option<&Table>, pins: &[PinKey], platforms: &[String], update: bool, changed: &BTreeSet<PinKey>) -> BTreeSet<String> {
     pins.iter()
         .filter(|pin| {
+            let backend = backend(committed, pin);
             update
-                || platforms.iter().any(|p| match coverage(committed, pin, p).state {
+                || platforms.iter().flat_map(|p| generated_keys(backend.as_deref(), &pin.tool, p)).any(|p| match coverage(committed, pin, &p).state {
                     State::Missing => true,
                     State::Verified => changed.contains(*pin),
                     State::Exempt | State::Unsupported => false,

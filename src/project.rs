@@ -286,7 +286,8 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     if let Some(skills) = &project.skills {
         crate::skills::validate_dir(&skills.dir)?;
     }
-    let policy = artifacts::Policy::from_settings(&project.lock)?;
+    let host = locker(opts).host();
+    let policy = artifacts::Policy::from_settings_on(&project.lock, &host)?;
     let previous = lock::read(&opts.root)?;
     if opts.mode == Mode::Frozen && previous.is_none() {
         return Err(
@@ -304,7 +305,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     // Every locked operation (`compile --locked`, inspect with a lock, install, up, exec, run,
     // status) passes through here, before any bundle fetch or provider call.
     if opts.mode == Mode::Frozen {
-        policy.check_runtime_platform()?;
+        policy.check_host(&host)?;
     }
 
     let mut loaded = Vec::new();
@@ -370,10 +371,10 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         );
     }
     if opts.mode == Mode::Frozen {
-        check_committed_artifacts(&new_lock, &pins, &policy)?;
+        check_committed_artifacts(&new_lock, &pins, &policy, &host)?;
     }
     if policy.required() && opts.mode != Mode::Frozen && opts.write {
-        let unchecked = artifacts::unchecked(new_lock.provider_lock.as_ref(), &pins, &policy.platforms, &outcome.reasons);
+        let unchecked = artifacts::unchecked_targets(new_lock.provider_lock.as_ref(), &pins, &policy.platforms, &outcome.reasons);
         if !unchecked.is_empty() {
             return Err(artifacts::unlocked_error(unchecked));
         }
@@ -464,9 +465,10 @@ fn probed_services(stack: &Composed) -> Result<Vec<String>> {
     Ok(seen.into_values().cloned().collect())
 }
 
-/// The platform a resolution ran on, recorded for reviewers of stack.lock, in mise's names.
+/// The platform a resolution ran on, recorded for reviewers of stack.lock, in mise's names
+/// (`<os>-<arch>`; the C library and CPU do not change what a version request resolves to).
 fn platform() -> String {
-    artifacts::current_platform()
+    artifacts::Host::current().base()
 }
 
 struct VersionRequest {
@@ -666,8 +668,9 @@ struct ArtifactOutcome {
     warnings: Vec<String>,
 }
 
-/// Locked operations: the embedded lock must agree with its pins, and the policy must be met.
-fn check_committed_artifacts(lock: &Lockfile, pins: &[PinKey], policy: &artifacts::Policy) -> Result<()> {
+/// Locked operations: the embedded lock must agree with its pins, and the policy must be met on
+/// every listed platform and, under the key mise looks each pin up by, on this machine.
+fn check_committed_artifacts(lock: &Lockfile, pins: &[PinKey], policy: &artifacts::Policy, host: &artifacts::Host) -> Result<()> {
     if let Some(embedded) = &lock.provider_lock {
         artifacts::validate(embedded, pins)?;
     }
@@ -681,7 +684,12 @@ fn check_committed_artifacts(lock: &Lockfile, pins: &[PinKey], policy: &artifact
         )
         .hint("run `stack compile` (it needs network access to lock artifacts), then commit stack.lock"));
     }
-    let unchecked = artifacts::unchecked(lock.provider_lock.as_ref(), pins, &policy.platforms, &Default::default());
+    let mut unchecked = artifacts::unchecked_targets(lock.provider_lock.as_ref(), pins, &policy.platforms, &Default::default());
+    if unchecked.is_empty() {
+        // Listed platforms are covered; this machine may still need a key none of them is
+        // (`linux-x64-musl` for Node when only `linux-x64` is listed).
+        unchecked = artifacts::unchecked(lock.provider_lock.as_ref(), pins, std::slice::from_ref(host), &Default::default());
+    }
     if unchecked.is_empty() {
         return Ok(());
     }

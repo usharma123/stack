@@ -121,6 +121,12 @@ pub trait Locker: Send + Sync {
     /// `mise lock --platform <platforms> <tools>...` in `scratch`, bounded. The lock it leaves
     /// is read from the scratch root by the caller; a nonzero exit is not a failure by itself.
     fn lock(&self, scratch: &ScratchRoot, platforms: &[String], tools: &[String]) -> Result<LockRun>;
+
+    /// The machine whose lock entries mise will look up: `"current"` in `[lock] platforms` and
+    /// the checks locked operations make here. Tests substitute another machine.
+    fn host(&self) -> crate::artifacts::Host {
+        crate::artifacts::Host::current()
+    }
 }
 
 /// How a `mise lock` run ended. Exit status and the presence of an entry prove nothing about
