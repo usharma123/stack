@@ -64,6 +64,13 @@ stack mcp
 
 Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc`, `stack_doctor` and `stack_skill`, which returns one skill's `SKILL.md`.
 
+Every call is checked against the tool's advertised `inputSchema` before anything runs: an
+unknown argument (`secret` for `secrets`, `timeout` for `timeout_secs`), a wrong type, a missing
+required argument, an out-of-range number, or two arguments that conflict (`require` with
+`require_all`, `update` with `locked`) is a `usage` error naming it, with the accepted names in
+the hint. `command` must be an argv list; a string is refused, not split. An argument given as
+`null` counts as omitted.
+
 `stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command, and
 `stack_run` grants exactly the task's declared `secrets`. Granted values are replaced by
 `[redacted:KEY]` in `stdout` and `stderr`, and the result lists the granted names under

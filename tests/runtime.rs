@@ -863,6 +863,74 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
 }
 
 #[test]
+fn mcp_rejects_malformed_arguments_before_any_work() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.t]\nrun='true'\n");
+    let root = fixture.dir.path();
+    let _ = fs::remove_file(root.join("mise.log"));
+    let ran = ["sh", "-c", "touch \"$REVIEW_FIXTURE/ran\""];
+    // (tool, arguments, what the message names, what the hint says)
+    let cases: Vec<(&str, Value, &str, &str)> = vec![
+        ("stack_exec", json!({ "command": ran, "secret": ["DEPLOY_KEY"] }), "unknown argument `secret`", "did you mean `secrets`?"),
+        ("stack_exec", json!({ "command": ran, "timeout": "1s" }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_exec", json!({ "command": "echo hi" }), "`command` must be an array", r#"["sh", "-c", "echo hi"]"#),
+        ("stack_exec", json!({ "command": ["echo", 1] }), "`command` item 1: must be a string", ""),
+        ("stack_exec", json!({ "command": [] }), "`command` must not be empty", ""),
+        ("stack_exec", json!({}), "`command` is required", ""),
+        ("stack_exec", json!({ "command": null }), "`command` is required", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_secs": "1s" }), "`timeout_secs` must be a whole number", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_secs": 0 }), "`timeout_secs` must be at least 1", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_secs": 1.5 }), "`timeout_secs` must be a whole number", ""),
+        ("stack_exec", json!({ "command": ran, "require": "db" }), "`require` must be an array", ""),
+        ("stack_exec", json!({ "command": ran, "require": [null] }), "`require` item null", ""),
+        ("stack_exec", json!({ "command": ran, "require": ["db"], "require_all": true }), "`require` and `require_all` cannot be given together", ""),
+        ("stack_exec", json!({ "command": ran, "require_all": "yes" }), "`require_all` must be true or false", ""),
+        ("stack_exec", json!({ "command": ran, "secrets": "DEPLOY_KEY" }), "`secrets` must be an array", ""),
+        ("stack_exec", json!({ "command": ran, "secrets": ["deploy_key"] }), "is not a secret name", ""),
+        ("stack_run", json!({ "task": "t", "secrets": ["A"] }), "unknown argument `secrets`", "secrets the task declares"),
+        ("stack_run", json!({ "task": "t", "args": "a b" }), "`args` must be an array", ""),
+        ("stack_run", json!({ "task": "t", "args": ["a", false] }), "`args` item false", ""),
+        ("stack_run", json!({ "task": 5 }), "`task` must be a string", ""),
+        ("stack_run", json!({ "task": "t", "timeout": 5 }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_compile", json!({ "update": true, "locked": true }), "`update` and `locked` cannot be given together", ""),
+        ("stack_compile", json!({ "update": "yes" }), "`update` must be true or false", ""),
+        ("stack_up", json!({ "ttl": 30 }), "`ttl` must be a string", ""),
+        ("stack_up", json!({ "owner": 1 }), "unknown argument `owner`", "did you mean `owner_pid`?"),
+        ("stack_restart", json!({ "services": "web" }), "`services` must be an array", ""),
+        ("stack_logs", json!({ "service": "web", "tail": 0 }), "`tail` must be from 1 to 10000", ""),
+        ("stack_logs", json!({ "tail": 5 }), "`service` is required", ""),
+        ("stack_inspect", json!({ "all_skills": 1 }), "`all_skills` must be true or false", ""),
+        ("stack_skill", json!({ "tool": "jq", "name": 3 }), "`name` must be a string", ""),
+        ("stack_status", json!({ "verbose": true }), "unknown argument `verbose`", "stack_status accepts: dir"),
+        ("stack_gc", json!({ "force": true }), "unknown argument `force`", ""),
+        ("stack_down", json!({ "dir_": "x" }), "unknown argument `dir_`", "did you mean `dir`?"),
+    ];
+    let calls: Vec<(&str, Value)> = cases.iter().map(|(tool, args, _, _)| (*tool, args.clone())).collect();
+    for (result, (tool, args, message, hint)) in fixture.mcp(&calls, &[]).iter().zip(&cases) {
+        let error = &result["structuredContent"]["error"];
+        assert_eq!((result["isError"].as_bool(), error["code"].as_str()), (Some(true), Some("usage")), "{tool} {args}: {result}");
+        assert!(error["message"].as_str().unwrap().contains(message), "{tool} {args}: {error}");
+        assert!(error["hint"].as_str().unwrap_or_default().contains(hint), "{tool} {args}: {error}");
+    }
+    assert!(!root.join("ran").exists(), "a command ran");
+    assert!(!root.join("mise.log").exists(), "provider work ran: {}", fs::read_to_string(root.join("mise.log")).unwrap_or_default());
+    assert!(!root.join("app/.stack/session.json").exists() && !root.join("state/sessions").exists());
+
+    // `null` still means omitted, and well-formed calls run.
+    let results = fixture.mcp(
+        &[
+            ("stack_exec", json!({ "command": ran, "secrets": null, "require": null, "require_all": null, "timeout_secs": null })),
+            ("stack_exec", json!({ "command": ["true"], "require": [], "require_all": true, "timeout_secs": u64::MAX })),
+            ("stack_run", json!({ "task": "t", "args": null })),
+        ],
+        &[],
+    );
+    for result in &results {
+        assert_eq!(result["structuredContent"]["data"]["exit_code"], 0, "{result}");
+    }
+    assert!(root.join("ran").exists());
+}
+
+#[test]
 fn mcp_rejects_owner_pids_outside_the_supported_range_before_lifecycle_work() {
     let fixture = Fixture::new();
     let log = fixture.dir.path().join("mise.log");

@@ -81,7 +81,153 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 fn schema(props: Value, required: &[&str]) -> Value {
     let mut p = props;
     p["dir"] = json!({ "type": "string", "description": "Project directory containing stack.toml (default: server cwd)" });
-    json!({ "type": "object", "properties": p, "required": required })
+    json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false })
+}
+
+/// The one `pattern` the tool schemas use: a fnox secret name.
+const SECRET_NAME_PATTERN: &str = "^[A-Z_][A-Z0-9_]*$";
+
+fn secret_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_') && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Arguments of one tool that cannot be given together, as on the command line.
+const CONFLICTS: &[(&str, &str, &str)] = &[("stack_compile", "update", "locked"), ("stack_exec", "require", "require_all")];
+
+/// Check a call's arguments against the tool's advertised `inputSchema` before anything else
+/// happens: no project is opened, no provider asked, nothing written. Unknown names, wrong
+/// types and out-of-range numbers are `usage` errors; an argument given as `null` counts as
+/// omitted. Returns the arguments as an object (`{}` when the call gave none).
+fn validate(name: &str, args: &Value) -> Result<serde_json::Map<String, Value>> {
+    let tools = tools();
+    let Some(tool) = tools.as_array().into_iter().flatten().find(|t| t["name"] == name) else {
+        return Err(StackError::new("unknown_tool", format!("no tool named '{name}'")));
+    };
+    let schema = &tool["inputSchema"];
+    let usage = |message: String| StackError::new("usage", format!("{name}: {message}"));
+    let args = match args {
+        Value::Null => serde_json::Map::new(),
+        Value::Object(map) => map.clone(),
+        other => return Err(usage(format!("arguments must be an object, not {other}"))),
+    };
+    let properties = schema["properties"].as_object().expect("tool schemas list their properties");
+    for (key, value) in &args {
+        let Some(property) = properties.get(key) else {
+            let known: Vec<&str> = properties.keys().map(String::as_str).collect();
+            let hint = match closest(key, &known) {
+                _ if name == "stack_run" && key.starts_with("secret") => {
+                    "stack_run grants exactly the secrets the task declares: declare them under [tasks.<name>] secrets = [...] in stack.toml, or use stack_exec with secrets".to_string()
+                }
+                Some(near) => format!("did you mean `{near}`? {name} accepts: {}", known.join(", ")),
+                None => format!("{name} accepts: {}", known.join(", ")),
+            };
+            return Err(usage(format!("unknown argument `{key}`")).hint(hint));
+        };
+        if !value.is_null() {
+            check_value(value, property).map_err(|why| {
+                let e = usage(format!("`{key}` {why}"));
+                match (key.as_str(), value) {
+                    ("command", Value::String(s)) => e.hint(format!(
+                        "command is an argv list run without a shell, such as [\"echo\", \"hi\"]; for shell syntax use [\"sh\", \"-c\", {}]",
+                        Value::String(s.clone())
+                    )),
+                    _ => e,
+                }
+            })?;
+        }
+    }
+    for key in schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if args.get(key).map_or(true, Value::is_null) {
+            return Err(usage(format!("`{key}` is required")));
+        }
+    }
+    let given = |key: &str| match args.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    };
+    for (_, a, b) in CONFLICTS.iter().filter(|(tool, _, _)| *tool == name) {
+        if given(a) && given(b) {
+            return Err(usage(format!("`{a}` and `{b}` cannot be given together")));
+        }
+    }
+    Ok(args)
+}
+
+/// Why `value` does not fit `property` (one schema of a tool's `properties`), if it does not.
+fn check_value(value: &Value, property: &Value) -> std::result::Result<(), String> {
+    let kind = property["type"].as_str().unwrap_or_default();
+    let shown = |v: &Value| match v {
+        Value::String(_) => "a string".to_string(),
+        Value::Array(_) => "an array".to_string(),
+        Value::Object(_) => "an object".to_string(),
+        other => other.to_string(),
+    };
+    match kind {
+        "string" => {
+            let s = value.as_str().ok_or_else(|| format!("must be a string, not {}", shown(value)))?;
+            if property["pattern"].as_str() == Some(SECRET_NAME_PATTERN) && !secret_name(s) {
+                return Err(format!("{s:?} is not a secret name (uppercase letters, digits and _, not starting with a digit)"));
+            }
+            Ok(())
+        }
+        "boolean" => value.as_bool().map(drop).ok_or_else(|| format!("must be true or false, not {}", shown(value))),
+        "integer" => {
+            // Beyond i64 (only u64 is) counts as past any maximum.
+            let Some(n) = value.as_i64().or_else(|| value.as_u64().map(|_| i64::MAX)) else {
+                return Err(format!("must be a whole number, not {}", shown(value)));
+            };
+            let (min, max) = (property["minimum"].as_i64(), property["maximum"].as_i64());
+            if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                let range = match (min, max) {
+                    (Some(a), Some(b)) => format!("from {a} to {b}"),
+                    (Some(a), None) => format!("at least {a}"),
+                    (None, Some(b)) => format!("at most {b}"),
+                    (None, None) => unreachable!("only a bound can be out of range"),
+                };
+                return Err(format!("must be {range}, not {value}"));
+            }
+            Ok(())
+        }
+        "array" => {
+            let items = value.as_array().ok_or_else(|| format!("must be an array, not {}", shown(value)))?;
+            if property["minItems"].as_u64().is_some_and(|m| (items.len() as u64) < m) {
+                return Err("must not be empty".into());
+            }
+            for item in items {
+                check_value(item, &property["items"]).map_err(|why| format!("item {item}: {why}"))?;
+            }
+            Ok(())
+        }
+        other => unreachable!("tool schemas use no {other:?} properties"),
+    }
+}
+
+/// The accepted name `given` most likely meant: one it starts or ends, or one within two edits.
+fn closest<'a>(given: &str, known: &[&'a str]) -> Option<&'a str> {
+    let given = given.to_ascii_lowercase();
+    let distance = |a: &str, b: &str| {
+        let b: Vec<char> = b.chars().collect();
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.chars().enumerate() {
+            let mut prev = row[0];
+            row[0] = i + 1;
+            for (j, cb) in b.iter().enumerate() {
+                let next = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(row[j + 1] + 1);
+                prev = row[j + 1];
+                row[j + 1] = next;
+            }
+        }
+        row[b.len()]
+    };
+    known
+        .iter()
+        .map(|k| (if k.starts_with(given.as_str()) || given.starts_with(k) { 0 } else { distance(&given, k) }, *k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
 }
 
 fn tools() -> Value {
@@ -105,14 +251,14 @@ fn tools() -> Value {
               "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
               "require": { "type": "array", "items": { "type": "string" } },
               "require_all": { "type": "boolean" },
-              "secrets": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Literal values are replaced by [redacted:KEY] ([redacted] where naming the key could spell out a value) in the parsed stdout and stderr strings; key names are listed under secrets; values shorter than 8 bytes or ones a marker could spell out are refused (secret_unsupported)" },
-              "timeout_secs": { "type": "integer" }
+              "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Literal values are replaced by [redacted:KEY] ([redacted] where naming the key could spell out a value) in the parsed stdout and stderr strings; key names are listed under secrets; values shorter than 8 bytes or ones a marker could spell out are refused (secret_unsupported)" },
+              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds before the command is killed (default 600)" }
           }), &["command"]) },
         { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec. The task receives exactly the secrets it declares (secrets = [...] in stack.toml), redacted from its output as in stack_exec; no others can be added here.",
           "inputSchema": schema(json!({
               "task": { "type": "string" },
               "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
-              "timeout_secs": { "type": "integer" }
+              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds before the task is killed (default 600)" }
           }), &["task"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
@@ -123,8 +269,10 @@ fn tools() -> Value {
 
 fn call(params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
-    let args = &params["arguments"];
-    let outcome = ctx(args).and_then(|ctx| dispatch(name, args, &ctx));
+    let outcome = validate(name, &params["arguments"]).and_then(|args| {
+        let args = Value::Object(args);
+        ctx(&args).and_then(|ctx| dispatch(name, &args, &ctx))
+    });
     let envelope = match outcome {
         Ok(data) => json!({ "ok": true, "data": data }),
         Err(e) => json!({ "ok": false, "error": e }),
@@ -282,55 +430,28 @@ fn startup_timeout(args: &Value) -> Result<Duration> {
 }
 
 fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
-    let command: Vec<String> = args["command"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let secrets = secret_names(&args["secrets"])?;
-    let require = if args["require_all"] == true {
-        Require::All
-    } else {
-        Require::Only(
-            args["require"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        )
-    };
+    let command = strings(args, "command")?;
+    let secrets = strings(args, "secrets")?;
+    let require = if args["require_all"] == true { Require::All } else { Require::Only(strings(args, "require")?) };
     captured(args, ctx, || session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true }))
 }
 
-/// `secrets` of `stack_exec`: omitted, or an array of names. Anything else is refused rather
-/// than read as no grant.
-fn secret_names(value: &Value) -> Result<Vec<String>> {
-    match value {
+/// An array-of-strings argument: omitted (or `null`) is empty, and anything else is refused
+/// rather than read as less than it says. [`validate`] has already checked it.
+fn strings(args: &Value, key: &str) -> Result<Vec<String>> {
+    match &args[key] {
         Value::Null => Ok(Vec::new()),
         Value::Array(items) => items
             .iter()
-            .map(|v| v.as_str().map(String::from).ok_or_else(|| StackError::new("usage", format!("secret name {v} is not a string"))))
+            .map(|v| v.as_str().map(String::from).ok_or_else(|| StackError::new("usage", format!("`{key}` item {v} is not a string"))))
             .collect(),
-        v => Err(StackError::new("usage", format!("secrets must be an array of secret names, not {v}"))),
+        v => Err(StackError::new("usage", format!("`{key}` must be an array of strings, not {v}"))),
     }
 }
 
 fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
     let task = args["task"].as_str().ok_or_else(|| StackError::new("usage", "task is required"))?;
-    let extra: Vec<String> = args["args"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    if !args["secrets"].is_null() {
-        return Err(StackError::new("usage", "stack_run grants exactly the secrets the task declares and accepts no others")
-            .hint("declare them under [tasks.<name>] secrets = [...] in stack.toml, or use stack_exec with secrets"));
-    }
+    let extra = strings(args, "args")?;
     captured(args, ctx, || session::plan_task(ctx, task, &extra, true))
 }
 
@@ -449,6 +570,50 @@ mod tests {
             let e = startup_timeout(&json!({ "timeout_secs": bad })).unwrap_err();
             assert_eq!(e.code, "usage", "{bad}");
         }
+    }
+
+    #[test]
+    fn every_tool_schema_is_closed_and_uses_only_what_validation_checks() {
+        fn walk(property: &Value) {
+            match property["type"].as_str() {
+                Some("string") => assert!(property["pattern"].is_null() || property["pattern"] == SECRET_NAME_PATTERN, "{property}"),
+                Some("boolean" | "integer") => {}
+                Some("array") => walk(&property["items"]),
+                other => panic!("unchecked property type {other:?}: {property}"),
+            }
+        }
+        for tool in tools().as_array().unwrap() {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["additionalProperties"], false, "{tool}");
+            schema["properties"].as_object().unwrap().values().for_each(walk);
+        }
+    }
+
+    #[test]
+    fn arguments_are_checked_before_a_project_is_opened() {
+        for args in [json!(["command"]), json!("echo hi"), json!(5)] {
+            let e = validate("stack_exec", &args).unwrap_err();
+            assert_eq!(e.code, "usage", "{args}");
+            assert!(e.message.contains("arguments must be an object"), "{}", e.message);
+        }
+        assert!(validate("stack_status", &Value::Null).unwrap().is_empty(), "no arguments is none");
+        let e = validate("stack_status", &json!({ "dir": 5 })).unwrap_err();
+        assert!(e.message.contains("`dir` must be a string"), "{}", e.message);
+        // An unknown tool is named as such, whatever its arguments, before any directory is read.
+        let called = call(&json!({ "name": "stack_nope", "arguments": { "dir": "/does/not/exist" } }));
+        assert_eq!(called["structuredContent"]["error"]["code"], "unknown_tool");
+        let called = call(&json!({ "name": "stack_status", "arguments": { "dir": "/does/not/exist", "extra": 1 } }));
+        assert_eq!(called["structuredContent"]["error"]["code"], "usage");
+    }
+
+    #[test]
+    fn misspelled_arguments_suggest_the_accepted_name() {
+        let known = ["command", "require", "require_all", "secrets", "timeout_secs", "dir"];
+        assert_eq!(closest("secret", &known), Some("secrets"));
+        assert_eq!(closest("timeout", &known), Some("timeout_secs"));
+        assert_eq!(closest("Command", &known), Some("command"));
+        assert_eq!(closest("requir_all", &known), Some("require_all"));
+        assert_eq!(closest("environment", &known), None);
     }
 
     #[test]
