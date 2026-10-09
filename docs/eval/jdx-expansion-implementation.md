@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: Astra approved `12b7215`; its nonblocking reserved-session correction and Linux validation are in progress.
+Status: Astra approved `12b7215` and Linux validation passed; the nonblocking reserved-session correction is in progress.
 
 ## Scope and base
 
@@ -591,3 +591,20 @@ Stack-owned declaration early with `invalid_env`, without fabricating a session 
 other Stack-prefixed inputs. This narrow validation correction will receive a focused review.
 Current-head Linux validation was still pending when Astra issued its approval; older Linux
 and Alpine results remain labeled by their tested implementation.
+
+### Linux validation of the approved implementation
+
+At exact `12b7215`, GNU Linux ARM64 passed all 396 Rust tests, the release build, separately
+enabled real mise 2026.9.18 provenance/precedence and scratch tests, and native scenarios
+1 and 10. Java/Go local path fixtures retained explicit environment precedence in shell
+and task templates; literal dollars/braces and name-only snapshots passed. Literal tilde
+state paths cleaned task copies and owned links on success, error and timeout while
+preserving foreign links, regular tracking files, project links and trust entries.
+
+Held plans remained stable across compile, with correct project assets, pinned Python and
+bundle PATH. Real fnox snapshot/timeout controls and persistence sweeps found no evaluated
+or granted sentinel values on disk; captured output stayed redacted. Ordinary compile and
+inspect left no retired scratch links, and inspect preserved project/state content.
+Report: `/tmp/jdx-linux-12b7215.601tchep/REPORT.md`. Failed harness attempts are retained and
+separated from successful product checks. Source remained read-only and all owned Docker
+resources were removed. Broader Alpine/platform runs remain explicitly prior-head evidence.
