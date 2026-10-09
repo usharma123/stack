@@ -42,10 +42,10 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
     // What each directory's file names is gathered first, then each file is written once.
     let mut planned = Planned::default();
     let generated = [".config/mise/conf.d/stack.toml", ".config/mise/mise.lock", ".config/mise/locks"];
-    if generated.iter().any(|p| std::fs::symlink_metadata(root.join(p)).is_ok()) && contained(root, Path::new(".config/mise"), &mut warnings) {
+    if generated.iter().any(|p| std::fs::symlink_metadata(root.join(p)).is_ok()) && contained(root, Path::new(".config/mise"), &mut warnings, &mut planned) {
         planned.add(root.join(".config/mise"), ["conf.d/stack.toml", "mise.lock", "locks/"].map(String::from).to_vec());
     }
-    if contained(root, Path::new(".stack"), &mut warnings) {
+    if contained(root, Path::new(".stack"), &mut warnings, &mut Planned::default()) {
         let ignore = root.join(".stack/.gitignore");
         if std::fs::symlink_metadata(&ignore).is_err() {
             if let Err(e) = std::fs::write(&ignore, "*\n") {
@@ -55,7 +55,7 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
     }
     // A directory stack would refuse to link into holds nothing of stack's. Its normalized form
     // (`./a//b` is `a/b`) is where the links are.
-    if let Some(dir) = skills_dir.and_then(|dir| crate::skills::validate_dir(dir).ok()).filter(|dir| contained(root, dir, &mut warnings)) {
+    if let Some(dir) = skills_dir.and_then(|dir| crate::skills::validate_dir(dir).ok()).filter(|dir| contained(root, dir, &mut warnings, &mut planned)) {
         let dir = root.join(dir);
         match crate::skills::linked(&dir) {
             Ok(links) => {
@@ -121,12 +121,18 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// Whether `root/dir` exists as a real directory inside the project, by the rule skill links
-/// follow: no component a symbolic link. One that is not is left alone, with a warning.
-fn contained(root: &Path, dir: &Path, warnings: &mut Vec<String>) -> bool {
+/// follow: no component a symbolic link. One that is not is left alone, with a warning. Where
+/// it leads may still be a directory planned for the other category (a skills dir linked to
+/// `.config/mise`, say): that file is kept as it is too, as the warning says, rather than
+/// rewritten without this category's entries.
+fn contained(root: &Path, dir: &Path, warnings: &mut Vec<String>, planned: &mut Planned) -> bool {
     match crate::skills::real_dir(root, dir, false) {
         Ok(exists) => exists,
         Err((_, why)) => {
             warnings.push(format!("{why}; stack left any ignore file there alone, so what it generates there may show in git"));
+            if let Ok(real) = root.join(dir).canonicalize() {
+                planned.keep(real);
+            }
             false
         }
     }

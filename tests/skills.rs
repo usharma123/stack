@@ -628,6 +628,26 @@ fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both(
 }
 
 #[test]
+fn a_skills_dir_linked_to_the_provider_directory_keeps_the_file_there_as_it_is() {
+    let project = |dir: &str| SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}"));
+    let f = Fixture::new(&project(".config/mise"));
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let ignore = app.join(".config/mise/.gitignore");
+    let text = fs::read_to_string(&ignore).unwrap();
+    assert!(text.lines().any(|l| l == "/fnox"), "{text}");
+    // The same directory, now named through a link: refused, so the file there, with the skill
+    // links' entries, is kept as the warning says rather than rewritten with the provider's alone.
+    std::os::unix::fs::symlink(".config/mise", app.join("linked")).unwrap();
+    fs::write(app.join("stack.toml"), project("linked")).unwrap();
+    let v = f.json(&["compile"]);
+    assert!(v.to_string().contains("symbolic link") && v.to_string().contains("left any ignore file there alone"), "{v}");
+    assert_eq!(fs::read_to_string(&ignore).unwrap(), text);
+    assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new());
+}
+
+#[test]
 fn an_unreadable_skills_registry_keeps_stacks_ignore_file_as_it_is() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");
