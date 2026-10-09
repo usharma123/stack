@@ -103,7 +103,8 @@ pub struct Session {
     /// Complete compiled configuration and ports at launch, including project overrides.
     #[serde(default)]
     pub config_digest: String,
-    /// Coordinators currently executing against this generation. Dead entries are ignored.
+    /// Coordinators currently executing against this generation. The next lifecycle command
+    /// forgets those that have exited.
     #[serde(default)]
     pub active_executions: IndexMap<String, u32>,
     pub started_at: u64,
@@ -2832,20 +2833,36 @@ fn is_token(name: &str) -> bool {
 
 /// Under the project lock: forget executions whose completion record names this session, the
 /// token and the PID recorded for it, renewing the lease to when each finished, then those
-/// whose coordinator died. Records are matched first: a coordinator that wrote one has
-/// usually exited since, and its command still finished when the record says. Returns the
-/// records applied; the caller removes them only once a record without those executions is
-/// saved, so a crash in between applies them again. A record that can never apply (another
-/// generation's, or for a token no longer recorded) is removed; one stack did not write
-/// (another name, unreadable, naming another token) is left alone and never applied.
+/// whose coordinator had exited before the records were read. Returns the records applied;
+/// the caller removes them only once a record without those executions is saved, so a crash
+/// in between applies them again. A record that can never apply (another generation's, or for
+/// a token no longer recorded) is removed; one stack did not write (another name, unreadable,
+/// naming another token) is left alone and never applied.
+///
+/// Records are written without the lock, so the order matters. A coordinator writes its
+/// record before it exits: one seen exited before the read has left any record it ever will,
+/// and the read finds it. One seen running may write its record and exit after the read; it
+/// stays recorded, and the session busy, until the next reconcile applies that record. A
+/// liveness check after the read would forget it with its renewal unapplied.
 fn reconcile_executions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
+    let exited: Vec<String> = session
+        .active_executions
+        .iter()
+        .filter(|(_, pid)| !pid_alive(**pid))
+        .map(|(token, _)| token.clone())
+        .collect();
     let consumed = apply_completions(state, root, session);
-    session.active_executions.retain(|_, pid| pid_alive(*pid));
+    for token in &exited {
+        session.active_executions.shift_remove(token);
+    }
     consumed
 }
 
 fn apply_completions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(completions_dir(state, root)) else { return Vec::new() };
+    let entries = fs::read_dir(completions_dir(state, root));
+    #[cfg(test)]
+    tests::after_completions_read();
+    let Ok(entries) = entries else { return Vec::new() };
     let mut consumed = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
         let Some(token) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".json")).filter(|t| is_token(t)) else {
@@ -2888,11 +2905,11 @@ fn settle_executions(ctx: &Ctx, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// After [`reconcile_executions`], whose liveness observation this keeps: every execution
+/// still recorded was running when its records were read. Checking its PID again here could
+/// find it exited after writing a record that read missed.
 fn has_active_executions(session: &Session) -> bool {
-    session
-        .active_executions
-        .values()
-        .any(|pid| pid_alive(*pid))
+    !session.active_executions.is_empty()
 }
 
 /// A note when this checkout's running session was started from a configuration other than
@@ -3122,6 +3139,19 @@ fn lock_digest(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_COMPLETIONS_READ: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Runs, once, what a test scheduled for just after the completion records directory is
+    /// read, before anything is decided from it.
+    pub(super) fn after_completions_read() {
+        if let Some(hook) = AFTER_COMPLETIONS_READ.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
 
     #[test]
     fn a_completion_applies_only_to_the_execution_it_names() {
@@ -3187,6 +3217,65 @@ mod tests {
         assert_eq!(reconcile_executions(&state, &root, &mut session), [path]);
         assert_eq!(session.lease.as_ref().unwrap().renewed_at, 500, "renewed to when it finished");
         assert!(session.active_executions.is_empty(), "the one that left no record is forgotten too");
+    }
+
+    #[test]
+    fn a_command_finishing_while_gc_reads_the_records_keeps_the_session_until_its_record_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("app"));
+        fs::create_dir_all(&root).unwrap();
+        let dir = completions_dir(&state, &root);
+        let (go, staged) = (tmp.path().join("go"), tmp.path().join("staged.json"));
+        // A coordinator that, once told, publishes its record atomically and exits, as one
+        // that could not take the lock does.
+        let mut coordinator = std::process::Command::new("sh")
+            .args(["-c", r#"i=0; while [ ! -e "$1" ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; mkdir -p "$2" && mv "$3" "$2/$4""#, "sh"])
+            .arg(&go)
+            .arg(&dir)
+            .arg(&staged)
+            .arg(format!("{}.json", "f".repeat(64)))
+            .spawn()
+            .unwrap();
+        let crashed = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let renewed_at = now() - 120;
+        let mut session = Session {
+            id: "s1".into(),
+            project: root.clone(),
+            lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at }),
+            ..Session::default()
+        };
+        session.active_executions.insert("f".repeat(64), coordinator.id());
+        session.active_executions.insert("c".repeat(64), crashed);
+        let index = index_path(&state, &root);
+        write_json(&index, &session).unwrap();
+        let completed_at = now();
+        write_json(&staged, &Completion { session: "s1".into(), token: "f".repeat(64), pid: coordinator.id(), completed_at }).unwrap();
+
+        // The command finishes and its coordinator exits just after GC read the records,
+        // before GC decides which executions are gone or whether the session is idle.
+        AFTER_COMPLETIONS_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                fs::write(&go, "").unwrap();
+                assert!(coordinator.wait().unwrap().success());
+            }))
+        });
+        assert!(gc(&state).unwrap().is_empty(), "seen running when the records were read, so still busy");
+        assert!(AFTER_COMPLETIONS_READ.with(|h| h.borrow().is_none()), "the coordinator finished inside that window");
+        let record = dir.join(format!("{}.json", "f".repeat(64)));
+        assert!(record.exists(), "its record waits for the next reconcile");
+        assert_eq!(read_json::<Session>(&index).unwrap().lease.unwrap().renewed_at, renewed_at);
+
+        // The next one applies it: the lease counts from when the command finished.
+        assert!(gc(&state).unwrap().is_empty());
+        for saved in [read_json::<Session>(&index).unwrap(), read_json(&root.join(".stack/session.json")).unwrap()] {
+            assert_eq!(saved.lease.unwrap().renewed_at, completed_at);
+            assert!(saved.active_executions.is_empty(), "the crashed one is forgotten with it");
+        }
+        assert!(!record.exists());
     }
 
     #[test]

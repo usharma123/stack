@@ -134,12 +134,15 @@ output (mise's answer when no release matches) is an error, not a version.
   completion. A command that cannot take the lock within a second to finish, with or without
   a deadline, leaves an atomic completion record naming its session, token and PID, written
   without the lock; every lifecycle decision under the lock (`up`, `restart`, `exec`, GC)
-  applies the records matching all three first, before forgetting executions whose
-  coordinator died (the one that wrote a record has usually exited since), and removes them
-  only after the record without those executions is saved. GC does not save for a deleted project; `down` and GC's
-  reclaim remove the project's records with its index. GC ignores TTL expiry while a
-  coordinator is alive. An explicit runner-death policy still takes precedence over a
-  surviving command.
+  first notes which coordinators have exited, then applies the records matching all three,
+  then forgets only the executions whose coordinator it saw exited, and removes the records
+  only after the record without those executions is saved. A coordinator writes its record
+  before it exits, so one seen exited has left any record it ever will. One seen running may
+  finish while the records are read; it counts as running for that decision, never checked
+  again, and the next one applies its record. GC does not save for a deleted project; `down`
+  and GC's reclaim remove the project's records with its index. GC ignores TTL expiry while
+  an execution it saw running is recorded. An explicit runner-death policy still takes
+  precedence over a surviving command.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
   those processes dead and ports closed. A reserved port is stack's to wait for only when a

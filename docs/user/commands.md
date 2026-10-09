@@ -123,8 +123,9 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the session. A command that finished while another command held the project lock for more
   than a second records that it finished under the state directory's `completed/`; the next
   `up`, `restart`, `exec`, `run` or `gc` for the project applies it, forgetting that command
-  only and renewing the lease to when it finished, even once that process has exited.
-  `status` may list it until then. When
+  only and renewing the lease to when it finished, even once that process has exited. One
+  that finishes while that command reads the records still counts as running for it, and the
+  command after applies it. `status` may list it until then. When
   even that record cannot be written, the result of `exec --json`, MCP `stack_exec` and
   `stack_run` carries a `warnings` entry beside the command's own outcome (or, when the
   command could not be started, in a detail of its `exec_failed` error), and the session
