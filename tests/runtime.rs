@@ -9,6 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// mise as stack drives it: answers from files a test writes under `$REVIEW_FIXTURE`.
+const FAKE_MISE: &str = include_str!("fakes/mise.sh");
+
 struct Fixture {
     dir: TempDir,
 }
@@ -41,118 +44,7 @@ impl Fixture {
         )
         .unwrap();
         let mise = dir.path().join("bin/mise");
-        fs::write(
-            &mise,
-            r#"#!/bin/sh
-echo "$*" >>"$REVIEW_FIXTURE/mise.log"
-# Which file ran, however PATH named it: a relative entry is found from the working directory.
-case $0 in */*) self=${0%/*} ;; *) self=. ;; esac
-echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
-# A supervisor stand-in that runs until killed, started only when none runs. `$1` records who
-# started it: `mise x` in stack's own session, or a request client in its killable group.
-supervise() {
-  if test -f "$REVIEW_FIXTURE/supervisor-process" && ! kill -0 "$(cut -d' ' -f1 "$REVIEW_FIXTURE/supervisor-pid" 2>/dev/null)" 2>/dev/null; then
-    sleep 60 </dev/null >/dev/null 2>&1 &
-    echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
-  fi
-}
-case "$1 $2" in
-  'latest '*)
-    # Where resolution ran and the only configuration it could see.
-    { echo "dir=$(pwd -P) trusted=${MISE_TRUSTED_CONFIG_PATHS-unset} no_config=${MISE_NO_CONFIG-unset}"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/latest.log"
-    if test -f "$REVIEW_FIXTURE/latest-empty"; then exit 0; fi
-    v=${2#*@}; if test "$v" = "$2"; then v=1.0.0; fi
-    case "$2" in python@3.13) v=3.13.16 ;; postgres@17) v=17.11 ;; redis@8) v=8.2.1 ;; rust@1.93) v=1.93.1 ;; esac
-    echo "$v" ;;
-  'which pitchfork') echo "$REVIEW_FIXTURE/bin/pitchfork" ;;
-  'ls --json')
-    # Installed releases, asked in a scratch root: where it ran and the only configuration it saw.
-    { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/ls.log"
-    if test "${3-}" = fnox; then
-      { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/fnox-ls.log"
-      if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
-    elif test -f "$REVIEW_FIXTURE/ls.json"; then
-      printf '{"fnox":'; cat "$REVIEW_FIXTURE/ls.json"; echo '}'
-    else echo '{}'; fi ;;
-  'skills ls') echo '[]' ;;
-  'lock --platform')
-    # Artifact locking in a scratch root: what it was given, then the lock a test supplies.
-    { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml; echo '--- seed'; cat .config/mise/mise.lock; } >>"$REVIEW_FIXTURE/lock.log"
-    if test -f "$REVIEW_FIXTURE/mise-lock.toml"; then cp "$REVIEW_FIXTURE/mise-lock.toml" .config/mise/mise.lock; fi ;;
-  'install --locked'|'install --yes')
-    # The rendered lock as the install saw it.
-    if test -f .config/mise/mise.lock; then cp .config/mise/mise.lock "$REVIEW_FIXTURE/rendered-at-install"; fi
-    if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi ;;
-  'version ')
-    echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
-    echo 'mise WARN  mise version 2099.1.1 available' >&2
-    if test -f "$REVIEW_FIXTURE/mise-version"; then cat "$REVIEW_FIXTURE/mise-version"; else echo '2026.10.3 macos-arm64 (2026-10-05)'; fi ;;
-  'env --json')
-    if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
-    # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
-    if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
-      touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
-    fi
-    cat "$REVIEW_FIXTURE/env.json" ;;
-  'daemons --json')
-    if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
-      if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
-      touch "$REVIEW_FIXTURE/query-observed"
-    fi
-    if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
-    # A supervised listener (see `daemons start`) is reported with its real PID while alive.
-    if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
-    else
-      cat "$REVIEW_FIXTURE/daemons.json"
-    fi ;;
-  'daemons start')
-    supervise request
-    # A request client that would launch a service later, after the request gave up. Like a
-    # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
-    if test -f "$REVIEW_FIXTURE/late-client"; then
-      python3 -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
-    fi
-    if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
-    # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
-    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
-      echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
-      sleep 0.3
-    fi
-    if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
-      cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
-      touch "$REVIEW_FIXTURE/started"
-    fi
-    if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi ;;
-  'run --skip-deps')
-    # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
-    shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"
-    # The generated config the task ran from: its definition as stack planned it.
-    cp .config/mise/conf.d/stack.toml "$REVIEW_FIXTURE/run-config" 2>/dev/null
-    if test "$task" = fail; then exit 3; fi
-    # A task that shows the environment it was given, on both streams.
-    if test "$task" = showenv; then echo; env | sort; env | sort >&2; fi ;;
-  'x --')
-    # The supervisor stack starts on its own: which mise it is told to run daemons with.
-    echo "$*|${PITCHFORK_MISE_BIN-unset}" >>"$REVIEW_FIXTURE/supervisor-start.log"
-    # A start that hangs for `x-hang` seconds (its PID recorded to end it) or fails, as asked.
-    if test -f "$REVIEW_FIXTURE/x-hang"; then echo $$ >"$REVIEW_FIXTURE/x-hang-pid"; exec sleep "$(cat "$REVIEW_FIXTURE/x-hang")"; fi
-    if test -f "$REVIEW_FIXTURE/x-fail"; then echo 'cannot start the supervisor' >&2; exit 1; fi
-    supervise detached ;;
-  'daemons logs')
-    if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
-  'daemons stop')
-    if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
-    if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
-    # A stopped supervised listener is reported stopped, like a real daemon.
-    if test -f "$REVIEW_FIXTURE/listen-port"; then
-      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
-    fi ;;
-esac
-"#,
-        )
-        .unwrap();
+        fs::write(&mise, FAKE_MISE).unwrap();
         fs::set_permissions(mise, fs::Permissions::from_mode(0o755)).unwrap();
         // The supervisor as stack reaches it without a project: answers from files the test
         // controls, and "stops" a daemon by killing the PID it was told it tracks.
@@ -3264,23 +3156,8 @@ const SENTINELS: &[&str] = &[
 /// `.mise-bins`, which is what the stack's PATH names. Steps answer from files the test writes
 /// (`fnox-<step>-mode`, `fnox-<step>.json`); every run logs its arguments and prints a
 /// diagnostic quoting a secret on stderr, as fnox does for a malformed configuration.
-const FAKE_FNOX: &str = r##"#!/bin/sh
-echo "$*|${FNOX_NON_INTERACTIVE-unset}|$(pwd -P)" >>"$REVIEW_FIXTURE/fnox.log"
-echo '  × fnox.toml line 3: DEPLOY_KEY = "leak-sentinel-stderr-0004"' >&2
-case " $* " in *" --describe "*) step=describe ;; *) step=keys ;; esac
-case "$(cat "$REVIEW_FIXTURE/fnox-$step-mode" 2>/dev/null)" in
-  garbage) echo 'leak-sentinel-garbage-0006 is not the protocol'; exit 0 ;;
-  config) echo '{"schema":1,"error":{"kind":"config","message":"line 3: DEPLOY_KEY = leak-sentinel-config-0005"}}'; exit 1 ;;
-  oversized) head -c 70000 /dev/zero | tr '\0' x; exit 0 ;;
-  exit) exit 3 ;;
-  file) cat "$REVIEW_FIXTURE/fnox-$step.json"; exit "$(cat "$REVIEW_FIXTURE/fnox-$step-exit" 2>/dev/null || echo 0)" ;;
-esac
-if test "$step" = describe; then
-  echo '{"schema":1,"fnox_version":"1.39.0","profile":["default"],"keys":[{"key":"DEPLOY_KEY","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},{"key":"SENTRY_DSN","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},{"key":"SHORT_KEY","kind":"secret","env":true,"as_file":false,"injectable":{"exec":true,"shell":true}},{"key":"HIDDEN","kind":"secret","env":false,"as_file":false,"injectable":{"exec":false,"shell":false}}],"dynamic_leases":[],"daemon_enabled":false}'
-else
-  echo '{"schema":1,"fnox_version":"1.39.0","scope":"exec","profile":["default"],"set":{"DEPLOY_KEY":"leak-sentinel-deploy-0001","SENTRY_DSN":"leak-sentinel-sentry-0002","SHORT_KEY":"short77","DEP":"leak-sentinel-dependency-0003"},"files":{},"remove":["HIDDEN","PGHOST","DATABASE_URL","PATH","MISE_SHELL","__MISE_DIFF","STACK_PROJECT"],"missing":[],"leases":[]}'
-fi
-"##;
+const FAKE_FNOX: &str = include_str!("fakes/fnox.sh");
+
 
 fn write_exe(path: &Path, script: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3636,6 +3513,154 @@ fn a_task_deleted_or_ungranted_while_its_run_waits_is_refused_or_runs_without_se
         assert!(fs::read_to_string(fixture.dir.path().join("run-config")).unwrap().contains("new-definition"), "{context}");
         assert_eq!(fnox_log(&fixture).len(), fnox_before, "{context}: fnox ran for a task that declares no secrets");
     }
+    assert_no_leak_on_disk(&fixture);
+}
+
+/// The copies of the provider configuration task runs hold (`<cache>/task-config/*`).
+fn task_configs(fixture: &Fixture) -> Vec<std::path::PathBuf> {
+    fs::read_dir(fixture.dir.path().join("cache/task-config"))
+        .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default()
+}
+
+/// Start `stack run <task>` (CLI) or `stack_run` (MCP) with the fake provider's gate held, and
+/// return once `mise run` is waiting at it: stack has planned the task and released the project
+/// lock, mise has not read its configuration. Then write `edited` as stack.toml and compile it
+/// as any other command would, check the copy the run holds, open the gate and return the run's
+/// result envelope.
+fn run_gated_across_a_compile(fixture: &Fixture, task: &str, edited: &str, mcp: bool) -> Value {
+    let root = fixture.dir.path();
+    let app = root.join("app").canonicalize().unwrap();
+    let (gate, waiting) = (root.join("run-gate"), root.join("run-waiting"));
+    let _ = fs::remove_file(&waiting);
+    fs::write(&gate, "").unwrap();
+    let mut command = if mcp { fixture.command(&["mcp"]) } else { fixture.command(&["--json", "run", task]) };
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    if mcp {
+        use std::io::Write;
+        writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})).unwrap();
+        writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":{"dir": app, "task": task}}})).unwrap();
+    }
+    drop(stdin);
+    let queued = Queued(Some(child));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !waiting.exists() {
+        assert!(Instant::now() < deadline, "mise run never reached the gate");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The copy the planned run holds: one private directory, the definition it was planned
+    // from, and nothing granted.
+    let copies = task_configs(fixture);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(fs::metadata(&copies[0]).unwrap().permissions().mode() & 0o777, 0o700);
+    let held = fs::read_to_string(copies[0].join(".config/mise/conf.d/stack.toml")).unwrap();
+    assert_eq!(held, fs::read_to_string(app.join(".config/mise/conf.d/stack.toml")).unwrap());
+    assert_no_leak(&held, "the task's configuration copy");
+    // The lock is free: an ordinary compile publishes the edit while the run waits.
+    fs::write(app.join("stack.toml"), edited).unwrap();
+    fixture.ok(&["compile"]);
+    assert_ne!(fs::read_to_string(app.join(".config/mise/conf.d/stack.toml")).unwrap(), held, "the compile must change the generated config");
+    fs::remove_file(&gate).unwrap();
+    let out = queued.finish();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !mcp {
+        return serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{stdout} {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let response = stdout.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|r| r["id"] == 1).unwrap();
+    response["result"]["structuredContent"].clone()
+}
+
+#[test]
+fn a_planned_task_runs_the_definition_and_grant_it_was_planned_with_whatever_is_compiled_before_mise_starts() {
+    let head = "[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n";
+    let manifest = |body: &str, secret: &str| format!("{head}[tasks.showenv]\nrun = '{body}'\nsecrets = ['{secret}']\n[tasks.other]\nrun = 'other'\n");
+    let (old, new) = (manifest("old-definition", "DEPLOY_KEY"), manifest("new-definition", "SENTRY_DSN"));
+    let deleted = format!("{head}[tasks.other]\nrun = 'other'\n");
+    let fixture = secrets_fixture("");
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    for mcp in [false, true] {
+        for (edit, edited) in [("edited", &new), ("deleted", &deleted)] {
+            let context = format!("{} {edit}", if mcp { "MCP" } else { "CLI" });
+            fs::write(app.join("stack.toml"), &old).unwrap();
+            fixture.ok(&["compile"]);
+            let envelope = run_gated_across_a_compile(&fixture, "showenv", edited, mcp);
+            assert_no_leak(&envelope.to_string(), &context);
+            assert_eq!(envelope["ok"], true, "{context}: {envelope}");
+            let data = &envelope["data"];
+            // The body and the grant both come from the plan, not from the later compile.
+            let ran = fs::read_to_string(fixture.dir.path().join("run-config")).unwrap();
+            assert!(ran.contains("old-definition") && !ran.contains("new-definition"), "{context}: {ran}");
+            assert_eq!(data["secrets"], json!(["DEPLOY_KEY"]), "{context}: {envelope}");
+            let stdout = data["stdout"].as_str().unwrap();
+            assert!(stdout.contains("\nDEPLOY_KEY=[redacted:DEPLOY_KEY]\n"), "{context}: {stdout}");
+            assert!(!stdout.contains("SENTRY_DSN="), "{context}: {stdout}");
+            // mise loaded the copy as its only configuration, rooted at the project, from it.
+            let run_log = fs::read_to_string(fixture.dir.path().join("run.log")).unwrap();
+            let last = run_log.lines().last().unwrap();
+            let copies = std::fs::canonicalize(fixture.dir.path().join("cache/task-config")).unwrap();
+            assert!(last.starts_with(&format!("config={}/", copies.display())), "{context}: {last}");
+            assert!(last.ends_with(&format!("/.config/mise/conf.d/stack.toml root={} dir={}", app.display(), app.display())), "{context}: {last}");
+            assert!(stdout.contains(&format!("\nMISE_GLOBAL_CONFIG_ROOT={}\n", app.display())), "{context}: {stdout}");
+            assert!(task_configs(&fixture).is_empty(), "{context}: the copy outlived its run");
+
+            // Planned after the compile: what it published.
+            let (envelope, text, _) = json_run(&fixture, &["run", "showenv"]);
+            assert_no_leak(&text, &context);
+            if edit == "edited" {
+                assert_eq!(envelope["data"]["secrets"], json!(["SENTRY_DSN"]), "{context}: {envelope}");
+                let stdout = envelope["data"]["stdout"].as_str().unwrap();
+                assert!(stdout.contains("\nSENTRY_DSN=[redacted:SENTRY_DSN]\n") && !stdout.contains("DEPLOY_KEY="), "{context}: {stdout}");
+                assert!(fs::read_to_string(fixture.dir.path().join("run-config")).unwrap().contains("new-definition"), "{context}");
+            } else {
+                assert_eq!(envelope["error"]["code"], "unknown_task", "{context}: {envelope}");
+            }
+        }
+    }
+    assert!(task_configs(&fixture).is_empty());
+    assert_no_leak_on_disk(&fixture);
+}
+
+#[test]
+fn a_task_configuration_copy_is_removed_after_a_timeout_a_failed_plan_and_a_terminal_run() {
+    let fixture = secrets_fixture("[tasks.hang]\nrun = 'sleep'\n[tasks.showenv]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n");
+    // Timed out: the run's process group is killed, then the copy removed.
+    let (envelope, text, out) = json_run(&fixture, &["run", "--timeout", "1s", "hang"]);
+    assert_eq!(out.status.code(), Some(124), "{text}");
+    assert_eq!(envelope["error"]["code"], "timed_out", "{text}");
+    assert!(task_configs(&fixture).is_empty(), "CLI timeout");
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "hang", "timeout_secs": 1 }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "timed_out", "{}", results[0]);
+    assert!(task_configs(&fixture).is_empty(), "MCP timeout");
+    // Planning fails after the copy was made: fnox cannot answer for the grant.
+    fs::write(fixture.dir.path().join("fnox-keys-mode"), "exit").unwrap();
+    let (envelope, text, _) = json_run(&fixture, &["run", "showenv"]);
+    assert_eq!(envelope["ok"], false, "{text}");
+    assert_no_leak(&text, "failed plan");
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "showenv" }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["ok"], false, "{}", results[0]);
+    // Only the two timed-out runs reached mise; the failed plans did not.
+    assert_eq!(fs::read_to_string(fixture.dir.path().join("run.log")).unwrap().lines().count(), 2);
+    assert!(task_configs(&fixture).is_empty(), "failed plan");
+    fs::remove_file(fixture.dir.path().join("fnox-keys-mode")).unwrap();
+    // On the terminal: the copy is removed once the task exits, with the link mise made to it
+    // and the one left by a run killed before it could clean up. Others are kept.
+    let state = fixture.dir.path().join("mise-state");
+    let tracked = state.join("tracked-configs");
+    fs::create_dir_all(&tracked).unwrap();
+    fs::write(fixture.dir.path().join("track-configs"), "").unwrap();
+    let copies = fixture.dir.path().join("cache/task-config").canonicalize().unwrap();
+    std::os::unix::fs::symlink(copies.join("999999999-killed/.config/mise/conf.d/stack.toml"), tracked.join("killed")).unwrap();
+    let project_config = fixture.dir.path().join("app/.config/mise/conf.d/stack.toml");
+    std::os::unix::fs::symlink(&project_config, tracked.join("project")).unwrap();
+    let out = fixture.command(&["run", "showenv"]).env("MISE_STATE_DIR", &state).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(task_configs(&fixture).is_empty(), "terminal run");
+    let run_log = fs::read_to_string(fixture.dir.path().join("run.log")).unwrap();
+    assert!(run_log.lines().last().unwrap().starts_with(&format!("config={}/", copies.display())), "{run_log}");
+    let left: Vec<_> = fs::read_dir(&tracked).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["project"], "mise's links to removed copies must go with them");
     assert_no_leak_on_disk(&fixture);
 }
 

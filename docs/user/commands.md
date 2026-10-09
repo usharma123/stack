@@ -82,7 +82,13 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   the services itself. Every service must verify first, whatever the task's `services` list:
   mise hands a task every service's endpoint, including any stack would withhold. For commands
   that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
-  than services to skip. `unknown_task` lists the tasks the project defines.
+  than services to skip. `unknown_task` lists the tasks the project defines. The task runs from
+  a copy of the generated configuration taken when it was planned, under the project lock, so a
+  `compile` while it starts or runs does not change its body, env or tools; the next run sees
+  the change. mise loads the copy as its only configuration, rooted at the project, so the
+  working directory, relative paths and `{{config_root}}` are the project's. The copy is kept in
+  a private directory under stack's cache and removed when the task ends, fails to plan or times
+  out, along with the link mise records to it under `$MISE_STATE_DIR/tracked-configs`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code. When `--timeout` expires the command's process group is killed and stack
   exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the

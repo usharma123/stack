@@ -13,6 +13,7 @@ use crate::artifacts;
 use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
+pub use crate::provider::task_config::TaskConfig;
 use crate::secrets::{self, Grant};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json};
@@ -1644,6 +1645,9 @@ pub struct ExecPlan {
     pub secret_warnings: Vec<String>,
     /// Replaces granted values in captured output; empty without grants.
     pub redactor: crate::process::Redactor,
+    /// A task's copy of the provider configuration it was planned from, which `env` points
+    /// `mise run` at. Removed when the plan is dropped, after the command finishes.
+    pub task_config: Option<TaskConfig>,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -1965,6 +1969,11 @@ pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Gran
 /// The task is granted exactly the secrets it declares, read from the same compile, under the
 /// same project lock, as the command and environment: a task edited while this invocation
 /// waits for the lock runs with its new definition's grant, never its old one.
+///
+/// The lock is released before the task runs, and an ordinary compile may then rewrite the
+/// generated configuration. `mise run` therefore reads a copy taken under the lock (see
+/// [`TaskConfig`]): the plan runs the body, env and tool pins it was planned and granted for,
+/// whatever is compiled while it waits or runs.
 pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Result<ExecPlan> {
     plan(ctx, Target::Task { name, args, captured })
 }
@@ -2019,6 +2028,11 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         }
     };
     secrets::validate(&grant.keys, &report.stack, origin)?;
+    // Under the lock, from what this compile wrote; removed if planning fails after this.
+    let mut task_config = match target {
+        Target::Task { .. } => Some(TaskConfig::capture(&ctx.root, &ctx.cache)?),
+        Target::Command { .. } => None,
+    };
     mise::trust(&ctx.root)?;
     timings.mark("trust");
     let (mut env, checks) = if report.stack.services.is_empty() {
@@ -2032,6 +2046,10 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         timings.mark("verify");
         (env, checks)
     };
+    // Set before secrets resolve, so no grant can replace them.
+    if let Some(config) = &task_config {
+        env.extend(config.env());
+    }
 
     let required: Vec<&String> = match require {
         Require::Nothing => Vec::new(),
@@ -2110,6 +2128,13 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             env.insert(key.clone(), value.clone());
         }
     }
+    if let Some(config) = task_config.as_mut() {
+        config.track_with(|key| match env.get(key) {
+            Some(value) => Some(value.clone()),
+            None if removed.iter().any(|r| r == key) => None,
+            None => std::env::var(key).ok(),
+        });
+    }
     let (head, args) = cmd
         .split_first()
         .ok_or_else(|| StackError::new("usage", "no command given"))?;
@@ -2170,6 +2195,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         secrets,
         secret_warnings,
         redactor,
+        task_config,
     })
 }
 

@@ -3,3 +3,4 @@
 
 pub mod mise;
 pub mod scratch;
+pub mod task_config;

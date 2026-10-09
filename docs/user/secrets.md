@@ -27,7 +27,10 @@ Over MCP, `stack_exec` takes `secrets: ["DEPLOY_KEY"]`. `stack run` and `stack_r
 the task's list and accept no additions (`stack_run` with `secrets` is a `usage` error). The
 list is read from the same compile, under the project lock, as the command that runs: a task edited
 while its run waits for another stack command runs its new definition with its new list, and a
-task removed meanwhile is refused as `unknown_task`.
+task removed meanwhile is refused as `unknown_task`. Once planned, the run keeps that definition:
+`mise run` reads a copy of the generated configuration taken under the same lock, so a compile
+while it starts or runs cannot pair the planned grant with another body. The copy holds only what
+compile already wrote, never a granted value.
 `secrets` lists names, never values, so bundles may declare it; two layers defining one task must
 agree on the whole task, as for any other field.
 
