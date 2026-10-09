@@ -696,11 +696,21 @@ pub fn sync(root: &Path, dir: &Path, discovery: &Discovery) -> SyncReport {
 /// Create `<root>/<dir>` component by component. Every component must be a real directory:
 /// a symbolic link anywhere in the path could lead outside the project, so it is refused.
 fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str, String)> {
+    real_dir(root, dir, true).map(drop)
+}
+
+/// Whether `<root>/<dir>` is a real directory inside the project, checked component by
+/// component without following a symbolic link: `Ok(false)` when a component does not exist
+/// (created instead, with `create`), and an error for a link, a non-directory, or a path that
+/// does not resolve inside the project. Skill links and stack's ignore files are written only
+/// into a directory this accepts.
+pub(crate) fn real_dir(root: &Path, dir: &Path, create: bool) -> std::result::Result<bool, (&'static str, String)> {
     let mut at = root.to_path_buf();
     for component in dir.components() {
         at.push(component);
         let meta = match std::fs::symlink_metadata(&at) {
             Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(false),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 match std::fs::create_dir(&at) {
                     Ok(()) => {}
@@ -720,7 +730,7 @@ fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str
     }
     // No component is a link, so the path cannot resolve outside the project.
     match at.canonicalize() {
-        Ok(real) if real == at && real.starts_with(root) => Ok(()),
+        Ok(real) if real == at && real.starts_with(root) => Ok(true),
         _ => Err(("invalid_path", format!("{} does not resolve inside the project", at.display()))),
     }
 }

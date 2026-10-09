@@ -37,12 +37,14 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
     let exclude = locate(root)?;
     let mut warnings = Vec::new();
     warnings.extend(drop_shared_blocks(&exclude));
+    // Each directory is checked before anything in it is read, written or removed: a symbolic
+    // link anywhere on the way may lead to another checkout, whose files are never touched.
     let mise = root.join(".config/mise");
     let generated = [".config/mise/conf.d/stack.toml", ".config/mise/mise.lock", ".config/mise/locks"];
-    if generated.iter().any(|p| std::fs::symlink_metadata(root.join(p)).is_ok()) {
+    if generated.iter().any(|p| std::fs::symlink_metadata(root.join(p)).is_ok()) && contained(root, Path::new(".config/mise"), &mut warnings) {
         warnings.extend(own(root, &mise, &["conf.d/stack.toml", "mise.lock", "locks/"].map(String::from)));
     }
-    if root.join(".stack").is_dir() {
+    if contained(root, Path::new(".stack"), &mut warnings) {
         let ignore = root.join(".stack/.gitignore");
         if std::fs::symlink_metadata(&ignore).is_err() {
             if let Err(e) = std::fs::write(&ignore, "*\n") {
@@ -52,7 +54,7 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
     }
     // A directory stack would refuse to link into holds nothing of stack's. Its normalized form
     // (`./a//b` is `a/b`) is where the links are.
-    if let Some(dir) = skills_dir.and_then(|dir| crate::skills::validate_dir(dir).ok()) {
+    if let Some(dir) = skills_dir.and_then(|dir| crate::skills::validate_dir(dir).ok()).filter(|dir| contained(root, dir, &mut warnings)) {
         let dir = root.join(dir);
         let links = crate::skills::linked(&dir);
         let registry = std::fs::symlink_metadata(dir.join(crate::skills::REGISTRY)).is_ok();
@@ -64,6 +66,18 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
         warnings.extend(own(root, &dir, &entries));
     }
     (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
+/// Whether `root/dir` exists as a real directory inside the project, by the rule skill links
+/// follow: no component a symbolic link. One that is not is left alone, with a warning.
+fn contained(root: &Path, dir: &Path, warnings: &mut Vec<String>) -> bool {
+    match crate::skills::real_dir(root, dir, false) {
+        Ok(exists) => exists,
+        Err((_, why)) => {
+            warnings.push(format!("{why}; stack left any ignore file there alone, so what it generates there may show in git"));
+            false
+        }
+    }
 }
 
 /// The exclude file git reads for `root`'s repository, when `root` is in a work tree.

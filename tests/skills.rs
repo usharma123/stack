@@ -554,6 +554,37 @@ fn a_link_made_in_one_checkout_never_hides_the_same_path_in_another() {
 }
 
 #[test]
+fn a_skills_dir_linked_into_another_checkout_leaves_that_checkouts_files_alone() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let theirs = app.join(".config/mise/.gitignore");
+    let original = fs::read_to_string(&theirs).unwrap();
+    git_in(&app, &["add", "stack.toml", "stack.lock"]);
+    git_in(&app, &["commit", "-qm", "stack"]);
+    // Checkout B's skills dir is a link to A's generated provider directory.
+    let b = f.path("b");
+    git_in(&app, &["worktree", "add", "-q", b.to_str().unwrap()]);
+    std::os::unix::fs::symlink(app.join(".config/mise"), b.join("linked-skills")).unwrap();
+    fs::write(b.join("stack.toml"), SYNC_PROJECT.replace("dir = \".claude/skills\"", "dir = \"linked-skills\"")).unwrap();
+    let out = f.command_at(&b, &["--json", "compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("symbolic link"), "an honest warning: {text}");
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), original, "A's generated .gitignore is untouched");
+    assert_eq!(untracked_in(&app, ".config/"), Vec::<String>::new());
+    // The same for a provider directory that is itself a link into A.
+    let c = f.path("c");
+    git_in(&app, &["worktree", "add", "-q", c.to_str().unwrap()]);
+    fs::create_dir_all(c.join(".config")).unwrap();
+    std::os::unix::fs::symlink(app.join(".config/mise"), c.join(".config/mise")).unwrap();
+    fs::write(c.join("stack.toml"), SYNC_PROJECT.replace("\n[skills]\ndir = \".claude/skills\"\n", "")).unwrap();
+    let _ = f.command_at(&c, &["--json", "compile"]).output().unwrap();
+    assert_eq!(fs::read_to_string(&theirs).unwrap(), original, "A's generated .gitignore is untouched");
+}
+
+#[test]
 fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");
