@@ -395,7 +395,7 @@ cover that combined path with real tools.
 
 At exact implementation `06dc7c3`, parent full checks passed 386 Rust tests, Clippy, and 41 Node
 tests. The optional real-mise configuration-isolation test and all ten macOS native scenarios
-are running separately. Linux ARM64 validation is checking the updated tests and snapshots
+passed separately. Linux ARM64 validation is checking the updated tests and snapshots
 with mise 2026.9.18. Astra round 3 receives the full original brief, both earlier reviews,
 all implementer responses, the independent post-planning proof, and unresolved platform and
 snapshot lifecycle limits. No sign-off is claimed yet.
@@ -404,3 +404,10 @@ Snapshot limits under review include its global/project config distinction, dela
 for killed parents, background commands that invoke mise after the owning task exits, private
 `mise use` writes, and translated/custom CPU builds. Earlier head counts remain labeled by
 commit and platform. Real snapshot controls: `/tmp/stack-task-config-real2.G2WV`.
+
+Parent real-tool checks at `06dc7c3` passed the normally opt-in provider-boundary test and all
+ten macOS native scenarios, including OCI, fnox tasks, services, leases, MCP timeout cleanup,
+identity probes, occupied-port recovery, and locked install without a session. The private
+native state and this run's registry were removed. Logs: `/tmp/stack-jdx-r3-rust.log`,
+`stack-jdx-r3-clippy.log`, `stack-jdx-r3-node.log`, `stack-jdx-r3-boundary.log`, and
+`stack-jdx-r3-native-all.log`. Linux final validation and Astra round 3 remain pending.
