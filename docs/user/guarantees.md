@@ -8,6 +8,8 @@
   the exact release, so a fresh machine installs the same versions after upstream releases.
   `compile` resolves only new or changed requests, `--update` re-resolves all of them and
   reports moves, and `--locked` (and `up`, `exec`, `status`) refuse missing or stale pins.
+  `exec` also refuses when a pinned release is not installed, rather than running whatever
+  else `PATH` holds.
   An exact version names a release; the artifact checksums below are what pin the bytes.
   A tool's [allowlisted options](bundles.md#tool-options) are part of its pin: stack.lock
   records them, and changing one is a changed request (`lock_outdated` in locked mode).

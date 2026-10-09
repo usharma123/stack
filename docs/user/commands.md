@@ -34,6 +34,10 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   against stack.lock's artifact checksums where it has them (see
   [Artifact checksums](#artifact-checksums)). Use it to warm a checkout (CI caches, disposable
   worktrees) without a session; `exec` then has the tools.
+- `exec` refuses with `tools_not_installed` (naming each release) when a release stack.lock
+  pins is not installed, before anything runs, so neither the command nor anything it starts
+  can pick up another release from `PATH`. Run `stack install`. `run` leaves installation to
+  `mise run`, which installs what the task's configuration names.
 - Errors from `up` that happen once its steps have begun end their `details` with a progress
   record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
   come before it. Invalid arguments, an unreadable session, and a failed initial GC pass

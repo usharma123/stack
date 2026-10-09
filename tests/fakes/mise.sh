@@ -26,9 +26,29 @@ case "$1 $2" in
     if test "${3-}" = fnox; then
       { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/fnox-ls.log"
       if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
-    elif test -f "$REVIEW_FIXTURE/ls.json"; then
-      printf '{"fnox":'; cat "$REVIEW_FIXTURE/ls.json"; echo '}'
-    else echo '{}'; fi ;;
+    else
+      # Every release the configuration names, installed when an install recorded it (or a
+      # test listed it) in `installed`; `ls.json` stands for fnox's rows when a test gives them.
+      python3 -c '
+import json, os, sys, tomllib
+fixture = sys.argv[1]
+try:
+    tools = tomllib.load(open(".config/mise/conf.d/stack.toml", "rb")).get("tools", {})
+except FileNotFoundError:
+    tools = {}
+try:
+    installed = set(open(os.path.join(fixture, "installed")).read().split())
+except FileNotFoundError:
+    installed = set()
+out = {}
+for tool, value in tools.items():
+    for v in value if isinstance(value, list) else [value]:
+        v = v["version"] if isinstance(v, dict) else v
+        out.setdefault(tool, []).append({"version": v, "requested_version": v, "install_path": os.path.join(fixture, "installs", tool, v), "installed": f"{tool}@{v}" in installed, "active": False})
+if os.path.exists(os.path.join(fixture, "ls.json")):
+    out["fnox"] = json.load(open(os.path.join(fixture, "ls.json")))
+print(json.dumps(out))' "$REVIEW_FIXTURE"
+    fi ;;
   'skills ls') echo '[]' ;;
   'lock --platform')
     # Artifact locking in a scratch root: what it was given, then the lock a test supplies.
@@ -37,7 +57,26 @@ case "$1 $2" in
   'install --locked'|'install --yes')
     # The rendered lock as the install saw it.
     if test -f .config/mise/mise.lock; then cp .config/mise/mise.lock "$REVIEW_FIXTURE/rendered-at-install"; fi
-    if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi ;;
+    if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi
+    # Record what was installed: the named tools (every one when none is named), each at every
+    # version the configuration gives it.
+    shift 1
+    python3 -c '
+import os, sys, tomllib
+try:
+    config = tomllib.load(open(".config/mise/conf.d/stack.toml", "rb"))
+except FileNotFoundError:
+    config = {}
+tools = {k: v if isinstance(v, list) else [v] for k, v in config.get("tools", {}).items()}
+# A preset service installs its tool at the version the daemon names.
+for daemon in config.get("daemons", {}).values():
+    if "preset" in daemon and "version" in daemon:
+        tools.setdefault(daemon["preset"], []).append(daemon["version"])
+named = [a for a in sys.argv[2:] if not a.startswith("-")] or list(tools)
+with open(os.path.join(sys.argv[1], "installed"), "a") as f:
+    for tool in named:
+        for v in tools.get(tool, []):
+            f.write("%s@%s\n" % (tool, v["version"] if isinstance(v, dict) else v))' "$REVIEW_FIXTURE" "$@" ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
     echo 'mise WARN  mise version 2099.1.1 available' >&2

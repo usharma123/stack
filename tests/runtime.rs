@@ -129,6 +129,36 @@ fn cli_exec_runs_in_the_selected_project_directory() {
 }
 
 #[test]
+fn exec_refuses_a_pin_that_is_not_installed_instead_of_running_another_release_on_path() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.8.2'\n[tasks.q]\nrun='jq --version'\n");
+    // Another jq on the stack's PATH, as a system one would be when the pin is missing.
+    write_exe(&fixture.dir.path().join("bin/jq"), "#!/bin/sh\ntouch \"$REVIEW_FIXTURE/fallback-ran\"\necho jq-1.7.1\n");
+    let ran = fixture.dir.path().join("fallback-ran");
+    for cmd in [&["jq", "--version"][..], &["sh", "-c", "jq --version"]] {
+        let mut args = vec!["--json", "exec", "--"];
+        args.extend_from_slice(cmd);
+        let out = fixture.command(&args).output().unwrap();
+        let error = &json_result(&out)["error"];
+        assert_eq!(error["code"], "tools_not_installed", "{cmd:?}: {error}");
+        assert_eq!(error["details"], json!([{ "tool": "jq", "version": "1.8.2" }]), "{cmd:?}");
+        assert!(error["hint"].as_str().unwrap().contains("stack install"), "{error}");
+        assert!(!ran.exists(), "{cmd:?}: the unpinned jq ran");
+    }
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", "jq --version"] }))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["code"], "tools_not_installed", "{}", results[0]);
+    assert!(!ran.exists(), "MCP: the unpinned jq ran");
+    // A task is still handed to `mise run`, which installs what its configuration names.
+    assert_eq!(String::from_utf8_lossy(&fixture.ok(&["run", "q"]).stdout), "q|");
+
+    fixture.ok(&["install"]);
+    let out = fixture.ok(&["--json", "exec", "--", "sh", "-c", "jq --version"]);
+    assert_eq!(json_result(&out)["data"]["exit_code"], 0);
+    // What mise was asked: the pin as stack.lock records it, from a scratch root.
+    let ls = fs::read_to_string(fixture.dir.path().join("ls.log")).unwrap();
+    assert!(ls.contains("jq = \"1.8.2\"") && !ls.contains(&format!("dir={}", fixture.dir.path().join("app").canonicalize().unwrap().display())), "{ls}");
+}
+
+#[test]
 fn project_overrides_change_the_session_generation_even_when_bundle_pins_do_not() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);
@@ -369,6 +399,7 @@ fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
     let fixture = Fixture::with_bundle(
         "[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n[services.redis]\npreset='redis'\n",
     );
+    fixture.ok(&["install"]);
     // The caller's own values must not leak through either, whether poisoned or removed.
     let caller = [
         ("DATABASE_URL", "postgresql://caller@localhost:5432/caller"),
@@ -593,6 +624,7 @@ fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing()
     // and unrelated ones still pass through untouched.
     let fixture =
         Fixture::with_bundle("[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n");
+    fixture.ok(&["install"]);
     let check_withheld = |context: &str| {
         let seen = dumped(&fixture);
         assert_eq!(seen["UNRELATED_RAW"], unrelated, "{context}");
@@ -709,6 +741,7 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
     let fixture =
         Fixture::with_bundle("[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n");
     let listeners = Listeners::start();
+    fixture.ok(&["install"]);
     let (port, dir) = (
         listeners.port.to_string(),
         listeners.socket_dir.path().display().to_string(),
@@ -3160,6 +3193,7 @@ fn stacks_without_mr_boxington_never_ask_for_the_provider_release() {
 fn exec_finds_cargo_through_the_wrapper_mise_puts_first_and_run_passes_through() {
     let fixture = Fixture::with_bundle(RUST_MBX);
     let wrappers = fixture.dir.path().join("command-wrappers/bin");
+    fixture.ok(&["install"]);
     fs::create_dir_all(&wrappers).unwrap();
     fs::write(wrappers.join("cargo"), "#!/bin/sh\necho \"wrapped cargo $*\"\n").unwrap();
     fs::set_permissions(wrappers.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -3222,6 +3256,7 @@ fn secrets_fixture(extra: &str) -> Fixture {
     )
     .unwrap();
     fixture.ok(&["compile"]);
+    fixture.ok(&["install"]);
     fixture
 }
 
@@ -3891,11 +3926,19 @@ fn only_the_fnox_release_stack_lock_pins_is_run() {
     refused("link out of the pinned directory", "not_pinned");
     fs::remove_file(pinned_bins.join("fnox")).unwrap();
     std::os::unix::fs::symlink(root.join("installs/fnox/1.39.0/fnox"), pinned_bins.join("fnox")).unwrap();
-    // The pinned release is not installed, or not on PATH at all.
+    // The pinned release is not installed: exec refuses before any secret is looked up.
+    let not_installed = |context: &str| {
+        let (envelope, text, _) = json_run(&fixture, &["exec", "--secret", "DEPLOY_KEY", "--", "true"]);
+        assert_eq!(envelope["error"]["code"], "tools_not_installed", "{context}: {text}");
+        assert_eq!(envelope["error"]["details"], json!([{ "tool": "fnox", "version": "1.39.0" }]), "{context}: {text}");
+        assert!(!root.join("impostor-ran").exists(), "{context}: the impostor ran");
+        assert!(fnox_log(&fixture).is_empty(), "{context}");
+    };
     installed(&fixture, &[("1.39.0", false), ("1.38.0", true)]);
-    refused("not installed", "not_installed");
+    not_installed("not installed");
     installed(&fixture, &[("1.38.0", true)]);
-    refused("only another release installed", "not_installed");
+    not_installed("only another release installed");
+    // Or not on PATH at all.
     installed(&fixture, &[("1.39.0", true)]);
     path_first(&fixture, &root.join("nowhere"));
     refused("not on PATH", "not_on_path");

@@ -13,6 +13,7 @@ use crate::artifacts;
 use crate::ports;
 use crate::project::{self, Options, Report};
 use crate::provider::mise::{self, DaemonStatus};
+use crate::provider::scratch;
 pub use crate::provider::task_config::TaskConfig;
 use crate::secrets::{self, Grant};
 use crate::source::Mode;
@@ -2030,6 +2031,23 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         }
     };
     secrets::validate(&grant.keys, &report.stack, origin)?;
+    let required: Vec<&String> = match require {
+        Require::Nothing => Vec::new(),
+        Require::All => report.stack.services.keys().collect(),
+        Require::Only(names) => names.iter().collect(),
+    };
+    for name in &required {
+        if !report.stack.services.contains_key(*name) {
+            return Err(unknown_service(&report, name));
+        }
+    }
+    // A pin that is not installed leaves its directory off the provider's PATH, and the
+    // command (or anything it starts) would find whatever release is next on PATH. A task is
+    // left to `mise run`, which installs what its configuration names.
+    if let Target::Command { .. } = target {
+        require_installed(ctx, &report)?;
+        timings.mark("installed");
+    }
     mise::trust(&ctx.root)?;
     timings.mark("trust");
     let (mut env, checks) = if report.stack.services.is_empty() {
@@ -2063,16 +2081,6 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         env.extend(config.env());
     }
 
-    let required: Vec<&String> = match require {
-        Require::Nothing => Vec::new(),
-        Require::All => report.stack.services.keys().collect(),
-        Require::Only(names) => names.iter().collect(),
-    };
-    for name in &required {
-        if !report.stack.services.contains_key(*name) {
-            return Err(unknown_service(&report, name));
-        }
-    }
     let unavailable: Vec<Value> = checks
         .iter()
         .filter(|c| !c.ready && required.contains(&&c.service))
@@ -2209,6 +2217,23 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         redactor,
         task_config,
     })
+}
+
+/// Every release stack.lock pins is installed, as mise reports it, or `tools_not_installed`
+/// naming the ones that are not. Nothing is installed here.
+fn require_installed(ctx: &Ctx, report: &Report) -> Result<()> {
+    let pins = report.lock.as_ref().map(scratch::pins).unwrap_or_default();
+    let missing = scratch::not_installed(&ctx.cache, &pins)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = missing.iter().map(|p| format!("{}@{}", p.tool, p.spec.version)).collect();
+    Err(StackError::new(
+        "tools_not_installed",
+        format!("pinned release(s) not installed: {}", names.join(", ")),
+    )
+    .hint("run `stack install`; exec does not fall back to another release on PATH")
+    .details(missing.iter().map(|p| json!({ "tool": p.tool, "version": p.spec.version })).collect()))
 }
 
 /// The grant's values from the fnox release stack.lock pins, validated against everything this
