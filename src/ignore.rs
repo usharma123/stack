@@ -57,17 +57,26 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
     // (`./a//b` is `a/b`) is where the links are.
     if let Some(dir) = skills_dir.and_then(|dir| crate::skills::validate_dir(dir).ok()).filter(|dir| contained(root, dir, &mut warnings)) {
         let dir = root.join(dir);
-        let links = crate::skills::linked(&dir);
-        let registry = std::fs::symlink_metadata(dir.join(crate::skills::REGISTRY)).is_ok();
-        let mut entries: Vec<String> = Vec::new();
-        if registry {
-            entries.push(crate::skills::REGISTRY.to_string());
+        match crate::skills::linked(&dir) {
+            Ok(links) => {
+                let mut entries: Vec<String> = Vec::new();
+                if std::fs::symlink_metadata(dir.join(crate::skills::REGISTRY)).is_ok() {
+                    entries.push(crate::skills::REGISTRY.to_string());
+                }
+                entries.extend(links);
+                planned.add(dir, entries);
+            }
+            // Which links are stack's is unknown: its file there, if any, is kept as it is.
+            Err(why) => {
+                warnings.push(format!("{why}; its .gitignore there was left as it is"));
+                planned.keep(dir);
+            }
         }
-        entries.extend(links);
-        planned.add(dir, entries);
     }
     for (dir, entries) in planned.0 {
-        warnings.extend(own(root, &dir, &entries));
+        if !planned.1.iter().any(|kept| same_dir(kept, &dir)) {
+            warnings.extend(own(root, &dir, &entries));
+        }
     }
     (!warnings.is_empty()).then(|| warnings.join("; "))
 }
@@ -75,10 +84,15 @@ pub fn update(root: &Path, skills_dir: Option<&str>) -> Option<String> {
 /// The entries of each directory's `.gitignore`, one per physical directory: a skills dir
 /// that is also the provider directory (`.config/mise`, or the same directory named otherwise
 /// on a case-insensitive file system) gets one file naming both, never one replacing the other.
+/// Directories whose file is kept as it is are listed second.
 #[derive(Default)]
-struct Planned(Vec<(PathBuf, Vec<String>)>);
+struct Planned(Vec<(PathBuf, Vec<String>)>, Vec<PathBuf>);
 
 impl Planned {
+    fn keep(&mut self, dir: PathBuf) {
+        self.1.push(dir);
+    }
+
     fn add(&mut self, dir: PathBuf, entries: Vec<String>) {
         match self.0.iter_mut().find(|(other, _)| same_dir(other, &dir)) {
             Some((_, held)) => {

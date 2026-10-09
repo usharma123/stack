@@ -738,10 +738,11 @@ pub(crate) fn real_dir(root: &Path, dir: &Path, create: bool) -> std::result::Re
 /// The link names stack recorded in `dir`'s registry that are still its links: a symbolic
 /// link (never followed) pointing exactly where it was recorded. A name since removed,
 /// replaced (by a directory or file the user wrote, or a link of their own) or pointed
-/// elsewhere is not stack's. None when the registry cannot be read.
-pub fn linked(dir: &Path) -> Vec<String> {
-    let Ok(registry) = read_registry(dir) else { return Vec::new() };
-    registry
+/// elsewhere is not stack's. An error says why the registry cannot be read: what stack owns
+/// there is then unknown.
+pub fn linked(dir: &Path) -> std::result::Result<Vec<String>, String> {
+    let registry = read_registry(dir)?;
+    Ok(registry
         .links
         .into_iter()
         .filter(|(name, recorded)| {
@@ -750,7 +751,7 @@ pub fn linked(dir: &Path) -> Vec<String> {
                 && std::fs::read_link(&link).ok().as_ref() == Some(recorded)
         })
         .map(|(name, _)| name)
-        .collect()
+        .collect())
 }
 
 /// The ownership record, refusing anything stack cannot trust: a link (which could redirect a

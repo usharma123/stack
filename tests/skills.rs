@@ -609,6 +609,31 @@ fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both(
 }
 
 #[test]
+fn an_unreadable_skills_registry_keeps_stacks_ignore_file_as_it_is() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    f.json(&["install"]);
+    let ignore = app.join(".claude/skills/.gitignore");
+    let text = fs::read_to_string(&ignore).unwrap();
+    let registry = app.join(".claude/skills/.stack-skills.json");
+    let elsewhere = f.path("elsewhere.json");
+    fs::copy(&registry, &elsewhere).unwrap();
+    for (what, break_it) in [
+        ("malformed", Box::new(|| fs::write(&registry, "{ not json").unwrap()) as Box<dyn Fn()>),
+        ("link", Box::new(|| std::os::unix::fs::symlink(&elsewhere, &registry).unwrap())),
+    ] {
+        let _ = fs::remove_file(&registry);
+        break_it();
+        let out = f.command_at(&app, &["--json", "compile"]).output().unwrap();
+        assert!(out.status.success(), "{what}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("left as it is"), "{what}: a warning says why");
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), text, "{what}: stack's file is kept");
+        assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new(), "{what}");
+    }
+}
+
+#[test]
 fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");
