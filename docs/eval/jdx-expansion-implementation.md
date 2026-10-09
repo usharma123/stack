@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and remediation are integrated; Astra round 3 is in progress.
+Status: all routes and remediation are integrated; final Linux validation and Astra round 4 are in progress.
 
 ## Scope and base
 
@@ -411,3 +411,10 @@ identity probes, occupied-port recovery, and locked install without a session. T
 native state and this run's registry were removed. Logs: `/tmp/stack-jdx-r3-rust.log`,
 `stack-jdx-r3-clippy.log`, `stack-jdx-r3-node.log`, `stack-jdx-r3-boundary.log`, and
 `stack-jdx-r3-native-all.log`. Linux final validation and Astra round 3 remain pending.
+
+### Review capacity interruption
+
+Astra round 3 stopped with the provider error `Selected model is at capacity`, before a
+technical verdict. Its incomplete task and nested work were stopped. A fresh round 4 reviews
+the same `06dc7c3` implementation with the full original brief, prior reviews, implementer
+responses, and current validation receipts. No sign-off is inferred from the interrupted run.
