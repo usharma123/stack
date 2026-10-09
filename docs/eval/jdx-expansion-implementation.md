@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and remediation are integrated; final Linux validation and Astra round 4 are in progress.
+Status: all routes and remediation are integrated; final Linux validation passed and Astra round 4 is in progress.
 
 ## Scope and base
 
@@ -418,3 +418,25 @@ Astra round 3 stopped with the provider error `Selected model is at capacity`, b
 technical verdict. Its incomplete task and nested work were stopped. A fresh round 4 reviews
 the same `06dc7c3` implementation with the full original brief, prior reviews, implementer
 responses, and current validation receipts. No sign-off is inferred from the interrupted run.
+
+### Final Linux ARM64 and Alpine validation
+
+At exact `06dc7c3`, Linux ARM64 passed all 386 Rust tests and the release build. Real mise
+2026.9.18 passed native scenarios 1 and 10, sixteen remediation probes, and the public-API
+saved-task proof with pinned Python, old/new bodies, project roots, arguments, bundle PATH,
+private snapshot permissions and cleanup. Actual GNU Bun/Node execution and preservation of
+all nine generated Bun variant tables passed. Source mounts were read-only and the checkout
+remained clean. Report: `/tmp/jdx-linux-06dc7c3.8u7no276/REPORT.md`.
+
+An additional custom static ARM64 Stack build ran on actual Alpine 3.20.10 with official
+mise 2026.9.18 musl. Required Node coverage correctly refused the missing
+`linux-arm64-musl` entry before mutation or execution; a Bun-only required fixture installed
+and executed the real musl artifact. This adds native musl evidence, but establishes neither
+non-AVX2 execution nor four-platform installation.
+
+The validator retained three corrected harness failures and their original logs. Its first
+cleanup assertion found dangling tracked-config links into removed resolution/locking
+scratch roots; task-snapshot links were cleaned correctly. This broader scratch cleanup
+issue was sent to Astra for assessment. The musl build also emitted a `libc::time_t`
+deprecation warning; no musl strict-Clippy pass is claimed. All owned containers and the
+Cargo volume were removed, with other resources untouched.
