@@ -659,7 +659,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     steps.ok("gc", json!({ "reaped": reaped.len() }));
 
     let _guard = project_lock(&ctx.state, &ctx.root).map_err(|e| steps.clone().fail("lock", e, false))?;
-    let previous = load(ctx)?;
+    let mut previous = load(ctx)?;
+    if let Some(session) = previous.as_mut() {
+        settle_executions(ctx, session).map_err(|e| steps.clone().fail("session", e, false))?;
+    }
+    let previous = previous;
     if previous.as_ref().is_some_and(has_active_executions) {
         return Err(steps.fail(
             "session",
@@ -968,6 +972,7 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     let mut session = load(ctx)?.ok_or_else(|| {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
+    settle_executions(ctx, &mut session)?;
     if has_active_executions(&session) {
         return Err(StackError::new("session_busy", "commands are still executing in this session"));
     }
@@ -1413,6 +1418,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
 
     remove_if_exists(&ctx.session_file())?;
     remove_if_exists(&ctx.index_file())?;
+    remove_dir_if_exists(&completions_dir(&ctx.state, &ctx.root))?;
     // Everything stack owned is gone, so whatever still answers on a reserved port is foreign.
     let pinned = pinned_ports(ctx);
     let conflicts = reserved
@@ -2241,7 +2247,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             lease.renewed_at = now();
         }
         let token = sha256_hex(format!("{:?}{}", Instant::now(), std::process::id()).as_bytes());
-        session.active_executions.retain(|_, pid| pid_alive(*pid));
+        let consumed = reconcile_executions(&ctx.state, &ctx.root, session);
         session
             .active_executions
             .insert(token.clone(), std::process::id());
@@ -2252,6 +2258,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             let _ = write_json(&ctx.index_file(), session);
             return Err(e);
         }
+        forget_completions(&consumed);
         execution = Some(ExecutionGuard {
             root: ctx.root.clone(),
             state: ctx.state.clone(),
@@ -2483,7 +2490,14 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         if !path.exists() {
             continue;
         }
-        let session: Session = read_json(&path)?;
+        let mut session: Session = read_json(&path)?;
+        let consumed = reconcile_executions(state, &ctx.root, &mut session);
+        // Saved only for a project still there: a save would recreate a deleted checkout's
+        // `.stack/`. A gone project's completion records go with its index.
+        if !consumed.is_empty() && project_gone(&session).is_none() {
+            save(&ctx, &session)?;
+            forget_completions(&consumed);
+        }
         // TTL describes idle time; an executing command is not idle. Owner death still
         // follows the explicit runner policy even if one of its commands has survived.
         let owner_dead = session
@@ -2494,7 +2508,7 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         let busy = !owner_dead && has_active_executions(&session);
         if let Some(reason) = project_gone(&session) {
             if !busy {
-                out.push(reclaim_gone(&path, session, reason));
+                out.push(reclaim_gone(state, &path, session, reason));
             }
             continue;
         }
@@ -2528,7 +2542,7 @@ fn project_gone(session: &Session) -> Option<&'static str> {
 /// Reconcile a gone project without signalling a daemon whose identity can be replaced.
 /// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
 /// their ownership record. Only confirmed terminal state permits releasing the record.
-fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
+fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
@@ -2542,7 +2556,7 @@ fn reclaim_gone(index: &Path, session: Session, reason: &str) -> GcEntry {
         }
     }
     if problems.is_empty() {
-        if let Err(e) = remove_if_exists(index) {
+        if let Err(e) = remove_if_exists(index).and_then(|()| remove_dir_if_exists(&completions_dir(state, &session.project))) {
             problems.push(e.to_string());
         }
     }
@@ -2784,6 +2798,87 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(crate::error::io_error(path.display(), e)),
+    }
+}
+
+/// A command that finished while another command held the project lock, so it could not
+/// remove its execution itself. Written without the lock; applied under it by the next
+/// lifecycle command, to this execution of this session only.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Completion {
+    session: String,
+    token: String,
+    pid: u32,
+    completed_at: u64,
+}
+
+/// Where a project's completion records are: `<state>/completed/<project key>/<token>.json`.
+fn completions_dir(state: &Path, root: &Path) -> PathBuf {
+    state.join("completed").join(project_key(root))
+}
+
+/// An execution token as [`plan`] makes it: a SHA-256 in lowercase hex.
+fn is_token(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Under the project lock: forget executions whose coordinator died, and those whose
+/// completion record names this session, the token and the PID recorded for it, renewing the
+/// lease to when each finished. Returns the records applied; the caller removes them only
+/// once a record without those executions is saved, so a crash in between applies them again.
+/// A record that can never apply (another generation's, or for a token no longer recorded)
+/// is removed; one stack did not write (another name, unreadable, naming another token) is
+/// left alone and never applied.
+fn reconcile_executions(state: &Path, root: &Path, session: &mut Session) -> Vec<PathBuf> {
+    session.active_executions.retain(|_, pid| pid_alive(*pid));
+    let Ok(entries) = fs::read_dir(completions_dir(state, root)) else { return Vec::new() };
+    let mut consumed = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        let Some(token) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".json")).filter(|t| is_token(t)) else {
+            continue;
+        };
+        let Ok(completion) = fs::read(&path).map_err(drop).and_then(|b| serde_json::from_slice::<Completion>(&b).map_err(drop)) else {
+            continue;
+        };
+        if completion.token != token {
+            continue;
+        }
+        let recorded = session.active_executions.get(token).copied();
+        if completion.session == session.id && recorded == Some(completion.pid) {
+            session.active_executions.shift_remove(token);
+            if let Some(lease) = session.lease.as_mut() {
+                lease.renewed_at = lease.renewed_at.max(completion.completed_at);
+            }
+            consumed.push(path);
+        } else if completion.session != session.id || recorded.is_none() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    consumed
+}
+
+fn forget_completions(consumed: &[PathBuf]) {
+    for path in consumed {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// [`reconcile_executions`] for a decision that may not save otherwise: the record is saved
+/// when a completion applied, then the completions are removed.
+fn settle_executions(ctx: &Ctx, session: &mut Session) -> Result<()> {
+    let consumed = reconcile_executions(&ctx.state, &ctx.root, session);
+    if !consumed.is_empty() {
+        save(ctx, session)?;
+        forget_completions(&consumed);
+    }
+    Ok(())
+}
+
 fn has_active_executions(session: &Session) -> bool {
     session
         .active_executions
@@ -2924,6 +3019,7 @@ fn changed_since(root: &Path, watch: &[String], started_at_ms: u64) -> (Vec<Stri
 
 /// An execution is registered under the lifecycle lock and removed at command completion.
 /// A crashed coordinator is ignored by GC through its PID, without a background heartbeat.
+/// One whose removal cannot have the lock in time leaves a [`Completion`] instead.
 pub struct ExecutionGuard {
     root: PathBuf,
     state: PathBuf,
@@ -2942,8 +3038,24 @@ impl Drop for ExecutionGuard {
             cache: PathBuf::new(),
             state: self.state.clone(),
         };
-        let Ok(_guard) = project_lock(&ctx.state, &ctx.root) else {
-            return;
+        let completed_at = now();
+        let _guard = match project_lock(&ctx.state, &ctx.root) {
+            Ok(guard) => guard,
+            // Another command holds the lock past the grace: the next lifecycle command
+            // applies this record. Without it the execution stays recorded (and the session
+            // busy) while this process lives.
+            Err(e) if e.code == "lock_busy" => {
+                let completion = Completion { session: self.session_id.clone(), token: self.token.clone(), pid: std::process::id(), completed_at };
+                let path = completions_dir(&ctx.state, &ctx.root).join(format!("{}.json", self.token));
+                if let Err(e) = write_json(&path, &completion) {
+                    eprintln!("stack: cannot record that this command finished: {e}");
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("stack: cannot finish execution lease: {e}");
+                return;
+            }
         };
         let Ok(Some(mut session)) = load(&ctx) else {
             return;
@@ -2953,7 +3065,7 @@ impl Drop for ExecutionGuard {
         }
         session.active_executions.shift_remove(&self.token);
         if let Some(lease) = session.lease.as_mut() {
-            lease.renewed_at = now();
+            lease.renewed_at = completed_at;
         }
         if let Err(e) = save(&ctx, &session) {
             eprintln!("stack: cannot finish execution lease: {e}");
@@ -2976,6 +3088,49 @@ fn lock_digest(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_completion_applies_only_to_the_execution_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("app"));
+        let dir = completions_dir(&state, &root);
+        fs::create_dir_all(&dir).unwrap();
+        let token = |c: char| c.to_string().repeat(64);
+        let me = std::process::id();
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        for t in ['1', '2', '4', '6'] {
+            session.active_executions.insert(token(t), me);
+        }
+        let write = |name: &str, session: &str, token: &str, pid: u32| {
+            write_json(&dir.join(name), &Completion { session: session.into(), token: token.into(), pid, completed_at: 500 }).unwrap();
+        };
+        let json = |t: char| format!("{}.json", token(t));
+        write(&json('1'), "s1", &token('1'), me); // applies
+        write(&json('2'), "s1", &token('2'), me + 1); // another process's PID: never applies
+        write(&json('3'), "s1", &token('3'), me); // no longer recorded: removed
+        write(&json('5'), "s0", &token('5'), me); // another generation's: removed
+        write(&json('4'), "s1", &token('6'), me); // names another token: left alone
+        fs::write(dir.join(json('6')), "{ not json").unwrap(); // unreadable: left alone
+        write("short.json", "s1", "short", me); // not a token's name: left alone
+        write(&json('7').to_uppercase(), "s1", &token('7').to_uppercase(), me); // nor this
+        let consumed = reconcile_executions(&state, &root, &mut session);
+        assert_eq!(consumed, [dir.join(json('1'))]);
+        assert_eq!(session.active_executions.keys().cloned().collect::<Vec<_>>(), [token('2'), token('4'), token('6')]);
+        assert_eq!(session.lease.as_ref().unwrap().renewed_at, 500, "renewed to when it finished");
+        forget_completions(&consumed);
+        let mut left: Vec<String> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        let mut expected = vec![json('2'), json('4'), json('6'), json('7').to_uppercase(), "short.json".to_string()];
+        expected.sort();
+        assert_eq!(left, expected);
+        // A record whose PID does not match is removed once its token is no longer recorded,
+        // and a lease is never moved back.
+        session.active_executions.shift_remove(&token('2'));
+        session.lease.as_mut().unwrap().renewed_at = 900;
+        assert!(reconcile_executions(&state, &root, &mut session).is_empty());
+        assert!(!dir.join(json('2')).exists());
+        assert_eq!(session.lease.as_ref().unwrap().renewed_at, 900);
+    }
 
     #[test]
     fn an_expired_startup_reports_timed_out_with_the_cut_short_step_and_its_progress() {

@@ -131,7 +131,11 @@ output (mise's answer when no release matches) is an error, not a version.
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.
   Commands register active executions before releasing the lifecycle lock and renew on
-  completion. GC ignores TTL expiry while a coordinator is alive. An explicit runner-death
+  completion. A command that cannot take the lock to finish leaves an atomic completion record
+  naming its session, token and PID, written without the lock; every lifecycle decision under
+  the lock (`up`, `restart`, `exec`, GC) applies the records matching all three first, and
+  removes them only after the record without those executions is saved. GC does not save for a
+  deleted project; `down` and GC's reclaim remove the project's records with its index. GC ignores TTL expiry while a coordinator is alive. An explicit runner-death
   policy still takes precedence over a surviving command.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires

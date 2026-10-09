@@ -444,6 +444,187 @@ fn a_timed_out_command_releases_its_execution_even_while_the_project_is_locked()
     assert_eq!(results[1]["structuredContent"]["ok"], true, "{}", results[1]);
 }
 
+/// One interactive `stack mcp` server: each call is answered before the next is sent.
+struct Server {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+    app: std::path::PathBuf,
+    id: u32,
+}
+
+impl Server {
+    fn start(fixture: &Fixture) -> Self {
+        let mut child = fixture.command(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = std::io::BufReader::new(child.stdout.take().unwrap());
+        Server { child, input, output, app: fixture.dir.path().join("app"), id: 0 }
+    }
+
+    fn call(&mut self, name: &str, mut args: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.id += 1;
+        args["dir"] = json!(self.app);
+        writeln!(self.input, "{}", json!({"jsonrpc":"2.0","id":self.id,"method":"tools/call","params":{"name":name,"arguments":args}})).unwrap();
+        let mut line = String::new();
+        self.output.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()["result"]["structuredContent"].clone()
+    }
+
+    fn close(self) {
+        let Server { mut child, input, .. } = self;
+        drop(input);
+        assert!(child.wait().unwrap().success());
+    }
+}
+
+fn read_value(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// Wait until `session_file` records an execution, then hold the project lock for `hold`.
+fn hold_project_lock_once_executing(state: &Path, app: &Path, session_file: &Path, hold: Duration) -> thread::JoinHandle<()> {
+    let (state, app, session_file) = (state.to_path_buf(), app.to_path_buf(), session_file.to_path_buf());
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+            assert!(Instant::now() < deadline, "execution never registered");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _lock = stack::state::project_lock(&state, &app).unwrap();
+        thread::sleep(hold);
+    })
+}
+
+/// This fixture's completion records: `state/completed/<project key>/`.
+fn completions(fixture: &Fixture) -> std::path::PathBuf {
+    let index = fixture.session_paths().pop().unwrap();
+    fixture.dir.path().join("state/completed").join(index.file_stem().unwrap())
+}
+
+#[test]
+fn a_timed_out_command_whose_release_outwaits_its_grace_still_frees_the_session() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let state = fixture.dir.path().join("state");
+    let session_file = app.join(".stack/session.json");
+    let records = completions(&fixture);
+    // Another command holds the project lock for longer than the release waits for it.
+    let holder = hold_project_lock_once_executing(&state, &app, &session_file, Duration::from_secs(12));
+    let mut server = Server::start(&fixture);
+    let started = Instant::now();
+    let result = server.call("stack_exec", json!({ "command": ["sleep", "30"], "timeout_secs": 1 }));
+    let elapsed = started.elapsed();
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    assert!(elapsed < Duration::from_secs(12), "the call stays bounded: {elapsed:?}");
+    // While the lock is still held: the execution is recorded, with a record that it finished.
+    let recorded = read_value(&session_file)["active_executions"].clone();
+    let (token, pid) = recorded.as_object().unwrap().iter().next().unwrap_or_else(|| panic!("{recorded}"));
+    let completion = read_value(&records.join(format!("{token}.json")));
+    assert_eq!(completion["token"], json!(token));
+    assert_eq!(completion["pid"], *pid);
+    assert_eq!(completion["pid"], server.child.id());
+    assert_eq!(completion["session"], read_value(&session_file)["id"]);
+    holder.join().unwrap();
+    // Neither another process, while the server lives, nor the same server sees it as busy.
+    let out = fixture.command(&["--json", "up"]).output().unwrap();
+    assert_eq!(json_result(&out)["ok"], true, "another process: {}", String::from_utf8_lossy(&out.stdout));
+    let result = server.call("stack_up", json!({}));
+    assert_eq!(result["ok"], true, "the same server: {result}");
+    assert_eq!(read_value(&session_file)["active_executions"], json!({}));
+    assert_eq!(fs::read_dir(&records).unwrap().count(), 0, "the applied record is removed");
+    server.close();
+    fixture.ok(&["down"]);
+    assert!(!records.exists(), "down removes the project's completion records");
+}
+
+/// Record `token` as executing for this (live) test process, in both session files.
+fn record_execution(fixture: &Fixture, token: &str, renewed_at: Option<u64>) -> Value {
+    let mut session = read_value(&fixture.session_paths().pop().unwrap());
+    session["active_executions"][token] = json!(std::process::id());
+    if let Some(at) = renewed_at {
+        session["lease"]["renewed_at"] = json!(at);
+    }
+    for path in fixture.session_paths() {
+        if path.parent().unwrap().exists() {
+            fs::write(&path, session.to_string()).unwrap();
+        }
+    }
+    session
+}
+
+/// The completion record that execution would have left.
+fn complete(fixture: &Fixture, session: &Value, token: &str, completed_at: u64) -> std::path::PathBuf {
+    let dir = completions(fixture);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{token}.json"));
+    let record = json!({ "session": session["id"], "token": token, "pid": std::process::id(), "completed_at": completed_at });
+    fs::write(&path, record.to_string()).unwrap();
+    path
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+#[test]
+fn a_finished_execution_is_settled_and_a_running_one_still_keeps_the_session_busy() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let session_file = fixture.dir.path().join("app/.stack/session.json");
+    // Another process's command, still running.
+    let mut running = fixture.command(&["exec", "--", "sleep", "4"]).stdout(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+        assert!(Instant::now() < deadline, "execution never registered");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let other = read_value(&session_file)["active_executions"].as_object().unwrap().keys().next().unwrap().clone();
+    // And one that finished but could not remove itself.
+    let done = "d".repeat(64);
+    let session = record_execution(&fixture, &done, None);
+    let record = complete(&fixture, &session, &done, unix_now());
+    let out = fixture.command(&["--json", "up"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "session_busy", "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(read_value(&session_file)["active_executions"], json!({ other.clone(): running.id() }), "only the finished one is forgotten");
+    assert!(!record.exists());
+    assert!(running.wait().unwrap().success());
+    fixture.ok(&["up"]);
+}
+
+#[test]
+fn gc_applies_a_completion_renewing_the_lease_and_reclaims_a_deleted_project_it_unblocks() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "30s"]);
+    let index = fixture.session_paths().pop().unwrap();
+    let token = "e".repeat(64);
+    // Idle long past the TTL by the record, but its command finished just now.
+    let session = record_execution(&fixture, &token, Some(unix_now() - 120));
+    let finished = unix_now();
+    let record = complete(&fixture, &session, &token, finished);
+    let out = fixture.ok(&["gc", "--json"]);
+    assert_eq!(json_result(&out)["data"], json!([]), "the lease counts from when the command finished");
+    let saved = read_value(&index);
+    assert_eq!(saved["active_executions"], json!({}));
+    assert!(saved["lease"]["renewed_at"].as_u64().unwrap() >= finished, "{saved}");
+    assert!(!record.exists());
+
+    // A deleted project whose only execution finished is reclaimed, not kept as busy, and
+    // nothing recreates the directory.
+    let session = record_execution(&fixture, &token, None);
+    let record = complete(&fixture, &session, &token, unix_now());
+    let app = fixture.dir.path().join("app");
+    fs::remove_dir_all(&app).unwrap();
+    let (ok, result) = fixture.gc(&[]);
+    assert!(ok, "{result}");
+    let reclaimed = result["data"].clone();
+    assert_eq!(reclaimed[0]["reason"], "project directory deleted", "{reclaimed}");
+    assert_eq!(reclaimed[0]["stopped"], true, "{reclaimed}");
+    assert!(!index.exists() && !record.parent().unwrap().exists());
+    assert!(!app.exists(), "gc recreated the deleted project");
+}
+
 #[test]
 fn active_exec_protects_ttl_until_completion_then_the_session_can_expire() {
     let fixture = Fixture::new();
