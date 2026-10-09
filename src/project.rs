@@ -348,6 +348,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     }
 
     let stack = compose(&loaded, &project)?;
+    reserved_env(&stack)?;
     let probed = probed_services(&stack)?;
     let (tools, services, mut versions) = lock_versions(&stack, previous.as_ref(), opts)?;
     let mut new_lock = Lockfile::new(locked, tools.clone(), services.clone());
@@ -441,6 +442,19 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         provider_skills: None,
         skills_dir: project.skills.map(|s| s.dir),
     })
+}
+
+/// `STACK_SESSION` is stack's: `run` and `exec` set it to the session's id and remove it when
+/// there is none, so a declared value would be overridden or left dangling.
+fn reserved_env(stack: &Composed) -> Result<()> {
+    match stack.env.get("STACK_SESSION") {
+        Some(e) => Err(StackError::new(
+            "invalid_env",
+            format!("env.STACK_SESSION ({}) is reserved; stack sets it to the running session's id", e.origin),
+        )
+        .hint("remove STACK_SESSION from [env]; tasks and `stack exec` receive it while a session is up")),
+        None => Ok(()),
+    }
 }
 
 /// Services with identity probes. Their token variables must not collide with each other or

@@ -90,9 +90,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   are the ones evaluated against the project's own generated file when the task was planned,
   so a value built from `{{config_source}}` names the project's file, not the copy, and an
   explicit value such as `JAVA_HOME` or `GOROOT` still takes precedence over the one a tool
-  sets, as it does for `exec`. The copy declares each value the task already receives by name
-  (`{{ env["JAVA_HOME"] }}`), never the value itself, and keeps tools, `_.path` and tasks,
-  which mise applies as usual. `PATH`, and a variable whose name has characters other than
+  sets, as it does for `exec`. Tasks and `exec` receive `STACK_SESSION`, the running session's
+  id, only while a session exists; an `[env]` that declares it is refused with `invalid_env`
+  before anything is written or run. The copy declares each value the task already receives
+  by name (`{{ env["JAVA_HOME"] }}`), never the value itself, and keeps tools, `_.path` and
+  tasks, which mise applies as usual. `PATH`, and a variable whose name has characters other than
   letters, digits, `_`, `-` and `.`, are left out of the copy and simply inherited. A template
   such as `{{exec(...)}}` is evaluated once, when the task is planned. The copy is kept in
   a private directory under stack's cache and removed when the task ends, fails to plan or times

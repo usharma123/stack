@@ -2716,6 +2716,45 @@ fn run_hands_a_declared_task_to_mise_without_its_daemon_startup() {
 }
 
 #[test]
+fn tasks_get_the_real_session_or_none_and_a_declared_stack_session_is_refused_first() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.showenv]\nrun='env'\n");
+    let show = "printf '%s' \"${STACK_SESSION-unset}\"";
+    let session_of = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("STACK_SESSION=").map(str::to_string))
+    };
+
+    // No session: neither exec nor a task receives one, and the task still runs.
+    assert_eq!(String::from_utf8_lossy(&fixture.ok(&["exec", "--", "sh", "-c", show]).stdout), "unset");
+    assert_eq!(session_of(&fixture.ok(&["run", "showenv"])), None);
+
+    // A session: both receive its id.
+    let up = json_result(&fixture.ok(&["--json", "up"]));
+    let id = up["data"]["session"]["id"].as_str().unwrap().to_string();
+    assert_eq!(String::from_utf8_lossy(&fixture.ok(&["exec", "--", "sh", "-c", show]).stdout), id);
+    assert_eq!(session_of(&fixture.ok(&["run", "showenv"])).as_deref(), Some(id.as_str()));
+    fixture.ok(&["down"]);
+
+    // Declaring it is refused before mise is asked for anything.
+    fs::write(
+        fixture.dir.path().join("app/stack.toml"),
+        "[[use]]\nbundle='path:../bundle'\n[env]\nSTACK_SESSION='fixture'\n",
+    )
+    .unwrap();
+    let log = fixture.dir.path().join("mise.log");
+    let calls = fs::read_to_string(&log).unwrap();
+    for args in [&["--json", "run", "showenv"][..], &["--json", "exec", "--", "true"], &["--json", "compile"]] {
+        let out = fixture.command(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let error = &json_result(&out)["error"];
+        assert_eq!(error["code"], "invalid_env", "{args:?}: {error}");
+        assert!(error["message"].as_str().unwrap().contains("env.STACK_SESSION (project)"), "{error}");
+    }
+    assert_eq!(fs::read_to_string(&log).unwrap(), calls, "mise is never run");
+}
+
+#[test]
 fn run_refuses_while_any_service_is_unverified() {
     // Even a task that names no services: `mise run` would hand it every service's endpoint
     // again, including the ones stack withholds.

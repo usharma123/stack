@@ -753,6 +753,61 @@ fn identity_probes_are_validated() {
 }
 
 #[test]
+fn stack_session_is_reserved_in_every_env_layer_before_anything_is_written() {
+    let sb = Sandbox::new();
+    let uses = sb.path_bundle("b", "[bundle]\nname = \"b\"\n[env]\nSTACK_SESSION = \"fixture\"\n");
+    let clean = sb.path_bundle("c", "[bundle]\nname = \"c\"\n[env]\nMODE = \"dev\"\n");
+    let declared = [
+        ("[env]\nSTACK_SESSION = \"fixture\"\n[tasks.t]\nrun = \"printf ok\"\n".to_string(), "project"),
+        (uses.clone(), "bundle:b"),
+        (format!("{uses}[override.env]\nSTACK_SESSION = \"mine\"\n"), "override"),
+        (format!("{clean}[override.env]\nSTACK_SESSION = \"mine\"\n"), "override"),
+    ];
+    let refused = |root: &Path, toml: &str, origin: &str, modes: &[(Mode, bool)]| {
+        fs::write(root.join("stack.toml"), toml).unwrap();
+        for (mode, write) in modes {
+            let err = compile(&sb.options(root, *mode, *write)).unwrap_err();
+            assert_eq!(err.code, "invalid_env", "{toml}");
+            assert!(err.message.contains("env.STACK_SESSION") && err.message.contains(origin), "{origin}: {}", err.message);
+            assert!(err.hint.as_deref().unwrap_or("").contains("remove STACK_SESSION"), "{err:?}");
+        }
+    };
+
+    // A fresh project: no lock, generated configuration or provider call.
+    let root = sb.project("");
+    for (toml, origin) in &declared {
+        refused(&root, toml, origin, &[(Mode::UseLock, true), (Mode::Update, true), (Mode::UseLock, false)]);
+        assert!(!root.join("stack.lock").exists(), "{toml}");
+        assert!(!mise::output_path(&root).exists(), "{toml}");
+        assert_eq!(sb.upstream.calls(), 0, "the provider is never asked for {toml}");
+    }
+
+    // A compiled project: locked operations (exec, run, up) and inspect refuse a declaration
+    // added to its layers, and nothing already generated changes. (A bundle new to stack.lock
+    // is refused as `lock_outdated` before composition.)
+    fs::write(root.join("stack.toml"), format!("{clean}[tasks.t]\nrun = \"printf ok\"\n")).unwrap();
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let lock_before = lock_text(&root);
+    let output_before = fs::read(mise::output_path(&root)).unwrap();
+    let calls = sb.upstream.calls();
+    for (toml, origin) in [
+        (format!("{clean}[env]\nSTACK_SESSION = \"fixture\"\n[tasks.t]\nrun = \"printf ok\"\n"), "project"),
+        (format!("{clean}[override.env]\nSTACK_SESSION = \"mine\"\n[tasks.t]\nrun = \"printf ok\"\n"), "override"),
+    ] {
+        refused(&root, &toml, origin, &[(Mode::Frozen, true), (Mode::UseLock, true), (stack::project::inspect_mode(&root), false)]);
+        assert_eq!(lock_text(&root), lock_before, "{toml}");
+        assert_eq!(fs::read(mise::output_path(&root)).unwrap(), output_before, "{toml}");
+        assert_eq!(sb.upstream.calls(), calls, "{toml}");
+    }
+
+    // Only the exact name is reserved; the session itself is still handed to tasks at run time.
+    fs::write(root.join("stack.toml"), "[env]\nSTACK_SESSION_LABEL = \"x\"\nSTACK_SESSIONS = \"y\"\n[tasks.t]\nrun = \"printf ok\"\n").unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(report.stack.env.contains_key("STACK_SESSION_LABEL"));
+    sb.compile(&root, Mode::Frozen).unwrap();
+}
+
+#[test]
 fn damaged_release_pins_fail_offline_without_rewriting_outputs() {
     let sb = Sandbox::new();
     let root = sb.project("[tools]\npython='3.13'\n");

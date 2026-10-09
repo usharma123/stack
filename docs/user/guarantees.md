@@ -73,7 +73,8 @@
 
 Stack provider commands use only the generated Stack mise configuration. Project, parent
 and global mise aliases cannot reinterpret locked releases. Put application variables and
-tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected.
+tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected, as
+is `STACK_SESSION`, which stack sets itself.
 Version resolution runs `mise latest` in a scratch provider root of its own under stack's
 cache, whose only configuration is the one tool and its options; nothing in the project's
 `[env]` or tasks is evaluated, and the root is removed afterwards. No scratch configuration is
