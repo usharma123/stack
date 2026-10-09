@@ -57,8 +57,12 @@ print(json.dumps(out))' "$REVIEW_FIXTURE"
     { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml; echo '--- seed'; cat .config/mise/mise.lock; } >>"$REVIEW_FIXTURE/lock.log"
     if test -f "$REVIEW_FIXTURE/mise-lock.toml"; then cp "$REVIEW_FIXTURE/mise-lock.toml" .config/mise/mise.lock; fi ;;
   'install --locked'|'install --yes')
-    # The rendered lock as the install saw it.
-    if test -f .config/mise/mise.lock; then cp .config/mise/mise.lock "$REVIEW_FIXTURE/rendered-at-install"; fi
+    # The configuration mise loads, as `run` below picks it, and the lock beside it as the
+    # install saw it: a task's copy when stack installs a task's tools from it.
+    config=$MISE_OVERRIDE_CONFIG_FILENAMES
+    test -f "$config" || config=$MISE_GLOBAL_CONFIG_FILE
+    echo "config=$config $*" >>"$REVIEW_FIXTURE/install.log"
+    if test -f "${config%/conf.d/*}/mise.lock"; then cp "${config%/conf.d/*}/mise.lock" "$REVIEW_FIXTURE/rendered-at-install"; fi
     if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi
     # Record what was installed: the named tools (every one when none is named), each at every
     # version the configuration gives it.
@@ -66,7 +70,7 @@ print(json.dumps(out))' "$REVIEW_FIXTURE"
     "$py" -c '
 import os, sys, tomllib
 try:
-    config = tomllib.load(open(".config/mise/conf.d/stack.toml", "rb"))
+    config = tomllib.load(open(sys.argv[2], "rb"))
 except FileNotFoundError:
     config = {}
 tools = {k: v if isinstance(v, list) else [v] for k, v in config.get("tools", {}).items()}
@@ -74,11 +78,11 @@ tools = {k: v if isinstance(v, list) else [v] for k, v in config.get("tools", {}
 for daemon in config.get("daemons", {}).values():
     if "preset" in daemon and "version" in daemon:
         tools.setdefault(daemon["preset"], []).append(daemon["version"])
-named = [a for a in sys.argv[2:] if not a.startswith("-")] or list(tools)
+named = [a for a in sys.argv[3:] if not a.startswith("-")] or list(tools)
 with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     for tool in named:
         for v in tools.get(tool, []):
-            f.write("%s@%s\n" % (tool, v["version"] if isinstance(v, dict) else v))' "$REVIEW_FIXTURE" "$@" ;;
+            f.write("%s@%s\n" % (tool, v["version"] if isinstance(v, dict) else v))' "$REVIEW_FIXTURE" "$config" "$@" ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
     echo 'mise WARN  mise version 2099.1.1 available' >&2

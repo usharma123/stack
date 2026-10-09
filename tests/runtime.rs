@@ -4368,9 +4368,62 @@ fn a_task_runs_against_the_lock_rendered_from_stack_lock_never_a_missing_or_stal
 }
 
 #[test]
-fn a_task_whose_tools_mise_refuses_gets_stacks_remedy_beside_mises_own_output() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n[tasks.fail]\nrun='false'\n");
-    let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: GitHub's current digest for jq matches this download (asset updated t1, release published t2), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n";
+fn a_tasks_missing_pins_install_from_its_copy_before_it_runs_and_a_warm_run_installs_nothing() {
+    let (fixture, _) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    let _ = fs::remove_file(dir.join("app/.config/mise/mise.lock"));
+    let before = mise_log(&fixture).len();
+    let data = json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"].clone();
+    assert_eq!(data["exit_code"], 0, "{data}");
+    let calls: Vec<String> = mise_log(&fixture)[before..].lines().filter(|l| l.starts_with("install") || l.starts_with("run")).map(|l| l.trim().to_string()).collect();
+    // stack install's split, before the task starts: checked pins locked, the rest plain.
+    assert_eq!(calls, ["install --locked --yes --quiet jq rust", "install --yes --quiet npm:prettier uv", "run --skip-deps --no-timings q --"], "{data}");
+    // From the task's copy, with the lock rendered from stack.lock beside it.
+    let install_log = fs::read_to_string(dir.join("install.log")).unwrap();
+    assert!(install_log.lines().all(|l| l.contains("/task-config/")), "{install_log}");
+    let expected = stack::artifacts::rendered(stack::lock::read(&dir.join("app")).unwrap().as_ref()).unwrap();
+    assert_eq!(fs::read_to_string(dir.join("rendered-at-install")).unwrap(), expected);
+    assert!(!dir.join("app/.config/mise/mise.lock").exists(), "the project's files are not written");
+    // Everything installed: only the installed query, beside the environment.
+    for route in ["cli", "mcp"] {
+        let before = mise_log(&fixture).len();
+        let data = match route {
+            "cli" => json_result(&fixture.command(&["--json", "run", "q"]).output().unwrap())["data"].clone(),
+            _ => fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"]["data"].clone(),
+        };
+        assert_eq!(data["exit_code"], 0, "{route}: {data}");
+        assert!(!mise_log(&fixture)[before..].lines().any(|l| l.starts_with("install") || l.starts_with("version")), "{route}");
+    }
+}
+
+#[test]
+fn a_task_whose_pins_mise_refuses_fails_with_stacks_remedy_before_it_runs() {
+    let (fixture, platform) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    let refusal = format!("mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on {platform} locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a\nActual:   sha256:11\nhint: GitHub's current digest for jq matches this download (asset updated t1, release published t2), so the expected checksum is out of date: the maintainer likely re-uploaded the asset. If you trust the new upload, update the checksum in mise.lock.\n");
+    fs::write(dir.join("install-locked-fail"), &refusal).unwrap();
+    let before = mise_log(&fixture).len();
+    let cli = fixture.command(&["--json", "run", "q"]).output().unwrap();
+    let mcp = fixture.mcp(&[("stack_run", json!({ "task": "q" }))], &[])[0]["structuredContent"].clone();
+    for e in [json_result(&cli)["error"].clone(), mcp["error"].clone()] {
+        assert_eq!(e["code"], "artifact_mismatch", "{e}");
+        assert_eq!(e["details"][0]["name"], "jq@1.7.1", "{e}");
+        assert!(e["hint"].as_str().unwrap().contains("stack compile --update"), "{e}");
+        assert!(!e.to_string().contains("update the checksum in mise.lock"), "{e}");
+    }
+    // In a terminal: stack's error, never mise's advice to edit the lock.
+    let terminal = fixture.command(&["run", "q"]).output().unwrap();
+    assert!(!terminal.status.success());
+    let text = format!("{}{}", String::from_utf8_lossy(&terminal.stdout), String::from_utf8_lossy(&terminal.stderr));
+    assert!(text.contains("artifact_mismatch") || text.contains("does not match stack.lock"), "{text}");
+    assert!(text.contains("stack compile --update") && !text.contains("mise.lock"), "{text}");
+    assert!(!mise_log(&fixture)[before..].contains("run --skip-deps"), "the task never started");
+}
+
+#[test]
+fn a_tasks_own_output_is_returned_as_it_wrote_it_and_never_read_for_refusals() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n");
+    let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: update the checksum in mise.lock.\n";
     fs::write(fixture.dir.path().join("run-refusal"), refusal).unwrap();
     for data in [
         json_result(&fixture.command(&["--json", "run", "refused"]).output().unwrap())["data"].clone(),
@@ -4378,14 +4431,8 @@ fn a_task_whose_tools_mise_refuses_gets_stacks_remedy_beside_mises_own_output() 
     ] {
         assert_eq!(data["exit_code"], 1, "{data}");
         assert_eq!(data["stderr"], refusal, "the task's output is not rewritten");
-        let warnings = data["warnings"].as_array().unwrap();
-        assert_eq!(warnings.len(), 1, "{data}");
-        let warning = warnings[0].as_str().unwrap();
-        assert!(warning.starts_with("artifact_mismatch: mise refused a download for jq@1.7.1 on macos-arm64") && warning.contains("do not edit it") && warning.contains("stack compile --update"), "{warning}");
+        assert!(data.get("warnings").is_none(), "{data}");
     }
-    // Other failures keep their usual shape.
-    let data = &json_result(&fixture.command(&["--json", "run", "fail"]).output().unwrap())["data"];
-    assert!(data.get("warnings").is_none(), "{data}");
 }
 
 #[test]

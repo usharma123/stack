@@ -36,8 +36,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   worktrees) without a session; `exec` then has the tools.
 - `exec` refuses with `tools_not_installed` (naming each release) when a release stack.lock
   pins is not installed, before anything runs, so neither the command nor anything it starts
-  can pick up another release from `PATH`. Run `stack install`. `run` leaves installation to
-  `mise run`, which installs what the task's configuration names.
+  can pick up another release from `PATH`. Run `stack install`. `run` installs a task's missing
+  pins itself before the task starts, from the task's configuration copy and the lock rendered
+  from stack.lock, with `install`'s checks and locked/plain split; a refused download is
+  `artifact_mismatch`, and the task does not run. With every pin installed nothing more is
+  asked of mise.
 - Errors from `up` that happen once its steps have begun end their `details` with a progress
   record, `{steps, retry_safe, changed}`; error-specific entries (such as each port conflict)
   come before it. Invalid arguments, an unreadable session, and a failed initial GC pass
@@ -235,7 +238,7 @@ the machine is not checked again.
 
 | Code | When |
 |---|---|
-| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected. `details` give `expected`, `actual` and `url`, and `upstream` when mise compared the asset with GitHub's digest; mise's own advice to edit `mise.lock` is left out, since stack renders that file from stack.lock. A task whose tools `mise run` fails to install this way keeps mise's output and gets the same remedy as an `artifact_mismatch` warning (captured runs only) |
+| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected. `details` give `expected`, `actual` and `url`, and `upstream` when mise compared the asset with GitHub's digest; mise's own advice to edit `mise.lock` is left out, since stack renders that file from stack.lock. `run` reports it the same way, before the task starts |
 | `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed. A pin `compile` just failed to lock usually has no artifact for that platform upstream: drop the platform, pin another release, or use `best-effort` |
 | `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read; nothing was changed |
 | `lock_invalid` | the embedded lock disagrees with the pins or is malformed; `compile --update` replaces it |

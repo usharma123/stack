@@ -543,8 +543,15 @@ pub fn configure_command(command: &mut Command, root: &Path) {
 
 /// A mise command, bounded by the caller's deadline (see `process::output`).
 fn mise(root: &Path, args: &[&str]) -> Result<Output> {
+    mise_with(root, args, &[])
+}
+
+/// [`mise`], with `overrides` set after the provider selection (to point mise at another
+/// configuration, such as a task's copy).
+fn mise_with(root: &Path, args: &[&str], overrides: &[(String, String)]) -> Result<Output> {
     let mut command = Command::new("mise");
     configure_command(&mut command, root);
+    command.envs(overrides.iter().map(|(k, v)| (k, v)));
     command.args(args)
         .current_dir(root)
         .env("MISE_YES", "1")
@@ -692,13 +699,18 @@ pub fn trust(root: &Path) -> Result<()> {
 /// A download mise refuses because it does not match the rendered lock is `artifact_mismatch`
 /// with what mise said parsed into details; any other failure is `install_failed`.
 pub fn install_tools(root: &Path, tools: &[String], locked: bool) -> Result<()> {
+    install_tools_with(root, &[], tools, locked)
+}
+
+/// [`install_tools`] with `overrides` naming the configuration (see [`mise_with`]).
+pub fn install_tools_with(root: &Path, overrides: &[(String, String)], tools: &[String], locked: bool) -> Result<()> {
     let mut args = vec!["install"];
     if locked {
         args.push("--locked");
     }
     args.extend(["--yes", "--quiet"]);
     args.extend(tools.iter().map(String::as_str));
-    let out = mise(root, &args)?;
+    let out = mise_with(root, &args, overrides)?;
     if out.status.success() {
         return Ok(());
     }

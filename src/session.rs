@@ -1133,6 +1133,14 @@ const INSTALL_BOUNDARY: &str = "mise checks the recorded checksum (and packslip 
 /// `.config/mise/mise.lock` rendered from stack.lock. The provider release was checked before
 /// the compile wrote anything (`Ctx::compile_to_install`).
 fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
+    let plan = install_plan(report)?;
+    artifacts::write_rendered(&ctx.root, report.lock.as_ref())?;
+    Ok(plan)
+}
+
+/// The artifact policy met on this platform, and how each tool installs here. Nothing is
+/// written.
+fn install_plan(report: &Report) -> Result<InstallPlan> {
     let platform = artifacts::current_platform();
     let policy = &report.artifact_policy;
     let pins = report.pins();
@@ -1154,7 +1162,6 @@ fn prepare_install(ctx: &Ctx, report: &Report) -> Result<InstallPlan> {
         }
     }
     let everything = report.stack.services.values().any(|e| e.value.preset.as_deref().is_some_and(|p| mise::preset_tool(p).is_none()));
-    artifacts::write_rendered(&ctx.root, report.lock.as_ref())?;
     Ok(InstallPlan { artifacts: artifacts::summary(lock, &pins, &platform), partition, everything })
 }
 
@@ -1983,7 +1990,8 @@ pub fn plan_exec_with(ctx: &Ctx, cmd: &[String], require: &Require, grant: &Gran
 /// The lock is released before the task runs, and an ordinary compile may then rewrite the
 /// generated configuration. `mise run` therefore reads a copy taken under the lock (see
 /// [`TaskConfig`]): the plan runs the body, env and tool pins it was planned and granted for,
-/// whatever is compiled while it waits or runs. Its `[env]` values are the ones planning read
+/// whatever is compiled while it waits or runs. Pins that are not installed are installed from
+/// that copy before the task starts (see [`install_task_tools`]). Its `[env]` values are the ones planning read
 /// from the project's own file, not evaluated again against the copy, and they still take
 /// precedence over the environment a tool sets.
 pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Result<ExecPlan> {
@@ -2054,16 +2062,16 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     // A pin that is not installed leaves its directory off the provider's PATH, and the
     // command (or anything it starts) would find whatever release is next on PATH. Asked while
     // the provider prepares the environment, and answered before anything runs on that PATH
-    // (identity probes included). A task is left to `mise run`, which installs what its
-    // configuration names.
-    let installed = matches!(target, Target::Command { .. }).then(|| {
+    // (identity probes included). A command is refused; a task's missing pins are installed
+    // from its configuration copy below, before it starts.
+    let installed = {
         let (cache, pins) = (ctx.cache.clone(), report.lock.as_ref().map(scratch::pins).unwrap_or_default());
         let deadline = crate::process::deadline();
         std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             scratch::not_installed(&cache, &pins)
         })
-    });
+    };
     let provided = mise::trust(&ctx.root).and_then(|()| {
         timings.mark("trust");
         if report.stack.services.is_empty() {
@@ -2072,8 +2080,9 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             mise::env_and_daemons(&ctx.root).map(|(env, statuses)| (env, Some(statuses)))
         }
     });
-    if let Some(handle) = installed {
-        require_installed(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?)?;
+    let missing = installed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+    if let Target::Command { .. } = target {
+        require_installed(&missing)?;
     }
     let (mut env, statuses) = provided?;
     timings.mark("env");
@@ -2102,8 +2111,9 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         )?),
         Target::Command { .. } => None,
     };
-    // Set before secrets resolve, so no grant can replace them.
     if let Some(config) = &task_config {
+        install_task_tools(ctx, &report, config, &missing)?;
+        // Set before secrets resolve, so no grant can replace them.
         env.extend(config.env());
     }
 
@@ -2251,9 +2261,40 @@ fn check_services_host(report: &Report) -> Result<()> {
     mise::check_services_host(&artifacts::Host::current(), &services)
 }
 
+/// Install a task's `missing` pins before it starts, so `mise run` has nothing to install.
+/// Run against the task's configuration copy and the lock beside it (rendered from the
+/// validated stack.lock), with `stack install`'s checks and split: the provider release, the
+/// artifact policy on this platform, then `mise install --locked` for pins checked or exempt
+/// here and plain `mise install` for the rest. A refused download is `artifact_mismatch` with
+/// stack's remedy, before the task runs, whether its output is captured or not; nothing here
+/// reads the task's own output. With every pin installed this asks nothing more of mise.
+fn install_task_tools(ctx: &Ctx, report: &Report, config: &TaskConfig, missing: &[scratch::Pin]) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    mise::require(&ctx.root, &project::install_requirements(report))?;
+    let plan = install_plan(report)?;
+    let wanted = |tools: &[String]| -> Vec<String> { tools.iter().filter(|t| missing.iter().any(|p| &p.tool == *t)).cloned().collect() };
+    let locked = wanted(&plan.partition.locked);
+    let mut plain = wanted(&plan.partition.plain);
+    for pin in missing {
+        if !locked.contains(&pin.tool) && !plain.contains(&pin.tool) {
+            plain.push(pin.tool.clone());
+        }
+    }
+    let overrides = config.env();
+    if !locked.is_empty() {
+        mise::install_tools_with(&ctx.root, &overrides, &locked, true)?;
+    }
+    if !plain.is_empty() {
+        mise::install_tools_with(&ctx.root, &overrides, &plain, false)?;
+    }
+    Ok(())
+}
+
 /// `tools_not_installed` naming the pins mise does not report installed, if any. Nothing is
 /// installed here.
-fn require_installed(missing: Vec<scratch::Pin>) -> Result<()> {
+fn require_installed(missing: &[scratch::Pin]) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
