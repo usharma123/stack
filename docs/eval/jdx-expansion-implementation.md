@@ -1,6 +1,10 @@
 # Jdx expansion implementation record
 
-Status: Astra approved `12b7215` and Linux validation passed; its reserved-session correction is integrated for final focused review.
+Status: complete. Astra approved final implementation `557b6ed`; all requested routes and opt-in skills sync are integrated and committed locally.
+
+Final Rust and Clippy checks passed on Rust 1.93.1. Linux, Node and native receipts below
+identify their tested implementation explicitly. Earlier pending statuses describe the state
+at that review round and are superseded by the final approval and delivery section.
 
 ## Scope and base
 
@@ -628,3 +632,37 @@ tests and Clippy with warnings denied, using Rust 1.93.1, the documented CI comp
 Logs: `/tmp/stack-jdx-r7-rust.log` and `/tmp/stack-jdx-r7-clippy.log`.
 A fresh Astra round 7 focuses on this correction, with the original brief,
 all prior findings/responses, round 6 approval and completed Linux evidence.
+
+### Final approval and local delivery
+
+Astra round 7 approved exact `557b6ed`, closing the reserved-session P3 with no new actionable
+finding. Both new regressions passed independently. A separate MCP probe verified run,
+exec, inspect, up and install reject the declaration without provider calls or changes to
+generated files and machine-state contents. Fresh exec/run preserve the missing-lock error
+precedence. Receipts: `/tmp/stack-astra-r7.2TGz6f/targeted.log` and
+`/tmp/stack-astra-r7.2TGz6f/probe-receipts.json`. Round 6's broader approval remains applicable
+to the unchanged snapshot, secret, artifact and skills implementation.
+
+All four routes, v2 migration, typed tool options and Rust-mbx example, task/exec grants,
+redaction, skill discovery/retrieval and opt-in ownership-safe sync are complete. Defaults
+and excluded scope remain as authorized. User documentation and this evidence record are
+committed. The inherited Stack version remains 0.1.19; Cargo metadata and dependencies are
+unchanged from the approved DX base. No push, PR, merge or release was performed.
+
+| Final validation | Tested implementation | Result |
+|---|---|---|
+| Parent full Rust suite and Clippy, Rust 1.93.1 | `557b6ed` | 398 tests passed; warnings denied |
+| Parent Node suite | `12b7215`, Node files unchanged since | 41 passed; one normal opt-in skip |
+| Real mise task provenance/precedence controls | `12b7215` | Passed on 2026.9.18 and 2026.10.3 |
+| Real reserved-session validation controls | worker `09f4d29`, integrated as `557b6ed` | Passed on both mise versions |
+| GNU Linux ARM64 full suite/release and real native 1/10 | `12b7215` | 396 tests; real task/secret/snapshot checks passed |
+| All ten macOS native scenarios | `06dc7c3`; later worker `237d976` | Passed; later precedence worker passed nine with OCI skipped |
+| Actual Alpine ARM64 Bun execution and Node musl refusal | `06dc7c3`, platform code unchanged since | Passed |
+| Astra review/remediation loop | `12b7215` broad; `557b6ed` final correction | Approved |
+
+Final changes after Linux validation are reserved-name validation, two regression tests and
+docs; task execution and platform algorithms are unchanged. Evidence does not establish
+four-platform installation, native non-AVX2 execution, mixed translated/native binaries,
+custom CPU builds, real signer-change/custom packslip trust installation, external secret
+provider authentication, forced verification of warm stores or older mise runtime behavior.
+Those are recorded evidence limits, not unimplemented additions to the authorized scope.
