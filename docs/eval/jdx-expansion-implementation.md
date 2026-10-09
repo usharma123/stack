@@ -461,3 +461,20 @@ Astra confirmed the five round-one corrections, task/grant planning race correct
 platform variant corrections. Its 33 focused tests passed. The post-planning body race is
 closed, subject to the remaining environment provenance correction. No final approval is
 claimed; a fresh review will receive both remediation responses and prior findings.
+
+### Scratch tracking cleanup integration
+
+Worker commit `58683b8` was integrated as `b593f79`. Each scratch root records the effective
+mise tracking directory of its commands, then removes only symlinks whose current targets
+point into that retiring root. State-directory precedence, relative paths and home expansion
+are covered; sibling, prefix, retargeted, regular-file and trust entries are preserved.
+Concurrent commands from a root share a deduplicated record.
+
+The worker passed 390 Rust tests, Clippy, and real mise 2026.10.3 success/error controls for
+explicit mise state, XDG state and HOME fallback. Its compile/inspect control left no new
+scratch links, compared with four dangling links before the change. Parent validation at
+`b593f79` passed all seven scratch tests with `STACK_TEST_MISE` enabled, including real
+concurrent mise queries and per-root cleanup. No Linux or mise 2026.9.18 pass is claimed for
+this correction yet. Killed processes still leave their root and links; no global sweep was
+added. Callers must keep state-directory environment variables unchanged after obtaining
+the command; current callers do so. Environment provenance remediation remains active.
