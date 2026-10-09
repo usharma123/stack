@@ -1,6 +1,6 @@
 # Jdx expansion implementation record
 
-Status: all routes and round 4 corrections are integrated; combined Linux validation passed and Astra round 5 is in progress.
+Status: all routes are integrated; combined Linux validation passed and Astra round 5 remediation is in progress.
 
 ## Scope and base
 
@@ -524,3 +524,26 @@ original logs were retained. Source mounts were read-only; only owned Docker res
 removed. The user docs' three stale descriptions of leftover tracking links were corrected.
 Broader platform and Alpine runs remain explicitly prior-head evidence; implementation
 platform code has not changed. Astra received these results for its ongoing round 5 review.
+
+### Astra round 5: explicit environment precedence
+
+Astra requested one P2 correction at `639f1b8`. Omitting planned scalar `[env]` declarations
+fixes project template provenance, but makes those values inherited rather than explicit.
+When `mise run` reloads tools, tool defaults can override them: real local Java/Go path
+fixtures changed explicit `JAVA_HOME` and `GOROOT` on mise 2026.9.18 and 2026.10.3.
+The Java task's shell and `{{env.JAVA_HOME}}` template both changed, while `stack exec` and
+an original-config task control retained the explicit value. All commands exited zero;
+the finding concerns which environment the task received. Source and receipts:
+`/tmp/stack-r5-tool-env.gtc9silf/REPORT.md` and `/tmp/stack-astra-r5.nmgF5b/`.
+
+The review also found a nonblocking task-copy tracking cleanup gap: literal
+`MISE_STATE_DIR='~/mise-state'` is expanded by mise but not by TaskConfig. A new Opus task
+will correct both defects, retaining immutable task/grant binding, original project
+template provenance, explicit environment precedence, generated directives, and the
+no-granted-values-on-disk guarantee. State-path resolution will share the scratch helper's
+validated semantics where appropriate. Final approval remains pending.
+
+Astra's 59 focused tests passed, with one additional gated test returning without real-mise
+execution. Prior remediations remain supported. Bundle PATH order matched; no additional
+accepted task-template defect was verified. A failed isolated Rust-installer probe supplied
+no Rust finding. Non-AVX2 and signer-change runtime evidence remain absent.
