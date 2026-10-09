@@ -201,10 +201,20 @@ artifacts = "best-effort"                                             # or "requ
 ```
 
 `platforms` uses mise's names (`linux-x64-musl` and the other qualifiers mise accepts are
-allowed); `"current"` means the compiling machine's platform. Entries for platforms no longer
-listed are dropped at the next `compile`.
+allowed); `"current"` means the compiling machine as mise names it (`linux-x64-musl` on a musl
+Linux such as Alpine). Entries for platforms no longer listed are dropped at the next `compile`.
 
-Coverage is derived from stack.lock for every pin and listed platform, never stored:
+mise looks a release up under one key per machine and backend, with no fallback to a shorter
+key. Every backend but Bun's uses `<os>-<arch>`, plus `-musl` on a musl Linux. Bun adds its
+build: `-baseline` on an x64 CPU without AVX2, `-musl`, or `-musl-baseline`. Locking an
+unqualified platform writes Bun's builds too (`linux-x64` also writes `linux-x64-baseline`,
+`linux-x64-musl` and `linux-x64-musl-baseline`; `linux-arm64` writes `linux-arm64-musl`;
+`macos-x64` writes `macos-x64-baseline`). stack keeps them with the listed platform. Other
+backends get only what is listed: for Node on Alpine, list `linux-x64-musl`.
+
+Coverage is derived from stack.lock for every pin and listed platform (and each Bun build
+written for it), never stored. On a machine, it is the coverage of the key mise will look the
+pin up by there:
 
 | State | Meaning |
 |---|---|
@@ -214,14 +224,21 @@ Coverage is derived from stack.lock for every pin and listed platform, never sto
 | `missing` | no entry, or none for the platform (mise publishes no artifact, could not lock it, or nothing was locked yet) |
 
 `compile --json` and `inspect --json` add `backend` and `artifacts` to every `versions[]`
-entry: `artifacts.<platform>` has `state`, and `checksum` and `signer` when verified.
-`status --json` and the `install` step of `install` and `up` report this platform's coverage as
-`artifacts: { platform, verified, exempt, unsupported, missing }` (entries are `tool@version`).
+entry: `artifacts.<platform>` has `state`, and `checksum` and `signer` when verified; Bun's
+builds follow their listed platform. `status --json` and the `install` step of `install` and
+`up` report this machine's coverage as `artifacts: { platform, verified, exempt, unsupported,
+missing }` (entries are `tool@version`). `platform` is mise's name for the machine; `keys` maps
+a pin looked up under another key (Bun's `linux-x64-baseline`) to it. If stack cannot tell
+whether a Linux uses glibc or musl (no `/etc/os-release` ID, no loader in `/lib` or `/lib64`),
+it cannot name the key mise will use: pins with download URLs are `missing` and `reason` says
+why.
 
 `compile` (ordinary and `--update`):
 
 - Locks only pins that need it: every pin under `--update`, otherwise pins with a `missing`
-  state on a listed platform (new releases have no entry yet) and pins whose declared options
+  state on a listed platform or a Bun build written for one (new releases have no entry yet;
+  a Bun release that publishes no musl build is asked for again on every `compile`) and pins
+  whose declared options
   changed while they resolve to the release they had (its entry was locked for the earlier
   options). A request that changes but names the same release and options, or a tool that pins
   the same release as a service, needs no locking. With full coverage it makes no `mise lock`
@@ -271,7 +288,7 @@ Errors:
 | Code | When |
 |---|---|
 | `artifact_mismatch` | mise refused a download (checksum) or a packslip signer or repository identity that differs from stack.lock. `details`: `[{ kind: "checksum" \| "signer" \| "repository", name, platform?, expected?, actual?, url? }]`, then mise's output. Verify upstream; `compile --update` and review the diff if the change is expected |
-| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform (`details`: `[{ name, platform, state, reason? }]`), or this machine's platform is not listed (`details`: `[{ platform, state: "unlisted", platforms }]`). Every locked operation (`compile --locked`, `inspect` with a lock, `install`, `up`, `exec`, `run`, `status`, and their MCP tools) refuses an unlisted platform before any provider call; ordinary `compile` may lock other platforms from any machine. Nothing is written or installed |
+| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform, or under the key mise needs on this machine (`details`: `[{ name, platform, state, reason? }]`, `platform` being that key), or this machine is not listed (`details`: `[{ platform, state: "unlisted", platforms }]`). A machine is listed when a listed platform is, or writes, a key it needs: `linux-x64` lists a musl or non-AVX2 x64 Linux, `linux-x64-musl` lists only a musl one. Every locked operation (`compile --locked`, `inspect` with a lock, `install`, `up`, `exec`, `run`, `status`, and their MCP tools) checks this before any provider call; ordinary `compile` may lock other platforms from any machine. Nothing is written or installed |
 | `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read. stack.lock, the provider config and the rendered lock are unchanged |
 | `lock_invalid` | embedded entries disagree with the pins (an entry for a version stack.lock does not pin), a malformed `[provider_lock]`, a dangling `conda_deps` name, or a value with template syntax (`{{`, `{%`, `{#`). `compile --update` replaces a bad embedded lock |
 | `lock_outdated` | `artifacts = "required"` with a version 2 lock |

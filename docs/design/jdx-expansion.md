@@ -211,11 +211,74 @@ Rules:
 - `[lock] artifacts = "best-effort" | "required"`, default `best-effort`. Required: every pin
   must be `verified` or `exempt` on every listed platform, else compile fails; locked operations
   refuse a runtime platform that is not listed; v2 locks are refused.
-- Platform names are mise's (`<os>-<arch>` with `arm64`, `x64`). Stack maps
-  `std::env::consts` (`aarch64` to `arm64`, `x86_64` to `x64`); v3 writes canonical names in
+- Platform names are mise's: `<os>-<arch>` (`arm64`, `x64`) with an optional qualifier mise
+  accepts (`musl`, `baseline`, `musl-baseline`, `gnu`, `glibc`, `msvc`). Stack maps
+  `std::env::consts` (`aarch64` to `arm64`, `x86_64` to `x64`); v3 writes `<os>-<arch>` in
   `resolved_on` and reads the older `macos-aarch64` form from v2.
 
-Coverage is derived, never stored. For each pin and listed platform:
+#### Lock keys are per backend, not per machine
+
+This design first assumed one `<os>-<arch>` key per machine. Review round 2 showed that is
+wrong, and the GPT-6.1 Sol source study (tag bytes of mise 2026.9.18 and 2026.10.3 compared;
+both versions identical on every point below) confirmed it:
+
+- A locked install looks up exactly one key per release, `get_platform_key()`, and fails
+  without a URL under it; there is no fallback to a less-qualified key, and a glibc machine never
+  reads a `-musl` entry (`src/backend/mod.rs` locked check, both tags).
+- Every backend but core:bun requires mise's `Platform::current()`: `<os>-<arch>`, plus `-musl`
+  on a musl Linux. mise decides musl from `/etc/os-release` (`ID`, then `ID_LIKE`, any of
+  `alpine`, `postmarketos`, `chimera`), else a glibc loader (`ld-linux-*`) in `/lib` or `/lib64`,
+  else a musl loader (`ld-musl-*`) there, else the C library its own binary was built for
+  (`crates/mise-util/src/platform.rs`).
+- core:bun requires its build variant: on x64, `-baseline` without AVX2 (Rust's runtime
+  `is_x86_feature_detected!("avx2")`), `-musl` on musl, `-musl-baseline` for both; on arm64,
+  `-musl` on musl (`src/plugins/core/bun.rs`). The qualifier is `musl-baseline`, never
+  `baseline-musl`.
+- `mise lock --platform <target>` writes Bun's variants for an unqualified target (`linux-x64`
+  gives `-baseline`, `-musl`, `-musl-baseline`; `linux-arm64` gives `-musl`; `macos-x64` and
+  `windows-x64` give `-baseline`) and writes a qualified target alone. No other backend writes
+  variants: Node from `linux-x64` has no `linux-x64-musl` entry. The capture that showed the
+  problem (bun 1.3.0, seven tables from four targets) is a test fixture.
+- Stack withholds `MISE_OS`, `MISE_ARCH` and `MISE_LIBC` (`config_key`) and renders no
+  `[settings]` that change them, so mise detects all of this itself. No mise command reports
+  the key it would use (`doctor` reports its build target, `version` its OS and architecture).
+
+So Stack:
+
+- Keeps the tables mise generates for a listed platform (for Bun, the variants above; a table is
+  kept when its key is listed or generated for a listed key by the entry's backend) through
+  retain, seed, merge, render, ordinary compile and `--update`. They are compared and reported
+  like any key: `versions[].artifacts` lists each after its listed platform, with `added`,
+  `differs_upstream`, `artifact_changed` or `retained`; a committed variant is never replaced
+  by, or rebased onto, another key's value. A pin missing a variant of a listed platform is
+  locked again by ordinary compile (a lock written before variants were kept gets them added).
+- Resolves coverage on a machine per pin, to the key mise will look up there: `status`, the
+  install step's `artifacts` and partition, and every `required` check of this machine. A
+  repeat of mise's detection (`artifacts::Host`, once per process) reads `/etc/os-release` and
+  the loaders as data and uses the same AVX2 detector; it never uses Stack's own build target as
+  a fact about the machine. Where mise would fall back to its build target (no os-release ID,
+  no loader), Stack cannot name the key: URL-locked pins are `missing` with that reason.
+  `verified` is said only when the exact entry mise will read exists.
+- Lists a machine under `required` when a listed platform is, or generates, a key some backend
+  needs there: `linux-x64` lists a musl or non-AVX2 x64 Linux (it generates Bun's variants for
+  them); `linux-x64-musl` lists a musl x64 Linux only. Coverage then decides per pin, and every
+  locked operation under `required` checks this machine's keys besides the listed platforms:
+  Node on Alpine with only `linux-x64` listed is `artifact_unlocked` naming
+  `linux-x64-musl`. List `linux-x64-musl` for such machines; Stack does not add it.
+- Expands `"current"` to mise's `Platform::current()` (`linux-x64-musl` on Alpine). Bun on a
+  musl machine without AVX2 needs `linux-x64-musl-baseline`, which only `linux-x64` (or the
+  variant itself) generates.
+- Leaves the default `[lock] platforms` unchanged. Locking coverage for a platform is not
+  installing on it.
+
+Limits: Stack's AVX2 answer matches mise's when both run natively on the same architecture; a
+Rosetta-translated or custom mise build (`target-feature=+avx2`) can differ, and so can a
+`MISE_ARCH` override in the user's environment, which Stack withholds from mise but which says
+nothing about Stack's own process. Alpine and non-AVX2 behaviour is tested on simulated machines
+against real captured locks and mise's source, not on native machines.
+
+Coverage is derived, never stored. For each pin and listed platform (and each variant mise
+generated for it), and on a machine under the key mise looks the pin up by there:
 
 | State | Meaning |
 |---|---|
@@ -228,7 +291,9 @@ Coverage is derived, never stored. For each pin and listed platform:
 `artifacts: { "<platform>": { state, checksum?, signer?, reason? } }`; `reason` is mise's
 text for a `missing` platform when it was captured. `status --json` and the `install` step of
 `up` report `artifacts: { platform, verified: [...], exempt: [...], unsupported: [...], missing:
-[...] }` for the current platform.
+[...], keys?, reason? }` for the current machine: `platform` is mise's name for it, `keys` maps
+each pin looked up under another key (Bun's variant) to that key, and `reason` says why no key
+can be named when the C library cannot be told.
 
 Compile (`stack compile`, ordinary and `--update`):
 
@@ -322,8 +387,8 @@ or identity options on the tool; those are typed tool options (route 2).
 
 ### Guarantees after this route
 
-- A tool downloaded on a platform where its coverage is `verified` has the checksum stack.lock
-  records, or `install`/`up` fail naming the tool. Packslip-backed tools also have the recorded
+- A tool downloaded on a machine where its coverage (under the key mise looks it up by there) is
+  `verified` has the checksum stack.lock records, or `install`/`up` fail naming the tool. Packslip-backed tools also have the recorded
   signer identity.
 - Committed checksums change only through `compile --update`, and every change is reported.
 - Coverage is explicit per tool and platform in every version report; nothing is called
@@ -373,6 +438,11 @@ Details schemas: `artifact_unlocked` lists `[{ name, platform, state, reason? }]
   mismatch" and a fake signer refusal give `artifact_mismatch` with parsed details; v2 lock runs
   with every pin `missing`; `required` refuses v2, an unlisted runtime platform and an
   unsupported pin before any install.
+- Platforms (`tests/platform_variants.rs`, `tests/platform_hosts.rs`): the bun 1.3.0 and node
+  24.13.0 tables real mise 2026.10.3 wrote round-trip with every variant through compile, a
+  second compile, `--update` (changed and retained) and a lock that lacks them; coverage,
+  partition, summary and `required` on simulated glibc/musl, AVX2/baseline and undetected-libc
+  machines; the libc probe on fixture roots (gcompat on Alpine is musl).
 - E2E (real mise, `tests/e2e`): compile a project with fnox and postgres; remove the tool store
   entry for fnox, tamper its checksum in stack.lock, expect `artifact_mismatch` from `stack
   install`; restore, expect success; compile twice and assert the second makes no `mise lock`
@@ -387,6 +457,8 @@ Details schemas: `artifact_unlocked` lists `[{ name, platform, state, reason? }]
 - Redis: track mise's conda solver for `redis-server`; until it locks, the e2e redis scenarios
   run `missing`.
 - Whether `inspect` without a lock should list the platforms that would be locked.
+- Whether to read mise's own build target (`doctor`) for machines where its libc detection
+  falls back to it, instead of reporting such machines `missing`.
 
 ## Route 2: Mr Boxington as an optional Rust bundle
 
