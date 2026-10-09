@@ -246,19 +246,19 @@ fn tools() -> Value {
         { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
           "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. A command still running at timeout_secs (default 600) is killed and the call fails with timed_out; its output so far is in the error details. secrets grants named fnox secrets to this command only; no granted value appears literally in the parsed stdout or stderr strings, including the timed_out error's. Key names are not secret: they appear under secrets and in [redacted:KEY] markers. Values the command transforms (encoded, split, or only matching after the result's JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read secrets it was not granted, and those values are not redacted.",
+        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. timeout_secs (default 600) counts from the call, planning included: a command still running then is killed and the call fails with timed_out, its output so far in the error details; a call whose planning is cut short fails with timed_out before anything runs. secrets grants named fnox secrets to this command only; no granted value appears literally in the parsed stdout or stderr strings, including the timed_out error's. Key names are not secret: they appear under secrets and in [redacted:KEY] markers. Values the command transforms (encoded, split, or only matching after the result's JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read secrets it was not granted, and those values are not redacted.",
           "inputSchema": schema(json!({
               "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
               "require": { "type": "array", "items": { "type": "string" } },
               "require_all": { "type": "boolean" },
               "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Literal values are replaced by [redacted:KEY] ([redacted] where naming the key could spell out a value) in the parsed stdout and stderr strings; key names are listed under secrets; values shorter than 8 bytes or ones a marker could spell out are refused (secret_unsupported)" },
-              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds before the command is killed (default 600)" }
+              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning included, before it fails and the command is killed (default 600)" }
           }), &["command"]) },
         { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec. The task receives exactly the secrets it declares (secrets = [...] in stack.toml), redacted from its output as in stack_exec; no others can be added here.",
           "inputSchema": schema(json!({
               "task": { "type": "string" },
               "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
-              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds before the task is killed (default 600)" }
+              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before it fails and the task is killed (default 600)" }
           }), &["task"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
@@ -456,13 +456,15 @@ fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
     captured(args, ctx, || session::plan_task(ctx, task, &extra, true))
 }
 
+/// Plan and run within `timeout_secs`, which counts from the call: planning (including a
+/// task's install of missing pins) and the command share it.
 fn captured(args: &Value, ctx: &Ctx, plan: impl FnOnce() -> Result<session::ExecPlan>) -> Result<Value> {
-    let plan = plan()?;
     let timeout = Duration::from_secs(
         args["timeout_secs"]
             .as_u64()
             .unwrap_or(DEFAULT_EXEC_TIMEOUT),
     );
+    let (plan, _deadline) = session::plan_within(Some(timeout), "raise timeout_secs", plan)?;
     let result = run_captured(ctx, &plan, timeout)?;
     if result["timed_out"] == true {
         return Err(timed_out(timeout, result, "raise timeout_secs"));

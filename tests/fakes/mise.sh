@@ -68,6 +68,10 @@ print(json.dumps(out))' "$REVIEW_FIXTURE"
       mkdir -p "$MISE_STATE_DIR/tracked-configs"
       ln -sf "$config" "$MISE_STATE_DIR/tracked-configs/install-$(printf %s "$config" | cksum | cut -d' ' -f1)"
     fi
+    # A stalled download: a child that sleeps `install-stall` seconds, its PID recorded.
+    if test -f "$REVIEW_FIXTURE/install-stall"; then
+      sh -c 'echo $$ >"$1/install-stalled-pid"; exec sleep "$(cat "$1/install-stall")"' sh "$REVIEW_FIXTURE"
+    fi
     if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi
     # Record what was installed: the named tools (every one when none is named), each at every
     # version the configuration gives it.

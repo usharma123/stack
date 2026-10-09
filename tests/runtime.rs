@@ -4509,6 +4509,59 @@ fn a_refused_cold_install_leaves_no_tracking_link_to_the_removed_task_copy() {
 }
 
 #[test]
+fn a_stalled_cold_install_is_cut_short_by_the_runs_timeout_and_the_next_call_runs() {
+    let (fixture, _) = artifact_fixture("[tasks.q]\nrun='jq --version'\n");
+    let dir = fixture.dir.path();
+    let stalled_ended = || {
+        let pid: i32 = fs::read_to_string(dir.join("install-stalled-pid")).unwrap().trim().parse().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(pid, 0) != 0 }
+    };
+    let ran = || fs::read_to_string(dir.join("mise.log")).unwrap().lines().filter(|l| l.starts_with("run --skip-deps")).count();
+    let task_configs = || fs::read_dir(dir.join("cache/task-config")).map(|d| d.count()).unwrap_or(0);
+    for route in ["cli", "terminal", "mcp"] {
+        let _ = fs::remove_file(dir.join("installed"));
+        let _ = fs::remove_file(dir.join("install-stalled-pid"));
+        fs::write(dir.join("install-stall"), "30").unwrap();
+        let before = ran();
+        let start = Instant::now();
+        let error = match route {
+            "cli" => {
+                let out = fixture.command(&["--json", "run", "--timeout", "1s", "q"]).output().unwrap();
+                assert_eq!(out.status.code(), Some(124), "{route}");
+                json_result(&out)["error"].clone()
+            }
+            "terminal" => {
+                let out = fixture.command(&["run", "--timeout", "1s", "q"]).output().unwrap();
+                assert_eq!(out.status.code(), Some(124), "{route}: {}", String::from_utf8_lossy(&out.stderr));
+                assert!(String::from_utf8_lossy(&out.stderr).contains("timed_out"), "{route}");
+                json!({ "code": "timed_out", "details": [{ "cause": {} }] })
+            }
+            _ => {
+                // The same server answers the next call once the stalled one gave up.
+                let results = fixture.mcp(&[("stack_run", json!({ "task": "q", "timeout_secs": 1 })), ("stack_status", json!({}))], &[]);
+                assert_eq!(results[1]["structuredContent"]["ok"], true, "{route}: {}", results[1]);
+                results[0]["structuredContent"]["error"].clone()
+            }
+        };
+        assert!(start.elapsed() < Duration::from_secs(8), "{route}: took {:?}", start.elapsed());
+        assert_eq!(error["code"], "timed_out", "{route}: {error}");
+        assert!(error["details"][0].get("cause").is_some(), "{route}: what was cut short: {error}");
+        assert!(stalled_ended(), "{route}: the installer's group is killed");
+        assert_eq!(ran(), before, "{route}: the task never started");
+        assert_eq!(task_configs(), 0, "{route}: the task's copy is removed");
+        // The project lock was released: a call without the stall installs and runs.
+        fs::remove_file(dir.join("install-stall")).unwrap();
+        let data = json_result(&fixture.command(&["--json", "run", "--timeout", "30s", "q"]).output().unwrap())["data"].clone();
+        assert_eq!(data["exit_code"], 0, "{route}: {data}");
+    }
+}
+
+#[test]
 fn a_tasks_own_output_is_returned_as_it_wrote_it_and_never_read_for_refusals() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.refused]\nrun='jq .'\n");
     let refusal = "mise ERROR Failed to install aqua:jqlang/jq@1.7.1: lockfile entry for jq@1.7.1 on macos-arm64 locks https://example.invalid/jq: Checksum mismatch for file /tmp/x/jq:\nExpected: sha256:00\nActual:   sha256:11\nhint: update the checksum in mise.lock.\n";

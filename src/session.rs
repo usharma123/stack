@@ -1998,6 +1998,35 @@ pub fn plan_task(ctx: &Ctx, name: &str, args: &[String], captured: bool) -> Resu
     plan(ctx, Target::Task { name, args, captured })
 }
 
+/// Plan an exec or task (`plan`) under a deadline of `timeout` from now, which bounds the whole
+/// call: waiting for the project lock, compiling, reading the environment, verifying, installing
+/// a task's missing pins and resolving grants, then the command. The deadline stays set on this
+/// thread while the returned scope lives: keep it while the command runs, which then gets only
+/// the time left. Each subprocess planning starts is bounded by it and killed with its process
+/// group when it passes, the project lock is released and a task's copy removed. Planning cut
+/// short, or finished with no time left for the command, is `timed_out` with nothing run and
+/// what was cut short as the `cause`. Without a timeout this is `plan()` with no deadline.
+pub fn plan_within(
+    timeout: Option<Duration>,
+    raise: &str,
+    plan: impl FnOnce() -> Result<ExecPlan>,
+) -> Result<(ExecPlan, crate::process::DeadlineScope)> {
+    // A timeout too long to fix as a point in time cannot pass: no deadline, as without one.
+    let at = timeout.and_then(|t| Instant::now().checked_add(t));
+    let scope = crate::process::deadline_scope(at);
+    let planned = plan();
+    let Some(timeout) = timeout.filter(|_| crate::process::expired()) else {
+        return planned.map(|plan| (plan, scope));
+    };
+    let details = match planned {
+        Ok(_) => Vec::new(),
+        Err(cause) => vec![json!({ "cause": cause })],
+    };
+    Err(StackError::new("timed_out", format!("the command did not start within {}s; nothing ran", timeout.as_secs()))
+        .hint(format!("{raise}: the time counts from the call, including waiting for the project lock, compiling and installing missing pins"))
+        .details(details))
+}
+
 /// What [`plan`] prepares: an explicit command with its own grant, or a declared task whose
 /// command and grant come from the compile that plans it.
 enum Target<'a> {

@@ -30,7 +30,7 @@ stack --json exec --require-all --timeout 5m -- python --version
 stack --json down
 ```
 
-`exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code. On timeout it exits 124 with `ok: false` and code `timed_out`; the output so far is in `error.details`. Without `--json`, commands keep stdout and stderr, and `--timeout` works too.
+`exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code. `--timeout` counts from the call, planning included (lock, compile, a task's install of missing pins), and the command gets what is left. On timeout it exits 124 with `ok: false` and code `timed_out`; the output so far is in `error.details`, or, when planning was cut short and nothing ran, the cut-short step's error as `cause`. Without `--json`, commands keep stdout and stderr, and `--timeout` works too.
 
 `up` and `restart` default to a 10m startup deadline. Their CLI `--timeout` accepts durations
 of at least 1s; MCP `timeout_secs` accepts a whole number of seconds of at least 1, default

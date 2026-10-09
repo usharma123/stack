@@ -94,7 +94,8 @@ enum Cmd {
         /// Fail unless every service verifies
         #[arg(long, conflicts_with = "require")]
         require_all: bool,
-        /// Kill the command after this long (e.g. 10m) and exit 124. Default: no limit
+        /// Give up after this long (e.g. 10m), killing the command, and exit 124. Counts from
+        /// the call: planning (the project lock, compile, environment) is included. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         /// Grant this fnox secret to the command (repeatable), resolved through the stack's
@@ -111,7 +112,8 @@ enum Cmd {
     Run {
         /// Task name, as in [tasks.<name>]
         task: String,
-        /// Kill the task after this long (e.g. 10m) and exit 124. Default: no limit
+        /// Give up after this long (e.g. 10m), killing the task, and exit 124. Counts from the
+        /// call: planning, including installing missing pins, is included. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
         /// Extra arguments, appended to the task's command
@@ -485,11 +487,13 @@ fn run_command(
 ) -> Result<ExitCode> {
     let timeout = timeout.map(parse_duration).transpose()?.map(Duration::from_secs);
     // Captured output is redacted, so values too short to redact are refused there; on the
-    // terminal nothing is captured or redacted.
+    // terminal nothing is captured or redacted. The timeout covers planning too, and the
+    // command gets what is left of it while the deadline scope lives.
+    let (plan, _deadline) = session::plan_within(timeout, "raise --timeout", || plan(as_json))?;
     if as_json {
-        exec_json(ctx, plan(true)?, timeout)
+        exec_json(ctx, plan, timeout)
     } else {
-        exec(ctx, plan(false)?, timeout)
+        exec(ctx, plan, timeout)
     }
 }
 
@@ -541,7 +545,8 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     let code = match timeout {
         None => command.status().map_err(start_error)?.code(),
         Some(timeout) => {
-            let (code, timed_out) = stack::process::run_with_deadline(&mut command, timeout).map_err(start_error)?;
+            // What planning left of the timeout.
+            let (code, timed_out) = stack::process::run_with_deadline(&mut command, stack::process::bounded(timeout)).map_err(start_error)?;
             if timed_out {
                 eprintln!("stack: command did not finish within {}s and was killed", timeout.as_secs());
                 return Ok(ExitCode::from(124));

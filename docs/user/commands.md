@@ -95,7 +95,12 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   receive `STACK_SESSION` only while a session exists; an `[env]` that declares it is refused
   with `invalid_env`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
-  command's code. When `--timeout` expires the command's process group is killed and stack
+  command's code. `--timeout` (and MCP `timeout_secs`) counts from the call: waiting for the
+  project lock, compiling, reading the environment, installing a task's missing pins and
+  resolving grants share it with the command, which gets what is left. Planning cut short
+  (its subprocess killed with its process group, the lock released, the task's copy removed)
+  fails with `timed_out` before anything runs, exit 124, with the cut-short step's error as
+  `cause`. When `--timeout` expires while the command runs, its process group is killed and stack
   exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the
   captured output is the error's only detail. Without `--json` the command keeps stdout and
   stderr; with `--timeout` it also runs in its own process group, so its stdin is empty, and

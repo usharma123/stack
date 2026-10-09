@@ -870,10 +870,15 @@ pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
 }
 
 /// `env` and `daemons` at once. Both only read provider state for the same configuration, so
-/// they run concurrently; errors are reported in the order the two used to run.
+/// they run concurrently, both within the caller's deadline; errors are reported in the order
+/// the two used to run.
 pub fn env_and_daemons(root: &Path) -> Result<(IndexMap<String, String>, Vec<DaemonStatus>)> {
+    let deadline = crate::process::deadline();
     let (env, daemons) = std::thread::scope(|scope| {
-        let statuses = scope.spawn(|| daemons(root));
+        let statuses = scope.spawn(|| {
+            let _deadline = crate::process::deadline_scope(deadline);
+            daemons(root)
+        });
         let env = env(root);
         let statuses = statuses
             .join()
