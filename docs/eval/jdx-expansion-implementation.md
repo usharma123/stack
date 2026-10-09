@@ -332,3 +332,19 @@ The first post-planning investigation returned only a provider refusal for possi
 cybersecurity risk, with no technical findings. A narrower local task-definition consistency
 test has been delegated with harmless output and synthetic ordinary variables. The concern
 remains unverified until that test or independent review supplies evidence.
+
+### Post-planning task consistency finding
+
+The bounded retry confirmed that a saved `ExecPlan` still reads the shared generated task
+configuration at execution time. With real mise, a plan for a harmless `version-one` task
+printed `version-two` after a separate thread normally compiled that new definition. The
+same saved plan had printed `version-one` in its control run. The execution reservation
+protects session lifetime and does not freeze generated configuration. The read-only source
+checkout remained clean, and the test used no credentials or external services.
+
+An additional Opus task will bind each invocation to immutable generated provider configuration
+held by the execution plan. It must preserve project working-directory and config-relative
+semantics, provider isolation, lock metadata where needed, and cleanup, without holding the
+project lock through the long task or persisting granted values. This extends the earlier
+queued-task correction to the confirmed post-planning window. Evidence:
+`/var/folders/l3/6x2gqh2x1rbdkr21_hzckff40000gn/T/stack-task-config-proof-ep4ay0jl/README.md`.
