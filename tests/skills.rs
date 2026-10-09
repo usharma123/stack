@@ -115,9 +115,13 @@ impl Fixture {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_at(&self.path("app"), args)
+    }
+
+    fn command_at(&self, dir: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stack"));
         command
-            .args(["-C", self.path("app").to_str().unwrap()])
+            .args(["-C", dir.to_str().unwrap()])
             .args(args)
             .env("PATH", format!("{}:/usr/bin:/bin", self.path("bin").display()))
             .env("HOME", self.path("home"))
@@ -498,6 +502,67 @@ fn skill_links_and_their_registry_are_excluded_from_git_but_a_users_own_skills_a
     fs::write(dir.join("mbx/SKILL.md"), "mine too\n").unwrap();
     f.json(&["install"]);
     assert_eq!(untracked(), [".claude/skills/mbx/SKILL.md", ".claude/skills/mine/SKILL.md"]);
+}
+
+/// `git <args>` in `dir`, which must succeed; its stdout.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Untracked paths under `dir` starting with `under`, ignored ones left out.
+fn untracked_in(dir: &Path, under: &str) -> Vec<String> {
+    git_in(dir, &["status", "--porcelain", "--untracked-files=all"]).lines().filter_map(|l| l.strip_prefix("?? ")).filter(|p| p.starts_with(under)).map(String::from).collect()
+}
+
+#[test]
+fn a_link_made_in_one_checkout_never_hides_the_same_path_in_another() {
+    let f = Fixture::new(SYNC_PROJECT);
+    let app = f.path("app");
+    git_in(&app, &["init", "-q"]);
+    // An earlier release's block in the shared exclude, naming this link for checkout A.
+    let exclude = app.join(".git/info/exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, format!("*.log\n\n# stack: generated files of {a}\n/.claude/skills/fnox\n# stack: end of {a}\n", a = app.display())).unwrap();
+    f.json(&["install"]);
+    assert!(app.join(".claude/skills/fnox").exists());
+    assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new());
+    assert_eq!(fs::read_to_string(&exclude).unwrap(), "*.log\n", "the shared block is gone");
+    let ignore = fs::read_to_string(app.join(".claude/skills/.gitignore")).unwrap();
+    assert!(ignore.contains("\n/.stack-skills.json\n") && ignore.contains("\n/fnox\n") && !ignore.contains("\n/*\n"), "{ignore}");
+
+    // Checkout B, a linked worktree without [skills]: a skill the user writes at the same path.
+    git_in(&app, &["add", "stack.toml", "stack.lock"]);
+    git_in(&app, &["commit", "-qm", "stack"]);
+    let b = f.path("b");
+    git_in(&app, &["worktree", "add", "-q", b.to_str().unwrap()]);
+    fs::write(b.join("stack.toml"), SYNC_PROJECT.replace("\n[skills]\ndir = \".claude/skills\"\n", "")).unwrap();
+    let out = f.command_at(&b, &["compile"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    fs::create_dir_all(b.join(".claude/skills/fnox")).unwrap();
+    fs::write(b.join(".claude/skills/fnox/SKILL.md"), "the user's\n").unwrap();
+    assert_eq!(untracked_in(&b, ".claude/"), [".claude/skills/fnox/SKILL.md"]);
+    // And in A, still ignored.
+    assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new());
+}
+
+#[test]
+fn a_skills_dir_written_with_dot_or_doubled_separators_is_ignored_where_the_links_are() {
+    for dir in ["./.claude/skills", ".claude//skills/", "./.claude/./skills"] {
+        let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}")));
+        let app = f.path("app");
+        git_in(&app, &["init", "-q"]);
+        f.json(&["install"]);
+        assert!(app.join(".claude/skills/fnox").exists() && app.join(".claude/skills/.gitignore").exists(), "{dir}");
+        assert_eq!(untracked_in(&app, ".claude/"), Vec::<String>::new(), "{dir}");
+    }
 }
 
 #[test]

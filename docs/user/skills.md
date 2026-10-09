@@ -77,8 +77,10 @@ dir = ".claude/skills"
 ```
 
 The links point into one user's mise installs. In a git checkout stack lists each link it
-made, and `.stack-skills.json`, in the repository's local `.git/info/exclude`, so they stay
-out of version control while skills you add to the directory yourself do not.
+made, and `.stack-skills.json`, by exact name in a `.gitignore` of its own in that directory
+(which also ignores itself), so they stay out of version control in this checkout while
+skills you add to the directory yourself, and the same names in other worktrees, do not. A
+`.gitignore` of yours there is left as it is, with a warning naming the links it misses.
 
 - Project only: a bundle cannot set `[skills]`.
 - `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no

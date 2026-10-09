@@ -256,6 +256,6 @@ Migration: version 2 locks stay valid under `best-effort`, with every pin `missi
 `compile` writes version 3 and needs network access for `mise lock`. Because a session's
 configuration includes stack.lock, the first `up` after migrating restarts services once.
 `.config/mise/mise.lock` and `.config/mise/locks/` are generated; in a git checkout stack
-excludes them (see [Install](install.md#first-run)).
+ignores them through its own `.config/mise/.gitignore` (see [Install](install.md#first-run)).
 
 [All docs](../README.md)
