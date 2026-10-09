@@ -84,20 +84,14 @@ mbx = "1.22.0"
 | `identity`, `identity_prefix`, `issuer` | string | packslip-backed tools |
 
 A packslip-backed tool is one named `packslip:<host>/<owner>/<repo>`, or a registry name such
-as `fnox` that mise's registry installs through packslip (`compile` asks `mise registry`). The
-trust options need mise 2026.9.2 or newer. Everything else is `invalid_tool`, with a hint
-naming what the tool accepts: an unknown option (including packslip's `pin`, which is a
-packslip command-line flag, not a mise option), a wrong type, a table without `version`, a
-nested value, `mr_boxington` without Mr Boxington, or template syntax (`{{`, `{%`, `{#`) in a
-version or option string, which mise would render (`exec()` included) wherever stack asks it
-about the tool. Extending the list is a code change.
+as `fnox` that mise installs through packslip. Anything else is `invalid_tool`, with a hint
+naming what the tool accepts: an unknown option, a wrong type, a table without `version`, a
+nested value, `mr_boxington` without Mr Boxington, or template syntax in a version or option.
 
 `"1.93"` and `{ version = "1.93" }` are the same value. Layers that differ in any option
 conflict, and only `[override.tools]` resolves it by replacing the whole value. `stack.lock`
-records the options with the pin, version resolution sees them (packslip trust options decide
-which releases mise can list), and the generated config renders them with the exact release.
-`install`, `up` and `doctor` fail with `provider_outdated` when mise is older than an option
-needs, instead of letting mise ignore it.
+records the options with the pin. `install`, `up` and `doctor` fail with `provider_outdated`
+when mise is too old for an option, instead of letting mise ignore it.
 
 ## Rust build caching with Mr Boxington
 
@@ -123,8 +117,6 @@ run = "cargo build"
 - Editors run Cargo themselves. As mise's documentation says, run them (or rust-analyzer's
   Cargo) through `stack exec` or mise's wrapper; the editor override `mbx setup` writes is not
   part of the mise option.
-- mise publishes the wrapper under its own data directory (`command-wrappers/bin`); it is on
-  `PATH` only in environments mise activates for this stack.
 
 See [commands](commands.md) for compile options and [guarantees](guarantees.md) for locking and conflict rules.
 

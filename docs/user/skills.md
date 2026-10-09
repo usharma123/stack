@@ -31,26 +31,15 @@ entry per pinned tool and preset service tool, and one per skill when a release 
 | `not_installed` | the pinned release is not installed on this machine; `stack install` installs it |
 | `unavailable` | stack could not tell: nothing pinned yet, or mise could not answer |
 
-How it works: stack writes a configuration naming every pin at its exact release (services as
-their preset's tool, with the tool's allowlisted options) and nothing else into a scratch
-directory of its own under stack's cache, runs `mise ls --json` and `mise skills ls --json`
-there (10 seconds each, at the same time), and removes the directory. Rows for tools or
-releases stack.lock does not pin are ignored, so the answer is the same in a fresh worktree
-without a generated config and in one whose generated config is stale. No `[env]` template or
-task of the project's is evaluated, nothing is installed, and nothing is written into the
-project. Stack removes mise's tracking links into the scratch directory with the directory,
-on success or error, and keeps other tracking entries and trust records. A process killed
-before cleanup can leave its directory and links.
+Stack asks mise about exactly the releases stack.lock pins, in a scratch directory under its
+cache, so the answer is the same in a fresh worktree and in one whose generated config is stale.
+Nothing from the project's `[env]` or tasks is evaluated, nothing is installed, and nothing is
+written into the project. A skill is `available` only when its name is a plain name and its
+files lie inside the pinned release's install directory.
 
-A skill is `available` only when its name matches `[a-z0-9][a-z0-9_-]*` and its directory and
-`SKILL.md`, with links resolved, lie inside the install directory mise reports for the pinned
-release. Anything else is `no_skill` with a `reason`.
-
-Without `stack.lock` (before the first `compile`) nothing is pinned: every entry is
-`unavailable` and mise is not asked, rather than reporting whatever release happens to be
-active. When mise cannot answer (not installed, older than 2026.9.2, which added `mise
-skills`, a timeout, or output stack cannot read), every entry is `unavailable`, `warnings`
-carries `skills_unavailable: ...`, and the command still succeeds.
+Without `stack.lock` nothing is pinned and every entry is `unavailable`. When mise cannot answer
+(not installed, older than 2026.9.2, a timeout or unreadable output), every entry is
+`unavailable`, `warnings` carries `skills_unavailable`, and the command still succeeds.
 
 ### The provider's skills
 
@@ -88,36 +77,19 @@ and keep the links out of version control; they point into one user's mise insta
 .claude/skills/
 ```
 
-- Project only: a bundle cannot set `[skills]` (`bundle_invalid`).
-- `dir` must be relative, stay inside the project and not be inside `.stack` or `.git`
-  (`invalid_path` at compile). When linking, every existing component of the path must be a
-  real directory: a symbolic link anywhere in it is refused (`invalid_path`), so links cannot
-  be written outside the project.
+- Project only: a bundle cannot set `[skills]`.
+- `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no
+  symbolic link along the path (`invalid_path`).
 - After the install step, a `skills` step links every `available` skill to `<dir>/<name>` and
-  records what it linked in `<dir>/.stack-skills.json`. Stack replaces or removes only a
-  symbolic link whose current target is the one it recorded. A real directory, a file, a link
-  stack did not make, or one of stack's links pointed elsewhere since is left alone, reported
-  under `kept` with a reason, and no longer considered stack's.
-- Two pinned releases shipping a skill of the same name: neither is linked; the step lists it
-  under `skipped`.
-- Links to skills no longer available (a tool removed, a release changed) are removed if they
-  are still stack's (`pruned`). A directory with nothing to link is not created.
-- Removal needs discovery to have settled every pinned release: the release is installed and
-  mise listed its skills, or it declares none. When mise does not answer (an older mise, a
-  timeout, unreadable output), a pinned release is not installed, or stack.lock pins nothing
-  yet, stack's links that no available skill names are left in place, stay stack's, and are
-  listed under `preserved` with the releases that were not settled; `.stack-skills.json` is
-  not rewritten for them. Stack does not record which release a link came from, so one
-  unsettled release defers every removal until a sync that settles them all. New skills are
-  still linked, and a name two releases declare is still removed.
-- A `.stack-skills.json` that is a link, not a regular file, malformed, of an unknown version,
-  or naming something other than a plain skill name makes stack change nothing in the
-  directory; move it aside to start afresh.
-- Nothing in this step fails `up` or `install`. Problems make the step's status `warning`, are
-  listed in its `detail.warnings` (`{ code, message }` with code `skills_unavailable`,
-  `invalid_path` or `skills_failed`) and in the result's top-level `warnings`, and are printed
-  to stderr without `--json`.
-- Stack links skills itself rather than running `mise skills sync`, which would also link the
-  provider's skill.
+  records its links in `<dir>/.stack-skills.json`. Stack replaces or removes only a link it
+  recorded that still points where it left it. Anything else at that name is left alone and
+  reported under `kept`.
+- Two releases shipping a skill of the same name: neither is linked (`skipped`).
+- Links to skills no longer available are removed (`pruned`), but only when mise answered for
+  every pinned release. Otherwise they are left in place and listed under `preserved`.
+- Nothing in this step fails `up` or `install`. Problems make the step's status `warning` and
+  appear in the result's `warnings`.
+- Stack links skills itself rather than running `mise skills sync`, which would also link
+  Pitchfork's skill.
 
 [All docs](../README.md)

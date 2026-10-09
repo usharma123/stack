@@ -1,12 +1,10 @@
 # Stack and the jdx tool ecosystem: selective integration
 
-Status: implemented on `feat/jdx-expansion`; see the [implementation and validation record](../eval/jdx-expansion-implementation.md).
-Original design drafted by Claude Fable 5.1, critiqued over two rounds by
+Status: implemented. Drafted by Claude Fable 5.1 and critiqued over two rounds by
 GPT-6-Astra; disagreements and resolutions are in [Fable vs Astra](#fable-vs-astra). Facts
 about upstream tools were checked against mise 2026.10.3, fnox 1.39.0, packslip 1.6.0, mbx
 1.22.0 and pitchfork 2.29.0 on macOS arm64 unless a line says otherwise. "Observed" means run
-here; "documented" means read in upstream docs or release notes but not run; "assumed" is
-neither.
+here; "documented" means read in upstream docs or release notes but not run.
 
 Stack borrows tool installation from mise and service supervision from Pitchfork
 ([DESIGN.md](../DESIGN.md)). A dogfooding pass on Stack 0.1.7 (three parallel agents on a sample
@@ -219,9 +217,8 @@ Rules:
 
 #### Lock keys are per backend, not per machine
 
-This design first assumed one `<os>-<arch>` key per machine. Review round 2 showed that is
-wrong, and the GPT-6.1 Sol source study (tag bytes of mise 2026.9.18 and 2026.10.3 compared;
-both versions identical on every point below) confirmed it:
+mise looks a release up under one key per machine and backend, not one per machine. From
+mise's source at 2026.9.18 and 2026.10.3 (identical on every point below):
 
 - A locked install looks up exactly one key per release, `get_platform_key()`, and fails
   without a URL under it; there is no fallback to a less-qualified key, and a glibc machine never
@@ -238,8 +235,7 @@ both versions identical on every point below) confirmed it:
 - `mise lock --platform <target>` writes Bun's variants for an unqualified target (`linux-x64`
   gives `-baseline`, `-musl`, `-musl-baseline`; `linux-arm64` gives `-musl`; `macos-x64` and
   `windows-x64` give `-baseline`) and writes a qualified target alone. No other backend writes
-  variants: Node from `linux-x64` has no `linux-x64-musl` entry. The capture that showed the
-  problem (bun 1.3.0, seven tables from four targets) is a test fixture.
+  variants: Node from `linux-x64` has no `linux-x64-musl` entry.
 - Stack withholds `MISE_OS`, `MISE_ARCH` and `MISE_LIBC` (`config_key`) and renders no
   `[settings]` that change them, so mise detects all of this itself. No mise command reports
   the key it would use (`doctor` reports its build target, `version` its OS and architecture).

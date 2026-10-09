@@ -12,17 +12,22 @@
   A tool's [allowlisted options](bundles.md#tool-options) are part of its pin: stack.lock
   records them, and changing one is a changed request (`lock_outdated` in locked mode).
 - **Artifact checksums.** `stack.lock` embeds mise's lock for every pin on each `[lock]
-  platforms` entry (and Bun's per-CPU and musl builds mise writes for it). A release downloaded
-  on a machine where its coverage, under the key mise looks it up by there, is `verified` has the
-  checksum stack.lock records (and for packslip-backed tools the recorded signer), or `install`
-  and `up` fail with `artifact_mismatch` naming the tool. Committed checksums change only through
-  `compile --update`, which reports every change; ordinary `compile` keeps them and warns when
-  upstream differs. Coverage (`verified`, `exempt`, `unsupported`, `missing`) is reported per
-  tool and platform, and nothing is called verified that mise did not check. Not covered: tools
-  mise cannot lock for a particular release or platform, backends without download URLs (`core:rust`, `cargo`, `go`),
-  npm and Python dependency graphs, and releases already installed on the machine, which mise
-  does not re-check. `[lock] artifacts = "required"` turns any gap on a listed platform, or under
-  the key this machine needs, into `artifact_unlocked`. See [Artifact checksums](commands.md#artifact-checksums).
+  platforms` entry. A release downloaded where its coverage is `verified` has the checksum
+  stack.lock records, and for packslip-backed tools the recorded signer, or `install` and `up`
+  fail with `artifact_mismatch`. Committed checksums change only through `compile --update`,
+  which reports every change. Not covered: releases or platforms mise cannot lock, backends
+  without download URLs, npm and Python dependency graphs, and releases already installed on
+  the machine. `[lock] artifacts = "required"` turns any gap into `artifact_unlocked`. See
+  [Artifact checksums](commands.md#artifact-checksums).
+- **Secrets by name, only where granted.** A task or command receives exactly the fnox secrets
+  it is granted, from the fnox release `stack.lock` pins. A grant never sets or removes a
+  service endpoint or other variable stack controls. Values never enter `stack.lock`, generated
+  configuration, session records or reports, and captured output (`--json`, MCP) never contains
+  a granted value literally. Terminal output is not redacted and inherited variables pass
+  through: see [secret grants](secrets.md#boundary).
+- **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
+  stack.lock pins. Pitchfork's own skill is never surfaced to agents. Skill links are opt-in,
+  and stack only replaces or removes a link it made that still points where it left it.
 - **No silent conflicts.** If two layers define the same key differently, compile fails with every
   conflict listed. Only `[override.*]` resolves one, and the output records what it replaced.
 - **Bundles carry files.** `{{bundle_dir}}` and `paths.bin` resolve to the bundle's own files.
@@ -75,16 +80,10 @@ Stack provider commands use only the generated Stack mise configuration. Project
 and global mise aliases cannot reinterpret locked releases. Put application variables and
 tasks in Stack bundles or `stack.toml`; `MISE_*` variables in their `[env]` are rejected, as
 is `STACK_SESSION`, which stack sets itself.
-Version resolution runs `mise latest` in a scratch provider root of its own under stack's
-cache, whose only configuration is the one tool and its options; nothing in the project's
-`[env]` or tasks is evaluated, and the root is removed afterwards. No scratch configuration is
-written for a pin with template syntax in its name, version or options, however the pin
-arrived (a manifest, a service version, an edited stack.lock). Artifact locking does the
-same with one scratch root per `compile` naming every pin at its exact version; values with
-template syntax are refused before mise could evaluate them.
-Skills discovery (`inspect`, `compile`, the `skills` step) works the same way, in a scratch
-root naming only stack.lock's pins; tool versions and options with template syntax are
-rejected because mise would evaluate them there.
+Version resolution, artifact locking and skills discovery each run mise in a scratch directory
+under stack's cache that names only the pinned tools, so nothing in the project's `[env]` or
+tasks is evaluated there. Versions and options containing template syntax are refused before
+mise could evaluate them.
 `stack exec` carries this same boundary into nested mise commands. Direct mise invocations
 outside `stack exec` still follow mise's normal configuration rules.
 

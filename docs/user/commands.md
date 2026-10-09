@@ -22,15 +22,13 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 
 - `inspect` before the first `compile` previews what compile would lock; afterwards it fails on drift.
 - `inspect` and `compile` list the [agent skills](skills.md) of the releases stack.lock pins
-  under `skills`. To find them they run `mise ls --json` and `mise skills ls --json` (10s
-  each) in a scratch directory under stack's cache that names only the pins, and remove it;
-  they install nothing and write nothing into the project. When mise cannot answer, every
-  entry is `unavailable` with a `skills_unavailable` warning and the command still succeeds.
-  `--all-skills` also lists the provider's (Pitchfork's) under `provider_skills`.
-- With `[skills] dir` in stack.toml, `install` and `up` add a `skills` step after installing
-  that links available skills into that directory. Its problems are warnings (step status
-  `warning`, top-level `warnings`), never failures. While mise cannot answer for every pinned
-  release, it removes none of its links (`preserved`). See [agent skills](skills.md).
+  under `skills`. They install nothing and write nothing into the project. When mise cannot
+  answer, every entry is `unavailable` with a `skills_unavailable` warning and the command
+  still succeeds. `--all-skills` also lists Pitchfork's under `provider_skills`.
+- With `[skills] dir` in stack.toml, `install` and `up` add a `skills` step that links available
+  skills into that directory. Its problems are warnings, never failures. See
+  [agent skills](skills.md).
+
 - `install` is `up` without the start: compile in locked mode, trust the generated config, check
   the supervisor socket path, install every pinned tool and preset service binary, checked
   against stack.lock's artifact checksums where it has them (see
@@ -83,23 +81,10 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   mise hands a task every service's endpoint, including any stack would withhold. For commands
   that should run with services down, use `stack exec`. Stack's tasks have no dependencies other
   than services to skip. `unknown_task` lists the tasks the project defines. The task runs from
-  a copy of the generated configuration taken when it was planned, under the project lock, so a
-  `compile` while it starts or runs does not change its body, env or tools; the next run sees
-  the change. mise loads the copy as its only configuration, rooted at the project, so the
-  working directory, relative paths and `{{config_root}}` are the project's. Its `[env]` values
-  are the ones evaluated against the project's own generated file when the task was planned,
-  so a value built from `{{config_source}}` names the project's file, not the copy, and an
-  explicit value such as `JAVA_HOME` or `GOROOT` still takes precedence over the one a tool
-  sets, as it does for `exec`. Tasks and `exec` receive `STACK_SESSION`, the running session's
-  id, only while a session exists; an `[env]` that declares it is refused with `invalid_env`
-  before generated configuration or state is written or a task/exec command runs. The copy
-  declares each value the task already receives
-  by name (`{{ env["JAVA_HOME"] }}`), never the value itself, and keeps tools, `_.path` and
-  tasks, which mise applies as usual. `PATH`, and a variable whose name has characters other than
-  letters, digits, `_`, `-` and `.`, are left out of the copy and simply inherited. A template
-  such as `{{exec(...)}}` is evaluated once, when the task is planned. The copy is kept in
-  a private directory under stack's cache and removed when the task ends, fails to plan or times
-  out, along with the link mise records to it in its state directory's `tracked-configs`.
+  the configuration as it was when the run was planned, so a `compile` while it starts or runs
+  does not change its body, env or tools; the next run sees the change. Tasks and `exec`
+  receive `STACK_SESSION` only while a session exists; an `[env]` that declares it is refused
+  with `invalid_env`.
 - `exec --json` captures at most 64 KiB of each stream into the result and exits with the
   command's code. When `--timeout` expires the command's process group is killed and stack
   exits 124; with `--json` the result is then `ok: false` with code `timed_out`, and the
@@ -107,13 +92,11 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   stderr; with `--timeout` it also runs in its own process group, so its stdin is empty, and
   interrupt, terminate and hangup signals are passed on to it.
 - `exec --secret KEY` (repeatable) and a task's `secrets = [...]` grant named fnox secrets,
-  resolved through the fnox release `stack.lock` pins once services verify. Names are checked
-  before any provider call (`invalid_secret`). With `--json` granted values are replaced by
-  `[redacted:KEY]` (`[redacted]` where naming the key could spell out a value) in the captured
-  output before it is bounded, and values under 8 bytes or ones stack's markers could spell out
-  are refused (`secret_unsupported`); without `--json` the command's output reaches the terminal
-  unredacted. The result lists granted names under `secrets` and declined removals under
-  `warnings`. See [secret grants](secrets.md) for the rules, codes and boundary.
+  resolved through the fnox release `stack.lock` pins once services verify. With `--json`,
+  granted values are replaced by `[redacted:KEY]` in the captured output, and values under 8
+  bytes are refused; without `--json` output reaches the terminal unredacted. See
+  [secret grants](secrets.md).
+
 - `restart [service...]` stops the named services (every service when none are named), waits
   until their recorded processes are gone and ports closed, starts them again and verifies the
   whole stack, like `up`. Other services keep running and the session keeps its id. Use it
@@ -173,14 +156,8 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
   or `preset` with template syntax (`{{`, `{%`, `{#`) is `invalid_service`, in any layer.
 - `tools.<name>` accepts a table with `version` and [allowlisted options](bundles.md#tool-options)
   (`mr_boxington` on `rust`; `pubkey`, `identity`, `identity_prefix`, `issuer` on packslip-backed
-  tools). Anything else is `invalid_tool`, as is template syntax (`{{`, `{%`, `{#`) in a version
-  or option string, which mise would evaluate. `compile` asks `mise registry` once per registry name
-  that carries packslip options. Version reports (`inspect`, `compile`, `install`) list a pin's
-  `options`. `install`, `up` and `doctor` run `mise version` when an option needs a newer mise
-  (2026.9.2) and fail with `provider_outdated` before installing anything.
-- `compile` resolves each version request in its own scratch directory under stack's cache
-  (`resolve/`), configured with that one tool only, and removes it afterwards along with
-  mise's tracking links into that directory. Other tracking entries and trust records are kept.
+  tools). Anything else is `invalid_tool`. `install`, `up` and `doctor` fail with
+  `provider_outdated` when an option needs a newer mise (2026.9.2).
 - Requests that name no release (`system`, `path:`, `ref:`) remain explicitly nonreproducible
   and produce warnings for both tools and services. Damaged release pins fail with `lock_invalid`.
 - Git sources accept only `ref=` and `dir=`; anything else is an error rather than ignored.
@@ -200,15 +177,12 @@ All accept `-C <dir>` and `--json`. `exec -C` runs in the selected project direc
 - A custom service's `run` should `exec` its server (`run = "exec python3 -m http.server $PORT"`),
   so the supervisor stops the server itself rather than a wrapping shell.
 
-[All docs](../README.md)
-
 ## Artifact checksums
 
-`stack.lock` version 3 embeds mise's own lock (`mise.lock`) under `[provider_lock]`, so a
-machine that downloads a locked release gets the bytes stack.lock records for its platform, or
-the install fails naming the tool. Stack never hashes artifacts itself: mise records a checksum
-(and for packslip-backed tools a signer and repository identity) when it locks, and checks them
-when it downloads.
+`stack.lock` version 3 embeds mise's own lock (`mise.lock`) under `[provider_lock]`. A machine
+that downloads a locked release gets the bytes stack.lock records for its platform, or the
+install fails naming the tool. Stack never hashes artifacts itself: mise records a checksum, and
+for packslip-backed tools a signer, when it locks, and checks them when it downloads.
 
 ```toml
 # stack.toml, project only (a bundle cannot set it)
@@ -217,109 +191,48 @@ platforms = ["macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]   # the def
 artifacts = "best-effort"                                             # or "required"
 ```
 
-`platforms` uses mise's names (`linux-x64-musl` and the other qualifiers mise accepts are
-allowed); `"current"` means the compiling machine as mise names it (`linux-x64-musl` on a musl
-Linux such as Alpine). Entries for platforms no longer listed are dropped at the next `compile`.
+`platforms` uses mise's names, including qualifiers such as `linux-x64-musl`; `"current"` means
+the compiling machine. mise looks a release up under one key per machine and backend: Node on
+Alpine needs `linux-x64-musl` listed, while Bun's per-CPU and musl builds are locked with their
+unqualified platform.
 
-mise looks a release up under one key per machine and backend, with no fallback to a shorter
-key. Every backend but Bun's uses `<os>-<arch>`, plus `-musl` on a musl Linux. Bun adds its
-build: `-baseline` on an x64 CPU without AVX2, `-musl`, or `-musl-baseline`. Locking an
-unqualified platform writes Bun's builds too (`linux-x64` also writes `linux-x64-baseline`,
-`linux-x64-musl` and `linux-x64-musl-baseline`; `linux-arm64` writes `linux-arm64-musl`;
-`macos-x64` writes `macos-x64-baseline`). stack keeps them with the listed platform. Other
-backends get only what is listed: for Node on Alpine, list `linux-x64-musl`.
-
-Coverage is derived from stack.lock for every pin and listed platform (and each Bun build
-written for it), never stored. On a machine, it is the coverage of the key mise will look the
-pin up by there:
+Coverage is reported for every pin and listed platform:
 
 | State | Meaning |
 |---|---|
-| `verified` | the entry has `checksum` and `url` for the platform, plus `signer` for packslip |
-| `exempt` | the backend records no download URL and mise's `--locked` accepts it as is (`core:rust`, `core:swift`, `core:dotnet`, `cargo`, `go`, `gem`, `ubi`, `spinel`, `asdf`) |
-| `unsupported` | the backend locks a dependency graph in a sidecar file stack does not carry (`npm`, `pypi`, `pipx`); never installed with `--locked` |
-| `missing` | no entry, or none for the platform (mise publishes no artifact, could not lock it, or nothing was locked yet) |
+| `verified` | the entry has a checksum and URL for the platform, plus a signer for packslip |
+| `exempt` | the backend records no download URL and mise accepts it as is (`core:rust`, `cargo`, `go`, `gem`, `ubi`, ...) |
+| `unsupported` | the backend locks a dependency graph stack does not carry (`npm`, `pypi`, `pipx`) |
+| `missing` | no entry for the platform: mise publishes no artifact, could not lock it, or nothing was locked yet |
 
-`compile --json` and `inspect --json` add `backend` and `artifacts` to every `versions[]`
-entry: `artifacts.<platform>` has `state`, and `checksum` and `signer` when verified; Bun's
-builds follow their listed platform. `status --json` and the `install` step of `install` and
-`up` report this machine's coverage as `artifacts: { platform, verified, exempt, unsupported,
-missing }` (entries are `tool@version`). `platform` is mise's name for the machine; `keys` maps
-a pin looked up under another key (Bun's `linux-x64-baseline`) to it. If stack cannot tell
-whether a Linux uses glibc or musl (no `/etc/os-release` ID, no loader in `/lib` or `/lib64`),
-it cannot name the key mise will use: pins with download URLs are `missing` and `reason` says
-why.
+`compile --json` and `inspect --json` add `backend` and `artifacts` to each `versions[]` entry.
+`status --json` and the `install` step of `install` and `up` report this machine's coverage.
 
-`compile` (ordinary and `--update`):
+`compile` locks only pins that need it (all of them under `--update`), in a scratch directory
+under stack's cache, without evaluating anything else from the project. A committed checksum is
+kept unless you run `compile --update`: an upstream difference is a warning, and under
+`--update` each change is reported with the old value. When `--update` gets no fresh answer
+(offline, for example) the committed value is kept and reported `retained`. With full coverage,
+`compile` makes no `mise lock` call.
 
-- Locks only pins that need it: every pin under `--update`, otherwise pins with a `missing`
-  state on a listed platform or a Bun build written for one (new releases have no entry yet;
-  a Bun release that publishes no musl build is asked for again on every `compile`) and pins
-  whose declared options
-  changed while they resolve to the release they had (its entry was locked for the earlier
-  options). A request that changes but names the same release and options, or a tool that pins
-  the same release as a service, needs no locking. With full coverage it makes no `mise lock`
-  call and needs no network for artifacts. A pin mise cannot lock
-  (for example, Pitchfork 2.29.0 on macos-x64, which has no artifact) stays `missing`, so every ordinary
-  `compile` of such a project asks mise again; `mise lock` skips it without failing.
-- Runs `mise lock --platform <list> <tools>...` in a scratch root of its own under stack's cache
-  (`lock/`), removed afterwards. Its configuration is `[tools]` with every pin at its exact
-  version (service pins as their preset tool) and nothing else, so no `[env]` template or task
-  of the project's is evaluated. The tools being locked start with no entry, so whatever the run
-  leaves for them is fresh. Bounded by 10 minutes and any command deadline.
-- Merges against what stack.lock commits. A committed value is kept unless `--update`: a
-  different upstream value is a warning (`artifacts.<tool>@<version>.<platform> differs
-  upstream; run stack compile --update to accept`) and `change: "differs_upstream"`. Under
-  `--update` the new value replaces it and is reported as `change: "artifact_changed"` with
-  `checksum_was`, `url_was` and `signer_was`. When `--update` gets nothing fresh for a committed
-  value (offline, skipped) the value is kept and reported `change: "retained"` with mise's reason
-  if it gave one, never as refreshed; so is a pin whose options changed when ordinary `compile`
-  gets nothing fresh for it, with a warning (`artifacts.<tool>@<version>.<platform>: its request
-  changed, but mise produced no fresh entry to compare; the committed value is kept`). New
-  values are `change: "added"`.
-- Conda dependency records (`conda-packages`) shared between tools follow the same rule per
-  (platform, package) and are reported under `deps` on each pin that references them. Records no
-  entry references are pruned; a `conda_deps` name without a record is `lock_invalid`.
-- `missing` platforms carry `reason`, mise's own line, when the run gave one. `mise lock`
-  exiting nonzero is reported as a warning, not a failure: it still writes what it could.
-- `npm` and Python (`pypi`/`pipx`) sidecar references are removed; stack.lock records which
-  releases had one (`stack_sidecars`), so they stay `unsupported`.
-- Fields and tables mise adds that stack does not know are carried as written.
-
-Locked operations (`compile --locked`, `inspect`, `install`, `up`, `exec`, `status`) never run
-`mise lock`. `compile`, `install` and `up` write `.config/mise/mise.lock` from stack.lock
-(everything under `[provider_lock]` but `provider` and `stack_sidecars`) before mise reads it;
-`exec`, `status` and `inspect` do not. `install` and `up` then run `mise install --locked
-<tools whose coverage here is verified or exempt>` and plain `mise install <the rest>`, skipping
-an empty call. A tool name pinned at several versions goes in the locked call only when every
-version qualifies. The step detail lists both (`locked`, `plain`) and states the boundary below.
-mise checks recorded checksums in the plain call too; `--locked` additionally refuses a release
-with no URL for the platform.
-
-Boundary: mise checks what it downloads. A release already installed on the machine is
-reported installed and not checked again, so `verified` describes the policy applied, not the
-bytes on disk; a fresh machine or tool store is where the check applies.
-
-Errors:
+Locked operations never run `mise lock`. `install` and `up` render `.config/mise/mise.lock` from
+stack.lock, then run `mise install --locked` for pins that are `verified` or `exempt` here and a
+plain `mise install` for the rest. mise checks what it downloads: a release already installed on
+the machine is not checked again.
 
 | Code | When |
 |---|---|
-| `artifact_mismatch` | mise refused a download (checksum) or a packslip signer or repository identity that differs from stack.lock. `details`: `[{ kind: "checksum" \| "signer" \| "repository", name, platform?, expected?, actual?, url? }]`, then mise's output. Verify upstream; `compile --update` and review the diff if the change is expected |
-| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform, or under the key mise needs on this machine (`details`: `[{ name, platform, state, reason? }]`, `platform` being that key), or this machine is not listed (`details`: `[{ platform, state: "unlisted", platforms }]`). A machine is listed when a listed platform is, or writes, a key it needs: `linux-x64` lists a musl or non-AVX2 x64 Linux, `linux-x64-musl` lists only a musl one. Every locked operation (`compile --locked`, `inspect` with a lock, `install`, `up`, `exec`, `run`, `status`, and their MCP tools) checks this before any provider call; ordinary `compile` may lock other platforms from any machine. Nothing is written or installed |
-| `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read. stack.lock, the provider config and the rendered lock are unchanged |
-| `lock_invalid` | embedded entries disagree with the pins (an entry for a version stack.lock does not pin), a malformed `[provider_lock]`, a dangling `conda_deps` name, or a value with template syntax (`{{`, `{%`, `{#`). `compile --update` replaces a bad embedded lock |
+| `artifact_mismatch` | mise refused a download, signer or repository identity that differs from stack.lock. Verify upstream, then `compile --update` and review the diff if the change is expected |
+| `artifact_unlocked` | `artifacts = "required"` and a pin is `missing` or `unsupported` on a listed platform or on this machine, or this machine's platform is not listed. Nothing is written or installed |
+| `artifact_lock_failed` | `mise lock` could not run, timed out, or left a lock stack cannot read; nothing was changed |
+| `lock_invalid` | the embedded lock disagrees with the pins or is malformed; `compile --update` replaces it |
 | `lock_outdated` | `artifacts = "required"` with a version 2 lock |
-| `provider_outdated` | mise older than 2026.9.16, which the embedded lock needs; checked by `compile`, `install`, `up` and `doctor` before anything is written |
+| `provider_outdated` | mise is older than 2026.9.16, which the embedded lock needs |
 | `install_failed` | any other install failure, with mise's output |
 
-Migration: version 2 locks stay valid for locked operations under `best-effort`, with every pin
-`missing`; the next `compile` writes version 3 (and needs network access for `mise lock`) and
-rewrites `resolved_on` in mise's platform names. Under `required` a version 2 lock is
-`lock_outdated`. A session's configuration digest includes stack.lock, so the first `up` after
-migrating restarts services once. Keep `.config/mise/mise.lock` and `.config/mise/locks/` out of
-version control with the generated config: they are rendered from stack.lock.
+Migration: version 2 locks stay valid under `best-effort`, with every pin `missing`. The next
+`compile` writes version 3 and needs network access for `mise lock`. Because a session's
+configuration includes stack.lock, the first `up` after migrating restarts services once. Keep
+`.config/mise/mise.lock` and `.config/mise/locks/` out of version control: they are generated.
 
-mise records each scratch configuration it loads among its tracked configs. Stack removes
-links into a scratch directory when that directory is dropped, on success or error, and keeps
-other entries. A process killed before cleanup can leave its scratch directory and links.
-
+[All docs](../README.md)

@@ -71,15 +71,12 @@ output (mise's answer when no release matches) is an error, not a version.
   (`17` → `17.11`, `8` → `8.10.2`) mise's presets reuse existing data; this was checked on macOS
   with mise 2026.9.18.
 - An exact version is not an artifact checksum. `[provider_lock]` is mise's `mise.lock`
-  re-nested verbatim (plus stack's `provider` and `stack_sidecars` keys), matched to pins by
-  tool name as rendered and version; its `options` are mise's own and never compared with
-  declared options. `compile` locks the pins that need entries in a scratch root seeded with
-  nothing for them and merges: committed values change only under `--update`, differences are
-  reported, a skipped refresh is `retained`, shared conda records are merged per (platform,
-  package) and pruned when unreferenced. Locked operations render `.config/mise/mise.lock` from
-  stack.lock before installing and split the install into `mise install --locked` (verified or
-  exempt here) and plain `mise install` (unsupported or missing). Version 2 locks remain valid
-  under `best-effort`; `required` refuses them. See [Artifact checksums](user/commands.md#artifact-checksums).
+  embedded verbatim, matched to pins by tool name and version. `compile` locks only the pins
+  that need entries, in a scratch root, and merges the result: committed values change only
+  under `--update`, every difference is reported, and shared conda records are merged per
+  package. Locked operations render `.config/mise/mise.lock` from stack.lock and install with
+  `mise install --locked` where coverage allows. Version 2 locks stay valid under
+  `best-effort`. See [Artifact checksums](user/commands.md#artifact-checksums).
 
 ## Runtime contract
 
@@ -120,19 +117,13 @@ output (mise's answer when no release matches) is an error, not a version.
   become a URL that names only the invalid host. Only values that name no host (ports, users,
   databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
   turns this into a refusal to run.
-- **Secret grants.** A task's `secrets` names, `exec --secret` and MCP `stack_exec.secrets` are
-  resolved by stack, not by mise's native task secrets: `exec` computes the environment with
-  `mise env --json` and runs the program itself, so a mise-side grant would not reach it.
-  Names are checked at compile and plan time against every service's endpoint variables,
-  `[env]` and the variables stack and mise reserve, and at run time also against everything the
-  planned environment sets or withholds. After verification and withholding, stack locates the
-  `fnox` on the planned `PATH`, requires it to resolve inside the install directory mise reports
-  for the locked release (asked in a `[tools]`-only scratch root), and runs it twice
-  (`--describe`, then `--keys`), non-interactive and without fnox's daemon, each bounded by 30s,
-  64 KiB and a process-group kill. The whole answer is validated before anything is applied;
-  nothing fnox prints is forwarded. Captured output passes through a streaming literal matcher
-  before its tail is bounded. Values live only in the command's environment and in that
-  matcher. Details and the boundary: [secret grants](user/secrets.md).
+- **Secret grants.** Stack resolves grants itself rather than using mise's native task
+  secrets, because `exec` computes the environment with `mise env --json` and runs the program
+  itself, so a mise-side grant would not reach it. Names are checked at compile and plan time
+  against service endpoints, `[env]` and reserved variables. After verification, stack runs the
+  pinned `fnox` twice (`--describe`, then `--keys`), bounded in time and output, validates the
+  whole answer before applying it, and never forwards what fnox printed. Captured output passes
+  through a streaming matcher before it is bounded. See [secret grants](user/secrets.md).
 - **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
   `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.
@@ -220,7 +211,7 @@ staging directory behind.
   are liveness-only.
 - Artifact checksums cover what mise can lock and downloads; releases already installed are not
   re-checked, and npm/Python dependency graphs, URL-less backends and tools mise cannot lock
-  (redis today) are reported but not covered.
+  are reported but not covered.
 - OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
 - Unattended expiry needs `stack gc --watch` running under a supervisor of your choice.
 - Deleted-project cleanup depends on what was recorded at launch; it refuses rather than guesses.

@@ -46,12 +46,10 @@ When that fails (`mise x -- pitchfork supervisor start` exits non-zero, or mise 
 found or run), the supervisor is not asked and the error is `start_failed`, `stop_failed`
 or `provider_unavailable`; one still running at the deadline is left to finish.
 
-`install` and `up` report this platform's artifact coverage in their `install` step
-(`artifacts.verified`, `exempt`, `unsupported`, `missing`), and `compile`/`inspect` report it per
-`versions[]` entry and platform. `artifact_mismatch` means mise refused a download or signer that
-differs from stack.lock: do not work around it; report it, and only run `stack compile --update`
-when the change is expected upstream. `artifact_unlocked` means the project requires coverage
-that stack.lock lacks. A `verified` release already installed on the machine was not re-checked.
+`install` and `up` report this machine's artifact coverage, and `compile`/`inspect` report it per
+pin and platform. `artifact_mismatch` means mise refused a download that differs from
+stack.lock: do not work around it. Report it, and run `stack compile --update` only when the
+change is expected upstream.
 
 `stack up` does not restart a service whose configuration is unchanged, so after editing code a
 service loaded, run `stack restart <service>`. Declare `watch = [...]` on the service and
@@ -64,17 +62,12 @@ Start the stdio MCP server with:
 stack mcp
 ```
 
-Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc`, `stack_doctor`, and `stack_skill` (the `SKILL.md` of one skill `stack_inspect` lists as available, at most 64 KiB).
+Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc`, `stack_doctor` and `stack_skill`, which returns one skill's `SKILL.md`.
 
-`stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command;
-`stack_run` grants exactly the task's declared `secrets` and refuses additions. Granted values
-are replaced by `[redacted:KEY]` in the parsed `stdout` and `stderr` strings (also in a
-`timed_out` error's details; `[redacted]` where naming the key could spell out a value), the
-result lists the names (key names are not secret)
-under `secrets` and declined fnox removals under `warnings`, and values under 8 bytes or ones
-stack's markers could spell out are refused with `secret_unsupported`. Failures are
-`invalid_secret`, `secret_missing`, `secret_unavailable` and `secret_unsupported`; nothing fnox
-printed is ever included. See [secret grants](secrets.md).
+`stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command, and
+`stack_run` grants exactly the task's declared `secrets`. Granted values are replaced by
+`[redacted:KEY]` in `stdout` and `stderr`, and the result lists the granted names under
+`secrets`. See [secret grants](secrets.md).
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep
