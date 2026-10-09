@@ -327,3 +327,8 @@ claim is made.
 A focused Sol high investigation is checking whether the generated task configuration can
 still change after planning releases its lock and before mise loads the task. This is an
 unverified related boundary concern. Platform-variant remediation is also still in progress.
+
+The first post-planning investigation returned only a provider refusal for possible
+cybersecurity risk, with no technical findings. A narrower local task-definition consistency
+test has been delegated with harmless output and synthetic ordinary variables. The concern
+remains unverified until that test or independent review supplies evidence.
