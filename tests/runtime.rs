@@ -2725,13 +2725,18 @@ fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
     fixture.supervisor_tracks(running.service.0, running.port);
-    let mut child = fixture.command(&["exec", "--", "sleep", "3"]).stdout(Stdio::null()).spawn().unwrap();
-    let session_file = fixture.dir.path().join("app/.stack/session.json");
+    // The command signals once it runs: stack has registered it and finished writing the
+    // project before starting it, so deleting the project cannot race that write.
+    let started = fixture.dir.path().join("exec-started");
+    let script = format!("touch '{}'; sleep 3", started.display());
+    let mut child = fixture.command(&["exec", "--", "sh", "-c", &script]).stdout(Stdio::null()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !fs::read_to_string(&session_file).is_ok_and(|s| s.contains("active_executions\": {\n    \"")) {
-        assert!(Instant::now() < deadline, "execution never registered");
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "execution never started");
         thread::sleep(Duration::from_millis(10));
     }
+    let session = fs::read_to_string(fixture.dir.path().join("app/.stack/session.json")).unwrap();
+    assert!(session.contains("active_executions\": {\n    \""), "{session}");
     fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
     let (ok, result) = fixture.gc(&[]);
     assert!(ok && result["data"] == json!([]), "{result}");
@@ -4431,6 +4436,9 @@ fn a_task_configuration_copy_is_removed_after_a_timeout_a_failed_plan_and_a_term
     let results = fixture.mcp(&[("stack_run", json!({ "task": "hang", "timeout_secs": 1 }))], &[]);
     assert_eq!(results[0]["structuredContent"]["error"]["code"], "timed_out", "{}", results[0]);
     assert!(task_configs(&fixture).is_empty(), "MCP timeout");
+    // A timeout bounds planning too, so on a slow machine a run may end before reaching mise.
+    let reached = |fixture: &Fixture| fs::read_to_string(fixture.dir.path().join("run.log")).map_or(0, |log| log.lines().count());
+    let timed_out = reached(&fixture);
     // Planning fails after the copy was made: fnox cannot answer for the grant.
     fs::write(fixture.dir.path().join("fnox-keys-mode"), "exit").unwrap();
     let (envelope, text, _) = json_run(&fixture, &["run", "showenv"]);
@@ -4438,8 +4446,8 @@ fn a_task_configuration_copy_is_removed_after_a_timeout_a_failed_plan_and_a_term
     assert_no_leak(&text, "failed plan");
     let results = fixture.mcp(&[("stack_run", json!({ "task": "showenv" }))], &[]);
     assert_eq!(results[0]["structuredContent"]["ok"], false, "{}", results[0]);
-    // Only the two timed-out runs reached mise; the failed plans did not.
-    assert_eq!(fs::read_to_string(fixture.dir.path().join("run.log")).unwrap().lines().count(), 2);
+    // The failed plans never reached mise.
+    assert_eq!(reached(&fixture), timed_out);
     assert!(task_configs(&fixture).is_empty(), "failed plan");
     fs::remove_file(fixture.dir.path().join("fnox-keys-mode")).unwrap();
     // On the terminal: the copy is removed once the task exits, with the link mise made to it
