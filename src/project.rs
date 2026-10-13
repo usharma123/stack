@@ -377,7 +377,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     if policy.required() && opts.mode != Mode::Frozen && opts.write {
         let unchecked = artifacts::unchecked_targets(new_lock.provider_lock.as_ref(), &pins, &policy.platforms, &outcome.reasons);
         if !unchecked.is_empty() {
-            return Err(artifacts::unlocked_error(unchecked));
+            return Err(artifacts::unlocked_error(unchecked, true));
         }
     }
     // A report reads the lock it describes: the one written, or the committed one.
@@ -393,6 +393,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     preflight(&stack, &new_lock)?;
 
     let output = mise::output_path(&opts.root);
+    let mut ignore_warning = None;
     let (ports, identities) = if opts.write {
         let requests: Vec<Request> = stack
             .services
@@ -415,6 +416,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         };
         let identities = crate::identity::assign(&opts.state, &opts.root, &probed)?;
         write_if_changed(&output, &mise::render(&stack, &ports, &exact, &identities))?;
+        ignore_warning = crate::ignore::update(&opts.root, project.skills.as_ref().map(|s| s.dir.as_str()));
         (ports, identities)
     } else {
         let mut identities = crate::identity::lookup(&opts.state, &opts.root)?;
@@ -424,6 +426,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
 
     let mut warnings = warnings(&stack);
     warnings.extend(outcome.warnings);
+    warnings.extend(ignore_warning);
     let lock = if opts.write || opts.mode == Mode::Frozen { Some(new_lock) } else { previous };
     Ok(Report {
         lock,
@@ -707,7 +710,7 @@ fn check_committed_artifacts(lock: &Lockfile, pins: &[PinKey], policy: &artifact
     if unchecked.is_empty() {
         return Ok(());
     }
-    Err(artifacts::unlocked_error(unchecked))
+    Err(artifacts::unlocked_error(unchecked, false))
 }
 
 /// Ordinary compile and `--update`: lock the artifacts of the pins that need entries in a
@@ -730,7 +733,16 @@ fn lock_artifacts(previous: Option<&Lockfile>, new_lock: &Lockfile, pins: &[PinK
             committed = None;
         }
     }
+    let mut dropped = Vec::new();
     if let Some(embedded) = committed.as_mut() {
+        let unlisted = artifacts::unlisted_platforms(embedded, pins, platforms);
+        if !unlisted.is_empty() {
+            let unlisted: Vec<String> = unlisted.into_iter().collect();
+            dropped.push(format!(
+                "artifact checksums for {} were dropped from stack.lock: `[lock] platforms` does not list them (the default no longer includes macos-x64; a tools-only project that installs on Intel macOS lists it to keep them)",
+                unlisted.join(", ")
+            ));
+        }
         artifacts::retain(embedded, pins, platforms);
     }
     // A pin whose options changed can resolve to the release it had; its committed entry was
@@ -741,7 +753,7 @@ fn lock_artifacts(previous: Option<&Lockfile>, new_lock: &Lockfile, pins: &[PinK
     if !targets.is_empty() || artifacts::has_entries(committed.as_ref()) {
         mise::check_requirements(locker.version(&opts.root)?, &[lock_requirement_for("stack.lock's embedded artifact lock (mise.lock version 3)")])?;
     }
-    let mut outcome = ArtifactOutcome::default();
+    let mut outcome = ArtifactOutcome { warnings: dropped, ..Default::default() };
     if targets.is_empty() {
         outcome.provider_lock = committed.filter(|e| artifacts::has_entries(Some(e)));
         return Ok(outcome);
@@ -782,7 +794,7 @@ fn lock_artifacts(previous: Option<&Lockfile>, new_lock: &Lockfile, pins: &[PinK
     let embedded = artifacts::finish(merged.lock, committed.as_ref(), stripped, pins, platforms);
     outcome.provider_lock = Some(embedded).filter(|e| artifacts::has_entries(Some(e)));
     outcome.events = merged.events;
-    outcome.warnings = merged.warnings;
+    outcome.warnings.extend(merged.warnings);
     outcome.reasons = reasons;
     if run.exit_code != Some(0) {
         outcome.warnings.push(format!(

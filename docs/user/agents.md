@@ -30,7 +30,7 @@ stack --json exec --require-all --timeout 5m -- python --version
 stack --json down
 ```
 
-`exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code. On timeout it exits 124 with `ok: false` and code `timed_out`; the output so far is in `error.details`. Without `--json`, commands keep stdout and stderr, and `--timeout` works too.
+`exec --json` captures at most 64 KiB from each output stream and exits with the command's exit code. `--timeout` counts from the call, planning included (lock, compile, a task's install of missing pins), and the command gets what is left. On timeout it exits 124 with `ok: false` and code `timed_out`; the output so far is in `error.details`, or, when planning was cut short and nothing ran, the cut-short step's error as `cause`. Without `--json`, commands keep stdout and stderr, and `--timeout` works too.
 
 `up` and `restart` default to a 10m startup deadline. Their CLI `--timeout` accepts durations
 of at least 1s; MCP `timeout_secs` accepts a whole number of seconds of at least 1, default
@@ -64,10 +64,18 @@ stack mcp
 
 Configure your MCP client to launch `stack` with the argument `mcp`. The server exposes Stack operations through the same structured result contract: `stack_inspect`, `stack_compile` (with `reassign_ports` after a `port_conflict`), `stack_install`, `stack_up`, `stack_restart`, `stack_status`, `stack_run`, `stack_exec`, `stack_logs`, `stack_renew`, `stack_down`, `stack_gc`, `stack_doctor` and `stack_skill`, which returns one skill's `SKILL.md`.
 
+Every call is checked against the tool's advertised `inputSchema` before anything runs: an
+unknown argument (`secret` for `secrets`, `timeout` for `timeout_secs`), a wrong type, a missing
+required argument, an out-of-range number, or two arguments that conflict (`require` with
+`require_all`, `update` with `locked`) is a `usage` error naming it, with the accepted names in
+the hint. `command` must be an argv list; a string is refused, not split. An argument given as
+`null` counts as omitted.
+
 `stack_exec` takes `secrets: ["KEY", ...]` to grant named fnox secrets to one command, and
 `stack_run` grants exactly the task's declared `secrets`. Granted values are replaced by
 `[redacted:KEY]` in `stdout` and `stderr`, and the result lists the granted names under
-`secrets`. See [secret grants](secrets.md).
+`secrets`. A grant is not access control: the command can run fnox itself to read secrets it
+was not granted, and those values are not redacted. See [secret grants](secrets.md).
 
 MCP execution is bounded on Unix: at most 64 KiB of each output stream is retained, and the
 command's process group is terminated on timeout or completion. Detached children cannot keep

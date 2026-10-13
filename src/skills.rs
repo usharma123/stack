@@ -378,7 +378,11 @@ pub struct SkillText {
 }
 
 /// The `SKILL.md` of an available, non-provider skill that discovery enumerated.
-pub fn read(discovery: &Discovery, tool: &str, name: &str) -> Result<SkillText> {
+pub fn read(discovery: &Discovery, tool: &str, name: Option<&str>) -> Result<SkillText> {
+    let name = match name {
+        Some(name) => name,
+        None => only_skill(discovery, tool)?,
+    };
     let not_found = |why: String| {
         StackError::new("skill_not_found", format!("no skill {name:?} of tool {tool:?}: {why}"))
             .hint("`stack_inspect` lists the stack's skills under `skills`; only `available` ones can be read")
@@ -438,6 +442,26 @@ pub fn read(discovery: &Discovery, tool: &str, name: &str) -> Result<SkillText> 
         bytes: text.len() as u64,
         text,
     })
+}
+
+/// The name of `tool`'s one available skill. With several the caller must choose; with none,
+/// reading fails as it would for any name.
+fn only_skill<'a>(discovery: &'a Discovery, tool: &str) -> Result<&'a str> {
+    let names: Vec<&str> = discovery
+        .skills
+        .iter()
+        .filter(|s| s.tool == tool && s.status == Status::Available)
+        .filter_map(|s| s.name.as_deref())
+        .collect();
+    match names.as_slice() {
+        [one] => Ok(one),
+        [] => Err(StackError::new("skill_not_found", format!("tool {tool:?} has no available skill"))
+            .hint("`stack_inspect` lists the stack's skills under `skills`; only `available` ones can be read")
+            .with_detail(json!({ "tool": tool }))),
+        several => Err(StackError::new("usage", format!("tool {tool:?} has {} available skills; name one", several.len()))
+            .hint(format!("give name, one of: {}", several.join(", ")))
+            .with_detail(json!({ "tool": tool, "names": several }))),
+    }
 }
 
 /// Open a file whose last component must not be a symbolic link.
@@ -670,13 +694,57 @@ pub fn sync(root: &Path, dir: &Path, discovery: &Discovery) -> SyncReport {
 }
 
 /// Create `<root>/<dir>` component by component. Every component must be a real directory:
-/// a symbolic link anywhere in the path could lead outside the project, so it is refused.
+/// a symbolic link anywhere in the path could lead outside the project, so it is refused. So is
+/// `.stack` or `.git` by another name: its first component is created alone and checked before
+/// anything inside it, and removed again when it was new.
 fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str, String)> {
+    let Some(first) = dir.components().next() else { return real_dir(root, dir, true).map(drop) };
+    let first = root.join(first);
+    let new = std::fs::symlink_metadata(&first).is_err();
+    real_dir(root, Path::new(first.file_name().unwrap_or_default()), true)?;
+    if reserved(root, dir) {
+        if new {
+            let _ = std::fs::remove_dir(&first);
+        }
+        return Err(("invalid_path", format!("{} is .stack or .git on this file system; stack never links skills inside either", first.display())));
+    }
+    real_dir(root, dir, true).map(drop)
+}
+
+/// Whether `<root>/<dir>` is inside `.stack` or `.git` as the file system resolves names:
+/// its first component is the same directory as either. Where the file system ignores case
+/// `.Stack` is `.stack`, whichever was created first; where it does not, `.Stack` is its own
+/// directory. [`validate_dir`] already refused the names as written.
+pub(crate) fn reserved(root: &Path, dir: &Path) -> bool {
+    let Some(Component::Normal(first)) = dir.components().next() else { return false };
+    let Some(first) = file_id(&root.join(first)) else { return false };
+    [".stack", ".git"].iter().any(|name| file_id(&root.join(name)).as_ref() == Some(&first))
+}
+
+/// What `path` is, following links: its device and inode.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok()
+}
+
+/// Whether `<root>/<dir>` is a real directory inside the project, checked component by
+/// component without following a symbolic link: `Ok(false)` when a component does not exist
+/// (created instead, with `create`), and an error for a link, a non-directory, or a path that
+/// does not resolve inside the project. Skill links and stack's ignore files are written only
+/// into a directory this accepts; skill links only where [`reserved`] is false too.
+pub(crate) fn real_dir(root: &Path, dir: &Path, create: bool) -> std::result::Result<bool, (&'static str, String)> {
     let mut at = root.to_path_buf();
     for component in dir.components() {
         at.push(component);
         let meta = match std::fs::symlink_metadata(&at) {
             Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(false),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 match std::fs::create_dir(&at) {
                     Ok(()) => {}
@@ -694,11 +762,32 @@ fn prepare_dir(root: &Path, dir: &Path) -> std::result::Result<(), (&'static str
             return Err(("invalid_path", format!("{} is not a directory", at.display())));
         }
     }
-    // No component is a link, so the path cannot resolve outside the project.
-    match at.canonicalize() {
-        Ok(real) if real == at && real.starts_with(root) => Ok(()),
+    // No component is a link, so the path cannot resolve outside the project. Where the file
+    // system ignores case, the stored spelling (`.config` for `.Config`) may differ from the one
+    // written: the directory is the same.
+    match (at.canonicalize(), root.canonicalize()) {
+        (Ok(real), Ok(real_root)) if real.starts_with(&real_root) => Ok(true),
         _ => Err(("invalid_path", format!("{} does not resolve inside the project", at.display()))),
     }
+}
+
+/// The link names stack recorded in `dir`'s registry that are still its links: a symbolic
+/// link (never followed) pointing exactly where it was recorded. A name since removed,
+/// replaced (by a directory or file the user wrote, or a link of their own) or pointed
+/// elsewhere is not stack's. An error says why the registry cannot be read: what stack owns
+/// there is then unknown.
+pub fn linked(dir: &Path) -> std::result::Result<Vec<String>, String> {
+    let registry = read_registry(dir)?;
+    Ok(registry
+        .links
+        .into_iter()
+        .filter(|(name, recorded)| {
+            let link = dir.join(name);
+            std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
+                && std::fs::read_link(&link).ok().as_ref() == Some(recorded)
+        })
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// The ownership record, refusing anything stack cannot trust: a link (which could redirect a
@@ -853,7 +942,7 @@ mod tests {
         let names: Vec<_> = d.skills.iter().map(|s| (s.name.clone().unwrap(), s.status)).collect();
         assert_eq!(names, [("fnox".into(), Status::Available), ("fnox-setup".into(), Status::Available)]);
         assert!(d.warnings.is_empty());
-        let text = read(&d, "fnox", "fnox-setup").unwrap();
+        let text = read(&d, "fnox", Some("fnox-setup")).unwrap();
         assert_eq!(text.text, "# fnox-setup\n");
     }
 
@@ -902,7 +991,7 @@ mod tests {
             assert_eq!(s.status, Status::NoSkill, "{s:?}");
             assert!(s.reason.is_some());
         }
-        assert_eq!(read(&d, "fnox", "escape").unwrap_err().code, "skill_not_found");
+        assert_eq!(read(&d, "fnox", Some("escape")).unwrap_err().code, "skill_not_found");
     }
 
     #[test]
@@ -912,18 +1001,18 @@ mod tests {
         std::fs::write(&entry, vec![b'a'; 65 * 1024]).unwrap();
         let lock = Lockfile::new(vec![], vec![locked("fnox", None, "1.39.0")], vec![]);
         let d = discover_with(&lock, &[version("tool", "fnox", None, Some("1.39.0"), "project")], |_| Ok(answer(&rel, "fnox", "1.39.0", &["big"])));
-        assert_eq!(read(&d, "fnox", "big").unwrap_err().code, "skill_too_large");
+        assert_eq!(read(&d, "fnox", Some("big")).unwrap_err().code, "skill_too_large");
         std::fs::write(&entry, vec![b'a'; 64 * 1024]).unwrap();
-        assert_eq!(read(&d, "fnox", "big").unwrap().bytes, 64 * 1024);
+        assert_eq!(read(&d, "fnox", Some("big")).unwrap().bytes, 64 * 1024);
         // Swapped for a link after discovery: refused, never followed.
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret"), "s").unwrap();
         std::fs::remove_file(&entry).unwrap();
         std::os::unix::fs::symlink(outside.path().join("secret"), &entry).unwrap();
-        assert_eq!(read(&d, "fnox", "big").unwrap_err().code, "skill_unreadable");
+        assert_eq!(read(&d, "fnox", Some("big")).unwrap_err().code, "skill_unreadable");
         std::fs::remove_file(&entry).unwrap();
         std::fs::write(&entry, [0xff, 0xfe]).unwrap();
-        assert_eq!(read(&d, "fnox", "big").unwrap_err().code, "skill_unreadable");
+        assert_eq!(read(&d, "fnox", Some("big")).unwrap_err().code, "skill_unreadable");
     }
 
     #[test]
@@ -933,6 +1022,37 @@ mod tests {
         for bad in ["", " ", "/abs", "../x", "a/../../b", "a/..", ".", ".stack/skills", ".git/skills", "\\x"] {
             assert_eq!(validate_dir(bad).unwrap_err().code, "invalid_path", "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_case_alias_is_its_real_directory_and_never_one_inside_stack_or_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in [".config/mise", ".stack/skills", ".git/skills"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        assert_eq!(real_dir(&root, Path::new(".config/mise"), false), Ok(true));
+        // stack's own directory is a real one inside the project: only skills stay out of it.
+        assert_eq!(real_dir(&root, Path::new(".stack"), false), Ok(true));
+        assert!(reserved(&root, Path::new(".stack/skills")) && reserved(&root, Path::new(".git")));
+        assert!(!reserved(&root, Path::new(".config/mise")) && !reserved(&root, Path::new("a/.stack")));
+        // Only where the file system ignores case do these name the directories above.
+        if !root.join(".CONFIG").exists() {
+            assert!(!reserved(&root, Path::new(".Stack/skills")));
+            return;
+        }
+        assert_eq!(real_dir(&root, Path::new(".Config/MISE"), false), Ok(true));
+        for alias in [".Stack/skills", ".GIT/skills"] {
+            assert!(reserved(&root, Path::new(alias)), "{alias}");
+            assert_eq!(prepare_dir(&root, Path::new(alias)).unwrap_err().0, "invalid_path", "{alias}");
+        }
+        // Before `.stack` exists, its alias is refused as well, and not left behind.
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh = fresh.path().canonicalize().unwrap();
+        assert_eq!(prepare_dir(&fresh, Path::new(".Stack/skills")).unwrap_err().0, "invalid_path");
+        assert!(!fresh.join(".stack").exists());
+        prepare_dir(&fresh, Path::new(".Config/mise")).unwrap();
+        assert!(fresh.join(".config/mise").is_dir());
     }
 
     #[test]

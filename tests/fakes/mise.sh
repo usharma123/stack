@@ -1,5 +1,7 @@
 #!/bin/sh
 echo "$*" >>"$REVIEW_FIXTURE/mise.log"
+# The Python the test found on its own PATH before narrowing stack's (see tests/support/python.rs).
+py=${REVIEW_PYTHON:-python3}
 # Which file ran, however PATH named it: a relative entry is found from the working directory.
 case $0 in */*) self=${0%/*} ;; *) self=. ;; esac
 echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
@@ -26,18 +28,78 @@ case "$1 $2" in
     if test "${3-}" = fnox; then
       { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/fnox-ls.log"
       if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
-    elif test -f "$REVIEW_FIXTURE/ls.json"; then
-      printf '{"fnox":'; cat "$REVIEW_FIXTURE/ls.json"; echo '}'
-    else echo '{}'; fi ;;
+    else
+      # Every release the configuration names, installed when an install recorded it (or a
+      # test listed it) in `installed`; `ls.json` stands for fnox's rows when a test gives them.
+      "$py" -c '
+import json, os, sys, tomllib
+fixture = sys.argv[1]
+try:
+    tools = tomllib.load(open(".config/mise/conf.d/stack.toml", "rb")).get("tools", {})
+except FileNotFoundError:
+    tools = {}
+try:
+    installed = set(open(os.path.join(fixture, "installed")).read().split())
+except FileNotFoundError:
+    installed = set()
+out = {}
+for tool, value in tools.items():
+    for v in value if isinstance(value, list) else [value]:
+        v = v["version"] if isinstance(v, dict) else v
+        out.setdefault(tool, []).append({"version": v, "requested_version": v, "install_path": os.path.join(fixture, "installs", tool, v), "installed": f"{tool}@{v}" in installed, "active": False})
+if os.path.exists(os.path.join(fixture, "ls.json")):
+    out["fnox"] = json.load(open(os.path.join(fixture, "ls.json")))
+print(json.dumps(out))' "$REVIEW_FIXTURE"
+    fi ;;
   'skills ls') echo '[]' ;;
   'lock --platform')
     # Artifact locking in a scratch root: what it was given, then the lock a test supplies.
     { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml; echo '--- seed'; cat .config/mise/mise.lock; } >>"$REVIEW_FIXTURE/lock.log"
     if test -f "$REVIEW_FIXTURE/mise-lock.toml"; then cp "$REVIEW_FIXTURE/mise-lock.toml" .config/mise/mise.lock; fi ;;
   'install --locked'|'install --yes')
-    # The rendered lock as the install saw it.
-    if test -f .config/mise/mise.lock; then cp .config/mise/mise.lock "$REVIEW_FIXTURE/rendered-at-install"; fi
-    if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi ;;
+    # The configuration mise loads, as `run` below picks it, and the lock beside it as the
+    # install saw it: a task's copy when stack installs a task's tools from it.
+    config=$MISE_OVERRIDE_CONFIG_FILENAMES
+    test -f "$config" || config=$MISE_GLOBAL_CONFIG_FILE
+    echo "config=$config $*" >>"$REVIEW_FIXTURE/install.log"
+    if test -f "${config%/conf.d/*}/mise.lock"; then cp "${config%/conf.d/*}/mise.lock" "$REVIEW_FIXTURE/rendered-at-install"; fi
+    # Like mise, link the configuration it loaded under its state directory, when a test asks.
+    if test -f "$REVIEW_FIXTURE/track-configs"; then
+      mkdir -p "$MISE_STATE_DIR/tracked-configs"
+      ln -sf "$config" "$MISE_STATE_DIR/tracked-configs/install-$(printf %s "$config" | cksum | cut -d' ' -f1)"
+    fi
+    # A stalled download: a child that sleeps `install-stall` seconds, its PID recorded.
+    if test -f "$REVIEW_FIXTURE/install-stall"; then
+      sh -c 'echo $$ >"$1/install-stalled-pid"; exec sleep "$(cat "$1/install-stall")"' sh "$REVIEW_FIXTURE"
+    fi
+    if test "$2" = --locked && test -f "$REVIEW_FIXTURE/install-locked-fail"; then cat "$REVIEW_FIXTURE/install-locked-fail" >&2; exit 1; fi
+    # Record what was installed: the named tools (every one when none is named), each at every
+    # version the configuration gives it.
+    shift 1
+    "$py" -c '
+import os, re, sys, tomllib
+try:
+    config = tomllib.load(open(sys.argv[2], "rb"))
+except FileNotFoundError:
+    config = {}
+# Like mise, every [env] value is rendered when the configuration loads: a variable the copy
+# declares as inherited must be in the environment, or nothing installs.
+for key, value in config.get("env", {}).items():
+    for name in re.findall(r"env\[\"([^\"]+)\"\]", value if isinstance(value, str) else ""):
+        if name not in os.environ:
+            sys.exit("mise ERROR Failed to render [env] %s: Tried to render a variable that is undefined" % key)
+        with open(os.path.join(sys.argv[1], "install-env.log"), "a") as f:
+            f.write("%s=%s\n" % (name, os.environ[name]))
+tools = {k: v if isinstance(v, list) else [v] for k, v in config.get("tools", {}).items()}
+# A preset service installs its tool at the version the daemon names.
+for daemon in config.get("daemons", {}).values():
+    if "preset" in daemon and "version" in daemon:
+        tools.setdefault(daemon["preset"], []).append(daemon["version"])
+named = [a for a in sys.argv[3:] if not a.startswith("-")] or list(tools)
+with open(os.path.join(sys.argv[1], "installed"), "a") as f:
+    for tool in named:
+        for v in tools.get(tool, []):
+            f.write("%s@%s\n" % (tool, v["version"] if isinstance(v, dict) else v))' "$REVIEW_FIXTURE" "$config" "$@" ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
     echo 'mise WARN  mise version 2099.1.1 available' >&2
@@ -57,7 +119,7 @@ case "$1 $2" in
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     # A supervised listener (see `daemons start`) is reported with its real PID while alive.
     if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
+      "$py" -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
     else
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
@@ -66,12 +128,12 @@ case "$1 $2" in
     # A request client that would launch a service later, after the request gave up. Like a
     # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).
     if test -f "$REVIEW_FIXTURE/late-client"; then
-      python3 -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
+      "$py" -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
     fi
     if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
+      "$py" -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
       echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
       sleep 0.3
     fi
@@ -96,6 +158,9 @@ case "$1 $2" in
     echo "config=$config root=${MISE_GLOBAL_CONFIG_ROOT-unset} dir=$(pwd -P)" >>"$REVIEW_FIXTURE/run.log"
     # The generated config the task ran from: its definition as stack planned it.
     cp "$config" "$REVIEW_FIXTURE/run-config" 2>/dev/null
+    # The provider lock mise finds beside it, if any.
+    rm -f "$REVIEW_FIXTURE/run-lock"
+    cp "${config%/conf.d/*}/mise.lock" "$REVIEW_FIXTURE/run-lock" 2>/dev/null
     # Like mise, link the configuration it loaded under its state directory, when a test asks.
     if test -f "$REVIEW_FIXTURE/track-configs"; then
       mkdir -p "$MISE_STATE_DIR/tracked-configs"
@@ -103,6 +168,8 @@ case "$1 $2" in
     fi
     if test "$task" = hang; then sleep 30; fi
     if test "$task" = fail; then exit 3; fi
+    # A task whose tools mise could not install: what mise printed, as a test gives it.
+    if test "$task" = refused; then cat "$REVIEW_FIXTURE/run-refusal" >&2; exit 1; fi
     # A task that shows the environment it was given, on both streams.
     if test "$task" = showenv; then echo; env | sort; env | sort >&2; fi ;;
   'x --')
@@ -119,6 +186,6 @@ case "$1 $2" in
     if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
     # A stopped supervised listener is reported stopped, like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port"; then
-      python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
+      "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json"
     fi ;;
 esac

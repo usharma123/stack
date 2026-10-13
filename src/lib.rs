@@ -7,6 +7,7 @@ pub mod error;
 pub mod git;
 pub mod hash;
 pub mod identity;
+pub mod ignore;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;
