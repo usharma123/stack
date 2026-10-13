@@ -572,7 +572,13 @@ fn required_artifacts_under_the_default_platforms_cover_a_stack_with_a_service()
         assert_eq!(covered.keys().collect::<Vec<_>>(), ["macos-arm64", "linux-x64", "linux-arm64"], "{name}");
         assert!(covered.values().all(|a| a.state == stack::artifacts::State::Verified), "{name}: {covered:?}");
     }
-    sb.compile(Mode::Frozen).unwrap();
+    // Locked operations refuse an Intel Mac, which the default no longer lists.
+    if stack::artifacts::current_platform() == "macos-x64" {
+        let e = sb.compile(Mode::Frozen).unwrap_err();
+        assert_eq!((e.code, e.details[0]["state"].as_str()), ("artifact_unlocked", Some("unlisted")));
+    } else {
+        sb.compile(Mode::Frozen).unwrap();
+    }
     // A tools-only project may still list Intel macOS itself.
     sb.write("[tools]\njq = \"1.7.1\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\nartifacts = \"required\"\n");
     let report = sb.compile(Mode::UseLock).unwrap();
@@ -618,8 +624,8 @@ fn version_2_locks_stay_usable_under_best_effort_and_migrate_on_compile() {
     assert!(artifacts(&report, "jq").values().all(|a| a.state == stack::artifacts::State::Missing));
     assert!(!sb.root().join(".config/mise/mise.lock").exists());
     assert_eq!(sb.lock().version, 2, "locked mode does not rewrite it");
-    // Required refuses it.
-    sb.write("[tools]\njq = \"1.7\"\n[lock]\nartifacts = \"required\"\n");
+    // Required refuses it, on any machine.
+    sb.write("[tools]\njq = \"1.7\"\n[lock]\nplatforms = [\"current\"]\nartifacts = \"required\"\n");
     assert_eq!(sb.compile(Mode::Frozen).unwrap_err().code, "lock_outdated");
     // Ordinary compile writes version 3 with mise's platform names.
     sb.write("[tools]\njq = \"1.7\"\n");

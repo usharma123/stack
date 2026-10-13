@@ -988,6 +988,7 @@ fn printed(stdout: &str) -> std::collections::BTreeMap<String, String> {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
     let fixture = Fixture::with_bundle(
         "[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n[services.redis]\npreset='redis'\n",
@@ -1086,6 +1087,7 @@ fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn verified_endpoints_pass_through_and_are_poisoned_once_verification_fails() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let inspect: Value =
@@ -1175,6 +1177,7 @@ fn dumped(fixture: &Fixture) -> std::collections::BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -1323,6 +1326,7 @@ fn assert_refused(output: &str, context: &str) {
 const UNVERIFIED: &str = "unverified.stack.invalid";
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
     let Some(psql) = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|d| d.join("psql"))
@@ -1683,6 +1687,7 @@ fn exec_timeout_without_json_keeps_the_output_and_kills_the_whole_command() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_session_copied_in_from_another_checkout_is_ignored_and_never_committed() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1704,6 +1709,7 @@ fn a_session_copied_in_from_another_checkout_is_ignored_and_never_committed() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();
@@ -1751,6 +1757,7 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_restart_records_the_replacement_it_launched() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1787,6 +1794,7 @@ fn a_failed_restart_records_the_replacement_it_launched() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn retrying_an_incomplete_launch_keeps_what_it_recorded_until_down_confirms_it() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1815,6 +1823,7 @@ fn retrying_an_incomplete_launch_keeps_what_it_recorded_until_down_confirms_it()
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_legacy_session_copy_is_ignored_unless_it_may_be_the_last_record_of_a_live_service() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1847,6 +1856,7 @@ fn a_legacy_session_copy_is_ignored_unless_it_may_be_the_last_record_of_a_live_s
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_moved_checkouts_only_record_is_kept_and_named() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1869,6 +1879,7 @@ fn a_moved_checkouts_only_record_is_kept_and_named() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn mcp_restart_rejects_a_malformed_service_list_before_stopping_anything() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1887,6 +1898,7 @@ fn mcp_restart_rejects_a_malformed_service_list_before_stopping_anything() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn watch_compares_modification_times_below_a_second() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     let file = fixture.dir.path().join("app/main.py");
@@ -1907,6 +1919,7 @@ fn watch_compares_modification_times_below_a_second() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_watch_too_large_to_scan_is_reported_incomplete() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['wide']\n");
     let wide = fixture.dir.path().join("app/wide");
@@ -1924,6 +1937,7 @@ fn a_watch_too_large_to_scan_is_reported_incomplete() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_keeps_a_legacy_process_start_time_unknown() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1963,6 +1977,7 @@ fn exec_with_a_timeout_passes_termination_on_to_the_command() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_refuses_a_session_started_from_another_configuration() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -2007,6 +2022,7 @@ fn argument_errors_honour_json() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_start_keeps_ownership_even_after_the_service_is_removed() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     fs::write(
@@ -2034,6 +2050,7 @@ fn a_failed_start_keeps_ownership_even_after_the_service_is_removed() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_start_reports_the_services_error_without_the_supervisors_animation() {
     let fixture = Fixture::with_bundle(WEB);
     let frame = |n: u32| format!("{} [{WEB_ID}] waiting for delay (3s)...\n\r", char::from_u32(0x280b + n).unwrap());
@@ -2078,6 +2095,7 @@ fn non_unicode_arguments_never_crash_usage_errors() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn startup_time_does_not_consume_the_idle_ttl() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
@@ -2132,6 +2150,7 @@ fn mise_resolution_with_no_matching_release_fails_before_writing_anything() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_long_supervisor_socket_path_fails_before_install_and_doctor_reports_it() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
@@ -2231,6 +2250,7 @@ fn web_status(fixture: &Fixture) -> Value {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn identity_probes_accept_only_this_checkouts_instance() {
     let fixture = Fixture::with_bundle(PROBED_WEB);
     fs::write(fixture.dir.path().join("bundle/probe.py"), PROBE_PY).unwrap();
@@ -2310,6 +2330,7 @@ fn identity_probes_accept_only_this_checkouts_instance() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn services_without_probes_stay_liveness_only() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
@@ -2417,6 +2438,7 @@ impl Fixture {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn deleted_projects_are_retained_until_the_supervisor_confirms_terminal_cleanup() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2464,6 +2486,7 @@ fn awkward_provider(fixture: &Fixture) -> (String, String) {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2508,6 +2531,7 @@ fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim(
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn every_gc_mode_shows_the_recovery_commands() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2535,6 +2559,7 @@ fn every_gc_mode_shows_the_recovery_commands() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2575,6 +2600,7 @@ fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_foreign_process_on_a_dead_services_port_is_left_alone() {
     let fixture = Fixture::with_bundle(WEB);
     let mut running = fixture.start_web(&[]);
@@ -2593,6 +2619,7 @@ fn a_foreign_process_on_a_dead_services_port_is_left_alone() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_reused_directory_inode_does_not_inherit_the_old_sessions_authority() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2633,6 +2660,7 @@ fn sessions_without_directory_birth_times_remain_readable() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&["--ttl", "1s"]);
@@ -2669,6 +2697,7 @@ fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn nonterminal_supervisor_states_keep_ownership_even_when_the_recorded_pid_is_dead() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2691,6 +2720,7 @@ fn nonterminal_supervisor_states_keep_ownership_even_when_the_recorded_pid_is_de
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -2714,6 +2744,7 @@ fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&["--ttl", "2s"]);
@@ -2758,6 +2789,7 @@ fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn configured_home_cannot_hide_an_overlong_supervisor_socket() {
     let fixture = Fixture::with_bundle(WEB);
     let long = format!("/tmp/{}", "x".repeat(120));
@@ -2774,6 +2806,7 @@ fn configured_home_cannot_hide_an_overlong_supervisor_socket() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn every_partial_start_failure_preserves_observed_ownership() {
     for failure in ["fail-start", "fail-env-after-start", "fail-query-after-one"] {
         let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.other]\nrun='false'\n");
@@ -2811,6 +2844,7 @@ fn json_result(out: &Output) -> Value {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -2850,6 +2884,7 @@ fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure(
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
     // Pitchfork finds mise for `mise x` only in a few fixed places, unless told. A supervisor
     // that cannot find it runs every project's daemons with the tools of the project that
@@ -2865,39 +2900,46 @@ fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_absolutely() {
     supervisor_outlives_a_timed_out_start(None, "bin/mise", None);
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_relatively() {
     supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", None);
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_mise_is_in_the_project() {
     // An empty PATH entry means the working directory.
     supervisor_outlives_a_timed_out_start(Some(""), "app/mise", None);
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_directory_named_mise() {
     // The OS skips a directory named `mise` on PATH, searchable or not, for the file after it.
     supervisor_outlives_a_timed_out_start(None, "bin/mise", Some(Decoy::Directory));
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_directory_named_mise() {
     supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", Some(Decoy::Directory));
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_mise_only_others_may_run() {
     // The OS skips a file this user may not run for the file after it, whatever others may.
     supervisor_outlives_a_timed_out_start(None, "bin/mise", Some(Decoy::OthersOnly));
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_mise_only_others_may_run() {
     supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", Some(Decoy::OthersOnly));
 }
@@ -3015,6 +3057,7 @@ fn no_supervisor_request(calls: &[String]) {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_cannot_start_stops_up_before_any_request_and_a_retry_succeeds() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
@@ -3048,6 +3091,7 @@ fn a_supervisor_stack_cannot_start_stops_up_before_any_request_and_a_retry_succe
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_cannot_start_stops_restart_before_it_stops_anything() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
@@ -3072,6 +3116,7 @@ fn a_supervisor_stack_cannot_start_stops_restart_before_it_stops_anything() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_stack_cannot_run_stops_up_before_any_request() {
     // A mise first on PATH that names a missing interpreter: the OS skips it for a bare
     // `mise`, but run by path it cannot be started at all.
@@ -3094,6 +3139,7 @@ fn a_supervisor_stack_cannot_run_stops_up_before_any_request() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_supervisor_start_still_running_at_the_deadline_is_left_to_finish_and_no_request_is_made() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
@@ -3150,6 +3196,7 @@ fn report_generation_change(fixture: &Fixture, old: u16, new: u16) {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_foreign_listener_on_the_new_port_of_a_changed_generation_is_a_conflict_after_the_old_stops() {
     let fixture = Fixture::with_bundle(WEB);
     let old = assigned_port(&fixture, "web");
@@ -3178,6 +3225,7 @@ fn a_foreign_listener_on_the_new_port_of_a_changed_generation_is_a_conflict_afte
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_during_a_changed_generation_stops_the_old_service_and_reports_the_new_ports_squatter() {
     let fixture = Fixture::with_bundle(WEB);
     let old = assigned_port(&fixture, "web");
@@ -3199,6 +3247,7 @@ fn down_during_a_changed_generation_stops_the_old_service_and_reports_the_new_po
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn without_a_record_the_supervisors_active_port_decides_what_is_owned() {
     // No session record, the provider reports the daemon with a configured port it does not
     // listen on, and a squatter holds that configured port. Only Pitchfork's active port can
@@ -3231,6 +3280,7 @@ fn without_a_record_the_supervisors_active_port_decides_what_is_owned() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn without_a_record_or_an_active_port_the_configured_port_is_waited_for_not_assumed_foreign() {
     let fixture = Fixture::with_bundle(WEB);
     let old = assigned_port(&fixture, "web");
@@ -3255,6 +3305,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_pinned_port_held_by_another_program_points_at_the_override() {
     let fixture = Fixture::with_bundle(WEB);
     let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3274,6 +3325,7 @@ fn a_pinned_port_held_by_another_program_points_at_the_override() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -3299,6 +3351,7 @@ fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
 // ---- install and logs ----------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn install_puts_locked_tools_in_place_without_starting_or_recording_anything() {
     let fixture = Fixture::with_bundle(WEB);
     let result = json_result(&fixture.ok(&["install", "--json"]));
@@ -3360,6 +3413,7 @@ fn status_of_a_checkout_never_compiled_here_says_to_start_it_without_asking_the_
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_launched_checkout_missing_its_generated_config_is_still_asked_about() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -3449,6 +3503,7 @@ fn tasks_get_the_real_session_or_none_and_a_declared_stack_session_is_refused_fi
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn run_refuses_while_any_service_is_unverified() {
     // Even a task that names no services: `mise run` would hand it every service's endpoint
     // again, including the ones stack withholds.
@@ -3486,6 +3541,7 @@ fn mcp_runs_tasks_and_can_reassign_ports() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn interrupting_up_stops_its_start_request_so_nothing_launches_after_down() {
     use std::os::unix::process::CommandExt;
     let fixture = Fixture::with_bundle(WEB);
@@ -3573,6 +3629,7 @@ fn assert_cut_short_verifying(error: &Value, service: &str) {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_down() {
     let fixture = Fixture::with_bundle(WEB);
     let service = Detached::spawn();
@@ -3613,6 +3670,7 @@ fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_dow
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn mcp_up_reports_its_timeout_as_an_error_and_down_still_stops_what_launched() {
     let fixture = Fixture::with_bundle(WEB);
     let service = Detached::spawn();
@@ -3621,6 +3679,7 @@ fn mcp_up_reports_its_timeout_as_an_error_and_down_still_stops_what_launched() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn mcp_up_cut_short_while_verifying_keeps_what_launched_for_down() {
     let fixture = Fixture::with_bundle(WEB);
     let service = Detached::spawn();
@@ -3656,6 +3715,7 @@ fn mcp_up_times_out_and_down_stops(fixture: &Fixture, service: &Detached) -> Val
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_start_request_cut_short_by_the_timeout_is_killed_with_its_process_group() {
     let fixture = Fixture::with_bundle(WEB);
     fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
@@ -3683,6 +3743,7 @@ fn a_start_request_cut_short_by_the_timeout_is_killed_with_its_process_group() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn startup_waits_for_a_busy_project_only_until_its_timeout() {
     use std::os::unix::process::CommandExt;
     let fixture = Fixture::with_bundle(WEB);
@@ -3715,6 +3776,7 @@ fn startup_waits_for_a_busy_project_only_until_its_timeout() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_restart_cut_short_keeps_the_session_and_records_the_incomplete_launch() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -3984,6 +4046,7 @@ fn fnox_log(fixture: &Fixture) -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_grant_reaches_only_its_command_and_is_redacted_from_captured_output() {
     let fixture = secrets_fixture("[services.db]\npreset = 'postgres'\nversion = '17'\n");
     let script = r#"printf '%s\n' "$DEPLOY_KEY"; printf 'x%sy\n' "$DEPLOY_KEY" >&2; env | sort"#;
@@ -5039,6 +5102,7 @@ fn a_tasks_own_output_is_returned_as_it_wrote_it_and_never_read_for_refusals() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn version_2_locks_install_plainly_and_required_policies_refuse_before_any_install() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
     // The lock the fixture compiled, turned into version 2.
@@ -5154,6 +5218,7 @@ fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordina
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_mise_too_old_for_the_lock_fails_install_and_up_before_ports_identities_or_config_change() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[services.web]\nrun='true'\n");
     let platform = stack::artifacts::current_platform();
