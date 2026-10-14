@@ -1211,7 +1211,9 @@ fn request_each(
             }
             Err(_) => {}
         }
-        if cancel.load(Ordering::SeqCst) || crate::process::expired() {
+        // At the deadline the requests end by themselves, and their answers say what was cut
+        // short; only a cancellation ends them here.
+        if cancel.load(Ordering::SeqCst) {
             ends.iter().for_each(|f| f.store(true, Ordering::SeqCst));
             return Ok(false);
         }
