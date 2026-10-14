@@ -5,7 +5,7 @@
 //! type allows, confirms over the app's own connection settings that it reaches *this* instance.
 //! Connection variables for a service that fails the check are withheld from commands.
 
-use crate::error::{Result, StackError};
+use crate::error::{io_error, Result, StackError};
 use crate::hash::sha256_hex;
 use crate::compose::{Composed, Entry};
 use crate::manifest::{Service, Task};
@@ -776,7 +776,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
     }
-    let warnings = steps.skills(ctx, &report);
+    let mut warnings = steps.skills(ctx, &report);
     // Recorded before anything starts, so a deleted project's services can still be found.
     let provider = socket.and_then(|socket| {
         let state_dir = socket.path.parent()?.parent()?.to_path_buf();
@@ -832,6 +832,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             return Err(steps.fail("ports", port_conflict_error(conflicts), false));
         }
         steps.ok("ports", if mine.is_empty() { json!(null) } else { json!({ "stopped": mine.iter().map(Stray::json).collect::<Vec<_>>() }) });
+        match claim_data(ctx, &report, &statuses) {
+            Ok(moved) => warnings.extend(moved),
+            Err(e) => return Err(steps.fail("data", e, false)),
+        }
     }
 
     let stamp = now();
@@ -943,6 +947,65 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         reaped,
         warnings,
     })
+}
+
+/// The file beside a service's data directory naming the checkout (by token, see
+/// [`crate::checkout`]) whose data it is.
+fn data_marker(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".stack-checkout");
+    dir.with_file_name(name)
+}
+
+/// Make the data directories of the services about to start this checkout's. mise keeps a
+/// preset's data under a directory keyed by the project's path alone, so a checkout deleted
+/// and recreated at the same path would find its predecessor's databases. Data marked for
+/// another checkout is moved aside, never deleted, to `<dir>.replaced-<unix time>` with its
+/// marker, and reported; this checkout then starts with empty data. Data of this checkout stays.
+/// Data from before markers existed (or with an unreadable marker) cannot be told apart and is
+/// adopted. Running services are
+/// left alone: their data is in use.
+fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus]) -> Result<Vec<String>> {
+    let Some(token) = crate::checkout::token(&ctx.root) else { return Ok(Vec::new()) };
+    let mut moved = Vec::new();
+    for daemon in statuses {
+        let Some(dir) = daemon.data_dir.as_deref().map(PathBuf::from) else { continue };
+        let running = matches!(daemon.status.as_str(), "running" | "starting") || daemon.pid.is_some_and(pid_alive);
+        if running || !report.stack.services.contains_key(&daemon.name) {
+            continue;
+        }
+        let marker = data_marker(&dir);
+        // An unreadable marker says no more than a missing one.
+        let owner = fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|v| v["checkout"].as_str().map(String::from));
+        if owner.as_deref() == Some(token.as_str()) {
+            continue;
+        }
+        if owner.is_some() && dir.exists() {
+            let stamp = now();
+            let aside = (0..)
+                .map(|n| {
+                    let suffix = if n == 0 { format!(".replaced-{stamp}") } else { format!(".replaced-{stamp}-{n}") };
+                    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+                    name.push(suffix);
+                    dir.with_file_name(name)
+                })
+                .find(|p| !p.exists())
+                .expect("an unused name");
+            fs::rename(&dir, &aside).map_err(|e| io_error(dir.display(), e))?;
+            fs::rename(&marker, data_marker(&aside)).map_err(|e| io_error(marker.display(), e))?;
+            moved.push(format!(
+                "{}: data an earlier checkout at this path left in {} was moved to {}; this checkout starts with empty data",
+                daemon.name,
+                dir.display(),
+                aside.display()
+            ));
+        }
+        crate::state::write_json(&marker, &json!({ "checkout": token }))?;
+    }
+    Ok(moved)
 }
 
 /// How often a running start is checked on.

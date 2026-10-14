@@ -135,6 +135,13 @@ output (mise's answer when no release matches) is an error, not a version.
   seen that command's process exit, so a running command is never forgotten. GC ignores TTL
   expiry while an execution it saw running is recorded. An explicit runner-death policy still
   takes precedence over a surviving command.
+- **Data.** mise keeps a preset's data under a directory keyed by the project's path alone,
+  so a checkout recreated at a path would find its predecessor's databases. Before starting,
+  `up` writes the checkout token (see *Checkout token*) to `<data dir>.stack-checkout`. Data
+  marked for another checkout is moved, with its marker, to `<data dir>.replaced-<unix time>`
+  (never deleted) and named in `warnings`; the new checkout starts empty. Unmarked data, from
+  before markers or with an unreadable marker, is adopted. A running service's data is not
+  touched.
 - **Starting.** Services start one `mise daemons start -- <name>` request at a time, in
   order. Pitchfork 2.29.0 spawns a request's daemons concurrently, and on macOS Rust's standard
   library creates the pipe a spawn waits on with `pipe()` and only then marks it close-on-exec:

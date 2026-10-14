@@ -66,6 +66,9 @@ load code you edited use `restart`.
   fails with `port_conflict`, naming the port and, where it can, the program. Run
   `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never
   reassigns ports on its own.
+- **Recreated checkouts** start with empty data. If a checkout at the same path was deleted
+  without `down`, its databases are moved to `<data dir>.replaced-<time>` (never deleted) and
+  a warning names them. The same checkout keeps its data across `down` and `up`.
 - **Result.** `--json` gives one check per service (port, readiness, identity) and the
   session's id and lease. The full record, with PIDs and data directories, is
   `.stack/session.json`.

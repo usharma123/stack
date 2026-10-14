@@ -3286,6 +3286,51 @@ fn services_are_started_one_request_at_a_time() {
     fixture.ok(&["down"]);
 }
 
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_is_kept() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    let data = fixture.dir.path().join("mise-state/daemons/0123/data/web");
+    let daemon = json!([{ "id": "app-test/web", "name": "web", "status": "running", "port": port, "data_dir": data }]);
+    fs::write(fixture.dir.path().join("daemons-started.json"), daemon.to_string()).unwrap();
+    let stopped = json!([{ "id": "app-test/web", "name": "web", "status": "stopped", "port": port, "data_dir": data }]);
+    fs::write(fixture.dir.path().join("daemons.json"), stopped.to_string()).unwrap();
+    let marker = data.with_file_name("web.stack-checkout");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    let aside = || fs::read_dir(data.parent().unwrap()).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("web.replaced-")).collect::<Vec<_>>();
+
+    // Data from before markers existed is adopted, not moved.
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("legacy"), "").unwrap();
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(up["data"].get("warnings").is_none(), "{up}");
+    assert!(data.join("legacy").exists());
+    let owner: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(owner["checkout"], token.as_str());
+    fixture.ok(&["down"]);
+
+    // The same checkout keeps its data across restarts.
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(up["data"].get("warnings").is_none() && data.join("legacy").exists() && aside().is_empty(), "{up}");
+    fixture.ok(&["down"]);
+
+    // Data another checkout at this path left is moved aside with its marker, and said so.
+    fs::write(&marker, json!({ "checkout": "a-deleted-checkout" }).to_string()).unwrap();
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let warning = up["data"]["warnings"][0].as_str().unwrap_or_else(|| panic!("{up}"));
+    assert!(warning.starts_with("web: data an earlier checkout") && warning.contains("starts with empty data"), "{warning}");
+    let moved = aside();
+    assert_eq!(moved.len(), 2, "the directory and its marker: {moved:?}");
+    let moved_dir = data.with_file_name(moved.iter().find(|n| !n.ends_with(".stack-checkout")).unwrap());
+    assert!(moved_dir.join("legacy").exists(), "kept, not deleted");
+    assert!(!data.exists(), "this checkout starts empty");
+    let owner: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(owner["checkout"], token.as_str());
+    fixture.ok(&["down"]);
+}
+
 /// A service process the supervisor launched and then lost track of, as Pitchfork 2.29.0 did
 /// with a start it was still recording when it was told to stop: a wrapper leading its own
 /// session (as Pitchfork starts each service) with a child listening on `port`, both with
