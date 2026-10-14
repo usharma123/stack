@@ -2109,9 +2109,11 @@ fn stop_strays(
             unsafe { libc::kill(p.pid as libc::pid_t, sig) };
         }
     };
-    // Adds what `rescan` finds that is not known yet, and says how many that were.
-    let discover = |processes: &mut Vec<Process>| -> usize {
+    // Adds what `rescan` finds that is not known yet, signalled with `sig` (the current phase's),
+    // and says how many that were.
+    let discover = |processes: &mut Vec<Process>, sig: libc::c_int| -> usize {
         let found: Vec<Process> = rescan.map(|r| r()).unwrap_or_default().into_iter().filter(|p| !processes.iter().any(|q| q.same(p))).collect();
+        signal(&found, sig);
         let n = found.len();
         processes.extend(found);
         n
@@ -2122,11 +2124,9 @@ fn stop_strays(
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     let mut killing = false;
     loop {
-        let before = processes.len();
-        if discover(&mut processes) > 0 {
-            signal(&processes[before..], if killing { libc::SIGKILL } else { libc::SIGTERM });
-        }
-        if gone(&processes) && discover(&mut processes) == 0 {
+        let sig = if killing { libc::SIGKILL } else { libc::SIGTERM };
+        discover(&mut processes, sig);
+        if gone(&processes) && discover(&mut processes, sig) == 0 {
             break;
         }
         let now = Instant::now();
@@ -3739,6 +3739,25 @@ fn lock_digest(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_found_only_by_the_last_rescan_is_still_stopped() {
+        let mut worker = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let observed = crate::procinfo::process(worker.id()).unwrap();
+        // The worker shows up only once everything else already looks gone.
+        let calls = std::cell::Cell::new(0);
+        let rescan = || {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 { vec![observed.clone()] } else { Vec::new() }
+        };
+        let started = Instant::now();
+        let survivors = stop_strays(&[], &[], Some(&rescan));
+        let elapsed = started.elapsed();
+        let _ = worker.kill();
+        let _ = worker.wait();
+        assert!(survivors.is_empty(), "{survivors:?}");
+        assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}: it was never sent SIGTERM");
+    }
     use std::cell::RefCell;
 
     thread_local! {
