@@ -658,82 +658,62 @@ fn collect(
     Ok(Piped { timed_out, stdout: out.finish(), stderr: err.finish() })
 }
 
-/// Commands running with signals forwarded to them, and how signals reach them: those of
-/// [`output`] (several threads may each run one) or the one of `run_with_deadline`. The
-/// handler only writes the signal to a pipe; [`forwarder`] does the rest in an ordinary
-/// thread, holding this lock. Commands are spawned and named here, and leave it and are
-/// reaped, under the same lock, so a group is signalled only between its command's spawn and
-/// its reaping: never a group ID that is not yet named, or one already free for reuse. A
-/// report still in the pipe when one kind of command hands over to the other reaches the
-/// commands named when it is handled.
+/// Commands running with signals passed on to them: those of [`output`] (several threads may
+/// each run one) and of `run_with_deadline`. The handler, installed once and kept, only
+/// writes the signal to a pipe with its arrival number; [`forwarder`] does the rest in an
+/// ordinary thread, holding this lock. Commands are spawned and named here, and leave it and
+/// are reaped, under the same lock, so a group is signalled only between its command's spawn
+/// and its reaping: never a group ID that is not yet named, or one already free for reuse.
 #[cfg(unix)]
 struct Registry {
-    /// Commands forwarding signals now; the handler stays installed while any does.
-    users: usize,
-    /// They are `run_with_deadline`'s: a signal passes to the command and stack goes on.
+    commands: Vec<Named>,
+}
+
+/// One command's process group; `passing` for `run_with_deadline`'s, which a signal reaches
+/// without ending stack; `since` is the arrival number when it was named: signals that
+/// arrived by then are not its.
+#[cfg(unix)]
+struct Named {
+    group: i32,
     passing: bool,
-    /// The dispositions the handler replaced, restored when the last user leaves.
-    previous: Vec<(libc::c_int, libc::sigaction)>,
-    /// Process groups of the commands running, each named once.
-    groups: Vec<i32>,
+    since: u64,
 }
 
 #[cfg(unix)]
-static REGISTRY: std::sync::Mutex<Registry> =
-    std::sync::Mutex::new(Registry { users: 0, passing: false, previous: Vec::new(), groups: Vec::new() });
-
-/// Which installation of the handler is current: each first user after none installs anew.
-/// Reports carry it, so one handled after its users left is not taken for a later one's.
-#[cfg(unix)]
-static GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Reports the handler wrote, and those [`forwarder`] handled without ending stack.
-#[cfg(unix)]
-static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(unix)]
-static HANDLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// A report's flag for a signal that passes to the command without ending stack.
-#[cfg(unix)]
-const PASSING: u8 = 0x80;
-
-/// Bytes of one report (see [`report`]).
-#[cfg(unix)]
-const REPORT_SIZE: usize = 8;
+static REGISTRY: std::sync::Mutex<Registry> = std::sync::Mutex::new(Registry { commands: Vec::new() });
 
 #[cfg(unix)]
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
     REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Signals reported so far: each report carries its number, taken as the handler's first act.
+#[cfg(unix)]
+static ARRIVALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The highest arrival number [`forwarder`] passed on without ending stack.
+#[cfg(unix)]
+static HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The write end of the pipe the handler reports signals through, once [`forwarder`] runs.
 #[cfg(unix)]
 static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// For [`output`]: tell [`forwarder`] which signal came, to be passed on before it ends stack.
+/// Bytes of one report: the signal, then its arrival number. Smaller than `PIPE_BUF`, so each
+/// is written whole; the reader collects whole reports.
+#[cfg(unix)]
+const REPORT_SIZE: usize = 16;
+
+/// Tell [`forwarder`] which signal came, and when. Only atomics and `write`, which are
+/// async-signal-safe; errno is kept for the interrupted code.
 #[cfg(unix)]
 extern "C" fn report_signal(signal: libc::c_int) {
-    report(signal as u8);
-}
-
-/// For `run_with_deadline`: tell [`forwarder`] which signal came, to be passed on only.
-#[cfg(unix)]
-extern "C" fn report_passing(signal: libc::c_int) {
-    report(signal as u8 | PASSING);
-}
-
-/// One record of [`REPORT_SIZE`] bytes: the signal (with [`PASSING`]) and the handler's
-/// generation. Records are smaller than `PIPE_BUF`, so each is written, and read, whole.
-/// Only atomics and `write`, which are async-signal-safe; errno is kept for the interrupted
-/// code.
-#[cfg(unix)]
-fn report(byte: u8) {
+    let arrival = ARRIVALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let fd = WAKE.load(std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
-        REPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut record = [0u8; REPORT_SIZE];
-        record[0] = byte;
-        record[1..5].copy_from_slice(&GENERATION.load(std::sync::atomic::Ordering::SeqCst).to_ne_bytes());
+        record[0] = signal as u8;
+        record[8..].copy_from_slice(&arrival.to_ne_bytes());
         // SAFETY: errno is thread-local and saved around write, which is async-signal-safe.
         unsafe {
             let errno = *errno_location();
@@ -753,9 +733,12 @@ unsafe fn errno_location() -> *mut libc::c_int {
     libc::__errno_location()
 }
 
-/// Start, once, the thread that passes each reported signal on to every running command's
-/// group and then lets it end stack, as it would have without the handler (stack installs no
-/// handlers of its own besides these, so that is the default action).
+/// Start, once, the thread that handles reported signals, and install the handler for each
+/// forwarded signal stack does not ignore (one ignored then stays ignored). A signal is passed
+/// on to every command named before it arrived. When all of them are `run_with_deadline`'s,
+/// stack goes on; otherwise, or when there were none, it takes the default action and ends
+/// stack, as it would have without the handler (stack installs no handlers of its own
+/// besides this one).
 #[cfg(unix)]
 fn forwarder() -> io::Result<()> {
     static STARTED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
@@ -770,86 +753,83 @@ fn forwarder() -> io::Result<()> {
                 // SAFETY: plain fcntl on descriptors this function owns.
                 unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             }
-            // A full pipe drops a report rather than blocking the handler; one that ends stack
-            // is enough, and `run_with_deadline` gives up waiting for a dropped one.
+            // A full pipe drops a report rather than blocking the handler; the reports it
+            // holds already end stack or reach the running commands.
             // SAFETY: as above.
             unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
             let read = fds[0];
             std::thread::Builder::new()
                 .name("stack-signals".into())
-                .spawn(move || loop {
+                .spawn(move || {
                     let mut record = [0u8; REPORT_SIZE];
-                    // SAFETY: reads one record into a local buffer of its size.
-                    if unsafe { libc::read(read, record.as_mut_ptr().cast(), REPORT_SIZE) } != REPORT_SIZE as isize {
-                        continue;
+                    let mut filled = 0;
+                    loop {
+                        // SAFETY: reads into the unfilled rest of a local buffer.
+                        let n = unsafe { libc::read(read, record[filled..].as_mut_ptr().cast(), REPORT_SIZE - filled) };
+                        if n <= 0 {
+                            continue;
+                        }
+                        filled += n as usize;
+                        if filled < REPORT_SIZE {
+                            continue;
+                        }
+                        filled = 0;
+                        let signal = libc::c_int::from(record[0]);
+                        let arrival = u64::from_ne_bytes(record[8..].try_into().expect("eight bytes"));
+                        let registry = registry();
+                        let recipients: Vec<&Named> = registry.commands.iter().filter(|c| c.since < arrival).collect();
+                        for command in &recipients {
+                            // SAFETY: the group is a running command's own: it cannot be reaped
+                            // while this lock is held.
+                            unsafe { libc::kill(-command.group, signal) };
+                        }
+                        if !recipients.is_empty() && recipients.iter().all(|c| c.passing) {
+                            HANDLED.fetch_max(arrival, std::sync::atomic::Ordering::SeqCst);
+                            continue;
+                        }
+                        // SAFETY: restore the default action, unblock it here and raise it in
+                        // this thread, which ends stack; the lock is held until then.
+                        unsafe {
+                            libc::signal(signal, libc::SIG_DFL);
+                            let mut set: libc::sigset_t = std::mem::zeroed();
+                            libc::sigemptyset(&mut set);
+                            libc::sigaddset(&mut set, signal);
+                            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                            libc::raise(signal);
+                        }
+                        drop(registry);
                     }
-                    let byte = record[0];
-                    let generation = u32::from_ne_bytes(record[1..5].try_into().expect("four bytes"));
-                    let signal = libc::c_int::from(byte & !PASSING);
-                    let registry = registry();
-                    for group in &registry.groups {
-                        // SAFETY: the group is a running command's own: it cannot be reaped
-                        // while this lock is held.
-                        unsafe { libc::kill(-group, signal) };
-                    }
-                    // A signal passes on without ending stack only to the command it came for.
-                    // One whose command is gone gets the default action, which ends stack.
-                    let current = registry.users > 0
-                        && registry.passing
-                        && GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation;
-                    if byte & PASSING != 0 && current {
-                        HANDLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        continue;
-                    }
-                    // SAFETY: restore the default action, unblock it here and raise it in this
-                    // thread, which ends stack; the lock is held until then.
-                    unsafe {
-                        libc::signal(signal, libc::SIG_DFL);
-                        let mut set: libc::sigset_t = std::mem::zeroed();
-                        libc::sigemptyset(&mut set);
-                        libc::sigaddset(&mut set, signal);
-                        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-                        libc::raise(signal);
-                    }
-                    drop(registry);
                 })
                 .map_err(|e| e.to_string())?;
             WAKE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            install_forwarding(report_signal).map(|_| ()).map_err(|e| e.to_string())
         })
         .clone()
         .map_err(io::Error::other)
 }
 
-/// Join the commands forwarding signals; the first installs the handler. For [`output`]
-/// (`passing` false), `false` while `run_with_deadline` forwards them to its own command.
+/// Spawn `command` and name its process group (see [`Registry`]), under the registry's lock.
+/// A signal arriving from the moment the spawn begins is the command's too.
 #[cfg(unix)]
-fn enter_forwarding(passing: bool) -> io::Result<bool> {
-    forwarder()?;
+fn spawn_named(command: &mut Command, passing: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<Child> {
     let mut registry = registry();
-    if registry.users == 0 {
-        // `run_with_deadline` holds this itself, and waits for `output`'s commands to end.
-        let exclusive = if passing { None } else { Some(FORWARDING.try_lock()) };
-        if matches!(exclusive, Some(Err(_))) {
-            return Ok(false);
-        }
-        GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        registry.previous = install_forwarding(if passing { report_passing } else { report_signal })?;
-        registry.passing = passing;
-    } else if registry.passing != passing {
-        return Ok(false);
-    }
-    registry.users += 1;
-    Ok(true)
+    let since = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+    let child = spawn(command)?;
+    registry.commands.push(Named { group: child.id() as i32, passing, since });
+    Ok(child)
 }
 
-/// Leave what [`enter_forwarding`] joined; the last restores the dispositions.
+/// Unname `child`'s group and end it (`kill`: with its group, else only reap it), under the
+/// registry's lock, so the group is never signalled once its ID may be reused.
 #[cfg(unix)]
-fn leave_forwarding() {
+fn retire(child: &mut OwnedChild, kill: bool) {
     let mut registry = registry();
-    registry.users -= 1;
-    if registry.users == 0 {
-        restore_dispositions(&std::mem::take(&mut registry.previous));
+    let group = child.child.id() as i32;
+    registry.commands.retain(|c| c.group != group);
+    if kill {
+        child.terminate();
+    } else {
+        child.reap();
     }
 }
 
@@ -857,10 +837,6 @@ fn leave_forwarding() {
 #[cfg(unix)]
 const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-/// Held while `run_with_deadline` forwards signals to its command, and taken by
-/// [`enter_forwarding`] to install the handler of [`output`]'s commands.
-#[cfg(unix)]
-static FORWARDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The forwarded signals, as a set to block.
 #[cfg(unix)]
@@ -948,11 +924,7 @@ fn restore_dispositions(previous: &[(libc::c_int, libc::sigaction)]) {
 #[cfg(unix)]
 pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result<(Option<i32>, bool)> {
     use std::os::unix::process::CommandExt;
-    let _forwarding = FORWARDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Commands of `output` forwarding signals keep their handler until the last one ends.
-    while registry().users > 0 {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    forwarder()?;
     let held = forwarded_set();
     let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
     let result = run_held(command, timeout, &held, caller_mask);
@@ -965,29 +937,12 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         held: &libc::sigset_t,
         caller_mask: libc::sigset_t,
     ) -> io::Result<(Option<i32>, bool)> {
-        enter_forwarding(true)?;
         command.process_group(0).stdin(Stdio::null());
         // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
         unsafe {
             command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
         }
-        // Spawned and named, and later unnamed and ended, under the registry's lock, as for
-        // `output`.
-        let spawned = {
-            let mut registry = registry();
-            let spawned = command.spawn();
-            if let Ok(child) = &spawned {
-                registry.groups.push(child.id() as i32);
-            }
-            spawned
-        };
-        let mut child = match spawned {
-            Ok(child) => OwnedChild::new(child),
-            Err(e) => {
-                leave_passing();
-                return Err(e);
-            }
-        };
+        let mut child = OwnedChild::new(spawn_named(command, true, Command::spawn)?);
         let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
             let start = Instant::now();
             loop {
@@ -1001,13 +956,14 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
             }
         });
         let _ = set_mask(libc::SIG_BLOCK, held);
-        {
-            let group = child.child.id() as i32;
-            let mut registry = registry();
-            registry.groups.retain(|g| *g != group);
-            child.terminate();
+        // Signals that arrived while the command ran reach it before it is unnamed (bounded:
+        // a full pipe drops reports).
+        let arrived = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(1);
+        while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrived && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
         }
-        leave_passing();
+        retire(&mut child, true);
         let timed_out = waited?;
         // Like a shell: a command ended by a signal reports 128 + its number.
         let code = child.status.and_then(|status| {
@@ -1015,19 +971,6 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
             status.code().or_else(|| status.signal().map(|s| 128 + s))
         });
         Ok((if timed_out { None } else { code }, timed_out))
-    }
-
-    /// Leave forwarding once every signal reported for the command was handled (bounded: a
-    /// full pipe drops reports). One reported later is not passed on to a later command: its
-    /// generation is gone, so it ends stack (see [`forwarder`]).
-    fn leave_passing() {
-        let until = Instant::now() + Duration::from_secs(1);
-        while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < REPORTED.load(std::sync::atomic::Ordering::SeqCst)
-            && Instant::now() < until
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        leave_forwarding();
     }
 }
 
@@ -1065,77 +1008,38 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
 #[cfg(unix)]
 fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output> {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
+    forwarder()?;
     let held = forwarded_set();
     let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
-    // Signals stay blocked from before the spawn until forwarding names the new group, so none
-    // can end stack while the command would be left running; the command starts unblocked.
-    // Every command running at once is forwarded to (several threads may each run one).
-    let forwarding = match enter_forwarding(false) {
-        Ok(forwarding) => forwarding,
-        Err(e) => {
-            let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
-            return Err(e);
-        }
-    };
-    let leave = || {
-        if forwarding {
-            leave_forwarding();
-        }
-    };
+    // This thread blocks those signals from before the spawn to after the reaping; the command
+    // starts unblocked. Every command running at once is named (several threads may each run
+    // one), so a signal reaches each before stack ends.
     // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
     unsafe {
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
-    // Spawned and named under the registry's lock: a signal is passed on to it, or comes before.
-    let spawned = {
-        let mut registry = forwarding.then(registry);
-        let spawned = spawn_piped(command);
-        if let (Some(registry), Ok(child)) = (registry.as_mut(), &spawned) {
-            registry.groups.push(child.id() as i32);
-        }
-        spawned
-    };
-    let mut child = match spawned {
+    let mut child = match spawn_named(command, false, spawn_piped) {
         Ok(child) => OwnedChild::new(child),
         Err(e) => {
-            leave();
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
         }
     };
-    let group = child.child.id() as i32;
-    let mut named = forwarding;
-    // Unnamed and ended (killed with its group when `kill`, else reaped) under the registry's
-    // lock, once, so its group ID is never signalled after it may be reused.
-    let mut retire = |child: &mut OwnedChild, kill: bool| {
-        let registry = named.then(registry);
-        if let Some(mut registry) = registry {
-            registry.groups.retain(|g| *g != group);
-            named = false;
-            finish(child, kill);
-        } else {
-            finish(child, kill);
-        }
-    };
-    fn finish(child: &mut OwnedChild, kill: bool) {
-        if kill {
-            child.terminate();
-        } else {
-            child.reap();
-        }
-    }
+    let mut retired = false;
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
         collect(&mut child, timeout, OUTPUT_LIMIT, None, |child, timed_out| {
             let _ = set_mask(libc::SIG_BLOCK, &held);
             // A command that finished may have started something meant to outlive it, as a
             // supervisor client starts the supervisor; only a command cut short loses its group.
             retire(child, timed_out);
+            retired = true;
         })
     });
     // `collect` may have failed before its teardown ran; then nothing it started is kept.
     let _ = set_mask(libc::SIG_BLOCK, &held);
-    retire(&mut child, true);
-    leave();
+    if !retired {
+        retire(&mut child, true);
+    }
     let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
     let piped = piped?;
     Ok(Output {
@@ -1333,15 +1237,8 @@ mod tests {
         assert_eq!(codes, (0..8).map(Some).collect::<Vec<_>>());
         // Other tests may run commands meanwhile; once all are done nothing stays named.
         let until = Instant::now() + Duration::from_secs(20);
-        loop {
-            let registry = registry();
-            if registry.users == 0 {
-                assert!(registry.groups.is_empty(), "{:?}", registry.groups);
-                assert!(registry.previous.is_empty());
-                break;
-            }
-            drop(registry);
-            assert!(Instant::now() < until, "commands never stopped forwarding");
+        while !registry().commands.is_empty() {
+            assert!(Instant::now() < until, "commands stayed named");
             std::thread::sleep(Duration::from_millis(20));
         }
     }
