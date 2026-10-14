@@ -38,11 +38,9 @@ stack down                               # before you finish or remove the check
 
 A few things that are easy to get wrong:
 
-- **Read connection details from the environment.** `DATABASE_URL`, `REDIS_URL` and
-  `<NAME>_PORT` are set for every command. Ports differ per checkout, so never hardcode one.
-- **For your own services, use `http://127.0.0.1:$<NAME>_PORT`.** mise also sets
-  `<NAME>_URL` to a `https://<name>.<project>.localhost` proxy address, which answers only when
-  Pitchfork's proxy is running.
+- **Read connection details from the environment.** `DATABASE_URL`, `REDIS_URL`,
+  `<NAME>_PORT` and, for your own services, `<NAME>_URL` (`http://127.0.0.1:<port>`) are set
+  for every command. Ports differ per checkout, so never hardcode one.
 - **`watch` does not reload anything.** When a file listed in a service's `watch` changes,
   `status`, `exec` and `run` tell you to run `stack restart <service>`. `up` leaves a service
   with unchanged configuration running, so it will not pick up your edit either.
