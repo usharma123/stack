@@ -46,7 +46,7 @@ moved=$(jq -r '.data.ports.postgres' "$T/reassign-appH.json")
 [[ "$moved" != "$port" ]] || fail 'reassign kept the occupied port'
 stack up --json >"$T/up-appH.json"
 assert_json '.ok and all(.data.checks[]; .ready and .identity == "instance")' "$T/up-appH.json"
-jq -e --argjson p "$moved" '.data.session.services.postgres.port == $p' "$T/up-appH.json" >/dev/null || fail 'postgres did not move'
+[[ "$(checked postgres port "$T/up-appH.json")" == "$moved" ]] || fail 'postgres did not move'
 stack logs postgres --tail 20 --json >"$T/logs-appH.json"
 assert_json '.ok and (.data.lines | length > 0) and .data.truncated == false' "$T/logs-appH.json"
 
@@ -75,7 +75,7 @@ jq -e --argjson p "$next" '.ok and .data.confirmed and .data.conflicts[0].port =
 kill "$squatter2"; wait "$squatter2" 2>/dev/null || true
 stack up --json >"$T/up-appH2.json"
 assert_json '.ok and all(.data.checks[]; .ready and .identity == "instance")' "$T/up-appH2.json"
-jq -e --argjson p "$next" '.data.session.services.postgres.port == $p' "$T/up-appH2.json" >/dev/null || fail 'postgres did not move to the free port'
+[[ "$(checked postgres port "$T/up-appH2.json")" == "$next" ]] || fail 'postgres did not move to the free port'
 stack down --json >"$T/down-appH.json"
 assert_json '.ok and .data.confirmed and (.data.conflicts == null)' "$T/down-appH.json"
 # shellcheck disable=SC2046

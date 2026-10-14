@@ -164,7 +164,8 @@ def worker(run, phase, rnd, index, app, failure):
         if not up.get("ok"):
             result["notes"].append(f"up failed: {up.get('error', {}).get('code')}")
             return result
-        session = up["data"]["session"]
+        # The record every release writes; `up` reports only part of it.
+        session = json.loads((pathlib.Path(app) / ".stack/session.json").read_text())
         pids = [s["pid"] for s in session["services"].values() if s.get("pid")]
         code, _, result["task_ms"] = run.sh(ctx, "task", [run.stack, "exec", "--require-all", "--", "bash", "-c", TASK], app)
         result["task_ok"] = code == 0
@@ -198,7 +199,7 @@ def worker(run, phase, rnd, index, app, failure):
             code, up2, _ = run.stack_json(ctx, "recover-up", ["up", "--owner-pid", str(runner.pid)], app)
             result["recovered"] = bool(up2.get("ok"))
             if up2.get("ok"):
-                pids += [s["pid"] for s in up2["data"]["session"]["services"].values() if s.get("pid")]
+                pids += [c["pid"] for c in up2["data"]["checks"] if c.get("pid")]
         if failure == "runner_death":
             # The agent runner dies without `down`: GC alone must reclaim exactly its services.
             runner.kill()

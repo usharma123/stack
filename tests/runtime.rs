@@ -108,6 +108,11 @@ esac
         out
     }
 
+    /// The project's session record, with what `up` and `restart` leave out of their results.
+    fn session(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.dir.path().join("app/.stack/session.json")).unwrap()).unwrap()
+    }
+
     fn session_paths(&self) -> Vec<std::path::PathBuf> {
         let mut paths = vec![self.dir.path().join("app/.stack/session.json")];
         paths.extend(
@@ -1716,7 +1721,7 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     let up = json_result(&fixture.ok(&["up", "--json"]));
     let before = up["data"]["checks"][0]["pid"].as_u64().unwrap();
-    assert!(up["data"]["session"]["services"]["web"]["started_at_ms"].is_u64(), "{up}");
+    assert!(fixture.session()["services"]["web"]["started_at_ms"].is_u64(), "{up}");
 
     // Edited after the service started: reported, not a verification failure.
     thread::sleep(Duration::from_millis(1100));
@@ -1758,11 +1763,33 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn up_and_restart_results_carry_one_check_per_service_and_leave_internals_to_the_record() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    for args in [&["up", "--ttl", "30m", "--json"][..], &["restart", "--json"]] {
+        let result = json_result(&fixture.ok(args));
+        let data = &result["data"];
+        let session = data["session"].as_object().unwrap();
+        assert_eq!(session.keys().collect::<Vec<_>>(), ["id", "started_at", "lease"], "{result}");
+        assert_eq!(data["checks"][0]["service"], "web");
+        assert_eq!(data["checks"][0]["port"], json!(assigned_port(&fixture, "web")));
+        assert!(data["steps"].as_array().unwrap().iter().all(|s| s.get("detail").is_none()), "{result}");
+        assert!(data.get("reaped").is_none() && data.get("warnings").is_none(), "{result}");
+        assert!(result.to_string().len() < 800, "{} bytes: {result}", result.to_string().len());
+    }
+    // The record keeps everything stack itself needs.
+    let record = fixture.session();
+    assert!(record["config_digest"].is_string() && record["services"]["web"]["pid"].is_u64(), "{record}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_restart_records_the_replacement_it_launched() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     let up = json_result(&fixture.ok(&["up", "--json"]));
-    let old = up["data"]["session"]["services"]["web"]["pid"].as_u64().unwrap();
+    let old = up["data"]["checks"][0]["pid"].as_u64().unwrap();
     fs::write(fixture.dir.path().join("fail-env-after-start"), "").unwrap();
     let out = fixture.command(&["restart", "web", "--json"]).output().unwrap();
     assert!(!out.status.success());
@@ -1904,8 +1931,8 @@ fn watch_compares_modification_times_below_a_second() {
     let file = fixture.dir.path().join("app/main.py");
     fs::write(&file, "before").unwrap();
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    let up = json_result(&fixture.ok(&["up", "--json"]));
-    let start = up["data"]["session"]["services"]["web"]["started_at_ms"].as_u64().unwrap();
+    fixture.ok(&["up"]);
+    let start = fixture.session()["services"]["web"]["started_at_ms"].as_u64().unwrap();
     let set_mtime = |ms: u64| {
         let file = fs::File::options().write(true).open(&file).unwrap();
         file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms)).unwrap();
@@ -1942,15 +1969,15 @@ fn up_keeps_a_legacy_process_start_time_unknown() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     let up = json_result(&fixture.ok(&["up", "--json"]));
-    let pid = up["data"]["session"]["services"]["web"]["pid"].clone();
+    let pid = up["data"]["checks"][0]["pid"].clone();
     for path in fixture.session_paths() {
         let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         record["services"]["web"].as_object_mut().unwrap().remove("started_at_ms");
         fs::write(path, record.to_string()).unwrap();
     }
     let again = json_result(&fixture.ok(&["up", "--json"]));
-    assert_eq!(again["data"]["session"]["services"]["web"]["pid"], pid);
-    assert_eq!(again["data"]["session"]["services"]["web"].get("started_at_ms"), None, "{again}");
+    assert_eq!(again["data"]["checks"][0]["pid"], pid);
+    assert_eq!(fixture.session()["services"]["web"].get("started_at_ms"), None, "{again}");
     let out = fixture.command(&["logs", "web", "--since-start", "--json"]).output().unwrap();
     assert!(json_result(&out)["error"]["hint"].as_str().unwrap().contains("stack restart"));
     fixture.ok(&["down"]);
@@ -2073,7 +2100,7 @@ fn a_failed_start_reports_the_services_error_without_the_supervisors_animation()
     assert_eq!(
         result["error"]["details"][0]["output"],
         format!(
-            "\u{2022} [{WEB_ID}] Traceback (most recent call last):\n\u{2022} [{WEB_ID}]   File \"/p/server.py\", line 2, in <module>\n\u{2022} [{WEB_ID}] RuntimeError: bad edit\npitchfork ERROR Daemon {WEB_ID} failed to start\nstart failed"
+            "[web] Traceback (most recent call last):\n[web]   File \"/p/server.py\", line 2, in <module>\n[web] RuntimeError: bad edit\npitchfork ERROR Daemon {WEB_ID} failed to start\nstart failed"
         ),
         "{result}"
     );

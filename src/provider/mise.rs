@@ -646,12 +646,85 @@ fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
 
 /// Lines of provider output kept in an error: enough for a traceback and the final error.
 const TAIL_LINES: usize = 20;
+/// Lines of a service's own output kept when the supervisor reports it failed, and when it
+/// did not (its startup chatter says little about someone else's failure).
+const FAILED_SERVICE_LINES: usize = 12;
+const OTHER_SERVICE_LINES: usize = 2;
+/// Bytes of one kept line, and of the whole tail.
+const LINE_BYTES: usize = 300;
+const TAIL_BYTES: usize = 2048;
 
 /// Last lines of combined output, as a terminal would have left them, without mise's advice to
-/// edit mise.lock (see [`without_lock_advice`]).
+/// edit mise.lock (see [`without_lock_advice`]), with each service's log lines summarized (see
+/// [`summarize_services`]) and bounded in bytes as well as lines.
 pub fn tail(out: &Output) -> String {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    without_lock_advice(&readable_tail(&text, TAIL_LINES))
+    let lines = readable_lines(&text);
+    let kept = summarize_services(&lines);
+    bounded_tail(&without_lock_advice(&kept[kept.len().saturating_sub(TAIL_LINES)..].join("\n")))
+}
+
+/// The supervisor streams every starting service's output as `• [<project>-<hash>/<name>] …`.
+/// A failed start shows the failing service's last lines, a start the deadline cut short only
+/// what each service printed last; everything else the supervisor said (its errors, `✗` lines)
+/// is kept. Service lines are shortened to `[<name>] …`.
+fn summarize_services(lines: &[String]) -> Vec<String> {
+    // (qualified id, name, message)
+    let service_line = |line: &str| -> Option<(String, String, String)> {
+        let rest = line.strip_prefix("\u{2022} [")?;
+        let (id, message) = rest.split_once("] ")?;
+        Some((id.to_string(), id.rsplit('/').next().unwrap_or(id).to_string(), message.to_string()))
+    };
+    // A service the supervisor itself names (`Daemon <id> failed`, `✗ [<id>] failed`) failed.
+    let ids: Vec<(String, String)> = lines.iter().filter_map(|l| service_line(l)).map(|(id, name, _)| (id, name)).collect();
+    let failed: Vec<&str> = ids
+        .iter()
+        .filter(|(id, _)| lines.iter().any(|l| service_line(l).is_none() && l.contains(id.as_str())))
+        .map(|(_, name)| name.as_str())
+        .collect();
+    let mut budget: IndexMap<String, usize> = IndexMap::new();
+    let mut kept: Vec<String> = Vec::new();
+    for line in lines.iter().rev() {
+        match service_line(line) {
+            Some((_, name, message)) => {
+                let left = budget.entry(name.clone()).or_insert(if failed.contains(&name.as_str()) { FAILED_SERVICE_LINES } else { OTHER_SERVICE_LINES });
+                if *left > 0 {
+                    *left -= 1;
+                    kept.push(format!("[{name}] {message}"));
+                }
+            }
+            None => kept.push(line.clone()),
+        }
+    }
+    kept.reverse();
+    kept
+}
+
+/// `text` with each line cut at [`LINE_BYTES`] and only the last [`TAIL_BYTES`] kept, at line
+/// boundaries; what was dropped is said in the first line.
+fn bounded_tail(text: &str) -> String {
+    let cut = |line: &str| {
+        if line.len() <= LINE_BYTES {
+            return line.to_string();
+        }
+        let mut end = LINE_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &line[..end])
+    };
+    let lines: Vec<String> = text.lines().map(cut).collect();
+    let mut total = 0;
+    let mut start = lines.len();
+    while start > 0 && total + lines[start - 1].len() + 1 <= TAIL_BYTES {
+        start -= 1;
+        total += lines[start].len() + 1;
+    }
+    let mut out = lines[start..].to_vec();
+    if start > 0 {
+        out.insert(0, format!("({start} earlier lines omitted; `stack logs <service>` shows a service's output)"));
+    }
+    out.join("\n")
 }
 
 /// The last `max` lines of terminal output in readable form: escape sequences removed, each
@@ -659,6 +732,12 @@ pub fn tail(out: &Output) -> String {
 /// frames dropped unless they are all there is. The supervisor animates progress even when
 /// it is captured, between the lines a failing service printed.
 fn readable_tail(text: &str, max: usize) -> String {
+    let lines = readable_lines(text);
+    lines[lines.len().saturating_sub(max)..].join("\n")
+}
+
+/// Every line of [`readable_tail`].
+fn readable_lines(text: &str) -> Vec<String> {
     let plain = strip_escapes(text);
     let lines: Vec<&str> = plain
         .split('\n')
@@ -667,7 +746,7 @@ fn readable_tail(text: &str, max: usize) -> String {
         .collect();
     let content: Vec<&str> = lines.iter().copied().filter(|l| !spinner_frame(l)).collect();
     let kept = if content.is_empty() { &lines[lines.len().saturating_sub(1)..] } else { &content[..] };
-    kept[kept.len().saturating_sub(max)..].join("\n")
+    kept.iter().map(|l| l.to_string()).collect()
 }
 
 /// A progress line: it starts with a Braille spinner glyph.
@@ -1119,6 +1198,56 @@ pitchfork ERROR Daemon app-9df2/api failed to start
         let tail = readable_tail(&text, TAIL_LINES);
         assert_eq!(tail.lines().count(), TAIL_LINES);
         assert!(tail.starts_with("line 12\n") && tail.ends_with("line 30\nError: final"), "{tail}");
+    }
+
+    fn output(stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output { status: std::process::ExitStatus::from_raw(256), stdout: stdout.into(), stderr: stderr.into() }
+    }
+
+    #[test]
+    fn a_failed_start_keeps_the_failing_service_and_the_supervisor_and_drops_others_chatter() {
+        // Healthy services stream their startup while another one fails.
+        let chatter: String = (1..=15).map(|n| format!("\u{2022} [app-9df2/redis] startup line {n}\n")).collect();
+        let tail = tail(&output(&format!("{chatter}{FAILED_START}"), ""));
+        assert_eq!(
+            tail,
+            "[redis] startup line 14
+[redis] startup line 15
+[api] Traceback (most recent call last):
+[api]   File \"/p/server.py\", line 2, in <module>
+[api]     raise RuntimeError(\"bad edit\")
+[api] RuntimeError: bad edit
+pitchfork ERROR Daemon app-9df2/api failed to start
+\u{2717} [app-9df2/api] failed (exit code 1): Daemon app-9df2/api failed with exit code 1"
+        );
+    }
+
+    #[test]
+    fn a_start_cut_short_keeps_what_each_service_said_last() {
+        // `mise daemons start` cut short by the deadline in the field (0.1.21): every line was
+        // a healthy service's.
+        let mut text = String::new();
+        for n in 1..=18 {
+            text.push_str(&format!("\u{2022} [appA-3f6a77c577bb049e/redis] 85472:M 14 Oct 2026 09:15:34.733 * redis line {n}\n"));
+        }
+        text.push_str("\u{2022} [appA-3f6a77c577bb049e/postgres] LOG:  checkpoint starting: time\n");
+        text.push_str("\u{2022} [appA-3f6a77c577bb049e/postgres] LOG:  checkpoint complete\n");
+        let tail = tail(&output(&text, ""));
+        assert_eq!(tail.lines().count(), 4, "{tail}");
+        assert!(tail.starts_with("[redis] 85472:M") && tail.contains("redis line 18") && tail.ends_with("[postgres] LOG:  checkpoint complete"), "{tail}");
+    }
+
+    #[test]
+    fn a_tail_is_bounded_in_bytes_whatever_its_lines() {
+        let long = "x".repeat(100_000);
+        let text: String = (0..TAIL_LINES).map(|n| format!("Error {n}: {long}\n")).collect();
+        let kept = tail(&output("", &text));
+        assert!(kept.len() <= TAIL_BYTES + 200, "{} bytes", kept.len());
+        assert!(kept.starts_with("(") && kept.contains("earlier lines omitted"), "{}", &kept[..200]);
+        assert!(kept.ends_with("x…") && kept.lines().last().unwrap().starts_with(&format!("Error {}: ", TAIL_LINES - 1)), "the last line is kept");
+        // Multibyte characters are never split.
+        assert!(tail(&output(&"é".repeat(400), "")).ends_with("é…"));
     }
 
     #[test]

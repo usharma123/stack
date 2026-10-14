@@ -327,7 +327,8 @@ class Benchmark:
                         if not supervisor or len(supervisor.splitlines()) != 1 or not Path(supervisor).is_absolute():
                             raise RuntimeError('missing required cleanup supervisor path')
                         context['supervisor'] = provider_artifact(supervisor, 'pitchfork', env['MISE_DATA_DIR'])
-                    session = json.loads(stdout)['data']['session']
+                    # The record every release writes; `up` reports only part of it.
+                    session = json.loads((app / '.stack/session.json').read_text())
                     expected = {name: os.path.realpath(service['data_dir'])
                                 for name, service in session['services'].items()}
                     self.verify(context, expected)

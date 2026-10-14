@@ -21,7 +21,9 @@ expect_error() {
 # In-place edit that behaves the same with GNU and BSD userlands.
 edit() { perl -pi -e "$1" "$2"; }
 # PIDs recorded in an `up --json` result, one per line.
-recorded_pids() { jq -r '.data.session.services[].pid // empty' "$1"; }
+recorded_pids() { jq -r '.data.checks[].pid // empty' "$1"; }
+# A service's field in an `up --json` result's checks.
+checked() { jq -r --arg s "$1" --arg f "$2" '.data.checks[] | select(.service == $s) | .[$f]' "$3"; }
 assert_dead() {
   local pid
   for pid in "$@"; do

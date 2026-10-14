@@ -620,15 +620,78 @@ pub fn owner_pid(value: u64) -> Result<u32> {
         })
 }
 
-#[derive(Debug, Serialize)]
+/// What `up` did. Serialized compactly (see [`StartedView`]): the session's full record stays in
+/// `.stack/session.json`.
+#[derive(Debug)]
 pub struct UpReport {
     pub session: Session,
     pub checks: Vec<Check>,
     pub steps: Vec<Value>,
     pub reaped: Vec<GcEntry>,
     /// Problems that did not stop startup (the `skills` step).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+impl Serialize for UpReport {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        StartedView {
+            session: SessionView::of(&self.session),
+            restarted: None,
+            checks: &self.checks,
+            steps: compact_steps(&self.steps),
+            reaped: &self.reaped,
+            warnings: &self.warnings,
+        }
+        .serialize(s)
+    }
+}
+
+/// The result of a successful `up` or `restart`, as agents read it: one check per service
+/// (port, readiness, identity, anything withheld) and the session's id and lease. Internals
+/// that only stack itself reads (digests, provider IDs, data directories, timestamps of each
+/// service) are left to the session file, and steps keep only details that say something the
+/// checks do not.
+#[derive(Serialize)]
+struct StartedView<'a> {
+    session: SessionView<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restarted: Option<&'a [String]>,
+    checks: &'a [Check],
+    steps: Vec<Value>,
+    #[serde(skip_serializing_if = "<[GcEntry]>::is_empty")]
+    reaped: &'a [GcEntry],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    warnings: &'a [String],
+}
+
+#[derive(Serialize)]
+struct SessionView<'a> {
+    id: &'a str,
+    started_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease: Option<&'a Lease>,
+}
+
+impl<'a> SessionView<'a> {
+    fn of(session: &'a Session) -> Self {
+        Self { id: &session.id, started_at: session.started_at, lease: session.lease.as_ref() }
+    }
+}
+
+/// Successful steps without details the result already carries elsewhere (ports and identities
+/// are in the checks) or that only matter when something fails (the socket, install coverage:
+/// `stack install` reports it).
+fn compact_steps(steps: &[Value]) -> Vec<Value> {
+    const REDUNDANT: [&str; 9] = ["gc", "compile", "preflight", "install", "stop_previous", "ports", "stop", "start", "verify"];
+    steps
+        .iter()
+        .map(|step| match step.as_object() {
+            Some(fields) if step["status"] == "ok" && (REDUNDANT.contains(&step["step"].as_str().unwrap_or_default()) || step["detail"].is_null()) => {
+                Value::Object(fields.iter().filter(|(k, _)| *k != "detail").map(|(k, v)| (k.clone(), v.clone())).collect())
+            }
+            _ => step.clone(),
+        })
+        .collect()
 }
 
 /// Preserve every observed launch identity before further provider calls can fail.
@@ -951,12 +1014,27 @@ fn not_ready(checks: &[Check]) -> StackError {
     StackError::new("not_ready", format!("{} service(s) failed verification", failed.len())).details(failed)
 }
 
-#[derive(Debug, Serialize)]
+/// What `restart` did, serialized like [`UpReport`].
+#[derive(Debug)]
 pub struct RestartReport {
     pub session: Session,
     pub restarted: Vec<String>,
     pub checks: Vec<Check>,
     pub steps: Vec<Value>,
+}
+
+impl Serialize for RestartReport {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        StartedView {
+            session: SessionView::of(&self.session),
+            restarted: Some(&self.restarted),
+            checks: &self.checks,
+            steps: compact_steps(&self.steps),
+            reaped: &[],
+            warnings: &[],
+        }
+        .serialize(s)
+    }
 }
 
 /// Stop and start the named services (every service when none are named) of the running,
