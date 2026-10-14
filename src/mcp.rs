@@ -17,6 +17,9 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
+/// What the server tells a client about using its tools, once, at initialization.
+const INSTRUCTIONS: &str = "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
+
 fn startup_timeout_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
 }
@@ -49,7 +52,7 @@ pub fn serve() -> std::io::Result<()> {
                 "protocolVersion": negotiate(msg["params"]["protocolVersion"].as_str()),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "stack", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.",
+                "instructions": INSTRUCTIONS,
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -238,14 +241,14 @@ fn tools() -> Value {
           "inputSchema": schema(json!({ "tool": { "type": "string" }, "name": { "type": "string" } }), &["tool"]) },
         { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock; reassign_ports gives this checkout fresh ports (after a port_conflict).",
           "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" }, "reassign_ports": { "type": "boolean" } }), &[]) },
-        { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up.",
+        { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up. A service already running with unchanged configuration is kept, not restarted: after editing code it loaded, use stack_restart.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded, then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up.",
+        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded (files under a service's `watch` included: watching only reports changes, it never reloads), then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up.",
           "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
           "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
-        { "name": "stack_status", "description": "Live verification of every service, plus session and lease state.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_status", "description": "Live verification of every service, plus session and lease state. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. timeout_secs (default 600) counts from the call, planning included: a command still running then is killed and the call fails with timed_out, its output so far in the error details; a call whose planning is cut short fails with timed_out before anything runs. secrets grants named fnox secrets to this command only; no granted value appears literally in the parsed stdout or stderr strings, including the timed_out error's. Key names are not secret: they appear under secrets and in [redacted:KEY] markers. Values the command transforms (encoded, split, or only matching after the result's JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read secrets it was not granted, and those values are not redacted.",
           "inputSchema": schema(json!({
               "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
@@ -652,5 +655,17 @@ mod tests {
             let tool = tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["properties"]["timeout_secs"]["minimum"], 1, "{tool}");
         }
+    }
+
+    #[test]
+    fn watching_is_described_as_reporting_never_as_reloading() {
+        assert!(INSTRUCTIONS.contains("only makes stack_status, stack_exec and stack_run report changed files"), "{INSTRUCTIONS}");
+        let tools = tools();
+        let description = |name: &str| {
+            tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["description"].as_str().unwrap().to_string()
+        };
+        assert!(description("stack_up").contains("kept, not restarted"));
+        assert!(description("stack_status").contains("nothing reloads them, so call stack_restart"));
+        assert!(description("stack_restart").contains("it never reloads"));
     }
 }
