@@ -57,6 +57,36 @@ pub fn bounded(limit: Duration) -> Duration {
     remaining().map_or(limit, |r| r.min(limit))
 }
 
+thread_local! {
+    static CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Lifts this thread's cancellation flag when dropped.
+#[must_use = "cancellation applies only while the scope is alive"]
+pub struct CancelScope;
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        CANCEL.with(|c| c.borrow_mut().take());
+    }
+}
+
+/// Let another thread end the command this thread runs through [`output`]: once `flag` is set,
+/// the command is ended as if its deadline had passed (its process group killed), and so is
+/// every later one, until the scope is dropped.
+pub fn cancel_scope(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> CancelScope {
+    CANCEL.with(|c| *c.borrow_mut() = Some(flag));
+    CancelScope
+}
+
+fn cancelled() -> bool {
+    CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
+fn cancellable() -> bool {
+    CANCEL.with(|c| c.borrow().is_some())
+}
+
 pub struct Captured {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
@@ -594,6 +624,9 @@ fn collect(
         if exited(&child.child)? {
             break false;
         }
+        if cancelled() {
+            break true;
+        }
         let Some(remaining) = timeout
             .checked_sub(start.elapsed())
             .filter(|r| !r.is_zero())
@@ -813,12 +846,20 @@ const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// the command in stack's own group; ignored signals stay ignored.
 pub fn output(command: &mut Command) -> io::Result<Output> {
     command.stdin(Stdio::null());
+    if cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled before it could start"));
+    }
     #[cfg(unix)]
     if let Some(remaining) = remaining() {
         if remaining.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "the deadline passed before it could start"));
         }
         return output_within(command, remaining);
+    }
+    // Only a command in its own group can be ended for a cancellation (see [`cancel_scope`]).
+    #[cfg(unix)]
+    if cancellable() {
+        return output_within(command, Duration::from_secs(u32::MAX.into()));
     }
     command.output()
 }
@@ -1037,6 +1078,31 @@ mod tests {
         let err = output(Command::new("touch").arg(&marker)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn another_thread_can_end_output_with_its_group_and_nothing_starts_after() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                // No deadline: cancellation alone must still end the command's whole group.
+                let _cancel = cancel_scope(flag);
+                let out = output(Command::new("sh").args(["-c", "sleep 30 & echo $!; wait"])).unwrap();
+                let child: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+                (out.status.success(), child, output(&mut Command::new("true")).map(|_| ()).unwrap_err().kind())
+            })
+        };
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(true, Ordering::SeqCst);
+        let (succeeded, child, later) = worker.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        assert!(!succeeded);
+        assert!(ends_soon(child as u32), "the group's sleep survived");
+        assert_eq!(later, io::ErrorKind::Interrupted);
     }
 
     #[test]

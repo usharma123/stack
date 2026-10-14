@@ -1133,22 +1133,26 @@ fn local_datetime(_: u64) -> Option<String> {
     None
 }
 
-pub fn start(root: &Path) -> Result<()> {
-    detach_supervisor(root, "start_failed")?;
-    checked(root, &["daemons", "start"], "start_failed").map(|_| ())
-}
-
 pub fn stop(root: &Path) -> Result<()> {
     detach_supervisor(root, "stop_failed")?;
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
 }
 
-/// Start only the named daemons of this project.
+/// Start the named daemons of this project, one request at a time, in order.
+///
+/// Pitchfork 2.29.0 spawns the daemons of one request concurrently, and on macOS (where Rust's
+/// standard library cannot create a pipe close-on-exec atomically) one spawn can leave a copy
+/// of the pipe through which another learns it has exec'd in the process it forks. That spawn
+/// then waits, before recording its process, until the other daemon exits: the request never
+/// returns, and a stop meanwhile finds the service "not running" and leaves it. Field logs of
+/// 0.1.21 show exactly this, the recording delayed to the instant the other daemon stopped.
+/// One daemon per request spawns nothing else of this project's at once.
 pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
-    let mut args = vec!["daemons", "start", "--"];
-    args.extend(names.iter().map(String::as_str));
     detach_supervisor(root, "start_failed")?;
-    checked(root, &args, "start_failed").map(|_| ())
+    for name in names {
+        checked(root, &["daemons", "start", "--", name], "start_failed")?;
+    }
+    Ok(())
 }
 
 /// Stop only the named daemons of this project.
@@ -1171,7 +1175,7 @@ mod tests {
     fn a_deadline_already_past_starts_no_supervisor_and_makes_no_request() {
         let root = tempfile::tempdir().unwrap();
         let _expired = crate::process::deadline_scope(Some(std::time::Instant::now()));
-        let e = start(root.path()).unwrap_err();
+        let e = start_daemons(root.path(), &["db".into()]).unwrap_err();
         assert_eq!(e.code, "timed_out", "{e:?}");
         assert!(e.message.contains("before `mise x -- pitchfork supervisor start`"), "{e:?}");
     }

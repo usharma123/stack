@@ -131,9 +131,19 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       "$py" -c 'import signal,sys,time; signal.signal(signal.SIGINT, signal.SIG_DFL); open(sys.argv[2], "w").close(); time.sleep(2); open(sys.argv[1], "w")' "$REVIEW_FIXTURE/late-launch" "$REVIEW_FIXTURE/client-waiting" >/dev/null 2>&1 &
     fi
     if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi
+    echo "$*" >>"$REVIEW_FIXTURE/start-requests.log"
+    # Pitchfork 2.29.0 stuck before recording a service it spawned: the service listens with
+    # the checkout token the file holds, the supervisor reports nothing, the request never ends.
+    if test -f "$REVIEW_FIXTURE/unrecorded-start"; then
+      STACK_CHECKOUT_TOKEN=$(cat "$REVIEW_FIXTURE/unrecorded-start") "$py" -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/unrecorded-port")" </dev/null >/dev/null 2>&1 &
+      echo $! >"$REVIEW_FIXTURE/unrecorded-pid"
+      exec sleep 600
+    fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      "$py" -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" </dev/null >/dev/null 2>&1 &
+      # In a session of its own, as Pitchfork runs a service, when the request is to outlive it.
+      detach=; test -f "$REVIEW_FIXTURE/hang-after-start" && detach=1
+      "$py" -c 'import os,socket,sys,time; sys.argv[2] and os.setsid(); s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" "$detach" </dev/null >/dev/null 2>&1 &
       echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
       sleep 0.3
     fi
@@ -141,7 +151,9 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       cp "$REVIEW_FIXTURE/daemons-started.json" "$REVIEW_FIXTURE/daemons.json"
       touch "$REVIEW_FIXTURE/started"
     fi
-    if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi ;;
+    if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi
+    # A request that goes on after everything it started is running, as in the field.
+    if test -f "$REVIEW_FIXTURE/hang-after-start"; then echo $$ >"$REVIEW_FIXTURE/hung-client"; exec sleep "$(cat "$REVIEW_FIXTURE/hang-after-start")"; fi ;;
   'run --skip-deps')
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"

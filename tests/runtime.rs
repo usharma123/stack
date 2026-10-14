@@ -3211,6 +3211,81 @@ fn supervise_listener(fixture: &Fixture, port: u16) {
     .unwrap();
 }
 
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_start_request_still_waiting_once_every_service_verifies_is_ended_not_waited_for() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
+    let started = Instant::now();
+    let up = json_result(&fixture.ok(&["up", "--timeout", "2m", "--json"]));
+    assert!(started.elapsed() < Duration::from_secs(20), "waited {:?} on the request", started.elapsed());
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    let client: u32 = fs::read_to_string(fixture.dir.path().join("hung-client")).unwrap().trim().parse().unwrap();
+    let gone = Instant::now() + Duration::from_secs(5);
+    while pid_alive(client) && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!pid_alive(client), "the request was left running");
+    let supervised: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    assert!(pid_alive(supervised), "ending the request stopped the service");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_declared_readiness_check_holds_the_start_until_it_passes() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nready_cmd='test -f ready && test -n \"$PORT\"'\n");
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
+    let out = fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "timed_out", "a listening service is not ready before its check passes: {result}");
+    fs::write(fixture.dir.path().join("app/ready"), "").unwrap();
+    let started = Instant::now();
+    let up = json_result(&fixture.ok(&["up", "--timeout", "2m", "--json"]));
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_service_the_supervisor_launched_but_never_records_fails_the_start_quickly() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    fs::write(fixture.dir.path().join("unrecorded-port"), port.to_string()).unwrap();
+    fs::write(fixture.dir.path().join("unrecorded-start"), &token).unwrap();
+    let started = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "2m", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    let listener: u32 = fs::read_to_string(fixture.dir.path().join("unrecorded-pid")).unwrap().trim().parse().unwrap();
+    let cleanup = Lost { wrapper: listener, listener };
+    assert!(started.elapsed() < Duration::from_secs(40), "waited {:?}", started.elapsed());
+    assert_eq!(result["error"]["code"], "start_failed", "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("has not recorded it"), "{result}");
+    assert_eq!(result["error"]["details"][0]["pid"], listener, "{result}");
+    assert_eq!(result["error"]["details"].as_array().unwrap().last().unwrap()["retry_safe"], true, "{result}");
+
+    fs::remove_file(fixture.dir.path().join("unrecorded-start")).unwrap();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(listener), "down left the unrecorded service running");
+    drop(cleanup);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn services_are_started_one_request_at_a_time() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
+    let out = fixture.command(&["up", "--timeout", "3s", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
+    assert_eq!(requests, "daemons start -- web\ndaemons start -- api\n");
+    fixture.ok(&["down"]);
+}
+
 /// A service process the supervisor launched and then lost track of, as Pitchfork 2.29.0 did
 /// with a start it was still recording when it was told to stop: a wrapper leading its own
 /// session (as Pitchfork starts each service) with a child listening on `port`, both with

@@ -881,7 +881,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         // Capture qualified IDs before launch when available, including interrupted starts.
         let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
-        if let Err(start_error) = mise::start(&ctx.root) {
+        let names: Vec<String> = report.stack.services.keys().cloned().collect();
+        if let Err(start_error) = start_watched(ctx, &report, &names) {
             let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
@@ -942,6 +943,116 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         reaped,
         warnings,
     })
+}
+
+/// How often a running start is checked on.
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a service may listen, launched for this checkout, before the supervisor records it.
+const STALL_LIMIT: Duration = Duration::from_secs(15);
+
+/// Start `names` through the supervisor (see [`mise::start_daemons`]) while watching what it
+/// does, rather than waiting on its request for as long as the deadline allows:
+///
+/// - Once every service verifies and each one started passes the readiness check it declares
+///   (see [`declared_ready`]), what the request still waits for cannot matter: it is ended
+///   (its process group, never the supervisor) and the start succeeds.
+/// - A service listening on its port, launched for this checkout (see [`Stray`]), that the
+///   supervisor still has not recorded after [`STALL_LIMIT`] will not be recorded until
+///   something else changes: the request is ended and the start fails, retry-safe, saying so.
+///   `down` stops such a process.
+///
+/// Every supervisor listing seen is recorded, as during verification.
+fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (done, finished) = mpsc::channel();
+    let starter = {
+        let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
+        std::thread::spawn(move || {
+            let _deadline = crate::process::deadline_scope(deadline);
+            let _cancel = crate::process::cancel_scope(cancel);
+            let _ = done.send(mise::start_daemons(&root, &names));
+        })
+    };
+    let end = |outcome: Result<()>| {
+        cancel.store(true, Ordering::SeqCst);
+        let _ = starter.join();
+        outcome
+    };
+    let token = crate::checkout::token(&ctx.root);
+    let timings = Timings::new("start_watch");
+    let mut unrecorded: IndexMap<String, Instant> = IndexMap::new();
+    loop {
+        match finished.recv_timeout(WATCH_INTERVAL) {
+            Ok(outcome) => return end(outcome),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return end(Err(StackError::new("start_failed", "the supervisor request ended without an answer"))),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        // The request ends at the deadline by itself; there is no time left to look.
+        if crate::process::expired() {
+            continue;
+        }
+        let Ok(statuses) = mise::daemons(&ctx.root) else { continue };
+        let _ = record_launch_observations(ctx, &statuses);
+        if let Ok(env) = mise::env(&ctx.root) {
+            let checks = verify_all(&ctx.root, report, &env, &statuses, &timings);
+            if checks.iter().all(|c| c.ready) && names.iter().all(|n| declared_ready(ctx, report, &env, n) == Some(true)) {
+                return end(Ok(()));
+            }
+        }
+        let Some(token) = token.as_deref() else { continue };
+        for name in names {
+            let recorded = statuses.iter().any(|d| d.name == *name && d.pid.is_some_and(pid_alive));
+            let launched = report.ports.get(name).filter(|p| !recorded && accepting(**p)).and_then(|p| stray(name, *p, token));
+            match launched {
+                Some(stray) => {
+                    let since = *unrecorded.entry(name.clone()).or_insert_with(Instant::now);
+                    if since.elapsed() >= STALL_LIMIT {
+                        let error = StackError::new(
+                            "start_failed",
+                            format!(
+                                "the supervisor started {name} (pid {}, listening on port {}) but has not recorded it after {}s",
+                                stray.chain[0].pid,
+                                stray.port,
+                                STALL_LIMIT.as_secs()
+                            ),
+                        )
+                        .hint("run `stack down`, which stops it, then `stack up`")
+                        .details(vec![stray.json()]);
+                        return end(Err(error));
+                    }
+                }
+                None => {
+                    unrecorded.shift_remove(name);
+                }
+            }
+        }
+    }
+}
+
+/// Whether `name` passes the readiness check its definition declares, as the supervisor would
+/// run it (`sh -c` in the project, with the app's environment and `$PORT`). Postgres and
+/// Redis without one are checked by verification itself, through their protocol. `None` when
+/// stack cannot tell: another preset's check is the provider's own.
+fn declared_ready(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str) -> Option<bool> {
+    let service = &report.stack.services.get(name)?.value;
+    let port = report.ports.get(name).copied();
+    if let Some(command) = &service.ready_cmd {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", command]).current_dir(&ctx.root);
+        mise::configure_command(&mut sh, &ctx.root);
+        sh.envs(env);
+        if let Some(port) = port {
+            sh.env("PORT", port.to_string());
+        }
+        let out = crate::process::capture(&mut sh, crate::process::bounded(Duration::from_secs(5)), 4096).ok()?;
+        return Some(!out.timed_out && out.exit_code == Some(0));
+    }
+    match service.preset.as_deref() {
+        Some("postgres" | "redis") | None => Some(service.ready_port.map_or(true, accepting)),
+        Some(_) => None,
+    }
 }
 
 /// Verify what a start launched, recording each supervisor listing as it is seen. Should the
@@ -1155,7 +1266,7 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     }
     session.launching = true;
     save(ctx, &session).map_err(|e| steps.clone().fail("record_launch", e, true))?;
-    if let Err(start_error) = mise::start_daemons(&ctx.root, &names) {
+    if let Err(start_error) = start_watched(ctx, &report, &names) {
         let observed = record_after_failed_start(ctx);
         if let Err(error) = observed {
             return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));

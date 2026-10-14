@@ -135,6 +135,17 @@ output (mise's answer when no release matches) is an error, not a version.
   seen that command's process exit, so a running command is never forgotten. GC ignores TTL
   expiry while an execution it saw running is recorded. An explicit runner-death policy still
   takes precedence over a surviving command.
+- **Starting.** Services start one `mise daemons start -- <name>` request at a time, in
+  order. Pitchfork 2.29.0 spawns a request's daemons concurrently, and on macOS Rust's standard
+  library creates the pipe a spawn waits on with `pipe()` and only then marks it close-on-exec:
+  a daemon forked in between keeps it open, so the other spawn neither returns nor records its
+  process until that daemon exits. Field logs of 0.1.21 show the recording delayed to the
+  second the other daemon stopped. Meanwhile stack watches: once every service verifies and
+  passes its declared `ready_cmd`/`ready_port` (Postgres and Redis through their protocol;
+  other presets' checks are the provider's, so their request is always waited for), the
+  request is ended, its process group only. A service listening with this checkout's token
+  that the supervisor still has not recorded 15 seconds later fails the start with
+  `start_failed`, retry-safe, instead of running out the deadline.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
   those processes dead and ports closed. A reserved port is stack's to wait for only when a
