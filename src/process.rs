@@ -682,6 +682,11 @@ struct Registry {
 static REGISTRY: std::sync::Mutex<Registry> =
     std::sync::Mutex::new(Registry { users: 0, passing: false, previous: Vec::new(), groups: Vec::new() });
 
+/// Which installation of the handler is current: each first user after none installs anew.
+/// Reports carry it, so one handled after its users left is not taken for a later one's.
+#[cfg(unix)]
+static GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Reports the handler wrote, and those [`forwarder`] handled without ending stack.
 #[cfg(unix)]
 static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -691,6 +696,10 @@ static HANDLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// A report's flag for a signal that passes to the command without ending stack.
 #[cfg(unix)]
 const PASSING: u8 = 0x80;
+
+/// Bytes of one report (see [`report`]).
+#[cfg(unix)]
+const REPORT_SIZE: usize = 8;
 
 #[cfg(unix)]
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
@@ -713,17 +722,22 @@ extern "C" fn report_passing(signal: libc::c_int) {
     report(signal as u8 | PASSING);
 }
 
-/// Only an atomic add and `write`, which are async-signal-safe; errno is kept for the
-/// interrupted code.
+/// One record of [`REPORT_SIZE`] bytes: the signal (with [`PASSING`]) and the handler's
+/// generation. Records are smaller than `PIPE_BUF`, so each is written, and read, whole.
+/// Only atomics and `write`, which are async-signal-safe; errno is kept for the interrupted
+/// code.
 #[cfg(unix)]
 fn report(byte: u8) {
     let fd = WAKE.load(std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
         REPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut record = [0u8; REPORT_SIZE];
+        record[0] = byte;
+        record[1..5].copy_from_slice(&GENERATION.load(std::sync::atomic::Ordering::SeqCst).to_ne_bytes());
         // SAFETY: errno is thread-local and saved around write, which is async-signal-safe.
         unsafe {
             let errno = *errno_location();
-            libc::write(fd, (&byte as *const u8).cast(), 1);
+            libc::write(fd, record.as_ptr().cast(), REPORT_SIZE);
             *errno_location() = errno;
         }
     }
@@ -764,11 +778,13 @@ fn forwarder() -> io::Result<()> {
             std::thread::Builder::new()
                 .name("stack-signals".into())
                 .spawn(move || loop {
-                    let mut byte = 0u8;
-                    // SAFETY: reads one byte into a local.
-                    if unsafe { libc::read(read, (&mut byte as *mut u8).cast(), 1) } != 1 {
+                    let mut record = [0u8; REPORT_SIZE];
+                    // SAFETY: reads one record into a local buffer of its size.
+                    if unsafe { libc::read(read, record.as_mut_ptr().cast(), REPORT_SIZE) } != REPORT_SIZE as isize {
                         continue;
                     }
+                    let byte = record[0];
+                    let generation = u32::from_ne_bytes(record[1..5].try_into().expect("four bytes"));
                     let signal = libc::c_int::from(byte & !PASSING);
                     let registry = registry();
                     for group in &registry.groups {
@@ -776,7 +792,12 @@ fn forwarder() -> io::Result<()> {
                         // while this lock is held.
                         unsafe { libc::kill(-group, signal) };
                     }
-                    if byte & PASSING != 0 {
+                    // A signal passes on without ending stack only to the command it came for.
+                    // One whose command is gone gets the default action, which ends stack.
+                    let current = registry.users > 0
+                        && registry.passing
+                        && GENERATION.load(std::sync::atomic::Ordering::SeqCst) == generation;
+                    if byte & PASSING != 0 && current {
                         HANDLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         continue;
                     }
@@ -812,6 +833,7 @@ fn enter_forwarding(passing: bool) -> io::Result<bool> {
         if matches!(exclusive, Some(Err(_))) {
             return Ok(false);
         }
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         registry.previous = install_forwarding(if passing { report_passing } else { report_signal })?;
         registry.passing = passing;
     } else if registry.passing != passing {
@@ -995,8 +1017,9 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         Ok((if timed_out { None } else { code }, timed_out))
     }
 
-    /// Leave forwarding once every signal reported for the command was handled, so none is
-    /// passed on to a later one (bounded: a full pipe drops reports).
+    /// Leave forwarding once every signal reported for the command was handled (bounded: a
+    /// full pipe drops reports). One reported later is not passed on to a later command: its
+    /// generation is gone, so it ends stack (see [`forwarder`]).
     fn leave_passing() {
         let until = Instant::now() + Duration::from_secs(1);
         while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < REPORTED.load(std::sync::atomic::Ordering::SeqCst)
