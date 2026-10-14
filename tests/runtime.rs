@@ -3297,6 +3297,9 @@ fn a_service_the_supervisor_launched_but_never_records_fails_the_start_quickly()
     let listener: u32 = fs::read_to_string(fixture.dir.path().join("unrecorded-pid")).unwrap().trim().parse().unwrap();
     let cleanup = Lost { wrapper: listener, listener, worker: None };
     assert!(started.elapsed() < Duration::from_secs(40), "waited {:?}", started.elapsed());
+    // The request was ended before `up` returned, not left to a thread `up` exits without.
+    let client: u32 = fs::read_to_string(fixture.dir.path().join("unrecorded-client")).unwrap().trim().parse().unwrap();
+    assert!(!pid_alive(client), "the start request outlived up");
     assert_eq!(result["error"]["code"], "start_failed", "{result}");
     assert!(result["error"]["message"].as_str().unwrap().contains("has not recorded it"), "{result}");
     assert_eq!(result["error"]["details"][0]["pid"], listener, "{result}");

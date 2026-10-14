@@ -145,6 +145,7 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/unrecorded-start"; then
       STACK_CHECKOUT_TOKEN=$(cat "$REVIEW_FIXTURE/unrecorded-start") "$py" -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/unrecorded-port")" </dev/null >/dev/null 2>&1 &
       echo $! >"$REVIEW_FIXTURE/unrecorded-pid"
+      echo $$ >"$REVIEW_FIXTURE/unrecorded-client"
       exec sleep 600
     fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.

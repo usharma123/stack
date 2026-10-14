@@ -1164,11 +1164,34 @@ fn request_starts(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     completed: &std::sync::Mutex<Vec<String>>,
 ) -> Result<Vec<String>> {
+    let mut ends = Vec::new();
+    let mut threads = Vec::new();
+    let outcome = request_each(root, names, hand_off, cancel, completed, &mut ends, &mut threads);
+    // No request outlives this: one still waiting is ended (its process group) and waited for,
+    // so a stack that exits next cannot leave it behind.
+    for end in &ends {
+        end.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
+    outcome
+}
+
+/// [`request_starts`], leaving the requests' end flags and threads to the caller.
+fn request_each(
+    root: &Path,
+    names: &[String],
+    hand_off: &[bool],
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    completed: &std::sync::Mutex<Vec<String>>,
+    ends: &mut Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    threads: &mut Vec<std::thread::JoinHandle<()>>,
+) -> Result<Vec<String>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     mise::prepare_start(root)?;
     let (sent, answers) = mpsc::channel::<(usize, Result<()>)>();
-    let mut ends: Vec<Arc<AtomicBool>> = Vec::new();
     let mut done: Vec<bool> = Vec::new();
     let mut handed: Vec<String> = Vec::new();
     // One answer, or 200ms; the first error of a request not ended here ends every request.
@@ -1197,16 +1220,16 @@ fn request_starts(
     for (i, name) in names.iter().enumerate() {
         let end = Arc::new(AtomicBool::new(false));
         let (dir, service, sent, deadline, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::deadline(), end.clone());
-        std::thread::spawn(move || {
+        threads.push(std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             let _cancel = crate::process::cancel_scope(flag);
             let _ = sent.send((i, mise::start_daemon(&dir, &service)));
-        });
+        }));
         ends.push(end);
         done.push(false);
         let mut recorded: Option<Instant> = None;
         while !done[i] {
-            if !next(&ends, &mut done, &handed)? {
+            if !next(ends, &mut done, &handed)? {
                 return Ok(handed);
             }
             if done[i] {
@@ -1231,7 +1254,7 @@ fn request_starts(
         }
     }
     while done.iter().any(|d| !d) {
-        if !next(&ends, &mut done, &handed)? {
+        if !next(ends, &mut done, &handed)? {
             break;
         }
     }
