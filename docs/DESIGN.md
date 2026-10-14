@@ -29,8 +29,8 @@ change what a bundle means.
   mirrors the machine index for its own path. One naming another directory from a different
   directory (by device and inode) was copied in (committed, cloned, duplicated) and is
   ignored. So is one whose original path's machine index still holds it, or whose services
-  the supervisor confirms are gone (the same test `stack gc` uses before dropping a record). Otherwise (this directory was moved, or a record from before 0.1.18
-  cannot tell) it may be the last record of running services: it is kept and reported as
+  the supervisor confirms are gone (the same test `stack gc` uses before dropping a record).
+  Otherwise (this directory was moved) it may be the last record of running services: it is kept and reported as
   `session_conflict` naming the original path. Stack keeps `.stack/` out of Git with its own `.gitignore`.
 
 ## Composition rule
@@ -57,7 +57,7 @@ output (mise's answer when no release matches) is an error, not a version.
 - One exact version applies to every platform. If a platform lacks that release, installing
   fails there (`install_failed`); stack does not resolve differently per machine.
 - Provider tools stack adds (Pitchfork) are locked like any other tool.
-- Preset mappings from mise 2026.9.18 are postgres → postgres, redis → redis,
+- Preset mappings (mise 2026.9.18) are postgres → postgres, redis → redis,
   cockroachdb → cockroach, nats → nats-server and spicedb → spicedb. An omitted service
   version becomes a `latest` request, resolved and pinned once. Unknown presets fail in
   locked mode. Nonrelease requests remain explicitly warned exceptions.
@@ -91,8 +91,7 @@ output (mise's answer when no release matches) is an error, not a version.
   removes the session while reservations persist, so "no session" does not mean "never used".
 - **Generations.** A session fingerprints the complete composed configuration, bundle lock and
   assigned ports. `status` reports a change as stale; `exec` withholds service endpoints until
-  `up` stops the previous owned instance and verifies the new configuration. Legacy records
-  without a configuration fingerprint require the same restart. Provider data-version checks
+  `up` stops the previous owned instance and verifies the new configuration. Provider data-version checks
   remain in force: incompatible version changes fail explicitly and preserve the data, rather
   than silently reusing the old process or resetting the database.
 - **Verification** happens on every `exec` and `status`, not from the record: supervisor state,
@@ -130,19 +129,12 @@ output (mise's answer when no release matches) is an error, not a version.
   Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.
-  Commands register active executions before releasing the lifecycle lock and renew on
-  completion. A command that cannot take the lock within a second to finish, with or without
-  a deadline, leaves an atomic completion record naming its session, token and PID, written
-  without the lock; every lifecycle decision under the lock (`up`, `restart`, `exec`, GC)
-  first notes which coordinators have exited, then applies the records matching all three,
-  then forgets only the executions whose coordinator it saw exited, and removes the records
-  only after the record without those executions is saved. A coordinator writes its record
-  before it exits, so one seen exited has left any record it ever will. One seen running may
-  finish while the records are read; it counts as running for that decision, never checked
-  again, and the next one applies its record. GC does not save for a deleted project; `down`
-  and GC's reclaim remove the project's records with its index. GC ignores TTL expiry while
-  an execution it saw running is recorded. An explicit runner-death policy still takes
-  precedence over a surviving command.
+  Commands register active executions under the lifecycle lock and renew on completion. A
+  command that cannot retake the lock within a second leaves an atomic completion record
+  (session, token, PID) instead; the next lifecycle operation applies it, but only once it has
+  seen that command's process exit, so a running command is never forgotten. GC ignores TTL
+  expiry while an execution it saw running is recorded. An explicit runner-death policy still
+  takes precedence over a surviving command.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
   those processes dead and ports closed. A reserved port is stack's to wait for only when a
@@ -212,6 +204,36 @@ may follow the single gzip member. Directories are created with default permissi
 than their archived modes, and cleanup grants the owner access first, so no mode can leave a
 staging directory behind.
 
+## Decisions
+
+Choices that are easy to revisit by accident, and why they were made.
+
+- **One MCP surface.** Stack does not proxy the mise, Pitchfork or fnox MCP servers. Each has
+  its own error contract and failure modes; agents get one contract from Stack.
+- **`stack.lock` embeds mise's lock verbatim** under `[provider_lock]`. A Stack-shaped schema
+  would lose tables mise owns (several entries per version, conda packages, sidecars).
+  Committing `.config/mise/mise.lock` beside `stack.lock` was rejected: one committed lock is
+  the contract, and a generated directory that is half committed is a trap.
+- **Default lock platforms are the release matrix**, not the compiling machine. A lock that
+  covers only a laptop gives a fresh Linux CI runner nothing. `macos-x64` is excluded because
+  Pitchfork publishes no build for it.
+- **`unsupported` is its own coverage state.** A backend that records no download URL is not
+  automatically safe for `mise install --locked`: a cold locked npm install failed on the
+  stripped dependency graph. Such pins install through the plain call, and `required` rejects
+  them.
+- **Discovery runs in a scratch root per call**, with only `[tools]` rendered. Rendering the full
+  config ran project `[env]` templates, and a shared root raced with `compile`.
+- **Stack resolves secret grants itself.** `exec` does not run through `mise x`, and `mise x`
+  does not redact. fnox asking to remove a protected variable is a warning rather than an
+  error, because fnox lists every `env = false` key whether requested or not.
+- **Secret values under 8 bytes are refused in captured output.** Replacing every occurrence
+  of a short string mangles output. This is a usability limit, not a security property;
+  revisit it if real projects hit it.
+- **Skills are linked by Stack, not `mise skills sync`**, which would also link Pitchfork's
+  skill and teach agents to manage daemons around Stack.
+- **Task caching is deferred.** Most tasks depend on services, and a cached `test` would replay
+  results from a different database state. Only tasks with `services = []` could be cached.
+
 ## Not covered yet
 
 - The end-to-end suite runs natively on macOS and Linux (`tests/e2e/native.sh`) and in Docker;
@@ -225,4 +247,5 @@ staging directory behind.
 - OCI auth is env credentials or anonymous tokens; no Docker credential helpers.
 - Unattended expiry needs `stack gc --watch` running under a supervisor of your choice.
 - Deleted-project cleanup depends on what was recorded at launch; it refuses rather than guesses.
-- Agent productivity has not been measured; see [pilot-protocol.md](pilot-protocol.md).
+- Agent productivity has not been measured beyond single observations; see
+  [pilot-protocol.md](pilot-protocol.md).
