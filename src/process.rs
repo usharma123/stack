@@ -658,30 +658,20 @@ fn collect(
     Ok(Piped { timed_out, stdout: out.finish(), stderr: err.finish() })
 }
 
-/// Process group of the command `run_with_deadline` is waiting for, for its signal handler.
-#[cfg(unix)]
-static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-#[cfg(unix)]
-extern "C" fn forward_signal(signal: libc::c_int) {
-    let group = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
-    if group > 0 {
-        // SAFETY: kill is async-signal-safe; the group is the command's own.
-        unsafe {
-            libc::kill(-group, signal);
-        }
-    }
-}
-
-/// Commands [`output`] runs at once (several threads may each run one) and how signals reach
-/// them. The handler only writes the signal to a pipe; [`forwarder`] does the rest in an
-/// ordinary thread, holding this lock. Commands are spawned and named here, and leave it and
-/// are reaped, under the same lock, so a group is signalled only between its command's spawn
-/// and its reaping: never a group ID that is not yet named, or one already free for reuse.
+/// Commands running with signals forwarded to them, and how signals reach them: those of
+/// [`output`] (several threads may each run one) or the one of `run_with_deadline`. The
+/// handler only writes the signal to a pipe; [`forwarder`] does the rest in an ordinary
+/// thread, holding this lock. Commands are spawned and named here, and leave it and are
+/// reaped, under the same lock, so a group is signalled only between its command's spawn and
+/// its reaping: never a group ID that is not yet named, or one already free for reuse. A
+/// report still in the pipe when one kind of command hands over to the other reaches the
+/// commands named when it is handled.
 #[cfg(unix)]
 struct Registry {
     /// Commands forwarding signals now; the handler stays installed while any does.
     users: usize,
+    /// They are `run_with_deadline`'s: a signal passes to the command and stack goes on.
+    passing: bool,
     /// The dispositions the handler replaced, restored when the last user leaves.
     previous: Vec<(libc::c_int, libc::sigaction)>,
     /// Process groups of the commands running, each named once.
@@ -689,7 +679,18 @@ struct Registry {
 }
 
 #[cfg(unix)]
-static REGISTRY: std::sync::Mutex<Registry> = std::sync::Mutex::new(Registry { users: 0, previous: Vec::new(), groups: Vec::new() });
+static REGISTRY: std::sync::Mutex<Registry> =
+    std::sync::Mutex::new(Registry { users: 0, passing: false, previous: Vec::new(), groups: Vec::new() });
+
+/// Reports the handler wrote, and those [`forwarder`] handled without ending stack.
+#[cfg(unix)]
+static REPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(unix)]
+static HANDLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A report's flag for a signal that passes to the command without ending stack.
+#[cfg(unix)]
+const PASSING: u8 = 0x80;
 
 #[cfg(unix)]
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
@@ -700,13 +701,25 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 #[cfg(unix)]
 static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// For [`output`]: tell [`forwarder`] which signal came. Only `write`, which is
-/// async-signal-safe; errno is kept for the interrupted code.
+/// For [`output`]: tell [`forwarder`] which signal came, to be passed on before it ends stack.
 #[cfg(unix)]
 extern "C" fn report_signal(signal: libc::c_int) {
+    report(signal as u8);
+}
+
+/// For `run_with_deadline`: tell [`forwarder`] which signal came, to be passed on only.
+#[cfg(unix)]
+extern "C" fn report_passing(signal: libc::c_int) {
+    report(signal as u8 | PASSING);
+}
+
+/// Only an atomic add and `write`, which are async-signal-safe; errno is kept for the
+/// interrupted code.
+#[cfg(unix)]
+fn report(byte: u8) {
     let fd = WAKE.load(std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
-        let byte = signal as u8;
+        REPORTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: errno is thread-local and saved around write, which is async-signal-safe.
         unsafe {
             let errno = *errno_location();
@@ -743,7 +756,8 @@ fn forwarder() -> io::Result<()> {
                 // SAFETY: plain fcntl on descriptors this function owns.
                 unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             }
-            // A full pipe drops a report rather than blocking the handler; one is enough.
+            // A full pipe drops a report rather than blocking the handler; one that ends stack
+            // is enough, and `run_with_deadline` gives up waiting for a dropped one.
             // SAFETY: as above.
             unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
             let read = fds[0];
@@ -755,12 +769,16 @@ fn forwarder() -> io::Result<()> {
                     if unsafe { libc::read(read, (&mut byte as *mut u8).cast(), 1) } != 1 {
                         continue;
                     }
-                    let signal = libc::c_int::from(byte);
+                    let signal = libc::c_int::from(byte & !PASSING);
                     let registry = registry();
                     for group in &registry.groups {
                         // SAFETY: the group is a running command's own: it cannot be reaped
                         // while this lock is held.
                         unsafe { libc::kill(-group, signal) };
+                    }
+                    if byte & PASSING != 0 {
+                        HANDLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        continue;
                     }
                     // SAFETY: restore the default action, unblock it here and raise it in this
                     // thread, which ends stack; the lock is held until then.
@@ -782,15 +800,22 @@ fn forwarder() -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
-/// Join the [`output`] commands forwarding signals; the first installs the handler. `false`
-/// while `run_with_deadline` forwards them to its own command instead.
+/// Join the commands forwarding signals; the first installs the handler. For [`output`]
+/// (`passing` false), `false` while `run_with_deadline` forwards them to its own command.
 #[cfg(unix)]
-fn enter_forwarding() -> io::Result<bool> {
+fn enter_forwarding(passing: bool) -> io::Result<bool> {
     forwarder()?;
     let mut registry = registry();
     if registry.users == 0 {
-        let Ok(_exclusive) = FORWARDING.try_lock() else { return Ok(false) };
-        registry.previous = install_forwarding(report_signal)?;
+        // `run_with_deadline` holds this itself, and waits for `output`'s commands to end.
+        let exclusive = if passing { None } else { Some(FORWARDING.try_lock()) };
+        if matches!(exclusive, Some(Err(_))) {
+            return Ok(false);
+        }
+        registry.previous = install_forwarding(if passing { report_passing } else { report_signal })?;
+        registry.passing = passing;
+    } else if registry.passing != passing {
+        return Ok(false);
     }
     registry.users += 1;
     Ok(true)
@@ -810,8 +835,8 @@ fn leave_forwarding() {
 #[cfg(unix)]
 const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-/// Held while `run_with_deadline` forwards signals to `FORWARD_TO`, which names one group at a
-/// time, and taken by [`enter_forwarding`] to install the handler of [`output`]'s commands.
+/// Held while `run_with_deadline` forwards signals to its command, and taken by
+/// [`enter_forwarding`] to install the handler of [`output`]'s commands.
 #[cfg(unix)]
 static FORWARDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -918,20 +943,29 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         held: &libc::sigset_t,
         caller_mask: libc::sigset_t,
     ) -> io::Result<(Option<i32>, bool)> {
-        let previous = install_forwarding(forward_signal)?;
+        enter_forwarding(true)?;
         command.process_group(0).stdin(Stdio::null());
         // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
         unsafe {
             command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
         }
-        let mut child = match command.spawn() {
+        // Spawned and named, and later unnamed and ended, under the registry's lock, as for
+        // `output`.
+        let spawned = {
+            let mut registry = registry();
+            let spawned = command.spawn();
+            if let Ok(child) = &spawned {
+                registry.groups.push(child.id() as i32);
+            }
+            spawned
+        };
+        let mut child = match spawned {
             Ok(child) => OwnedChild::new(child),
             Err(e) => {
-                restore_dispositions(&previous);
+                leave_passing();
                 return Err(e);
             }
         };
-        FORWARD_TO.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
         let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
             let start = Instant::now();
             loop {
@@ -945,9 +979,13 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
             }
         });
         let _ = set_mask(libc::SIG_BLOCK, held);
-        child.terminate();
-        FORWARD_TO.store(0, std::sync::atomic::Ordering::SeqCst);
-        restore_dispositions(&previous);
+        {
+            let group = child.child.id() as i32;
+            let mut registry = registry();
+            registry.groups.retain(|g| *g != group);
+            child.terminate();
+        }
+        leave_passing();
         let timed_out = waited?;
         // Like a shell: a command ended by a signal reports 128 + its number.
         let code = child.status.and_then(|status| {
@@ -955,6 +993,18 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
             status.code().or_else(|| status.signal().map(|s| 128 + s))
         });
         Ok((if timed_out { None } else { code }, timed_out))
+    }
+
+    /// Leave forwarding once every signal reported for the command was handled, so none is
+    /// passed on to a later one (bounded: a full pipe drops reports).
+    fn leave_passing() {
+        let until = Instant::now() + Duration::from_secs(1);
+        while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < REPORTED.load(std::sync::atomic::Ordering::SeqCst)
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        leave_forwarding();
     }
 }
 
@@ -997,7 +1047,7 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
     // Signals stay blocked from before the spawn until forwarding names the new group, so none
     // can end stack while the command would be left running; the command starts unblocked.
     // Every command running at once is forwarded to (several threads may each run one).
-    let forwarding = match enter_forwarding() {
+    let forwarding = match enter_forwarding(false) {
         Ok(forwarding) => forwarding,
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
