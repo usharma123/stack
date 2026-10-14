@@ -691,7 +691,8 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 #[cfg(unix)]
 static ARRIVALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The highest arrival number [`forwarder`] passed on without ending stack.
+/// Every report numbered up to this one was handled (passed on without ending stack: one that
+/// ends stack leaves nothing to wait for).
 #[cfg(unix)]
 static HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -704,22 +705,40 @@ static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1
 #[cfg(unix)]
 const REPORT_SIZE: usize = 16;
 
-/// Tell [`forwarder`] which signal came, and when. Only atomics and `write`, which are
-/// async-signal-safe; errno is kept for the interrupted code.
+/// Tell [`forwarder`] which signal came, and when. Only atomics, `write`, `signal` and
+/// `raise`, which are async-signal-safe; errno is kept for the interrupted code. A report that
+/// cannot be written (thousands queued) takes the default action at once, ending stack, so no
+/// report is ever lost.
 #[cfg(unix)]
 extern "C" fn report_signal(signal: libc::c_int) {
     let arrival = ARRIVALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let fd = WAKE.load(std::sync::atomic::Ordering::SeqCst);
-    if fd >= 0 {
-        let mut record = [0u8; REPORT_SIZE];
-        record[0] = signal as u8;
-        record[8..].copy_from_slice(&arrival.to_ne_bytes());
-        // SAFETY: errno is thread-local and saved around write, which is async-signal-safe.
-        unsafe {
-            let errno = *errno_location();
-            libc::write(fd, record.as_ptr().cast(), REPORT_SIZE);
-            *errno_location() = errno;
+    let mut record = [0u8; REPORT_SIZE];
+    record[0] = signal as u8;
+    record[8..].copy_from_slice(&arrival.to_ne_bytes());
+    // SAFETY: errno is thread-local and saved around write. The raised signal is blocked while
+    // this handler runs and is delivered, with the default action, once it returns.
+    unsafe {
+        let errno = *errno_location();
+        let written = fd >= 0 && libc::write(fd, record.as_ptr().cast(), REPORT_SIZE) == REPORT_SIZE as isize;
+        *errno_location() = errno;
+        if !written {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
         }
+    }
+}
+
+/// Wait until every signal that arrived by now was handled (see [`HANDLED`]), so it reaches
+/// the commands it arrived for, classified as they were, before one of them is unnamed. A
+/// report is written right after its number is taken; the bound only keeps a stalled
+/// forwarder from holding a command's teardown forever.
+#[cfg(unix)]
+fn await_reports() {
+    let arrived = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(2);
+    while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrived && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -753,8 +772,8 @@ fn forwarder() -> io::Result<()> {
                 // SAFETY: plain fcntl on descriptors this function owns.
                 unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             }
-            // A full pipe drops a report rather than blocking the handler; the reports it
-            // holds already end stack or reach the running commands.
+            // A full pipe fails the handler's write rather than blocking it (see
+            // `report_signal`).
             // SAFETY: as above.
             unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
             let read = fds[0];
@@ -763,6 +782,9 @@ fn forwarder() -> io::Result<()> {
                 .spawn(move || {
                     let mut record = [0u8; REPORT_SIZE];
                     let mut filled = 0;
+                    // Reports handled beyond the contiguous boundary: they may be read out of
+                    // order, as a handler can be paused between taking its number and writing.
+                    let mut ahead = std::collections::BTreeSet::new();
                     loop {
                         // SAFETY: reads into the unfilled rest of a local buffer.
                         let n = unsafe { libc::read(read, record[filled..].as_mut_ptr().cast(), REPORT_SIZE - filled) };
@@ -784,7 +806,12 @@ fn forwarder() -> io::Result<()> {
                             unsafe { libc::kill(-command.group, signal) };
                         }
                         if !recipients.is_empty() && recipients.iter().all(|c| c.passing) {
-                            HANDLED.fetch_max(arrival, std::sync::atomic::Ordering::SeqCst);
+                            ahead.insert(arrival);
+                            let mut boundary = HANDLED.load(std::sync::atomic::Ordering::SeqCst);
+                            while ahead.remove(&(boundary + 1)) {
+                                boundary += 1;
+                            }
+                            HANDLED.store(boundary, std::sync::atomic::Ordering::SeqCst);
                             continue;
                         }
                         // SAFETY: restore the default action, unblock it here and raise it in
@@ -820,9 +847,11 @@ fn spawn_named(command: &mut Command, passing: bool, spawn: impl FnOnce(&mut Com
 }
 
 /// Unname `child`'s group and end it (`kill`: with its group, else only reap it), under the
-/// registry's lock, so the group is never signalled once its ID may be reused.
+/// registry's lock, so the group is never signalled once its ID may be reused. Signals that
+/// arrived while it ran are handled first (see [`await_reports`]).
 #[cfg(unix)]
 fn retire(child: &mut OwnedChild, kill: bool) {
+    await_reports();
     let mut registry = registry();
     let group = child.child.id() as i32;
     registry.commands.retain(|c| c.group != group);
@@ -956,13 +985,6 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
             }
         });
         let _ = set_mask(libc::SIG_BLOCK, held);
-        // Signals that arrived while the command ran reach it before it is unnamed (bounded:
-        // a full pipe drops reports).
-        let arrived = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
-        let until = Instant::now() + Duration::from_secs(1);
-        while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrived && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(5));
-        }
         retire(&mut child, true);
         let timed_out = waited?;
         // Like a shell: a command ended by a signal reports 128 + its number.
