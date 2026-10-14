@@ -2,12 +2,14 @@
 
 # Stack
 
-Reusable development stacks for projects and coding agents.
+Stack gives every checkout of a project its own pinned tools and its own running services:
+Postgres, Redis, or anything you can start from a command. Each checkout gets its own ports
+and data, and Stack checks every service before a command runs. Run five agents in five
+worktrees and none of them will touch another's database.
 
-Define your tools and services once, publish them as a bundle, and reuse them across projects.
-Each checkout gets pinned versions, its own ports, and service checks before commands run.
-Stack uses [mise](https://mise.jdx.dev) to install tools and Pitchfork, through `mise daemons`,
-to run services.
+Define the stack once in `stack.toml`, or share it as a bundle from Git, a local path or an
+OCI registry. Stack installs tools with [mise](https://mise.jdx.dev) and runs services with
+Pitchfork.
 
 ## Installation
 
@@ -16,62 +18,62 @@ npm install -g @ushawarma/stack
 stack setup
 ```
 
-Requires Node.js 22.14+ and supports macOS 13+ and Linux on x64 and arm64 (services need Apple silicon or Linux; Intel Macs run tools-only stacks).
-`stack setup` downloads the [mise](https://mise.jdx.dev) release stack is tested against, unless
-mise is already on `PATH`. Stack installs Pitchfork through mise.
+Needs Node.js 22.14+, on macOS 13+ or Linux (x64 or arm64). Intel Macs run tools-only stacks:
+Pitchfork, which runs services, has no Intel macOS build. `stack setup` uses the mise on your
+`PATH`, or downloads the release Stack is tested against.
 
-Start with [install and first run](https://github.com/usharma123/stack/blob/main/docs/user/install.md)
-for a complete example.
-
-## How it works
-
-A project's `stack.toml` can define tools and services directly or import bundles from Git,
-a local path, or an OCI registry:
+## Quick start
 
 ```toml
+# stack.toml
 [tools]
 python = "3.13"
 
-[services.redis]
-preset = "redis"
-version = "7"
+[services.postgres]
+preset = "postgres"
+version = "17"
+
+[tasks.test]
+run = "python -m unittest"
+services = ["postgres"]
 ```
 
 ```sh
-stack compile                 # lock versions and assign this checkout's ports
-stack up --ttl 30m             # start and verify services
-stack exec --require redis -- python -c 'import os; print(os.environ["REDIS_URL"])'
-stack down                    # stop services and confirm they are gone
+stack compile          # lock exact versions in stack.lock, assign this checkout's ports
+stack up --ttl 30m     # install, start and verify the services
+stack run test         # run a task once every service checks out
+stack exec -- python -c 'import os; print(os.environ["DATABASE_URL"])'
+stack down             # stop everything and confirm it is gone
 ```
 
-Define `[tasks.<name>]` in `stack.toml` and run them with `stack run <name>`, which first
-verifies the stack's services.
+Commit `stack.toml` and `stack.lock`. Connection details reach your app through the
+environment (`DATABASE_URL`, `REDIS_URL`, `<NAME>_PORT`), so nothing hardcodes a port.
 
-Commit `stack.toml` and `stack.lock` to share the configuration and resolved versions.
-Use `--json` for structured command results, or `stack mcp` for the stdio MCP server.
-Coding agents: see the [agent quickstart](https://github.com/usharma123/stack/blob/main/docs/user/agents.md).
+## For coding agents
 
-## Status
+Run `stack mcp` to start a stdio MCP server with the same operations, or pass `--json` to any
+command for one structured result with a stable error `code` and `hint`. If a service is down
+or belongs to another checkout, Stack withholds its address (or, with `--require`, refuses to
+run) rather than let the command reach the wrong server. See the [agent guide](https://github.com/usharma123/stack/blob/main/docs/user/agents.md).
 
-Stack is an early prototype. Service and session scenarios are tested with real mise and
-Pitchfork on Linux and macOS. See the [design](https://github.com/usharma123/stack/blob/main/docs/DESIGN.md)
-for implementation scope and limits.
+## Some notes
 
-Bundles run trusted code. Review them before use. TTL cleanup runs during `stack gc` and
-`stack up`; run `stack gc --watch` under a supervisor for unattended cleanup.
+Stack is early. Expect rough edges, and pin a version in CI.
+
+Bundles are code you run: review them like any other dependency. Sessions with a `--ttl` are
+cleaned up by `stack gc` or the next `stack up`. Nothing runs in the background unless you run
+`stack gc --watch` under a supervisor.
 
 ## Documentation
 
 Full docs live in [docs/](https://github.com/usharma123/stack/tree/main/docs).
 
 - [Install and first run](https://github.com/usharma123/stack/blob/main/docs/user/install.md)
-- [Bundles and project configuration](https://github.com/usharma123/stack/blob/main/docs/user/bundles.md)
+- [Coding agents: JSON output and MCP](https://github.com/usharma123/stack/blob/main/docs/user/agents.md)
+- [Bundles and `stack.toml`](https://github.com/usharma123/stack/blob/main/docs/user/bundles.md)
 - [Command reference](https://github.com/usharma123/stack/blob/main/docs/user/commands.md)
-- [Guarantees and limits](https://github.com/usharma123/stack/blob/main/docs/user/guarantees.md)
-- [Service identity probes](https://github.com/usharma123/stack/blob/main/docs/user/identity-probes.md)
-- [Secret grants](https://github.com/usharma123/stack/blob/main/docs/user/secrets.md)
-- [Publishing bundles to OCI registries](https://github.com/usharma123/stack/blob/main/docs/user/registries.md)
-- [JSON output and MCP](https://github.com/usharma123/stack/blob/main/docs/user/agents.md)
-- [Agent skills](https://github.com/usharma123/stack/blob/main/docs/user/skills.md)
+- [Worktrees and sandboxes](https://github.com/usharma123/stack/blob/main/docs/user/worktrees.md)
+- [Secrets](https://github.com/usharma123/stack/blob/main/docs/user/secrets.md)
+- [What Stack guarantees](https://github.com/usharma123/stack/blob/main/docs/user/guarantees.md)
 
-Building from source? Start with [development and validation](https://github.com/usharma123/stack/blob/main/docs/operations/development.md).
+Building from source? Start at [docs/operations/development.md](https://github.com/usharma123/stack/blob/main/docs/operations/development.md).

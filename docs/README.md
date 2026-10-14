@@ -3,32 +3,25 @@
 ## Using Stack
 
 - [Install and first run](user/install.md)
-- [Bundles and project configuration](user/bundles.md)
+- [Coding agents: JSON output and MCP](user/agents.md)
+- [Bundles and `stack.toml`](user/bundles.md)
 - [Command reference](user/commands.md)
-- [Guarantees and limits](user/guarantees.md)
-- [Service identity probes](user/identity-probes.md)
-- [Secret grants](user/secrets.md)
-- [Publishing bundles to OCI registries](user/registries.md)
-- [JSON output and MCP](user/agents.md)
+- [Worktrees and sandboxes](user/worktrees.md)
+- [Secrets](user/secrets.md)
 - [Agent skills](user/skills.md)
-- [Worktree and agent-sandbox integration](user/worktrees.md)
+- [Service identity probes](user/identity-probes.md)
+- [Publishing bundles to OCI registries](user/registries.md)
+- [What Stack guarantees](user/guarantees.md)
+
+---
 
 ## Working on Stack
 
-Start with [development and validation](operations/development.md).
+Start with the [development runbook](operations/development.md).
 
-- [Design and implementation scope](DESIGN.md)
-- [jdx tool integration design](design/jdx-expansion.md)
-- [Release guide](RELEASING.md)
+- [Design](DESIGN.md): what Stack owns, the session model, and why
+- [Release](RELEASING.md)
+- [Pilot protocol](pilot-protocol.md): how agent concurrency is measured
 - [Competitor evaluation](../eval/REPORT.md)
-- [Pilot protocol](pilot-protocol.md)
-
-### Evaluation follow-up records
-
-- [Plan](eval-followup-plan.md)
-- [Implementation](eval-followup-implementation.md)
-- [Review](eval-followup-review-r1.md)
-- [Review resolution](eval-followup-review-resolution.md)
-- [Port conflicts, install, logs review (2026-10-06)](reviews/2026-10-06-occupied-port-install-logs.md)
 
 [Repository home](../README.md)

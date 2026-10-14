@@ -31,11 +31,8 @@ entry per pinned tool and preset service tool, and one per skill when a release 
 | `not_installed` | the pinned release is not installed on this machine; `stack install` installs it |
 | `unavailable` | stack could not tell: nothing pinned yet, or mise could not answer |
 
-Stack asks mise about exactly the releases stack.lock pins, in a scratch directory under its
-cache, so the answer is the same in a fresh worktree and in one whose generated config is stale.
-Nothing from the project's `[env]` or tasks is evaluated, nothing is installed, and nothing is
-written into the project. A skill is `available` only when its name is a plain name and its
-files lie inside the pinned release's install directory.
+Stack asks mise only about the releases `stack.lock` pins, so the answer is the same in a
+fresh worktree. Nothing is installed or written into the project.
 
 Without `stack.lock` nothing is pinned and every entry is `unavailable`. When mise cannot answer
 (not installed, older than 2026.9.2, a timeout or unreadable output), every entry is
@@ -68,42 +65,28 @@ release carries no provider pages, so an agent without network access cannot fol
 
 ## Linking skills into the project
 
-To have `stack up` and `stack install` link skills where an agent looks for them:
+To have `stack up` and `stack install` link skills where your agent looks for them:
 
 ```toml
-# stack.toml
+# stack.toml (project only; a bundle cannot set it)
 [skills]
 dir = ".claude/skills"
 ```
 
-The links point into one user's mise installs. In a git checkout stack lists each link it
-made, and `.stack-skills.json`, by exact name in a `.gitignore` of its own in that directory
-(which also ignores itself), so they stay out of version control in this checkout while
-skills you add to the directory yourself, and the same names in other worktrees, do not. A
-link is listed only while it is still the link stack made, pointing where it recorded: once
-you replace it with a skill directory or a link of your own, or remove it, the next `compile`
-stops ignoring that name. A skills dir that is also `.config/mise`, under any spelling the
-file system treats as the same directory (`.Config/mise` on a case-insensitive one), gets one
-`.gitignore` naming both the provider files and the links. A skills dir reached through a
-symbolic link is refused, and stack's file in the directory it leads to is left as it is. A
-`.gitignore` of yours there is left as it is, with a warning naming the links it misses.
+Each `available` skill is linked to `<dir>/<name>`, and the links are recorded in
+`<dir>/.stack-skills.json`.
 
-- Project only: a bundle cannot set `[skills]`.
-- `dir` must be relative and stay inside the project, outside `.stack` and `.git`, with no
-  symbolic link along the path (`invalid_path`). Any spelling the file system resolves to the
-  same directory as `.stack` or `.git` is refused too, whether or not that directory existed
-  first: `.Stack` on a case-insensitive file system, but not on a case-sensitive one, where it
-  is a directory of its own.
-- After the install step, a `skills` step links every `available` skill to `<dir>/<name>` and
-  records its links in `<dir>/.stack-skills.json`. Stack replaces or removes only a link it
-  recorded that still points where it left it. Anything else at that name is left alone and
-  reported under `kept`.
-- Two releases shipping a skill of the same name: neither is linked (`skipped`).
-- Links to skills no longer available are removed (`pruned`), but only when mise answered for
-  every pinned release. Otherwise they are left in place and listed under `preserved`.
-- Nothing in this step fails `up` or `install`. Problems make the step's status `warning` and
-  appear in the result's `warnings`.
-- Stack links skills itself rather than running `mise skills sync`, which would also link
-  Pitchfork's skill.
+- The links point into your own mise installs, so in a Git checkout Stack lists them in a
+  `.gitignore` of its own in that directory. Skills you add there yourself stay visible.
+- Stack only replaces or removes a link it made that still points where it left it. Anything
+  else at that name is left alone and reported under `kept`.
+- If two releases ship a skill with the same name, neither is linked (`skipped`).
+- Links to skills that are no longer available are removed (`pruned`).
+- `dir` must be a relative path inside the project, outside `.stack` and `.git`, with no
+  symbolic link along the way (`invalid_path`).
+- Problems in this step are warnings. They never fail `up` or `install`.
+
+Stack links skills itself rather than running `mise skills sync`, which would also link
+Pitchfork's skill.
 
 [All docs](../README.md)

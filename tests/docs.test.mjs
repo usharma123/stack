@@ -34,7 +34,7 @@ for operation, envelope, expected in json.loads(sys.argv[1]):
 `, JSON.stringify(cases)]);
 });
 
-// Runs the worktrees.md script under a temporary HOME, with stand-ins for npm and stack. The
+// Runs examples/isolated-stack.sh under a temporary HOME, with stand-ins for npm and stack. The
 // stand-in stack logs each call, fails a call that starts with an entry in `fail`, hangs on one
 // in `hang` and reports `supervisor` as the supervisor's status. A call in `resist` ignores
 // signals and succeeds after a second; so does npm when `npm` is 'resist', while 'hang' makes
@@ -46,7 +46,7 @@ async function isolatedRun({ fail = [], hang = [], resist = [], npm = '', superv
   const dir = mkdtempSync(path.join(tmpdir(), 'stack-docs-'));
   try {
     const template = '/tmp/stack-iso.XXXXXX';
-    let script = block('worktrees.md', 'Isolated runs', 'bash');
+    let script = readFileSync('examples/isolated-stack.sh', 'utf8');
     assert.ok(script.includes(template));
     script = script.replace(template, `${dir}/iso.XXXXXX`);
     if (grace !== undefined) {
@@ -148,7 +148,7 @@ const TASK = ['bash', '-c', 'echo $$ >"$DOCS_STUB_DIR/task.pid"; touch "$DOCS_ST
 // Like TASK, but it ignores interrupt, terminate and hangup.
 const STUBBORN = ['bash', '-c', 'trap "" INT TERM HUP; echo $$ >"$DOCS_STUB_DIR/task.pid"; touch "$DOCS_STUB_DIR/started"; sleep 20; touch "$DOCS_STUB_DIR/finished"'];
 
-test('worktrees.md isolated run keeps HOME, moves every store under its root and removes only that root', async () => {
+test('isolated-stack.sh keeps HOME, moves every store under its root and removes only that root', async () => {
   const inherited = ['MISE_DATA_DIR', 'MISE_ENV', '__MISE_DIFF', 'PITCHFORK_CONFIG_DIR', 'PITCHFORK_STATE_DIR',
     'PITCHFORK_LOGS_DIR', 'STACK_STATE_DIR', 'STACK_DATA_DIR', 'STACK_CACHE_DIR', 'npm_config_globalconfig',
     'npm_config_registry', 'NPM_CONFIG_USERCONFIG'];
@@ -177,7 +177,7 @@ test('worktrees.md isolated run keeps HOME, moves every store under its root and
   });
 });
 
-test('worktrees.md isolated run keeps its root and fails when cleanup is not confirmed', async () => {
+test('isolated-stack.sh keeps its root and fails when cleanup is not confirmed', async () => {
   const cases = [
     { fail: ['down'] },
     { fail: ['exec -- pitchfork supervisor stop'] },
@@ -194,7 +194,7 @@ test('worktrees.md isolated run keeps its root and fails when cleanup is not con
   }
 });
 
-test('worktrees.md isolated run stops services after a failed start and reports the failure', async () => {
+test('isolated-stack.sh stops services after a failed start and reports the failure', async () => {
   await isolatedRun({ fail: ['up'], command: dir => ['touch', `${dir}/ran`] }, ({ dir, root, calls, status }) => {
     assert.notEqual(status, 0);
     assert.ok(!existsSync(path.join(dir, 'ran')));
@@ -205,7 +205,7 @@ test('worktrees.md isolated run stops services after a failed start and reports 
   });
 });
 
-test('worktrees.md isolated run keeps its root when a global provider file changes', async () => {
+test('isolated-stack.sh keeps its root when a global provider file changes', async () => {
   await isolatedRun({
     prepare: dir => mkdirSync(path.join(dir, 'home/.config/mise'), { recursive: true }),
     command: () => ['bash', '-c', 'echo "[tools]" >"$HOME/.config/mise/config.toml"'],
@@ -215,7 +215,7 @@ test('worktrees.md isolated run keeps its root when a global provider file chang
   });
 });
 
-test('worktrees.md isolated run refuses to start when a global provider file cannot be read', { skip: process.getuid?.() === 0 }, async () => {
+test('isolated-stack.sh refuses to start when a global provider file cannot be read', { skip: process.getuid?.() === 0 }, async () => {
   await isolatedRun({
     prepare: dir => {
       const file = path.join(dir, 'home/.config/pitchfork/config.toml');
@@ -230,7 +230,7 @@ test('worktrees.md isolated run refuses to start when a global provider file can
   });
 });
 
-test('worktrees.md isolated run cancels the command and cleans up on a signal to the script alone', async () => {
+test('isolated-stack.sh cancels the command and cleans up on a signal to the script alone', async () => {
   for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]]) {
     await isolatedRun({ command: () => TASK, interrupt: signalAfter('started', signal) }, async ({ dir, root, calls, status, stderr, elapsed }) => {
       assert.equal(status, code, `${signal}\n${stderr}`);
@@ -246,7 +246,7 @@ test('worktrees.md isolated run cancels the command and cleans up on a signal to
   }
 });
 
-test('worktrees.md isolated run cancels the command and cleans up on Ctrl-C to its process group', async () => {
+test('isolated-stack.sh cancels the command and cleans up on Ctrl-C to its process group', async () => {
   await isolatedRun({ command: () => TASK, interrupt: signalAfter('started', 'SIGINT', { group: true }) }, async ({ dir, root, calls, status, elapsed }) => {
     assert.equal(status, 130);
     assert.ok(elapsed < 5_000, `${elapsed}ms`);
@@ -257,7 +257,7 @@ test('worktrees.md isolated run cancels the command and cleans up on Ctrl-C to i
   });
 });
 
-test('worktrees.md isolated run kills what the command left in its group after a signal', async () => {
+test('isolated-stack.sh kills what the command left in its group after a signal', async () => {
   // The command exits on SIGTERM; a grandchild that ignores it, writing into a pipe, does not.
   const command = ['bash', '-c', `bash -c 'trap "" INT TERM HUP; echo $$ >"$DOCS_STUB_DIR/grandchild.pid"; exec sleep 20' | cat &
     touch "$DOCS_STUB_DIR/started"; wait`];
@@ -270,7 +270,7 @@ test('worktrees.md isolated run kills what the command left in its group after a
   });
 });
 
-test('worktrees.md isolated run kills a command that ignores the signal after the grace period', async () => {
+test('isolated-stack.sh kills a command that ignores the signal after the grace period', async () => {
   await isolatedRun({ grace: 1, command: () => STUBBORN, interrupt: signalAfter('started', 'SIGTERM') }, async ({ dir, root, calls, status, elapsed }) => {
     assert.equal(status, 143);
     assert.ok(elapsed >= 1_000 && elapsed < 6_000, `${elapsed}ms`);
@@ -281,7 +281,7 @@ test('worktrees.md isolated run kills a command that ignores the signal after th
   });
 });
 
-test('worktrees.md isolated run kills a command that ignores the signal at a second signal', async () => {
+test('isolated-stack.sh kills a command that ignores the signal at a second signal', async () => {
   await isolatedRun({ command: () => STUBBORN, interrupt: signalAfter('started', 'SIGTERM', { again: 300 }) }, async ({ dir, root, calls, status, elapsed }) => {
     assert.equal(status, 143);
     assert.ok(elapsed < 5_000, `${elapsed}ms`);
@@ -291,7 +291,7 @@ test('worktrees.md isolated run kills a command that ignores the signal at a sec
   });
 });
 
-test('worktrees.md isolated run starts nothing more after a signal during setup', async () => {
+test('isolated-stack.sh starts nothing more after a signal during setup', async () => {
   // npm is cancelled; and npm that ignores the signal and succeeds still stops the run.
   for (const npm of ['hang', 'resist']) {
     await isolatedRun({ npm, command: dir => ['touch', `${dir}/ran`], interrupt: signalAfter('busy', 'SIGTERM') }, ({ dir, root, calls, status, stderr, elapsed }) => {
@@ -304,7 +304,7 @@ test('worktrees.md isolated run starts nothing more after a signal during setup'
   }
 });
 
-test('worktrees.md isolated run skips the command after a signal during stack up and still cleans up', async () => {
+test('isolated-stack.sh skips the command after a signal during stack up and still cleans up', async () => {
   await isolatedRun({ resist: ['up'], command: dir => ['touch', `${dir}/ran`], interrupt: signalAfter('busy', 'SIGINT') }, ({ dir, root, calls, status }) => {
     assert.equal(status, 130);
     assert.ok(!existsSync(path.join(dir, 'ran')), 'up succeeded, but the command must not start');
@@ -313,7 +313,7 @@ test('worktrees.md isolated run skips the command after a signal during stack up
   });
 });
 
-test('worktrees.md isolated run stops cleaning up and keeps its root after a signal during cleanup', async () => {
+test('isolated-stack.sh stops cleaning up and keeps its root after a signal during cleanup', async () => {
   // stack down is cancelled; and a stack down that ignores the signal and succeeds still ends cleanup.
   for (const options of [{ hang: ['down'] }, { resist: ['down'] }]) {
     await isolatedRun({ ...options, interrupt: signalAfter('busy', 'SIGTERM') }, ({ root, calls, status, stderr, elapsed }) => {

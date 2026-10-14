@@ -1,27 +1,25 @@
 # Install and first run
 
-Install the CLI with:
-
 ```sh
 npm install -g @ushawarma/stack
 stack setup
+stack doctor
 ```
 
-Prebuilt binaries cover macOS 13+ and Linux (static, any distribution or libc), on x64 and arm64.
-On Intel Macs stack runs tools-only stacks: Pitchfork, which supervises services, publishes no
-Intel macOS build, so `install`, `up`, `exec` and `run` refuse a stack with services there
-(`services_unsupported`) before installing anything.
-Stack needs [mise](https://mise.jdx.dev); it installs everything else, including Pitchfork,
-through it. `stack setup` uses a mise already on `PATH`; otherwise it downloads the pinned release
-stack is tested against (checked by SHA-256) into `~/.local/share/stack/bin` (`$STACK_DATA_DIR/bin`
-or `$XDG_DATA_HOME/stack/bin` when set). Stack finds it there without any `PATH` change. Run
-`stack doctor` to check a machine.
-Node.js 22.14+ is required. See [release guide](../RELEASING.md) for CI checks,
-trusted publishing setup, release tags, and recovery.
+The package carries prebuilt binaries for macOS 13+ and Linux (static, any distribution) on
+x64 and arm64, and needs Node.js 22.14+. You also need `git` and `tar` on `PATH`.
+
+Stack installs everything through [mise](https://mise.jdx.dev). `stack setup` uses the mise on
+your `PATH`; if there is none, it downloads the release Stack is tested against (checked by
+SHA-256) into `~/.local/share/stack/bin`, where Stack finds it without a `PATH` change.
+`stack doctor` checks the machine and, inside a project, that it compiles.
+
+### Intel Macs
+
+Pitchfork, which runs services, has no Intel macOS build. Tools-only stacks work. A stack with
+services fails with `services_unsupported` before anything is installed.
 
 ## First run
-
-Run `stack setup` once, and make sure `git` and `tar` are on `PATH`.
 
 In an empty directory, create `stack.toml`:
 
@@ -34,10 +32,9 @@ preset = "redis"
 version = "7"
 ```
 
-Then run:
+Then:
 
 ```sh
-stack doctor
 stack compile
 stack up --ttl 30m
 stack exec --require redis -- python -c 'import os; print(os.environ["REDIS_URL"])'
@@ -45,12 +42,22 @@ stack status
 stack down
 ```
 
-`compile` records exact versions in `stack.lock` and assigns this checkout its own ports. `up` installs the tools and starts Redis. `exec` verifies Redis before exposing its connection URL. `down` confirms the service has stopped.
+- `compile` writes the exact versions to `stack.lock` and gives this checkout its own ports.
+- `up` installs Python and Redis, starts Redis and checks that it is this checkout's server.
+- `exec` runs a command with the stack's tools and environment. `--require redis` makes it
+  refuse to run if Redis does not check out.
+- `down` stops Redis and returns once the process is gone.
 
-Commit `stack.toml` and `stack.lock`. The rest stack generates is machine-specific: `.stack/`, `.config/mise/conf.d/stack.toml`, `.config/mise/mise.lock`, `.config/mise/locks/` and the [skill links](skills.md#linking-skills-into-the-project) with their `.stack-skills.json`. In a git checkout, `compile` (and every command that compiles) names exactly those paths in a `.gitignore` of stack's own beside them: `.stack/.gitignore`, `.config/mise/.gitignore` and `<skills dir>/.gitignore`. Each ignores itself, so it never shows as untracked, and covers only the checkout it is in, so a path stack generates in one worktree is never hidden in another where it is yours. Your other files under `.config/` and your own skills stay visible, and a file you already track stays tracked. A `.gitignore` of yours in one of those directories is never changed; stack warns about the generated paths it leaves unignored. A directory reached through a symbolic link (a skills dir or `.config/mise` linked into another checkout, say) is left alone entirely, with a warning, by the same rule skill links follow. Earlier releases listed these paths in the shared `.git/info/exclude`; stack removes those blocks (taking git's `exclude.lock`, waiting up to five seconds for another writer, or less when the call has a shorter `--timeout`), leaving your own lines there. A `.stack/session.json` copied in from another directory (committed by an earlier release, or a duplicated checkout) is ignored.
+`--ttl 30m` puts a lease on the session. Once it expires, `stack gc` or the next `stack up`
+stops the services for you.
 
-> Stack is an early prototype. Review bundles before using them: their commands run as trusted code. A TTL is reclaimed by `stack gc` or a later `stack up`; unattended cleanup requires running `stack gc --watch` under a supervisor.
+## What to commit
 
-Next, [reuse a bundle](bundles.md) or read the [command reference](commands.md).
+Commit `stack.toml` and `stack.lock`. Everything else Stack writes is specific to the
+machine: `.stack/`, and the `.config/mise/` files it generates. In a Git checkout Stack adds a
+small `.gitignore` next to each of them, so they never show up in `git status`. Stack never
+edits a `.gitignore` of yours, and leaves your other files in `.config/` alone.
+
+Next, [reuse a bundle](bundles.md), or set Stack up for [coding agents](agents.md).
 
 [All docs](../README.md)
