@@ -673,66 +673,137 @@ extern "C" fn forward_signal(signal: libc::c_int) {
     }
 }
 
-/// Process groups of the commands [`output`] runs at once (several threads may each run one),
-/// one per slot, 0 when free, for [`forward_all_and_end`].
+/// Commands [`output`] runs at once (several threads may each run one) and how signals reach
+/// them. The handler only writes the signal to a pipe; [`forwarder`] does the rest in an
+/// ordinary thread, holding this lock. Commands are spawned and named here, and leave it and
+/// are reaped, under the same lock, so a group is signalled only between its command's spawn
+/// and its reaping: never a group ID that is not yet named, or one already free for reuse.
 #[cfg(unix)]
-static GROUPS: [std::sync::atomic::AtomicI32; 64] = [const { std::sync::atomic::AtomicI32::new(0) }; 64];
+struct Registry {
+    /// Commands forwarding signals now; the handler stays installed while any does.
+    users: usize,
+    /// The dispositions the handler replaced, restored when the last user leaves.
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+    /// Process groups of the commands running, each named once.
+    groups: Vec<i32>,
+}
 
-/// How many [`output`] commands forward signals now, and the dispositions their handler
-/// replaced, restored when the last one ends.
 #[cfg(unix)]
-static SHARED: std::sync::Mutex<(usize, Vec<(libc::c_int, libc::sigaction)>)> = std::sync::Mutex::new((0, Vec::new()));
+static REGISTRY: std::sync::Mutex<Registry> = std::sync::Mutex::new(Registry { users: 0, previous: Vec::new(), groups: Vec::new() });
 
-/// For [`output`]: pass the signal on to every command running, then let it end stack as it
-/// would have without the handler. Stack installs no handlers of its own besides these, so
-/// that is the default action.
 #[cfg(unix)]
-extern "C" fn forward_all_and_end(signal: libc::c_int) {
-    for slot in &GROUPS {
-        let group = slot.load(std::sync::atomic::Ordering::SeqCst);
-        if group > 0 {
-            // SAFETY: kill is async-signal-safe; the group is a running command's own.
-            unsafe {
-                libc::kill(-group, signal);
-            }
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The write end of the pipe the handler reports signals through, once [`forwarder`] runs.
+#[cfg(unix)]
+static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// For [`output`]: tell [`forwarder`] which signal came. Only `write`, which is
+/// async-signal-safe; errno is kept for the interrupted code.
+#[cfg(unix)]
+extern "C" fn report_signal(signal: libc::c_int) {
+    let fd = WAKE.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = signal as u8;
+        // SAFETY: errno is thread-local and saved around write, which is async-signal-safe.
+        unsafe {
+            let errno = *errno_location();
+            libc::write(fd, (&byte as *const u8).cast(), 1);
+            *errno_location() = errno;
         }
     }
-    // SAFETY: signal and raise are async-signal-safe. The raised signal is blocked while this
-    // handler runs and is delivered, with the default action, once it returns.
-    unsafe {
-        libc::signal(signal, libc::SIG_DFL);
-        libc::raise(signal);
-    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+/// Start, once, the thread that passes each reported signal on to every running command's
+/// group and then lets it end stack, as it would have without the handler (stack installs no
+/// handlers of its own besides these, so that is the default action).
+#[cfg(unix)]
+fn forwarder() -> io::Result<()> {
+    static STARTED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    STARTED
+        .get_or_init(|| {
+            let mut fds = [0; 2];
+            // SAFETY: pipe writes two descriptors into the array.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            for fd in fds {
+                // SAFETY: plain fcntl on descriptors this function owns.
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
+            // A full pipe drops a report rather than blocking the handler; one is enough.
+            // SAFETY: as above.
+            unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
+            let read = fds[0];
+            std::thread::Builder::new()
+                .name("stack-signals".into())
+                .spawn(move || loop {
+                    let mut byte = 0u8;
+                    // SAFETY: reads one byte into a local.
+                    if unsafe { libc::read(read, (&mut byte as *mut u8).cast(), 1) } != 1 {
+                        continue;
+                    }
+                    let signal = libc::c_int::from(byte);
+                    let registry = registry();
+                    for group in &registry.groups {
+                        // SAFETY: the group is a running command's own: it cannot be reaped
+                        // while this lock is held.
+                        unsafe { libc::kill(-group, signal) };
+                    }
+                    // SAFETY: restore the default action, unblock it here and raise it in this
+                    // thread, which ends stack; the lock is held until then.
+                    unsafe {
+                        libc::signal(signal, libc::SIG_DFL);
+                        let mut set: libc::sigset_t = std::mem::zeroed();
+                        libc::sigemptyset(&mut set);
+                        libc::sigaddset(&mut set, signal);
+                        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                        libc::raise(signal);
+                    }
+                    drop(registry);
+                })
+                .map_err(|e| e.to_string())?;
+            WAKE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .clone()
+        .map_err(io::Error::other)
 }
 
 /// Join the [`output`] commands forwarding signals; the first installs the handler. `false`
 /// while `run_with_deadline` forwards them to its own command instead.
 #[cfg(unix)]
 fn enter_forwarding() -> io::Result<bool> {
-    let mut shared = SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if shared.0 == 0 {
+    forwarder()?;
+    let mut registry = registry();
+    if registry.users == 0 {
         let Ok(_exclusive) = FORWARDING.try_lock() else { return Ok(false) };
-        shared.1 = install_forwarding(forward_all_and_end)?;
+        registry.previous = install_forwarding(report_signal)?;
     }
-    shared.0 += 1;
+    registry.users += 1;
     Ok(true)
 }
 
 /// Leave what [`enter_forwarding`] joined; the last restores the dispositions.
 #[cfg(unix)]
 fn leave_forwarding() {
-    let mut shared = SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    shared.0 -= 1;
-    if shared.0 == 0 {
-        restore_dispositions(&std::mem::take(&mut shared.1));
+    let mut registry = registry();
+    registry.users -= 1;
+    if registry.users == 0 {
+        restore_dispositions(&std::mem::take(&mut registry.previous));
     }
-}
-
-/// Name `group` to the handler; `None` when every slot is taken (the command then is not
-/// signalled first, as before forwarding existed).
-#[cfg(unix)]
-fn add_group(group: i32) -> Option<usize> {
-    GROUPS.iter().position(|slot| slot.compare_exchange(0, group, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok())
 }
 
 /// The signals `run_with_deadline` and `output` pass on to their command.
@@ -832,7 +903,7 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
     use std::os::unix::process::CommandExt;
     let _forwarding = FORWARDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Commands of `output` forwarding signals keep their handler until the last one ends.
-    while SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 > 0 {
+    while registry().users > 0 {
         std::thread::sleep(Duration::from_millis(10));
     }
     let held = forwarded_set();
@@ -942,7 +1013,15 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
     unsafe {
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
-    let spawned = spawn_piped(command);
+    // Spawned and named under the registry's lock: a signal is passed on to it, or comes before.
+    let spawned = {
+        let mut registry = forwarding.then(registry);
+        let spawned = spawn_piped(command);
+        if let (Some(registry), Ok(child)) = (registry.as_mut(), &spawned) {
+            registry.groups.push(child.id() as i32);
+        }
+        spawned
+    };
     let mut child = match spawned {
         Ok(child) => OwnedChild::new(child),
         Err(e) => {
@@ -951,30 +1030,38 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
             return Err(e);
         }
     };
-    let slot = forwarding.then(|| add_group(child.child.id() as i32)).flatten();
-    // Stop forwarding before the group can be reaped and its ID reused.
-    let unname = || {
-        if let Some(slot) = slot {
-            GROUPS[slot].store(0, std::sync::atomic::Ordering::SeqCst);
+    let group = child.child.id() as i32;
+    let mut named = forwarding;
+    // Unnamed and ended (killed with its group when `kill`, else reaped) under the registry's
+    // lock, once, so its group ID is never signalled after it may be reused.
+    let mut retire = |child: &mut OwnedChild, kill: bool| {
+        let registry = named.then(registry);
+        if let Some(mut registry) = registry {
+            registry.groups.retain(|g| *g != group);
+            named = false;
+            finish(child, kill);
+        } else {
+            finish(child, kill);
         }
     };
+    fn finish(child: &mut OwnedChild, kill: bool) {
+        if kill {
+            child.terminate();
+        } else {
+            child.reap();
+        }
+    }
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
         collect(&mut child, timeout, OUTPUT_LIMIT, None, |child, timed_out| {
             let _ = set_mask(libc::SIG_BLOCK, &held);
-            unname();
             // A command that finished may have started something meant to outlive it, as a
             // supervisor client starts the supervisor; only a command cut short loses its group.
-            if timed_out {
-                child.terminate();
-            } else {
-                child.reap();
-            }
+            retire(child, timed_out);
         })
     });
     // `collect` may have failed before its teardown ran; then nothing it started is kept.
     let _ = set_mask(libc::SIG_BLOCK, &held);
-    unname();
-    child.terminate();
+    retire(&mut child, true);
     leave();
     let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
     let piped = piped?;
@@ -1155,6 +1242,35 @@ mod tests {
         assert!(!succeeded);
         assert!(ends_soon(child as u32), "the group's sleep survived");
         assert_eq!(later, io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn commands_run_at_once_are_each_named_for_forwarding_and_released_once() {
+        let _deadline = deadline_scope(Some(Instant::now() + Duration::from_secs(30)));
+        let running: Vec<_> = (0..8)
+            .map(|n| {
+                let deadline = deadline();
+                std::thread::spawn(move || {
+                    let _deadline = deadline_scope(deadline);
+                    output(Command::new("sh").args(["-c", &format!("sleep 0.{n}; exit {n}")])).unwrap().status.code()
+                })
+            })
+            .collect();
+        let codes: Vec<_> = running.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(codes, (0..8).map(Some).collect::<Vec<_>>());
+        // Other tests may run commands meanwhile; once all are done nothing stays named.
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let registry = registry();
+            if registry.users == 0 {
+                assert!(registry.groups.is_empty(), "{:?}", registry.groups);
+                assert!(registry.previous.is_empty());
+                break;
+            }
+            drop(registry);
+            assert!(Instant::now() < until, "commands never stopped forwarding");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
