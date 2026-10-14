@@ -73,3 +73,25 @@ assert_json '.ok and .data.confirmed and (.data.conflicts == null)' "$T/down-str
 # shellcheck disable=SC2046
 assert_dead $(recorded_pids "$T/up-stray.json")
 cd "$W" && rm -rf appR-old
+
+echo "A service waiting for one declared after it still starts, though each start holds mise's lock until ready"
+mkdir -p "$W/appD"
+cd "$W/appD" || exit 1
+git init -q
+cat >stack.toml <<'TOML'
+[tools]
+python = "3.13"
+
+[services.first]
+run = "while [ ! -e second-up ]; do sleep 0.2; done; exec python3 -m http.server $PORT --bind 127.0.0.1"
+ready_cmd = "curl -fsS http://127.0.0.1:$PORT/ >/dev/null"
+
+[services.second]
+run = "touch second-up && exec python3 -m http.server $PORT --bind 127.0.0.1"
+ready_cmd = "curl -fsS http://127.0.0.1:$PORT/ >/dev/null"
+TOML
+stack compile >/dev/null
+stack up --timeout 2m --json >"$T/up-appD.json" || fail "reverse dependency: $(cat "$T/up-appD.json")"
+assert_json '.ok and all(.data.checks[]; .ready)' "$T/up-appD.json"
+stack down --json >"$T/down-appD.json"
+assert_json '.ok and .data.confirmed' "$T/down-appD.json"

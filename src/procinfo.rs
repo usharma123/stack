@@ -31,15 +31,47 @@ pub fn process(pid: u32) -> Option<Process> {
 
 /// Whether `pid`'s environment, as it was when it started, sets `key` to exactly `value`.
 /// macOS shows no environment for its own platform binaries (`/bin/sh`, say), even to their
-/// owner: an empty one is unknown, not proof of absence.
+/// owner, and on macOS an argument that is exactly `key=value` counts too (see
+/// `parse_procargs`): only `Some(true)` is an answer to rely on.
 pub fn environ_has(pid: u32, key: &str, value: &str) -> Option<bool> {
     let wanted = format!("{key}={value}");
     imp::environ(pid).filter(|vars| !vars.is_empty()).map(|vars| vars.iter().any(|v| v.as_slice() == wanted.as_bytes()))
 }
 
+/// Every process whose environment sets `key` to `value` (see [`environ_has`]), other than this
+/// one, each observed before and after its environment was read, so a process that replaced
+/// another under its PID is never credited with what the other carried.
+pub fn carrying(key: &str, value: &str) -> Vec<Process> {
+    let me = std::process::id();
+    imp::pids()
+        .into_iter()
+        .filter(|pid| *pid != me && *pid > 1)
+        .filter_map(|pid| {
+            let before = process(pid)?;
+            (environ_has(pid, key, value) == Some(true) && before.current().is_some()).then_some(before)
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Process;
+
+    pub fn pids() -> Vec<u32> {
+        // SAFETY: with a null buffer proc_listallpids returns the count; then it writes at most
+        // `size` bytes.
+        unsafe {
+            let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
+            if count <= 0 {
+                return Vec::new();
+            }
+            let mut pids = vec![0 as libc::pid_t; count as usize * 2 + 64];
+            let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+            let n = libc::proc_listallpids(pids.as_mut_ptr().cast(), size);
+            pids.truncate(n.max(0) as usize);
+            pids.into_iter().filter_map(|p| u32::try_from(p).ok()).collect()
+        }
+    }
 
     pub fn process(pid: u32) -> Option<Process> {
         let pid = libc::c_int::try_from(pid).ok()?;
@@ -89,23 +121,26 @@ mod imp {
         parse_procargs(buf.get(..size)?)
     }
 
-    /// Arguments may be empty strings, so exactly `argc` of them are consumed after the
-    /// executable path and its NUL padding; the environment follows, up to an empty entry.
+    /// Every string after the executable path: the arguments, then the environment. Which is
+    /// which cannot always be told: the path is padded with NULs, and an empty `argv[0]` looks
+    /// the same. Arguments are kept rather than risk counting part of the environment as
+    /// arguments; an argument that is exactly `KEY=value` reads as that variable.
     pub(super) fn parse_procargs(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
-        let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
-        let rest = &buf[4..];
+        let rest = buf.get(4..)?;
         let path_end = rest.iter().position(|b| *b == 0)?;
-        let mut at = path_end + rest[path_end..].iter().position(|b| *b != 0)?;
-        for _ in 0..argc {
-            at += rest.get(at..)?.iter().position(|b| *b == 0)? + 1;
-        }
-        Some(rest.get(at..)?.split(|b| *b == 0).take_while(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
+        Some(rest[path_end..].split(|b| *b == 0).filter(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
     }
 }
 
 #[cfg(target_os = "linux")]
 mod imp {
     use super::Process;
+
+    pub fn pids() -> Vec<u32> {
+        std::fs::read_dir("/proc")
+            .map(|entries| entries.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
+            .unwrap_or_default()
+    }
 
     pub fn process(pid: u32) -> Option<Process> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -131,6 +166,10 @@ mod imp {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::Process;
+
+    pub fn pids() -> Vec<u32> {
+        Vec::new()
+    }
 
     pub fn process(_: u32) -> Option<Process> {
         None
@@ -159,10 +198,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn empty_arguments_are_arguments_and_the_environment_follows_them() {
-        let mut buf = 2i32.to_ne_bytes().to_vec();
-        buf.extend_from_slice(b"/bin/x\0\0\0\0x\0\0A=1\0B=2\0\0junk\0");
-        assert_eq!(imp::parse_procargs(&buf), Some(vec![b"A=1".to_vec(), b"B=2".to_vec()]));
+    fn the_environment_is_found_whatever_the_arguments() {
+        // Empty arguments, argv[0] included, cannot hide a variable.
+        for args in [&b"x\0y\0"[..], b"\0\0", b"\0x\0"] {
+            let mut buf = 2i32.to_ne_bytes().to_vec();
+            buf.extend_from_slice(b"/bin/x\0\0\0\0");
+            buf.extend_from_slice(args);
+            buf.extend_from_slice(b"A=1\0B=2\0\0");
+            let strings = imp::parse_procargs(&buf).unwrap();
+            assert!(strings.contains(&b"A=1".to_vec()) && strings.contains(&b"B=2".to_vec()), "{args:?}");
+        }
     }
 
     #[test]
@@ -186,6 +231,7 @@ mod tests {
         }
         assert_eq!(environ_has(child.id(), "STACK_PROCINFO_TEST", "yes"), Some(true));
         assert_eq!(environ_has(child.id(), "STACK_PROCINFO_TEST", "no"), Some(false));
+        assert_eq!(carrying("STACK_PROCINFO_TEST", "yes").iter().map(|p| p.pid).collect::<Vec<_>>(), [child.id()]);
         child.kill().unwrap();
         // Not yet reaped: a zombie is no process.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

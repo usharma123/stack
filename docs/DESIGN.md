@@ -143,8 +143,12 @@ output (mise's answer when no release matches) is an error, not a version.
   before markers or with an unreadable marker, is adopted. A running service's data is not
   touched.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
-  and the next is made only once the supervisor has recorded the previous service's process;
-  readiness waits overlap, so a service may wait for one declared after it. Pitchfork 2.29.0
+  and the next is made only once the supervisor has recorded the previous service's process.
+  mise holds its project lock until a request's service is ready, so a request whose service
+  stack can check itself (a service without a preset, Postgres, Redis, or one with a
+  `ready_cmd`) that still waits 5 seconds after its process was recorded is ended (its process
+  group only) and the next service is requested; that service must then verify and pass its
+  readiness check as stack runs it. A service may so wait for one declared after it. Pitchfork 2.29.0
   spawns a request's daemons concurrently, and on macOS Rust's standard library creates the
   pipe a spawn waits on with `pipe()` and only then marks it close-on-exec: a daemon forked in
   between keeps it open, so the other spawn neither returns nor records its process until that
@@ -169,9 +173,11 @@ output (mise's answer when no release matches) is an error, not a version.
   path, device, inode and creation time, so stable for one directory and different for one
   recreated at its path. A listener on a reserved port whose environment carries it was
   launched by the supervisor for this checkout even when no record accounts for it, as when
-  Pitchfork 2.29.0 records a start only after it was told to stop (see *Starting*). `down`
-  and `up` stop it, its token-carrying ancestors and their process group, each signal bound to
-  the PID and start time observed, and `down` does not confirm while it lives. A listener
+  Pitchfork 2.29.0 records a start only after it was told to stop (see *Starting*). `up` stops
+  it, its token-carrying ancestors and the token carriers of its process group; `down`, once
+  every recorded process is gone, stops every process still carrying the token, listening or
+  not, and does not confirm while one lives. Each process is observed before and after its
+  environment is read, and each signal is bound to the PID and start time observed. A listener
   whose environment cannot be read (another user's, or a macOS platform binary's) is foreign.
 - **Installing.** `install` runs the compile, trust, socket-preflight and install steps of `up`
   and nothing after: no session, no stop, no start. It is locked like `up`.

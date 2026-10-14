@@ -124,6 +124,14 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
   'daemons start')
+    # Like mise, a start holds the project's lock until it returns; the kernel releases it when
+    # the holder dies, which a holder that is gone stands for here.
+    lock=$REVIEW_FIXTURE/project-lock
+    until (set -C; echo $$ >"$lock") 2>/dev/null; do
+      holder=$(cat "$lock" 2>/dev/null)
+      if test -n "$holder" && ! kill -0 "$holder" 2>/dev/null; then rm -f "$lock"; else sleep 0.05; fi
+    done
+    trap 'rm -f "$lock"' EXIT
     supervise request
     # A request client that would launch a service later, after the request gave up. Like a
     # real client it keeps SIGINT's default action (a plain `&` job of sh would ignore it).

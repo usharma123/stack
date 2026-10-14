@@ -3261,7 +3261,7 @@ fn a_service_the_supervisor_launched_but_never_records_fails_the_start_quickly()
     let out = fixture.command(&["up", "--timeout", "2m", "--json"]).output().unwrap();
     let result = json_result(&out);
     let listener: u32 = fs::read_to_string(fixture.dir.path().join("unrecorded-pid")).unwrap().trim().parse().unwrap();
-    let cleanup = Lost { wrapper: listener, listener };
+    let cleanup = Lost { wrapper: listener, listener, worker: None };
     assert!(started.elapsed() < Duration::from_secs(40), "waited {:?}", started.elapsed());
     assert_eq!(result["error"]["code"], "start_failed", "{result}");
     assert!(result["error"]["message"].as_str().unwrap().contains("has not recorded it"), "{result}");
@@ -3339,10 +3339,25 @@ fn down_confirms_only_once_a_lost_service_is_gone_even_when_it_outlives_its_port
     let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
     // Its listener closes the port on SIGTERM, keeps running, and is reparented once its
     // wrapper dies: still the same process, so it is killed before anything is confirmed.
-    let lost = lost_service_with(port, &token, true);
+    let lost = lost_service_with(port, &token, true, false);
     let down = json_result(&fixture.ok(&["down", "--json"]));
     assert_eq!(down["data"]["confirmed"], true, "{down}");
     assert!(!pid_alive(lost.listener), "confirmed while the listener lived");
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_confirms_only_once_every_process_of_a_lost_service_is_gone() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    // A worker beside the listener ignores SIGTERM and holds no port.
+    let lost = lost_service_with(port, &token, false, true);
+    let worker = lost.worker.unwrap();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(worker), "confirmed while the worker lived");
+    assert!(down["data"]["stopped"].as_array().unwrap().iter().any(|s| s["pid"] == worker), "{down}");
 }
 
 #[test]
@@ -3375,9 +3390,10 @@ fn down_stops_a_service_child_that_keeps_the_port_after_the_supervisor_stops_its
 fn a_service_waiting_for_one_declared_after_it_does_not_hold_back_its_start() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    // web is ready only once api's start was requested.
+    // web is ready only once api's start was requested, and its request holds mise's project
+    // lock until then.
     fs::write(fixture.dir.path().join("wait-for"), "api").unwrap();
-    let out = fixture.command(&["up", "--timeout", "8s", "--json"]).output().unwrap();
+    let out = fixture.command(&["up", "--timeout", "20s", "--json"]).output().unwrap();
     let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
     assert_eq!(requests, "daemons start -- web\ndaemons start -- api\n", "{}", String::from_utf8_lossy(&out.stdout));
     fixture.ok(&["down"]);
@@ -3408,42 +3424,52 @@ fn a_supervisor_start_still_running_does_not_hold_back_verified_services() {
 struct Lost {
     wrapper: u32,
     listener: u32,
+    /// A worker beside the listener, in the same group, that ignores SIGTERM, when asked for.
+    worker: Option<u32>,
 }
 
 impl Drop for Lost {
     fn drop(&mut self) {
-        // SAFETY: the test's own session, which the wrapper leads.
+        // SAFETY: the test's own processes: the session the wrapper leads, and its worker.
         unsafe { libc::kill(-(self.wrapper as i32), libc::SIGKILL) };
+        if let Some(worker) = self.worker {
+            unsafe { libc::kill(worker as i32, libc::SIGKILL) };
+        }
     }
 }
 
 fn lost_service(port: u16, token: &str) -> Lost {
-    lost_service_with(port, token, false)
+    lost_service_with(port, token, false, false)
 }
 
-/// [`lost_service`]; a `stubborn` listener closes its port on SIGTERM but keeps running.
-fn lost_service_with(port: u16, token: &str, stubborn: bool) -> Lost {
+/// [`lost_service`]; a `stubborn` listener closes its port on SIGTERM but keeps running, and
+/// `worker` adds a process beside it.
+fn lost_service_with(port: u16, token: &str, stubborn: bool, worker: bool) -> Lost {
     let script = r#"
 import os, subprocess, sys
 if sys.argv[1] == "launch":
-    wrapper = subprocess.Popen([sys.executable, "-c", sys.argv[2], "wrap", sys.argv[2], sys.argv[3], sys.argv[4]], start_new_session=True, stdout=subprocess.PIPE, text=True)
+    wrapper = subprocess.Popen([sys.executable, "-c", sys.argv[2], "wrap", sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]], start_new_session=True, stdout=subprocess.PIPE, text=True)
     print(wrapper.pid, wrapper.stdout.readline().strip(), flush=True)
     os._exit(0)
 listen = "import signal,socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); sys.argv[2] == '1' and signal.signal(signal.SIGTERM, lambda *_: s.close()); print('ready', flush=True); [time.sleep(1) for _ in range(600)]"
 child = subprocess.Popen([sys.executable, "-c", listen, sys.argv[3], sys.argv[4]], stdout=subprocess.PIPE, text=True)
 child.stdout.readline()
-print(child.pid, flush=True)
+worker = None
+if sys.argv[5] == "1":
+    worker = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); [time.sleep(1) for _ in range(600)]"], stdout=subprocess.PIPE, text=True)
+    worker.stdout.readline()
+print(child.pid, worker.pid if worker else 0, flush=True)
 child.wait()
 "#;
     let out = Command::new(python::python())
-        .args(["-c", script, "launch", script, &port.to_string(), if stubborn { "1" } else { "0" }])
+        .args(["-c", script, "launch", script, &port.to_string(), if stubborn { "1" } else { "0" }, if worker { "1" } else { "0" }])
         .env("STACK_CHECKOUT_TOKEN", token)
         .stderr(Stdio::inherit())
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     let mut pids = text.split_whitespace().map(|p| p.parse::<u32>().unwrap_or_else(|_| panic!("{text}")));
-    Lost { wrapper: pids.next().unwrap(), listener: pids.next().unwrap() }
+    Lost { wrapper: pids.next().unwrap(), listener: pids.next().unwrap(), worker: pids.next().filter(|p| *p != 0) }
 }
 
 #[test]
