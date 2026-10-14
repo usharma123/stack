@@ -363,11 +363,14 @@ pub fn implicit_env(stack: &Composed, python: Option<&str>) -> IndexMap<String, 
     env
 }
 
+/// The generated provider configuration. `checkout` is the checkout's token (see
+/// [`crate::checkout`]), given to every service in its own environment.
 pub fn render(
     stack: &Composed,
     ports: &IndexMap<String, u16>,
     versions: &Versions,
     identities: &IndexMap<String, String>,
+    checkout: Option<&str>,
 ) -> String {
     let mut doc = Table::new();
     let has_services = !stack.services.is_empty();
@@ -435,6 +438,13 @@ pub fn render(
                 put(&mut t, "run", s.run.clone().map(Value::String));
                 put(&mut t, "ready_cmd", s.ready_cmd.clone().map(Value::String));
                 put(&mut t, "ready_port", s.ready_port.map(|p| Value::Integer(p.into())));
+                // The daemon's own environment, unlike `[env]`, reaches only what the
+                // supervisor launches for it: never a task, `exec` command or `mise x`.
+                if let Some(token) = checkout {
+                    let mut env = Table::new();
+                    env.insert(crate::checkout::TOKEN_VAR.into(), Value::String(token.into()));
+                    t.insert("env".into(), Value::Table(env));
+                }
                 if let Some(port) = ports.get(name) {
                     t.insert("port".into(), Value::Integer((*port).into()));
                     // Pitchfork accepts the first successful readiness check. Let TCP unblock
@@ -716,7 +726,7 @@ fn bounded_tail(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(cut).collect();
     let mut total = 0;
     let mut start = lines.len();
-    while start > 0 && total + lines[start - 1].len() + 1 <= TAIL_BYTES {
+    while start > 0 && total + lines[start - 1].len() < TAIL_BYTES {
         start -= 1;
         total += lines[start].len() + 1;
     }

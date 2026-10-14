@@ -126,7 +126,8 @@ supervisor could not return them.
 
 Stops every service and returns once the processes are gone and their ports closed. Another
 program listening on one of this checkout's ports is reported under `conflicts` and left
-alone. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
+alone. A service process the supervisor started for this checkout but lost track of is
+stopped too, listed with `"unrecorded": true`. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
 by name.
 
 ## gc

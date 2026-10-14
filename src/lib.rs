@@ -1,6 +1,7 @@
 //! stack: compose reusable development bundles and run them through existing providers.
 
 pub mod artifacts;
+pub mod checkout;
 pub mod compose;
 pub mod doctor;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod mcp;
 pub mod oci;
 pub mod ports;
 pub mod process;
+pub mod procinfo;
 pub mod project;
 pub mod provider;
 pub mod secrets;

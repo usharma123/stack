@@ -680,9 +680,9 @@ impl<'a> SessionView<'a> {
 
 /// Successful steps without details the result already carries elsewhere (ports and identities
 /// are in the checks) or that only matter when something fails (the socket, install coverage:
-/// `stack install` reports it).
+/// `stack install` reports it). What `stop_previous` and `ports` stopped without a record is kept.
 fn compact_steps(steps: &[Value]) -> Vec<Value> {
-    const REDUNDANT: [&str; 9] = ["gc", "compile", "preflight", "install", "stop_previous", "ports", "stop", "start", "verify"];
+    const REDUNDANT: [&str; 7] = ["gc", "compile", "preflight", "install", "stop", "start", "verify"];
     steps
         .iter()
         .map(|step| match step.as_object() {
@@ -791,10 +791,14 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     let restart = previous.as_ref().is_some_and(|s| s.config_digest != digest);
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
     if restart || unrecorded {
-        if let Err(e) = down_locked(ctx, provider.as_ref()) {
-            return Err(steps.fail("stop_previous", e, true));
+        match down_locked(ctx, provider.as_ref()) {
+            Err(e) => return Err(steps.fail("stop_previous", e, true)),
+            // Processes no record accounted for are worth saying; the rest is routine.
+            Ok(down) => {
+                let unrecorded: Vec<&Value> = down.stopped.iter().filter(|s| s["unrecorded"] == true).collect();
+                steps.ok("stop_previous", if unrecorded.is_empty() { json!(null) } else { json!({ "stopped": unrecorded }) });
+            }
         }
-        steps.ok("stop_previous", json!(null));
     }
     // Nothing can start on a port a foreign program holds, and the supervisor's own error
     // would come after the attempt. Stack's own daemons still running (an unchanged
@@ -804,11 +808,30 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             Ok(s) => s,
             Err(e) => return Err(steps.fail("ports", e, false)),
         };
-        let conflicts = port_conflicts(&report, &statuses);
+        // This checkout's own service processes that no record accounts for are stopped, not
+        // refused as another program's (see `Stray`).
+        let token = crate::checkout::token(&ctx.root);
+        let (mine, conflicts): (Vec<Stray>, Vec<PortConflict>) = port_conflicts(&report, &statuses).into_iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut mine, mut others), c| {
+                match token.as_deref().and_then(|t| stray(&c.service, c.port, t)) {
+                    Some(s) => mine.push(s),
+                    None => others.push(c),
+                }
+                (mine, others)
+            },
+        );
+        let survivors = stop_strays(&mine);
+        if !survivors.is_empty() {
+            let e = StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
+                .hint("run `stack down`, then `stack up`")
+                .details(survivors);
+            return Err(steps.fail("ports", e, false));
+        }
         if !conflicts.is_empty() {
             return Err(steps.fail("ports", port_conflict_error(conflicts), false));
         }
-        steps.ok("ports", json!(null));
+        steps.ok("ports", if mine.is_empty() { json!(null) } else { json!({ "stopped": mine.iter().map(Stray::json).collect::<Vec<_>>() }) });
     }
 
     let stamp = now();
@@ -1497,6 +1520,15 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
             .hint("retry `stack down`; stopping is safe to repeat")
             .details(leftovers));
     }
+    // A process the supervisor launched for this checkout but lost track of is still this
+    // checkout's: it is stopped, not reported as foreign, and `down` never confirms while it lives.
+    let strays = strays(&ctx.root, &reserved);
+    let survivors = stop_strays(&strays);
+    if !survivors.is_empty() {
+        return Err(StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
+            .hint("retry `stack down`; stopping is safe to repeat")
+            .details(survivors));
+    }
 
     remove_if_exists(&ctx.session_file())?;
     remove_if_exists(&ctx.index_file())?;
@@ -1512,6 +1544,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
         stopped: pids
             .iter()
             .map(|(name, pid)| json!({ "service": name, "pid": pid }))
+            .chain(strays.iter().map(Stray::json))
             .collect(),
         confirmed: true,
         conflicts,
@@ -1634,6 +1667,85 @@ fn port_conflict_error(conflicts: Vec<PortConflict>) -> StackError {
     )
     .hint(hints.join("; "))
     .details(conflicts.iter().map(|c| serde_json::to_value(c).expect("conflict serializes")).collect())
+}
+
+/// A process listening on one of this checkout's ports that the supervisor launched for this
+/// checkout (its environment carries the checkout's token, which only services receive) while
+/// no record accounts for it: Pitchfork can lose track of a process it started, as when a
+/// start it was still recording is stopped. `chain` is the listener and the ancestors that
+/// also carry the token, listener first, as observed; `group` is the topmost one's process
+/// group when it leads it (Pitchfork starts each service in a session of its own).
+#[derive(Debug, Clone)]
+struct Stray {
+    service: String,
+    port: u16,
+    chain: Vec<crate::procinfo::Process>,
+    group: Option<u32>,
+}
+
+impl Stray {
+    fn json(&self) -> Value {
+        json!({ "service": self.service, "port": self.port, "pid": self.chain[0].pid, "unrecorded": true })
+    }
+}
+
+/// This checkout's service listening on `port` though nothing recorded it, if that can be
+/// established. Anything else, including a listener whose environment cannot be read, is not.
+fn stray(service: &str, port: u16, token: &str) -> Option<Stray> {
+    use crate::procinfo::{environ_has, process};
+    let holder = ports::holder(port)?;
+    let carries = |pid: u32| environ_has(pid, crate::checkout::TOKEN_VAR, token) == Some(true);
+    if !carries(holder.pid) {
+        return None;
+    }
+    let mut chain = vec![process(holder.pid)?];
+    while let Some(parent) = process(chain.last()?.parent).filter(|p| p.pid > 1 && carries(p.pid)) {
+        chain.push(parent);
+    }
+    let top = chain.last()?;
+    let group = (top.group == top.pid).then_some(top.group);
+    Some(Stray { service: service.to_string(), port, chain, group })
+}
+
+/// Strays on `ports` (service, port) of the checkout at `root`.
+fn strays(root: &Path, ports: &IndexMap<String, u16>) -> Vec<Stray> {
+    let Some(token) = crate::checkout::token(root) else { return Vec::new() };
+    ports.iter().filter(|(_, port)| accepting(**port)).filter_map(|(service, port)| stray(service, *port, &token)).collect()
+}
+
+/// Stop strays: terminate each (its group when it leads one), and kill what is left once
+/// `STOP_TIMEOUT` passes. Every signal is sent only while the process is still the one observed
+/// (same PID and start time), so a reused PID is never signalled. Returns those still alive or
+/// still listening.
+fn stop_strays(strays: &[Stray]) -> Vec<Value> {
+    let signal = |stray: &Stray, sig: libc::c_int| {
+        let current = |p: &crate::procinfo::Process| crate::procinfo::process(p.pid).as_ref() == Some(p);
+        let top = stray.chain.last().expect("a stray has a listener");
+        if let Some(group) = stray.group.filter(|_| current(top)) {
+            // SAFETY: kill only sends a signal; the group's leader was just confirmed unchanged.
+            unsafe { libc::kill(-(group as libc::pid_t), sig) };
+        }
+        for p in stray.chain.iter().filter(|p| current(p)) {
+            // SAFETY: as above, for one confirmed process.
+            unsafe { libc::kill(p.pid as libc::pid_t, sig) };
+        }
+    };
+    let gone = |stray: &Stray| !accepting(stray.port) && stray.chain.iter().all(|p| crate::procinfo::process(p.pid).as_ref() != Some(p));
+    for stray in strays {
+        signal(stray, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
+    while Instant::now() < deadline && !strays.iter().all(gone) {
+        sleep(Duration::from_millis(200));
+    }
+    for stray in strays.iter().filter(|s| !gone(s)) {
+        signal(stray, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + crate::process::bounded(Duration::from_secs(2));
+    while Instant::now() < deadline && !strays.iter().all(gone) {
+        sleep(Duration::from_millis(100));
+    }
+    strays.iter().filter(|s| !gone(s)).map(Stray::json).collect()
 }
 
 fn accepting(port: u16) -> bool {

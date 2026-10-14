@@ -3211,6 +3211,93 @@ fn supervise_listener(fixture: &Fixture, port: u16) {
     .unwrap();
 }
 
+/// A service process the supervisor launched and then lost track of, as Pitchfork 2.29.0 did
+/// with a start it was still recording when it was told to stop: a wrapper leading its own
+/// session (as Pitchfork starts each service) with a child listening on `port`, both with
+/// `token` in their environment, orphaned to init. Killed with its session when dropped.
+struct Lost {
+    wrapper: u32,
+    listener: u32,
+}
+
+impl Drop for Lost {
+    fn drop(&mut self) {
+        // SAFETY: the test's own session, which the wrapper leads.
+        unsafe { libc::kill(-(self.wrapper as i32), libc::SIGKILL) };
+    }
+}
+
+fn lost_service(port: u16, token: &str) -> Lost {
+    let script = r#"
+import os, subprocess, sys
+if sys.argv[1] == "launch":
+    wrapper = subprocess.Popen([sys.executable, "-c", sys.argv[2], "wrap", sys.argv[2], sys.argv[3]], start_new_session=True, stdout=subprocess.PIPE, text=True)
+    print(wrapper.pid, wrapper.stdout.readline().strip(), flush=True)
+    os._exit(0)
+listen = "import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); print('ready', flush=True); time.sleep(600)"
+child = subprocess.Popen([sys.executable, "-c", listen, sys.argv[3]], stdout=subprocess.PIPE, text=True)
+child.stdout.readline()
+print(child.pid, flush=True)
+child.wait()
+"#;
+    let out = Command::new(python::python())
+        .args(["-c", script, "launch", script, &port.to_string()])
+        .env("STACK_CHECKOUT_TOKEN", token)
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut pids = text.split_whitespace().map(|p| p.parse::<u32>().unwrap_or_else(|_| panic!("{text}")));
+    Lost { wrapper: pids.next().unwrap(), listener: pids.next().unwrap() }
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_service_process_the_supervisor_lost_is_stopped_by_up_and_down_never_called_foreign() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    supervise_listener(&fixture, port);
+
+    // `up` stops it instead of refusing with port_conflict, and starts the service: while
+    // reconciling a missing launch record, or, with a record, before checking ports.
+    let lost = lost_service(port, &token);
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let step = |up: &Value, name: &str| up["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == name).unwrap().clone();
+    let stopped = json!([{ "service": "web", "port": port, "pid": lost.listener, "unrecorded": true }]);
+    assert_eq!(step(&up, "stop_previous")["detail"]["stopped"], stopped, "{up}");
+    assert!(!pid_alive(lost.wrapper) && !pid_alive(lost.listener), "the wrapper and its listener were both stopped");
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    let supervised: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    // The supervisor loses its process; another one of this checkout takes the port.
+    unsafe { libc::kill(supervised as i32, libc::SIGKILL) };
+    fs::write(fixture.dir.path().join("daemons-started.json"), json!([{ "id": "app-test/web", "name": "web", "status": "stopped", "port": port }]).to_string()).unwrap();
+    fs::copy(fixture.dir.path().join("daemons-started.json"), fixture.dir.path().join("daemons.json")).unwrap();
+    let lost = lost_service(port, &token);
+    supervise_listener(&fixture, port);
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(step(&up, "ports")["detail"]["stopped"], json!([{ "service": "web", "port": port, "pid": lost.listener, "unrecorded": true }]), "{up}");
+    assert!(!pid_alive(lost.wrapper) && !pid_alive(lost.listener));
+    fixture.ok(&["down"]);
+
+    // `down` stops it and confirms only once it is gone.
+    let lost = lost_service(port, &token);
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    let stopped = json!({ "service": "web", "port": port, "pid": lost.listener, "unrecorded": true });
+    assert!(down["data"]["stopped"].as_array().unwrap().contains(&stopped), "{down}");
+    assert!(down["data"].get("conflicts").is_none(), "{down}");
+    assert!(!pid_alive(lost.wrapper) && !pid_alive(lost.listener));
+
+    // Another checkout's service is another program's: refused and reported, never stopped.
+    let lost = lost_service(port, "another-checkout");
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "port_conflict");
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["conflicts"][0]["holder"]["pid"], lost.listener, "{down}");
+    assert!(pid_alive(lost.wrapper) && pid_alive(lost.listener), "a foreign process was signalled");
+}
+
 /// After `compile --reassign-ports` while `web` still runs on `old`: the provider reports the
 /// daemon running with its *new* configured port `new`, Pitchfork reports the actual `old`.
 fn report_generation_change(fixture: &Fixture, old: u16, new: u16) {

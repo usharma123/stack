@@ -144,6 +144,15 @@ output (mise's answer when no release matches) is an error, not a version.
   `pitchfork status --json` for its active port; if that cannot be established the recorded
   (else configured) port is waited for. A foreign listener on a reserved port is reported in
   `conflicts`, not stopped and not a failure.
+- **Checkout token.** Every service gets `STACK_CHECKOUT_TOKEN` in its own daemon environment
+  (never in `[env]`, so no task, `exec` command or `mise x` has it): a hash of the checkout's
+  path, device, inode and creation time, so stable for one directory and different for one
+  recreated at its path. A listener on a reserved port whose environment carries it was
+  launched by the supervisor for this checkout even when no record accounts for it, as when
+  Pitchfork 2.29.0 records a start only after it was told to stop (see *Starting*). `down`
+  and `up` stop it, its token-carrying ancestors and their process group, each signal bound to
+  the PID and start time observed, and `down` does not confirm while it lives. A listener
+  whose environment cannot be read (another user's, or a macOS platform binary's) is foreign.
 - **Installing.** `install` runs the compile, trust, socket-preflight and install steps of `up`
   and nothing after: no session, no stop, no start. It is locked like `up`.
 - **Logs.** `logs <service> --tail N` returns the supervisor's stored output for one daemon

@@ -415,7 +415,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
             services: services.iter().map(|t| (t.name.clone(), t.resolved.clone())).collect(),
         };
         let identities = crate::identity::assign(&opts.state, &opts.root, &probed)?;
-        write_if_changed(&output, &mise::render(&stack, &ports, &exact, &identities))?;
+        write_if_changed(&output, &mise::render(&stack, &ports, &exact, &identities, crate::checkout::token(&opts.root).as_deref()))?;
         ignore_warning = crate::ignore::update(&opts.root, project.skills.as_ref().map(|s| s.dir.as_str()));
         (ports, identities)
     } else {
