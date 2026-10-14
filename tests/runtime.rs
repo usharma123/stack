@@ -3234,6 +3234,40 @@ fn a_start_request_still_waiting_once_every_service_verifies_is_ended_not_waited
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_service_whose_request_returned_counts_as_ready_for_ending_another_request() {
+    // NATS readiness is the provider's alone; its request returned, so it passed it.
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.queue]\npreset='nats'\n[services.web]\nrun='true'\n");
+    let (queue, web) = (assigned_port(&fixture, "queue"), assigned_port(&fixture, "web"));
+    supervise_listener(&fixture, web);
+    // The queue listens once the supervisor started it.
+    let started_marker = fixture.dir.path().join("started");
+    let (hold, release) = std::sync::mpsc::channel::<()>();
+    let listener = thread::spawn(move || {
+        while !started_marker.exists() {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _queue = std::net::TcpListener::bind(("127.0.0.1", queue)).unwrap();
+        let _ = release.recv_timeout(Duration::from_secs(120));
+    });
+    let daemons = json!([
+        { "id": "app-test/queue", "name": "queue", "status": "running", "port": queue },
+        { "id": "app-test/web", "name": "web", "status": "running", "port": web },
+    ]);
+    fs::write(fixture.dir.path().join("daemons-started.json"), daemons.to_string()).unwrap();
+    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
+    fs::write(fixture.dir.path().join("hang-service"), "web").unwrap();
+    let started = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "1m", "--json"]).output().unwrap();
+    let up = json_result(&out);
+    assert_eq!(up["ok"], true, "{up}");
+    assert!(started.elapsed() < Duration::from_secs(20), "waited {:?}", started.elapsed());
+    drop(hold);
+    listener.join().unwrap();
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_declared_readiness_check_holds_the_start_until_it_passes() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nready_cmd='test -f ready && test -n \"$PORT\"'\n");
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -3362,6 +3396,24 @@ fn down_confirms_only_once_every_process_of_a_lost_service_is_gone() {
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_stops_a_process_a_lost_service_starts_while_it_stops() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    let respawned = fixture.dir.path().join("respawned");
+    std::env::set_var("LOST_RESPAWNED", &respawned);
+    // Its listener starts a worker, carrying its environment, as SIGTERM ends it.
+    let lost = lost_service_with_mode(port, &token, "2", false);
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    let worker: u32 = fs::read_to_string(&respawned).unwrap().trim().parse().unwrap();
+    let cleanup = Lost { wrapper: worker, listener: worker, worker: Some(worker) };
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(worker), "confirmed while the worker it started lived: {down}");
+    drop((cleanup, lost));
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_stops_a_service_child_that_keeps_the_port_after_the_supervisor_stops_its_leader() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -3445,13 +3497,30 @@ fn lost_service(port: u16, token: &str) -> Lost {
 /// [`lost_service`]; a `stubborn` listener closes its port on SIGTERM but keeps running, and
 /// `worker` adds a process beside it.
 fn lost_service_with(port: u16, token: &str, stubborn: bool, worker: bool) -> Lost {
+    lost_service_with_mode(port, token, if stubborn { "1" } else { "0" }, worker)
+}
+
+/// [`lost_service_with`] by the listener's SIGTERM `mode`: "0" ends, "1" closes its port and
+/// keeps running, "2" starts a worker (its PID written to `$LOST_RESPAWNED`) and ends.
+fn lost_service_with_mode(port: u16, token: &str, mode: &str, worker: bool) -> Lost {
     let script = r#"
 import os, subprocess, sys
 if sys.argv[1] == "launch":
     wrapper = subprocess.Popen([sys.executable, "-c", sys.argv[2], "wrap", sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]], start_new_session=True, stdout=subprocess.PIPE, text=True)
     print(wrapper.pid, wrapper.stdout.readline().strip(), flush=True)
     os._exit(0)
-listen = "import signal,socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); sys.argv[2] == '1' and signal.signal(signal.SIGTERM, lambda *_: s.close()); print('ready', flush=True); [time.sleep(1) for _ in range(600)]"
+listen = """
+import os, signal, socket, subprocess, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen()
+def respawn(*_):
+    worker = subprocess.Popen([sys.executable, '-c', 'import time; [time.sleep(1) for _ in range(600)]'])
+    open(os.environ['LOST_RESPAWNED'], 'w').write(str(worker.pid))
+    os._exit(0)
+if sys.argv[2] == '1': signal.signal(signal.SIGTERM, lambda *_: s.close())
+if sys.argv[2] == '2': signal.signal(signal.SIGTERM, respawn)
+print('ready', flush=True)
+[time.sleep(1) for _ in range(600)]
+"""
 child = subprocess.Popen([sys.executable, "-c", listen, sys.argv[3], sys.argv[4]], stdout=subprocess.PIPE, text=True)
 child.stdout.readline()
 worker = None
@@ -3462,7 +3531,7 @@ print(child.pid, worker.pid if worker else 0, flush=True)
 child.wait()
 "#;
     let out = Command::new(python::python())
-        .args(["-c", script, "launch", script, &port.to_string(), if stubborn { "1" } else { "0" }, if worker { "1" } else { "0" }])
+        .args(["-c", script, "launch", script, &port.to_string(), mode, if worker { "1" } else { "0" }])
         .env("STACK_CHECKOUT_TOKEN", token)
         .stderr(Stdio::inherit())
         .output()

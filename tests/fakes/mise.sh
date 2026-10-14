@@ -165,7 +165,10 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       n=0; while ! grep -q -- "-- $(cat "$REVIEW_FIXTURE/wait-for")\$" "$REVIEW_FIXTURE/start-requests.log" && test $n -lt 600; do sleep 0.05; n=$((n + 1)); done
     fi
     # A request that goes on after everything it started is running, as in the field.
-    if test -f "$REVIEW_FIXTURE/hang-after-start"; then echo $$ >"$REVIEW_FIXTURE/hung-client"; exec sleep "$(cat "$REVIEW_FIXTURE/hang-after-start")"; fi ;;
+    # `hang-service` limits that to one service's request.
+    if test -f "$REVIEW_FIXTURE/hang-after-start" && { ! test -f "$REVIEW_FIXTURE/hang-service" || test "$4" = "$(cat "$REVIEW_FIXTURE/hang-service")"; }; then
+      echo $$ >"$REVIEW_FIXTURE/hung-client"; exec sleep "$(cat "$REVIEW_FIXTURE/hang-after-start")"
+    fi ;;
   'run --skip-deps')
     # `mise run --skip-deps --no-timings <task> -- <args>`: echo what the task would receive.
     shift 3; task=$1; shift 2; printf '%s|' "$task" "$@"

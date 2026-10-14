@@ -31,8 +31,8 @@ pub fn process(pid: u32) -> Option<Process> {
 
 /// Whether `pid`'s environment, as it was when it started, sets `key` to exactly `value`.
 /// macOS shows no environment for its own platform binaries (`/bin/sh`, say), even to their
-/// owner, and on macOS an argument that is exactly `key=value` counts too (see
-/// `parse_procargs`): only `Some(true)` is an answer to rely on.
+/// owner, and an environment that cannot be told from the arguments is unknown too: only
+/// `Some(true)` is an answer to rely on.
 pub fn environ_has(pid: u32, key: &str, value: &str) -> Option<bool> {
     let wanted = format!("{key}={value}");
     imp::environ(pid).filter(|vars| !vars.is_empty()).map(|vars| vars.iter().any(|v| v.as_slice() == wanted.as_bytes()))
@@ -121,14 +121,22 @@ mod imp {
         parse_procargs(buf.get(..size)?)
     }
 
-    /// Every string after the executable path: the arguments, then the environment. Which is
-    /// which cannot always be told: the path is padded with NULs, and an empty `argv[0]` looks
-    /// the same. Arguments are kept rather than risk counting part of the environment as
-    /// arguments; an argument that is exactly `KEY=value` reads as that variable.
+    /// The environment in a `KERN_PROCARGS2` buffer: argc, the executable path padded with
+    /// NULs to a pointer-size boundary (measured on macOS 15 arm64: arguments start at
+    /// `round_up(len + 1, 8)` after argc, whatever they are), exactly argc arguments, then the
+    /// environment up to an empty entry. A layout that does not match is unknown.
     pub(super) fn parse_procargs(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
         let rest = buf.get(4..)?;
         let path_end = rest.iter().position(|b| *b == 0)?;
-        Some(rest[path_end..].split(|b| *b == 0).filter(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
+        let mut at = (path_end + 1).div_ceil(std::mem::size_of::<usize>()) * std::mem::size_of::<usize>();
+        if !rest.get(path_end..at)?.iter().all(|b| *b == 0) {
+            return None;
+        }
+        for _ in 0..argc {
+            at += rest.get(at..)?.iter().position(|b| *b == 0)? + 1;
+        }
+        Some(rest.get(at..)?.split(|b| *b == 0).take_while(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
     }
 }
 
@@ -187,33 +195,63 @@ mod tests {
     /// A child to describe: this test binary (not a platform binary, whose environment macOS
     /// hides) running [`sleeper`].
     fn child() -> std::process::Child {
-        std::process::Command::new(std::env::current_exe().unwrap())
+        child_with(|_| {})
+    }
+
+    fn child_with(adjust: impl FnOnce(&mut std::process::Command)) -> std::process::Child {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", "procinfo::tests::sleeper", "--ignored", "--test-threads", "1"])
             .env("STACK_PROCINFO_TEST", "yes")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
+            .stderr(std::process::Stdio::null());
+        adjust(&mut command);
+        command.spawn().unwrap()
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn the_environment_is_found_whatever_the_arguments() {
-        // Empty arguments, argv[0] included, cannot hide a variable.
-        for args in [&b"x\0y\0"[..], b"\0\0", b"\0x\0"] {
-            let mut buf = 2i32.to_ne_bytes().to_vec();
-            buf.extend_from_slice(b"/bin/x\0\0\0\0");
+    fn the_environment_is_told_from_the_arguments() {
+        // "/bin/x" and its NUL padded to 8 bytes.
+        let parse = |argc: i32, args: &[u8]| {
+            let mut buf = argc.to_ne_bytes().to_vec();
+            buf.extend_from_slice(b"/bin/x\0\0");
             buf.extend_from_slice(args);
-            buf.extend_from_slice(b"A=1\0B=2\0\0");
-            let strings = imp::parse_procargs(&buf).unwrap();
-            assert!(strings.contains(&b"A=1".to_vec()) && strings.contains(&b"B=2".to_vec()), "{args:?}");
-        }
+            buf.extend_from_slice(b"A=1\0B=2\0\0junk\0");
+            imp::parse_procargs(&buf)
+        };
+        let env = Some(vec![b"A=1".to_vec(), b"B=2".to_vec()]);
+        assert_eq!(parse(2, b"x\0y\0"), env);
+        assert_eq!(parse(2, b"\0y\0"), env, "an empty argv[0]");
+        assert_eq!(parse(3, b"\0\0\0"), env, "only empty arguments");
+        // A variable passed as an argument is an argument.
+        assert_eq!(parse(1, b"STACK_CHECKOUT_TOKEN=t\0"), env);
+        // Padding that is not NULs is a layout this does not know.
+        let mut odd = 1i32.to_ne_bytes().to_vec();
+        odd.extend_from_slice(b"/bin/x\0zx\0A=1\0\0");
+        assert_eq!(imp::parse_procargs(&odd), None);
     }
 
     #[test]
     #[ignore = "a long-running child for the other tests"]
     fn sleeper() {
         std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_live_environment_is_read_past_an_empty_argv0_and_never_from_arguments() {
+        use std::os::unix::process::CommandExt;
+        let mut child = child_with(|c| {
+            c.arg0("").arg("STACK_PROCINFO_ARG=yes").env("STACK_PROCINFO_TEST", "argv0");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while environ_has(child.id(), "STACK_PROCINFO_TEST", "argv0") != Some(true) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(environ_has(child.id(), "STACK_PROCINFO_TEST", "argv0"), Some(true));
+        assert_ne!(environ_has(child.id(), "STACK_PROCINFO_ARG", "yes"), Some(true));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

@@ -153,10 +153,10 @@ output (mise's answer when no release matches) is an error, not a version.
   pipe a spawn waits on with `pipe()` and only then marks it close-on-exec: a daemon forked in
   between keeps it open, so the other spawn neither returns nor records its process until that
   daemon exits. Field logs of 0.1.21 show the recording delayed to the second the other daemon
-  stopped. Meanwhile stack watches: once every service verifies and passes its declared
-  `ready_cmd`/`ready_port` (Postgres and Redis through their protocol; other presets' checks
-  are the provider's, so their requests are always waited for), the requests are ended, their
-  process groups only. A service listening with this checkout's token that the supervisor
+  stopped. Meanwhile stack watches: once every service verifies and either its request
+  returned (the provider's readiness passed) or it passes its declared `ready_cmd`/`ready_port`
+  (Postgres and Redis through their protocol; other presets' checks are the provider's alone),
+  the requests still waiting are ended, their process groups only. A service listening with this checkout's token that the supervisor
   still has not recorded 15 seconds later fails the start with `start_failed`, retry-safe,
   instead of running out the deadline.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
@@ -176,7 +176,9 @@ output (mise's answer when no release matches) is an error, not a version.
   Pitchfork 2.29.0 records a start only after it was told to stop (see *Starting*). `up` stops
   it, its token-carrying ancestors and the token carriers of its process group; `down`, once
   every recorded process is gone, stops every process still carrying the token, listening or
-  not, and does not confirm while one lives. Each process is observed before and after its
+  not, including ones started while it stops, and does not confirm while one lives. On macOS
+  the environment is read from `KERN_PROCARGS2` past exactly `argc` arguments; a token passed
+  as an argument is not one. Each process is observed before and after its
   environment is read, and each signal is bound to the PID and start time observed. A listener
   whose environment cannot be read (another user's, or a macOS platform binary's) is foreign.
 - **Installing.** `install` runs the compile, trust, socket-preflight and install steps of `up`
