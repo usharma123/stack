@@ -670,13 +670,23 @@ struct Registry {
 }
 
 /// One command's process group; `passing` for `run_with_deadline`'s, which a signal reaches
-/// without ending stack; `since` is the arrival number when it was named: signals that
-/// arrived by then are not its.
+/// without ending stack. A signal is the command's when it arrived after `since` (the arrival
+/// number as its spawn began) and, once it was unnamed, by `until` (the number then). An
+/// unnamed command is never signalled, its group may be reused, but still decides what a
+/// signal that arrived for it does; it is forgotten once every such signal was handled.
 #[cfg(unix)]
 struct Named {
     group: i32,
     passing: bool,
     since: u64,
+    until: Option<u64>,
+}
+
+#[cfg(unix)]
+impl Named {
+    fn received(&self, arrival: u64) -> bool {
+        self.since < arrival && self.until.map_or(true, |until| arrival <= until)
+    }
 }
 
 #[cfg(unix)]
@@ -729,18 +739,7 @@ extern "C" fn report_signal(signal: libc::c_int) {
     }
 }
 
-/// Wait until every signal that arrived by now was handled (see [`HANDLED`]), so it reaches
-/// the commands it arrived for, classified as they were, before one of them is unnamed. A
-/// report is written right after its number is taken; the bound only keeps a stalled
-/// forwarder from holding a command's teardown forever.
-#[cfg(unix)]
-fn await_reports() {
-    let arrived = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
-    let until = Instant::now() + Duration::from_secs(2);
-    while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrived && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(2));
-    }
-}
+
 
 #[cfg(target_os = "macos")]
 unsafe fn errno_location() -> *mut libc::c_int {
@@ -798,20 +797,21 @@ fn forwarder() -> io::Result<()> {
                         filled = 0;
                         let signal = libc::c_int::from(record[0]);
                         let arrival = u64::from_ne_bytes(record[8..].try_into().expect("eight bytes"));
-                        let registry = registry();
-                        let recipients: Vec<&Named> = registry.commands.iter().filter(|c| c.since < arrival).collect();
-                        for command in &recipients {
+                        let mut registry = registry();
+                        let (targets, goes_on) = decide(&registry.commands, arrival);
+                        for group in targets {
                             // SAFETY: the group is a running command's own: it cannot be reaped
                             // while this lock is held.
-                            unsafe { libc::kill(-command.group, signal) };
+                            unsafe { libc::kill(-group, signal) };
                         }
-                        if !recipients.is_empty() && recipients.iter().all(|c| c.passing) {
+                        if goes_on {
                             ahead.insert(arrival);
                             let mut boundary = HANDLED.load(std::sync::atomic::Ordering::SeqCst);
                             while ahead.remove(&(boundary + 1)) {
                                 boundary += 1;
                             }
                             HANDLED.store(boundary, std::sync::atomic::Ordering::SeqCst);
+                            forget_settled(&mut registry);
                             continue;
                         }
                         // SAFETY: restore the default action, unblock it here and raise it in
@@ -835,6 +835,16 @@ fn forwarder() -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+/// What a signal numbered `arrival` does: the groups to pass it on to (its commands still
+/// named), and whether stack goes on, which it does only when the signal had commands and all
+/// of them were `run_with_deadline`'s.
+#[cfg(unix)]
+fn decide(commands: &[Named], arrival: u64) -> (Vec<i32>, bool) {
+    let recipients: Vec<&Named> = commands.iter().filter(|c| c.received(arrival)).collect();
+    let targets = recipients.iter().filter(|c| c.until.is_none()).map(|c| c.group).collect();
+    (targets, !recipients.is_empty() && recipients.iter().all(|c| c.passing))
+}
+
 /// Spawn `command` and name its process group (see [`Registry`]), under the registry's lock.
 /// A signal arriving from the moment the spawn begins is the command's too.
 #[cfg(unix)]
@@ -842,24 +852,34 @@ fn spawn_named(command: &mut Command, passing: bool, spawn: impl FnOnce(&mut Com
     let mut registry = registry();
     let since = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
     let child = spawn(command)?;
-    registry.commands.push(Named { group: child.id() as i32, passing, since });
+    registry.commands.push(Named { group: child.id() as i32, passing, since, until: None });
     Ok(child)
 }
 
 /// Unname `child`'s group and end it (`kill`: with its group, else only reap it), under the
-/// registry's lock, so the group is never signalled once its ID may be reused. Signals that
-/// arrived while it ran are handled first (see [`await_reports`]).
+/// registry's lock, so the group is never signalled once its ID may be reused. A signal that
+/// arrived while it was named still counts it (see [`Named`]).
 #[cfg(unix)]
 fn retire(child: &mut OwnedChild, kill: bool) {
-    await_reports();
     let mut registry = registry();
     let group = child.child.id() as i32;
-    registry.commands.retain(|c| c.group != group);
+    let until = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(named) = registry.commands.iter_mut().find(|c| c.group == group && c.until.is_none()) {
+        named.until = Some(until);
+    }
     if kill {
         child.terminate();
     } else {
         child.reap();
     }
+    forget_settled(&mut registry);
+}
+
+/// Forget unnamed commands every signal they received was handled for.
+#[cfg(unix)]
+fn forget_settled(registry: &mut Registry) {
+    let handled = HANDLED.load(std::sync::atomic::Ordering::SeqCst);
+    registry.commands.retain(|c| c.until.map_or(true, |until| until > handled));
 }
 
 /// The signals `run_with_deadline` and `output` pass on to their command.
@@ -1259,10 +1279,27 @@ mod tests {
         assert_eq!(codes, (0..8).map(Some).collect::<Vec<_>>());
         // Other tests may run commands meanwhile; once all are done nothing stays named.
         let until = Instant::now() + Duration::from_secs(20);
-        while !registry().commands.is_empty() {
+        while registry().commands.iter().any(|c| c.until.is_none()) {
             assert!(Instant::now() < until, "commands stayed named");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_signal_is_decided_by_the_commands_named_when_it_arrived() {
+        let named = |group, passing, since, until| Named { group, passing, since, until };
+        // exec's command (passing) and a captured command, both named from arrival 0.
+        let mut commands = vec![named(10, true, 0, None), named(20, false, 0, None)];
+        assert_eq!(decide(&commands, 1), (vec![10, 20], false), "reaches both, ends stack");
+        // The captured command is unnamed at arrival 1: a signal numbered 1 is still its,
+        // so it still ends stack, but its group is no longer signalled.
+        commands[1].until = Some(1);
+        assert_eq!(decide(&commands, 1), (vec![10], false));
+        // One that arrived after only reaches exec's command, and stack goes on.
+        assert_eq!(decide(&commands, 2), (vec![10], true));
+        // A command named after a signal arrived is not its; with no command it ends stack.
+        assert_eq!(decide(&[named(30, true, 5, None)], 5), (vec![], false));
+        assert_eq!(decide(&[], 1), (vec![], false));
     }
 
     #[test]
