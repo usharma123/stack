@@ -937,8 +937,9 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
 
 /// Start a command in a session of its own, with no input or output, and wait up to `wait` for
 /// it to exit. A command still running then is left to finish on its own, never signalled: for
-/// commands that may start a process outliving them which nothing here may stop. Returns its
-/// exit status, or `None` if it was left running.
+/// commands that may start a process outliving them which nothing here may stop. A cancellation
+/// (see [`cancel_scope`]) also ends the wait. Returns its exit status, or `None` if it was left
+/// running.
 #[cfg(unix)]
 pub fn run_detached(command: &mut Command, wait: Duration) -> io::Result<Option<std::process::ExitStatus>> {
     use std::os::unix::process::CommandExt;
@@ -957,7 +958,7 @@ pub fn run_detached(command: &mut Command, wait: Duration) -> io::Result<Option<
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
-        if start.elapsed() >= wait {
+        if start.elapsed() >= wait || cancelled() {
             // Reaped in the background so it never lingers as a zombie of a long-lived server.
             std::thread::spawn(move || child.wait());
             return Ok(None);

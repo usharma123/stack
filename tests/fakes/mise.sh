@@ -152,6 +152,10 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       touch "$REVIEW_FIXTURE/started"
     fi
     if test -f "$REVIEW_FIXTURE/fail-start"; then cat "$REVIEW_FIXTURE/fail-start" >&2; echo 'start failed' >&2; exit 1; fi
+    # A service whose readiness waits for another one's request (`wait-for` names it).
+    if test -f "$REVIEW_FIXTURE/wait-for" && test "$4" != "$(cat "$REVIEW_FIXTURE/wait-for")"; then
+      n=0; while ! grep -q -- "-- $(cat "$REVIEW_FIXTURE/wait-for")\$" "$REVIEW_FIXTURE/start-requests.log" && test $n -lt 600; do sleep 0.05; n=$((n + 1)); done
+    fi
     # A request that goes on after everything it started is running, as in the field.
     if test -f "$REVIEW_FIXTURE/hang-after-start"; then echo $$ >"$REVIEW_FIXTURE/hung-client"; exec sleep "$(cat "$REVIEW_FIXTURE/hang-after-start")"; fi ;;
   'run --skip-deps')

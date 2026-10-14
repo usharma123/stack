@@ -2,13 +2,26 @@
 //! process group, start time and environment. Each answer is `None` when the platform cannot
 //! say, which never means "no".
 
-/// One observation of a process. `started` tells a process from a later one reusing its PID.
+/// One observation of a process. `started` tells a process from a later one reusing its PID;
+/// its parent and group may change while it is the same process (an orphan is reparented).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
     pub pid: u32,
     pub parent: u32,
     pub group: u32,
     pub started: u64,
+}
+
+impl Process {
+    /// Still the process observed: same PID and start time.
+    pub fn same(&self, other: &Process) -> bool {
+        self.pid == other.pid && self.started == other.started
+    }
+
+    /// The process `self` observed, if it is still running.
+    pub fn current(&self) -> Option<Process> {
+        process(self.pid).filter(|now| now.same(self))
+    }
 }
 
 /// The process `pid` now. A zombie (exited, not yet reaped) is no process.
@@ -73,14 +86,20 @@ mod imp {
                 return None;
             }
         }
-        let buf = buf.get(..size)?;
+        parse_procargs(buf.get(..size)?)
+    }
+
+    /// Arguments may be empty strings, so exactly `argc` of them are consumed after the
+    /// executable path and its NUL padding; the environment follows, up to an empty entry.
+    pub(super) fn parse_procargs(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
         let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
-        let mut fields = buf[4..].split(|b| *b == 0).filter(|f| !f.is_empty());
-        // The executable path, then the arguments.
-        for _ in 0..=argc {
-            fields.next()?;
+        let rest = &buf[4..];
+        let path_end = rest.iter().position(|b| *b == 0)?;
+        let mut at = path_end + rest[path_end..].iter().position(|b| *b != 0)?;
+        for _ in 0..argc {
+            at += rest.get(at..)?.iter().position(|b| *b == 0)? + 1;
         }
-        Some(fields.map(<[u8]>::to_vec).collect())
+        Some(rest.get(at..)?.split(|b| *b == 0).take_while(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
     }
 }
 
@@ -136,6 +155,14 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_arguments_are_arguments_and_the_environment_follows_them() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/x\0\0\0\0x\0\0A=1\0B=2\0\0junk\0");
+        assert_eq!(imp::parse_procargs(&buf), Some(vec![b"A=1".to_vec(), b"B=2".to_vec()]));
     }
 
     #[test]

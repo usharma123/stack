@@ -3331,6 +3331,76 @@ fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_
     fixture.ok(&["down"]);
 }
 
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_confirms_only_once_a_lost_service_is_gone_even_when_it_outlives_its_port() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    // Its listener closes the port on SIGTERM, keeps running, and is reparented once its
+    // wrapper dies: still the same process, so it is killed before anything is confirmed.
+    let lost = lost_service_with(port, &token, true);
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(lost.listener), "confirmed while the listener lived");
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_stops_a_service_child_that_keeps_the_port_after_the_supervisor_stops_its_leader() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
+    supervise_listener(&fixture, port);
+    fixture.ok(&["up"]);
+    // The supervisor's process for the service is now a wrapper whose child holds the port;
+    // stopping the wrapper leaves the child listening.
+    let tracked = fixture.dir.path().join("pf-tracked-pid");
+    let old: i32 = fs::read_to_string(&tracked).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(old, libc::SIGKILL) };
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let lost = lost_service(port, &token);
+    fs::write(&tracked, lost.wrapper.to_string()).unwrap();
+    let started = Instant::now();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(started.elapsed() < Duration::from_secs(15), "waited {:?} before stopping it", started.elapsed());
+    assert!(!pid_alive(lost.wrapper) && !pid_alive(lost.listener), "{down}");
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_service_waiting_for_one_declared_after_it_does_not_hold_back_its_start() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    // web is ready only once api's start was requested.
+    fs::write(fixture.dir.path().join("wait-for"), "api").unwrap();
+    let out = fixture.command(&["up", "--timeout", "8s", "--json"]).output().unwrap();
+    let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
+    assert_eq!(requests, "daemons start -- web\ndaemons start -- api\n", "{}", String::from_utf8_lossy(&out.stdout));
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_supervisor_start_still_running_does_not_hold_back_verified_services() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    fs::write(fixture.dir.path().join("x-hang"), "600").unwrap();
+    let started = Instant::now();
+    let out = fixture.command(&["up", "--timeout", "1m", "--json"]).output().unwrap();
+    let hung: i32 = fs::read_to_string(fixture.dir.path().join("x-hang-pid")).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(hung, libc::SIGKILL) };
+    let up = json_result(&out);
+    assert_eq!(up["ok"], true, "{up}");
+    assert!(started.elapsed() < Duration::from_secs(20), "waited {:?}", started.elapsed());
+    fs::remove_file(fixture.dir.path().join("x-hang")).unwrap();
+    fixture.ok(&["down"]);
+}
+
 /// A service process the supervisor launched and then lost track of, as Pitchfork 2.29.0 did
 /// with a start it was still recording when it was told to stop: a wrapper leading its own
 /// session (as Pitchfork starts each service) with a child listening on `port`, both with
@@ -3348,20 +3418,25 @@ impl Drop for Lost {
 }
 
 fn lost_service(port: u16, token: &str) -> Lost {
+    lost_service_with(port, token, false)
+}
+
+/// [`lost_service`]; a `stubborn` listener closes its port on SIGTERM but keeps running.
+fn lost_service_with(port: u16, token: &str, stubborn: bool) -> Lost {
     let script = r#"
 import os, subprocess, sys
 if sys.argv[1] == "launch":
-    wrapper = subprocess.Popen([sys.executable, "-c", sys.argv[2], "wrap", sys.argv[2], sys.argv[3]], start_new_session=True, stdout=subprocess.PIPE, text=True)
+    wrapper = subprocess.Popen([sys.executable, "-c", sys.argv[2], "wrap", sys.argv[2], sys.argv[3], sys.argv[4]], start_new_session=True, stdout=subprocess.PIPE, text=True)
     print(wrapper.pid, wrapper.stdout.readline().strip(), flush=True)
     os._exit(0)
-listen = "import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); print('ready', flush=True); time.sleep(600)"
-child = subprocess.Popen([sys.executable, "-c", listen, sys.argv[3]], stdout=subprocess.PIPE, text=True)
+listen = "import signal,socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(); sys.argv[2] == '1' and signal.signal(signal.SIGTERM, lambda *_: s.close()); print('ready', flush=True); [time.sleep(1) for _ in range(600)]"
+child = subprocess.Popen([sys.executable, "-c", listen, sys.argv[3], sys.argv[4]], stdout=subprocess.PIPE, text=True)
 child.stdout.readline()
 print(child.pid, flush=True)
 child.wait()
 "#;
     let out = Command::new(python::python())
-        .args(["-c", script, "launch", script, &port.to_string()])
+        .args(["-c", script, "launch", script, &port.to_string(), if stubborn { "1" } else { "0" }])
         .env("STACK_CHECKOUT_TOKEN", token)
         .stderr(Stdio::inherit())
         .output()

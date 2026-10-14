@@ -670,40 +670,52 @@ const TAIL_BYTES: usize = 2048;
 pub fn tail(out: &Output) -> String {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let lines = readable_lines(&text);
-    let kept = summarize_services(&lines);
+    let mut kept = summarize_services(&lines);
+    // Over the limit, other services' lines go first, oldest first.
+    let mut excess = kept.len().saturating_sub(TAIL_LINES);
+    kept.retain(|(_, other)| {
+        let drop = excess > 0 && *other;
+        excess -= usize::from(drop);
+        !drop
+    });
+    let kept: Vec<String> = kept.into_iter().map(|(line, _)| line).collect();
     bounded_tail(&without_lock_advice(&kept[kept.len().saturating_sub(TAIL_LINES)..].join("\n")))
 }
 
 /// The supervisor streams every starting service's output as `• [<project>-<hash>/<name>] …`.
 /// A failed start shows the failing service's last lines, a start the deadline cut short only
 /// what each service printed last; everything else the supervisor said (its errors, `✗` lines)
-/// is kept. Service lines are shortened to `[<name>] …`.
-fn summarize_services(lines: &[String]) -> Vec<String> {
-    // (qualified id, name, message)
-    let service_line = |line: &str| -> Option<(String, String, String)> {
-        let rest = line.strip_prefix("\u{2022} [")?;
-        let (id, message) = rest.split_once("] ")?;
-        Some((id.to_string(), id.rsplit('/').next().unwrap_or(id).to_string(), message.to_string()))
-    };
-    // A service the supervisor itself names (`Daemon <id> failed`, `✗ [<id>] failed`) failed.
-    let ids: Vec<(String, String)> = lines.iter().filter_map(|l| service_line(l)).map(|(id, name, _)| (id, name)).collect();
-    let failed: Vec<&str> = ids
+/// is kept. Service lines are shortened to `[<name>] …`. Each kept line says whether it is a
+/// service's that did not fail.
+fn summarize_services(lines: &[String]) -> Vec<(String, bool)> {
+    // (qualified id, name, message), parsed once per line.
+    let parsed: Vec<Option<(&str, &str, &str)>> = lines
         .iter()
-        .filter(|(id, _)| lines.iter().any(|l| service_line(l).is_none() && l.contains(id.as_str())))
-        .map(|(_, name)| name.as_str())
+        .map(|line| {
+            let (id, message) = line.strip_prefix("\u{2022} [")?.split_once("] ")?;
+            Some((id, id.rsplit('/').next().unwrap_or(id), message))
+        })
         .collect();
-    let mut budget: IndexMap<String, usize> = IndexMap::new();
-    let mut kept: Vec<String> = Vec::new();
-    for line in lines.iter().rev() {
-        match service_line(line) {
-            Some((_, name, message)) => {
-                let left = budget.entry(name.clone()).or_insert(if failed.contains(&name.as_str()) { FAILED_SERVICE_LINES } else { OTHER_SERVICE_LINES });
+    // A service the supervisor itself names (`Daemon <id> failed`, `✗ [<id>] failed`) failed.
+    let ids: std::collections::HashSet<&str> = parsed.iter().flatten().map(|(id, _, _)| *id).collect();
+    let mut failed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (line, parsed) in lines.iter().zip(&parsed) {
+        if parsed.is_none() {
+            failed.extend(ids.iter().filter(|id| line.contains(**id)));
+        }
+    }
+    let mut budget: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut kept: Vec<(String, bool)> = Vec::new();
+    for (line, parsed) in lines.iter().zip(&parsed).rev() {
+        match parsed {
+            Some((id, name, message)) => {
+                let left = budget.entry(id).or_insert(if failed.contains(id) { FAILED_SERVICE_LINES } else { OTHER_SERVICE_LINES });
                 if *left > 0 {
                     *left -= 1;
-                    kept.push(format!("[{name}] {message}"));
+                    kept.push((format!("[{name}] {message}"), !failed.contains(id)));
                 }
             }
-            None => kept.push(line.clone()),
+            None => kept.push((line.clone(), false)),
         }
     }
     kept.reverse();
@@ -1138,21 +1150,15 @@ pub fn stop(root: &Path) -> Result<()> {
     checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
 }
 
-/// Start the named daemons of this project, one request at a time, in order.
-///
-/// Pitchfork 2.29.0 spawns the daemons of one request concurrently, and on macOS (where Rust's
-/// standard library cannot create a pipe close-on-exec atomically) one spawn can leave a copy
-/// of the pipe through which another learns it has exec'd in the process it forks. That spawn
-/// then waits, before recording its process, until the other daemon exits: the request never
-/// returns, and a stop meanwhile finds the service "not running" and leaves it. Field logs of
-/// 0.1.21 show exactly this, the recording delayed to the instant the other daemon stopped.
-/// One daemon per request spawns nothing else of this project's at once.
-pub fn start_daemons(root: &Path, names: &[String]) -> Result<()> {
-    detach_supervisor(root, "start_failed")?;
-    for name in names {
-        checked(root, &["daemons", "start", "--", name], "start_failed")?;
-    }
-    Ok(())
+/// Make sure the supervisor runs before start requests are made under a deadline (see
+/// [`detach_supervisor`]).
+pub fn prepare_start(root: &Path) -> Result<()> {
+    detach_supervisor(root, "start_failed")
+}
+
+/// Ask the supervisor to start one daemon of this project; returns once it is ready.
+pub fn start_daemon(root: &Path, name: &str) -> Result<()> {
+    checked(root, &["daemons", "start", "--", name], "start_failed").map(|_| ())
 }
 
 /// Stop only the named daemons of this project.
@@ -1175,7 +1181,7 @@ mod tests {
     fn a_deadline_already_past_starts_no_supervisor_and_makes_no_request() {
         let root = tempfile::tempdir().unwrap();
         let _expired = crate::process::deadline_scope(Some(std::time::Instant::now()));
-        let e = start_daemons(root.path(), &["db".into()]).unwrap_err();
+        let e = prepare_start(root.path()).unwrap_err();
         assert_eq!(e.code, "timed_out", "{e:?}");
         assert!(e.message.contains("before `mise x -- pitchfork supervisor start`"), "{e:?}");
     }
@@ -1250,6 +1256,15 @@ pitchfork ERROR Daemon app-9df2/api failed to start
         let tail = tail(&output(&text, ""));
         assert_eq!(tail.lines().count(), 4, "{tail}");
         assert!(tail.starts_with("[redis] 85472:M") && tail.contains("redis line 18") && tail.ends_with("[postgres] LOG:  checkpoint complete"), "{tail}");
+    }
+
+    #[test]
+    fn summarizing_a_long_start_takes_linear_time() {
+        let text: String = (0..200_000).map(|n| format!("\u{2022} [app-1/s{}] line {n}\n", n % 50)).collect();
+        let started = std::time::Instant::now();
+        let kept = tail(&output(&text, "pitchfork ERROR Daemon app-1/s7 failed to start\n"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(kept.ends_with("pitchfork ERROR Daemon app-1/s7 failed to start") && kept.contains("[s7] line 199957"), "{kept}");
     }
 
     #[test]

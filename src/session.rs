@@ -1013,7 +1013,7 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a service may listen, launched for this checkout, before the supervisor records it.
 const STALL_LIMIT: Duration = Duration::from_secs(15);
 
-/// Start `names` through the supervisor (see [`mise::start_daemons`]) while watching what it
+/// Start `names` through the supervisor (see [`request_starts`]) while watching what it
 /// does, rather than waiting on its request for as long as the deadline allows:
 ///
 /// - Once every service verifies and each one started passes the readiness check it declares
@@ -1034,8 +1034,8 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
         let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
         std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
-            let _cancel = crate::process::cancel_scope(cancel);
-            let _ = done.send(mise::start_daemons(&root, &names));
+            let _cancel = crate::process::cancel_scope(cancel.clone());
+            let _ = done.send(request_starts(&root, &names, &cancel));
         })
     };
     let end = |outcome: Result<()>| {
@@ -1092,6 +1092,73 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
             }
         }
     }
+}
+
+/// Ask the supervisor to start each of `names`, in order, each through a request of its own
+/// that returns once that service is ready, issuing the next request only once the supervisor
+/// has recorded the previous service's process (or its request ended).
+///
+/// Pitchfork 2.29.0 spawns a request's daemons concurrently, and on macOS Rust's standard
+/// library creates the pipe a spawn waits on with `pipe()` and only then marks it
+/// close-on-exec: a daemon forked in between keeps it open, so the other spawn neither returns
+/// nor records its process until that daemon exits. In the field (0.1.21) the recording came
+/// the second the other daemon was stopped. Spawning one service at a time avoids that, while
+/// readiness waits still overlap, so a service may wait for one declared after it.
+fn request_starts(root: &Path, names: &[String], cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    mise::prepare_start(root)?;
+    let (sent, answers) = mpsc::channel::<(String, Result<()>)>();
+    let mut pending = 0;
+    let wait = |pending: &mut usize, until: Option<&str>| -> Result<()> {
+        loop {
+            match answers.recv_timeout(Duration::from_millis(200)) {
+                Ok((name, outcome)) => {
+                    *pending -= 1;
+                    if let Err(e) = outcome {
+                        // The others are ended with it.
+                        cancel.store(true, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                    if until == Some(name.as_str()) || (until.is_none() && *pending == 0) {
+                        return Ok(());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            if until.is_none() {
+                continue;
+            }
+            if cancel.load(Ordering::SeqCst) || crate::process::expired() {
+                return Ok(());
+            }
+            let recorded = mise::daemons(root)
+                .is_ok_and(|statuses| statuses.iter().any(|d| Some(d.name.as_str()) == until && d.pid.is_some_and(pid_alive)));
+            if recorded {
+                return Ok(());
+            }
+        }
+    };
+    for name in names {
+        let (root, service, sent) = (root.to_path_buf(), name.clone(), sent.clone());
+        let (deadline, flag) = (crate::process::deadline(), cancel.clone());
+        std::thread::spawn(move || {
+            let _deadline = crate::process::deadline_scope(deadline);
+            let _cancel = crate::process::cancel_scope(flag);
+            let outcome = mise::start_daemon(&root, &service);
+            let _ = sent.send((service, outcome));
+        });
+        pending += 1;
+        wait(&mut pending, Some(name))?;
+    }
+    if pending > 0 {
+        wait(&mut pending, None)?;
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(StackError::new("start_failed", "the start was ended"));
+    }
+    Ok(())
 }
 
 /// Whether `name` passes the readiness check its definition declares, as the supervisor would
@@ -1671,8 +1738,30 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
         mise::stop(&ctx.root)?;
     }
 
+    // A port still open once every recorded process is gone is held by something else: when
+    // that is this checkout's own service process (see `Stray`), it is stopped here, before
+    // anything is confirmed.
+    let mut candidates: IndexMap<String, u16> = reserved.clone();
+    for port in &ports {
+        if !candidates.values().any(|p| p == port) {
+            candidates.insert(format!("port {port}"), *port);
+        }
+    }
+    let mut strays: Vec<Stray> = Vec::new();
+    let mut looked = false;
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     let leftovers = loop {
+        let pids_alive = pids.iter().any(|(_, pid)| pid_alive(*pid));
+        if !pids_alive && !looked {
+            looked = true;
+            strays = self::strays(&ctx.root, &candidates);
+            let survivors = stop_strays(&strays);
+            if !survivors.is_empty() {
+                return Err(StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
+                    .hint("retry `stack down`; stopping is safe to repeat")
+                    .details(survivors));
+            }
+        }
         let alive: Vec<Value> = pids
             .iter()
             .filter(|(_, pid)| pid_alive(*pid))
@@ -1693,15 +1782,6 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
         return Err(StackError::new("stop_unconfirmed", "services did not stop")
             .hint("retry `stack down`; stopping is safe to repeat")
             .details(leftovers));
-    }
-    // A process the supervisor launched for this checkout but lost track of is still this
-    // checkout's: it is stopped, not reported as foreign, and `down` never confirms while it lives.
-    let strays = strays(&ctx.root, &reserved);
-    let survivors = stop_strays(&strays);
-    if !survivors.is_empty() {
-        return Err(StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
-            .hint("retry `stack down`; stopping is safe to repeat")
-            .details(survivors));
     }
 
     remove_if_exists(&ctx.session_file())?;
@@ -1865,15 +1945,17 @@ impl Stray {
 
 /// This checkout's service listening on `port` though nothing recorded it, if that can be
 /// established. Anything else, including a listener whose environment cannot be read, is not.
+/// Each process is observed before and after its environment is read, so the token is never
+/// credited to a process that replaced it under the same PID.
 fn stray(service: &str, port: u16, token: &str) -> Option<Stray> {
     use crate::procinfo::{environ_has, process};
-    let holder = ports::holder(port)?;
-    let carries = |pid: u32| environ_has(pid, crate::checkout::TOKEN_VAR, token) == Some(true);
-    if !carries(holder.pid) {
-        return None;
-    }
-    let mut chain = vec![process(holder.pid)?];
-    while let Some(parent) = process(chain.last()?.parent).filter(|p| p.pid > 1 && carries(p.pid)) {
+    let owned = |pid: u32| {
+        let before = process(pid)?;
+        let carries = environ_has(pid, crate::checkout::TOKEN_VAR, token) == Some(true);
+        (carries && before.current().is_some()).then_some(before)
+    };
+    let mut chain = vec![owned(ports::holder(port)?.pid)?];
+    while let Some(parent) = Some(chain.last()?.parent).filter(|p| *p > 1).and_then(owned) {
         chain.push(parent);
     }
     let top = chain.last()?;
@@ -1887,24 +1969,24 @@ fn strays(root: &Path, ports: &IndexMap<String, u16>) -> Vec<Stray> {
     ports.iter().filter(|(_, port)| accepting(**port)).filter_map(|(service, port)| stray(service, *port, &token)).collect()
 }
 
-/// Stop strays: terminate each (its group when it leads one), and kill what is left once
+/// Stop strays: terminate each (its group when it still leads one), and kill what is left once
 /// `STOP_TIMEOUT` passes. Every signal is sent only while the process is still the one observed
-/// (same PID and start time), so a reused PID is never signalled. Returns those still alive or
-/// still listening.
+/// (same PID and start time), so a reused PID is never signalled; a process whose parent died
+/// is still the same process. Returns those still alive or still listening.
+#[cfg(unix)]
 fn stop_strays(strays: &[Stray]) -> Vec<Value> {
     let signal = |stray: &Stray, sig: libc::c_int| {
-        let current = |p: &crate::procinfo::Process| crate::procinfo::process(p.pid).as_ref() == Some(p);
         let top = stray.chain.last().expect("a stray has a listener");
-        if let Some(group) = stray.group.filter(|_| current(top)) {
+        if let Some(group) = stray.group.filter(|g| top.current().is_some_and(|now| now.group == *g)) {
             // SAFETY: kill only sends a signal; the group's leader was just confirmed unchanged.
             unsafe { libc::kill(-(group as libc::pid_t), sig) };
         }
-        for p in stray.chain.iter().filter(|p| current(p)) {
+        for p in stray.chain.iter().filter(|p| p.current().is_some()) {
             // SAFETY: as above, for one confirmed process.
             unsafe { libc::kill(p.pid as libc::pid_t, sig) };
         }
     };
-    let gone = |stray: &Stray| !accepting(stray.port) && stray.chain.iter().all(|p| crate::procinfo::process(p.pid).as_ref() != Some(p));
+    let gone = |stray: &Stray| !accepting(stray.port) && stray.chain.iter().all(|p| p.current().is_none());
     for stray in strays {
         signal(stray, libc::SIGTERM);
     }
@@ -1920,6 +2002,12 @@ fn stop_strays(strays: &[Stray]) -> Vec<Value> {
         sleep(Duration::from_millis(100));
     }
     strays.iter().filter(|s| !gone(s)).map(Stray::json).collect()
+}
+
+/// Without Unix signals nothing is stopped, so every stray is reported as surviving.
+#[cfg(not(unix))]
+fn stop_strays(strays: &[Stray]) -> Vec<Value> {
+    strays.iter().map(Stray::json).collect()
 }
 
 fn accepting(port: u16) -> bool {
