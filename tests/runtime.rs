@@ -3975,6 +3975,47 @@ fn interrupting_up_stops_its_start_request_so_nothing_launches_after_down() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn interrupting_up_stops_every_start_request_running_at_once() {
+    use std::os::unix::process::CommandExt;
+    // queue's request waits for readiness (NATS's check is the provider's, so it is never
+    // ended early) while web's waits for mise's project lock: two requests at once.
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.queue]\npreset='nats'\n[services.web]\nrun='true'\n");
+    let queue = assigned_port(&fixture, "queue");
+    supervise_listener(&fixture, queue);
+    let daemons = json!([{ "id": "app-test/queue", "name": "queue", "status": "running", "port": queue }]);
+    fs::write(fixture.dir.path().join("daemons-started.json"), daemons.to_string()).unwrap();
+    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
+    fs::write(fixture.dir.path().join("hang-service"), "queue").unwrap();
+    let mut up = fixture.command(&["up", "--json"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let clients = ["queue", "web"].map(|s| fixture.dir.path().join(format!("client-{s}")));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !clients.iter().all(|c| c.exists()) {
+        if Instant::now() >= deadline {
+            let _ = up.kill();
+            let _ = up.wait();
+            panic!("both requests never ran at once");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    unsafe { libc::kill(-(up.id() as i32), libc::SIGINT) };
+    assert!(!up.wait().unwrap().success());
+    let pids: Vec<u32> = clients.iter().map(|c| fs::read_to_string(c).unwrap().trim().parse().unwrap()).collect();
+    let gone = Instant::now() + Duration::from_secs(5);
+    while pids.iter().any(|p| pid_alive(*p)) && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(50));
+    }
+    for pid in &pids {
+        if pid_alive(*pid) {
+            unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+            panic!("start request {pid} outlived the interrupted up");
+        }
+    }
+    fixture.ok(&["down"]);
+}
+
+#[test]
 fn an_ignored_hangup_stays_ignored_after_captured_commands() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;

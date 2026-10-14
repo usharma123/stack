@@ -124,6 +124,7 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
   'daemons start')
+    echo $$ >"$REVIEW_FIXTURE/client-$4"
     # Like mise, a start holds the project's lock until it returns; the kernel releases it when
     # the holder dies, which a holder that is gone stands for here.
     lock=$REVIEW_FIXTURE/project-lock

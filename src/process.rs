@@ -673,11 +673,30 @@ extern "C" fn forward_signal(signal: libc::c_int) {
     }
 }
 
-/// For [`output`]: pass the signal on, then let it end stack as it would have without the
-/// handler. Stack installs no handlers of its own besides these, so that is the default action.
+/// Process groups of the commands [`output`] runs at once (several threads may each run one),
+/// one per slot, 0 when free, for [`forward_all_and_end`].
 #[cfg(unix)]
-extern "C" fn forward_and_end(signal: libc::c_int) {
-    forward_signal(signal);
+static GROUPS: [std::sync::atomic::AtomicI32; 64] = [const { std::sync::atomic::AtomicI32::new(0) }; 64];
+
+/// How many [`output`] commands forward signals now, and the dispositions their handler
+/// replaced, restored when the last one ends.
+#[cfg(unix)]
+static SHARED: std::sync::Mutex<(usize, Vec<(libc::c_int, libc::sigaction)>)> = std::sync::Mutex::new((0, Vec::new()));
+
+/// For [`output`]: pass the signal on to every command running, then let it end stack as it
+/// would have without the handler. Stack installs no handlers of its own besides these, so
+/// that is the default action.
+#[cfg(unix)]
+extern "C" fn forward_all_and_end(signal: libc::c_int) {
+    for slot in &GROUPS {
+        let group = slot.load(std::sync::atomic::Ordering::SeqCst);
+        if group > 0 {
+            // SAFETY: kill is async-signal-safe; the group is a running command's own.
+            unsafe {
+                libc::kill(-group, signal);
+            }
+        }
+    }
     // SAFETY: signal and raise are async-signal-safe. The raised signal is blocked while this
     // handler runs and is delivered, with the default action, once it returns.
     unsafe {
@@ -686,11 +705,42 @@ extern "C" fn forward_and_end(signal: libc::c_int) {
     }
 }
 
+/// Join the [`output`] commands forwarding signals; the first installs the handler. `false`
+/// while `run_with_deadline` forwards them to its own command instead.
+#[cfg(unix)]
+fn enter_forwarding() -> io::Result<bool> {
+    let mut shared = SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if shared.0 == 0 {
+        let Ok(_exclusive) = FORWARDING.try_lock() else { return Ok(false) };
+        shared.1 = install_forwarding(forward_all_and_end)?;
+    }
+    shared.0 += 1;
+    Ok(true)
+}
+
+/// Leave what [`enter_forwarding`] joined; the last restores the dispositions.
+#[cfg(unix)]
+fn leave_forwarding() {
+    let mut shared = SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared.0 -= 1;
+    if shared.0 == 0 {
+        restore_dispositions(&std::mem::take(&mut shared.1));
+    }
+}
+
+/// Name `group` to the handler; `None` when every slot is taken (the command then is not
+/// signalled first, as before forwarding existed).
+#[cfg(unix)]
+fn add_group(group: i32) -> Option<usize> {
+    GROUPS.iter().position(|slot| slot.compare_exchange(0, group, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok())
+}
+
 /// The signals `run_with_deadline` and `output` pass on to their command.
 #[cfg(unix)]
 const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-/// Held while signals are forwarded to `FORWARD_TO`, which names one group at a time.
+/// Held while `run_with_deadline` forwards signals to `FORWARD_TO`, which names one group at a
+/// time, and taken by [`enter_forwarding`] to install the handler of [`output`]'s commands.
 #[cfg(unix)]
 static FORWARDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -781,6 +831,10 @@ fn restore_dispositions(previous: &[(libc::c_int, libc::sigaction)]) {
 pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result<(Option<i32>, bool)> {
     use std::os::unix::process::CommandExt;
     let _forwarding = FORWARDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Commands of `output` forwarding signals keep their handler until the last one ends.
+    while SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 > 0 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let held = forwarded_set();
     let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
     let result = run_held(command, timeout, &held, caller_mask);
@@ -867,22 +921,21 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
 #[cfg(unix)]
 fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output> {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    // One group at a time can receive forwarded signals. Another thread's command, should one
-    // run at once, is still bounded and killed with its group; it just is not signalled first.
-    let forwarding = FORWARDING.try_lock().ok();
     let held = forwarded_set();
     let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
     // Signals stay blocked from before the spawn until forwarding names the new group, so none
     // can end stack while the command would be left running; the command starts unblocked.
-    let previous = match forwarding {
-        Some(_) => install_forwarding(forward_and_end),
-        None => Ok(Vec::new()),
-    };
-    let previous = match previous {
-        Ok(previous) => previous,
+    // Every command running at once is forwarded to (several threads may each run one).
+    let forwarding = match enter_forwarding() {
+        Ok(forwarding) => forwarding,
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
+        }
+    };
+    let leave = || {
+        if forwarding {
+            leave_forwarding();
         }
     };
     // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
@@ -893,21 +946,22 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
     let mut child = match spawned {
         Ok(child) => OwnedChild::new(child),
         Err(e) => {
-            restore_dispositions(&previous);
+            leave();
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
         }
     };
-    if forwarding.is_some() {
-        FORWARD_TO.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
-    }
+    let slot = forwarding.then(|| add_group(child.child.id() as i32)).flatten();
+    // Stop forwarding before the group can be reaped and its ID reused.
+    let unname = || {
+        if let Some(slot) = slot {
+            GROUPS[slot].store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
         collect(&mut child, timeout, OUTPUT_LIMIT, None, |child, timed_out| {
-            // Stop forwarding before the group can be reaped and its ID reused.
             let _ = set_mask(libc::SIG_BLOCK, &held);
-            if forwarding.is_some() {
-                FORWARD_TO.store(0, std::sync::atomic::Ordering::SeqCst);
-            }
+            unname();
             // A command that finished may have started something meant to outlive it, as a
             // supervisor client starts the supervisor; only a command cut short loses its group.
             if timed_out {
@@ -919,13 +973,10 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
     });
     // `collect` may have failed before its teardown ran; then nothing it started is kept.
     let _ = set_mask(libc::SIG_BLOCK, &held);
-    if forwarding.is_some() {
-        FORWARD_TO.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
+    unname();
     child.terminate();
-    restore_dispositions(&previous);
+    leave();
     let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
-    drop(forwarding);
     let piped = piped?;
     Ok(Output {
         // A child whose status could not be read was killed at the latest by `terminate`.
