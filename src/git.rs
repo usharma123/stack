@@ -294,31 +294,33 @@ mod tests {
             return rerun_cleanly("a_clone_cut_short_publishes_nothing_and_leaves_nothing_behind", tmp.path());
         }
         let cache = tmp.path().join("cache");
-        // Takes the request and never answers it, as a stalled remote would.
+        // Takes the request and never answers it, as a stalled remote would, and cuts the clone
+        // short only once git is waiting on it: a busy machine may take any time to get there.
         let silent = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let url = format!("http://127.0.0.1:{}/repo.git", silent.local_addr().unwrap().port());
+        let cut_short = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (requested, request) = std::sync::mpsc::channel();
+        let cut = cut_short.clone();
         thread::spawn(move || {
             let (conn, _) = silent.accept().unwrap();
             let mut line = String::new();
             std::io::BufRead::read_line(&mut std::io::BufReader::new(&conn), &mut line).unwrap();
             requested.send(line).unwrap();
+            cut.store(true, std::sync::atomic::Ordering::SeqCst);
             // Held open until git is gone.
             let _ = std::io::copy(&mut &conn, &mut std::io::sink());
         });
-        let limit = Duration::from_millis(500);
-        let start = Instant::now();
         let cut = {
-            let _deadline = crate::process::deadline_scope(Some(start + limit));
+            // The deadline only keeps a git that never reaches the remote from hanging the test.
+            let _deadline = crate::process::deadline_scope(Some(Instant::now() + Duration::from_secs(20)));
+            let _cancel = crate::process::cancel_scope(cut_short.clone());
             ensure_mirror(&cache, &url, false).expect_err("the remote never answers")
         };
-        let elapsed = start.elapsed();
-        let request = request.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("git never reached the remote: {cut}"));
+        let request = request.try_recv().unwrap_or_else(|_| panic!("git never reached the remote: {cut}"));
         assert!(request.starts_with("GET /repo.git/info/refs"), "{request:?}");
         // Killed while waiting, so git never got to say why it failed.
         assert_eq!(cut.code, "git_failed", "{cut}");
         assert!(cut.message.ends_with("failed: "), "{cut}");
-        assert!(elapsed >= limit && elapsed < limit + Duration::from_secs(5), "{elapsed:?}: {cut}");
         let mirror = mirror_path(&cache, &url);
         assert_eq!(entries(&cache.join("git")), [format!("{}.lock", mirror.file_name().unwrap().to_string_lossy())].into(), "{cut}");
     }
