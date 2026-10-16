@@ -15,8 +15,10 @@
 - **Conflicts are never silent.** If two layers set the same key differently, `compile` fails
   and lists every conflict. Only `[override.*]` resolves one, and the output says what it
   replaced.
-- **Each checkout gets its own ports.** Ports come from a machine-wide registry (40000-49999,
-  never a service's default) and stay the same across restarts. Bundles cannot pin ports.
+- **Each checkout gets its own ports.** Ports come from a machine-wide registry (20000-29999,
+  never a service's default) and stay the same across restarts. They stay clear of the ports
+  the system gives outgoing connections, which could otherwise keep a stopped service from
+  starting again; a port an earlier version assigned there is replaced. Bundles cannot pin ports.
 - **A command never reaches the wrong instance.** Before every `exec` and `run`, each service is
   checked live. Postgres and Redis are confirmed, over the app's own `DATABASE_URL` and
   `REDIS_URL`, to be this checkout's server. Other services can add an [identity
