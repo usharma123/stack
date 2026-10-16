@@ -35,7 +35,7 @@ echo 'Two independent checkouts start with distinct verified instances'
 for a in appA appB; do
   cd "$W/$a" || exit 1
   stack up --json > "$T/up-$a.json"
-  assert_json '.ok and (.data.checks | length == 2) and all(.data.checks[]; .ready and .identity == "instance" and .port >= 40000 and .port <= 49999)' "$T/up-$a.json"
+  assert_json '.ok and (.data.checks | length == 2) and all(.data.checks[]; .ready and .identity == "instance" and .port >= 20000 and .port <= 29999)' "$T/up-$a.json"
   stack exec --require-all -- bash -c 'set -euo pipefail; uv sync -q; uv run pytest -q'
   # The declared task, through mise's task runner, without mise starting the daemons again.
   stack run test >"$T/run-$a.out" 2>&1 || { cat "$T/run-$a.out"; fail "stack run test failed in $a"; }

@@ -80,10 +80,12 @@ output (mise's answer when no release matches) is an error, not a version.
 
 ## Runtime contract
 
-- **Ports.** Assigned per checkout from 40000-49999 via a locked machine-wide registry; reused
-  across restarts; pruned when a project directory disappears; `--reassign-ports` after a foreign
-  program takes one. Projects may pin ports in `[override.services]`; pins are checked against
-  other projects' reservations. Service defaults (5432, 6379) are never used. Before starting,
+- **Ports.** Assigned per checkout from 20000-29999 via a locked machine-wide registry; reused
+  across restarts; never inside the system's ephemeral range, where an outgoing connection can
+  hold a stopped service's port (a reservation made there earlier is replaced); pruned when a
+  project directory disappears; `--reassign-ports` after a foreign program takes one. Projects
+  may pin ports in `[override.services]`; pins are checked against other projects'
+  reservations. Service defaults (5432, 6379) are never used. Before starting,
   `up` checks every assigned port: one that accepts connections without a running or starting
   supervisor daemon of that service behind it is a `port_conflict`, naming the service, the port
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for

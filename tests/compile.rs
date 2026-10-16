@@ -258,7 +258,7 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
     // Postgres and Redis get a TCP fallback on their assigned ports. Stack still verifies
     // their instance identity after the supervisor reports them started.
     for (service, port) in &report.ports {
-        assert!((40000..=49999).contains(port), "{service} got {port}");
+        assert!((20000..=29999).contains(port), "{service} got {port}");
         assert!(rendered.contains(&format!("port = {port}")));
         assert!(rendered.contains(&format!("ready_port = {port}")), "{service}:\n{rendered}");
     }
