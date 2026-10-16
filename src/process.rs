@@ -1242,19 +1242,29 @@ mod tests {
     fn another_thread_can_end_output_with_its_group_and_nothing_starts_after() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let started = tmp.path().join("started");
         let flag = Arc::new(AtomicBool::new(false));
         let worker = {
             let flag = flag.clone();
+            let started = started.clone();
             std::thread::spawn(move || {
                 // No deadline: cancellation alone must still end the command's whole group.
                 let _cancel = cancel_scope(flag);
-                let out = output(Command::new("sh").args(["-c", "sleep 30 & echo $!; wait"])).unwrap();
+                let script = "sleep 30 & echo $!; touch \"$1\"; wait";
+                let out = output(Command::new("sh").args(["-c", script, "sh"]).arg(&started)).unwrap();
                 let child: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
                 (out.status.success(), child, output(&mut Command::new("true")).map(|_| ()).unwrap_err().kind())
             })
         };
+        // Cancelled only once the command is running, however long a busy machine takes to get
+        // there; the bound keeps a command that never starts from hanging the test.
+        let waiting = Instant::now();
+        while !started.exists() && !worker.is_finished() {
+            assert!(waiting.elapsed() < Duration::from_secs(20), "the command never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(300));
         flag.store(true, Ordering::SeqCst);
         let (succeeded, child, later) = worker.join().unwrap();
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
