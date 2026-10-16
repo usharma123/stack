@@ -266,6 +266,23 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
 }
 
 #[test]
+fn custom_services_get_their_loopback_address_as_their_url() {
+    let sb = Sandbox::new();
+    let root = sb.project(
+        "[services.api]\nrun = \"serve\"\n[services.web-ui]\nrun = \"serve\"\n[services.own]\nrun = \"serve\"\n\
+         [services.db]\npreset = \"postgres\"\n[env]\nOWN_URL = \"https://own.example\"\n",
+    );
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered: toml::Table = fs::read_to_string(mise::output_path(&root)).unwrap().parse().unwrap();
+    let env = rendered["env"].as_table().unwrap();
+    // Not mise's `https://<name>.<project>.localhost`, which needs Pitchfork's proxy.
+    assert_eq!(env["API_URL"].as_str(), Some(format!("http://127.0.0.1:{}", report.ports["api"]).as_str()));
+    assert_eq!(env["WEB_UI_URL"].as_str(), Some(format!("http://127.0.0.1:{}", report.ports["web-ui"]).as_str()));
+    assert_eq!(env["OWN_URL"].as_str(), Some("https://own.example"), "an explicit value is kept");
+    assert!(!env.contains_key("DB_URL"), "a preset's own variables name its endpoint: {env:?}");
+}
+
+#[test]
 fn uv_python_selection_is_left_to_the_project_when_it_sets_one() {
     let sb = Sandbox::new();
     let root = sb.project("[tools]\npython = \"3.13\"\n[env]\nUV_PYTHON_PREFERENCE = \"managed\"\n");

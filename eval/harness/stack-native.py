@@ -52,7 +52,8 @@ try:
         step(app + "-compile", app, ["stack", "compile", "--json"])
         up = json.loads(step(app + "-up", app, ["stack", "up", "--json"]))
         assert up["ok"] and all(c["ready"] and c["identity"] == "instance" for c in up["data"]["checks"])
-        sessions.append(up["data"]["session"])
+        # The session record, which every release writes; `up` reports only part of it.
+        sessions.append(json.loads((work / app / ".stack/session.json").read_text()))
         step(app + "-tests", app, ["stack", "exec", "--require-all", "--", "bash", "-c", "set -e; uv sync -q; uv run pytest -q; mise run seed; acme"])
         actual = step(app + "-identity", app, ["stack", "exec", "--require", "postgres", "--", "bash", "-c", 'psql "$DATABASE_URL" -Atc "show data_directory"']).strip()
         assert actual == sessions[-1]["services"]["postgres"]["data_dir"]

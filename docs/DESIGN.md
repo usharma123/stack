@@ -135,6 +135,30 @@ output (mise's answer when no release matches) is an error, not a version.
   seen that command's process exit, so a running command is never forgotten. GC ignores TTL
   expiry while an execution it saw running is recorded. An explicit runner-death policy still
   takes precedence over a surviving command.
+- **Data.** mise keeps a preset's data under a directory keyed by the project's path alone,
+  so a checkout recreated at a path would find its predecessor's databases. Before starting,
+  `up` writes the checkout token (see *Checkout token*) to `<data dir>.stack-checkout`. Data
+  marked for another checkout is moved, with its marker, to `<data dir>.replaced-<unix time>`
+  (never deleted) and named in `warnings`; the new checkout starts empty. Unmarked data, from
+  before markers or with an unreadable marker, is adopted. A running service's data is not
+  touched.
+- **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
+  and the next is made only once the supervisor has recorded the previous service's process.
+  mise holds its project lock until a request's service is ready, so a request whose service
+  stack can check itself (a service without a preset, Postgres, Redis, or one with a
+  `ready_cmd`) that still waits 5 seconds after its process was recorded is ended (its process
+  group only) and the next service is requested; that service must then verify and pass its
+  readiness check as stack runs it. A service may so wait for one declared after it. Pitchfork 2.29.0
+  spawns a request's daemons concurrently, and on macOS Rust's standard library creates the
+  pipe a spawn waits on with `pipe()` and only then marks it close-on-exec: a daemon forked in
+  between keeps it open, so the other spawn neither returns nor records its process until that
+  daemon exits. Field logs of 0.1.21 show the recording delayed to the second the other daemon
+  stopped. Meanwhile stack watches: once every service verifies and either its request
+  returned (the provider's readiness passed) or it passes its declared `ready_cmd`/`ready_port`
+  (Postgres and Redis through their protocol; other presets' checks are the provider's alone),
+  the requests still waiting are ended, their process groups only. A service listening with this checkout's token that the supervisor
+  still has not recorded 15 seconds later fails the start with `start_failed`, retry-safe,
+  instead of running out the deadline.
 - **Stopping.** `down` reconciles supervisor state with recorded PIDs and ports, including ports
   from an older generation. Query and stop failures preserve ownership records. Success requires
   those processes dead and ports closed. A reserved port is stack's to wait for only when a
@@ -144,6 +168,19 @@ output (mise's answer when no release matches) is an error, not a version.
   `pitchfork status --json` for its active port; if that cannot be established the recorded
   (else configured) port is waited for. A foreign listener on a reserved port is reported in
   `conflicts`, not stopped and not a failure.
+- **Checkout token.** Every service gets `STACK_CHECKOUT_TOKEN` in its own daemon environment
+  (never in `[env]`, so no task, `exec` command or `mise x` has it): a hash of the checkout's
+  path, device, inode and creation time, so stable for one directory and different for one
+  recreated at its path. A listener on a reserved port whose environment carries it was
+  launched by the supervisor for this checkout even when no record accounts for it, as when
+  Pitchfork 2.29.0 records a start only after it was told to stop (see *Starting*). `up` stops
+  it, its token-carrying ancestors and the token carriers of its process group; `down`, once
+  every recorded process is gone, stops every process still carrying the token, listening or
+  not, including ones started while it stops, and does not confirm while one lives. On macOS
+  the environment is read from `KERN_PROCARGS2` past exactly `argc` arguments; a token passed
+  as an argument is not one. Each process is observed before and after its
+  environment is read, and each signal is bound to the PID and start time observed. A listener
+  whose environment cannot be read (another user's, or a macOS platform binary's) is foreign.
 - **Installing.** `install` runs the compile, trust, socket-preflight and install steps of `up`
   and nothing after: no session, no stop, no start. It is locked like `up`.
 - **Logs.** `logs <service> --tail N` returns the supervisor's stored output for one daemon

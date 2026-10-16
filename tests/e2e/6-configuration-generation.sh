@@ -27,14 +27,15 @@ expect_error service_unavailable stack exec --require-all --json -- touch "$T/st
 # Stack must report that rejection, never adopt the old process as the new generation.
 if stack up --json >"$T/new-generation.json"; then fail 'version change bypassed the provider data migration gate'; fi
 assert_json '.ok == false and .error.code == "start_failed" and any(.error.details[]; .changed == true)' "$T/new-generation.json"
-old_pid=$(jq -r '.data.session.services.redis.pid' "$T/old-generation.json")
+old_pid=$(checked redis pid "$T/old-generation.json")
 if kill -0 "$old_pid" 2>/dev/null; then fail 'old Redis process survived the generation change'; fi
 expect_error service_unavailable stack exec --require-all --json -- true
 edit 's/version = "8"/version = "7"/' stack.toml
 stack compile >/dev/null
 stack up --json >"$T/recovered-generation.json"
 assert_json '.ok and all(.data.checks[]; .ready)' "$T/recovered-generation.json"
-jq -se '.[0].data.session.id != .[1].data.session.id and .[0].data.session.services.redis.pid != .[1].data.session.services.redis.pid' "$T/old-generation.json" "$T/recovered-generation.json" >/dev/null
+jq -se '.[0].data.session.id != .[1].data.session.id' "$T/old-generation.json" "$T/recovered-generation.json" >/dev/null
+[[ "$old_pid" != "$(checked redis pid "$T/recovered-generation.json")" ]] || fail 'Redis was not replaced'
 recovered=$(stack exec --require redis -- bash -c 'redis-cli -u "$REDIS_URL" get stack-generation')
 [[ "$recovered" == preserved ]] || fail 'version rejection reset the Redis data'
 stack status --json >"$T/current.json"

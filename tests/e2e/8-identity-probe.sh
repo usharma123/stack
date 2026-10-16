@@ -14,7 +14,7 @@ stack compile >/dev/null
 stack up --json >"$T/up-appF.json"
 assert_json '.ok and .data.checks[0].ready and .data.checks[0].identity == "instance"' "$T/up-appF.json"
 stack exec --require web -- python3 -c 'import os,urllib.request; urllib.request.urlopen("http://127.0.0.1:%s/identity" % os.environ["WEB_PORT"]).read()'
-f_port=$(jq -r '.data.session.services.web.port' "$T/up-appF.json")
+f_port=$(checked web port "$T/up-appF.json")
 
 echo "A healthy server of another checkout cannot satisfy this checkout's probe"
 cd "$W/appG" || exit 1

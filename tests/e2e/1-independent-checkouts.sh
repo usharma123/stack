@@ -45,11 +45,12 @@ for a in appA appB; do
   uvpy=$(stack exec -- uv run --no-project python -c 'import sys; print(sys.executable)')
   [[ "$(stack exec -- uv run --no-project python -V)" == "$(stack exec -- python -V)" ]] || fail "uv ran $uvpy, not the locked $py"
   actual=$(stack exec --require postgres -- bash -c 'psql "$DATABASE_URL" -Atc "show data_directory"')
-  expected=$(jq -r '.data.session.services.postgres.data_dir' "$T/up-$a.json")
+  expected=$(jq -r '.services.postgres.data_dir' "$W/$a/.stack/session.json")
   [[ "$actual" == "$expected" ]] || fail "wrong Postgres in $a"
   # The running servers are the locked releases, not whatever the request resolves to today.
   pg=$(stack exec --require postgres -- bash -c 'psql "$DATABASE_URL" -Atc "show server_version"')
   locked=$(jq -r '.data.versions[] | select(.name == "postgres") | .resolved' "$T/versions.json")
   [[ "$pg" == "$locked"* ]] || fail "Postgres $pg is not the locked $locked"
 done
-jq -se '.[0].data.session.services.postgres.port != .[1].data.session.services.postgres.port and .[0].data.session.services.redis.port != .[1].data.session.services.redis.port and .[0].data.session.services.postgres.data_dir != .[1].data.session.services.postgres.data_dir' "$T/up-appA.json" "$T/up-appB.json" >/dev/null
+for s in postgres redis; do [[ "$(checked $s port "$T/up-appA.json")" != "$(checked $s port "$T/up-appB.json")" ]] || fail "$s port shared"; done
+jq -se '.[0].services.postgres.data_dir != .[1].services.postgres.data_dir' "$W/appA/.stack/session.json" "$W/appB/.stack/session.json" >/dev/null

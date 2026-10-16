@@ -30,7 +30,7 @@ step compile_warm 'stack compile --json'
 step setup_warm 'stack up --json'
 assert_json '.ok and all(.data.checks[]; .ready and .identity == "instance")' /results/logs/stack.setup_warm.log
 step second_tests 'stack exec --require-all -- bash -c "set -e; uv sync -q; uv run pytest -q"'
-jq -se '.[0].data.session.services.postgres.port != .[1].data.session.services.postgres.port and .[0].data.session.services.redis.port != .[1].data.session.services.redis.port and .[0].data.session.services.postgres.data_dir != .[1].data.session.services.postgres.data_dir' /results/logs/stack.setup_cold.log /results/logs/stack.setup_warm.log >/dev/null
+jq -se '.[0].services.postgres.port != .[1].services.postgres.port and .[0].services.redis.port != .[1].services.redis.port and .[0].services.postgres.data_dir != .[1].services.postgres.data_dir' /srv/bench/app1/.stack/session.json /srv/bench/app2/.stack/session.json >/dev/null
 step independent_stop 'stack -C /srv/bench/app1 down --json && stack exec --require-all -- bash -c "uv run pytest -q"'
 step svc_stop 'stack down --json'
 assert_json '.ok and .data.confirmed' /results/logs/stack.svc_stop.log

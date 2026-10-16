@@ -66,8 +66,15 @@ load code you edited use `restart`.
   fails with `port_conflict`, naming the port and, where it can, the program. Run
   `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never
   reassigns ports on its own.
+- **Recreated checkouts** start with empty data. If a checkout at the same path was deleted
+  without `down`, its databases are moved to `<data dir>.replaced-<time>` (never deleted) and
+  a warning names them. The same checkout keeps its data across `down` and `up`.
+- **Result.** `--json` gives one check per service (port, readiness, identity) and the
+  session's id and lease. The full record, with PIDs and data directories, is
+  `.stack/session.json`.
 - **Failures** after the steps begin end with a progress record, `{steps, retry_safe,
-  changed}`, saying what was done and whether a retry is safe.
+  changed}`, saying what was done and whether a retry is safe. Service output in an error is
+  cut to each service's last lines; `stack logs <service>` has the rest.
 - `up` marks the generated mise config as trusted, so commands from the bundles you use run
   without mise's trust prompt. Review bundles like any dependency.
 
@@ -122,7 +129,8 @@ supervisor could not return them.
 
 Stops every service and returns once the processes are gone and their ports closed. Another
 program listening on one of this checkout's ports is reported under `conflicts` and left
-alone. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
+alone. A service process the supervisor started for this checkout but lost track of is
+stopped too, listed with `"unrecorded": true`. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
 by name.
 
 ## gc

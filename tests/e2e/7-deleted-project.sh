@@ -11,7 +11,8 @@ rm -f stack.lock
 edit "s|path:../bundles/pybase|git+file://$SRV/pybase?ref=v1|; s|path:../bundles/obs|git+file://$SRV/obs?ref=v1|" stack.toml
 stack compile >/dev/null
 stack up --json >"$T/up-appE.json"
-assert_json '.ok and (.data.session.provider.state_dir | length > 0) and all(.data.session.services[]; .provider_id | test("/"))' "$T/up-appE.json"
+assert_json '.ok' "$T/up-appE.json"
+assert_json '(.provider.state_dir | length > 0) and all(.services[]; .provider_id | test("/"))' .stack/session.json
 pids=$(recorded_pids "$T/up-appE.json")
 [[ -n "$pids" ]] || fail 'no service PIDs recorded'
 cd "$W" || exit 1
