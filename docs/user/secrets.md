@@ -22,6 +22,20 @@ services = ["postgres"]
 secrets = ["DEPLOY_KEY", "SENTRY_DSN"]
 ```
 
+The values come from fnox's own `fnox.toml`, beside `stack.toml` (or fnox's global
+configuration). For a first try, or a test, a plain provider holds fake values in the file
+itself; real projects use a provider that keeps them elsewhere (see fnox's documentation):
+
+```toml
+# fnox.toml: fake values for trying grants out; never put a real secret in a plain provider
+[providers.plain]
+type = "plain"
+
+[secrets]
+DEPLOY_KEY = { provider = "plain", value = "fake-deploy-key-0001" }
+SENTRY_DSN = { provider = "plain", value = "https://fake@example.invalid/1" }
+```
+
 ```sh
 stack run deploy                                   # granted DEPLOY_KEY and SENTRY_DSN
 stack exec --secret DEPLOY_KEY -- ./release.sh     # one command, repeat --secret for more
