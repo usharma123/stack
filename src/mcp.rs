@@ -18,7 +18,7 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
 /// What the server tells a client about using its tools, once, at initialization.
-const INSTRUCTIONS: &str = "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
+const INSTRUCTIONS: &str = "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
 
 fn startup_timeout_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
@@ -101,7 +101,7 @@ fn secret_name(s: &str) -> bool {
 }
 
 /// Arguments of one tool that cannot be given together, as on the command line.
-const CONFLICTS: &[(&str, &str, &str)] = &[("stack_compile", "update", "locked"), ("stack_exec", "require", "require_all")];
+const CONFLICTS: &[(&str, &str, &str)] = &[("stack_compile", "update", "locked"), ("stack_exec", "require", "require_all"), ("stack_restart", "services", "changed")];
 
 /// Check a call's arguments against the tool's advertised `inputSchema` before anything else
 /// happens: no project is opened, no provider asked, nothing written. Unknown names, wrong
@@ -255,8 +255,8 @@ fn tools() -> Value {
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up. A service already running with unchanged configuration is kept, not restarted: after editing code it loaded, use stack_restart.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded (files under a service's `watch` included: watching only reports changes, it never reloads), then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up.",
-          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "timeout_secs": startup_timeout_schema() }), &[]) },
+        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded (files under a service's `watch` included: watching only reports changes, it never reloads), then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up. changed: true restarts exactly the services whose watched files changed since they started (changed_since_start), and nothing when none did.",
+          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "changed": { "type": "boolean", "description": "Restart only the services whose watched files changed since they started" }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
           "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.", "inputSchema": schema(json!({}), &[]) },
@@ -400,7 +400,11 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 v => return Err(StackError::new("usage", format!("services must be an array of service names, not {v}"))),
             };
             let timeout = startup_timeout(args)?;
-            session::restart(ctx, &services, timeout).map(to_value)
+            if args["changed"] == true {
+                session::restart_changed(ctx, timeout).map(to_value)
+            } else {
+                session::restart(ctx, &services, timeout).map(to_value)
+            }
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),

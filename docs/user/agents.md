@@ -32,6 +32,7 @@ Any other MCP client: launch the command `stack` with the argument `mcp`. Every 
 stack up --ttl 30m --timeout 5m          # start and verify; safe to repeat
 stack run test                           # a task from stack.toml
 stack restart api                        # after editing code a running service loaded
+stack restart --changed                  # or: every service whose `watch` files changed
 stack exec --require-all -- <command>    # anything else
 stack down                               # before you finish or remove the checkout
 ```

@@ -1765,6 +1765,31 @@ fn a_session_copied_in_from_another_checkout_is_ignored_and_never_committed() {
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn restart_changed_restarts_exactly_the_services_whose_watched_files_changed() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
+    fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let before = up["data"]["checks"][0]["pid"].clone();
+    // Nothing changed: nothing restarts, and the stack is verified as it runs.
+    let none = json_result(&fixture.ok(&["restart", "--changed", "--json"]));
+    assert_eq!((none["data"]["restarted"].clone(), none["data"]["checks"][0]["pid"].clone()), (json!([]), before.clone()), "{none}");
+    thread::sleep(Duration::from_millis(1100));
+    fs::write(fixture.dir.path().join("app/main.py"), "v2").unwrap();
+    let changed = json_result(&fixture.ok(&["restart", "--changed", "--json"]));
+    assert_eq!(changed["data"]["restarted"], json!(["web"]), "{changed}");
+    assert_ne!(changed["data"]["checks"][0]["pid"], before, "{changed}");
+    assert!(changed["data"]["steps"].as_array().unwrap().iter().any(|s| s["step"] == "changed" && s["detail"] == json!(["web"])), "{changed}");
+    let mcp = fixture.mcp(&[("stack_restart", json!({ "changed": true })), ("stack_restart", json!({ "changed": true, "services": ["web"] }))], &[]);
+    assert_eq!(mcp[0]["structuredContent"]["data"]["restarted"], json!([]), "{}", mcp[0]);
+    assert_eq!(mcp[1]["structuredContent"]["error"]["code"], "usage", "{}", mcp[1]);
+    let out = fixture.command(&["restart", "--changed", "web", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();

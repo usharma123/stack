@@ -7,7 +7,7 @@
 | `stack install` | Install the locked tools and service binaries; start nothing |
 | `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) |
-| `stack restart [service...] [--timeout D]` | Restart services (all when none named) and verify again |
+| `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
@@ -109,7 +109,8 @@ services.
 
 A service can list `watch = ["app.py", "src"]`. When one of those files changes after the
 service started, `status`, `exec` and `run` report it with a `stack restart` hint. Nothing
-restarts automatically.
+restarts automatically: `stack restart --changed` restarts exactly the services whose watched
+files changed (none, when nothing did), so an agent need not pick the names out itself.
 
 ## exec
 

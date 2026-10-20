@@ -1525,10 +1525,18 @@ impl Serialize for RestartReport {
 /// running and the session is left incomplete (unverified) with what was launched recorded.
 pub fn restart(ctx: &Ctx, services: &[String], timeout: Duration) -> Result<RestartReport> {
     let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
-    restart_within(ctx, services).map_err(|e| startup_timed_out(e, "restart", timeout))
+    restart_within(ctx, services, false).map_err(|e| startup_timed_out(e, "restart", timeout))
 }
 
-fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
+/// [`restart`] of exactly the services whose `watch` paths changed after they started (what
+/// `status`, `exec` and `run` report as `changed_since_start`). With none changed nothing is
+/// restarted, and the result is the stack verified as it runs.
+pub fn restart_changed(ctx: &Ctx, timeout: Duration) -> Result<RestartReport> {
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
+    restart_within(ctx, &[], true).map_err(|e| startup_timed_out(e, "restart", timeout))
+}
+
+fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<RestartReport> {
     let mut steps = Steps::default();
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     let mut session = load(ctx)?.ok_or_else(|| {
@@ -1560,6 +1568,25 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
         if !names.contains(name) {
             names.push(name.clone());
         }
+    }
+    if changed_only {
+        names = report
+            .stack
+            .services
+            .iter()
+            .filter(|(_, e)| !e.value.watch.is_empty())
+            .filter_map(|(name, e)| {
+                let started = session.services.get(name)?.started_at_ms?;
+                (!changed_since(&ctx.root, &e.value.watch, started).0.is_empty()).then(|| name.clone())
+            })
+            .collect();
+        if names.is_empty() {
+            let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
+            let checks = verify_session(ctx, &report, &env, &statuses, Some(&session), &Timings::new("restart"));
+            steps.ok("changed", json!([]));
+            return Ok(RestartReport { session, restarted: Vec::new(), checks, steps: steps.0 });
+        }
+        steps.ok("changed", json!(names));
     }
     if names.is_empty() {
         names = report.stack.services.keys().cloned().collect();

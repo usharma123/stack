@@ -80,6 +80,9 @@ enum Cmd {
     Restart {
         /// Services to restart; the others keep running
         services: Vec<String>,
+        /// Restart only the services whose `watch` files changed since they started
+        #[arg(long, conflicts_with = "services")]
+        changed: bool,
         /// Give up after this long (e.g. 5m) and exit 124, like `up --timeout`. Default 10m
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
@@ -258,8 +261,8 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Restart { services, timeout } => startup_timeout(timeout.as_deref())
-            .and_then(|timeout| session::restart(&ctx, services, timeout))
+        Cmd::Restart { services, changed, timeout } => startup_timeout(timeout.as_deref())
+            .and_then(|timeout| if *changed { session::restart_changed(&ctx, timeout) } else { session::restart(&ctx, services, timeout) })
             .map(|r| {
                 emit(cli.json, &r, || {
                     for c in &r.checks {
