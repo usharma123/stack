@@ -58,7 +58,8 @@ A few things that are easy to get wrong:
 ## Reading results
 
 With `--json`, every command prints one object on stdout. MCP returns the same object as
-`structuredContent`. `ok` says whether Stack did what you asked, not whether your command
+`structuredContent`, and every tool's `outputSchema` describes it (`ok`, then `data` or
+`error` with `code`, `message`, `hint` and `details`). `ok` says whether Stack did what you asked, not whether your command
 passed:
 
 | Operation | Succeeded when |

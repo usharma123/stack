@@ -244,7 +244,40 @@ fn closest<'a>(given: &str, known: &[&'a str]) -> Option<&'a str> {
         .map(|(_, k)| k)
 }
 
+/// What every tool's `structuredContent` is: the `--json` envelope. `data` is the operation's
+/// result (see each command's documentation); `error` is set instead when `ok` is false.
+fn output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": { "type": "boolean", "description": "Whether Stack did what was asked (for stack_exec and stack_run, check data.exit_code too; for stack_status, data.healthy)" },
+            "data": { "description": "The operation's result, when ok is true" },
+            "error": {
+                "type": "object",
+                "description": "Why Stack could not do it, when ok is false",
+                "properties": {
+                    "code": { "type": "string", "description": "Stable error code, such as usage, service_unavailable or timed_out" },
+                    "message": { "type": "string" },
+                    "hint": { "type": "string", "description": "What to do next, where Stack knows" },
+                    "details": { "type": "array", "description": "Specifics: affected services, captured output, progress records" },
+                },
+                "required": ["code", "message"],
+            },
+        },
+        "required": ["ok"],
+    })
+}
+
+/// The tools, each with its `inputSchema` and the [`output_schema`] its results follow.
 fn tools() -> Value {
+    let mut tools = tool_definitions();
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        tool["outputSchema"] = output_schema();
+    }
+    tools
+}
+
+fn tool_definitions() -> Value {
     json!([
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything. `skills` lists the agent skills of the exact releases stack.lock pins (status available, no_skill, not_installed or unavailable); all_skills also lists the provider's own under provider_skills, for people.",
           "inputSchema": schema(json!({ "all_skills": { "type": "boolean" } }), &[]) },
@@ -637,6 +670,42 @@ mod tests {
             let e = startup_timeout(&json!({ "timeout_secs": bad })).unwrap_err();
             assert_eq!(e.code, "usage", "{bad}");
         }
+    }
+
+    /// Whether `value` fits `schema`, for the keywords the output schema uses.
+    fn fits(value: &Value, schema: &Value) -> bool {
+        let typed = match schema["type"].as_str() {
+            Some("object") => value.is_object(),
+            Some("boolean") => value.is_boolean(),
+            Some("string") => value.is_string(),
+            Some("array") => value.is_array(),
+            Some(_) => false,
+            None => true,
+        };
+        let required = schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).all(|k| value.get(k).is_some());
+        let properties = schema["properties"].as_object().into_iter().flatten().all(|(k, s)| value.get(k).map_or(true, |v| fits(v, s)));
+        typed && required && properties
+    }
+
+    #[test]
+    fn every_tool_advertises_the_envelope_its_results_follow() {
+        for tool in tools().as_array().unwrap() {
+            assert_eq!(tool["outputSchema"], output_schema(), "{}", tool["name"]);
+        }
+        // An error result and a success result both fit it.
+        let failed = call(&json!({ "name": "stack_nope", "arguments": {} }));
+        assert_eq!(failed["isError"], true);
+        assert!(fits(&failed["structuredContent"], &output_schema()), "{failed}");
+        let usage = call(&json!({ "name": "stack_exec", "arguments": { "command": "echo hi" } }));
+        assert!(fits(&usage["structuredContent"], &output_schema()) && usage["structuredContent"]["error"]["hint"].is_string(), "{usage}");
+        // Read-only: inspect writes nothing and asks no provider for an `[env]`-only project.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        let fine = call(&json!({ "name": "stack_inspect", "arguments": { "dir": dir.path() } }));
+        assert_eq!(fine["structuredContent"]["ok"], true, "{fine}");
+        assert!(fits(&fine["structuredContent"], &output_schema()), "{fine}");
+        assert!(!dir.path().join(".stack").exists() && !dir.path().join("stack.lock").exists());
+        assert!(!fits(&json!({ "data": 1 }), &output_schema()) && !fits(&json!({ "ok": false, "error": { "code": 1 } }), &output_schema()));
     }
 
     #[test]
