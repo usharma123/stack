@@ -44,8 +44,9 @@
 - **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
   `stack.lock` pins.
 - **Results are structured.** `--json` prints one object on stdout, even for argument errors,
-  and every error has a stable `code`, a `hint` and `details`. `stack mcp` returns the same
-  object. Git never prompts.
+  and every error has a stable `code` and a `message`, a `hint` where there is something to
+  do (every `usage` error has one), and `details` with the specifics where there are any.
+  Argument errors are `usage` and exit 2. `stack mcp` returns the same object. Git never prompts.
 
 ## mise configuration
 
