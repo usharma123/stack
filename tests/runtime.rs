@@ -776,7 +776,15 @@ fn a_finished_execution_is_settled_and_a_running_one_still_keeps_the_session_bus
     let session = record_execution(&fixture, &done, None);
     let record = complete(&fixture, &session, &done, unix_now());
     let out = fixture.command(&["--json", "up"]).output().unwrap();
-    assert_eq!(json_result(&out)["error"]["code"], "session_busy", "{}", String::from_utf8_lossy(&out.stdout));
+    let error = json_result(&out)["error"].clone();
+    assert_eq!(error["code"], "session_busy", "{}", String::from_utf8_lossy(&out.stdout));
+    // It says which stack process runs a command, and what to do.
+    assert!(error["hint"].as_str().unwrap().contains(&format!("pid {}", running.id())), "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("stack down"), "{error}");
+    assert_eq!(error["details"][0]["pid"], running.id(), "{error}");
+    assert!(error["details"][0]["command"].as_str().unwrap().contains("exec"), "{error}");
+    let restart = json_result(&fixture.command(&["--json", "restart"]).output().unwrap())["error"].clone();
+    assert_eq!((restart["code"].clone(), restart["details"][0]["pid"].clone()), (json!("session_busy"), json!(running.id())), "{restart}");
     assert_eq!(read_value(&session_file)["active_executions"], json!({ other.clone(): running.id() }), "only the finished one is forgotten");
     assert!(!record.exists());
     assert!(running.wait().unwrap().success());

@@ -731,15 +731,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         settle_executions(ctx, session).map_err(|e| steps.clone().fail("session", e, false))?;
     }
     let previous = previous;
-    if previous.as_ref().is_some_and(has_active_executions) {
-        return Err(steps.fail(
-            "session",
-            StackError::new(
-                "session_busy",
-                "commands are still executing in this session",
-            ),
-            false,
-        ));
+    if let Some(session) = previous.as_ref().filter(|s| has_active_executions(s)) {
+        return Err(steps.fail("session", busy(session, "up"), false));
     }
     // A mise too old for what the configuration asks would silently ignore it: checked before
     // the compile writes anything. The artifact policy is checked, and the provider's lock
@@ -1471,7 +1464,7 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
     })?;
     settle_executions(ctx, &mut session)?;
     if has_active_executions(&session) {
-        return Err(StackError::new("session_busy", "commands are still executing in this session"));
+        return Err(busy(&session, "restart"));
     }
     let report = ctx.compile(true)?;
     check_services_host(&report)?;
@@ -3694,6 +3687,34 @@ fn settle_executions(ctx: &Ctx, session: &mut Session) -> Result<()> {
 /// find it exited after writing a record that read missed.
 fn has_active_executions(session: &Session) -> bool {
     !session.active_executions.is_empty()
+}
+
+/// `session_busy` for `operation`, naming each Stack process that is running a command in the
+/// session (its PID and command line) and what to do.
+fn busy(session: &Session, operation: &str) -> StackError {
+    let running: Vec<Value> = session
+        .active_executions
+        .values()
+        .map(|pid| {
+            let command = Command::new("ps")
+                .args(["-o", "args=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|c| !c.is_empty());
+            json!({ "pid": pid, "command": command })
+        })
+        .collect();
+    let pids: Vec<String> = session.active_executions.values().map(u32::to_string).collect();
+    StackError::new(
+        "session_busy",
+        format!("{} command(s) are still executing in this session, so `{operation}` would stop services under them", running.len()),
+    )
+    .hint(format!(
+        "wait for the stack process(es) running them (pid {}) to finish, then retry `stack {operation}`; `stack down` stops the services anyway, and those commands lose them",
+        pids.join(", ")
+    ))
+    .details(running)
 }
 
 /// A note when this checkout's running session was started from a configuration other than

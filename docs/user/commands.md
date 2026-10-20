@@ -97,7 +97,10 @@ exit code is 1 when it did not.
 Stops the named services (all when none are named), waits until they are gone, starts them
 again and verifies the whole stack. Other services keep running. Fails with `no_session`
 before `up`, `session_stale` when the configuration changed since `up` (run `up`), and
-`session_busy` while commands are running in the session.
+`session_busy` while commands are running in the session. `session_busy` (from `up` too)
+lists each Stack process running a command (`details[].pid` and `command`). `down` is not
+refused while commands run: it is how you stop everything, and those commands lose their
+services.
 
 A service can list `watch = ["app.py", "src"]`. When one of those files changes after the
 service started, `status`, `exec` and `run` report it with a `stack restart` hint. Nothing
