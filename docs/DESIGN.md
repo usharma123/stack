@@ -156,7 +156,9 @@ output (mise's answer when no release matches) is an error, not a version.
   services it depends on verified and passed their declared readiness. `restart` adds every
   service that depends on one it restarts, and `up` stops a running dependent of a service it
   must start again before starting both, so no dependent keeps a connection to a dead
-  instance. Identity stays per service: a dependent is verified on its own.
+  instance. Identity stays per service: a dependent is verified on its own. A service's
+  `setup` runs just before it is requested (never for one left running), with the environment
+  `exec` would get, so migrations and seeding need not be chained into `run`.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
   and the next is made only once the supervisor has recorded the previous service's process.
   mise holds its project lock until a request's service is ready, so a request whose service

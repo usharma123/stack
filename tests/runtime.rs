@@ -3722,6 +3722,38 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_services_setup_runs_before_each_start_and_a_failing_one_stops_it() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nsetup='echo \"setup port=$PORT\" >> setup.log'\n");
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    let log = fixture.dir.path().join("app/setup.log");
+    fixture.ok(&["up"]);
+    assert_eq!(fs::read_to_string(&log).unwrap(), format!("setup port={port}\n"));
+    // A running service with unchanged configuration is not set up again.
+    fixture.ok(&["up"]);
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+    // A restart starts it again, after its setup.
+    fixture.ok(&["restart", "web"]);
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
+    fixture.ok(&["down"]);
+
+    // A failing setup: the service is not requested, and the error says what the setup said.
+    fs::write(fixture.dir.path().join("bundle/bundle.toml"), "[bundle]\nname='test'\n[services.web]\nrun='true'\nsetup='echo migrating; echo boom >&2; exit 4'\n").unwrap();
+    fixture.ok(&["compile"]);
+    let _ = fs::remove_file(fixture.dir.path().join("start-requests.log"));
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    let error = json_result(&out)["error"].clone();
+    assert_eq!(error["code"], "setup_failed", "{error}");
+    assert_eq!(error["message"], "web's setup exited 4, so web was not started", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("stack exec -- sh -c"), "{error}");
+    let detail = error["details"].as_array().unwrap().iter().find(|d| d.get("setup").is_some()).unwrap().clone();
+    assert_eq!((detail["exit_code"].clone(), detail["stdout"].clone(), detail["stderr"].clone()), (json!(4), json!("migrating"), json!("boom")), "{error}");
+    assert!(!fixture.dir.path().join("start-requests.log").exists(), "web was requested");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_service_is_requested_only_once_the_services_it_depends_on_are_ready() {
     // Declared first, but it waits for its dependency, which never becomes ready here.
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.api]\nrun='true'\ndepends_on=['db']\n[services.db]\nrun='true'\n");

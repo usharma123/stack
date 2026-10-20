@@ -1089,10 +1089,12 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
 fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
     let waves = dependency_waves(&report.stack.services, names);
     if waves.len() <= 1 {
+        run_setups(ctx, report, names)?;
         return start_watched(ctx, report, names);
     }
     let last = waves.len() - 1;
     for (i, wave) in waves.iter().enumerate() {
+        run_setups(ctx, report, wave)?;
         start_watched_scoped(ctx, report, wave, Some(wave))?;
         // A request may return once the provider launched the process; what depends on this
         // wave starts only once Stack verified it and its declared readiness passes.
@@ -1102,6 +1104,63 @@ fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
                 e.with_detail(json!({ "not_started": waiting }))
             })?;
         }
+    }
+    Ok(())
+}
+
+/// Most a service's `setup` may take, within the startup deadline.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bytes of each output stream a failed `setup` keeps.
+const SETUP_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Run the `setup` of each of `names` that is about to start (the supervisor does not report it
+/// running): through `sh -c` in the project, with the stack's tools and environment and the
+/// service's `$PORT`, as `stack exec` would, bounded by the startup deadline. The services
+/// it depends on were started and verified before it. A failing setup is `setup_failed`
+/// with its exit status and last lines, and the service is not started.
+fn run_setups(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
+    let wanted: Vec<(&String, &String)> = names
+        .iter()
+        .filter_map(|n| Some((n, report.stack.services.get(n)?.value.setup.as_ref()?)))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let statuses = mise::daemons(&ctx.root)?;
+    let running = |name: &String| statuses.iter().any(|d| d.name == *name && matches!(d.status.as_str(), "running" | "starting") && d.pid.is_some_and(pid_alive));
+    let wanted: Vec<_> = wanted.into_iter().filter(|(n, _)| !running(n)).collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let env = mise::env(&ctx.root)?;
+    for (name, setup) in wanted {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", setup]).current_dir(&ctx.root);
+        mise::configure_command(&mut sh, &ctx.root);
+        sh.envs(&env);
+        if let Some(port) = report.ports.get(name) {
+            sh.env("PORT", port.to_string());
+        }
+        let out = crate::process::capture_redacted(&mut sh, crate::process::bounded(SETUP_TIMEOUT), SETUP_OUTPUT_LIMIT, None)
+            .map_err(|e| StackError::new("setup_failed", format!("cannot run {name}'s setup: {e}")))?;
+        if out.exit_code == Some(0) && !out.timed_out {
+            continue;
+        }
+        if out.timed_out && crate::process::expired() {
+            return Err(StackError::new("timed_out", format!("{name}'s setup was cut short by the deadline")));
+        }
+        let tail = |text: &str| -> String {
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            truncate(&lines[lines.len().saturating_sub(12)..].join("\n"), 2000)
+        };
+        let how = match (out.timed_out, out.exit_code) {
+            (true, _) => format!("did not finish within {}s", SETUP_TIMEOUT.as_secs()),
+            (false, Some(code)) => format!("exited {code}"),
+            (false, None) => "was ended by a signal".to_string(),
+        };
+        return Err(StackError::new("setup_failed", format!("{name}'s setup {how}, so {name} was not started"))
+            .hint(format!("fix it and run `stack up` again; `stack exec -- sh -c {}` runs it by hand", shell_quote(setup)))
+            .with_detail(json!({ "service": name, "setup": setup, "exit_code": out.exit_code, "timed_out": out.timed_out, "stdout": tail(&out.stdout), "stderr": tail(&out.stderr) })));
     }
     Ok(())
 }
@@ -4762,6 +4821,7 @@ mod tests {
             identity: None,
             watch: Vec::new(),
             depends_on: Vec::new(),
+            setup: None,
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [

@@ -650,6 +650,7 @@ mod tests {
             identity: None,
             watch: vec![],
             depends_on: vec![],
+            setup: None,
         };
         stack.services.insert("db".into(), Entry { value: service(Some("postgres"), None), origin: "project".into() });
         stack.services.insert("cache".into(), Entry { value: service(Some("redis"), None), origin: "project".into() });
