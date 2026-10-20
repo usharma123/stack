@@ -1495,7 +1495,6 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
         ("stack_exec", json!({ "command": ran, "require": ["db"], "require_all": true }), "`require` and `require_all` cannot be given together", ""),
         ("stack_exec", json!({ "command": ran, "require_all": "yes" }), "`require_all` must be true or false", ""),
         ("stack_exec", json!({ "command": ran, "secrets": "DEPLOY_KEY" }), "`secrets` must be an array", ""),
-        ("stack_exec", json!({ "command": ran, "secrets": ["deploy_key"] }), "is not a secret name", ""),
         ("stack_run", json!({ "task": "t", "secrets": ["A"] }), "unknown argument `secrets`", "secrets the task declares"),
         ("stack_run", json!({ "task": "t", "args": "a b" }), "`args` must be an array", ""),
         ("stack_run", json!({ "task": "t", "args": ["a", false] }), "`args` item false", ""),
@@ -1521,6 +1520,17 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
         assert!(error["message"].as_str().unwrap().contains(message), "{tool} {args}: {error}");
         assert!(error["hint"].as_str().unwrap_or_default().contains(hint), "{tool} {args}: {error}");
     }
+    // A malformed secret name is `invalid_secret`, as `--secret` reports it on the CLI, still
+    // before anything runs.
+    let malformed = fixture.mcp(&[("stack_exec", json!({ "command": ran, "secrets": ["deploy_key"] }))], &[]);
+    let error = &malformed[0]["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_secret", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("upper-case variable names"), "{error}");
+    assert_eq!(error["details"][0]["key"], "deploy_key", "{error}");
+    let cli = json_result(&fixture.command(&["--json", "exec", "--secret", "deploy_key", "--", "true"]).output().unwrap());
+    assert_eq!((cli["error"]["code"].clone(), cli["error"]["hint"].clone()), (error["code"].clone(), error["hint"].clone()), "{cli}");
+    let _ = fs::remove_file(root.join("mise.log"));
+    let _ = fixture.mcp(&[("stack_exec", json!({ "command": ran, "secrets": ["deploy_key"] }))], &[]);
     assert!(!root.join("ran").exists(), "a command ran");
     assert!(!root.join("mise.log").exists(), "provider work ran: {}", fs::read_to_string(root.join("mise.log")).unwrap_or_default());
     assert!(!root.join("app/.stack/session.json").exists() && !root.join("state/sessions").exists());

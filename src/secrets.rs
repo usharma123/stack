@@ -99,6 +99,17 @@ pub enum Origin<'a> {
     Command,
 }
 
+/// `invalid_secret` for names that are not environment variable names, before anything about
+/// the stack is known, as [`validate`] reports them: what MCP checks against a tool's schema
+/// before any planning gives the same error as `--secret` on the CLI.
+pub fn malformed(keys: &[String]) -> Result<()> {
+    let bad: Vec<&String> = keys.iter().filter(|k| !valid_name(k)).collect();
+    let Some(first) = bad.first() else { return Ok(()) };
+    Err(StackError::new("invalid_secret", format!("{} secret name(s) of this command cannot be granted; first: {first}", bad.len()))
+        .hint("secret names are upper-case variable names that no service, [env] entry or stack/mise variable uses")
+        .details(bad.iter().map(|k| json!({ "key": k, "operation": "declare", "reason": "not an environment variable name ([A-Z_][A-Z0-9_]*)" })).collect()))
+}
+
 /// Check one grant's names against the stack: format, duplicates, protected variables, and
 /// fnox among the tools at an exact release. `invalid_secret` lists every problem.
 pub fn validate(keys: &[String], stack: &Composed, origin: Origin<'_>) -> Result<()> {

@@ -132,6 +132,12 @@ fn validate(name: &str, args: &Value) -> Result<serde_json::Map<String, Value>> 
             };
             return Err(usage(format!("unknown argument `{key}`")).hint(hint));
         };
+        // A malformed secret name is the same `invalid_secret` the CLI's `--secret` reports.
+        if key == "secrets" {
+            if let Some(names) = value.as_array().and_then(|items| items.iter().map(|v| v.as_str().map(String::from)).collect::<Option<Vec<_>>>()) {
+                crate::secrets::malformed(&names)?;
+            }
+        }
         if !value.is_null() {
             check_value(value, property).map_err(|why| {
                 let e = usage(format!("`{key}` {why}"));

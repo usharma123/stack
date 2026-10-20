@@ -112,7 +112,8 @@ missing required argument or a conflicting pair is a `usage` error, and the hint
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 
-`stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. `stack_run`
+`stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that
+is not an upper-case variable name is `invalid_secret`, as `--secret` reports it on the CLI. `stack_run`
 grants the task's declared `secrets`. Granted values show up as `[redacted:KEY]` in captured
 output. A grant controls what Stack injects. It does not limit what the command can read on
 its own. See [secrets](secrets.md).
