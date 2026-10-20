@@ -729,6 +729,23 @@ def review_problems(review, trial, plan, summary_path, directory, result):
     return problems + metric_problems(review, directory, evidence)
 
 
+def command_schema(value):
+    if not (isinstance(value, dict) and isinstance(value.get('argv'), list) and value['argv']
+            and all(isinstance(part, str) for part in value['argv'])
+            and isinstance(value.get('cwd'), str) and value['cwd']
+            and isinstance(value.get('receipt'), str) and value['receipt']
+            and number(value.get('started_unix_ns'), integer=True) and number(value.get('elapsed_ns'), integer=True)
+            and type(value.get('timed_out')) is bool and 'exit_code' in value
+            and (value['exit_code'] is None or type(value['exit_code']) is int)
+            and all(isinstance(value[key], str) for key in ['launch_error', 'cancelled'] if key in value)):
+        return False
+    stopped = value.get('stopped')
+    return ('stopped' not in value or (isinstance(stopped, dict)
+            and all(isinstance(stopped.get(key), list) and all(type(pid) is int and pid > 0 for pid in stopped[key])
+                    for key in ['terminated', 'killed', 'survivors'])
+            and isinstance(stopped.get('unresolved', []), list)))
+
+
 def residue_schema(value):
     """A complete observation, including explicit empty lists when nothing was seen."""
     return (isinstance(value, dict) and set(value) == {'pids', 'ports', 'owned_processes'}
@@ -786,19 +803,23 @@ def receipt(directory, name, hashes, problems, schema=None):
 
 
 def step_ok(record):
-    return isinstance(record, dict) and record.get('exit_code') == 0 and record.get('timed_out') is False
+    return (isinstance(record, dict) and type(record.get('exit_code')) is int and record['exit_code'] == 0
+            and record.get('timed_out') is False and 'cancelled' not in record and 'launch_error' not in record)
 
 
 def graded_verdict(task, directory, hashes, prefix, problems):
     """Both gates from the receipts: the smoke test through exec, and the hidden checks."""
-    smoke = receipt(directory, f'{prefix}-smoke_exec.json', hashes, problems)
-    verify = receipt(directory, f'{prefix}-verify.json', hashes, problems)
+    smoke = receipt(directory, f'{prefix}-smoke_exec.json', hashes, problems, command_schema)
+    verify = receipt(directory, f'{prefix}-verify.json', hashes, problems, command_schema)
     if f'{prefix}-verify.stdout' not in hashes:
         problems.append(f'{prefix}-verify.stdout missing')
         return False
     if verify is None or smoke is None:
         return False
-    return step_ok(smoke) and acceptance(task, verify, directory)[0]
+    if any(record.get('stopped', {}).get(key) for record in [smoke, verify] for key in ['survivors', 'unresolved']):
+        problems.append(f'{prefix} command cleanup left survivors or unresolved identities')
+        return False
+    return step_ok(smoke) and step_ok(verify) and acceptance(task, verify, directory)[0]
 
 
 def startup_metrics(graded, task, arm, binary, directory, hashes, prefix, window, problems):
@@ -829,7 +850,8 @@ def startup_metrics(graded, task, arm, binary, directory, hashes, prefix, window
                     break
                 started, duration = record.get('started_unix_ns'), record.get('elapsed_ns')
                 code = record.get('exit_code')
-                valid = (number(started, integer=True) and number(duration, integer=True)
+                valid = (command_schema(record) and not any(record.get('stopped', {}).get(key) for key in ['survivors', 'unresolved'])
+                         and number(started, integer=True) and number(duration, integer=True)
                          and type(record.get('timed_out')) is bool and (code is None or type(code) is int)
                          and record.get('receipt') == stem and number(window[0], integer=True)
                          and number(window[1], integer=True) and window[0] <= started
@@ -900,8 +922,10 @@ def derive(result, trial, plan, plan_path, directory):
             problems.append(f'{name} missing')
 
     # The agent: its receipt, the exact planned invocation, and timing.
-    agent = receipt(directory, 'agent.json', hashes, problems)
+    agent = receipt(directory, 'agent.json', hashes, problems, command_schema)
     if agent is not None:
+        if any(agent.get('stopped', {}).get(key) for key in ['survivors', 'unresolved']):
+            problems.append('agent command cleanup left survivors or unresolved identities')
         exit_code = agent.get('exit_code')
         if not (number(agent.get('elapsed_ns'), integer=True) and isinstance(agent.get('timed_out'), bool)
                 and (exit_code is None or (isinstance(exit_code, int) and not isinstance(exit_code, bool)))
@@ -987,7 +1011,8 @@ def derive(result, trial, plan, plan_path, directory):
             if 'grade-verify.json' in hashes:
                 problems.append('startup_failed but a verifier receipt exists')
             control = graded.get('startup_control')
-            if not (isinstance(control, dict) and step_ok(receipt(directory, 'grade-control-up.json', hashes, problems))
+            if not (isinstance(control, dict) and control.get('outcome') == 'graded' and control.get('passed') is True
+                    and step_ok(receipt(directory, 'grade-control-up.json', hashes, problems, command_schema))
                     and graded_verdict(trial['task'], directory, hashes, 'grade-control', problems)):
                 problems.append('the startup control did not pass, so the failure is not attributable to the submission')
             elif not (cleanup_schema(control.get('cleanup')) and clean(control.get('cleanup'))):

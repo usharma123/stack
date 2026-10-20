@@ -67,7 +67,8 @@ class TrialRecords:
 
     def step(self, name, exit_code, stdout=''):
         self.write(f'{name}.json', {'exit_code': exit_code, 'timed_out': False, 'elapsed_ns': 2 * 10**9,
-                                   'started_unix_ns': self.step_started, 'receipt': name})
+                                   'started_unix_ns': self.step_started, 'receipt': name,
+                                   'argv': ['synthetic-step', name], 'cwd': self.summary['workspace']})
         self.step_started += 2 * 10**9
         self.write_text(f'{name}.stdout', stdout)
 
@@ -263,6 +264,28 @@ class ReportTest(unittest.TestCase):
                     self.assertFalse(row['verified_task'])
                     self.assertFalse(row['autonomous'])
                     self.assertFalse(self.report()['publishable'])
+
+    def test_command_observations_reject_boolean_exits_and_missing_required_fields(self):
+        for name in ['agent.json', 'grade-smoke_exec.json', 'grade-verify.json', 'grade-setup.json']:
+            for change in [{'exit_code': False}, {'argv': None}, {'cwd': None}, {'elapsed_ns': None},
+                           {'started_unix_ns': None}, {'receipt': None}, {'timed_out': 'no'}]:
+                with self.subTest(name=name, change=change):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed()
+                    value = json.loads((records.out / name).read_text())
+                    records.replace_record(name, dict(value, **change))
+                    self.review(records)
+                    self.assertEqual(self.row()['status'], 'invalid')
+                    self.assertFalse(self.row()['verified_task'])
+
+    def test_unresolved_agent_command_cleanup_cannot_receive_completion_credit(self):
+        records = self.sealed()
+        agent = dict(records.agent, stopped={'terminated': [42], 'killed': [], 'survivors': [],
+                                           'unresolved': [{'pid': 42}]})
+        records.replace_record('agent.json', agent)
+        self.review(records)
+        self.assertEqual(self.row()['status'], 'invalid')
+        self.assertFalse(self.row()['verified_task'])
 
     def test_cleanup_requires_complete_typed_residue_and_consistent_ok(self):
         malformed = [{}, {'pids': [], 'ports': []}, dict(EMPTY, pids=''), dict(EMPTY, ports=[True]),
