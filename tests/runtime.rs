@@ -3385,6 +3385,26 @@ fn supervise_listener(fixture: &Fixture, port: u16) {
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_killed_service_is_reported_as_not_running_not_as_a_changed_process() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let pid: i32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(pid as u32) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    let reason = status["data"]["checks"][0]["reason"].as_str().unwrap_or_else(|| panic!("{status}")).to_string();
+    assert!(reason.contains("is not accepting connections"), "{reason}");
+    assert!(reason.contains("is gone") && reason.ends_with("run `stack up` to start it again"), "{reason}");
+    assert!(!reason.contains("changed since launch"), "{reason}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_start_request_still_waiting_once_every_service_verifies_is_ended_not_waited_for() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));

@@ -3767,12 +3767,18 @@ fn verify_session(
         let changed_process = session
             .and_then(|s| s.services.get(&check.service))
             .is_some_and(|r| r.pid != check.pid);
-        if let Some(reason) = reason
-            .or(changed_process.then_some("service process changed since launch; run `stack up`"))
-        {
+        // A service that failed its own check says why (its process is gone, its port closed);
+        // that the launched process is no longer there only adds to it. One that passed with a
+        // process other than the launched one is the changed process.
+        let process = match (&check.reason, changed_process) {
+            (Some(own), true) => Some(format!("{own}; the process `stack up` started is gone; run `stack up` to start it again")),
+            (None, true) => Some("service process changed since launch; run `stack up`".into()),
+            _ => None,
+        };
+        if let Some(reason) = reason.map(String::from).or(process) {
             check.ready = false;
             check.identity = None;
-            check.reason = Some(reason.into());
+            check.reason = Some(reason);
             check.withheld = binding_vars(
                 &check.service,
                 &report.stack.services[&check.service].value,
