@@ -91,6 +91,12 @@ compiling or installing comes out of the command's share. `up` and `restart` def
 minutes. When a deadline passes, Stack kills the command's process group and returns
 `timed_out` (CLI exit 124), with the output so far in `error.details`.
 
+A runner that cancels Stack with SIGTERM (or SIGINT, SIGHUP) cancels the command: Stack passes
+the signal on to the command's process group, waits up to 10 seconds, then kills the group; a
+second signal kills it at once. With `--json` the result is still printed (`exit_code: null`
+for a command the signal ended). `stack mcp` does the same for the command a call is running,
+answers that call, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
+
 If `up` times out, services may still be starting. Check `stack status`. Retrying `up` lets
 a slow service finish; a service that will never become ready needs `stack down` before you
 try again.

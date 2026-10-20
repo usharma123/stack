@@ -167,7 +167,7 @@ fn main() -> ExitCode {
     };
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
     }
@@ -543,7 +543,12 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     command.args(&plan.args).envs(&plan.env).current_dir(&ctx.root);
     let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
     let code = match timeout {
-        None => command.status().map_err(start_error)?.code(),
+        None => {
+            // Like a shell: a command ended by a signal reports 128 + its number.
+            use std::os::unix::process::ExitStatusExt;
+            let status = stack::process::run_attached(&mut command).map_err(start_error)?;
+            status.code().or_else(|| status.signal().map(|s| 128 + s))
+        }
         Some(timeout) => {
             // What planning left of the timeout.
             let (code, timed_out) = stack::process::run_with_deadline(&mut command, stack::process::bounded(timeout)).map_err(start_error)?;

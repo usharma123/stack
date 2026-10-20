@@ -214,6 +214,15 @@ output (mise's answer when no release matches) is an error, not a version.
 - **MCP execution.** Unix process groups bound command descendants. Output is drained through
   nonblocking pipes with fixed-size tails; neither a full pipe nor a detached descendant can
   extend collection beyond command completion or the deadline.
+- **Cancellation.** One signal handler, installed when the first command starts, passes
+  SIGINT, SIGTERM and SIGHUP on to the process group of every command running then. For a
+  user's command (`exec`, `run`, MCP calls) Stack then goes on waiting, kills the group 10 seconds
+  after the first signal or at the second, and reports the command once it is done; the MCP
+  server then answers the call and exits with 128 + the signal. A provider command gets the
+  signal and Stack ends at once, as before. Groups are named and unnamed under one lock with
+  the spawn and the reap, so a signal never reaches a group ID that may have been reused. A
+  command attached to a terminal stays in Stack's foreground group and is passed only SIGTERM,
+  as its own PID: the terminal's own interrupt and hangup already reach it.
 - **Projects without services** never query the supervisor: `down`, `status` and `exec` have
   nothing to reconcile, and `mise daemons` is not configured for them.
 - **Partial failure.** `up` returns completed steps, whether services may have been started

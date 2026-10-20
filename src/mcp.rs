@@ -64,6 +64,11 @@ pub fn serve() -> std::io::Result<()> {
             Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
         };
         send(&mut stdout, response)?;
+        // A signal that would have ended the server was passed on to the command a tool call
+        // ran instead; now that it was answered, the server ends as the signal asked.
+        if crate::process::passed_on().is_some() {
+            break;
+        }
     }
     Ok(())
 }

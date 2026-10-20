@@ -108,6 +108,14 @@ Runs a command with the stack's tools and environment, in the project directory.
   Stack exits 124 (`timed_out`).
 - With `--json`, at most 64 KiB of each output stream is captured into the result, and Stack
   exits with the command's exit code.
+- **Cancelling.** SIGINT, SIGTERM or SIGHUP sent to Stack is passed on to the command, and Stack
+  waits for it rather than exit and leave it running. A command still running 10 seconds later,
+  or when a second signal comes, is killed with its process group. Without a terminal (an agent
+  or CI runner) the command has its own process group, so each signal reaches everything it
+  started, and whatever is left of the group once it ends is killed. On a terminal the command
+  stays in the terminal's foreground group (so it can read the terminal and gets Ctrl-C
+  directly), and a SIGTERM sent to Stack alone is passed on to the command itself. `run` behaves
+  the same. A SIGKILL cannot be passed on.
 - `--secret KEY` (repeatable) grants a named fnox secret. See [secrets](secrets.md).
 
 ## run

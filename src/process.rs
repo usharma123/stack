@@ -438,6 +438,16 @@ impl OwnedChild {
         self.status = self.child.wait().ok();
     }
 
+    /// Kill only the child, which shares stack's own process group, then reap it.
+    fn terminate_leader(&mut self) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+        let _ = self.child.kill();
+        self.status = self.child.wait().ok();
+    }
+
     /// Reap a child that has exited, leaving whatever it started in its group running.
     fn reap(&mut self) {
         if self.terminated {
@@ -539,23 +549,69 @@ fn wait_readable(fds: &[std::os::fd::RawFd], wait: Duration) -> io::Result<()> {
 ///
 /// Waiting is driven by pipe readiness: a command that exits (closing its pipes) is noticed
 /// immediately rather than at the next fixed polling tick.
+///
+/// For stack's own provider commands. Interrupt, terminate and hangup signals stack receives
+/// meanwhile are passed on to the command's group and then end stack, as for [`output`].
 #[cfg(unix)]
 pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Captured> {
-    capture_redacted(command, timeout, limit, None)
+    capture_with(command, timeout, limit, None, false)
 }
 
-/// [`capture`], with every value of `redactor` replaced in both streams before they are
-/// bounded: `limit` applies to the redacted text, and a value split across reads or across
-/// the start of the retained tail is still replaced. `None` (or an empty redactor) captures
-/// exactly as [`capture`] does. A redactor with [conflicts](Redactor::conflicts) is refused
-/// before anything runs: its output could not be shown without a value.
+/// [`capture`] for a user's command (`exec --json`, `run --json`, MCP), with every value of
+/// `redactor` replaced in both streams before they are bounded: `limit` applies to the
+/// redacted text, and a value split across reads or across the start of the retained tail is
+/// still replaced. `None` (or an empty redactor) redacts nothing. A redactor with
+/// [conflicts](Redactor::conflicts) is refused before anything runs: its output could not be
+/// shown without a value.
+///
+/// Interrupt, terminate and hangup signals stack receives meanwhile are passed on to the
+/// command's group, and stack waits for it (see [`CANCEL_GRACE`]) instead of ending at once and
+/// leaving it running. Whatever is left in the group is killed once the command is done.
 #[cfg(unix)]
 pub fn capture_redacted(command: &mut Command, timeout: Duration, limit: usize, redactor: Option<&Redactor>) -> io::Result<Captured> {
     if redactor.is_some_and(|r| !r.conflicts.is_empty()) {
         return Err(io::Error::other("a granted value could be reproduced by its redaction marker, so output cannot be captured safely"));
     }
-    let mut child = OwnedChild::new(spawn_piped(command)?);
-    let piped = collect(&mut child, bounded(timeout), limit, redactor, |child, _| child.terminate())?;
+    capture_with(command, timeout, limit, redactor, true)
+}
+
+/// [`capture`] and [`capture_redacted`]: the command is named for forwarding (`passing` for a
+/// user's command, which a signal reaches without ending stack), and its group is killed when it
+/// is done, timed out, or stopped after a passed-on signal.
+#[cfg(unix)]
+fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor: Option<&Redactor>, passing: bool) -> io::Result<Captured> {
+    use std::os::unix::process::CommandExt;
+    forwarder()?;
+    let held = forwarded_set();
+    let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
+    // As in `output_within`: blocked in this thread from before the spawn to after the reaping,
+    // so no signal can end stack while the command it should reach is not yet named.
+    // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
+    }
+    let mut child = match spawn_named(command, passing, false, spawn_piped) {
+        Ok(child) => OwnedChild::new(child),
+        Err(e) => {
+            let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
+            return Err(e);
+        }
+    };
+    let passed = passing.then(|| Passed::new(child.child.id() as i32));
+    let mut retired = false;
+    let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
+        collect(&mut child, bounded(timeout), limit, redactor, passed, |child, _| {
+            let _ = set_mask(libc::SIG_BLOCK, &held);
+            retire(child, true);
+            retired = true;
+        })
+    });
+    let _ = set_mask(libc::SIG_BLOCK, &held);
+    if !retired {
+        retire(&mut child, true);
+    }
+    let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
+    let piped = piped?;
     Ok(Captured {
         exit_code: if piped.timed_out { None } else { child.status.and_then(|s| s.code()) },
         timed_out: piped.timed_out,
@@ -586,13 +642,16 @@ struct Piped {
 }
 
 /// Drain a child's pipes until it exits or `timeout` elapses, then `finish` it (told whether
-/// `timeout` passed) and keep what it wrote meanwhile.
+/// `timeout` passed) and keep what it wrote meanwhile. With `passed`, the child's group is
+/// one signals are passed on to: once [`Passed::expired`], the wait ends too, and the child is
+/// finished as a command cut short, though not reported as timed out.
 #[cfg(unix)]
 fn collect(
     child: &mut OwnedChild,
     timeout: Duration,
     limit: usize,
     redactor: Option<&Redactor>,
+    mut passed: Option<Passed>,
     finish: impl FnOnce(&mut OwnedChild, bool),
 ) -> io::Result<Piped> {
     use std::os::fd::AsRawFd;
@@ -614,6 +673,7 @@ fn collect(
     let (mut out_open, mut err_open) = (true, true);
     // After both pipes close the command is normally exiting; reap it with a short backoff.
     let mut reap_backoff = Duration::from_micros(250);
+    let mut stopped = false;
     let timed_out = loop {
         if out_open {
             out_open = drain(&mut stdout, &mut out)?;
@@ -626,6 +686,10 @@ fn collect(
         }
         if cancelled() {
             break true;
+        }
+        if passed.as_mut().is_some_and(Passed::expired) {
+            stopped = true;
+            break false;
         }
         let Some(remaining) = timeout
             .checked_sub(start.elapsed())
@@ -647,7 +711,7 @@ fn collect(
             wait_readable(&open, EXIT_CHECK_INTERVAL.min(remaining))?;
         }
     };
-    finish(child, timed_out);
+    finish(child, timed_out || stopped);
     // These reads never wait for EOF. A detached child cannot keep the server blocked.
     if out_open {
         drain(&mut stdout, &mut out)?;
@@ -674,18 +738,90 @@ struct Registry {
 /// number as its spawn began) and, once it was unnamed, by `until` (the number then). An
 /// unnamed command is never signalled, its group may be reused, but still decides what a
 /// signal that arrived for it does; it is forgotten once every such signal was handled.
+///
+/// A `leader` command shares stack's own process group, as a terminal's foreground job does:
+/// only its leader is signalled, and only with SIGTERM, which a terminal never sends (an
+/// interrupt or hangup from the terminal already reached it). `forwarded` counts the signals
+/// passed on to it.
 #[cfg(unix)]
 struct Named {
     group: i32,
     passing: bool,
     since: u64,
     until: Option<u64>,
+    leader: bool,
+    forwarded: u32,
 }
 
 #[cfg(unix)]
 impl Named {
-    fn received(&self, arrival: u64) -> bool {
-        self.since < arrival && self.until.map_or(true, |until| arrival <= until)
+    fn received(&self, arrival: u64, signal: libc::c_int) -> bool {
+        self.since < arrival && self.until.map_or(true, |until| arrival <= until) && (!self.leader || signal == libc::SIGTERM)
+    }
+}
+
+/// How long a user's command may take to exit after stack passed it an interrupt, terminate or
+/// hangup signal, before its whole process group is killed. A second such signal kills it at once.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// Signals passed on to `passing` commands so far, so a waiting command looks itself up in the
+/// registry only when one came.
+#[cfg(unix)]
+static PASSED_ON: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The first signal passed on to a `passing` command, 0 before one came.
+#[cfg(unix)]
+static TERMINATION: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The first interrupt, terminate or hangup signal stack passed on to a user's command instead
+/// of ending: once that command is done, stack should end too (exit 128 + the signal), as the
+/// signal asked. `None` while none came.
+#[cfg(unix)]
+pub fn passed_on() -> Option<i32> {
+    Some(TERMINATION.load(std::sync::atomic::Ordering::SeqCst)).filter(|s| *s != 0)
+}
+
+#[cfg(not(unix))]
+pub fn passed_on() -> Option<i32> {
+    None
+}
+
+/// Signals passed on to the command named with `group`, and whether to stop waiting for it.
+#[cfg(unix)]
+struct Passed {
+    group: i32,
+    seen: u64,
+    forwarded: u32,
+    first: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl Passed {
+    fn new(group: i32) -> Self {
+        Self { group, seen: PASSED_ON.load(std::sync::atomic::Ordering::SeqCst), forwarded: 0, first: None }
+    }
+
+    /// Whether a signal was passed on to the command and it must now be killed: a second one
+    /// came, or [`CANCEL_GRACE`] passed since the first.
+    fn expired(&mut self) -> bool {
+        let now = PASSED_ON.load(std::sync::atomic::Ordering::SeqCst);
+        if now != self.seen {
+            self.seen = now;
+            let registry = registry();
+            if let Some(named) = registry.commands.iter().find(|c| c.group == self.group && c.until.is_none()) {
+                self.forwarded = named.forwarded;
+            }
+            if self.forwarded > 0 && self.first.is_none() {
+                self.first = Some(Instant::now());
+            }
+        }
+        self.forwarded >= 2 || self.first.is_some_and(|first| first.elapsed() >= CANCEL_GRACE)
+    }
+
+    /// Whether any signal was passed on to the command.
+    fn signalled(&mut self) -> bool {
+        self.expired();
+        self.first.is_some()
     }
 }
 
@@ -798,11 +934,15 @@ fn forwarder() -> io::Result<()> {
                         let signal = libc::c_int::from(record[0]);
                         let arrival = u64::from_ne_bytes(record[8..].try_into().expect("eight bytes"));
                         let mut registry = registry();
-                        let (targets, goes_on) = decide(&registry.commands, arrival);
-                        for group in targets {
-                            // SAFETY: the group is a running command's own: it cannot be reaped
-                            // while this lock is held.
-                            unsafe { libc::kill(-group, signal) };
+                        let (targets, goes_on) = decide(&mut registry.commands, arrival, signal);
+                        for (group, leader) in &targets {
+                            // SAFETY: the group (or a leader's PID) is a running command's own:
+                            // it cannot be reaped while this lock is held.
+                            unsafe { libc::kill(if *leader { *group } else { -group }, signal) };
+                        }
+                        if goes_on && !targets.is_empty() {
+                            let _ = TERMINATION.compare_exchange(0, signal, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+                            PASSED_ON.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         if goes_on {
                             ahead.insert(arrival);
@@ -835,24 +975,34 @@ fn forwarder() -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
-/// What a signal numbered `arrival` does: the groups to pass it on to (its commands still
-/// named), and whether stack goes on, which it does only when the signal had commands and all
-/// of them were `run_with_deadline`'s.
+/// What `signal`, numbered `arrival`, does: the groups to pass it on to (its commands still
+/// named, each with whether it is a `leader` signalled alone), and whether stack goes on, which
+/// it does only when the signal had commands and all of them were `passing`. Each command it
+/// is passed on to counts it.
 #[cfg(unix)]
-fn decide(commands: &[Named], arrival: u64) -> (Vec<i32>, bool) {
-    let recipients: Vec<&Named> = commands.iter().filter(|c| c.received(arrival)).collect();
-    let targets = recipients.iter().filter(|c| c.until.is_none()).map(|c| c.group).collect();
-    (targets, !recipients.is_empty() && recipients.iter().all(|c| c.passing))
+fn decide(commands: &mut [Named], arrival: u64, signal: libc::c_int) -> (Vec<(i32, bool)>, bool) {
+    let mut targets = Vec::new();
+    let (mut any, mut all_passing) = (false, true);
+    for command in commands.iter_mut().filter(|c| c.received(arrival, signal)) {
+        any = true;
+        all_passing &= command.passing;
+        if command.until.is_none() {
+            command.forwarded += 1;
+            targets.push((command.group, command.leader));
+        }
+    }
+    (targets, any && all_passing)
 }
 
 /// Spawn `command` and name its process group (see [`Registry`]), under the registry's lock.
-/// A signal arriving from the moment the spawn begins is the command's too.
+/// A signal arriving from the moment the spawn begins is the command's too. A `leader` command
+/// stays in stack's own group; its PID names it.
 #[cfg(unix)]
-fn spawn_named(command: &mut Command, passing: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<Child> {
+fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<Child> {
     let mut registry = registry();
     let since = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
     let child = spawn(command)?;
-    registry.commands.push(Named { group: child.id() as i32, passing, since, until: None });
+    registry.commands.push(Named { group: child.id() as i32, passing, since, until: None, leader, forwarded: 0 });
     Ok(child)
 }
 
@@ -864,13 +1014,15 @@ fn retire(child: &mut OwnedChild, kill: bool) {
     let mut registry = registry();
     let group = child.child.id() as i32;
     let until = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+    let mut leader = false;
     if let Some(named) = registry.commands.iter_mut().find(|c| c.group == group && c.until.is_none()) {
         named.until = Some(until);
+        leader = named.leader;
     }
-    if kill {
-        child.terminate();
-    } else {
-        child.reap();
+    match (kill, leader) {
+        (true, false) => child.terminate(),
+        (true, true) => child.terminate_leader(),
+        (false, _) => child.reap(),
     }
     forget_settled(&mut registry);
 }
@@ -963,7 +1115,8 @@ fn restore_dispositions(previous: &[(libc::c_int, libc::sigaction)]) {
 /// Run a command on the caller's stdout and stderr until it exits or `timeout` elapses, then
 /// kill its whole process group. The command gets its own group so descendants are stopped
 /// too; it therefore cannot read the terminal (stdin is empty). Interrupt, terminate and
-/// hangup signals stack receives meanwhile are passed on to the group, unless ignored.
+/// hangup signals stack receives meanwhile are passed on to the group, unless ignored, and the
+/// group is killed once [`CANCEL_GRACE`] passes or a second one comes.
 ///
 /// Those signals stay blocked from before the spawn until forwarding targets the new group,
 /// and again during teardown, so none can end stack while the command would be left running;
@@ -991,7 +1144,8 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         unsafe {
             command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
         }
-        let mut child = OwnedChild::new(spawn_named(command, true, Command::spawn)?);
+        let mut child = OwnedChild::new(spawn_named(command, true, false, Command::spawn)?);
+        let mut passed = Passed::new(child.child.id() as i32);
         let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
             let start = Instant::now();
             loop {
@@ -1000,6 +1154,10 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
                 }
                 if start.elapsed() >= timeout {
                     break Ok(true);
+                }
+                // Stopped after a passed-on signal: killed below, not reported as timed out.
+                if passed.expired() {
+                    break Ok(false);
                 }
                 std::thread::sleep(EXIT_CHECK_INTERVAL);
             }
@@ -1014,6 +1172,63 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         });
         Ok((if timed_out { None } else { code }, timed_out))
     }
+}
+
+/// Run a command on stack's own stdin, stdout and stderr until it exits, with no deadline, and
+/// return how it ended. Interrupt, terminate and hangup signals stack receives meanwhile are
+/// passed on, and stack waits for the command instead of ending and leaving it running; once
+/// [`CANCEL_GRACE`] passes after the first, or a second comes, it is killed.
+///
+/// With no terminal on stdin, stdout or stderr (an agent or CI runner), the command gets its
+/// own process group: each signal reaches the whole group, and whatever is still in it is
+/// killed once the command is done after a signal was passed on. A command that ends on its own
+/// leaves what it started running, as a shell would. On a terminal the command stays in stack's
+/// group, the terminal's foreground job, so it can read the terminal and gets the terminal's own
+/// interrupts directly; a SIGTERM sent to stack alone is passed on to the command itself.
+#[cfg(unix)]
+pub fn run_attached(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    forwarder()?;
+    // SAFETY: isatty only inspects the descriptor.
+    let terminal = [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO].into_iter().any(|fd| unsafe { libc::isatty(fd) } == 1);
+    let held = forwarded_set();
+    let caller_mask = set_mask(libc::SIG_BLOCK, &held)?;
+    if !terminal {
+        command.process_group(0);
+    }
+    // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
+    }
+    let mut child = match spawn_named(command, true, terminal, Command::spawn) {
+        Ok(child) => OwnedChild::new(child),
+        Err(e) => {
+            let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
+            return Err(e);
+        }
+    };
+    let mut passed = Passed::new(child.child.id() as i32);
+    let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| loop {
+        if exited(&child.child)? {
+            break Ok(());
+        }
+        if passed.expired() {
+            break Ok(());
+        }
+        std::thread::sleep(EXIT_CHECK_INTERVAL);
+    });
+    let _ = set_mask(libc::SIG_BLOCK, &held);
+    let kill = waited.is_err() || passed.signalled();
+    retire(&mut child, kill);
+    let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
+    waited?;
+    // A child whose status could not be read was killed at the latest by `terminate`.
+    Ok(child.status.unwrap_or_else(|| std::process::ExitStatus::from_raw(libc::SIGKILL)))
+}
+
+#[cfg(not(unix))]
+pub fn run_attached(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    command.status()
 }
 
 /// Most bytes [`output`] keeps of each stream under a deadline; provider output is far smaller.
@@ -1060,7 +1275,7 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
     unsafe {
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
-    let mut child = match spawn_named(command, false, spawn_piped) {
+    let mut child = match spawn_named(command, false, false, spawn_piped) {
         Ok(child) => OwnedChild::new(child),
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
@@ -1069,7 +1284,7 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
     };
     let mut retired = false;
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
-        collect(&mut child, timeout, OUTPUT_LIMIT, None, |child, timed_out| {
+        collect(&mut child, timeout, OUTPUT_LIMIT, None, None, |child, timed_out| {
             let _ = set_mask(libc::SIG_BLOCK, &held);
             // A command that finished may have started something meant to outlive it, as a
             // supervisor client starts the supervisor; only a command cut short loses its group.
@@ -1297,19 +1512,28 @@ mod tests {
 
     #[test]
     fn a_signal_is_decided_by_the_commands_named_when_it_arrived() {
-        let named = |group, passing, since, until| Named { group, passing, since, until };
-        // exec's command (passing) and a captured command, both named from arrival 0.
+        let named = |group, passing, since, until| Named { group, passing, since, until, leader: false, forwarded: 0 };
+        let term = libc::SIGTERM;
+        // exec's command (passing) and a provider command, both named from arrival 0.
         let mut commands = vec![named(10, true, 0, None), named(20, false, 0, None)];
-        assert_eq!(decide(&commands, 1), (vec![10, 20], false), "reaches both, ends stack");
-        // The captured command is unnamed at arrival 1: a signal numbered 1 is still its,
+        assert_eq!(decide(&mut commands, 1, term), (vec![(10, false), (20, false)], false), "reaches both, ends stack");
+        // The provider command is unnamed at arrival 1: a signal numbered 1 is still its,
         // so it still ends stack, but its group is no longer signalled.
         commands[1].until = Some(1);
-        assert_eq!(decide(&commands, 1), (vec![10], false));
+        assert_eq!(decide(&mut commands, 1, term), (vec![(10, false)], false));
         // One that arrived after only reaches exec's command, and stack goes on.
-        assert_eq!(decide(&commands, 2), (vec![10], true));
+        assert_eq!(decide(&mut commands, 2, term), (vec![(10, false)], true));
+        // Each command counts what was passed on to it.
+        assert_eq!((commands[0].forwarded, commands[1].forwarded), (3, 1));
         // A command named after a signal arrived is not its; with no command it ends stack.
-        assert_eq!(decide(&[named(30, true, 5, None)], 5), (vec![], false));
-        assert_eq!(decide(&[], 1), (vec![], false));
+        assert_eq!(decide(&mut [named(30, true, 5, None)], 5, term), (vec![], false));
+        assert_eq!(decide(&mut [], 1, term), (vec![], false));
+        // A terminal's foreground command is passed SIGTERM alone, as its own PID; the
+        // terminal's interrupt already reached it, and still ends stack as it did.
+        let mut attached = vec![Named { leader: true, ..named(40, true, 0, None) }];
+        assert_eq!(decide(&mut attached, 1, term), (vec![(40, true)], true));
+        assert_eq!(decide(&mut attached, 2, libc::SIGINT), (vec![], false));
+        assert_eq!(decide(&mut attached, 3, libc::SIGHUP), (vec![], false));
     }
 
     #[test]

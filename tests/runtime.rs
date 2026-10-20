@@ -2003,6 +2003,111 @@ fn exec_with_a_timeout_passes_termination_on_to_the_command() {
     assert!(!pid_alive(child), "command {child} outlived stack");
 }
 
+/// A command that records its own PID and a background child's, then waits; `ignore` makes
+/// both ignore SIGTERM.
+fn tree_script(dir: &Path, ignore: bool) -> String {
+    let trap = if ignore { "trap '' TERM; " } else { "" };
+    format!("{trap}sleep 60 & echo \"$$ $!\" > {}; wait", dir.join("tree").display())
+}
+
+/// The command's and its child's PIDs, once the command wrote them.
+fn started_tree(dir: &Path) -> (u32, u32) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(text) = fs::read_to_string(dir.join("tree")) {
+            let pids: Vec<u32> = text.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            if let [command, child] = pids[..] {
+                return (command, child);
+            }
+        }
+        assert!(Instant::now() < deadline, "command never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether `pid` is gone within two seconds (an orphan is reaped by its new parent).
+fn gone_soon(pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pid_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    !pid_alive(pid)
+}
+
+/// SIGTERM, then a second one after `again` if given, to a stack process; how it ended.
+fn terminate(stack: &mut std::process::Child, again: Option<Duration>) -> (std::process::ExitStatus, Duration) {
+    let start = Instant::now();
+    unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
+    if let Some(again) = again {
+        thread::sleep(again);
+        unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
+    }
+    (stack.wait().unwrap(), start.elapsed())
+}
+
+#[test]
+fn sigterm_to_a_captured_or_attached_exec_stops_the_command_and_its_descendants_only() {
+    let fixture = Fixture::new();
+    let dir = fixture.dir.path();
+    let mut sentinel = Command::new("sleep").arg("60").spawn().unwrap();
+    for json in [true, false] {
+        let _ = fs::remove_file(dir.join("tree"));
+        let script = tree_script(dir, false);
+        let args: Vec<&str> = if json { vec!["--json", "exec", "--", "sh", "-c", &script] } else { vec!["exec", "--", "sh", "-c", &script] };
+        // No terminal on any stream, as for an agent or CI runner.
+        let mut stack = fixture.command(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let (command, child) = started_tree(dir);
+        let (status, _) = terminate(&mut stack, None);
+        assert!(gone_soon(command) && gone_soon(child), "json={json}: command {command} or its child {child} outlived stack");
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(stack.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+        if json {
+            // The result is still reported: the command ended by the signal it was passed.
+            let result: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
+            assert_eq!((result["ok"].clone(), result["data"]["exit_code"].clone()), (json!(true), Value::Null), "{result}");
+        } else {
+            assert_eq!(status.code(), Some(143), "{status:?}");
+        }
+    }
+    assert!(sentinel.try_wait().unwrap().is_none(), "an unrelated process was signalled");
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+}
+
+#[test]
+fn a_command_ignoring_sigterm_is_killed_with_its_group_at_a_second_signal() {
+    let fixture = Fixture::new();
+    let dir = fixture.dir.path();
+    let script = tree_script(dir, true);
+    let mut stack = fixture.command(&["--json", "exec", "--", "sh", "-c", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let (command, child) = started_tree(dir);
+    let (_, took) = terminate(&mut stack, Some(Duration::from_millis(300)));
+    assert!(took < Duration::from_secs(5), "{took:?}: a second signal must not wait out the grace period");
+    assert!(gone_soon(command) && gone_soon(child), "command {command} or child {child} survived");
+}
+
+#[test]
+fn sigterm_to_the_mcp_server_stops_a_running_command_answers_and_ends_the_server() {
+    let fixture = Fixture::new();
+    let dir = fixture.dir.path();
+    let script = tree_script(dir, false);
+    let mut server = fixture.command(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["sh","-c",script],"dir":dir.join("app")}}});
+    use std::io::Write;
+    // Input stays open: only the signal may end the server.
+    let mut input = server.stdin.take().unwrap();
+    writeln!(input, "{call}").unwrap();
+    let (command, child) = started_tree(dir);
+    let (status, _) = terminate(&mut server, None);
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    assert!(gone_soon(command) && gone_soon(child), "command {command} or child {child} outlived the server");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(server.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
+    assert_eq!(response["result"]["structuredContent"]["data"]["exit_code"], Value::Null, "{response}");
+    drop(input);
+}
+
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_refuses_a_session_started_from_another_configuration() {
