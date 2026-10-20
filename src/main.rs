@@ -339,8 +339,24 @@ fn main() -> ExitCode {
             fail(cli.json, e);
             ExitCode::from(124)
         }
+        // Like an argument error clap rejects: the same code, a hint, and exit 2.
+        Err(e) if e.code == "usage" => {
+            let help = format!("run `stack {} --help` for usage", subcommand());
+            fail(cli.json, mcp::with_usage_hint(e, &help));
+            ExitCode::from(2)
+        }
         Err(e) => fail(cli.json, e),
     }
+}
+
+/// The subcommand's name, as clap parsed the arguments it already accepted.
+fn subcommand() -> String {
+    use clap::CommandFactory;
+    Cli::command()
+        .try_get_matches_from(std::env::args_os())
+        .ok()
+        .and_then(|m| m.subcommand_name().map(String::from))
+        .unwrap_or_default()
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.

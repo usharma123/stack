@@ -279,10 +279,12 @@ fn tools() -> Value {
 
 fn call(params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
-    let outcome = validate(name, &params["arguments"]).and_then(|args| {
-        let args = Value::Object(args);
-        ctx(&args).and_then(|ctx| dispatch(name, &args, &ctx))
-    });
+    let outcome = validate(name, &params["arguments"])
+        .and_then(|args| {
+            let args = Value::Object(args);
+            ctx(&args).and_then(|ctx| dispatch(name, &args, &ctx))
+        })
+        .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
     let envelope = match outcome {
         Ok(data) => json!({ "ok": true, "data": data }),
         Err(e) => json!({ "ok": false, "error": e }),
@@ -563,11 +565,12 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
 
 /// `90`, `90s`, `30m`, `2h`, `1d`.
 pub fn parse_duration(s: &str) -> Result<u64> {
+    const HINT: &str = "give whole seconds, minutes, hours or days: 90, 90s, 30m, 2h or 1d";
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num
         .parse()
-        .map_err(|_| StackError::new("usage", format!("invalid duration '{s}'")))?;
+        .map_err(|_| StackError::new("usage", format!("invalid duration '{s}'")).hint(HINT))?;
     let mult = match unit {
         "" | "s" => 1,
         "m" => 60,
@@ -577,11 +580,20 @@ pub fn parse_duration(s: &str) -> Result<u64> {
             return Err(StackError::new(
                 "usage",
                 format!("invalid duration unit in '{s}'; use s, m, h or d"),
-            ))
+            )
+            .hint(HINT))
         }
     };
     n.checked_mul(mult)
-        .ok_or_else(|| StackError::new("usage", "duration is too large"))
+        .ok_or_else(|| StackError::new("usage", "duration is too large").hint(HINT))
+}
+
+/// Every `usage` error says where to look, even one raised without a hint of its own.
+pub fn with_usage_hint(e: StackError, help: &str) -> StackError {
+    if e.code == "usage" && e.hint.is_none() {
+        return e.hint(help.to_string());
+    }
+    e
 }
 
 #[cfg(test)]

@@ -83,6 +83,8 @@ def succeeded(operation, envelope):
   `data.checks` saying which service and why. The CLI exits 1.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
   `error.hint`. `error.details` carries the specifics.
+- A bad argument is `usage` with a hint, whether the parser or Stack itself rejected it (an
+  unknown flag, `--ttl banana`, `--timeout 1ms`), and the CLI exits 2 for it.
 - `exec` and `run` capture at most 64 KiB of each output stream.
 
 ## Timeouts
