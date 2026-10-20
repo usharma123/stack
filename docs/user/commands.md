@@ -61,7 +61,10 @@ load code you edited use `restart`.
   extend it). `--owner-pid N` ties it to a process that lives as long as your work.
 - **Timeout.** The default is 10 minutes, covering downloads, installs and readiness. On
   expiry you get `timed_out` (exit 124). Services may still be starting: check `status`, retry
-  `up`, or run `down` before fixing a service that will never become ready.
+  `up`, or run `down` before fixing a service that will never become ready. A service whose
+  `ready_cmd` does not pass is named in the hint with how it answers (`web's ready_cmd exits 7
+  (curl: (7) Failed to connect …)`), and `details` keep its exit status and last output lines
+  under `readiness`; the same goes for a failed `restart`.
 - **Port conflicts.** If another program is listening on one of this checkout's ports, `up`
   fails with `port_conflict`, naming the port and, where it can, the program. Run
   `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never

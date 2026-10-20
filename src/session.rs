@@ -884,11 +884,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
             }
-            return Err(steps.fail("start", start_error, true));
+            return Err(steps.fail("start", with_readiness(ctx, &report, &names, start_error), true));
         }
         steps.ok("start", json!(null));
 
-        checks = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, e, true))?;
+        checks = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
         steps.ok(
             "verify",
             json!(checks
@@ -1309,18 +1309,23 @@ fn request_each(
 /// run it (`sh -c` in the project, with the app's environment and `$PORT`). Postgres and
 /// Redis without one are checked by verification itself, through their protocol. `None` when
 /// stack cannot tell: another preset's check is the provider's own.
+/// `name`'s `ready_cmd` once, as the supervisor runs it: through `sh` in the project, with the
+/// stack's environment and `$PORT`, bounded at 5 seconds and 4 KiB of output.
+fn run_ready_cmd(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str, command: &str) -> Option<crate::process::Captured> {
+    let mut sh = Command::new("sh");
+    sh.args(["-c", command]).current_dir(&ctx.root);
+    mise::configure_command(&mut sh, &ctx.root);
+    sh.envs(env);
+    if let Some(port) = report.ports.get(name) {
+        sh.env("PORT", port.to_string());
+    }
+    crate::process::capture(&mut sh, crate::process::bounded(Duration::from_secs(5)), 4096).ok()
+}
+
 fn declared_ready(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str) -> Option<bool> {
     let service = &report.stack.services.get(name)?.value;
-    let port = report.ports.get(name).copied();
     if let Some(command) = &service.ready_cmd {
-        let mut sh = Command::new("sh");
-        sh.args(["-c", command]).current_dir(&ctx.root);
-        mise::configure_command(&mut sh, &ctx.root);
-        sh.envs(env);
-        if let Some(port) = port {
-            sh.env("PORT", port.to_string());
-        }
-        let out = crate::process::capture(&mut sh, crate::process::bounded(Duration::from_secs(5)), 4096).ok()?;
+        let out = run_ready_cmd(ctx, report, env, name, command)?;
         return Some(!out.timed_out && out.exit_code == Some(0));
     }
     match service.preset.as_deref() {
@@ -1369,16 +1374,83 @@ fn startup_timed_out(mut error: StackError, command: &str, timeout: Duration) ->
         .then(|| error.details.pop())
         .flatten();
     let changed = progress.as_ref().is_some_and(|p| p["changed"] == true);
+    let unready = unready_hint(&error);
     let mut details = vec![json!({ "cause": error })];
     details.extend(progress);
-    StackError::new("timed_out", format!("`stack {command}` did not finish within {}s", timeout.as_secs()))
-        .hint(if changed {
-            "what it launched stays recorded: `stack status` shows it, `stack up` again keeps waiting for \
+    let hint = match unready {
+        Some(unready) => format!(
+            "{unready}. Waiting longer helps only if the service is still starting: `stack logs <service>` shows it; \
+             fix the service or its ready_cmd, then `stack down` and `stack up`"
+        ),
+        None if changed => "what it launched stays recorded: `stack status` shows it, `stack up` again keeps waiting for \
              services still starting (give it a longer timeout if startup needs one), and `stack down` stops them"
-        } else {
-            "nothing was started; retry, with a longer timeout if this step needs it"
-        })
+            .into(),
+        None => "nothing was started; retry, with a longer timeout if this step needs it".into(),
+    };
+    StackError::new("timed_out", format!("`stack {command}` did not finish within {}s", timeout.as_secs()))
+        .hint(hint)
         .details(details)
+}
+
+/// `error` with what each started service's declared `ready_cmd` answers now, for the services
+/// that do not pass it: its exit status (or that it did not answer) and the last lines it
+/// printed. Each runs once, bounded, also when the deadline already passed. Nothing is added
+/// when every declared check passes or none is declared.
+fn with_readiness(ctx: &Ctx, report: &Report, names: &[String], error: StackError) -> StackError {
+    let _grace = crate::process::grace_scope(READINESS_GRACE);
+    let Ok(env) = mise::env(&ctx.root) else { return error };
+    let failing: Vec<Value> = names.iter().filter_map(|name| ready_failure(ctx, report, &env, name)).collect();
+    if failing.is_empty() {
+        return error;
+    }
+    error.with_detail(json!({ "readiness": failing }))
+}
+
+/// Time a failed or cut-short start may take to run each `ready_cmd` once more for its report.
+const READINESS_GRACE: Duration = Duration::from_secs(6);
+
+/// What `name`'s declared `ready_cmd` answers, when it does not succeed.
+fn ready_failure(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str) -> Option<Value> {
+    let command = report.stack.services.get(name)?.value.ready_cmd.clone()?;
+    let out = run_ready_cmd(ctx, report, env, name, &command)?;
+    if !out.timed_out && out.exit_code == Some(0) {
+        return None;
+    }
+    let tail = |text: &str| -> String {
+        let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+        truncate(&lines[lines.len().saturating_sub(3)..].join("\n"), 400)
+    };
+    Some(json!({
+        "service": name,
+        "ready_cmd": command,
+        "exit_code": out.exit_code,
+        "timed_out": out.timed_out,
+        "stdout": tail(&out.stdout),
+        "stderr": tail(&out.stderr),
+    }))
+}
+
+/// One line naming the services whose `ready_cmd` fails, from an error [`with_readiness`]
+/// annotated (the detail may sit in a nested cause).
+fn unready_hint(error: &StackError) -> Option<String> {
+    let failing = error.details.iter().find_map(|d| d.get("readiness")?.as_array().cloned())?;
+    let parts: Vec<String> = failing
+        .iter()
+        .map(|f| {
+            let service = f["service"].as_str().unwrap_or_default();
+            let how = match f["exit_code"].as_i64() {
+                _ if f["timed_out"] == true => "does not answer".to_string(),
+                Some(code) => format!("exits {code}"),
+                None => "ends by a signal".to_string(),
+            };
+            let said = f["stderr"].as_str().filter(|s| !s.is_empty()).or(f["stdout"].as_str().filter(|s| !s.is_empty()));
+            match said {
+                Some(said) => format!("{service}'s ready_cmd {how} ({})", said.lines().last().unwrap_or(said)),
+                None => format!("{service}'s ready_cmd {how}"),
+            }
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// Verify every service until all pass, or fail with `not_ready` after READY_TIMEOUT (or
@@ -1545,10 +1617,10 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
         if let Err(error) = observed {
             return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
         }
-        return Err(steps.fail("start", start_error, true));
+        return Err(steps.fail("start", with_readiness(ctx, &report, &names, start_error), true));
     }
     steps.ok("start", json!(names));
-    let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, e, true))?;
+    let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
     steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
 
     for check in &checks {
@@ -3757,7 +3829,7 @@ fn verify_session(
     let mut checks = verify_all(&ctx.root, report, env, statuses, timings);
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
-        Some(s) if s.launching => Some("`stack up` did not finish verifying this launch; run `stack up`"),
+        Some(s) if s.launching => Some("`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`"),
         Some(s) if s.config_digest != config_digest(ctx, report) => {
             Some("session configuration changed; run `stack up` to restart and verify it")
         }

@@ -3467,6 +3467,13 @@ fn a_declared_readiness_check_holds_the_start_until_it_passes() {
     let out = fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap();
     let result = json_result(&out);
     assert_eq!(result["error"]["code"], "timed_out", "a listening service is not ready before its check passes: {result}");
+    // The check that never passed is named, with how it answers, instead of only "keep waiting".
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.starts_with("web's ready_cmd exits 1") && hint.contains("stack logs") && hint.contains("stack down"), "{hint}");
+    let cause = &result["error"]["details"][0]["cause"]["details"];
+    let readiness = &cause.as_array().unwrap().iter().find_map(|d| d.get("readiness")).unwrap_or_else(|| panic!("{result}"))[0];
+    assert_eq!((readiness["service"].clone(), readiness["exit_code"].clone()), (json!("web"), json!(1)), "{result}");
+    assert_eq!(readiness["ready_cmd"], "test -f ready && test -n \"$PORT\"", "{result}");
     fs::write(fixture.dir.path().join("app/ready"), "").unwrap();
     let started = Instant::now();
     let up = json_result(&fixture.ok(&["up", "--timeout", "2m", "--json"]));
