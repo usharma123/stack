@@ -120,6 +120,11 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       cat "$REVIEW_FIXTURE/env.json"
     fi ;;
   'daemons --json')
+    # Like mise, without the generated configuration (which enables experimental features)
+    # there are no daemons to ask about.
+    if test -n "${MISE_OVERRIDE_CONFIG_FILENAMES-}" && ! test -f "$MISE_OVERRIDE_CONFIG_FILENAMES"; then
+      echo 'mise ERROR mise daemons is experimental. Enable it with `mise settings experimental=true`' >&2; exit 1
+    fi
     if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
       if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
       touch "$REVIEW_FIXTURE/query-observed"

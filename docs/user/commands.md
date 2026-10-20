@@ -143,7 +143,9 @@ supervisor could not return them.
 
 ## down
 
-Stops every service and returns once the processes are gone and their ports closed. Another
+Stops every service and returns once the processes are gone and their ports closed. It works
+in a checkout that never ran `up`, such as a fresh clone with only `stack.toml` and `stack.lock`:
+it writes the generated configuration from `stack.lock` first, then confirms nothing runs. Another
 program listening on one of this checkout's ports is reported under `conflicts` and left
 alone. A service process the supervisor started for this checkout but lost track of is
 stopped too, listed with `"unrecorded": true`. Run `down` before deleting a checkout: Stack will not stop a deleted project's services

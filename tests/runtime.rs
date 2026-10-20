@@ -2118,6 +2118,31 @@ fn sigterm_to_the_mcp_server_stops_a_running_command_answers_and_ends_the_server
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_before_any_up_in_a_checkout_without_its_generated_configuration_confirms_nothing_runs() {
+    let fixture = Fixture::with_bundle(WEB);
+    let app = fixture.dir.path().join("app");
+    // A fresh clone: stack.toml and stack.lock, its ports reserved, no generated configuration.
+    fs::remove_dir_all(app.join(".config")).unwrap();
+    let out = fixture.command(&["--json", "down"]).output().unwrap();
+    let result = json_result(&out);
+    assert!(out.status.success(), "{result}");
+    assert_eq!((result["ok"].clone(), result["data"]["confirmed"].clone()), (json!(true), json!(true)), "{result}");
+    assert!(app.join(".config/mise/conf.d/stack.toml").exists(), "down writes the configuration from stack.lock");
+
+    // A checkout that owns nothing (never compiled here) gets no configuration and no ports.
+    let other = fixture.dir.path().join("other");
+    fs::create_dir(&other).unwrap();
+    fs::copy(app.join("stack.toml"), other.join("stack.toml")).unwrap();
+    fs::copy(app.join("stack.lock"), other.join("stack.lock")).unwrap();
+    let out = fixture.command_at(&other, &["--json", "down"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!other.join(".config").exists());
+    let ports = fs::read_to_string(fixture.dir.path().join("state/ports.json")).unwrap();
+    assert!(!ports.contains(other.to_str().unwrap()), "{ports}");
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_refuses_a_session_started_from_another_configuration() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));

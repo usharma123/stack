@@ -1836,7 +1836,25 @@ pub struct PortConflict {
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
 pub fn down(ctx: &Ctx) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    restore_provider_config(ctx)?;
     down_locked(ctx, None)
+}
+
+/// Write the generated provider configuration from stack.lock when this checkout owns services
+/// (a port reservation or a launch record says so) but the file is missing, as in a fresh
+/// clone that never ran `up`: the supervisor cannot be asked about the project's services
+/// without it, and `run`, `install` and `up` write it the same way. A checkout that owns
+/// nothing is left alone, so `down` reserves no ports for it. When the configuration cannot be
+/// written (a stale stack.lock), `down` goes on and reports what the supervisor says.
+fn restore_provider_config(ctx: &Ctx) -> Result<()> {
+    if mise::output_path(&ctx.root).exists() {
+        return Ok(());
+    }
+    let owns = !ports::lookup(&ctx.state, &ctx.root)?.is_empty() || load(ctx)?.is_some_and(|s| !s.services.is_empty());
+    if owns {
+        let _ = ctx.compile(true);
+    }
+    Ok(())
 }
 
 fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownReport> {
