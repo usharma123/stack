@@ -99,8 +99,14 @@ and its inputs over stdin before the submission loads. The trial re-hashes the b
 after grading. Out of scope: editing the benchmark files undetected, reading the grader's
 memory, or tracing it.
 
-Grading uses a new runtime. It applies the submitted checkout, including deletions, except
-benchmark-owned files and runtime directories, then lets the harness run setup and startup.
+Grading uses a new runtime. Before agent teardown, the harness copies the submission once
+into read-only `submitted-tree/` under the trial evidence directory, outside the agent
+workspace. The patch and file hashes come from that copy, and grading overlays that exact
+tree, including deletions. Benchmark-owned, runtime and private-config paths are excluded
+from the overlay; symlink targets are never read or copied. The fresh runtime owns writable
+copies. The report checks the retained tree and binds the graded overlay manifest to the
+capture. The tree stays with the evidence after cleanup. Read-only permissions and separate
+paths are a same-host convention, not a sandbox.
 Grading ends with one of these outcomes:
 
 | Outcome | Meaning | Trial |
@@ -136,7 +142,7 @@ scripted product checks instead. The full coverage table is in
 
 - the prompt, and full agent stdout/stderr with timing, exit and exact argv receipts,
 - the agent's own transcript directory,
-- the submission (`submission.patch`, `submission.json`), diffed against a copy of the
+- the submission (`submitted-tree/`, `submission.patch`, `submission.json`), diffed against a copy of the
   starting commit kept outside the checkout, so commits, rewritten history, deletions and
   ignored files are all included,
 - what was left running at agent exit (`left-at-agent-exit.json`),
@@ -183,7 +189,11 @@ someone else's.
 An `exec` transition keeps the start identity. The harness follows the new command only
 while the command tree still attributes it. Otherwise it records an unresolved process,
 rather than reporting no survivors or signalling an uncertain identity. PID replacements
-are excluded. These checks retain the macOS clock-resolution and check-to-signal limits.
+are excluded. Every invoked command preserves this uncertainty, including observation-only
+task loops, down and supervisor stop. Any recorded survivor or unresolved identity invalidates
+the trial with no verified or autonomous credit. A later empty root scan cannot clear it.
+Stopped-command observations must include all four lists: terminated, killed, survivors and
+unresolved. These checks retain the macOS clock-resolution and check-to-signal limits.
 
 A trial whose arm teardown needed the harness to reclaim processes is valid but not
 autonomous. One where owned processes outlived every cleanup, or where a grading runtime
@@ -192,7 +202,10 @@ left any, is invalid.
 The latest cleanup must establish recovery. An earlier successful reclaim cannot excuse
 a later observation with survivors. A recorded final cleanup is required and compared with
 its summary independently. Residue observations require all three typed lists: PIDs, ports
-and owned processes. Missing lists or JSON `null` never mean clean.
+and owned processes. Missing lists or JSON `null` never mean clean. These rules apply to
+grading and startup controls too. Reclaim after an empty observation is an impossible sequence and is rejected.
+A grading or control runtime that required reclaim remains invalid even after recovery.
+A nonzero down with no leak remains a product observation, rather than a task failure.
 
 Global receipts hash the user's mise, Pitchfork and Stack config and state files, and list
 the user's mise installs. Another program on the host can change those too, so a difference
@@ -204,9 +217,13 @@ recorded per grading run. They describe lifecycle cost and are not scored.
 ## Reporting
 
 `run.py report` re-derives every verdict from the trial's hashed records and never from the
-summary's own booleans. A summary that contradicts its records, a missing, changed or unhashed
-evidence file, or an agent receipt that is malformed, shows a different argv from the plan or
-falls outside the trial window makes the trial invalid. It reports, per trial:
+summary's own booleans. Every command is bound to its expected role/stem and exact
+stdout/stderr files through the receipt's output digests, including the startup control.
+The verifier cannot select another command's output. A summary that contradicts its records,
+a missing, changed or unhashed evidence file, or an agent receipt that is malformed, shows a
+different argv from the plan or
+falls outside the trial window makes the trial invalid. All command roles require valid
+timestamps within the trial, including observation-only commands and cleanup. It reports, per trial:
 
 - status: `passed`, `failed`, `timed_out`, `invalid`, `unreviewed`, `review_invalid` or `not_run`,
 - grading outcome, verified task, autonomous, left running, whether the arm teardown was clean,

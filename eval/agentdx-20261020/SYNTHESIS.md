@@ -129,7 +129,8 @@ An independent review of `6175a0b` returned eleven findings, each with a reprodu
 counterexample. The following changes targeted those findings. Round 2 at `6fc65e4` closed
 eight and found residual cases in cleanup observations, command-tree cleanup and startup
 metrics, plus a cache-directory failure in the current checkout. The round-3 corrections
-below address those cases; independent review of the final head is still pending. The
+below targeted those cases. Round 3 at `b3bf9b0` found four further gaps, recorded below;
+review of the round-4 corrections is pending. The
 historical 78-test passes describe their recorded runs, not the later cache-bearing checkout.
 
 | # | Finding | Fix |
@@ -149,8 +150,9 @@ historical 78-test passes describe their recorded runs, not the later cache-bear
 ### Corrections after independent review round 2
 
 Round 2 at `6fc65e4` reproduced four remaining failures. The corrections below are
-implemented locally; fresh independent review is pending. The source under final validation
-is `f42b8acf0486c999642ff278e9f2ab7709e54dfa`. Later documentation does not change the
+historical round-3 implementation. Independent review at `b3bf9b0` confirmed B, C and D,
+and found A incomplete through the new findings below. That round tested code
+`f42b8acf0486c999642ff278e9f2ab7709e54dfa`. Its later documentation did not change the
 benchmark fingerprints recorded in `eval/results/agentdx-sol-round3-20261020/final/tested-code.json`.
 
 | Finding | Correction and commits | Verification |
@@ -185,6 +187,49 @@ retained, including the inherited dirty-source snapshots and failed counterexamp
 No new hosted benchmark, real-agent result, productivity estimate or product fix is claimed.
 The first real pilot still needs its concrete CLI/version, models/options, credential route
 and spend configuration. The source-built Stack binary remains the one identified above.
+
+### Corrections after independent review round 3
+
+Astra's read-only review of `b3bf9b0` requested four corrections. Local implementation is
+complete at code commit `fca4785`; a new independent Astra review is pending. The earlier
+claim that unresolved command cleanup always prevented credit was too broad: teardown,
+supervisor-stop and observation-only task-loop receipts had escaped that check.
+
+| Finding | Correction | Local verification |
+|---|---|---|
+| 1. Known unresolved children disappear behind a later empty root scan | `f673792`: preserve uncertainty in recorded cleanup/grades and audit every invoked command role. `fca4785`: stopped commands require explicit terminated, killed, survivors and unresolved lists; timeouts require a stop observation | Actual escaped-exec down still records a live unresolved child and now reports unclean. Its synthetic scored rows are invalid with no verified/autonomous credit. Timeout/cancellation/exec and unrelated sentinels pass, and probe-owned children are reclaimed |
+| 2. Teardown changes source after capture, and grading reads the changed bytes | `f7909d2`: retain a read-only `submitted-tree/` outside the agent workspace, derive the patch/hashes from it, and grade that tree. Bind the graded overlay manifest to the capture, preserve deletions/commits/ignored files and protected exclusions, and never read external symlink targets | Actual Git/teardown/overlay/grader probe and a full offline trial test retain the incorrect slug despite teardown writing the correct slug. Graded and captured hashes agree and the task fails. Host tools replace provisioning only; this is no real-agent result |
+| 3. Grading/control cleanup accepts an earlier empty observation before later survivors | `5883d6a`: enforce latest observations for every runtime and reject reclaim after an already empty observation. Grading/control reclaim remains invalid even after recovery | Both reviewer counterexamples and agent/final variants are invalid. Agent cleanup that legitimately requires successful harness reclaim remains valid but non-autonomous |
+| 4. A verifier receipt selects agent stdout | `5d222a8`: require the expected receipt role/stem and exact stdout/stderr digests for every command, including controls. Require the observed task-loop and cleanup command receipts | Redirected verifier output is rejected even when both files are independently hashed. Wrong/missing digests, removed receipts and out-of-window observation timing are invalid; valid failed-start controls remain scored failures |
+
+Evidence is retained under `eval/results/agentdx-sol-round4-20261020/`:
+
+- `final/tested-code.json`, `final/unittest-checkout.log` and `final/unittest-clean-export.log`
+  bind 115 passing tests in each checkout to committed `fca4785`. Existing hidden/reference
+  caches remain intact. Earlier 114-test runs at `f7909d2` and failing-before logs are retained.
+- `review-replays/` contains the bounded reviewer process, submission, record-binding, latest
+  cleanup, prior malformed-record, pidfd and slug-noise probes. `replay-provenance.json` records
+  original and adapted script hashes; output paths, corrected assertions and retained-tree
+  grading are the adaptations. All six malformed edge scenarios are invalid; the synthetic
+  valid-record control remains valid. This is record validation, not agent measurement.
+- Ten fresh scripted trials at `f7909d2` cover all six reference cells, two failed starts with
+  passing controls, and two committed solutions with bound options. Final code re-derives
+  their three reports identically. A further reference slug pair exercises final code. All
+  reports remain non-publishable harness self-tests with scripted transcript checks.
+- `report-rederivation.json` also re-derives the seven round-2 and six round-3 saved reports.
+  Their original files remain unchanged. The current stricter submission schema marks their
+  rows invalid because they lack a retained submitted tree; historical passes describe their
+  original harness version and cannot be promoted into current valid trials.
+- `resource-audit.json`, `globals-after-all.json`, `collected.json` and `preservation.json`
+  record scoped cleanup, unchanged global receipts, the unchanged binary, all 275 original
+  archive blobs/working files and both unchanged hands-on reports. Runtime roots, snapshots,
+  service data and caches are retained. Process checks establish none observed within the
+  existing platform limits.
+
+No cold service matrix was repeated: historical product findings and the C-locale ledger
+limitation are unchanged. No product source, worktree/snapshot feature, hosted benchmark,
+controlled real-agent trial or productivity claim was added. Real testing remains authorized;
+the concrete first-pilot configuration remains open.
 
 ### Benchmark validation
 

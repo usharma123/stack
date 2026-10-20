@@ -110,15 +110,19 @@ python3 bench/run.py plan --kind harness_selftest --models selftest --harness se
    harness touches anything.
 3. The submission is the agent's whole change against the kept starting commit: commits,
    edits, deletions and new files, including files the agent's `.gitignore` hides. It is
-   saved as `submission.patch` and `submission.json`, which also lists the agent's commits.
+   captured once into a retained read-only `submitted-tree/` outside the agent workspace.
+   `submission.patch` and `submission.json` describe those captured bytes and list the agent's
+   commits. Runtime and private-config paths are excluded; symlink targets are never read.
    Nothing is written to the agent's `.git`.
 4. The harness stops the agent's workspace with the arm's own `down`, and stops the root's
    Pitchfork supervisor in the Stack arm. It then looks for any process whose command line,
    working directory or an open file is under the runtime root. If any remain, the harness
    stops them, and the trial is not counted as autonomous.
-5. Grading uses a second fresh root: grader-only seed data, then the submitted checkout
-   applied over the starting project, including its deletions. Benchmark-owned files are never
-   taken from the submission: `stack.toml`, `stack.lock`, `mise.toml`, `dev.py`, seeds, smoke
+5. Grading uses a second fresh root: grader-only seed data, then the retained submitted tree
+   applied over the starting project, including its deletions. Cleanup writes to the live agent
+   workspace cannot change the files graded. The report compares the overlay manifest with
+   the captured file hashes and checks that the retained tree still matches. Benchmark-owned
+   files are never taken from the submission: `stack.toml`, `stack.lock`, `mise.toml`, `dev.py`, seeds, smoke
    tests and runtime directories. The harness runs `setup` and `up`, the project's existing smoke
    test through the arm's `exec`, and then `verify.py` through `exec`. The task passes only
    when two conditions both hold:
@@ -148,7 +152,15 @@ python3 bench/run.py plan --kind harness_selftest --models selftest --harness se
 Required observations must be complete objects with correctly typed fields. JSON `null`,
 an empty cleanup object or omitted residue lists do not establish a clean runtime. Final
 cleanup is compared independently with its summary, and the latest cleanup must show
-recovery even when an earlier reclaim succeeded.
+recovery even when an earlier reclaim succeeded. This applies to agent, final, grading and
+reference-control runtimes. Reclaim after an already empty observation is contradictory;
+grading or control cleanup requiring reclaim is invalid even if it succeeds.
+
+Every command receipt must match its expected role and exact stdout/stderr digests. This
+includes setup retries, the observed task loop, down and supervisor stop. Missing outputs or
+out-of-window command timing invalidate the row. Known survivors or unresolved identities
+from any command invalidate the trial, even if a later root scan is empty. A nonzero down
+with no leak remains a product observation.
 
 Startup seconds come from the setup and startup steps required by the arm and grading
 outcome. All setup attempts count. Missing or malformed timing stays missing and invalidates
