@@ -195,6 +195,22 @@ the trial with no verified or autonomous credit. A later empty root scan cannot 
 Stopped-command observations must include all four lists: terminated, killed, survivors and
 unresolved. These checks retain the macOS clock-resolution and check-to-signal limits.
 
+Grade, startup-control and teardown `command_cleanup` maps contain only uncertain stop
+observations from their own invoked commands. The report applies one consistency check to
+all of them: typed entries, matching command roles and exact agreement with the individual
+receipts. An absent map is treated as empty for older clean evidence. It cannot hide an
+uncertain receipt. A map that records uncertainty while the command receipt is clean is
+contradictory and invalidates the trial too.
+
+External cancellation is terminal for a trial. `invoke` records it and re-raises it, so any
+invoked receipt containing `cancelled` makes the row invalid even if the summary claims
+normal completion. This includes observation-only loops, cleanup, retries and reference
+controls. New receipts record `process_started`; an explicit false permits cancellation
+before launch without a stop observation. A started cancelled command requires all four
+stop lists. A clean stop never makes a cancelled trial scored or autonomous. Budget timeout
+remains separate: it requires a stop observation and follows the ordinary timeout and task
+scoring rules when cleanup is certain.
+
 A trial whose arm teardown needed the harness to reclaim processes is valid but not
 autonomous. One where owned processes outlived every cleanup, or where a grading runtime
 left any, is invalid.

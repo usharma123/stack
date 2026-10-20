@@ -162,6 +162,13 @@ out-of-window command timing invalidate the row. Known survivors or unresolved i
 from any command invalidate the trial, even if a later root scan is empty. A nonzero down
 with no leak remains a product observation.
 
+Grade, reference-control and cleanup uncertainty maps must agree with their own command
+receipts. Malformed maps, wrong command roles or contradictory stop observations invalidate
+the row. External cancellation in any invoked receipt also invalidates the trial, even when
+the summary omits it and the command stopped cleanly. A cancellation before launch needs no
+stop observation; a started cancelled command requires all four stop lists. Ordinary budget
+timeouts retain their separate scoring rules.
+
 Startup seconds come from the setup and startup steps required by the arm and grading
 outcome. All setup attempts count. Missing or malformed timing stays missing and invalidates
 the row; it is never converted to zero. Tools-only tasks have no `up` timing. Failed setup

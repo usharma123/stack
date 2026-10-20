@@ -130,7 +130,8 @@ counterexample. The following changes targeted those findings. Round 2 at `6fc65
 eight and found residual cases in cleanup observations, command-tree cleanup and startup
 metrics, plus a cache-directory failure in the current checkout. The round-3 corrections
 below targeted those cases. Round 3 at `b3bf9b0` found four further gaps, recorded below;
-review of the round-4 corrections is pending. The
+round 4 at `2ac082e` confirmed those four counterexamples corrected and found two narrower
+report-consistency gaps. The round-5 corrections below await a fresh independent review. The
 historical 78-test passes describe their recorded runs, not the later cache-bearing checkout.
 
 | # | Finding | Fix |
@@ -191,7 +192,8 @@ and spend configuration. The source-built Stack binary remains the one identifie
 ### Corrections after independent review round 3
 
 Astra's read-only review of `b3bf9b0` requested four corrections. Local implementation is
-complete at code commit `fca4785`; a new independent Astra review is pending. The earlier
+complete at code commit `fca4785`. Independent Astra review at `2ac082e` confirmed these
+four counterexamples corrected, with the two residual gaps described below. The earlier
 claim that unresolved command cleanup always prevented credit was too broad: teardown,
 supervisor-stop and observation-only task-loop receipts had escaped that check.
 
@@ -230,6 +232,54 @@ No cold service matrix was repeated: historical product findings and the C-local
 limitation are unchanged. No product source, worktree/snapshot feature, hosted benchmark,
 controlled real-agent trial or productivity claim was added. Real testing remains authorized;
 the concrete first-pilot configuration remains open.
+
+### Corrections after independent review round 4
+
+Astra's read-only review of `2ac082e` found two P2 report-consistency gaps using synthetic,
+rehashed contradictory records. The current recorder already rejected those situations;
+report derivation could still publish them. They were not observed runtime leaks or sandbox
+exploits. Round-5 implementation is complete at `24a04bb`; fresh independent review is pending.
+
+- `bd968fa` binds grade and reference-control uncertainty maps to their own command receipts,
+  using the same consistency check as teardown maps. Malformed entries, wrong roles, omitted
+  uncertainty and contradictory stop observations invalidate the row. A startup control on
+  an unreachable grading outcome is invalid too. Clean controls and ordinary nonzero down
+  with certain cleanup retain their previous behavior.
+- `24a04bb` derives cancellation from every invoked receipt. A cancelled command cannot
+  belong to a completed trial, even with a clean stop and no summary cancellation marker.
+  New receipts distinguish cancellation before launch from cancellation after starting a
+  child. Only the former needs no stop observation. Budget timeout remains separately scored.
+
+Evidence is retained under `eval/results/agentdx-sol-round5-20261020/`:
+
+- `final/tested-code.json`, both `final/unittest-*.log` files and `final/bench-code.tar` bind
+  124 passing tests in each checkout to committed `24a04bb`. Existing caches remain intact.
+  Failing-before logs retain 22 map-consistency failures and 34 cancellation failures.
+- `before/remaining-probes/` and `after/remaining-probes/` retain the seven exact reviewer
+  counterexamples and clean baseline. All seven formerly publishable cases now invalidate
+  without verified or autonomous credit. The baseline remains valid. The unchanged reviewer
+  matrix keeps both clean controls and rejects all 89 malformed cases across 91 scenarios.
+  Script hashes and path provenance are in `replay-provenance.json`.
+- Real bounded timeout, cancellation and escaped-exec probes retain their receipts under
+  `after/process/`. Certain cleanup removes the exec child; escaped identity remains explicitly
+  unresolved and is safely reclaimed by the probe. Sentinels survive. Linux pidfd checks are
+  mocked on this macOS host; slug noise and forgery checks use real Node.
+- Two fresh reference slug trials pass. Two further scripted trials externally cancel the
+  runner, stop their agent and descendant, preserve a sentinel and remain invalid. These
+  harness self-tests are nonpublishable; their transcript checks are scripted, not human reviews.
+- `report-rederivation.json` confirms all four round-4 reports, covering 12 scripted trials,
+  still derive identically. Seven round-2 plus six round-3 reports remain invalid for missing
+  retained submission trees. Their saved evidence is unchanged.
+- `preservation.json` verifies all 275 archive blobs and working files, both original reports,
+  product boundaries, the tested export bytes and unchanged binary. `resource-audit.json`
+  records nine retained new roots with no observed owned process or previously observed
+  listener. All 70 recorded round-3/4 roots still exist, a presence check only.
+  `collected.json` records unchanged global-state hashes. No private config contents are saved.
+
+No controlled real-agent or hosted measurement ran, no long service matrix was repeated, and
+no product or workspace feature changed. The existing platform, sandbox and pilot-configuration
+limits remain. The frozen checkpoint records exact heads, commands, retained wrapper failures
+and the next independent review step.
 
 ### Benchmark validation
 
