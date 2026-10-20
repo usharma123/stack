@@ -329,9 +329,9 @@ fn a_postgres_preset_initializes_with_a_fixed_utf8_locale_whatever_the_callers()
     // The daemon's own environment, which its one-time `initdb` runs with, replaces the
     // caller's locale; it is not in `[env]`, so commands keep theirs.
     assert_eq!(daemons["db"]["env"]["LC_ALL"].as_str(), Some("C.UTF-8"), "{daemons:?}");
-    for other in ["cache", "web"] {
-        assert!(daemons[other].get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{other}: {daemons:?}");
-    }
+    // Redis starts under any caller's locale, including one the machine lacks.
+    assert_eq!(daemons["cache"]["env"]["LC_ALL"].as_str(), Some("C"), "{daemons:?}");
+    assert!(daemons["web"].get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{daemons:?}");
     assert!(rendered.get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{rendered:?}");
 }
 

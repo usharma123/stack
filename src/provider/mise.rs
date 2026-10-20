@@ -529,9 +529,14 @@ pub fn render(
 /// A locale the project sets in `[env]` reaches the daemon too and takes precedence (mise
 /// applies `[env]` after a daemon's own environment): that is the project's committed choice,
 /// the same on every machine, not the caller's.
+///
+/// Redis takes its collation (for `SORT ... ALPHA`) from the inherited locale and exits at
+/// once when that names a locale the machine lacks (`LANG=en_US.UTF-8` in a minimal Linux
+/// image): `C`, which every system has, makes it start anywhere and sort the same everywhere.
 pub fn preset_env(preset: Option<&str>) -> &'static [(&'static str, &'static str)] {
     match preset {
         Some("postgres") => &[("LC_ALL", POSTGRES_LOCALE)],
+        Some("redis") => &[("LC_ALL", "C")],
         _ => &[],
     }
 }

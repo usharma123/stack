@@ -87,7 +87,8 @@ load code you edited use `restart`.
   Postgres too and takes precedence. An existing cluster keeps the encoding it was created
   with; when it is not `UTF8` (one created under `LC_ALL=C` by Stack 0.1.22 or earlier), `up`
   says so in `warnings`, with the commands to dump it and recreate it. Its data is never
-  reinitialized.
+  reinitialized. Redis likewise runs with `LC_ALL=C`, so a caller's locale the machine lacks
+  (`LANG=en_US.UTF-8` in a minimal Linux image) cannot keep it from starting.
 - **Recreated checkouts** start with empty data. If a checkout at the same path was deleted
   without `down`, its databases are moved to `<data dir>.replaced-<time>` (never deleted) and
   a warning names them. A service's data directory is mise's, under its state directory
