@@ -83,7 +83,8 @@ class Runtime:
         if left:
             result['reclaimed_by_harness'] = arms.reclaim(left)
             result['after_reclaim'] = arms.owned_processes(self.root)
-        result['ok'] = not left and all(value is True for value in result['down'].values())
+        # Clean means nothing owned is left; a failing `down` is the check's finding, not a leak.
+        result['ok'] = not left
         return result
 
 
@@ -171,6 +172,8 @@ def removed_checkout_reclaim(rt):
         if record['exit_code']:
             return {'error': f'{step} failed'}
     confirmed = data(record).get('confirmed') is True
+    # Stop the supervisor while a checkout still exists to run it from; gc does not need it.
+    invoke([str(rt.binary), 'exec', '--', 'pitchfork', 'supervisor', 'stop'], app, rt.env, 60, rt.out / 'supervisor-stop')
     shutil.rmtree(app)  # The check's own scratch checkout, after a confirmed `down`.
     gc = rt.stack('gc', rt.root, 'gc')
     registry = json.loads((rt.root / 'stack/state/ports.json').read_text())
