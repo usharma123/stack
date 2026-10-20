@@ -2,10 +2,13 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
@@ -81,6 +84,56 @@ class SubmissionTest(unittest.TestCase):
         patch, record = self.record()
         self.assertEqual((patch, record['changed']), (b'', []))
 
+    def test_capture_is_retained_and_unchanged_when_cleanup_rewrites_source(self):
+        (self.workspace / 'ignored.mjs').write_text('ignored but submitted\n')
+        (self.workspace / 'old.mjs').unlink()
+        patch, record = self.record()
+        captured = self.root / 'harness' / 'submitted-tree'
+        self.assertTrue(captured.is_dir())
+        self.assertEqual(arms.tree_files(captured), record['files_after'])
+        self.assertEqual((captured / 'slug.mjs').read_text(), 'bad\n')
+        (self.workspace / 'slug.mjs').write_text('corrected during cleanup\n')
+        (self.workspace / 'ignored.mjs').unlink()
+        self.assertEqual((captured / 'slug.mjs').read_text(), 'bad\n')
+        target = self.root / 'grade'
+        target.mkdir()
+        (target / 'old.mjs').write_text('old\n')
+        copied = arms.overlay(captured, target, full_tree=True)
+        self.assertEqual((target / 'slug.mjs').read_text(), 'bad\n')
+        self.assertEqual(copied['old.mjs'], 'deleted')
+        self.assertEqual(copied['ignored.mjs'], record['files_after']['ignored.mjs'])
+        self.assertFalse((captured / 'slug.mjs').stat().st_mode & 0o222)
+        self.assertFalse(captured.stat().st_mode & 0o222)
+        self.assertTrue((target / 'slug.mjs').stat().st_mode & 0o200)
+
+    def test_capture_excludes_private_files_and_does_not_follow_links(self):
+        for relative in ['.env', '.env.local', '.claude/settings.json', '.ssh/config']:
+            path = self.workspace / relative
+            path.parent.mkdir(exist_ok=True)
+            path.write_text('synthetic private fixture')
+        (self.workspace / 'link').symlink_to(self.root / 'not-present')
+        _, record = self.record()
+        self.assertEqual(set(record['files_after']), {'slug.mjs', 'old.mjs', 'smoke.mjs', '.gitignore', 'link'})
+        self.assertTrue(record['files_after']['link'].startswith('symlink:'))
+
+    def test_evidence_sealing_never_reads_a_retained_symlink_target(self):
+        external = self.root / 'external-fixture'
+        external.write_text('synthetic value that must not enter evidence')
+        (self.workspace / 'link').symlink_to(external)
+        _, record = self.record()
+        evidence = self.root / 'harness'
+        original = bench.digest
+
+        def no_links(path):
+            self.assertFalse(Path(path).is_symlink(), 'evidence hashing followed an external link')
+            return original(path)
+
+        with mock.patch.object(bench, 'digest', side_effect=no_links), \
+                mock.patch.object(bench, 'derive', return_value=({}, [])):
+            result = bench.seal({}, evidence, {}, {}, self.root)
+        self.assertNotIn('submitted-tree/link', result['evidence_sha256'])
+        self.assertEqual(record['files_after']['link'], 'symlink:' + str(external))
+
 
 class OverlayDeletionTest(unittest.TestCase):
     def test_full_checkout_deletions_reach_grading_but_protected_files_stay(self):
@@ -101,6 +154,51 @@ class OverlayDeletionTest(unittest.TestCase):
             (target / 'legacy.py').write_text('again')
             arms.overlay(source, target)  # an oracle overlay lists only its own files
             self.assertTrue((target / 'legacy.py').exists())
+
+
+@unittest.skipUnless(shutil.which('node'), 'host Node required for bounded offline grader reproduction')
+class SubmissionCleanupTest(unittest.TestCase):
+    def test_real_trial_grades_captured_bad_code_after_teardown_writes_good_code(self):
+        from test_experiment import plan_args
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory).resolve()
+            reference = (HERE / 'oracles/slug/slug.mjs').read_text()
+            down_script = 'from pathlib import Path\nPath("slug.mjs").write_text(' + repr(reference) + ')\n'
+            agent_script = 'from pathlib import Path\nPath("dev.py").write_text(' + repr(down_script) + ')\n'
+            plan_path = out / 'plan.json'
+            plan = bench.make_plan(plan_args(plan_path, repeats=1, agent_command=json.dumps(
+                [sys.executable, '-c', agent_script, '{model}', '{prompt_file}'])))
+            trial = next(t for t in plan['trials'] if t['arm'] == 'existing')
+            runtimes = []
+
+            def runtime(prefix, task, arm, binary, cache, locale):
+                root = out / f'runtime-{len(runtimes)}'
+                root.mkdir()
+                runtimes.append(root)
+                (root / 'context.json').write_text(json.dumps({'task': task, 'arm': arm}))
+                return root, {**arms.isolated_env(root, locale=locale), **bench.GIT_ENV}
+
+            def commands(arm, project, binary, verifier_argv=None):
+                steps = {'setup': [['/usr/bin/true']], 'up': [], 'smoke_exec': ['node', 'smoke.mjs'],
+                         'smoke_task_loop': ['node', 'smoke.mjs'], 'down': [sys.executable, 'dev.py', 'down']}
+                if verifier_argv:
+                    steps['verify'] = verifier_argv
+                return steps
+
+            with mock.patch.object(bench, 'new_runtime', side_effect=runtime), \
+                    mock.patch.object(arms, 'commands', side_effect=commands):
+                summary = bench.experiment_trial(SimpleNamespace(plan=plan_path, id=trial['id'],
+                                                                 results=out / 'results', cache_root=None))
+            evidence = out / 'results' / bench.trial_key(trial['id'])
+            submitted = json.loads((evidence / 'submission.json').read_text())
+            self.assertEqual(submitted['changed'], ['M\tdev.py'])
+            self.assertEqual((runtimes[0] / 'app/slug.mjs').read_text(), reference)
+            self.assertNotEqual((evidence / 'submitted-tree/slug.mjs').read_text(), reference)
+            self.assertEqual(summary['grade']['submitted_files']['slug.mjs'], submitted['files_after']['slug.mjs'])
+            self.assertEqual(summary['grade']['outcome'], 'graded')
+            self.assertFalse(summary['task_passed'])
+            self.assertTrue(summary['valid'], summary['problems'])
+            self.assertTrue(all(not arms.owned_processes(root) for root in runtimes))
 
 
 if __name__ == '__main__':

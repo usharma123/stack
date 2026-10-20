@@ -42,6 +42,7 @@ PROTECTED = {'stack.toml', 'stack.lock', 'mise.toml', 'mise.lock', 'dev.py', '.d
 HIDDEN_ROOT = HERE / 'hidden'
 HIDDEN = {'ledger': ['seed.py'], 'catalog': ['products.json'], 'slug': []}
 RUNTIME_DIRS = {'.git', '.stack', '.dev', '.venv', '.config', 'node_modules', '__pycache__'}
+PRIVATE_NAMES = {'.env', '.claude', '.codex', '.ssh', '.aws', '.npmrc', '.netrc'}
 GITIGNORE = '.stack/\n.dev/\n.venv/\n.config/mise/\nnode_modules/\n__pycache__/\n'
 
 
@@ -218,14 +219,27 @@ def tree_files(directory):
     for current, directories, names in os.walk(directory):
         base = Path(current)
         links = [name for name in directories if (base / name).is_symlink()]
-        directories[:] = sorted(name for name in directories if name not in RUNTIME_DIRS and name not in links)
+        directories[:] = sorted(name for name in directories if not excluded_submission_name(name) and name not in links)
         for name in sorted(names + links):
-            if name in RUNTIME_DIRS:
+            if excluded_submission_name(name):
                 continue
             path = base / name
             relative = path.relative_to(directory).as_posix()
             files[relative] = f'symlink:{os.readlink(path)}' if path.is_symlink() else digest(path) if path.is_file() else 'special'
     return files
+
+
+def excluded_submission_name(name):
+    return name in RUNTIME_DIRS or name in PRIVATE_NAMES or name.startswith('.env.')
+
+
+def overlay_manifest(before, submitted):
+    """The exact copy/skip/delete operations for a full submitted tree."""
+    copied = {name: 'symlink-skipped' if value.startswith('symlink:') else
+              'special-skipped' if value == 'special' else value
+              for name, value in submitted.items() if name not in PROTECTED}
+    copied.update({name: 'deleted' for name in before if name not in PROTECTED and name not in submitted})
+    return copied
 
 
 def overlay(source, workspace, full_tree=False):
@@ -246,6 +260,9 @@ def overlay(source, workspace, full_tree=False):
         target = workspace / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / relative, target)
+        # Retained submission snapshots are read-only. The fresh runtime owns a writable
+        # copy, including data files the app updates; executable bits are preserved.
+        target.chmod(target.stat().st_mode | 0o200)
         copied[relative] = digest(target)
     if full_tree:
         for relative in tree_files(workspace):

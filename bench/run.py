@@ -280,7 +280,8 @@ def new_runtime(prefix, task_id, arm, binary, cache, locale):
     return root, env
 
 
-def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_control=False, full_tree=False):
+def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_control=False, full_tree=False,
+          expected_submission=None):
     """Fresh runtime, grader-only data, submitted files overlaid, then the smoke test and hidden checks.
 
     `passed` needs both gates. The project's existing smoke test, run through the arm's
@@ -314,7 +315,12 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
         if arm == 'stack':
             result['lock_backends'] = arms.lock_backends(workspace)
         result['hidden_files'] = arms.copy_hidden(project, workspace)
+        before_overlay = arms.tree_files(workspace)
+        if expected_submission is not None and arms.tree_files(submission) != expected_submission:
+            raise ValueError('retained submitted tree changed before grading')
         result['submitted_files'] = arms.overlay(submission, workspace, full_tree) if submission else {}
+        if expected_submission is not None and result['submitted_files'] != arms.overlay_manifest(before_overlay, expected_submission):
+            raise ValueError('graded files differ from the retained submission')
         steps = arms.commands(arm, project, binary, arms.verifier_argv(task_id, workspace))
         timings, result['setup_attempts'] = {}, 0
         result['seconds'] = timings
@@ -509,33 +515,37 @@ def keep_baseline(workspace, root):
     return {'commit': commit, 'git_dir': str(store), 'files': arms.tree_files(workspace)}
 
 
-def submission_record(baseline, workspace):
+def submission_record(baseline, workspace, tree=None):
     """The whole submitted change against the starting commit: commits, edits, deletions and new files.
 
-    The checkout's files (runtime directories excluded, ignored files included, exactly what
-    grading overlays) are staged into a scratch index of the baseline repository. Nothing is
-    written to the agent's checkout or its `.git`. The agent's own history is read as well.
+    Copy once outside the agent workspace, hash and diff that copy, and retain it read-only
+    for grading. A scratch Git index is removed after capture; the submitted tree survives.
+    Runtime/private files are excluded and links are never followed. This is an access
+    convention on the same host, not protection against a hostile agent searching the host.
     """
-    stage = Path(tempfile.mkdtemp(prefix='as.', dir='/tmp'))
-    try:
-        tree = stage / 'tree'
-        files = arms.tree_files(workspace)
-        for relative, value in files.items():
+    tree = tree or Path(baseline['git_dir']).parent / 'submitted-tree'
+    tree.mkdir(parents=True, exist_ok=False)
+    with tempfile.TemporaryDirectory(prefix='index.', dir=Path(baseline['git_dir']).parent) as scratch:
+        for relative, value in arms.tree_files(workspace).items():
             target = tree / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             if value.startswith('symlink:'):
                 target.symlink_to(value[len('symlink:'):])
             elif value != 'special':
                 shutil.copy2(workspace / relative, target)
-        tree.mkdir(exist_ok=True)
-        env = {'GIT_DIR': baseline['git_dir'], 'GIT_WORK_TREE': str(tree), 'GIT_INDEX_FILE': str(stage / 'index')}
+        files = arms.tree_files(tree)  # hash the captured bytes, never the live workspace
+        env = {'GIT_DIR': baseline['git_dir'], 'GIT_WORK_TREE': str(tree), 'GIT_INDEX_FILE': str(Path(scratch) / 'index')}
         git(['read-tree', baseline['commit']], tree, env)
         git(['add', '--all', '--force', '.'], tree, env)
         diff = ['diff', '--cached', '--no-renames', '--no-ext-diff', '--no-textconv', baseline['commit']]
         patch = git([*diff, '--binary', '--full-index'], tree, env).stdout
         changed = git([*diff, '--name-status'], tree, env).stdout.decode().splitlines()
-    finally:
-        shutil.rmtree(stage)
+    for current, directories, names in os.walk(tree, topdown=False):
+        for name in names:
+            path = Path(current) / name
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o222)
+        Path(current).chmod(Path(current).stat().st_mode & ~0o222)
     head = git(['rev-parse', 'HEAD'], workspace, check=False)
     head = head.stdout.decode().strip() if head.returncode == 0 else None
     commits = git(['rev-list', '--reverse', f'{baseline["commit"]}..HEAD'], workspace, check=False)
@@ -543,7 +553,7 @@ def submission_record(baseline, workspace):
     record = {'initial_commit': baseline['commit'], 'baseline_git_dir': baseline['git_dir'], 'changed': changed,
               'agent_head': head, 'head_descends_from_initial': descends,
               'agent_commits': commits.stdout.decode().split() if commits.returncode == 0 else None,
-              'files_before': baseline['files'], 'files_after': files}
+              'files_before': baseline['files'], 'files_after': files, 'tree': tree.name}
     return patch, record
 
 
@@ -593,15 +603,16 @@ def experiment_trial(args):
             summary['agent'] = {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']}
             summary['finished_agent_unix_ns'] = time.time_ns()
             summary['left_running_at_agent_exit'] = write_record(out, 'left-at-agent-exit.json', arms.residue(trial['arm'], workspace, root, {}))
-            patch, submission = submission_record(baseline, workspace)
+            captured = out / 'submitted-tree'
+            patch, submission = submission_record(baseline, workspace, captured)
             (out / 'submission.patch').write_bytes(patch)
             write_record(out, 'submission.json', submission)
             summary['changed_files'] = submission['changed']
-            shutil.copytree(transcript, out / 'transcript')
+            shutil.copytree(transcript, out / 'transcript', symlinks=True)
             summary['agent_cleanup'] = write_record(out, 'agent-cleanup.json',
                                                     teardown(trial['arm'], workspace, root, env, binary, out, 'agent-cleanup'))
-            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', workspace, cache, plan['locale'],
-                           startup_control=True, full_tree=True)
+            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', captured, cache, plan['locale'],
+                           startup_control=True, full_tree=True, expected_submission=submission['files_after'])
             summary['grade'] = write_record(out, 'grade.json', graded)
             summary['task_passed'] = graded['passed'] is True
     except Cancelled as error:
@@ -622,7 +633,8 @@ def experiment_trial(args):
 
 def seal(summary, out, trial, plan, plan_path):
     """Hash every evidence file, judge the trial with the report's own derivation, write the summary."""
-    summary['evidence_sha256'] = {str(path.relative_to(out)): digest(path) for path in sorted(out.rglob('*')) if path.is_file()}
+    summary['evidence_sha256'] = {str(path.relative_to(out)): digest(path) for path in sorted(out.rglob('*'))
+                                  if not path.is_symlink() and path.is_file()}
     summary = json.loads(json.dumps(summary))  # judged exactly as the report will read it
     summary['problems'] = derive(summary, trial, plan, plan_path, out)[1]
     summary['valid'] = not summary['problems']
@@ -643,7 +655,7 @@ def review_template(args):
     summary = directory / 'summary.json'
     return {'schema': 'stack-agentdx-review/2', 'trial_id': trial['id'], 'trial_summary_sha256': digest(summary),
             'transcript_sha256': {str(path.relative_to(directory)): digest(path) for path in sorted(directory.glob('agent.std*'))
-                                  + sorted((directory / 'transcript').rglob('*')) if path.is_file()},
+                                  + sorted((directory / 'transcript').rglob('*')) if not path.is_symlink() and path.is_file()},
             'reviewer': None, 'requested_model': trial['model'], 'harness': plan['agent_harness'],
             'requested_options': plan['agent_options'],
             # Observed values come from the transcript or the harness's own receipt, never from the plan.
@@ -792,6 +804,17 @@ def globals_schema(value):
     return (isinstance(value, dict) and all(value.get(key) in ('present', 'absent') for key in arms.GLOBAL_ROOTS)
             and all(isinstance(key, str) and (isinstance(v, str) or
                     (isinstance(v, list) and all(isinstance(item, str) for item in v))) for key, v in value.items()))
+
+
+def submission_schema(value):
+    def files_schema(files):
+        return (isinstance(files, dict) and all(isinstance(name, str) and name and not Path(name).is_absolute()
+                and '..' not in Path(name).parts and not any(arms.excluded_submission_name(part) for part in Path(name).parts)
+                and isinstance(v, str) and (re.fullmatch('[0-9a-f]{64}', v) or v.startswith('symlink:') or v == 'special')
+                for name, v in files.items()))
+    return (isinstance(value, dict) and value.get('tree') == 'submitted-tree'
+            and isinstance(value.get('changed'), list) and all(isinstance(item, str) for item in value['changed'])
+            and all(files_schema(value.get(key)) for key in ['files_before', 'files_after']))
 
 
 def clean(teardown_record):
@@ -989,8 +1012,10 @@ def derive(result, trial, plan, plan_path, directory):
     hashes = result.get('evidence_sha256')
     if not isinstance(hashes, dict):
         return facts, problems + ['evidence hashes missing']
-    problems += [f'{name} changed' for name, value in hashes.items() if not (directory / name).is_file() or digest(directory / name) != value]
-    extra = sorted(str(path.relative_to(directory)) for path in directory.rglob('*') if path.is_file())
+    problems += [f'{name} changed' for name, value in hashes.items() if (directory / name).is_symlink()
+                 or not (directory / name).is_file() or digest(directory / name) != value]
+    extra = sorted(str(path.relative_to(directory)) for path in directory.rglob('*')
+                   if not path.is_symlink() and path.is_file())
     extra = [name for name in extra if name not in hashes and name not in {'summary.json', 'review.json'}
              and not name.startswith(REVIEW_EVIDENCE)]
     problems += [f'{name} is not in the trial evidence' for name in extra]
@@ -1066,15 +1091,19 @@ def derive(result, trial, plan, plan_path, directory):
         problems.append('benchmark files changed during the trial')
 
     # The submission and its grade.
-    submission = receipt(directory, 'submission.json', hashes, problems)
-    if submission is not None and not (isinstance(submission.get('changed'), list)
-                                       and all(isinstance(item, str) for item in submission['changed'])):
-        problems.append('submission.json malformed changed files')
+    submission = receipt(directory, 'submission.json', hashes, problems, submission_schema)
+    if submission is not None:
+        captured = directory / 'submitted-tree'
+        if not captured.is_dir() or arms.tree_files(captured) != submission['files_after']:
+            problems.append('retained submitted tree differs from submission.json or is missing')
     if submission is not None and submission.get('changed') != result.get('changed_files'):
         problems.append('summary changed_files contradicts submission.json')
     graded = receipt(directory, 'grade.json', hashes, problems)
     passed = False
     if graded is not None:
+        if submission is not None and graded.get('submitted_files') != arms.overlay_manifest(
+                submission['files_before'], submission['files_after']):
+            problems.append('graded submitted_files differ from the captured submission')
         if not (type(graded.get('passed')) is bool and isinstance(graded.get('outcome'), str)
                 and cleanup_schema(graded.get('cleanup'))):
             problems.append('grade.json malformed grade or cleanup')

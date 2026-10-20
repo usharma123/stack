@@ -87,10 +87,14 @@ class TrialRecords:
         self.agent.update({f'{suffix}_sha256': arms.digest(self.out / f'agent.{suffix}') for suffix in ['stdout', 'stderr']})
         self.write('agent.json', self.agent)
         self.write('left-at-agent-exit.json', self.left)
-        self.write('submission.json', {'changed': ['M\tslug.mjs']})
+        self.write_text('submitted-tree/slug.mjs', 'synthetic captured submission')
+        submitted = {'slug.mjs': arms.digest(self.out / 'submitted-tree/slug.mjs')}
+        self.write('submission.json', {'changed': ['M\tslug.mjs'], 'tree': 'submitted-tree',
+                                       'files_before': {'slug.mjs': '0' * 64}, 'files_after': submitted})
         self.write('agent-cleanup.json', self.agent_cleanup)
         self.cleanup_steps('agent-cleanup', self.agent_cleanup)
-        grade = {'outcome': self.outcome, 'cleanup': self.grade_cleanup, 'seconds': {'setup': 2.0}}
+        grade = {'outcome': self.outcome, 'cleanup': self.grade_cleanup, 'seconds': {'setup': 2.0},
+                 'submitted_files': submitted}
         self.step('grade-setup', 0)
         if self.outcome == 'graded':
             if arms.PROJECTS[arms.TASKS[self.task]['project']]['app']:
@@ -463,6 +467,37 @@ class ReportTest(unittest.TestCase):
     def test_partial_check_set_does_not_pass(self):
         self.review(self.sealed(checks={'case_0': True}, task_passed=True))
         self.assertEqual(self.row()['status'], 'invalid')
+
+    def test_graded_bytes_must_match_captured_submission_and_retained_tree(self):
+        for scenario in ['grade-mismatch', 'snapshot-mutated', 'snapshot-missing', 'manifest-malformed']:
+            with self.subTest(scenario=scenario):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed()
+                if scenario == 'grade-mismatch':
+                    grade = json.loads((records.out / 'grade.json').read_text())
+                    grade['submitted_files']['slug.mjs'] = '1' * 64
+                    records.replace_record('grade.json', grade, 'grade')
+                elif scenario == 'manifest-malformed':
+                    submission = json.loads((records.out / 'submission.json').read_text())
+                    submission['files_after'] = {'../outside': '1' * 64}
+                    records.replace_record('submission.json', submission)
+                else:
+                    path = records.out / 'submitted-tree/slug.mjs'
+                    if scenario == 'snapshot-missing':
+                        path.unlink()
+                    else:
+                        records.write_text('submitted-tree/slug.mjs', 'later bytes')
+                    summary = json.loads((records.out / 'summary.json').read_text())
+                    if path.exists():
+                        summary['evidence_sha256']['submitted-tree/slug.mjs'] = arms.digest(path)
+                    else:
+                        summary['evidence_sha256'].pop('submitted-tree/slug.mjs')
+                    records.edit_summary(**summary)
+                self.review(records)
+                self.assertEqual(self.row()['status'], 'invalid')
+                self.assertFalse(self.row()['verified_task'])
+                self.review(self.sealed(1))
+                self.assertEqual(self.row(1)['status'], 'passed')
 
     def test_verifier_cannot_redirect_to_agent_stdout_even_when_both_are_hashed(self):
         self.catalog_plan()
