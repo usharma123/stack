@@ -26,8 +26,10 @@
   that way. The address of a service that fails is replaced with `unverified.stack.invalid`, so
   an app that falls back to `localhost` fails loudly. `--require` refuses to run instead.
 - **Configuration changes need a fresh start.** A session records a fingerprint of the
-  compiled configuration and ports. After a change, services count as unverified until
-  `stack up` restarts them.
+  compiled configuration services see (everything but `[tasks]`) and ports. After a change,
+  services count as unverified until `stack up` restarts them. Adding or editing a task needs
+  no restart. A session started by Stack 0.1.22 or earlier, whose fingerprint included tasks,
+  needs one restart after its first task edit.
 - **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
   them. For a deleted checkout, `gc` never stops anything itself, because Pitchfork cannot

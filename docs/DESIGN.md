@@ -92,8 +92,10 @@ output (mise's answer when no release matches) is an error, not a version.
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
   assigned ports and the override for pinned ones. Stack never reassigns on its own: `down`
   removes the session while reservations persist, so "no session" does not mean "never used".
-- **Generations.** A session fingerprints the complete composed configuration, bundle lock and
-  assigned ports. `status` reports a change as stale; `exec` withholds service endpoints until
+- **Generations.** A session fingerprints the composed configuration except its tasks, the
+  bundle lock and the assigned ports. Tasks change what `run` runs, never a service, so editing
+  one keeps the session; a fingerprint recorded before tasks were left out, which still matches
+  the configuration with its tasks, is accepted too. `status` reports a change as stale; `exec` withholds service endpoints until
   `up` stops the previous owned instance and verifies the new configuration. Provider data-version checks
   remain in force: incompatible version changes fail explicitly and preserve the data, rather
   than silently reusing the old process or resetting the database.

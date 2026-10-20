@@ -781,7 +781,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
     let digest = config_digest(ctx, &report);
-    let restart = previous.as_ref().is_some_and(|s| s.config_digest != digest);
+    let restart = previous.as_ref().is_some_and(|s| !same_config(s, ctx, &report));
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
     if restart || unrecorded {
         match down_locked(ctx, provider.as_ref()) {
@@ -842,7 +842,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     if !report.stack.services.is_empty() {
         // Ownership is recorded before anything starts. If start or verification fails, or the
         // service is later removed from the configuration, `down` still knows what to reconcile.
-        let unverified = previous.as_ref().map_or(true, |p| p.launching || p.config_digest != digest);
+        let unverified = previous.as_ref().map_or(true, |p| p.launching || !same_config(p, ctx, &report));
         // Retrying an incomplete launch of this same generation stopped nothing, so whatever it
         // recorded (a process an interrupted `up` or `restart` observed) may still run. Those
         // identifiers are kept until observations replace them or `down` confirms them gone.
@@ -906,7 +906,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     // records stay valid.
     let reused = previous
         .as_ref()
-        .filter(|p| !p.launching && p.config_digest == digest && !restart && checks_match(p, &checks))
+        .filter(|p| !p.launching && same_config(p, ctx, &report) && !restart && checks_match(p, &checks))
         .map(|p| (p.id.clone(), p.started_at));
     let session = Session {
         id: reused.as_ref().map_or_else(|| new_session_id(ctx), |(id, _)| id.clone()),
@@ -1545,7 +1545,7 @@ fn restart_within(ctx: &Ctx, services: &[String]) -> Result<RestartReport> {
         return Err(StackError::new("session_stale", "the last start or restart of this session did not finish verifying")
             .hint("run `stack up`; it starts and verifies every service"));
     }
-    if session.config_digest != config_digest(ctx, &report) {
+    if !same_config(&session, ctx, &report) {
         return Err(StackError::new(
             "session_stale",
             "the running services were started from a different configuration",
@@ -2424,7 +2424,7 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     };
     let stale = session
         .as_ref()
-        .is_some_and(|s| s.config_digest != config_digest(ctx, &report));
+        .is_some_and(|s| !same_config(s, ctx, &report));
     let artifacts = (!report.pins().is_empty()).then(|| report.current_artifacts());
     // Services of an expired lease still answer, but the next `gc` or `up` stops them: not
     // something to rely on, so not healthy.
@@ -3076,7 +3076,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     let mut execution = None;
     if let Some(session) = session
         .as_mut()
-        .filter(|s| !s.launching && s.config_digest == config_digest(ctx, &report))
+        .filter(|s| !s.launching && same_config(s, ctx, &report))
     {
         if let Some(lease) = session.lease.as_mut() {
             lease.renewed_at = now();
@@ -3860,14 +3860,36 @@ fn busy(session: &Session, operation: &str) -> StackError {
 /// `report` (such as an edited `[env]`), for `inspect`. Read-only: no lock, no provider calls.
 pub fn stale_session(ctx: &Ctx, report: &Report) -> Option<String> {
     let session = load(ctx).ok()??;
-    (session.config_digest != config_digest(ctx, report)).then(|| {
+    (!same_config(&session, ctx, report)).then(|| {
         "the running services were started from a different configuration; `stack up` restarts them with this one".to_string()
     })
 }
 
+/// Whether `session` was started from the configuration `report` composes. Tasks are no part
+/// of it: they change what `stack run` runs, never a service. A session recorded by an earlier
+/// release, whose digest included the tasks, still counts while nothing else changed.
+fn same_config(session: &Session, ctx: &Ctx, report: &Report) -> bool {
+    session.config_digest == config_digest(ctx, report) || session.config_digest == digest_of(ctx, report, true)
+}
+
+/// The fingerprint a session records: everything that decides what its services run, which
+/// leaves out the tasks.
 fn config_digest(ctx: &Ctx, report: &Report) -> String {
+    digest_of(ctx, report, false)
+}
+
+fn digest_of(ctx: &Ctx, report: &Report, with_tasks: bool) -> String {
+    let mut stack = serde_json::to_value(&report.stack).expect("composed stack serializes");
+    if !with_tasks {
+        if let Some(stack) = stack.as_object_mut() {
+            stack.remove("tasks");
+            if let Some(Value::Array(overrides)) = stack.get_mut("overrides") {
+                overrides.retain(|o| o["kind"] != "tasks");
+            }
+        }
+    }
     let mut config =
-        json!({ "lock": lock_digest(&ctx.root), "stack": report.stack, "ports": report.ports });
+        json!({ "lock": lock_digest(&ctx.root), "stack": stack, "ports": report.ports });
     // Only when a service has a probe, so records written before probes existed stay current.
     if !report.identities.is_empty() {
         config["identities"] = json!(report.identities);
@@ -3897,7 +3919,7 @@ fn verify_session(
     let reason = match session {
         None => Some("no launch record; run `stack up`"),
         Some(s) if s.launching => Some("`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`"),
-        Some(s) if s.config_digest != config_digest(ctx, report) => {
+        Some(s) if !same_config(s, ctx, report) => {
             Some("session configuration changed; run `stack up` to restart and verify it")
         }
         _ => None,

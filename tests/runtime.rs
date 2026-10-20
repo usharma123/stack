@@ -2229,6 +2229,32 @@ fn down_before_any_up_in_a_checkout_without_its_generated_configuration_confirms
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn adding_or_editing_a_task_keeps_the_running_session_current() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let session = up["data"]["session"]["id"].clone();
+    for tasks in ["[tasks.probe]\nrun='echo one'\n", "[tasks.probe]\nrun='echo two'\n[tasks.more]\nrun='true'\nservices=['web']\n"] {
+        fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n{tasks}")).unwrap();
+        fixture.ok(&["compile"]);
+        let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+        assert_eq!((status["data"]["healthy"].clone(), status["data"]["stale"].clone()), (json!(true), json!(false)), "{tasks}: {status}");
+        let exec = json_result(&fixture.command(&["--json", "exec", "--require-all", "--", "true"]).output().unwrap());
+        assert_eq!(exec["data"]["exit_code"], 0, "{tasks}: {exec}");
+        let again = json_result(&fixture.ok(&["up", "--json"]));
+        assert_eq!(again["data"]["session"]["id"], session, "{tasks}: the same generation keeps running: {again}");
+        assert!(!again["data"]["steps"].as_array().unwrap().iter().any(|s| s["step"] == "stop_previous"), "{again}");
+    }
+    // A change services do see still needs a fresh start.
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
+    fixture.ok(&["compile"]);
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["stale"], true, "{status}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_refuses_a_session_started_from_another_configuration() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
