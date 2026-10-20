@@ -20,7 +20,7 @@ competitor benchmark is retired to [eval/archive/competitor-20261006](../eval/ar
 | Pre-registered plan, external agent trial, cleanup, grading | `run.py plan`, `run.py trial` | Exercised end to end with the scripted self-test agent only |
 | Human transcript review and report | `run.py review-template`, `run.py report` | Implemented; no real review exists yet |
 | Stack regression checks for the hands-on findings | `regressions.py` | Implemented, run on 0.1.22 |
-| Offline unit tests | `tests/` | 78 tests, including one counterexample per review finding |
+| Offline unit tests | `tests/` | Counterexamples for grading, required observations, timing, cleanup and submission capture; run counts in the synthesis |
 
 **No real agent trial has been run yet.** Real testing is authorized. What is still open is
 the configuration of a first run: which agent CLI and version, which model IDs and options,
@@ -145,6 +145,16 @@ python3 bench/run.py plan --kind harness_selftest --models selftest --harness se
 
    Missing, invalid and unreviewed trials stay in every denominator.
 
+Required observations must be complete objects with correctly typed fields. JSON `null`,
+an empty cleanup object or omitted residue lists do not establish a clean runtime. Final
+cleanup is compared independently with its summary, and the latest cleanup must show
+recovery even when an earlier reclaim succeeded.
+
+Startup seconds come from the setup and startup steps required by the arm and grading
+outcome. All setup attempts count. Missing or malformed timing stays missing and invalidates
+the row; it is never converted to zero. Tools-only tasks have no `up` timing. Failed setup
+does not require later unreachable steps. A malformed trial cannot abort the other assigned rows.
+
 The agent's final message is never read for scoring.
 
 ### Model options
@@ -188,6 +198,11 @@ checks that the process is still under that root. On Linux a pidfd holds the pro
 the check and the signal, and the kernel start tick catches reuse within the same second. On
 macOS `lstart` has one-second resolution, and a few microseconds separate the check from
 `kill`. The harness never signals by name or by a group it cannot attribute.
+
+A child that calls `exec` retains its start identity. If the command tree still establishes
+ownership, cleanup tracks its new command before escalation. If it cannot establish that
+ownership, the receipt lists the process as `unresolved` and leaves it unsignalled. A reused
+PID is never adopted as the old process.
 
 ## Regression checks
 

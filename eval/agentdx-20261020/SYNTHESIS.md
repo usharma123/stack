@@ -126,9 +126,11 @@ Design, in [bench/AGENTDX-PROTOCOL.md](../../bench/AGENTDX-PROTOCOL.md):
 ### Corrections after independent review round 1
 
 An independent review of `6175a0b` returned eleven findings, each with a reproducing
-counterexample. All eleven are fixed, and each counterexample is now a unit test run against the
-corrected code (78 offline tests in `bench/tests/`). The tests were not run against the old
-code; the review's own probes showed the old behaviour.
+counterexample. The following changes targeted those findings. Round 2 at `6fc65e4` closed
+eight and found residual cases in cleanup observations, command-tree cleanup and startup
+metrics, plus a cache-directory failure in the current checkout. The round-3 corrections
+below address those cases; independent review of the final head is still pending. The
+historical 78-test passes describe their recorded runs, not the later cache-bearing checkout.
 
 | # | Finding | Fix |
 |---|---|---|
@@ -143,6 +145,46 @@ code; the review's own probes showed the old behaviour.
 | 9 | Negative, infinite or unsourced metrics were accepted | Agent timing from its receipt and window; usage finite, typed and bound to a file by sha256 |
 | 10 | `regressions.py` exited 0 despite failed controls, cleanup or globals | Verdicts `fixed`/`reproduced`/`invalid` and exit 0/1/2; real `down-before-up` control |
 | 11 | The docs claimed real trials lacked authorization | Corrected: real testing is authorized; the first run's configuration is what remains open |
+
+### Corrections after independent review round 2
+
+Round 2 at `6fc65e4` reproduced four remaining failures. The corrections below are
+implemented locally; fresh independent review is pending. The source under final validation
+is `f42b8acf0486c999642ff278e9f2ab7709e54dfa`. Later documentation does not change the
+benchmark fingerprints recorded in `eval/results/agentdx-sol-round3-20261020/final/tested-code.json`.
+
+| Finding | Correction and commits | Verification |
+|---|---|---|
+| A: hashed nulls, incomplete observations and earlier recovery excusing later survivors | `9f08637`, `f42b8ac`: typed schemas for required observations and command receipts; independently compare final cleanup; latest cleanup must establish recovery; unresolved command cleanup receives no completion credit | All seven original report probes now return invalid rows without publication or exceptions. Tests also cover wrong field types, missing command fields, boolean exit codes, internally consistent later failure and contradictory final records |
+| B: a child executes a new program on SIGTERM and disappears from cleanup accounting | `21ec33f`: follow exec transitions only while the tree still establishes ownership; uncertain identities are listed as unresolved; never adopt a reused PID | Timeout and cancellation stop the exec child while unrelated sentinels survive. An escaped exec is reported unresolved and left unsignalled by command cleanup, then safely reclaimed by the bounded probe. PID-reuse and pidfd checks pass |
+| C: missing, negative or string startup timing can be published or abort the report | `634d75b`, `f42b8ac`: derive reachable setup/up receipts from the arm and outcome; validate complete receipts, bounded integer times and step order; include every setup retry; malformed trials remain invalid rows | Missing receipt plus missing hash stays missing, never zero. Negative/string/boolean/nonfinite/out-of-window durations fail. Passing startup controls preserve scored failures; setup failures require no unreachable later step. Other assignments remain in the report |
+| D: interpreter cache directories break hidden-data copying in this checkout | `dc623e3`: copy declared hidden files only. `d5212ff`: use the existing runtime-excluding overlay for scripted reference copies too | Existing caches under hidden and reference directories remain present. Cache-directory tests and both checkout and clean-export suites pass |
+
+New raw evidence is under `eval/results/agentdx-sol-round3-20261020/`. Earlier evidence was
+retained, including the inherited dirty-source snapshots and failed counterexamples.
+
+- Final code: 101 offline tests pass in both the current checkout and a clean `git archive`
+  export. See `final/unittest-checkout.log`, `final/unittest-clean-export.log` and
+  `final/offline-results.json`. The earlier 99-test runs at `d5212ff` are retained too.
+- Fourteen scripted trials at `d5212ff` exercise reference solutions in all three tasks and
+  both arms, startup failures with passing controls, broken health with passing hidden checks,
+  services left running, committed solutions and bound options. Two further reference catalog
+  trials run at `f42b8ac`. All have the expected verdicts. These are harness self-tests with
+  scripted transcript checks, not real agents or human reviews; all six reports are non-publishable.
+- `final/report-rederivation.json` compares all six saved reports with derivation by the final
+  code. `process/` retains raw timeout, cancellation and unresolved-identity receipts, with
+  unrelated sentinels and post-probe cleanup checks. `final/review-replays/` retains fresh
+  copies of the reviewer's report, pidfd and slug-noise probes and their results.
+- `final/resource-audit.json` records the final scan of this round's retained roots and observed
+  ports. `final/globals-after-all.json` and `final/collected.json` record the global comparison.
+  Runtime roots and data are retained as evidence. As elsewhere, cleanup means none observed
+  within the documented process-observation limits.
+- `final/preservation.json` verifies all 275 archive blobs and working files against the
+  original tree, both original reports unchanged, and no product-code changes since review.
+
+No new hosted benchmark, real-agent result, productivity estimate or product fix is claimed.
+The first real pilot still needs its concrete CLI/version, models/options, credential route
+and spend configuration. The source-built Stack binary remains the one identified above.
 
 ### Benchmark validation
 

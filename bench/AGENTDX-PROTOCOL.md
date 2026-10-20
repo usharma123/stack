@@ -180,9 +180,19 @@ that ignore SIGTERM, outlive their leader or leave its group. It uses the same p
 identity check. Once the leader is reaped, a group led by a different process is treated as
 someone else's.
 
+An `exec` transition keeps the start identity. The harness follows the new command only
+while the command tree still attributes it. Otherwise it records an unresolved process,
+rather than reporting no survivors or signalling an uncertain identity. PID replacements
+are excluded. These checks retain the macOS clock-resolution and check-to-signal limits.
+
 A trial whose arm teardown needed the harness to reclaim processes is valid but not
 autonomous. One where owned processes outlived every cleanup, or where a grading runtime
 left any, is invalid.
+
+The latest cleanup must establish recovery. An earlier successful reclaim cannot excuse
+a later observation with survivors. A recorded final cleanup is required and compared with
+its summary independently. Residue observations require all three typed lists: PIDs, ports
+and owned processes. Missing lists or JSON `null` never mean clean.
 
 Global receipts hash the user's mise, Pitchfork and Stack config and state files, and list
 the user's mise installs. Another program on the host can change those too, so a difference
@@ -202,6 +212,14 @@ falls outside the trial window makes the trial invalid. It reports, per trial:
 - grading outcome, verified task, autonomous, left running, whether the arm teardown was clean,
 - agent seconds (from the agent receipt) and startup seconds (from the grading receipts),
 - review counts, usage with its source, and observed options.
+
+Startup metrics require receipts for each step reachable on the grading outcome, derived
+from the arm's commands. All setup retry durations count. Durations and start timestamps
+must be bounded nonnegative integers, in the trial window and in step order. Missing,
+wrong-typed, infinite or negative values invalidate the row and leave the metric missing.
+Tools-only tasks have no `up`; a setup failure needs no later startup or verifier receipt.
+A failed submitted startup still needs a complete passing reference control. Corrupt trial
+records become invalid rows without removing any other assignment from the report.
 
 Per arm it gives counts, including scored startup failures, matched pairs with both arms
 scored, and discordant pairs. A `startup_failed` trial is scored, so it stays in its pair.
