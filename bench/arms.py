@@ -265,18 +265,8 @@ def listening(port):
         return connection.connect_ex(('127.0.0.1', int(port))) == 0
 
 
-def owned_processes(root):
-    """Live processes whose command line, working directory or an open file is under `root`.
-
-    The runtime root is unique per trial, so this finds owned processes even when a start
-    failed before anything was recorded. A process that detached with none of these under
-    the root would be missed; the result is therefore 'none observed', not proof of none.
-    """
-    roots = {str(root)}
-    if str(root).startswith('/private/'):
-        roots.add(str(root)[len('/private'):])
-    under = lambda text: any(r + '/' in text or text == r or text.endswith(r) for r in roots)
-    me = os.getpid()
+def process_table():
+    """Every live (non-zombie) process: pid, ppid, pgid, start time and full command line."""
     rows = {}
     listing = subprocess.run(['ps', '-axww', '-o', 'pid=,ppid=,pgid=,stat=,lstart=,command='], capture_output=True, text=True).stdout
     for line in listing.splitlines():
@@ -284,24 +274,132 @@ def owned_processes(root):
         if len(parts) < 10 or parts[3].startswith('Z'):
             continue
         pid = int(parts[0])
-        rows[pid] = {'pid': pid, 'ppid': int(parts[1]), 'pgid': int(parts[2]), 'started': ' '.join(parts[4:9]), 'command': parts[9]}
-    owned = {pid: 'command' for pid, row in rows.items() if under(row['command'])}
+        rows[pid] = {'pid': pid, 'ppid': int(parts[1]), 'pgid': int(parts[2]), 'started': ' '.join(parts[4:9]),
+                     'command': parts[9], **start_ticks(pid)}
+    return rows
+
+
+def start_ticks(pid):
+    """On Linux, the kernel start time in clock ticks: finer than `lstart`'s one second."""
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return {}
+    return {'start_ticks': int(stat[stat.rindex(')') + 2:].split()[19])}
+
+
+def process_identity(pid):
+    """Start time and command line of `pid` now, or None if it is gone or a zombie."""
+    out = subprocess.run(['ps', '-ww', '-p', str(pid), '-o', 'stat=,lstart=,command='], capture_output=True, text=True).stdout.strip()
+    parts = out.split(None, 6)
+    if len(parts) < 7 or parts[0].startswith('Z'):
+        return None
+    return {'started': ' '.join(parts[1:6]), 'command': parts[6], **start_ticks(pid)}
+
+
+def same_process(process):
+    """True while `process` (a row with pid, started, command) is still that exact process."""
+    now = process_identity(process['pid'])
+    return now is not None and all(now.get(key) == process.get(key) for key in ['started', 'command', 'start_ticks'])
+
+
+def signal_if_same(process, signum, still_owned=None):
+    """Signal one exact process, never a PID the system has since given to someone else.
+
+    Immediately before the signal, its start time and command line are compared with the
+    recorded ones and `still_owned(pid)` is asked again. On Linux a pidfd pins the process
+    between that check and the signal; elsewhere the window is the few microseconds between
+    `ps` returning and `kill`. Returns whether the signal was sent.
+    """
+    pidfd = _pidfd_open(process['pid'])
+    if pidfd is False:
+        return False
+    try:
+        if not same_process(process) or (still_owned is not None and not still_owned(process['pid'])):
+            return False
+        if pidfd is None:
+            os.kill(process['pid'], signum)
+        else:
+            signal.pidfd_send_signal(pidfd, signum)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        if pidfd not in (None, False):
+            os.close(pidfd)
+
+
+def _pidfd_open(pid):
+    """A pidfd where the platform has one, None where it does not, False if `pid` is gone."""
+    if not (hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal')):
+        return None
+    try:
+        return os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+
+
+def _roots(root):
+    roots = {str(root)}
+    if str(root).startswith('/private/'):
+        roots.add(str(root)[len('/private'):])
+    return roots
+
+
+def _under(roots, text):
+    return any(r + '/' in text or text == r or text.endswith(r) for r in roots)
+
+
+def owns(root, pid, command=None):
+    """Whether `pid` belongs to `root` now: command line, working directory or an open file under it."""
+    roots = _roots(root)
+    if command is None:
+        identity = process_identity(pid)
+        if identity is None:
+            return False
+        command = identity['command']
+    if _under(roots, command):
+        return True
+    if platform.system() == 'Linux':
+        try:
+            links = [os.readlink(f'/proc/{pid}/cwd')] + [os.readlink(f'/proc/{pid}/fd/{fd}') for fd in os.listdir(f'/proc/{pid}/fd')]
+        except OSError:
+            return False
+        return any(_under(roots, link) for link in links)
+    if shutil.which('lsof'):
+        listing = subprocess.run(['lsof', '-nP', '-w', '-a', '-p', str(pid), '-Fn'], capture_output=True, text=True).stdout
+        return any(line.startswith('n') and _under(roots, line[1:]) for line in listing.splitlines())
+    return False
+
+
+def owned_processes(root):
+    """Live processes whose command line, working directory or an open file is under `root`.
+
+    The runtime root is unique per trial, so this finds owned processes even when a start
+    failed before anything was recorded. A process that detached with none of these under
+    the root would be missed; the result is therefore 'none observed', not proof of none.
+    """
+    roots = _roots(root)
+    rows = process_table()
+    owned = {pid: 'command' for pid, row in rows.items() if _under(roots, row['command'])}
     if platform.system() == 'Linux':
         for pid in rows:
             try:
                 links = [os.readlink(f'/proc/{pid}/cwd')] + [os.readlink(f'/proc/{pid}/fd/{fd}') for fd in os.listdir(f'/proc/{pid}/fd')]
             except OSError:
                 continue
-            if any(under(link) for link in links):
+            if any(_under(roots, link) for link in links):
                 owned.setdefault(pid, 'open_file')
     elif shutil.which('lsof'):
         current = None
         for line in subprocess.run(['lsof', '-nP', '-w', '-u', str(os.getuid()), '-Fpn'], capture_output=True, text=True).stdout.splitlines():
             if line.startswith('p'):
                 current = int(line[1:])
-            elif line.startswith('n') and current is not None and under(line[1:]):
+            elif line.startswith('n') and current is not None and _under(roots, line[1:]):
                 owned.setdefault(current, 'open_file')
-    ancestors, pid = set(), me
+    ancestors, pid = set(), os.getpid()
     while pid in rows and pid not in ancestors:
         ancestors.add(pid)
         pid = rows[pid]['ppid']
@@ -371,25 +469,28 @@ def disk_usage(root, arm, workspace):
     return usage
 
 
-def reclaim(processes):
-    """Stop owned leftovers, re-checking each one's start time and command right before signalling."""
-    reclaimed = []
+RECLAIM_GRACE_SECONDS = 5
+
+
+def reclaim(processes, root):
+    """Stop owned leftovers: SIGTERM, a grace period, then SIGKILL for any that remain.
+
+    Before every signal, the escalation included, `signal_if_same` checks the process's start
+    time and command line again and `owns` checks it is still under `root`. A PID reused by an
+    unrelated process therefore receives nothing.
+    """
+    still_owned = lambda pid: owns(root, pid)
+    result = {'terminated': [], 'killed': [], 'not_signalled': []}
     for process in processes:
-        now = subprocess.run(['ps', '-p', str(process['pid']), '-o', 'lstart=,command='], capture_output=True, text=True).stdout.strip()
-        if not now or not now.startswith(process['started']) or process['command'] not in now:
-            continue
-        try:
-            os.kill(process['pid'], signal.SIGTERM)
-            reclaimed.append(process['pid'])
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and any(alive(pid) for pid in reclaimed):
+        (result['terminated'] if signal_if_same(process, signal.SIGTERM, still_owned) else result['not_signalled']).append(process['pid'])
+    signalled = [process for process in processes if process['pid'] in result['terminated']]
+    deadline = time.monotonic() + RECLAIM_GRACE_SECONDS
+    while time.monotonic() < deadline and any(same_process(process) for process in signalled):
         time.sleep(0.1)
-    for pid in reclaimed:
-        if alive(pid):
-            os.kill(pid, signal.SIGKILL)
-    return reclaimed
+    for process in signalled:
+        if signal_if_same(process, signal.SIGKILL, still_owned):
+            result['killed'].append(process['pid'])
+    return result
 
 
 def globals_snapshot():

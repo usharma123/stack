@@ -81,7 +81,7 @@ class Runtime:
             left = arms.owned_processes(self.root)
         result['left'] = left
         if left:
-            result['reclaimed_by_harness'] = arms.reclaim(left)
+            result['reclaimed_by_harness'] = arms.reclaim(left, self.root)
             result['after_reclaim'] = arms.owned_processes(self.root)
         # Clean means nothing owned is left; a failing `down` is the check's finding, not a leak.
         result['ok'] = not left
@@ -130,7 +130,7 @@ def external_sigterm_exec(rt):
             f"pathlib.Path({str(pidfile)!r}).write_text(json.dumps(dict(parent=os.getpid(),child=child.pid,group=os.getpgrp()))); "
             "time.sleep(30)")
     sentinel = subprocess.Popen(['sleep', '60'], start_new_session=True)
-    result, tree = {}, None
+    result, tree, owned = {}, None, []
     with (rt.out / 'exec.stdout').open('wb') as stdout, (rt.out / 'exec.stderr').open('wb') as stderr:
         process = subprocess.Popen([str(rt.binary), '--json', '-C', str(app), 'exec', '--', sys.executable, '-c', code],
                                    env=rt.env, stdout=stdout, stderr=stderr, start_new_session=True)
@@ -142,6 +142,8 @@ def external_sigterm_exec(rt):
                 return {'error': 'the command never reached the cancellation checkpoint'}
             tree = json.loads(pidfile.read_text())
             time.sleep(0.5)
+            # Identities taken while both are certainly this check's, for the cleanup below.
+            owned = [dict(arms.process_identity(pid) or {}, pid=pid) for pid in [tree['parent'], tree['child']]]
             result['before'] = subprocess.run(['ps', '-o', 'pid=,ppid=,pgid=,command=', '-p',
                                                f'{process.pid},{tree["parent"]},{tree["child"]}'], capture_output=True, text=True).stdout
             process.send_signal(signal.SIGTERM)
@@ -153,15 +155,23 @@ def external_sigterm_exec(rt):
             if process.poll() is None:
                 process.kill()
                 process.wait()
-            # Only the group this check created, identified by its recorded leader.
-            if tree and arms.alive(tree['parent']) and os.getpgid(tree['parent']) == tree['group']:
-                os.killpg(tree['group'], signal.SIGTERM)
+            # Only the exact processes this check started, re-identified before every signal.
+            stop_exact(owned if tree else [])
             sentinel.terminate()
             sentinel.wait()
     seen = result['observed']
     result['passed'] = not seen['command_alive'] and not seen['descendant_alive'] and seen['sentinel_alive']
     result['control_passed'] = seen['sentinel_alive']
     return result
+
+
+def stop_exact(processes):
+    signalled = [p for p in processes if 'started' in p and arms.signal_if_same(p, signal.SIGTERM)]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(arms.same_process(p) for p in signalled):
+        time.sleep(0.1)
+    for process in signalled:
+        arms.signal_if_same(process, signal.SIGKILL)
 
 
 @check('P2-4: `down` then deleting the checkout keeps its port reservations; `gc` does not reclaim them')

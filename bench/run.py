@@ -164,7 +164,7 @@ def teardown(arm, workspace, root, env, binary, out, label, seen=None):
     result.update(left=left, down_ok=down_ok, ok=not any(left.values()))
     if left['owned_processes']:
         # Arm teardown failed to stop these; the harness stops them so trials cannot interfere.
-        result['reclaimed_by_harness'] = arms.reclaim(left['owned_processes'])
+        result['reclaimed_by_harness'] = arms.reclaim(left['owned_processes'], root)
         result['after_reclaim'] = arms.residue(arm, workspace, root, tracked)
     result['disk_after_down'] = arms.disk_usage(root, arm, workspace)
     return result
