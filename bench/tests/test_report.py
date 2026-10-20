@@ -48,6 +48,8 @@ class TrialRecords:
         self.agent = {'argv': argv, 'cwd': runtime + '/app', 'started_unix_ns': now + 1, 'timed_out': False, 'receipt': 'agent',
                       'exit_code': 0, 'elapsed_ns': 10**9}
         self.summary['finished_agent_unix_ns'] = now + 2 + 10**9
+        self.summary['finished_unix_ns'] = now + 60 * 10**9
+        self.step_started = self.summary['finished_agent_unix_ns'] + 10
         self.left = EMPTY
         self.agent_cleanup, self.final_cleanup = teardown_record(), None
         self.checks = {name: True for name in arms.TASKS[self.task]['required_checks']}
@@ -64,7 +66,9 @@ class TrialRecords:
         self.write_text(name, json.dumps(value))
 
     def step(self, name, exit_code, stdout=''):
-        self.write(f'{name}.json', {'exit_code': exit_code, 'timed_out': False, 'elapsed_ns': 2 * 10**9, 'receipt': name})
+        self.write(f'{name}.json', {'exit_code': exit_code, 'timed_out': False, 'elapsed_ns': 2 * 10**9,
+                                   'started_unix_ns': self.step_started, 'receipt': name})
+        self.step_started += 2 * 10**9
         self.write_text(f'{name}.stdout', stdout)
 
     def graded_steps(self, prefix, checks):
@@ -82,12 +86,17 @@ class TrialRecords:
         grade = {'outcome': self.outcome, 'cleanup': self.grade_cleanup, 'seconds': {'setup': 2.0}}
         self.step('grade-setup', 0)
         if self.outcome == 'graded':
+            if arms.PROJECTS[arms.TASKS[self.task]['project']]['app']:
+                self.step('grade-up', 0)
+                grade['seconds']['up'] = 2.0
             self.graded_steps('grade', self.checks)
             grade['passed'] = all(self.checks.values()) and self.smoke_exit == 0
         else:
             self.step('grade-up', 1)
+            grade['seconds']['up'] = 2.0
             grade.update(passed=False, failed_step='up', failed_receipt='grade-up')
             if self.control is not None:
+                self.step('grade-control-setup', 0)
                 self.step('grade-control-up', 0 if self.control else 1)
                 self.graded_steps('grade-control', {name: self.control for name in self.checks})
                 grade['startup_control'] = {'outcome': 'graded', 'passed': self.control, 'cleanup': teardown_record()}
@@ -145,6 +154,10 @@ class ReportTest(unittest.TestCase):
 
     def report(self):
         return bench.report(SimpleNamespace(plan=str(self.plan_path), results=str(self.root / 'results')))
+
+    def catalog_plan(self):
+        self.plan_path = self.root / 'catalog-plan.json'
+        self.plan = bench.make_plan(plan_args(self.plan_path, repeats=1, tasks=['catalog-sku-uniqueness']))
 
     def review(self, records, **changes):
         review = bench.review_template(SimpleNamespace(plan=str(self.plan_path), id=records.trial['id'], results=str(self.root / 'results')))
@@ -317,6 +330,7 @@ class ReportTest(unittest.TestCase):
     # ---- finding 4: a submission that cannot start is a scored failure ----
 
     def test_failed_start_with_passing_control_is_a_scored_failure(self):
+        self.catalog_plan()
         for index in range(2):
             self.review(self.sealed(index, outcome='startup_failed', control=True))
         report = self.report()
@@ -328,10 +342,12 @@ class ReportTest(unittest.TestCase):
         self.assertTrue(report['complete'])
 
     def test_failed_start_whose_control_also_fails_is_infrastructure(self):
+        self.catalog_plan()
         self.review(self.sealed(outcome='startup_failed', control=False))
         self.assertIn('the startup control did not pass, so the failure is not attributable to the submission', self.row()['problems'])
 
     def test_failed_start_without_a_control_is_invalid(self):
+        self.catalog_plan()
         self.review(self.sealed(outcome='startup_failed', control=None))
         self.assertEqual(self.row()['status'], 'invalid')
 
@@ -381,6 +397,115 @@ class ReportTest(unittest.TestCase):
         summary = json.loads((records.out / 'summary.json').read_text())
         records.edit_summary(agent=dict(summary['agent'], elapsed_ns=1))
         self.assertIn('summary agent result contradicts agent.json', self.row()['problems'])
+
+    def test_startup_timing_is_typed_finite_nonnegative_and_inside_the_trial(self):
+        for change in [{'elapsed_ns': -10**9}, {'elapsed_ns': 'oops'}, {'elapsed_ns': True}, {'elapsed_ns': 1.5},
+                       {'elapsed_ns': float('inf')}, {'elapsed_ns': float('nan')}, {'elapsed_ns': 10**1000},
+                       {'elapsed_ns': 10**15}, {'started_unix_ns': None}, {'started_unix_ns': -1},
+                       {'started_unix_ns': self.plan['created_unix_ns'] - 1}]:
+            with self.subTest(change=change):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed()
+                setup = json.loads((records.out / 'grade-setup.json').read_text())
+                records.replace_record('grade-setup.json', {**setup, **change})
+                self.review(records)
+                self.review(self.sealed(1))
+                report = self.report()
+                row = report['rows'][0]
+                self.assertEqual(row['status'], 'invalid')
+                self.assertIsNone(row['startup_seconds']['setup'])
+                self.assertFalse(row['verified_task'])
+                self.assertFalse(row['autonomous'])
+                self.assertFalse(report['publishable'])
+                self.assertEqual(report['rows'][1]['status'], 'passed')
+
+    def test_setup_receipt_cannot_disappear_with_its_hash_or_summary_seconds(self):
+        for remove_seconds in [False, True]:
+            with self.subTest(remove_seconds=remove_seconds):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed()
+                summary = json.loads((records.out / 'summary.json').read_text())
+                (records.out / 'grade-setup.json').unlink()
+                summary['evidence_sha256'].pop('grade-setup.json')
+                if remove_seconds:
+                    grade = summary['grade']
+                    grade.pop('seconds')
+                    records.write('grade.json', grade)
+                    summary['evidence_sha256']['grade.json'] = arms.digest(records.out / 'grade.json')
+                records.edit_summary(**summary)
+                self.assertIn('grade-setup.json missing', self.row()['problems'])
+                self.assertIsNone(self.row()['startup_seconds']['setup'])
+
+    def test_service_start_and_control_require_setup_and_up_but_tools_only_has_no_up(self):
+        self.catalog_plan()
+        for outcome, name in [('graded', 'grade-up.json'), ('startup_failed', 'grade-control-setup.json')]:
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed(outcome=outcome, control=True)
+                summary = json.loads((records.out / 'summary.json').read_text())
+                (records.out / name).unlink()
+                summary['evidence_sha256'].pop(name)
+                records.edit_summary(**summary)
+                self.assertIn(f'{name} missing', self.row()['problems'])
+                self.assertEqual(self.row()['status'], 'invalid')
+
+    def test_startup_metrics_include_retries_and_reject_unreachable_attempts(self):
+        records = self.sealed()
+        setup = json.loads((records.out / 'grade-setup.json').read_text())
+        records.replace_record('grade-setup.json', dict(setup, exit_code=1))
+        retry = dict(setup, receipt='grade-setup-attempt-2', started_unix_ns=setup['started_unix_ns'] + setup['elapsed_ns'])
+        records.replace_record('grade-setup-attempt-2.json', retry)
+        grade = json.loads((records.out / 'grade.json').read_text())
+        grade['seconds']['setup'] = 4.0
+        records.replace_record('grade.json', grade, 'grade')
+        self.review(records)
+        self.assertEqual(self.row()['status'], 'passed')
+        self.assertEqual(self.row()['startup_seconds']['setup'], 4.0)
+        records.replace_record('grade-setup-attempt-3.json', dict(retry, elapsed_ns=-1))
+        self.assertEqual(self.row()['status'], 'invalid')
+        self.assertIn('grade-setup-attempt-3.json is unreachable on the recorded startup path', self.row()['problems'])
+
+    def test_summary_startup_seconds_and_overlapping_steps_are_rejected(self):
+        self.catalog_plan()
+        records = self.sealed()
+        grade = json.loads((records.out / 'grade.json').read_text())
+        records.replace_record('grade.json', dict(grade, seconds={'setup': -1, 'up': 2}), 'grade')
+        self.assertIn('grade seconds contradict startup receipts', self.row()['problems'])
+        setup = json.loads((records.out / 'grade-setup.json').read_text())
+        up = json.loads((records.out / 'grade-up.json').read_text())
+        records.replace_record('grade-up.json', dict(up, started_unix_ns=setup['started_unix_ns']))
+        self.assertTrue(any('grade-up.json malformed startup timing' in p for p in self.row()['problems']))
+
+    def test_setup_failure_does_not_require_an_unreachable_up_or_verifier(self):
+        self.catalog_plan()
+        records = self.sealed(outcome='setup_failed')
+        summary = json.loads((records.out / 'summary.json').read_text())
+        (records.out / 'grade-up.json').unlink()
+        summary['evidence_sha256'].pop('grade-up.json')
+        records.edit_summary(**summary)
+        setup = json.loads((records.out / 'grade-setup.json').read_text())
+        records.replace_record('grade-setup.json', dict(setup, exit_code=1))
+        for attempt in [2, 3]:
+            name = f'grade-setup-attempt-{attempt}'
+            records.replace_record(name + '.json', dict(setup, exit_code=1, receipt=name,
+                                   started_unix_ns=setup['started_unix_ns'] + (attempt - 1) * setup['elapsed_ns']))
+        grade = json.loads((records.out / 'grade.json').read_text())
+        grade.update(failed_step='setup', failed_receipt='grade-setup-attempt-3', seconds={'setup': 6.0})
+        records.replace_record('grade.json', grade, 'grade')
+        self.assertEqual(self.row()['status'], 'invalid')  # infrastructure still stays invalid
+        self.assertEqual(self.row()['startup_seconds'], {'setup': 6.0, 'up': None})
+        self.assertFalse(any(' missing' in p for p in self.row()['problems']))
+
+    def test_one_malformed_summary_does_not_abort_the_other_assigned_rows(self):
+        first = self.sealed()
+        (first.out / 'summary.json').write_text('null')
+        self.review(self.sealed(1))
+        report = self.report()
+        self.assertEqual([row['status'] for row in report['rows']], ['invalid', 'passed'])
+        self.assertFalse(report['publishable'])
+        (first.out / 'summary.json').write_text(json.dumps({'evidence_sha256': ['bad']}))
+        self.review(first)
+        self.assertEqual([row['status'] for row in self.report()['rows']], ['invalid', 'passed'])
 
     def test_usage_must_be_finite_typed_and_bound_to_a_file(self):
         records = self.sealed()

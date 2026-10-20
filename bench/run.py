@@ -298,6 +298,7 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
         result['submitted_files'] = arms.overlay(submission, workspace, full_tree) if submission else {}
         steps = arms.commands(arm, project, binary, arms.verifier_argv(task_id, workspace))
         timings, result['setup_attempts'] = {}, 0
+        result['seconds'] = timings
         for name in ['setup', 'up']:
             for index, argv in enumerate(steps[name]):
                 # Setup only installs locked artifacts, so the harness retries it twice; `up`
@@ -306,10 +307,10 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
                 for attempt in range(attempts):
                     record = invoke(argv, workspace, env, 900, out / f'{label}-{name}{index or ""}')
                     result['setup_attempts'] += name == 'setup'
+                    timings[name] = timings.get(name, 0) + record['elapsed_ns'] / 1e9
                     if record['exit_code'] == 0 or attempt == attempts - 1:
                         break
                     time.sleep(5 * (attempt + 1))
-                timings[name] = timings.get(name, 0) + record['elapsed_ns'] / 1e9
                 if record['exit_code'] != 0:
                     result.update(failed_step=name, failed_receipt=record['receipt'],
                                   outcome='setup_failed' if name == 'setup' else 'startup_failed')
@@ -635,7 +636,12 @@ def number(value, integer=False):
     """A finite, nonnegative number (an int when `integer`); booleans are not numbers here."""
     if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
         return False
-    return math.isfinite(value) and value >= 0
+    if integer:
+        return 0 <= value <= 2**63 - 1
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
 
 
 TOKEN_FIELDS = {'input', 'output', 'cache_read', 'cache_write', 'reasoning', 'total'}
@@ -795,6 +801,74 @@ def graded_verdict(task, directory, hashes, prefix, problems):
     return step_ok(smoke) and acceptance(task, verify, directory)[0]
 
 
+def startup_metrics(graded, task, arm, binary, directory, hashes, prefix, window, problems):
+    """Require the steps reachable on this terminal path, including every setup retry.
+
+    Receipt names come from the arm's commands, never from the supplied hash map. Missing
+    or malformed timing stays None; an arm with no up command has no up timing.
+    """
+    metrics = {'setup': None, 'up': None}
+    outcome = graded.get('outcome')
+    if outcome not in {'graded', 'startup_failed', 'setup_failed', 'infrastructure_failed'}:
+        return metrics
+    steps = arms.commands(arm, TASKS[task]['project'], binary)
+    previous_end, total, consumed = window[0], 0, set()
+    for phase in ['setup', 'up']:
+        if not steps[phase] or (phase == 'up' and outcome == 'setup_failed'):
+            continue
+        elapsed, complete = 0, True
+        for index, _ in enumerate(steps[phase]):
+            base = f'{prefix}-{phase}{index or ""}'
+            last = None
+            for attempt in range(1, (3 if phase == 'setup' else 1) + 1):
+                stem = base if attempt == 1 else f'{base}-attempt-{attempt}'
+                consumed.add(f'{stem}.json')
+                record = receipt(directory, f'{stem}.json', hashes, problems)
+                if record is None:
+                    complete = False
+                    break
+                started, duration = record.get('started_unix_ns'), record.get('elapsed_ns')
+                code = record.get('exit_code')
+                valid = (number(started, integer=True) and number(duration, integer=True)
+                         and type(record.get('timed_out')) is bool and (code is None or type(code) is int)
+                         and record.get('receipt') == stem and number(window[0], integer=True)
+                         and number(window[1], integer=True) and window[0] <= started
+                         and started + duration <= window[1] + 10**9 and started >= previous_end - 10**9)
+                if not valid:
+                    problems.append(f'{stem}.json malformed startup timing or command result')
+                    complete = False
+                else:
+                    elapsed += duration
+                    previous_end = started + duration
+                last = record
+                if step_ok(record):
+                    break
+            should_fail = (phase == 'setup' and outcome == 'setup_failed') or (
+                phase == 'up' and outcome in {'startup_failed', 'infrastructure_failed'})
+            if last is None or step_ok(last) == should_fail:
+                problems.append(f'{base} result contradicts grading outcome {outcome}')
+            if should_fail:
+                if graded.get('failed_step') != phase or last is None or graded.get('failed_receipt') != last.get('receipt'):
+                    problems.append(f'{prefix} failed step contradicts startup receipts')
+                break
+        if complete:
+            metrics[phase] = elapsed / 1e9
+            total += elapsed
+    if number(window[0], integer=True) and number(window[1], integer=True) and total > window[1] - window[0] + 10**9:
+        problems.append(f'{prefix} cumulative startup timing exceeds the trial window')
+        metrics = {'setup': None, 'up': None}
+    if 'seconds' in graded:
+        seconds = graded['seconds']
+        expected = {key: value for key, value in metrics.items() if value is not None}
+        if not (isinstance(seconds, dict) and set(seconds) == set(expected)
+                and all(number(seconds[k]) and math.isclose(seconds[k], v, rel_tol=1e-9, abs_tol=1e-9)
+                        for k, v in expected.items())):
+            problems.append(f'{prefix} seconds contradict startup receipts')
+    unexpected = {name for name in hashes if re.fullmatch(re.escape(prefix) + r'-(?:setup|up)\d*(?:-attempt-\d+)?\.json', name)} - consumed
+    problems += [f'{name} is unreachable on the recorded startup path' for name in sorted(unexpected)]
+    return metrics
+
+
 def derive(result, trial, plan, plan_path, directory):
     """Re-derive a trial's verdict from its hashed records; return (facts, problems).
 
@@ -897,6 +971,9 @@ def derive(result, trial, plan, plan_path, directory):
             problems.append('summary grade contradicts grade.json')
         outcome = graded.get('outcome')
         facts['outcome'] = outcome
+        window = (result.get('started_unix_ns'), result.get('finished_unix_ns'))
+        facts['startup_seconds'] = startup_metrics(graded, trial['task'], trial['arm'], Path(plan['stack_binary']),
+                                                   directory, hashes, 'grade', window, problems)
         if not clean(graded.get('cleanup')):
             problems.append('the grading runtime left owned processes')
         if outcome == 'graded':
@@ -915,16 +992,13 @@ def derive(result, trial, plan, plan_path, directory):
                 problems.append('the startup control did not pass, so the failure is not attributable to the submission')
             elif not (cleanup_schema(control.get('cleanup')) and clean(control.get('cleanup'))):
                 problems.append('the startup control runtime left owned processes')
+            if isinstance(control, dict):
+                startup_metrics(control, trial['task'], trial['arm'], Path(plan['stack_binary']), directory, hashes,
+                                'grade-control', window, problems)
         else:
             problems.append(f'grading ended {outcome}: {graded.get("error")}')
         if passed != (graded.get('passed') is True) or passed != (result.get('task_passed') is True):
             problems.append('task_passed disagrees with the grader receipts')
-        if 'seconds' in graded:
-            setup = [receipt(directory, name, hashes, problems) for name in sorted(hashes)
-                     if name == 'grade-setup.json' or (name.startswith('grade-setup-attempt-') and name.endswith('.json'))]
-            up = receipt(directory, 'grade-up.json', hashes, problems) if 'grade-up.json' in hashes else None
-            facts['startup_seconds'] = {'setup': sum(r['elapsed_ns'] for r in setup if r) / 1e9,
-                                        'up': up['elapsed_ns'] / 1e9 if up else None}
     facts['verified_task'] = passed and not problems
     return facts, problems
 
@@ -942,7 +1016,13 @@ def report(args):
                 result = json.loads(summary_path.read_text())
             except ValueError:
                 result = {}
-            facts, row['problems'] = derive(result, trial, plan, plan_path, directory)
+            try:
+                facts, row['problems'] = derive(result, trial, plan, plan_path, directory)
+            except (TypeError, ValueError, KeyError, AttributeError, OverflowError, OSError) as error:
+                # One corrupt trial cannot hide the rest of the pre-registered assignments.
+                facts, row['problems'] = {}, [f'malformed trial evidence: {type(error).__name__}: {error}']
+            if not isinstance(result, dict):
+                result = {}
             if result.get('valid') is not True and not row['problems']:
                 row['problems'].append('trial marked itself invalid')
             row.update({key: facts.get(key) for key in ['outcome', 'agent_seconds', 'agent_exit', 'timed_out', 'startup_seconds',
@@ -953,7 +1033,10 @@ def report(args):
             if review_path.exists():
                 with contextlib.suppress(ValueError):
                     review = json.loads(review_path.read_text())
-                row['review_problems'] = review_problems(review, trial, plan, summary_path, directory, result)
+                try:
+                    row['review_problems'] = review_problems(review, trial, plan, summary_path, directory, result)
+                except (TypeError, ValueError, KeyError, AttributeError, OverflowError, OSError) as error:
+                    row['review_problems'] = [f'malformed review evidence: {type(error).__name__}: {error}']
             if row['problems']:
                 row['status'] = 'invalid'
             elif review is None or row.get('review_problems'):

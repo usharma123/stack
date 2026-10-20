@@ -103,6 +103,7 @@ class GradeTest(unittest.TestCase):
     def test_setup_retry_that_succeeds_is_graded(self):
         result = FakeRuntime(self.out, {'grade-setup': 1}).grade()
         self.assertEqual((result['outcome'], result['setup_attempts'], result['passed']), ('graded', 2, True))
+        self.assertAlmostEqual(result['seconds']['setup'], 2e-9)  # both attempts count
 
 
 class HiddenDataTest(unittest.TestCase):
