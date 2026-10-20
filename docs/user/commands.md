@@ -93,7 +93,9 @@ load code you edited use `restart`.
 Checks every service now, not from a saved record: the process is alive, its port answers,
 and, for Postgres, Redis and services with an [identity probe](identity-probes.md), that it is
 this checkout's instance. `ok` stays true; `healthy` says whether everything passed, and the
-exit code is 1 when it did not.
+exit code is 1 when it did not. A session whose lease expired is not healthy either, though
+its services still answer: `lease_expired` says why, and that the next `gc` or `up` stops them
+(`stack renew` or any `exec` renews a TTL lease).
 
 ## restart
 

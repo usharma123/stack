@@ -2363,14 +2363,18 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
         .as_ref()
         .is_some_and(|s| s.config_digest != config_digest(ctx, &report));
     let artifacts = (!report.pins().is_empty()).then(|| report.current_artifacts());
+    // Services of an expired lease still answer, but the next `gc` or `up` stops them: not
+    // something to rely on, so not healthy.
+    let lease_expired = session
+        .as_ref()
+        .and_then(|s| s.lease.as_ref())
+        .and_then(|l| l.expired(now()))
+        .map(|why| format!("{why}; the next `stack gc` or `stack up` stops these services; `stack renew` (or any `stack exec`) renews a TTL lease"));
     Ok(StatusReport {
         artifacts,
-        healthy: !stale && checks.iter().all(|c| c.ready),
+        healthy: !stale && lease_expired.is_none() && checks.iter().all(|c| c.ready),
         stale,
-        lease_expired: session
-            .as_ref()
-            .and_then(|s| s.lease.as_ref())
-            .and_then(|l| l.expired(now())),
+        lease_expired,
         session,
         checks,
     })

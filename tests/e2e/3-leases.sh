@@ -51,8 +51,9 @@ assert_json '.ok and (.data.session.lease.owner_pid > 0)' "$T/owner.json"
 stack exec --require-all -- true
 kill "$RUNNER"
 if wait "$RUNNER"; then fail 'owner unexpectedly exited successfully'; fi
-stack status --json >"$T/owner-status.json"
-assert_json '.data.lease_expired | contains("owner process")' "$T/owner-status.json"
+# Not healthy (exit 1): the next gc or up stops these services.
+if stack status --json >"$T/owner-status.json"; then fail 'status called an expired lease healthy'; fi
+assert_json '(.data.healthy == false) and (.data.lease_expired | contains("owner process"))' "$T/owner-status.json"
 cd "$W/appB" || exit 1
 stack up --json >"$T/reap.json"
 assert_json '.ok and (.data.reaped | length == 1) and .data.reaped[0].stopped' "$T/reap.json"

@@ -587,6 +587,22 @@ fn a_command_without_a_timeout_does_not_wait_unbounded_to_finish_its_record() {
 }
 
 #[test]
+fn an_expired_lease_is_not_healthy_until_it_is_renewed() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "1s"]);
+    thread::sleep(Duration::from_millis(2200));
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status = json_result(&out);
+    assert_eq!(out.status.code(), Some(1), "{status}");
+    assert_eq!(status["data"]["healthy"], false, "{status}");
+    let why = status["data"]["lease_expired"].as_str().unwrap();
+    assert!(why.starts_with("lease expired") && why.contains("the next `stack gc` or `stack up` stops") && why.contains("stack renew"), "{why}");
+    fixture.ok(&["renew"]);
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!((status["data"]["healthy"].clone(), status["data"].get("lease_expired")), (json!(true), None), "{status}");
+}
+
+#[test]
 fn a_renewal_made_while_a_finished_command_waits_for_the_lock_is_kept() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "1s"]);
