@@ -1,0 +1,9 @@
+[project]
+name = "invoice-ledger"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = ["psycopg[binary]==3.3.6", "redis==5.3.1"]
+
+[tool.uv]
+python-downloads = "never"
+python-preference = "only-system"
