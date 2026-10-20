@@ -90,7 +90,9 @@ load code you edited use `restart`.
   reinitialized.
 - **Recreated checkouts** start with empty data. If a checkout at the same path was deleted
   without `down`, its databases are moved to `<data dir>.replaced-<time>` (never deleted) and
-  a warning names them. The same checkout keeps its data across `down` and `up`.
+  a warning names them. A service's data directory is mise's, under its state directory
+  (`$MISE_STATE_DIR/daemons/<hash>/data/<service>`), not under `STACK_DATA_DIR`; `.stack/session.json`
+  names it, and [`gc`](#gc) reports and reclaims a deleted checkout's. The same checkout keeps its data across `down` and `up`.
 - **Result.** `--json` gives one check per service (port, readiness, identity) and the
   session's id and lease. The full record, with PIDs and data directories, is
   `.stack/session.json`.
