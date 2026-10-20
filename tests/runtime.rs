@@ -60,6 +60,13 @@ case "$1" in
   status)
     if test -f "$REVIEW_FIXTURE/pf-status.json"; then cat "$REVIEW_FIXTURE/pf-status.json"; exit 0; fi
     echo "Error: Daemon $3 not found" >&2; exit 1 ;;
+  list)
+    if test -f "$REVIEW_FIXTURE/pf-list.json"; then cat "$REVIEW_FIXTURE/pf-list.json"; else echo '[]'; fi ;;
+  supervisor)
+    case "$2" in
+      status) test -f "$REVIEW_FIXTURE/pf-supervisor" ;;
+      stop) rm -f "$REVIEW_FIXTURE/pf-supervisor" ;;
+    esac ;;
   stop)
     if test -f "$REVIEW_FIXTURE/pf-fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
     kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" ;;
@@ -2148,6 +2155,51 @@ fn sigterm_to_the_mcp_server_stops_a_running_command_answers_and_ends_the_server
     let response: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
     assert_eq!(response["result"]["structuredContent"]["data"]["exit_code"], Value::Null, "{response}");
     drop(input);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_stops_the_supervisor_only_when_asked_and_nothing_else_uses_it() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let pf = dir.join("pf");
+    let run = |args: &[&str]| -> Value {
+        let out = fixture.command(args).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{args:?}: {result}");
+        result
+    };
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    run(&["up", "--json"]);
+    fs::write(dir.join("pf-supervisor"), "").unwrap();
+    // Another checkout's session records the same supervisor (a copy of this one's record).
+    let sessions = dir.join("state/sessions");
+    let mine = fs::read_dir(&sessions).unwrap().next().unwrap().unwrap().path();
+    let mut theirs: Value = serde_json::from_slice(&fs::read(&mine).unwrap()).unwrap();
+    theirs["project"] = json!(dir.join("other"));
+    let theirs_path = sessions.join("0000000000000000.json");
+    fs::write(&theirs_path, theirs.to_string()).unwrap();
+    // A plain down never touches the supervisor.
+    assert!(run(&["down", "--json"])["data"].get("supervisor").is_none());
+    let kept = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
+    assert_eq!(kept["stopped"], false, "{kept}");
+    assert!(kept["reason"].as_str().unwrap().contains("other") && kept["reason"].as_str().unwrap().contains("uses this supervisor"), "{kept}");
+    assert!(dir.join("pf-supervisor").exists());
+    fs::remove_file(&theirs_path).unwrap();
+    // A daemon it tracks, Stack's or not, is still running.
+    fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "running" }]).to_string()).unwrap();
+    let kept = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
+    assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!("daemon someone-else/db is running")), "{kept}");
+    assert!(dir.join("pf-supervisor").exists());
+    // Nothing uses it: stopped, and stopping it again is a no-op.
+    fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }]).to_string()).unwrap();
+    let stopped = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
+    assert_eq!(stopped["stopped"], true, "{stopped}");
+    assert!(!dir.join("pf-supervisor").exists());
+    let again = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
+    assert_eq!((again["stopped"].clone(), again["reason"].clone()), (json!(true), json!("it was not running")), "{again}");
+    let mcp = fixture.mcp(&[("stack_down", json!({ "stop_supervisor": true }))], &[("PITCHFORK_STATE_DIR", pf.to_str().unwrap())]);
+    assert_eq!(mcp[0]["structuredContent"]["data"]["supervisor"]["stopped"], true, "{}", mcp[0]);
 }
 
 #[test]

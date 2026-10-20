@@ -11,7 +11,7 @@
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
-| `stack down` | Stop services and confirm they are gone |
+| `stack down [--stop-supervisor]` | Stop services and confirm they are gone |
 | `stack renew` | Renew this session's lease |
 | `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
@@ -158,6 +158,13 @@ program listening on one of this checkout's ports is reported under `conflicts` 
 alone. A service process the supervisor started for this checkout but lost track of is
 stopped too, listed with `"unrecorded": true`. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
 by name.
+
+The Pitchfork supervisor that ran the services (and its `log-sink` helpers) keeps running
+after `down`: every project using its state directory shares it. `--stop-supervisor` stops it
+too, for a runner that gives each agent a root of its own, but only once this checkout's
+services are confirmed gone, no other checkout's session on the machine records the same
+supervisor, and no daemon it tracks (Stack's or anyone's) is running, waiting or stopping.
+Otherwise it is kept, and `supervisor.reason` says why.
 
 ## gc
 

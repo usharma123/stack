@@ -121,7 +121,12 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Stop services; succeeds only once their processes are gone
-    Down,
+    Down {
+        /// Then stop the Pitchfork supervisor that ran them, unless another session or any
+        /// running daemon still uses it (for a root of its own per agent)
+        #[arg(long)]
+        stop_supervisor: bool,
+    },
     /// Renew this project's session lease
     Renew,
     /// Reclaim sessions with expired leases or deleted projects (machine-wide)
@@ -299,9 +304,16 @@ fn main() -> ExitCode {
         Cmd::Run { task, timeout, args } => {
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
         }
-        Cmd::Down => session::down(&ctx).map(|r| {
+        Cmd::Down { stop_supervisor } => session::down_with(&ctx, *stop_supervisor).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                if let Some(supervisor) = &r.supervisor {
+                    match (supervisor["stopped"].as_bool(), supervisor["reason"].as_str()) {
+                        (Some(true), _) => println!("supervisor stopped"),
+                        (_, Some(reason)) => println!("supervisor kept: {reason}"),
+                        _ => {}
+                    }
+                }
                 for c in &r.conflicts {
                     println!("note: port {} reserved for {} is held by another program{}", c.port, c.service,
                         c.holder.as_ref().map(|h| format!(" (pid {} {})", h.pid, h.command)).unwrap_or_default());

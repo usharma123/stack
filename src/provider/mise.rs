@@ -1094,6 +1094,44 @@ fn pitchfork(bin: &Path, state_dir: &Path, args: &[&str]) -> std::result::Result
     Ok(out)
 }
 
+/// Daemons the supervisor of `state_dir` tracks (`pitchfork list --json`, which reads its state
+/// without starting a supervisor): each one's qualified id and status.
+pub fn supervisor_daemons(bin: &Path, state_dir: &Path) -> std::result::Result<Vec<(String, String)>, String> {
+    let out = pitchfork(bin, state_dir, &["list", "--json"])?;
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+        return Err(format!("pitchfork list: {err}"));
+    }
+    let list: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).map_err(|e| format!("unexpected `pitchfork list --json` output: {e}"))?;
+    Ok(list
+        .iter()
+        .map(|d| (d["id"].as_str().unwrap_or_default().to_string(), d["status"].as_str().unwrap_or_default().to_string()))
+        .collect())
+}
+
+/// Whether the supervisor of `state_dir` answers (`pitchfork supervisor status`).
+pub fn supervisor_running(bin: &Path, state_dir: &Path) -> std::result::Result<bool, String> {
+    Ok(pitchfork(bin, state_dir, &["supervisor", "status"])?.exit_code == Some(0))
+}
+
+/// `pitchfork supervisor stop` for `state_dir`, then wait (up to 10 seconds) until it no longer
+/// answers. Whether it stopped.
+pub fn stop_supervisor(bin: &Path, state_dir: &Path) -> std::result::Result<bool, String> {
+    let out = pitchfork(bin, state_dir, &["supervisor", "stop"])?;
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+        return Err(format!("pitchfork supervisor stop: {err}"));
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until {
+        if !supervisor_running(bin, state_dir)? {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(false)
+}
+
 /// `pitchfork status --json <id>` against the recorded supervisor state directory.
 pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Supervised, String> {
     let out = pitchfork(bin, state_dir, &["status", "--json", id])?;

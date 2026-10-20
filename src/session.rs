@@ -1897,6 +1897,10 @@ pub struct DownReport {
     /// nothing stack started is behind them, and `up` refuses to start over them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<PortConflict>,
+    /// What `--stop-supervisor` did with the supervisor that ran this checkout's services:
+    /// `{stopped, reason}`. Absent without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<Value>,
 }
 
 /// A port reserved for one of this checkout's services that a foreign program holds.
@@ -1912,9 +1916,67 @@ pub struct PortConflict {
 
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
 pub fn down(ctx: &Ctx) -> Result<DownReport> {
+    down_with(ctx, false)
+}
+
+/// [`down`], then with `stop_supervisor` the Pitchfork supervisor that ran this checkout's
+/// services, once they are confirmed gone and only while nothing else needs it (see
+/// [`stop_idle_supervisor`]). For runners that give each agent a root of its own; the
+/// supervisor is otherwise shared, and kept.
+pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     restore_provider_config(ctx)?;
-    down_locked(ctx, None)
+    let recorded = load(ctx)?.and_then(|s| s.provider);
+    let mut report = down_locked(ctx, None)?;
+    if stop_supervisor {
+        report.supervisor = Some(stop_idle_supervisor(ctx, recorded));
+    }
+    Ok(report)
+}
+
+/// Stop the supervisor that ran this checkout's services (the one its session recorded, else
+/// the one its configuration names now), unless another checkout's session on this machine
+/// uses the same supervisor or any daemon it tracks is running, waiting or stopping: the
+/// supervisor is shared by every project using its state directory, including ones Stack does
+/// not manage. What happened, and why not, is the result; nothing here fails `down`.
+fn stop_idle_supervisor(ctx: &Ctx, recorded: Option<ProviderRecord>) -> Value {
+    let kept = |reason: String| json!({ "stopped": false, "reason": reason });
+    let provider = recorded.or_else(|| {
+        let (socket, _) = preflight_socket(ctx).ok()?;
+        let state_dir = socket?.path.parent()?.parent()?.to_path_buf();
+        Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
+    });
+    let Some(provider) = provider else {
+        return kept("no supervisor is configured for this checkout".into());
+    };
+    let sharing: Vec<String> = fs::read_dir(ctx.state.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| read_json::<Session>(&e.path()).ok())
+        .filter(|s| s.project != ctx.root && s.provider.as_ref().is_some_and(|p| p.state_dir == provider.state_dir))
+        .map(|s| s.project.display().to_string())
+        .collect();
+    if let Some(project) = sharing.first() {
+        return kept(format!("the session of {project} uses this supervisor"));
+    }
+    let daemons = match mise::supervisor_daemons(&provider.pitchfork, &provider.state_dir) {
+        Ok(daemons) => daemons,
+        Err(why) => return kept(format!("cannot list the supervisor's daemons: {why}")),
+    };
+    if let Some((id, status)) = daemons.iter().find(|(_, status)| matches!(status.as_str(), "running" | "waiting" | "stopping")) {
+        return kept(format!("daemon {id} is {status}"));
+    }
+    match mise::supervisor_running(&provider.pitchfork, &provider.state_dir) {
+        Ok(false) => return json!({ "stopped": true, "reason": "it was not running" }),
+        Ok(true) => {}
+        Err(why) => return kept(why),
+    }
+    match mise::stop_supervisor(&provider.pitchfork, &provider.state_dir) {
+        Ok(true) => json!({ "stopped": true, "state_dir": provider.state_dir }),
+        Ok(false) => kept("it still answers after `pitchfork supervisor stop`".into()),
+        Err(why) => kept(why),
+    }
 }
 
 /// Write the generated provider configuration from stack.lock when this checkout owns services
@@ -2058,6 +2120,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
             .collect(),
         confirmed: true,
         conflicts,
+        supervisor: None,
     })
 }
 
