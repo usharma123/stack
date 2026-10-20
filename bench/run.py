@@ -505,6 +505,12 @@ def submission_record(baseline, workspace):
     return patch, record
 
 
+def write_record(out, name, value):
+    """One observation as its own evidence file. The report re-derives every verdict from these."""
+    (out / name).write_text(json.dumps(value, indent=2) + '\n')
+    return value
+
+
 def experiment_trial(args):
     plan_path = Path(args.plan).resolve()
     plan = json.loads(plan_path.read_text())
@@ -524,7 +530,7 @@ def experiment_trial(args):
     summary = {'kind': 'agent_trial', 'plan_kind': plan['kind'], 'trial': trial, 'plan_sha256': digest(plan_path),
                'started_unix_ns': time.time_ns(), 'host': platform.platform(), 'stack_sha256': plan['stack_sha256'],
                'locale': plan['locale'], 'cache': str(cache) if cache else 'cold', 'task_passed': False, 'valid': False}
-    before = arms.globals_snapshot()
+    before = write_record(out, 'globals-before.json', arms.globals_snapshot())
     workspace = root = env = None
     try:
         with host_lock():
@@ -539,41 +545,53 @@ def experiment_trial(args):
             (root / 'prompt.txt').write_text(prompt)
             transcript = root / 'transcript'
             transcript.mkdir()
-            argv = agent_argv(plan, trial['model'], {'prompt': prompt, 'prompt_file': str(root / 'prompt.txt'),
-                                                     'workspace': str(workspace), 'transcript_dir': str(transcript)})
+            argv = agent_argv(plan, trial['model'], agent_paths(summary, prompt))
             summary['agent_argv'] = [part.replace(prompt, '<prompt.txt>') for part in argv]
             agent = invoke(argv, workspace, env, plan['budget_seconds'], out / 'agent')
             summary['agent'] = {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']}
             summary['finished_agent_unix_ns'] = time.time_ns()
-            summary['left_running_at_agent_exit'] = arms.residue(trial['arm'], workspace, root, {})
+            summary['left_running_at_agent_exit'] = write_record(out, 'left-at-agent-exit.json', arms.residue(trial['arm'], workspace, root, {}))
             patch, submission = submission_record(baseline, workspace)
             (out / 'submission.patch').write_bytes(patch)
-            (out / 'submission.json').write_text(json.dumps(submission, indent=2) + '\n')
+            write_record(out, 'submission.json', submission)
             summary['changed_files'] = submission['changed']
             shutil.copytree(transcript, out / 'transcript')
-            summary['agent_cleanup'] = teardown(trial['arm'], workspace, root, env, binary, out, 'agent-cleanup')
+            summary['agent_cleanup'] = write_record(out, 'agent-cleanup.json',
+                                                    teardown(trial['arm'], workspace, root, env, binary, out, 'agent-cleanup'))
             graded = grade(trial['task'], trial['arm'], binary, out, 'grade', workspace, cache, plan['locale'],
                            startup_control=True, full_tree=True)
-            summary['grade'] = graded
+            summary['grade'] = write_record(out, 'grade.json', graded)
             summary['task_passed'] = graded['passed'] is True
-            # A submitted app that cannot start, while the reference can, fails the task. Setup,
-            # infrastructure and harness failures leave the trial invalid.
-            cleanups = [graded.get('cleanup'), (graded.get('startup_control') or {}).get('cleanup', {'ok': True})]
-            summary['valid'] = graded['outcome'] in ('graded', 'startup_failed') and all((c or {}).get('ok') is True for c in cleanups)
     except Cancelled as error:
         summary['cancelled'] = str(error)
         raise
     except Exception as error:
         summary['error'] = f'{type(error).__name__}: {error}'
     finally:
-        if workspace is not None and not (summary.get('agent_cleanup') or {}).get('ok'):
-            summary['final_cleanup'] = teardown(trial['arm'], workspace, root, env, binary, out, 'final-cleanup')
-        summary['globals_changed'] = arms.globals_diff(before, arms.globals_snapshot())
-        summary['valid'] = summary['valid'] and not summary['globals_changed'] and 'error' not in summary and 'cancelled' not in summary
+        if workspace is not None and not clean(summary.get('agent_cleanup')):
+            summary['final_cleanup'] = write_record(out, 'final-cleanup.json',
+                                                    teardown(trial['arm'], workspace, root, env, binary, out, 'final-cleanup'))
+        summary['globals_changed'] = arms.globals_diff(before, write_record(out, 'globals-after.json', arms.globals_snapshot()))
+        write_record(out, 'fingerprints-after.json', fingerprints())
         summary['finished_unix_ns'] = time.time_ns()
-        summary['evidence_sha256'] = {str(path.relative_to(out)): digest(path) for path in sorted(out.rglob('*')) if path.is_file()}
-        (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+        summary = seal(summary, out, trial, plan, plan_path)
     return summary
+
+
+def seal(summary, out, trial, plan, plan_path):
+    """Hash every evidence file, judge the trial with the report's own derivation, write the summary."""
+    summary['evidence_sha256'] = {str(path.relative_to(out)): digest(path) for path in sorted(out.rglob('*')) if path.is_file()}
+    summary = json.loads(json.dumps(summary))  # judged exactly as the report will read it
+    summary['problems'] = derive(summary, trial, plan, plan_path, out)[1]
+    summary['valid'] = not summary['problems']
+    (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    return summary
+
+
+def agent_paths(summary, prompt):
+    root = Path(summary['runtime'])
+    return {'prompt': prompt, 'prompt_file': str(root / 'prompt.txt'), 'workspace': summary['workspace'],
+            'transcript_dir': str(root / 'transcript')}
 
 
 def review_template(args):
@@ -588,7 +606,57 @@ def review_template(args):
             'requested_options': plan['agent_options'],
             # Observed values come from the transcript or the harness's own receipt, never from the plan.
             'observed_model': None, 'harness_version': None, 'observed_options': None,
-            'interventions': [], 'help_requests': [], 'workarounds': [], 'tokens': None, 'cost_usd': None, 'notes': ''}
+            'interventions': [], 'help_requests': [], 'workarounds': [],
+            # Provider-reported usage only, each bound to a file by path and sha256; null when absent.
+            'tokens': None, 'cost_usd': None, 'notes': ''}
+
+
+def number(value, integer=False):
+    """A finite, nonnegative number (an int when `integer`); booleans are not numbers here."""
+    if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
+TOKEN_FIELDS = {'input', 'output', 'cache_read', 'cache_write', 'reasoning', 'total'}
+REVIEW_EVIDENCE = 'review-evidence/'
+
+
+def source_problems(source, directory, hashes):
+    """A usage figure's source must be a file in the trial directory whose sha256 matches.
+
+    Files the trial produced (the agent's transcript) are in the evidence hashes already. A file
+    a reviewer adds later, such as a provider usage export, goes under `review-evidence/`.
+    """
+    if not (isinstance(source, dict) and set(source) == {'path', 'sha256'} and isinstance(source['path'], str)
+            and isinstance(source['sha256'], str)):
+        return ['source must be {"path": ..., "sha256": ...}']
+    relative = Path(source['path'])
+    if relative.is_absolute() or '..' in relative.parts:
+        return ['source path must be inside the trial directory']
+    path = directory / relative
+    if not path.is_file() or digest(path) != source['sha256']:
+        return [f'source {source["path"]} is missing or its sha256 differs']
+    if source['path'] in hashes:
+        return [] if hashes[source['path']] == source['sha256'] else [f'source {source["path"]} differs from the trial evidence']
+    return [] if source['path'].startswith(REVIEW_EVIDENCE) else [f'source {source["path"]} is neither trial evidence nor under {REVIEW_EVIDENCE}']
+
+
+def metric_problems(review, directory, hashes):
+    problems = []
+    tokens, cost = review.get('tokens'), review.get('cost_usd')
+    if tokens is not None:
+        counts = {key: value for key, value in tokens.items() if key != 'source'} if isinstance(tokens, dict) else {}
+        if not counts or set(counts) - TOKEN_FIELDS or not all(number(value, integer=True) for value in counts.values()):
+            problems.append(f'tokens must be null or nonnegative integer counts ({", ".join(sorted(TOKEN_FIELDS))}) with a source')
+        else:
+            problems += [f'tokens: {problem}' for problem in source_problems(tokens.get('source'), directory, hashes)]
+    if cost is not None:
+        if not (isinstance(cost, dict) and set(cost) == {'value', 'source'} and number(cost['value'])):
+            problems.append('cost_usd must be null or {"value": finite nonnegative number, "source": ...}')
+        else:
+            problems += [f'cost_usd: {problem}' for problem in source_problems(cost['source'], directory, hashes)]
+    return problems
 
 
 def review_problems(review, trial, plan, summary_path, directory, result):
@@ -608,13 +676,14 @@ def review_problems(review, trial, plan, summary_path, directory, result):
         problems.append('reviewer missing')
     if not isinstance(review.get('harness_version'), str) or not review['harness_version'].strip():
         problems.append('harness_version missing')
+    evidence = result.get('evidence_sha256') or {}
     hashes = review.get('transcript_sha256')
     if not isinstance(hashes, dict) or 'agent.stdout' not in hashes:
         problems.append('transcript hashes missing')
     else:
         for name, value in hashes.items():
             path = directory / name
-            if not path.is_file() or digest(path) != value or result.get('evidence_sha256', {}).get(name) != value:
+            if not path.is_file() or digest(path) != value or evidence.get(name) != value:
                 problems.append(f'transcript {name} does not match the trial evidence')
     window = (result.get('started_unix_ns', 0), result.get('finished_agent_unix_ns', 0))
     events = review.get('interventions')
@@ -625,26 +694,65 @@ def review_problems(review, trial, plan, summary_path, directory, result):
         problems.append('interventions recorded although the plan gives the agent no human channel')
     for event in events:
         if not (isinstance(event, dict) and event.get('kind') in INTERVENTION_KINDS and isinstance(event.get('reason'), str)
-                and isinstance(event.get('active_seconds'), (int, float)) and not isinstance(event.get('active_seconds'), bool)
-                and event['active_seconds'] >= 0 and isinstance(event.get('at_unix_ns'), int)
+                and number(event.get('active_seconds')) and number(event.get('at_unix_ns'), integer=True)
                 and window[0] <= event['at_unix_ns'] <= window[1]):
             problems.append(f'malformed intervention {event!r}')
     for key in ['help_requests', 'workarounds']:
         if not isinstance(review.get(key), list) or not all(isinstance(item, str) for item in review[key]):
             problems.append(f'{key} must be a list of strings')
-    for key in ['tokens', 'cost_usd']:
-        value = review.get(key)
-        if value is None:
-            continue
-        numbers = {k: v for k, v in value.items() if k != 'source'} if isinstance(value, dict) else {}
-        if not (isinstance(value, dict) and isinstance(value.get('source'), str) and value['source'].strip() and numbers
-                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 for v in numbers.values())):
-            problems.append(f'{key} must be null or numbers with a stated source')
-    return problems
+    return problems + metric_problems(review, directory, evidence)
 
 
-def evidence_problems(result, trial, plan, plan_path, directory):
-    problems = []
+def clean(teardown_record):
+    """Nothing owned was running after the arm's own teardown (recomputed, not read from `ok`)."""
+    left = (teardown_record or {}).get('left') if isinstance(teardown_record, dict) else None
+    return isinstance(left, dict) and not any(left.values())
+
+
+def restored(teardown_record):
+    """Clean, or clean once the harness reclaimed the leftovers."""
+    after = teardown_record.get('after_reclaim') if isinstance(teardown_record, dict) else None
+    return clean(teardown_record) or (isinstance(after, dict) and not any(after.values()))
+
+
+def receipt(directory, name, hashes, problems):
+    """A JSON evidence file, only if the summary hashes it and the file still matches."""
+    if name not in hashes:
+        problems.append(f'{name} missing')
+        return None
+    path = directory / name
+    if not path.is_file() or digest(path) != hashes[name]:
+        return None  # reported once as changed
+    try:
+        return json.loads(path.read_text())
+    except ValueError:
+        problems.append(f'{name} unreadable')
+        return None
+
+
+def step_ok(record):
+    return isinstance(record, dict) and record.get('exit_code') == 0 and record.get('timed_out') is False
+
+
+def graded_verdict(task, directory, hashes, prefix, problems):
+    """Both gates from the receipts: the smoke test through exec, and the hidden checks."""
+    smoke = receipt(directory, f'{prefix}-smoke_exec.json', hashes, problems)
+    verify = receipt(directory, f'{prefix}-verify.json', hashes, problems)
+    if f'{prefix}-verify.stdout' not in hashes:
+        problems.append(f'{prefix}-verify.stdout missing')
+        return False
+    if verify is None or smoke is None:
+        return False
+    return step_ok(smoke) and acceptance(task, verify, directory)[0]
+
+
+def derive(result, trial, plan, plan_path, directory):
+    """Re-derive a trial's verdict from its hashed records; return (facts, problems).
+
+    The summary's own booleans are never trusted. Each critical value is recomputed from the
+    record that observed it, and a summary that disagrees with its records is invalid.
+    """
+    problems, facts = [], {}
     if result.get('kind') != 'agent_trial' or result.get('plan_kind') != plan['kind']:
         problems.append('not an agent trial of this plan')
     if result.get('trial') != trial or result.get('plan_sha256') != digest(plan_path):
@@ -653,18 +761,114 @@ def evidence_problems(result, trial, plan, plan_path, directory):
         problems.append('binary or locale differs from the plan')
     if not result.get('started_unix_ns', 0) >= plan['created_unix_ns']:
         problems.append('started before the plan existed')
-    hashes = result.get('evidence_sha256') or {}
-    required = {'agent.json', 'agent.stdout', 'agent.stderr', 'submission.patch', 'grade-verify.stdout', 'grade-verify.json'}
-    problems += [f'{name} missing' for name in sorted(required - set(hashes))]
+    for key in ['error', 'cancelled']:
+        if key in result:
+            problems.append(f'trial {key}: {result[key]}')
+    hashes = result.get('evidence_sha256')
+    if not isinstance(hashes, dict):
+        return facts, problems + ['evidence hashes missing']
     problems += [f'{name} changed' for name, value in hashes.items() if not (directory / name).is_file() or digest(directory / name) != value]
-    if result.get('valid') is not True:
-        problems.append('trial marked invalid: ' + str(result.get('error') or result.get('grade', {}).get('error') or 'cleanup or globals'))
-    if (directory / 'grade-verify.json').is_file():
-        verify = json.loads((directory / 'grade-verify.json').read_text())
-        passed, _ = acceptance(trial['task'], verify, directory)
-        if passed != result.get('task_passed'):
-            problems.append('task_passed disagrees with the grader receipt')
-    return problems
+    extra = sorted(str(path.relative_to(directory)) for path in directory.rglob('*') if path.is_file())
+    extra = [name for name in extra if name not in hashes and name not in {'summary.json', 'review.json'}
+             and not name.startswith(REVIEW_EVIDENCE)]
+    problems += [f'{name} is not in the trial evidence' for name in extra]
+    for name in ['prompt.txt', 'agent.stdout', 'agent.stderr', 'submission.patch']:
+        if name not in hashes:
+            problems.append(f'{name} missing')
+
+    # The agent: its receipt, the exact planned invocation, and timing.
+    agent = receipt(directory, 'agent.json', hashes, problems)
+    if agent is not None:
+        exit_code = agent.get('exit_code')
+        if not (number(agent.get('elapsed_ns'), integer=True) and isinstance(agent.get('timed_out'), bool)
+                and (exit_code is None or (isinstance(exit_code, int) and not isinstance(exit_code, bool)))
+                and number(agent.get('started_unix_ns'), integer=True)):
+            problems.append('agent receipt is malformed')
+        else:
+            if {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']} != result.get('agent'):
+                problems.append('summary agent result contradicts agent.json')
+            finished = result.get('finished_agent_unix_ns')
+            if not (number(finished, integer=True) and result.get('started_unix_ns', 0) <= agent['started_unix_ns']
+                    and agent['started_unix_ns'] + agent['elapsed_ns'] <= finished + 10**9):
+                problems.append('agent timing is outside the trial window')
+            facts.update(agent_seconds=agent['elapsed_ns'] / 1e9, agent_exit=agent['exit_code'], timed_out=agent['timed_out'])
+        if (directory / 'prompt.txt').is_file() and 'runtime' in result and 'workspace' in result:
+            expected = agent_argv(plan, trial['model'], agent_paths(result, (directory / 'prompt.txt').read_text()))
+            if agent.get('argv') != expected:
+                problems.append('agent invocation differs from the planned command, model or options')
+
+    # What was running when the agent stopped, and whether cleanup restored the host.
+    left = receipt(directory, 'left-at-agent-exit.json', hashes, problems)
+    if left is not None:
+        if left != result.get('left_running_at_agent_exit'):
+            problems.append('summary left_running contradicts left-at-agent-exit.json')
+        split = arms.left_services(left) if isinstance(left, dict) else {'services': True, 'supervisor_processes': []}
+        facts.update(left_running=split['services'], supervisor_left=bool(split['supervisor_processes']))
+    agent_cleanup = receipt(directory, 'agent-cleanup.json', hashes, problems)
+    final_cleanup = receipt(directory, 'final-cleanup.json', hashes, problems) if 'final-cleanup.json' in hashes else None
+    if agent_cleanup is not None:
+        if agent_cleanup != result.get('agent_cleanup'):
+            problems.append('summary agent_cleanup contradicts agent-cleanup.json')
+        facts['arm_teardown_clean'] = clean(agent_cleanup)
+        if not (restored(agent_cleanup) or (final_cleanup is not None and restored(final_cleanup))):
+            problems.append('owned processes were still running after cleanup')
+        if not clean(agent_cleanup) and final_cleanup is None:
+            problems.append('arm teardown left processes but no final cleanup was recorded')
+
+    # Global state and benchmark files, before and after.
+    before = receipt(directory, 'globals-before.json', hashes, problems)
+    after = receipt(directory, 'globals-after.json', hashes, problems)
+    if before is not None and after is not None:
+        changed = arms.globals_diff(before, after)
+        if changed:
+            problems.append(f'global state changed: {changed}')
+        if changed != result.get('globals_changed'):
+            problems.append('summary globals_changed contradicts the global receipts')
+    after_files = receipt(directory, 'fingerprints-after.json', hashes, problems)
+    if after_files is not None and after_files != plan['fingerprints']:
+        problems.append('benchmark files changed during the trial')
+
+    # The submission and its grade.
+    submission = receipt(directory, 'submission.json', hashes, problems)
+    if submission is not None and submission.get('changed') != result.get('changed_files'):
+        problems.append('summary changed_files contradicts submission.json')
+    graded = receipt(directory, 'grade.json', hashes, problems)
+    passed = False
+    if graded is not None:
+        if graded != result.get('grade'):
+            problems.append('summary grade contradicts grade.json')
+        outcome = graded.get('outcome')
+        facts['outcome'] = outcome
+        if not clean(graded.get('cleanup')):
+            problems.append('the grading runtime left owned processes')
+        if outcome == 'graded':
+            passed = graded_verdict(trial['task'], directory, hashes, 'grade', problems)
+        elif outcome == 'startup_failed':
+            # A task failure only if the receipts show the submitted app failing to start and the
+            # reference passing in its control runtime.
+            up = receipt(directory, 'grade-up.json', hashes, problems)
+            if up is None or step_ok(up):
+                problems.append('startup_failed without a failing grade-up receipt')
+            if 'grade-verify.json' in hashes:
+                problems.append('startup_failed but a verifier receipt exists')
+            control = graded.get('startup_control')
+            if not (isinstance(control, dict) and step_ok(receipt(directory, 'grade-control-up.json', hashes, problems))
+                    and graded_verdict(trial['task'], directory, hashes, 'grade-control', problems)):
+                problems.append('the startup control did not pass, so the failure is not attributable to the submission')
+            elif not clean(control.get('cleanup')):
+                problems.append('the startup control runtime left owned processes')
+        else:
+            problems.append(f'grading ended {outcome}: {graded.get("error")}')
+        if passed != (graded.get('passed') is True) or passed != (result.get('task_passed') is True):
+            problems.append('task_passed disagrees with the grader receipts')
+        if 'seconds' in graded:
+            setup = [receipt(directory, name, hashes, problems) for name in sorted(hashes)
+                     if name == 'grade-setup.json' or (name.startswith('grade-setup-attempt-') and name.endswith('.json'))]
+            up = receipt(directory, 'grade-up.json', hashes, problems) if 'grade-up.json' in hashes else None
+            facts['startup_seconds'] = {'setup': sum(r['elapsed_ns'] for r in setup if r) / 1e9,
+                                        'up': up['elapsed_ns'] / 1e9 if up else None}
+    facts['verified_task'] = passed and not problems
+    return facts, problems
 
 
 def report(args):
@@ -680,30 +884,31 @@ def report(args):
                 result = json.loads(summary_path.read_text())
             except ValueError:
                 result = {}
-            row['problems'] = evidence_problems(result, trial, plan, plan_path, directory)
+            facts, row['problems'] = derive(result, trial, plan, plan_path, directory)
+            if result.get('valid') is not True and not row['problems']:
+                row['problems'].append('trial marked itself invalid')
+            row.update({key: facts.get(key) for key in ['outcome', 'agent_seconds', 'agent_exit', 'timed_out', 'startup_seconds',
+                                                         'left_running', 'supervisor_left', 'arm_teardown_clean']})
+            row['verified_task'] = facts.get('verified_task') is True and not row['problems']
             review_path = directory / 'review.json'
             review = None
             if review_path.exists():
                 with contextlib.suppress(ValueError):
                     review = json.loads(review_path.read_text())
                 row['review_problems'] = review_problems(review, trial, plan, summary_path, directory, result)
-            agent = result.get('agent') or {}
-            left = result.get('left_running_at_agent_exit')
-            split = arms.left_services(left) if isinstance(left, dict) else {'services': True, 'supervisor_processes': []}
-            row.update(verified_task=result.get('task_passed') is True and not row['problems'],
-                       left_running=split['services'], supervisor_left=bool(split['supervisor_processes']),
-                       agent_seconds=(agent.get('elapsed_ns') or 0) / 1e9,
-                       agent_exit=agent.get('exit_code'), timed_out=agent.get('timed_out'),
-                       startup_seconds=(result.get('grade') or {}).get('seconds'))
             if row['problems']:
                 row['status'] = 'invalid'
             elif review is None or row.get('review_problems'):
                 row['status'] = 'unreviewed' if review is None else 'review_invalid'
             else:
-                row['status'] = 'passed' if row['verified_task'] else ('timed_out' if agent.get('timed_out') else 'failed')
-                row['autonomous'] = row['verified_task'] and not review['interventions'] and not row['left_running']
+                row['status'] = 'passed' if row['verified_task'] else ('timed_out' if row['timed_out'] else 'failed')
+                # Autonomous: verified, no human help, nothing left running at agent exit, and the
+                # arm's own teardown stopped everything without the harness reclaiming by PID.
+                row['autonomous'] = (row['verified_task'] and not review['interventions'] and row['left_running'] is False
+                                     and row['arm_teardown_clean'] is True)
                 row.update(interventions=len(review['interventions']), help_requests=len(review['help_requests']),
-                           workarounds=review['workarounds'], tokens=review['tokens'], cost_usd=review['cost_usd'])
+                           workarounds=review['workarounds'], tokens=review['tokens'], cost_usd=review['cost_usd'],
+                           observed_options=review['observed_options'])
         rows.append(row)
     scored = {'passed', 'failed', 'timed_out'}
     counts = {}
@@ -711,6 +916,7 @@ def report(args):
         subset = [row for row in rows if row['arm'] == arm]
         counts[arm] = {'assigned': len(subset), 'autonomous': sum(row['autonomous'] for row in subset),
                        'verified_task': sum(row['verified_task'] for row in subset),
+                       'startup_failed': sum(row.get('outcome') == 'startup_failed' and row['status'] in scored for row in subset),
                        'left_services_running': sum(bool(row.get('left_running')) for row in subset),
                        'supervisor_left_running': sum(bool(row.get('supervisor_left')) for row in subset),
                        **{status: sum(row['status'] == status for row in subset)
@@ -726,11 +932,14 @@ def report(args):
             'complete': complete, 'counts': counts, 'pairs': pairs,
             'discordant': {'stack_only': sum(p['stack'] and not p['existing'] for p in pairs),
                            'existing_only': sum(p['existing'] and not p['stack'] for p in pairs)},
+            'agent_options': plan['agent_options'] if plan.get('agent_options_controlled') else 'harness defaults (not controlled by the plan)',
             'rows': rows,
             'limits': ['Synthetic pilot tasks on one host; descriptive only. No speedup or significance is computed.',
                        'Every assigned trial stays in the denominator; not_run, invalid and unreviewed are not successes.',
-                       'Autonomous = verified task, no recorded human help, nothing left running at agent exit.',
-                       'Model identity, help and cost come from a human transcript review, not the agent.']}
+                       'Autonomous = verified task (hidden checks and smoke test), no recorded human help, nothing left '
+                       'running at agent exit, and the arm teardown stopped everything itself.',
+                       'Every verdict is re-derived from hashed receipts; a summary that contradicts them is invalid.',
+                       'Model identity, effective options, help and usage come from a human transcript review, not the agent.']}
 
 
 def main():
