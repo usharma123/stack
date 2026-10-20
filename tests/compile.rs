@@ -283,6 +283,28 @@ fn custom_services_get_their_loopback_address_as_their_url() {
 }
 
 #[test]
+fn the_lock_names_the_stack_that_wrote_it_without_ever_going_stale_for_it() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\njq = \"1.7\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let path = root.join("stack.lock");
+    let text = fs::read_to_string(&path).unwrap();
+    let me = format!("written_by = \"stack {}\"", env!("CARGO_PKG_VERSION"));
+    assert!(text.contains(&me), "{text}");
+    // Another release wrote it: nothing it pins differs, so it is neither outdated nor rewritten,
+    // and compile says which release wrote it.
+    let other = text.replace(&me, "written_by = \"stack 0.0.1\"");
+    fs::write(&path, &other).unwrap();
+    sb.compile(&root, Mode::Frozen).unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), other, "an unchanged lock is not rewritten");
+    assert!(report.warnings.iter().any(|w| w.contains("last written by stack 0.0.1")), "{:?}", report.warnings);
+    // A lock without the field (Stack 0.1.22 and earlier) is current too.
+    fs::write(&path, text.replace(&format!("{me}\n"), "")).unwrap();
+    sb.compile(&root, Mode::Frozen).unwrap();
+}
+
+#[test]
 fn service_dependencies_must_name_services_and_never_form_a_cycle() {
     let sb = Sandbox::new();
     let error = |text: &str| sb.compile(&sb.project(text), Mode::UseLock).unwrap_err();

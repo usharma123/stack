@@ -198,7 +198,12 @@ is why Stack does not do this for you.
 ## doctor and setup
 
 `doctor` checks mise, git and tar, that Pitchfork's socket path fits the platform limit, that
-mise is new enough for the project's options and lock, and that the project compiles. When
+mise is new enough for the project's options and lock, and that the project compiles. Its
+`stack` check names this release and binary, and warns when another `stack` comes first on
+`PATH` (which hooks, agents and `stack mcp` registrations run) or when `stack.lock` was last
+written by another release. `stack.lock` records that release as `written_by`; it is not part
+of what the lock pins, so it never makes the lock outdated, and `compile` changes it only when
+it rewrites the lock anyway (and otherwise warns when it differs). When
 the stack uses fnox it also checks the declared secret names, without reading any values.
 
 Pitchfork's socket lives under its state directory. On macOS, if `up` reports

@@ -364,7 +364,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         outcome = lock_artifacts(previous.as_ref(), &new_lock, &pins, &policy, opts)?;
         new_lock.provider_lock = outcome.provider_lock.take();
     }
-    let lock_changed = previous.as_ref() != Some(&new_lock);
+    let lock_changed = !previous.as_ref().is_some_and(|p| p.same_pins(&new_lock));
     if opts.mode == Mode::Frozen && lock_changed {
         return Err(
             StackError::new("lock_outdated", "stack.toml and stack.lock disagree")
@@ -425,6 +425,10 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     };
 
     let mut warnings = warnings(&stack);
+    // A lock another Stack release wrote (often a different `stack` first on someone's PATH).
+    if let Some(other) = previous.as_ref().and_then(|p| p.written_by.clone()).filter(|w| *w != lock::writer() && !lock_changed) {
+        warnings.push(format!("stack.lock was last written by {other}, and this is {}; check which `stack` your PATH runs (`stack doctor`)", lock::writer()));
+    }
     warnings.extend(outcome.warnings);
     warnings.extend(ignore_warning);
     let lock = if opts.write || opts.mode == Mode::Frozen { Some(new_lock) } else { previous };

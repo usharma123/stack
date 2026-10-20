@@ -4817,6 +4817,34 @@ fn a_mise_version_that_misses_its_first_deadline_is_asked_again() {
 }
 
 #[test]
+fn doctor_names_another_stack_first_on_path_and_the_release_that_wrote_the_lock() {
+    let fixture = Fixture::new();
+    let check = |fixture: &Fixture| -> Value {
+        let out = fixture.command(&["doctor", "--json"]).output().unwrap();
+        let result = json_result(&out);
+        let checks = result["data"].as_array().or(result["error"]["details"].as_array()).unwrap().clone();
+        checks.into_iter().find(|c| c["name"] == "stack").unwrap_or_else(|| panic!("{result}"))
+    };
+    let other = fixture.dir.path().join("bin/stack");
+    write_exe(&other, "#!/bin/sh\necho 'stack 0.0.9'\n");
+    let found = check(&fixture);
+    let detail = found["detail"].as_str().unwrap();
+    assert!(detail.starts_with(&format!("stack {}", env!("CARGO_PKG_VERSION"))), "{found}");
+    assert!(detail.contains("`stack` on PATH is") && detail.contains("(stack 0.0.9), not this one"), "{found}");
+    assert_eq!(found["ok"], true, "a notice, not a failure: {found}");
+    // This very binary first on PATH: nothing to say about it.
+    fs::remove_file(&other).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stack"), &other).unwrap();
+    let lock = fixture.dir.path().join("app/stack.lock");
+    let text = fs::read_to_string(&lock).unwrap();
+    fs::write(&lock, text.replace(&format!("written_by = \"stack {}\"", env!("CARGO_PKG_VERSION")), "written_by = \"stack 0.0.9\"")).unwrap();
+    let found = check(&fixture);
+    let detail = found["detail"].as_str().unwrap();
+    assert!(!detail.contains("on PATH is"), "{found}");
+    assert!(detail.contains("stack.lock was last written by stack 0.0.9"), "{found}");
+}
+
+#[test]
 fn stacks_without_mr_boxington_never_ask_for_the_provider_release() {
     let fixture = Fixture::new();
     fs::write(fixture.dir.path().join("mise-version"), "2020.1.1\n").unwrap();
