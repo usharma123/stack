@@ -11,6 +11,10 @@ each, and tasks the tester wrote and graded.
 | GPT-6 Astra | [astra/REPORT.md](astra/REPORT.md) | [astra/](astra/), see [astra/README.md](astra/README.md) |
 
 The synthesis across both, and the benchmark built from them, is in [SYNTHESIS.md](SYNTHESIS.md).
+Fixes for their findings, one commit per finding on `fix/agentdx-findings-20261020`, are
+classified in [REMEDIATION-LEDGER.md](REMEDIATION-LEDGER.md). How they were tested, including
+the first bounded real-agent pilot, is in [REMEDIATION.md](REMEDIATION.md). The reports and the
+synthesis are left as they were written.
 
 ## Provenance of these copies
 

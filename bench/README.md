@@ -22,13 +22,19 @@ competitor benchmark is retired to [eval/archive/competitor-20261006](../eval/ar
 | Stack regression checks for the hands-on findings | `regressions.py` | Implemented, run on 0.1.22 |
 | Offline unit tests | `tests/` | Counterexamples for grading, required observations, timing, cleanup and submission capture; run counts in the synthesis |
 
-**No real agent trial has been run yet.** Real testing is authorized. What is still open is
-the configuration of a first run: which agent CLI and version, which model IDs and options,
-how the CLI's credentials reach a trial (the runner keeps `HOME` and isolates
-`XDG_CONFIG_HOME`), and the spend limit per trial and in total. Once those are chosen, start
-with a bounded pilot, for example one model on the three tasks with two repetitions (12
-trials), before any larger study. Every number so far comes from scripted validation,
-self-tests or regression checks, and none of it is agent evidence.
+**One bounded real-agent pilot has run**, on the remediation branch
+(`fix/agentdx-findings-20261020`). It used Claude Code 2.1.304 with `claude-opus-5-5`, effort
+`high`, on the three tasks in both arms, one repetition each: six trials, 600 s budget, warm
+cache, local macOS.
+
+- All six passed the hidden checks and the smoke test.
+- None is counted autonomous, because no human transcript review exists yet.
+- The report is not publishable, and six trials support no comparison between the arms.
+
+The plan, receipts and report are described in
+[eval/agentdx-20261020/REMEDIATION.md](../eval/agentdx-20261020/REMEDIATION.md#real-agent-pilot).
+A larger study, other models and hosted runs are not configured. All other numbers come from
+scripted validation, self-tests or regression checks.
 
 ## The tasks
 
@@ -236,6 +242,12 @@ that runs `up` and then a confirmed `down`. The exit status is:
 - 2 when any check is invalid or the user's global Stack, mise or Pitchfork state changed.
 
 ## Validation results on Stack 0.1.22
+
+On the remediation branch, all eight cells validate. That includes ledger/Stack under
+`LC_ALL=C`, and `stack run test` now passes in the Stack arm, so the R1 and R3 notes below
+describe 0.1.22 only. See
+[eval/agentdx-20261020/REMEDIATION.md](../eval/agentdx-20261020/REMEDIATION.md). The
+documented task loop still does not gate grading, because the benchmark files are unchanged.
 
 See [eval/agentdx-20261020/SYNTHESIS.md](../eval/agentdx-20261020/SYNTHESIS.md#benchmark-validation)
 for the exact runs. In short, every cell is gradeable. In the Stack arm, the project's

@@ -1,0 +1,156 @@
+# Fixing the AgentDX findings: what changed and how it was checked
+
+Branch `fix/agentdx-findings-20261020`. It starts from the approved benchmark head
+`065086dba914b886d1f46763a80b30c045e16021`; the product base is
+`8b3402fa1db8f11917b5ba33a333c9093545d9ce` (Stack 0.1.22). The branch has one plain commit per
+finding. Every distinct finding from the [Opus](opus/REPORT.md) and [Astra](astra/REPORT.md)
+reports and the [synthesis](SYNTHESIS.md) is classified, with its commit, its proof and what
+remains, in [REMEDIATION-LEDGER.md](REMEDIATION-LEDGER.md). The two reports, the synthesis and
+the archived benchmark are unchanged. Neither the benchmark files (`bench/`) nor their
+fingerprints changed, so the harness that was approved at `065086d` is still the one in use.
+
+Raw evidence is git-ignored, under `eval/results/agentdx-product-fixes-20261020/`. Paths
+below are relative to that directory.
+
+Independent review of this branch has not happened yet. Nothing here was pushed, released or
+published, and 0.1.22 is still not on npm. Every binary below is a source build.
+
+## Tested code
+
+- Tested head: `15ff636c190d6e8ee96cc9ab7be4e16df19db9a8`, clean tree. It has 31 commits since
+  `065086d`; the ledger maps each one to its finding.
+- Binary: `cargo build --locked` (cargo 1.93.1, debug), `stack 0.1.22`, sha256
+  `1cad860237a06ac7014c12010e21c0518f4ecf39cca9200ccbad5b5f8224c00e`. Frozen copies are in
+  `gates-r2/bin/stack` and `pilot-r2/bin/stack`. The binary embeds no docs, and there is no
+  `build.rs`, so the docs-only commits after the tested head leave it unchanged.
+- The final commit, `15ff636` (N1, Redis locale), was first committed as `44ebdde`. Clippy then
+  failed on a single-element loop in its test (`gates-r2/clippy.log`, exit 101). The test was
+  fixed in that same commit (`gates-r2/amend-note.txt`), and `gates-r2/clippy-2.log` exits 0.
+  The product code is identical, and so is the binary hash.
+
+## Gates at the tested head (all from `gates-r2/`)
+
+| Gate | Result |
+|---|---|
+| `cargo clippy --locked --all-targets -- -D warnings` (1.93.1) | exit 0 (`clippy-2.log`) |
+| `cargo test --locked --all-targets` (1.93.1) | exit 0: 508 passed, 0 failed, 1 ignored, across 15 test binaries (`cargo-test.log`) |
+| `node --test tests/*.test.mjs` | exit 0: 41 pass, 1 skipped (`node-tests.log`) |
+| Provider boundary against the real mise (`/opt/homebrew/bin/mise` 2026.10.3) | exit 0 (`provider-boundary-real-mise.log`) |
+| `tests/e2e/native.sh`, macOS 15.7.2 arm64, host mise 2026.10.3 | exit 0: 12 of 12 scenarios passed (`e2e.jsonl`). This includes `5-oci`, for the first time on this host, against a run-owned `registry:2` container that was removed afterwards (`e2e-registry.txt`) |
+| `bench/regressions.py`, cold | exit 0: all six `FIXED`, controls passed, cleanup clean, `globals_changed: []` (`regressions-cold/summary.json`) |
+| Eight validation cells, cold (`scripts/validate_all.sh`) | all valid: starting code fails, reference passes, smoke through `exec` passes, cleanup clean, globals unchanged. The documented `stack run test` loop passes before and after in every Stack cell, where 0.1.22 failed it in both service apps (R1). The ledger/Stack `LC_ALL=C` cell, which 0.1.22 could not run (R3), is valid (`validation-cold.txt`) |
+| Bench unit tests, `python3 -m unittest discover -s bench/tests` | 124 tests pass in the checkout (36.1 s) and in a clean `git archive HEAD` export (35.7 s) |
+| `cargo fmt --check` | not a repository check: CI does not run it, there is no `rustfmt.toml`, and files unchanged since the base differ too (`cargo-attempt1-zsh-exitcodes-lost.log`). Not counted |
+
+The global Stack/mise/Pitchfork hash receipt was taken with the benchmark's own
+`globals_snapshot()`, and it records hashes only. It is identical to the predecessor's
+start-of-work receipt (`gates-r2/globals-before.json` against `globals-before-start.json`).
+
+### Earlier gate runs, kept as they were
+
+These ran at `ec06451`, before the Redis fix, with binary `9d99203b…`. They are in `gates/`:
+
+- `e2e-native.log`: `3-leases` failed. With D3, `status` now exits 1 for an expired owner
+  lease, and the scenario still expected success.
+- `e2e-native-2.log`: a single-scenario rerun failed on a missing directory, a wrapper mistake.
+- `e2e-native-3.log`: `7-deleted-project` failed. It still asserted that `gc` returns nothing
+  after a removed checkout, which is the behaviour L1 changes.
+- Both scenarios were updated, in fixups folded into their finding commits. The `7-deleted-project`
+  update also checks that ports are released, that data is kept, and that `--reclaim-data`
+  then removes it.
+- `e2e-native-4` then passed 11 of 11 run scenarios, with OCI skipped.
+- `task-env-provenance-real-mise.log` failed before the R1 test adjustment;
+  `task-env-provenance-real-mise-2.log` passes.
+- Warm and cold validation, cold regressions and both bench test runs passed there too.
+
+### Linux (local Docker LinuxKit arm64, Debian 13, not a hosted runner)
+
+- `linux/`, at `ec06451`: the source build and `setup` succeeded as an unprivileged user, and
+  e2e passed 11 of 11 run scenarios. As root, `up` refused Postgres in 9 ms, before any download
+  (`root-up.log`, X8).
+- The regression run exited 2: `removed-checkout-reclaim` was `invalid` because Redis would not
+  start under `LANG=en_US.UTF-8`, a locale the image lacks. That is finding N1.
+- `linux2/`, at snapshot `c719b3c`, whose tree is byte-identical to the committed N1 fix: Redis
+  starts and answers `PING` under the missing locale (`redis-bad-locale.log`), and all six
+  regressions are `FIXED` (exit 0).
+- Linux was not re-run after the test-only amend.
+- There was no hosted Linux, Linux x64 or Intel macOS run, and no hosted-agent vendor run.
+
+## Real-agent pilot
+
+This is the first real-agent run of the benchmark: one model, three tasks, both arms, one
+repetition, so six trials. It ran in `pilot-r2/` against the final binary above.
+
+### Setup
+
+| | |
+|---|---|
+| Agent | Claude Code 2.1.304 (`/Users/utsavsharma/.local/bin/claude`), model `claude-opus-5-5`, `--effort high`. The effort setting is bound into argv by the plan (`agent_options_binding`) |
+| Isolation | Each trial gets a fresh CLI process and context, with `--safe-mode` (no CLAUDE.md, memory, plugins, hooks or MCP), `--strict-mcp-config`, `--no-session-persistence` and `--disable-slash-commands`. `Read`/`Edit` of the source checkout are denied, and stdin is closed. The CLI's normal login route was used; no credential was copied or printed |
+| Plan | `pilot-r2/plan.json`: seed 20261020, warm cache `/tmp/afx-warm`, `LANG=en_US.UTF-8`, a 600 s budget per trial (60 minutes at most in total), counterbalanced order, run by `pilot-r2/run.sh` |
+| The predecessor's plan | `pilot/plan.json` was kept unchanged and never run. Its argv put the prompt after the variadic `--disallowedTools`, which swallows it: `argv-check/old-argv.*` exits 1 with "Input must be provided". This plan moves `{prompt}` to straight after `-p` (`argv-check/new-argv.*`, exit 0) and binds the final binary. The arm order is the same |
+
+### Outcome (`pilot-r2/report.json`, re-derived from hashed receipts)
+
+| Trial | Hidden checks + smoke | Agent seconds | Turns | Bash / Write calls | Left at agent exit | CLI-reported cost (USD, list) |
+|---|---|---|---|---|---|---|
+| ledger / existing | pass | 62.3 | 9 | 7 / 1 | nothing | 0.25 |
+| ledger / stack | pass | 65.9 | 9 | 7 / 1 | the root's Pitchfork supervisor (L6) | 0.22 |
+| catalog / stack | pass | 29.3 | 6 | 5 / 0 | the root's Pitchfork supervisor (L6) | 0.13 |
+| catalog / existing | pass | 23.8 | 7 | 5 / 1 | nothing | 0.15 |
+| slug / existing | pass | 32.4 | 7 | 5 / 1 | nothing | 0.16 |
+| slug / stack | pass | 28.5 | 5 | 4 / 0 | nothing | 0.12 |
+
+- **All six are valid and `verified_task`, with no timeouts.**
+- **None counts as `autonomous`.** All six are `unreviewed`. A trial counts as autonomous only
+  after a human transcript review, and none has happened. No `review.json` was written. Unfilled
+  templates are in `pilot-r2/review-templates/`. Machine-extracted facts are in
+  `pilot-r2/transcript-facts.json`: model and version from the CLI's init event, tool calls,
+  every Bash command, and usage. They are labelled as not a review.
+- **The report has `publishable: false`, `complete: false` and no scored pairs.** That is
+  correct while the reviews are missing.
+- **Usage and cost** are the CLI's own `result` figures, at list prices. They are not a billing
+  record. Total: $1.04 and 242 s of agent time.
+- **Background model calls.** The CLI also made tiny `claude-haiku-5-5` calls of its own,
+  visible in `modelUsage` at about $0.0001 each.
+
+### What the transcripts show
+
+These are facts only; reading them is the reviewer's job.
+
+- **The documented loop works.** In both Stack service tasks, the agent ran `stack run test`
+  and it passed, without the `exec` workaround that R1 forced on 0.1.22.
+- **The supervisor stays behind.** Both Stack service agents ended with a plain `stack down`.
+  This left the root's Pitchfork supervisor running (`supervisor_left_running: 2`). That is
+  documented L6 behaviour, since `--stop-supervisor` is opt-in. The ledger records it as
+  pilot observation O1. The harness stopped the supervisor in teardown, which it does for every
+  Stack trial.
+- **No agent read or referenced the source checkout.** Its path appears in no transcript.
+  Agents edited the arm's smoke test in the slug task. The grader never takes benchmark-owned
+  files from a submission.
+- **Global state was not touched.** The Stack/mise/Pitchfork hash receipts are identical
+  before and after (`pilot-r2/globals-*.json`), and no trial process remained afterwards.
+
+### Limits
+
+- Six trials with one repetition is a smoke test of the method. It supports no comparison
+  between arms, no speedup and no statistics.
+- The tasks are small and synthetic, and every trial passed in both arms. These tasks therefore
+  do not separate the arms on this model.
+- Local macOS only. No hosted agent ran, because no safely configured hosted route existed here.
+- An independent human or Astra transcript review is still needed before any trial can count
+  as autonomous.
+
+## What remains open
+
+- **H1, handing database state between worktrees** (snapshot, clone, `exec --from`). This
+  needs a product decision on data ownership and copy semantics, and was not started.
+- **Distribution.** 0.1.22 is not published, and this branch makes no release.
+- **Hosted platforms.** No hosted runner, Linux x64 or Intel macOS was available. Every Linux
+  claim above is local LinuxKit.
+- **Benchmark follow-ups (B1)** are in the ledger: a Compose/devcontainer arm, a disposal task
+  family, and gating on the documented loop now that R1 is fixed. They would change the
+  approved harness, so none was made.
+- **Remaining limits per fix** are in the ledger's last column. Examples: R2 cannot forward a
+  SIGKILL to Stack, R3 does not convert existing `SQL_ASCII` clusters, R6a is opt-in per
+  service, and L1 data from before this branch is not in the data ledger.
