@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lists this checkout's Redis keys with their TTLs.
+for k in $(redis-cli -u "$REDIS_URL" --scan); do echo "$k ttl=$(redis-cli -u "$REDIS_URL" ttl "$k")"; done
+echo "keys: $(redis-cli -u "$REDIS_URL" dbsize)"

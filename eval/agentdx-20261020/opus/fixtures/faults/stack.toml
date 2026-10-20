@@ -1,0 +1,10 @@
+# Fault fixture: a service that starts but never becomes ready, and one that crashes at once.
+[tools]
+python = "3.13"
+
+[services.never]
+run = "echo 'never: booting'; exec python3 -c 'import time; time.sleep(3600)'"
+ready_cmd = "false"
+
+[tasks.hello]
+run = "echo hello"

@@ -1,0 +1,14 @@
+# Repro: a custom service's <NAME>_URL under `stack run` vs `stack exec`.
+[tools]
+python = "3.13"
+
+[services.web]
+run = "exec python3 -m http.server $PORT --bind 127.0.0.1"
+ready_cmd = "curl -fsS http://127.0.0.1:$PORT/ >/dev/null"
+
+[tasks.with_dep]
+run = "echo WEB_URL=$WEB_URL"
+services = ["web"]
+
+[tasks.without_dep]
+run = "echo WEB_URL=$WEB_URL"

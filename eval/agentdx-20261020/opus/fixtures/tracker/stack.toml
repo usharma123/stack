@@ -1,0 +1,33 @@
+# Task tracker: Python API backed by Postgres (data) and Redis (list cache).
+[tools]
+python = "3.13"
+uv = "0.12.23"
+
+[env]
+UV_PYTHON_DOWNLOADS = "never"
+
+[services.postgres]
+preset = "postgres"
+version = "17"
+
+[services.redis]
+preset = "redis"
+version = "7"
+
+# The API applies pending migrations at startup, then serves on $PORT.
+[services.api]
+run = "uv sync -q --frozen && exec uv run --frozen python -m tracker.server"
+ready_cmd = "curl -fsS http://127.0.0.1:$PORT/health >/dev/null"
+watch = ["tracker", "migrations"]
+
+[services.api.identity]
+command = "uv run --frozen python -m tracker.probe"
+timeout = "10s"
+
+[tasks.migrate]
+run = "uv run --frozen python -m tracker.migrate"
+services = ["postgres"]
+
+[tasks.test]
+run = "uv run --frozen pytest -q"
+services = ["postgres", "redis", "api"]

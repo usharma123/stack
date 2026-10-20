@@ -1,0 +1,15 @@
+[tools]
+node = "24"
+[services.web]
+run = "exec node server.mjs"
+watch = ["server.mjs"]
+[services.web.identity]
+command = "node -e 'fetch(process.env.WEB_URL+\"/identity\").then(r=>r.text()).then(t=>process.stdout.write(t))'"
+[tasks.test]
+run = "node test.mjs"
+
+[services.worker]
+run="exec node worker.mjs"
+watch=["worker.mjs"]
+[services.worker.identity]
+command="node -e 'fetch(process.env.WORKER_URL+\"/identity\").then(r=>r.text()).then(t=>process.stdout.write(t))'"

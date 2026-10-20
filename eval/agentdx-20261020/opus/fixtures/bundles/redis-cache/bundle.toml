@@ -1,0 +1,18 @@
+[bundle]
+name = "redis-cache"
+version = "1.0.0"
+description = "Redis 7 plus a cache-inspection CLI"
+
+[tools]
+python = "3.13"
+
+[services.redis]
+preset = "redis"
+version = "7"
+
+[tasks.cache-keys]
+run = "cachekeys"
+services = ["redis"]
+
+[paths]
+bin = ["bin"]

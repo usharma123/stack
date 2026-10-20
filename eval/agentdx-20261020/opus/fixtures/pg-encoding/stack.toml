@@ -1,0 +1,4 @@
+# Postgres-only fixture to read the cluster encoding a fresh `stack up` creates.
+[services.postgres]
+preset = "postgres"
+version = "17"

@@ -1,0 +1,16 @@
+import harness as h,shutil,re,json
+from mcp_client import Client
+base=h.RAW/'projects';bundle=base/'team-bundle';bundle.mkdir(exist_ok=True)
+(bundle/'bundle.toml').write_text('''[bundle]\nname="format-tools"\nversion="1"\n[tools]\njq="1.7.1"\n[env]\nTEAM="ledger"\n[tasks.test]\nrun="printf '{\\\"ok\\\":true}' | jq -e .ok"\n''')
+p=base/'tools';p.mkdir(exist_ok=True);(p/'stack.toml').write_text('''[[use]]\nbundle="../team-bundle"\n[lock]\nplatforms=["current"]\nartifacts="required"\n''')
+h.stack('bundle-naive-path',p,'compile');(p/'stack.toml').write_text((p/'stack.toml').read_text().replace('bundle="../','bundle="path:../'))
+h.stack('bundle-compile',p,'compile');lock=(p/'stack.lock').read_text();(h.RAW/'tools-original.lock').write_text(lock)
+(p/'stack.lock').write_text(re.sub(r'checksum = "sha256:[a-f0-9]+"','checksum = "sha256:'+'0'*64+'"',lock))
+h.stack('checksum-mismatch-install',p,'install');(p/'stack.lock').write_text(lock)
+h.stack('tools-install-retry',p,'install');h.stack('tools-test',p,'run','test');h.stack('tools-exec',p,'exec','--','jq','--version')
+h.stack('bundle-locked-replay',p,'compile','--locked');(bundle/'bundle.toml').write_text((bundle/'bundle.toml').read_text().replace('TEAM="ledger"','TEAM="changed"'))
+h.stack('bundle-content-drift',p,'compile','--locked')
+(bundle/'bundle.toml').write_text((bundle/'bundle.toml').read_text().replace('TEAM="changed"','TEAM="ledger"'))
+h.stack('bundle-restored',p,'compile','--locked')
+c=Client('mcp-exit-timeout');c.call('stack_exec',p,command=['sh','-c','echo deliberate; exit 7']);c.call('stack_exec',p,command=['sh','-c','echo before-timeout; sleep 30'],timeout_secs=1);c.call('stack_exec',p,command=['sh','-c','kill -TERM $$']);c.close()
+h.stack('cli-nonzero',p,'exec','--','sh','-c','exit 7');h.stack('cli-timeout',p,'exec','--timeout','1s','--','sh','-c','echo before-timeout; sleep 30');h.stack('cli-signal',p,'exec','--','sh','-c','kill -TERM $$')

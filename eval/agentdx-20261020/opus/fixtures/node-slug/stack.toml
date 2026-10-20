@@ -1,0 +1,6 @@
+# Tools-only Node project: no services.
+[tools]
+node = "22"
+
+[tasks.test]
+run = "node --test"
