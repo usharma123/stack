@@ -205,21 +205,49 @@ def lock_backends(workspace):
             if name in NATIVE_BACKENDS}
 
 
-def overlay(source, workspace):
-    """Copy submitted files into a fresh grading workspace, except protected and runtime files."""
+def tree_files(directory):
+    """What a submission consists of: every file outside runtime directories, as path -> sha256.
+
+    Symlinks are recorded by target and never followed.
+    """
+    files = {}
+    for current, directories, names in os.walk(directory):
+        base = Path(current)
+        links = [name for name in directories if (base / name).is_symlink()]
+        directories[:] = sorted(name for name in directories if name not in RUNTIME_DIRS and name not in links)
+        for name in sorted(names + links):
+            if name in RUNTIME_DIRS:
+                continue
+            path = base / name
+            relative = path.relative_to(directory).as_posix()
+            files[relative] = f'symlink:{os.readlink(path)}' if path.is_symlink() else digest(path) if path.is_file() else 'special'
+    return files
+
+
+def overlay(source, workspace, full_tree=False):
+    """Copy submitted files into a fresh grading workspace, except protected and runtime files.
+
+    With `full_tree` the source is a whole submitted checkout, so a starting file it no longer
+    has is deleted from the grading workspace too. A reference solution in `oracles/` lists
+    only the files it changes and is overlaid without deletions.
+    """
     copied = {}
-    for path in sorted(source.rglob('*')):
-        relative = path.relative_to(source)
-        if any(part in RUNTIME_DIRS for part in relative.parts) or relative.as_posix() in PROTECTED:
+    submitted = tree_files(source)
+    for relative, value in submitted.items():
+        if relative in PROTECTED:
             continue
-        if path.is_symlink():
-            copied[relative.as_posix()] = 'symlink-skipped'
+        if value.startswith('symlink:') or value == 'special':
+            copied[relative] = 'symlink-skipped' if value.startswith('symlink:') else 'special-skipped'
             continue
-        if path.is_file():
-            target = workspace / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
-            copied[relative.as_posix()] = digest(target)
+        target = workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / relative, target)
+        copied[relative] = digest(target)
+    if full_tree:
+        for relative in tree_files(workspace):
+            if relative not in PROTECTED and relative not in submitted:
+                (workspace / relative).unlink()
+                copied[relative] = 'deleted'
     return copied
 
 

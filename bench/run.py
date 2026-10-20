@@ -243,7 +243,7 @@ def new_runtime(prefix, task_id, arm, binary, cache, locale):
     return root, env
 
 
-def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_control=False):
+def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_control=False, full_tree=False):
     """Fresh runtime, grader-only data, submitted files overlaid, then the smoke test and hidden checks.
 
     `passed` needs both gates. The project's existing smoke test, run through the arm's
@@ -259,6 +259,7 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
       setup_failed           installing the locked tools failed after retries: infrastructure
       harness_error          anything else
     `startup_control` runs that control; validation grades the reference itself and needs none.
+    `full_tree` marks `submission` as a whole checkout, so files it deleted are deleted too.
     """
     project = TASKS[task_id]['project']
     root, env = new_runtime('ag.', task_id, arm, binary, cache, locale)
@@ -272,7 +273,7 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
         if hidden.is_dir():
             for path in hidden.iterdir():
                 shutil.copy2(path, workspace / path.name)
-        result['submitted_files'] = arms.overlay(submission, workspace) if submission else {}
+        result['submitted_files'] = arms.overlay(submission, workspace, full_tree) if submission else {}
         steps = arms.commands(arm, project, binary, arms.verifier_argv(task_id, workspace))
         timings, result['setup_attempts'] = {}, 0
         for name in ['setup', 'up']:
@@ -390,14 +391,64 @@ def trial_key(identifier):
     return hashlib.sha256(identifier.encode()).hexdigest()[:20]
 
 
-def submission_patch(workspace, root, env):
-    """Everything the agent changed relative to the starting commit, including new files."""
-    index_env = dict(env, GIT_INDEX_FILE=str(root / 'grade-index'))
-    subprocess.run(['git', 'add', '-A'], cwd=workspace, env=index_env, capture_output=True, check=True)
-    patch = subprocess.run(['git', 'diff', '--cached', '--binary', 'HEAD'], cwd=workspace, env=index_env, capture_output=True, check=True)
-    names = subprocess.run(['git', 'diff', '--cached', '--name-status', 'HEAD'], cwd=workspace, env=index_env,
-                           capture_output=True, text=True, check=True)
-    return patch.stdout, names.stdout.splitlines()
+# Harness git never reads the user's or the agent's hooks, global config or fsmonitor.
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0'}
+GIT = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.excludesFile=/dev/null']
+
+
+def git(argv, cwd, env=None, check=True):
+    return subprocess.run([*GIT, *argv], cwd=cwd, env={**os.environ, **GIT_ENV, **(env or {})}, capture_output=True, check=check)
+
+
+def keep_baseline(workspace, root):
+    """Copy the starting commit into a bare repository outside the agent's checkout.
+
+    The agent may commit, amend, reset or garbage-collect in its own `.git`; the submission
+    is still diffed against this copy of the commit the trial started from.
+    """
+    commit = git(['rev-parse', 'HEAD'], workspace).stdout.decode().strip()
+    store = root / 'harness' / 'baseline.git'
+    store.parent.mkdir()
+    git(['clone', '-q', '--bare', '--no-local', str(workspace), str(store)], root)
+    return {'commit': commit, 'git_dir': str(store), 'files': arms.tree_files(workspace)}
+
+
+def submission_record(baseline, workspace):
+    """The whole submitted change against the starting commit: commits, edits, deletions and new files.
+
+    The checkout's files (runtime directories excluded, ignored files included, exactly what
+    grading overlays) are staged into a scratch index of the baseline repository. Nothing is
+    written to the agent's checkout or its `.git`. The agent's own history is read as well.
+    """
+    stage = Path(tempfile.mkdtemp(prefix='as.', dir='/tmp'))
+    try:
+        tree = stage / 'tree'
+        files = arms.tree_files(workspace)
+        for relative, value in files.items():
+            target = tree / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if value.startswith('symlink:'):
+                target.symlink_to(value[len('symlink:'):])
+            elif value != 'special':
+                shutil.copy2(workspace / relative, target)
+        tree.mkdir(exist_ok=True)
+        env = {'GIT_DIR': baseline['git_dir'], 'GIT_WORK_TREE': str(tree), 'GIT_INDEX_FILE': str(stage / 'index')}
+        git(['read-tree', baseline['commit']], tree, env)
+        git(['add', '--all', '--force', '.'], tree, env)
+        diff = ['diff', '--cached', '--no-renames', '--no-ext-diff', '--no-textconv', baseline['commit']]
+        patch = git([*diff, '--binary', '--full-index'], tree, env).stdout
+        changed = git([*diff, '--name-status'], tree, env).stdout.decode().splitlines()
+    finally:
+        shutil.rmtree(stage)
+    head = git(['rev-parse', 'HEAD'], workspace, check=False)
+    head = head.stdout.decode().strip() if head.returncode == 0 else None
+    commits = git(['rev-list', '--reverse', f'{baseline["commit"]}..HEAD'], workspace, check=False)
+    descends = git(['merge-base', '--is-ancestor', baseline['commit'], 'HEAD'], workspace, check=False).returncode == 0
+    record = {'initial_commit': baseline['commit'], 'baseline_git_dir': baseline['git_dir'], 'changed': changed,
+              'agent_head': head, 'head_descends_from_initial': descends,
+              'agent_commits': commits.stdout.decode().split() if commits.returncode == 0 else None,
+              'files_before': baseline['files'], 'files_after': files}
+    return patch, record
 
 
 def experiment_trial(args):
@@ -427,6 +478,8 @@ def experiment_trial(args):
             summary['runtime'] = str(root)
             workspace = arms.prepare(trial['task'], trial['arm'], root, binary, env)
             summary['workspace'] = str(workspace)
+            baseline = keep_baseline(workspace, root)
+            summary['initial_commit'] = baseline['commit']
             prompt = TASKS[trial['task']]['instruction']
             (out / 'prompt.txt').write_text(prompt)
             (root / 'prompt.txt').write_text(prompt)
@@ -442,12 +495,14 @@ def experiment_trial(args):
             summary['agent'] = {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']}
             summary['finished_agent_unix_ns'] = time.time_ns()
             summary['left_running_at_agent_exit'] = arms.residue(trial['arm'], workspace, root, {})
-            patch, changed = submission_patch(workspace, root, env)
+            patch, submission = submission_record(baseline, workspace)
             (out / 'submission.patch').write_bytes(patch)
-            summary['changed_files'] = changed
+            (out / 'submission.json').write_text(json.dumps(submission, indent=2) + '\n')
+            summary['changed_files'] = submission['changed']
             shutil.copytree(transcript, out / 'transcript')
             summary['agent_cleanup'] = teardown(trial['arm'], workspace, root, env, binary, out, 'agent-cleanup')
-            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', workspace, cache, plan['locale'], startup_control=True)
+            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', workspace, cache, plan['locale'],
+                           startup_control=True, full_tree=True)
             summary['grade'] = graded
             summary['task_passed'] = graded['passed'] is True
             # A submitted app that cannot start, while the reference can, fails the task. Setup,
