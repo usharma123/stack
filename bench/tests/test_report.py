@@ -309,6 +309,26 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(self.row()['status'], 'invalid')
         self.assertFalse(self.row()['verified_task'])
 
+    def test_uncertainty_in_every_command_role_survives_later_empty_cleanup(self):
+        roles = ['agent', 'agent-cleanup-down', 'agent-cleanup-supervisor-stop', 'final-cleanup-down',
+                 'grade-smoke_task_loop', 'grade-cleanup-down', 'grade-control-smoke_task_loop',
+                 'grade-control-cleanup-supervisor-stop', 'grade-setup-attempt-2']
+        for stem in roles:
+            for key, value in [('survivors', [42]), ('unresolved', [{'pid': 42}])]:
+                with self.subTest(stem=stem, key=key):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed()
+                    command = json.loads((records.out / 'grade-smoke_exec.json').read_text())
+                    stopped = {'terminated': [42], 'killed': [], 'survivors': [], 'unresolved': []}
+                    stopped[key] = value
+                    records.replace_record(stem + '.json', dict(command, receipt=stem, stopped=stopped))
+                    self.review(records)
+                    row = self.row()
+                    self.assertEqual(row['status'], 'invalid')
+                    self.assertFalse(row['verified_task'])
+                    self.assertFalse(row['autonomous'])
+                    self.assertTrue(any('command cleanup' in problem for problem in row['problems']))
+
     def test_cleanup_requires_complete_typed_residue_and_consistent_ok(self):
         malformed = [{}, {'pids': [], 'ports': []}, dict(EMPTY, pids=''), dict(EMPTY, ports=[True]),
                      dict(EMPTY, owned_processes=[{}]), dict(EMPTY, pids=[-1])]

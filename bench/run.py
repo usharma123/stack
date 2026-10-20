@@ -35,6 +35,9 @@ from arms import HERE, TASKS, digest
 LOCK = Path('/tmp/stack-agentdx-bench.lock')
 DEFAULT_LOCALE = {'LANG': 'en_US.UTF-8'}
 INTERVENTION_KINDS = {'clarification', 'hint', 'command_fix', 'environment_repair', 'code_change', 'other'}
+COMMAND_STEM = re.compile(r'(?:agent|(?:agent|final|grade(?:-control)?)-cleanup-(?:down|supervisor-stop)'
+                          r'|grade(?:-control)?-(?:setup\d*|up\d*|smoke_exec|smoke_task_loop|verify))'
+                          r'(?:-attempt-[1-9]\d*)?')
 
 
 class Cancelled(BaseException):
@@ -225,6 +228,11 @@ def acceptance(task_id, record, out):
     return passed, result
 
 
+def uncertain_command(record):
+    """A later root scan cannot resolve a command's known survivors or lost identities."""
+    return any(record.get('stopped', {}).get(key) for key in ['survivors', 'unresolved'])
+
+
 def teardown(arm, workspace, root, env, binary, out, label, seen=None):
     """Stop through the arm's own commands, then look for anything owned still running."""
     project = TASKS[json.loads((root / 'context.json').read_text())['task']]['project']
@@ -233,8 +241,10 @@ def teardown(arm, workspace, root, env, binary, out, label, seen=None):
     tracked = {'pids': sorted(set(seen['pids']) | set(before['pids']) | {p['pid'] for p in before['owned_processes']}),
                'ports': sorted(set(seen['ports']) | set(before['ports']))}
     steps = arms.commands(arm, project, binary)
-    result = {'before': before, 'steps': {}}
+    result = {'before': before, 'steps': {}, 'command_cleanup': {}}
     down = invoke(steps['down'], workspace, env, 120, out / f'{label}-down')
+    if uncertain_command(down):
+        result['command_cleanup'][down['receipt']] = down['stopped']
     result['steps']['down'] = down['exit_code']
     down_ok = down['exit_code'] == 0
     if arm == 'stack':
@@ -244,6 +254,8 @@ def teardown(arm, workspace, root, env, binary, out, label, seen=None):
         if (root / 'pf/state').is_dir() and any((root / 'pf/state').iterdir()):
             stop = invoke([str(binary), 'exec', '--', 'pitchfork', 'supervisor', 'stop'], workspace, env, 60, out / f'{label}-supervisor-stop')
             result['steps']['supervisor_stop'] = stop['exit_code']
+            if uncertain_command(stop):
+                result['command_cleanup'][stop['receipt']] = stop['stopped']
     deadline = time.monotonic() + 15
     left = arms.residue(arm, workspace, root, tracked)
     while time.monotonic() < deadline and any(left.values()):
@@ -251,7 +263,7 @@ def teardown(arm, workspace, root, env, binary, out, label, seen=None):
         left = arms.residue(arm, workspace, root, tracked)
     # Clean means nothing owned is left. A failing `down` with nothing running is a product
     # observation (`down_ok`), not a leak.
-    result.update(left=left, down_ok=down_ok, ok=not any(left.values()))
+    result.update(left=left, down_ok=down_ok, ok=not any(left.values()) and not result['command_cleanup'])
     if left['owned_processes']:
         # Arm teardown failed to stop these; the harness stops them so trials cannot interfere.
         result['reclaimed_by_harness'] = arms.reclaim(left['owned_processes'], root)
@@ -288,8 +300,15 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
     """
     project = TASKS[task_id]['project']
     root, env = new_runtime('ag.', task_id, arm, binary, cache, locale)
-    result = {'runtime': str(root), 'passed': False, 'outcome': 'harness_error'}
+    result = {'runtime': str(root), 'passed': False, 'outcome': 'harness_error', 'command_cleanup': {}}
     workspace = None
+
+    def step(argv, timeout, stem):
+        record = invoke(argv, workspace, env, timeout, out / stem)
+        if uncertain_command(record):
+            result['command_cleanup'][record['receipt']] = record['stopped']
+        return record
+
     try:
         workspace = arms.prepare(task_id, arm, root, binary, env)
         if arm == 'stack':
@@ -305,7 +324,7 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
                 # runs the submitted code and gets one attempt.
                 attempts = 3 if name == 'setup' else 1
                 for attempt in range(attempts):
-                    record = invoke(argv, workspace, env, 900, out / f'{label}-{name}{index or ""}')
+                    record = step(argv, 900, f'{label}-{name}{index or ""}')
                     result['setup_attempts'] += name == 'setup'
                     timings[name] = timings.get(name, 0) + record['elapsed_ns'] / 1e9
                     if record['exit_code'] == 0 or attempt == attempts - 1:
@@ -317,8 +336,8 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
                     raise RuntimeError(f'{name} failed; see {record["receipt"]}')
         result['seconds'] = timings
         for name in ['smoke_exec', 'smoke_task_loop']:
-            result[name] = invoke(steps[name], workspace, env, 120, out / f'{label}-{name}')['exit_code'] == 0
-        verify = invoke(steps['verify'], workspace, env, 180, out / f'{label}-verify')
+            result[name] = step(steps[name], 120, f'{label}-{name}')['exit_code'] == 0
+        verify = step(steps['verify'], 180, f'{label}-verify')
         result['acceptance_passed'], result['acceptance'] = acceptance(task_id, verify, out)
         result['passed'] = result['acceptance_passed'] and result['smoke_exec']
         result['outcome'] = 'graded'
@@ -327,6 +346,8 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
     finally:
         if workspace is not None:
             result['cleanup'] = teardown(arm, workspace, root, env, binary, out, f'{label}-cleanup')
+    if result['command_cleanup'] or (result.get('cleanup') or {}).get('command_cleanup'):
+        result.update(passed=False, outcome='harness_error', error='command cleanup left survivors or unresolved identities')
     if result['outcome'] == 'startup_failed' and startup_control:
         # After the failed runtime is cleaned up, so the control cannot collide with it.
         control = grade(task_id, arm, binary, out, f'{label}-control', HERE / 'oracles' / project, cache, locale)
@@ -759,7 +780,9 @@ def residue_schema(value):
 def cleanup_schema(value):
     return (isinstance(value, dict) and residue_schema(value.get('before')) and residue_schema(value.get('left'))
             and isinstance(value.get('steps'), dict) and type(value['steps'].get('down')) is int
-            and type(value.get('ok')) is bool and value['ok'] == (not any(value['left'].values()))
+            and isinstance(value.get('command_cleanup', {}), dict)
+            and type(value.get('ok')) is bool
+            and value['ok'] == (not any(value['left'].values()) and not value.get('command_cleanup'))
             and (('after_reclaim' in value) == ('reclaimed_by_harness' in value))
             and ('after_reclaim' not in value or (residue_schema(value['after_reclaim'])
                  and bool(value['left']['owned_processes']) and isinstance(value['reclaimed_by_harness'], dict))))
@@ -774,7 +797,7 @@ def globals_schema(value):
 def clean(teardown_record):
     """Nothing owned was running after the arm's own teardown (recomputed, not read from `ok`)."""
     left = (teardown_record or {}).get('left') if isinstance(teardown_record, dict) else None
-    return (cleanup_schema(teardown_record) and not any(left.values())
+    return (cleanup_schema(teardown_record) and not any(left.values()) and not teardown_record.get('command_cleanup')
             and 'after_reclaim' not in teardown_record)
 
 
@@ -782,6 +805,8 @@ def restored(teardown_record):
     """Clean, or clean once the harness reclaimed the leftovers."""
     after = teardown_record.get('after_reclaim') if isinstance(teardown_record, dict) else None
     if not cleanup_schema(teardown_record):
+        return False
+    if teardown_record.get('command_cleanup'):
         return False
     if isinstance(teardown_record, dict) and 'after_reclaim' in teardown_record:
         return residue_schema(after) and not any(after.values())
@@ -922,6 +947,14 @@ def derive(result, trial, plan, plan_path, directory):
     extra = [name for name in extra if name not in hashes and name not in {'summary.json', 'review.json'}
              and not name.startswith(REVIEW_EVIDENCE)]
     problems += [f'{name} is not in the trial evidence' for name in extra]
+    # Audit every invoked command, including observation-only loops and cleanup commands.
+    # Uncertainty is terminal for this trial; a later empty ownership scan is not recovery
+    # evidence for an identity the command already lost. Never signal that identity here.
+    for name in sorted(hashes):
+        if name.endswith('.json') and COMMAND_STEM.fullmatch(name[:-5]):
+            command = receipt(directory, name, hashes, problems, command_schema)
+            if command is not None and uncertain_command(command):
+                problems.append(f'{name} command cleanup left survivors or unresolved identities')
     for name in ['prompt.txt', 'agent.stdout', 'agent.stderr', 'submission.patch']:
         if name not in hashes:
             problems.append(f'{name} missing')

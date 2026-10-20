@@ -25,6 +25,31 @@ REUSED = {'started': 'Mon Oct 19 10:00:07 2026', 'command': 'unrelated --daemon'
 class SignalTest(unittest.TestCase):
     """PID reuse is simulated; no real process is signalled here."""
 
+    def test_empty_root_scan_cannot_erase_down_or_supervisor_uncertainty(self):
+        empty = {'pids': [], 'ports': [], 'owned_processes': []}
+        for role in ['down', 'supervisor-stop']:
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'context.json').write_text('{"task":"slug-unicode"}')
+                (root / 'pf/state').mkdir(parents=True)
+                (root / 'pf/state/fixture').write_text('')
+
+                def command(argv, cwd, env, timeout, path):
+                    record = {'exit_code': 0, 'receipt': path.name}
+                    (root / (path.name + '.stdout')).write_text('{"data":{"confirmed":true}}')
+                    if path.name.endswith(role):
+                        record['stopped'] = {'survivors': [], 'unresolved': [{'pid': 42}]}
+                    return record
+
+                with mock.patch.object(bench, 'invoke', side_effect=command), \
+                        mock.patch.object(arms, 'residue', return_value=empty), \
+                        mock.patch.object(arms, 'disk_usage', return_value={}):
+                    result = bench.teardown('stack', root, root, {}, root / 'stack', root, 'cleanup')
+                self.assertFalse(result['ok'])
+                self.assertFalse(bench.clean(result))
+                self.assertFalse(bench.restored(result))
+                self.assertIn('cleanup-' + role, result['command_cleanup'])
+
     def run_reclaim(self, identities, owned=True):
         sent = []
         with mock.patch.object(arms, 'process_identity', side_effect=identities), \

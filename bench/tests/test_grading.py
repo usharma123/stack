@@ -75,6 +75,22 @@ class GradeTest(unittest.TestCase):
         self.assertFalse(result['smoke_task_loop'])
         self.assertTrue(result['passed'])
 
+    def test_observation_only_command_uncertainty_invalidates_recorded_grade(self):
+        runtime = FakeRuntime(self.out)
+        original = runtime.invoke
+
+        def uncertain(*args):
+            record = original(*args)
+            if args[-1].name == 'grade-smoke_task_loop':
+                record['stopped'] = {'survivors': [], 'unresolved': [{'pid': 42}]}
+            return record
+
+        runtime.invoke = uncertain
+        result = runtime.grade()
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['outcome'], 'harness_error')
+        self.assertIn('grade-smoke_task_loop', result['command_cleanup'])
+
     def test_app_that_does_not_start_is_a_task_failure_when_the_reference_starts(self):
         runtime = FakeRuntime(self.out, {'grade-up': 1})
         result = runtime.grade(startup_control=True)
