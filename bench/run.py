@@ -762,6 +762,16 @@ def review_problems(review, trial, plan, summary_path, directory, result):
     return problems + metric_problems(review, directory, evidence)
 
 
+def stopped_schema(value):
+    """The same complete stop observation in commands and their uncertainty maps."""
+    return (isinstance(value, dict)
+            and all(isinstance(value.get(key), list) and all(type(pid) is int and pid > 0 for pid in value[key])
+                    for key in ['terminated', 'killed', 'survivors'])
+            and isinstance(value.get('unresolved'), list)
+            and all(isinstance(item, dict) and type(item.get('pid')) is int and item['pid'] > 0
+                    for item in value['unresolved']))
+
+
 def command_schema(value):
     if not (isinstance(value, dict) and isinstance(value.get('argv'), list) and value['argv']
             and all(isinstance(part, str) for part in value['argv'])
@@ -772,12 +782,8 @@ def command_schema(value):
             and (value['exit_code'] is None or type(value['exit_code']) is int)
             and all(isinstance(value[key], str) for key in ['launch_error', 'cancelled'] if key in value)):
         return False
-    stopped = value.get('stopped')
     return (not (value['timed_out'] and 'stopped' not in value)
-            and ('stopped' not in value or (isinstance(stopped, dict)
-            and all(isinstance(stopped.get(key), list) and all(type(pid) is int and pid > 0 for pid in stopped[key])
-                    for key in ['terminated', 'killed', 'survivors'])
-            and isinstance(stopped.get('unresolved'), list))))
+            and ('stopped' not in value or stopped_schema(value['stopped'])))
 
 
 def residue_schema(value):
@@ -888,23 +894,49 @@ def command_receipt(directory, stem, hashes, problems, window=None):
     return record if valid else None
 
 
+def command_cleanup_consistency(observation, directory, prefix, stems, hashes, problems):
+    """Bind each runtime's uncertainty map to only the commands it actually invoked.
+
+    Maps contain only uncertain stop observations, not every successfully stopped command.
+    Missing maps mean empty for older clean evidence; malformed or contradictory maps do not.
+    """
+    actual = observation.get('command_cleanup', {})
+    if not (isinstance(actual, dict) and all(isinstance(stem, str) and stopped_schema(value)
+                                           for stem, value in actual.items())):
+        problems.append(f'{prefix} malformed command cleanup map')
+    expected = {}
+    for stem in stems:
+        raw = receipt(directory, stem + '.json', hashes, problems, command_schema)
+        if raw is not None and uncertain_command(raw):
+            expected[stem] = raw['stopped']
+    if actual != expected:
+        problems.append(f'{prefix} command cleanup contradicts its command receipts')
+    if isinstance(actual, dict) and any(stopped_schema(value) and any(value[key] for key in ['survivors', 'unresolved'])
+                                        for value in actual.values()):
+        problems.append(f'{prefix} command cleanup left survivors or unresolved identities')
+
+
+def grading_commands(graded, directory, prefix, hashes, problems):
+    roles = re.compile(re.escape(prefix) + r'-(?:setup\d*|up\d*|smoke_exec|smoke_task_loop|verify)'
+                       r'(?:-attempt-[1-9]\d*)?\.json')
+    stems = [name[:-5] for name in sorted(hashes) if roles.fullmatch(name)]
+    command_cleanup_consistency(graded, directory, prefix, stems, hashes, problems)
+
+
 def cleanup_commands(cleanup, directory, prefix, hashes, problems):
     """Require the down receipt, and supervisor stop if that step was recorded."""
     if not cleanup_schema(cleanup):
         return
     if set(cleanup['steps']) - {'down', 'supervisor_stop'}:
         problems.append(f'{prefix} unknown cleanup step')
-    uncertainty = {}
+    stems = []
     for role, code in cleanup['steps'].items():
         stem = f'{prefix}-{role.replace("_", "-")}'
+        stems.append(stem)
         command = command_receipt(directory, stem, hashes, problems)
         if command is not None and command['exit_code'] != code:
             problems.append(f'{prefix} step {role} contradicts its command receipt')
-        raw = receipt(directory, stem + '.json', hashes, problems, command_schema)
-        if raw is not None and uncertain_command(raw):
-            uncertainty[stem] = raw['stopped']
-    if cleanup.get('command_cleanup', {}) != uncertainty:
-        problems.append(f'{prefix} command cleanup contradicts its command receipts')
+    command_cleanup_consistency(cleanup, directory, prefix, stems, hashes, problems)
 
 
 def graded_verdict(task, directory, hashes, prefix, problems):
@@ -1111,6 +1143,13 @@ def derive(result, trial, plan, plan_path, directory):
         if graded != result.get('grade'):
             problems.append('summary grade contradicts grade.json')
         outcome = graded.get('outcome')
+        control = graded.get('startup_control')
+        if 'startup_control' in graded:
+            if outcome not in {'startup_failed', 'infrastructure_failed'} or not isinstance(control, dict):
+                problems.append('startup control is malformed or unreachable on the grading outcome')
+            if isinstance(control, dict):
+                grading_commands(control, directory, 'grade-control', hashes, problems)
+        grading_commands(graded, directory, 'grade', hashes, problems)
         cleanup_commands(graded.get('cleanup'), directory, 'grade-cleanup', hashes, problems)
         facts['outcome'] = outcome
         window = (result.get('started_unix_ns'), result.get('finished_unix_ns'))
@@ -1128,7 +1167,6 @@ def derive(result, trial, plan, plan_path, directory):
                 problems.append('startup_failed without a failing grade-up receipt')
             if 'grade-verify.json' in hashes:
                 problems.append('startup_failed but a verifier receipt exists')
-            control = graded.get('startup_control')
             if not (isinstance(control, dict) and control.get('outcome') == 'graded' and control.get('passed') is True
                     and step_ok(receipt(directory, 'grade-control-up.json', hashes, problems, command_schema))
                     and graded_verdict(trial['task'], directory, hashes, 'grade-control', problems)):

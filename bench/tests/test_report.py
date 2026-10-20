@@ -516,6 +516,82 @@ class ReportTest(unittest.TestCase):
                 self.review(self.sealed(1))
                 self.assertEqual(self.row(1)['status'], 'passed')
 
+    def test_grade_and_control_uncertainty_maps_must_match_their_commands(self):
+        self.catalog_plan()
+        stopped = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': [{'pid': 4242}]}
+        for control in [False, True]:
+            prefix = 'grade-control' if control else 'grade'
+            for value in [None, [], {'ignored': 'wrong-type'}, {prefix + '-smoke_task_loop': stopped},
+                          {prefix + '-cleanup-down': stopped},
+                          {prefix + '-smoke_exec': dict(stopped, unresolved='wrong-type')},
+                          {prefix + '-smoke_exec': dict(stopped, unresolved=[None])},
+                          {prefix + '-verify': dict(stopped, unresolved=[], survivors=[4242])},
+                          {prefix + '-verify': dict(stopped, unresolved=[])}]:
+                with self.subTest(control=control, value=value):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed(outcome='startup_failed' if control else 'graded', control=True)
+                    grade = json.loads((records.out / 'grade.json').read_text())
+                    target = grade['startup_control'] if control else grade
+                    target['command_cleanup'] = value
+                    records.replace_record('grade.json', grade, 'grade')
+                    self.review(records)
+                    self.review(self.sealed(1))
+                    report = self.report()
+                    self.assertEqual(report['rows'][0]['status'], 'invalid')
+                    self.assertFalse(report['rows'][0]['verified_task'])
+                    self.assertFalse(report['rows'][0]['autonomous'])
+                    self.assertFalse(report['publishable'])
+                    self.assertEqual(report['pairs'], [])
+                    self.assertEqual(report['rows'][1]['status'], 'passed')
+                    self.assertEqual(sum(c['assigned'] for c in report['counts'].values()), 2)
+
+    def test_uncertainty_map_cannot_omit_or_change_a_command_observation(self):
+        self.catalog_plan()
+        for control in [False, True]:
+            for mapping in ['missing', 'matching', 'changed']:
+                with self.subTest(control=control, mapping=mapping):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed(outcome='startup_failed' if control else 'graded', control=True)
+                    prefix = 'grade-control' if control else 'grade'
+                    stem = prefix + '-smoke_task_loop'
+                    stopped = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': [{'pid': 4242}]}
+                    command = json.loads((records.out / (stem + '.json')).read_text())
+                    records.replace_record(stem + '.json', dict(command, stopped=stopped))
+                    grade = json.loads((records.out / 'grade.json').read_text())
+                    target = grade['startup_control'] if control else grade
+                    target['command_cleanup'] = {} if mapping == 'missing' else {stem: stopped}
+                    if mapping == 'changed':
+                        target['command_cleanup'][stem] = dict(stopped, terminated=[4242])
+                    records.replace_record('grade.json', grade, 'grade')
+                    self.review(records)
+                    self.assertEqual(self.row()['status'], 'invalid')
+                    problems = self.row()['problems']
+                    self.assertTrue(any('survivors or unresolved' in p for p in problems))
+                    self.assertEqual(any(prefix + ' command cleanup contradicts' in p for p in problems), mapping != 'matching')
+
+    def test_unused_startup_control_cannot_hide_uncertainty(self):
+        records = self.sealed()
+        grade = json.loads((records.out / 'grade.json').read_text())
+        grade['startup_control'] = {'outcome': 'graded', 'passed': True, 'command_cleanup': {'ignored': 'wrong-type'}}
+        records.replace_record('grade.json', grade, 'grade')
+        self.review(records)
+        self.assertEqual(self.row()['status'], 'invalid')
+        self.assertFalse(self.row()['verified_task'])
+
+    def test_empty_grade_control_and_cleanup_uncertainty_maps_are_valid(self):
+        self.catalog_plan()
+        for index in range(2):
+            records = self.sealed(index, outcome='startup_failed', control=True)
+            grade = json.loads((records.out / 'grade.json').read_text())
+            grade['command_cleanup'] = {}
+            grade['startup_control']['command_cleanup'] = {}
+            for target in [grade, grade['startup_control']]:
+                target['cleanup']['command_cleanup'] = {}
+            records.replace_record('grade.json', grade, 'grade')
+            self.review(records)
+        self.assertTrue(self.report()['publishable'])
+        self.assertEqual([r['status'] for r in self.report()['rows']], ['failed', 'failed'])
+
     def test_verifier_cannot_redirect_to_agent_stdout_even_when_both_are_hashed(self):
         self.catalog_plan()
         for control in [False, True]:
