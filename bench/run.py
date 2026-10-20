@@ -57,17 +57,66 @@ def host_lock():
         yield
 
 
-def kill_group(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
+STOP_GRACE_SECONDS = 5
+
+
+def command_tree(process, known):
+    """What the command started and is still running, keyed by PID, with identities.
+
+    Members are the leader's process group (the command runs in a new session, so it owns
+    that group) and every descendant of the leader or of a process already found, which
+    catches children that moved to their own group. Once the leader is reaped its PID may
+    be reused; a group led by a process that is not the recorded leader is then foreign.
+    """
+    rows = arms.process_table()
+    leader = known.get(process.pid)
+    foreign_group = process.returncode is not None and process.pid in rows and not (
+        leader and all(rows[process.pid].get(key) == leader.get(key) for key in ['started', 'command', 'start_ticks']))
+    members = {pid: row for pid, row in rows.items() if not foreign_group and row['pgid'] == process.pid}
+    parents = {pid for pid, row in known.items() if arms.same_process(row)} | ({process.pid} if process.returncode is None else set())
+    parents |= set(members)
+    grew = True
+    while grew:
+        grew = False
+        for pid, row in rows.items():
+            if pid not in members and row['ppid'] in parents and pid != os.getpid():
+                members[pid] = row
+                parents.add(pid)
+                grew = True
+    return members
+
+
+def stop_tree(process):
+    """SIGTERM, then SIGKILL, everything the command started, including after its leader exits.
+
+    Each signal goes to one recorded process after `arms.signal_if_same` has checked its
+    start time and command line again, so an unrelated process that later reuses a PID is
+    never signalled. Returns what was signalled and anything that survived.
+    """
+    known, log = {}, {'terminated': [], 'killed': [], 'survivors': []}
+
+    def refresh():
+        for pid, row in command_tree(process, known).items():
+            known.setdefault(pid, row)
+
+    def signal_all(signum, done):
+        for pid, row in known.items():
+            if pid not in done and arms.signal_if_same(row, signum):
+                done.append(pid)
+
+    for signum, done in [(signal.SIGTERM, log['terminated']), (signal.SIGKILL, log['killed'])]:
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        while True:
+            process.poll()  # reap the leader once it exits
+            refresh()  # children forked while stopping are found and stopped too
+            signal_all(signum, done)
+            if time.monotonic() >= deadline or not any(arms.same_process(row) for row in known.values()):
+                break
+            time.sleep(0.1)
+    with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=5)
+    log['survivors'] = sorted(pid for pid, row in known.items() if arms.same_process(row))
+    return log
 
 
 def invoke(argv, cwd, env, timeout, receipt):
@@ -89,13 +138,13 @@ def invoke(argv, cwd, env, timeout, receipt):
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 record['timed_out'] = True
-                kill_group(process)
+                record['stopped'] = stop_tree(process)
             record['exit_code'] = process.returncode
         except (Cancelled, KeyboardInterrupt) as error:
             cancelled = error
             record['cancelled'] = type(error).__name__
-            if process is not None and process.poll() is None:
-                kill_group(process)
+            if process is not None:
+                record['stopped'] = stop_tree(process)
             record['exit_code'] = process.returncode if process is not None else None
         except OSError as error:
             record.update(exit_code=None, launch_error=str(error))
