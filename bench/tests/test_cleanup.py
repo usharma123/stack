@@ -206,6 +206,22 @@ class StopTreeTest(unittest.TestCase):
         self.assertTrue(record['timed_out'])
         self.assert_stopped(record)
 
+    def test_cancellation_before_launch_records_no_child_and_reraises(self):
+        for index, error in enumerate([bench.Cancelled('test'), KeyboardInterrupt()]):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(bench.subprocess, 'Popen', side_effect=error), \
+                    mock.patch.object(bench, 'stop_tree') as stop:
+                with self.assertRaises(type(error)):
+                    self.run_leader('same-group', 30)
+                name = 'step.json' if index == 0 else 'step-attempt-2.json'
+                record = json.loads((self.directory / name).read_text())
+                self.assertEqual(record['cancelled'], type(error).__name__)
+                self.assertFalse(record['process_started'])
+                self.assertNotIn('stopped', record)
+                self.assertIsNone(record['exit_code'])
+                self.assertTrue(bench.command_schema(record))
+                stop.assert_not_called()
+
     def test_external_cancellation_stops_the_tree(self):
         previous = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(bench.Cancelled('test')))
         try:
@@ -216,6 +232,8 @@ class StopTreeTest(unittest.TestCase):
             signal.signal(signal.SIGTERM, previous)
         record = json.loads((self.directory / 'step.json').read_text())
         self.assertEqual(record['cancelled'], 'Cancelled')
+        self.assertTrue(record['process_started'])
+        self.assertTrue(bench.command_schema(record))
         self.assert_stopped(record)
 
     def test_timeout_follows_a_child_that_execs_another_program(self):
@@ -237,6 +255,8 @@ class StopTreeTest(unittest.TestCase):
             signal.signal(signal.SIGTERM, previous)
         record = json.loads((self.directory / 'step.json').read_text())
         self.assertEqual(record['cancelled'], 'Cancelled')
+        self.assertTrue(record['process_started'])
+        self.assertTrue(bench.command_schema(record))
         self.assert_stopped(record)
         self.assertTrue(any(entry['pid'] == self.child() for entry in record['stopped']['exec_transitions']))
 

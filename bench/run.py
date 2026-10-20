@@ -156,12 +156,14 @@ def invoke(argv, cwd, env, timeout, receipt):
     while any(stem.with_name(stem.name + suffix).exists() for suffix in ['.json', '.stdout', '.stderr']):
         attempt += 1
         stem = receipt.with_name(f'{receipt.name}-attempt-{attempt}')
-    record = {'argv': argv, 'cwd': str(cwd), 'started_unix_ns': time.time_ns(), 'timed_out': False, 'receipt': stem.name}
+    record = {'argv': argv, 'cwd': str(cwd), 'started_unix_ns': time.time_ns(), 'timed_out': False,
+              'receipt': stem.name, 'process_started': False}
     started, process, cancelled = time.monotonic_ns(), None, None
     with stem.with_name(stem.name + '.stdout').open('wb') as out, stem.with_name(stem.name + '.stderr').open('wb') as err:
         try:
             process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                                        start_new_session=True)
+            record['process_started'] = True
             try:
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -782,7 +784,18 @@ def command_schema(value):
             and (value['exit_code'] is None or type(value['exit_code']) is int)
             and all(isinstance(value[key], str) for key in ['launch_error', 'cancelled'] if key in value)):
         return False
-    return (not (value['timed_out'] and 'stopped' not in value)
+    if 'cancelled' in value and value['cancelled'] not in {'Cancelled', 'KeyboardInterrupt'}:
+        return False
+    if 'process_started' in value:
+        if type(value['process_started']) is not bool:
+            return False
+        if not value['process_started'] and (value['exit_code'] is not None or value['timed_out']
+                or 'stopped' in value or not any(key in value for key in ['cancelled', 'launch_error'])):
+            return False
+    # Older receipts omit process_started. Only an explicit false can establish that
+    # cancellation happened before a child existed; otherwise stopping must be observed.
+    needs_stop = value['timed_out'] or ('cancelled' in value and value.get('process_started') is not False)
+    return (not (needs_stop and 'stopped' not in value)
             and ('stopped' not in value or stopped_schema(value['stopped'])))
 
 
@@ -869,11 +882,19 @@ def step_ok(record):
 
 def command_receipt(directory, stem, hashes, problems, window=None):
     """One command role, its exact output files, and the digests written by invoke()."""
-    record = receipt(directory, stem + '.json', hashes, problems, command_schema)
+    record = receipt(directory, stem + '.json', hashes, problems)
     if record is None:
         return None
-    valid = record['receipt'] == stem
-    if not valid:
+    # invoke() always re-raises external cancellation after saving this receipt. Even a
+    # clean stop or a cancellation before launch cannot belong to a completed trial.
+    if 'cancelled' in record:
+        problems.append(f'{stem}.json command was cancelled: {record["cancelled"]}')
+    if not command_schema(record):
+        problems.append(f'{stem}.json malformed observation')
+        return None
+    role_matches = record['receipt'] == stem
+    valid = role_matches and 'cancelled' not in record
+    if not role_matches:
         problems.append(f'{stem}.json receipt does not match command role')
     for suffix in ['stdout', 'stderr']:
         name = f'{stem}.{suffix}'

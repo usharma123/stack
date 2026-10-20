@@ -335,6 +335,86 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(self.row()['status'], 'invalid')
         self.assertFalse(self.row()['verified_task'])
 
+    def test_cancellation_in_every_invoked_role_invalidates_a_completed_trial(self):
+        self.catalog_plan()
+        roles = ['agent', 'agent-cleanup-down', 'agent-cleanup-supervisor-stop', 'final-cleanup-down',
+                 'grade-setup', 'grade-up', 'grade-smoke_exec', 'grade-smoke_task_loop', 'grade-verify',
+                 'grade-cleanup-down', 'grade-control-setup', 'grade-control-up', 'grade-control-smoke_exec',
+                 'grade-control-smoke_task_loop', 'grade-control-verify', 'grade-control-cleanup-down']
+        empty_stop = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': []}
+        for stem in roles:
+            for stop in [None, empty_stop]:
+                with self.subTest(stem=stem, stop=stop):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    cleanup = teardown_record()
+                    cleanup['steps']['supervisor_stop'] = 0
+                    control = stem.startswith('grade-control-')
+                    records = self.sealed(outcome='startup_failed' if control else 'graded', control=True,
+                                          agent_cleanup=cleanup, final_cleanup=teardown_record())
+                    command = json.loads((records.out / (stem + '.json')).read_text())
+                    command.update(cancelled='Cancelled', process_started=True)
+                    if stop is not None:
+                        command['stopped'] = stop
+                    records.replace_record(stem + '.json', command)
+                    self.review(records)
+                    self.review(self.sealed(1))
+                    report = self.report()
+                    row = report['rows'][0]
+                    self.assertEqual(row['status'], 'invalid')
+                    self.assertFalse(row['verified_task'])
+                    self.assertFalse(row['autonomous'])
+                    self.assertTrue(any(stem + '.json command was cancelled' in p for p in row['problems']))
+                    self.assertEqual(report['rows'][1]['status'], 'passed')
+                    self.assertFalse(report['publishable'])
+                    self.assertEqual(report['pairs'], [])
+
+    def test_prelaunch_cancellation_needs_no_stop_but_still_invalidates_the_trial(self):
+        records = self.sealed()
+        agent = dict(records.agent, cancelled='KeyboardInterrupt', process_started=False, exit_code=None)
+        self.assertTrue(bench.command_schema(agent))
+        records.replace_record('agent.json', agent)
+        self.review(records)
+        self.assertEqual(self.row()['status'], 'invalid')
+        self.assertTrue(any('command was cancelled' in p for p in self.row()['problems']))
+        for change in [{'process_started': True}, {'process_started': 'false'}, {'exit_code': 0},
+                       {'stopped': {}}, {'cancelled': ''}, {'cancelled': 'unknown'}]:
+            with self.subTest(change=change):
+                self.assertFalse(bench.command_schema(dict(agent, **change)))
+
+    def test_cancelled_setup_retry_is_terminal_even_if_a_later_retry_succeeds(self):
+        records = self.sealed()
+        command = json.loads((records.out / 'grade-setup.json').read_text())
+        stop = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': []}
+        records.replace_record('grade-setup.json', dict(command, exit_code=1, cancelled='Cancelled', stopped=stop))
+        records.retry('grade-setup-attempt-2', dict(command, receipt='grade-setup-attempt-2',
+                      started_unix_ns=command['started_unix_ns'] + command['elapsed_ns']))
+        grade = json.loads((records.out / 'grade.json').read_text())
+        grade['seconds']['setup'] = 4.0
+        records.replace_record('grade.json', grade, 'grade')
+        self.review(records)
+        self.assertEqual(self.row()['status'], 'invalid')
+
+    def test_timeout_is_scored_separately_from_external_cancellation(self):
+        stop = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': []}
+        records = self.sealed(smoke_exit=1)
+        command = dict(records.agent, timed_out=True, exit_code=-15, stopped=stop)
+        records.replace_record('agent.json', command)
+        records.edit_summary(agent={key: command.get(key) for key in
+                             ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']})
+        self.review(records)
+        self.assertEqual((self.row()['status'], self.row()['problems']), ('timed_out', []))
+        # An observation-only task-loop timeout or nonzero down is still a product observation.
+        records = self.sealed(1)
+        for stem in ['grade-smoke_task_loop', 'agent-cleanup-down']:
+            command = json.loads((records.out / (stem + '.json')).read_text())
+            records.replace_record(stem + '.json', dict(command, timed_out=True, exit_code=-15, stopped=stop))
+        cleanup = json.loads((records.out / 'agent-cleanup.json').read_text())
+        cleanup['steps']['down'] = -15
+        records.replace_record('agent-cleanup.json', cleanup, 'agent_cleanup')
+        self.review(records)
+        self.assertEqual((self.row(1)['status'], self.row(1)['problems']), ('passed', []))
+        self.assertTrue(self.row(1)['autonomous'])
+
     def test_stopped_commands_require_explicit_uncertainty_observations(self):
         for omitted in ['terminated', 'killed', 'survivors', 'unresolved', 'stopped']:
             with self.subTest(omitted=omitted):
