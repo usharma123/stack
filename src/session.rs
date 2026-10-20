@@ -903,6 +903,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                 .map(|c| (c.service.clone(), c.identity))
                 .collect::<IndexMap<_, _>>()),
         );
+        warnings.extend(encoding_warnings(ctx, &report, &checks));
     }
 
     // Startup and verification are not idle time: the lease starts once services are verified.
@@ -947,6 +948,42 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         reaped,
         warnings,
     })
+}
+
+/// A warning for each verified Postgres preset whose cluster is not `UTF8`: one created under
+/// a non-UTF-8 locale before Stack fixed the locale of new clusters (see
+/// [`mise::preset_env`]). Its data is kept as it is, never reinitialized; the warning says
+/// how to move to a `UTF8` cluster. Best effort: nothing is asked when no Postgres verified,
+/// and a query that fails warns about nothing.
+fn encoding_warnings(ctx: &Ctx, report: &Report, checks: &[Check]) -> Vec<String> {
+    let postgres: Vec<&Check> = checks
+        .iter()
+        .filter(|c| c.ready && report.stack.services.get(&c.service).is_some_and(|s| s.value.preset.as_deref() == Some("postgres")))
+        .collect();
+    if postgres.is_empty() {
+        return Vec::new();
+    }
+    let Ok(env) = mise::env(&ctx.root) else { return Vec::new() };
+    postgres.into_iter().filter_map(|check| encoding_warning(&env, check)).collect()
+}
+
+/// [`encoding_warnings`] for one verified Postgres, asked over the app's `DATABASE_URL`.
+fn encoding_warning(env: &IndexMap<String, String>, check: &Check) -> Option<String> {
+    let url = env.get("DATABASE_URL")?;
+    let encoding = run_probe(env, "psql", &[url, "-Atc", "show server_encoding"]).ok()?;
+    let encoding = encoding.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    if encoding == "UTF8" {
+        return None;
+    }
+    let dir = check.data_dir.as_deref().unwrap_or("its data directory");
+    Some(format!(
+        "{}: the cluster in {dir} uses encoding {encoding}, so text is not checked as UTF-8 and clients such as psycopg return bytes; \
+         it was created under a non-UTF-8 locale and is kept as it is. New clusters are UTF8 (locale {}). To move this one: \
+         `stack exec -- sh -c 'pg_dumpall -d \"$DATABASE_URL\" > dump.sql'`, `stack down`, move {dir} aside, `stack up`, \
+         then `stack exec -- sh -c 'psql \"$DATABASE_URL\" -f dump.sql'`",
+        check.service,
+        mise::POSTGRES_LOCALE
+    ))
 }
 
 /// The file beside a service's data directory naming the checkout (by token, see
@@ -4363,6 +4400,39 @@ mod tests {
         let path = format!("{}:/bin:/usr/bin", dir.path().display());
         let env = IndexMap::from([("PATH".to_string(), path)]);
         (dir, env)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_postgres_cluster_that_is_not_utf8_is_warned_about_and_a_utf8_one_is_not() {
+        let check = |data_dir: &str| Check {
+            service: "postgres".into(),
+            ready: true,
+            port: Some(1),
+            pid: None,
+            identity: Some(Identity::Instance),
+            reason: None,
+            withheld: Vec::new(),
+            changed_since_start: Vec::new(),
+            watch_incomplete: false,
+            checked_at: 0,
+            data_dir: Some(data_dir.into()),
+            provider_id: None,
+        };
+        let (_dir, mut env) = fake_client("psql", r#"test "$3" = 'show server_encoding' && echo SQL_ASCII"#);
+        env.insert("DATABASE_URL".into(), "postgresql://postgres@127.0.0.1:1/postgres".into());
+        let warning = encoding_warning(&env, &check("/data/pg")).expect("SQL_ASCII is warned about");
+        assert!(warning.starts_with("postgres: the cluster in /data/pg uses encoding SQL_ASCII"), "{warning}");
+        assert!(warning.contains("kept as it is") && warning.contains("C.UTF-8") && warning.contains("pg_dumpall"), "{warning}");
+        let (_dir, mut env) = fake_client("psql", "echo UTF8");
+        env.insert("DATABASE_URL".into(), "postgresql://x".into());
+        assert_eq!(encoding_warning(&env, &check("/data/pg")), None);
+        // A query that fails, or no URL, warns about nothing.
+        let (_dir, mut env) = fake_client("psql", "exit 2");
+        env.insert("DATABASE_URL".into(), "postgresql://x".into());
+        assert_eq!(encoding_warning(&env, &check("/data/pg")), None);
+        env.shift_remove("DATABASE_URL");
+        assert_eq!(encoding_warning(&env, &check("/data/pg")), None);
     }
 
     #[cfg(unix)]

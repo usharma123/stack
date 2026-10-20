@@ -66,6 +66,13 @@ load code you edited use `restart`.
   fails with `port_conflict`, naming the port and, where it can, the program. Run
   `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never
   reassigns ports on its own.
+- **Postgres encoding.** A new Postgres cluster is created `UTF8` with locale `C.UTF-8`
+  (code-point collation), whatever locale the shell running `up` has, so CI, `env -i` and
+  containers get the same database as a laptop. A locale set in the project's `[env]` reaches
+  Postgres too and takes precedence. An existing cluster keeps the encoding it was created
+  with; when it is not `UTF8` (one created under `LC_ALL=C` by Stack 0.1.22 or earlier), `up`
+  says so in `warnings`, with the commands to dump it and recreate it. Its data is never
+  reinitialized.
 - **Recreated checkouts** start with empty data. If a checkout at the same path was deleted
   without `down`, its databases are moved to `<data dir>.replaced-<time>` (never deleted) and
   a warning names them. The same checkout keeps its data across `down` and `up`.

@@ -283,6 +283,22 @@ fn custom_services_get_their_loopback_address_as_their_url() {
 }
 
 #[test]
+fn a_postgres_preset_initializes_with_a_fixed_utf8_locale_whatever_the_callers() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.db]\npreset = \"postgres\"\n[services.cache]\npreset = \"redis\"\n[services.web]\nrun = \"serve\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered: toml::Table = fs::read_to_string(mise::output_path(&root)).unwrap().parse().unwrap();
+    let daemons = rendered["daemons"].as_table().unwrap();
+    // The daemon's own environment, which its one-time `initdb` runs with, replaces the
+    // caller's locale; it is not in `[env]`, so commands keep theirs.
+    assert_eq!(daemons["db"]["env"]["LC_ALL"].as_str(), Some("C.UTF-8"), "{daemons:?}");
+    for other in ["cache", "web"] {
+        assert!(daemons[other].get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{other}: {daemons:?}");
+    }
+    assert!(rendered.get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{rendered:?}");
+}
+
+#[test]
 fn uv_python_selection_is_left_to_the_project_when_it_sets_one() {
     let sb = Sandbox::new();
     let root = sb.project("[tools]\npython = \"3.13\"\n[env]\nUV_PYTHON_PREFERENCE = \"managed\"\n");
