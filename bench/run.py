@@ -85,7 +85,9 @@ def command_tree(process, known):
                 members[pid] = row
                 parents.add(pid)
                 grew = True
-    return members
+    # Never adopt a replacement for a process already recorded, even if its current
+    # group/ancestry would otherwise qualify. exec keeps the original start identity.
+    return {pid: row for pid, row in members.items() if pid not in known or arms.same_start(known[pid], row)}
 
 
 def stop_tree(process):
@@ -93,31 +95,52 @@ def stop_tree(process):
 
     Each signal goes to one recorded process after `arms.signal_if_same` has checked its
     start time and command line again, so an unrelated process that later reuses a PID is
-    never signalled. Returns what was signalled and anything that survived.
+    never signalled. A member that replaces its program with exec() keeps its PID and start
+    time but changes its command line; when it is found in the tree again it is tracked under
+    its new command (`exec_transitions`). One that cannot be found in the tree again, whose PID
+    still has the recorded start time but another command, is never signalled and is reported
+    as `unresolved` rather than dropped. Returns what was signalled, what survived and what
+    could not be identified.
     """
-    known, log = {}, {'terminated': [], 'killed': [], 'survivors': []}
+    known, sent = {}, {signal.SIGTERM: set(), signal.SIGKILL: set()}
+    log = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': [], 'exec_transitions': []}
 
     def refresh():
         for pid, row in command_tree(process, known).items():
-            known.setdefault(pid, row)
+            previous = known.get(pid)
+            if previous is not None and arms.same_start(previous, row) and previous['command'] != row['command']:
+                log['exec_transitions'].append({'pid': pid, 'from': previous['command'], 'to': row['command']})
+            # A different start time means the recorded process is gone and this tree member is new.
+            known[pid] = row
 
     def signal_all(signum, done):
         for pid, row in known.items():
-            if pid not in done and arms.signal_if_same(row, signum):
-                done.append(pid)
+            key = (pid, row['started'], row.get('start_ticks'))
+            if key not in sent[signum] and arms.signal_if_same(row, signum):
+                sent[signum].add(key)
+                if pid not in done:
+                    done.append(pid)
 
     for signum, done in [(signal.SIGTERM, log['terminated']), (signal.SIGKILL, log['killed'])]:
         deadline = time.monotonic() + STOP_GRACE_SECONDS
         while True:
             process.poll()  # reap the leader once it exits
-            refresh()  # children forked while stopping are found and stopped too
+            refresh()  # children forked or exec'd while stopping are found and stopped too
             signal_all(signum, done)
             if time.monotonic() >= deadline or not any(arms.same_process(row) for row in known.values()):
                 break
             time.sleep(0.1)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=5)
-    log['survivors'] = sorted(pid for pid, row in known.items() if arms.same_process(row))
+    refresh()
+    for pid, row in sorted(known.items()):
+        now = arms.process_identity(pid)
+        if now is None:
+            continue
+        if arms.same_process(row):
+            log['survivors'].append(pid)
+        elif arms.same_start(row, now):
+            log['unresolved'].append({'pid': pid, 'recorded': row, 'now': now})
     return log
 
 

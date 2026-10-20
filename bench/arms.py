@@ -347,6 +347,12 @@ def same_process(process):
     return now is not None and all(now.get(key) == process.get(key) for key in ['started', 'command', 'start_ticks'])
 
 
+def same_start(recorded, now):
+    """Same start time (and, on Linux, start ticks): the same process unless the PID was reused
+    within the clock's resolution. exec() keeps the start time and changes only the command line."""
+    return all(recorded.get(key) == now.get(key) for key in ['started', 'start_ticks'])
+
+
 def signal_if_same(process, signum, still_owned=None):
     """Signal one exact process, never a PID the system has since given to someone else.
 

@@ -62,6 +62,28 @@ class SignalTest(unittest.TestCase):
         with mock.patch.object(arms, 'process_identity', return_value=dict(ORIGINAL, start_ticks=100)):
             self.assertTrue(arms.same_process(recorded))
 
+    def test_pidfd_checks_identity_and_ownership_without_numeric_pid_signals(self):
+        recorded = dict(ORIGINAL, start_ticks=100)
+        for identity, owned, expected in [(recorded, True, True), (dict(recorded, start_ticks=101), True, False),
+                                          (recorded, False, False)]:
+            with self.subTest(identity=identity, owned=owned), \
+                    mock.patch.object(arms, '_pidfd_open', return_value=57), \
+                    mock.patch.object(arms, 'process_identity', return_value=identity), \
+                    mock.patch.object(arms.signal, 'pidfd_send_signal', create=True) as send, \
+                    mock.patch.object(arms.os, 'close') as close, mock.patch.object(arms.os, 'kill') as kill:
+                self.assertEqual(arms.signal_if_same(recorded, signal.SIGKILL, lambda _: owned), expected)
+                self.assertEqual(send.call_count, int(expected))
+                close.assert_called_once_with(57)
+                kill.assert_not_called()
+
+    def test_tree_does_not_adopt_a_reused_child_pid(self):
+        leader = SimpleNamespace(pid=1, returncode=None)
+        old = dict(ORIGINAL, pgid=1, ppid=1, start_ticks=100)
+        replacement = dict(old, start_ticks=101)
+        with mock.patch.object(arms, 'process_table', return_value={old['pid']: replacement}), \
+                mock.patch.object(arms, 'same_process', return_value=False):
+            self.assertEqual(bench.command_tree(leader, {old['pid']: old}), {})
+
 
 @unittest.skipIf(sys.platform == 'darwin' and not shutil.which('lsof'), 'lsof unavailable')
 class ReclaimProcessTest(unittest.TestCase):
@@ -95,8 +117,16 @@ class ReclaimProcessTest(unittest.TestCase):
 
 
 # The leader exits on SIGTERM; its child ignores SIGTERM and, optionally, leaves the group.
+# 'exec-on-term' replaces itself with /bin/sleep when sent SIGTERM (review round 2, B);
+# 'escape-on-term' also leaves the session first, after its leader has gone, so the tree
+# can no longer vouch for it.
 CHILD = """import os, pathlib, signal, sys, time
-signal.signal(signal.SIGTERM, signal.SIG_IGN)
+def replace(*_):
+    if sys.argv[1] == 'escape-on-term':
+        time.sleep(0.5)
+        os.setsid()
+    os.execv('/bin/sleep', ['sleep', '30'])
+signal.signal(signal.SIGTERM, replace if sys.argv[1].endswith('-on-term') else signal.SIG_IGN)
 if sys.argv[1] == 'own-group':
     os.setpgrp()
 pathlib.Path('child.pid').write_text(str(os.getpid()))
@@ -163,12 +193,45 @@ class StopTreeTest(unittest.TestCase):
         self.assertEqual(record['cancelled'], 'Cancelled')
         self.assert_stopped(record)
 
+    def test_timeout_follows_a_child_that_execs_another_program(self):
+        record = self.run_leader('exec-on-term', 1.5)
+        self.assertTrue(record['timed_out'])
+        self.assert_stopped(record)
+        transition = [entry for entry in record['stopped']['exec_transitions'] if entry['pid'] == self.child()]
+        self.assertEqual(len(transition), 1)
+        self.assertIn('sleep 30', transition[0]['to'])
+        self.assertEqual(record['stopped']['unresolved'], [])
+
+    def test_cancellation_follows_a_child_that_execs_another_program(self):
+        previous = signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(bench.Cancelled('test')))
+        try:
+            threading.Timer(1.5, os.kill, [os.getpid(), signal.SIGTERM]).start()
+            with self.assertRaises(bench.Cancelled):
+                self.run_leader('exec-on-term', 30)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        record = json.loads((self.directory / 'step.json').read_text())
+        self.assertEqual(record['cancelled'], 'Cancelled')
+        self.assert_stopped(record)
+        self.assertTrue(any(entry['pid'] == self.child() for entry in record['stopped']['exec_transitions']))
+
+    def test_an_exec_the_tree_cannot_vouch_for_is_unresolved_not_signalled(self):
+        # The child leaves the session and execs after its leader exits: the PID keeps its start
+        # time but nothing ties it to the command any more. It is reported, never signalled.
+        record = self.run_leader('escape-on-term', 1.5)
+        child = self.child()
+        self.assertTrue(arms.alive(child), 'an unverifiable process was signalled')
+        self.assertNotIn(child, record['stopped']['killed'])
+        self.assertEqual([entry['pid'] for entry in record['stopped']['unresolved']], [child])
+        self.assertIn('sleep 30', record['stopped']['unresolved'][0]['now']['command'])
+        self.assertIsNone(self.sentinel.poll(), 'an unrelated process was signalled')
+
     def test_a_reaped_leaders_reused_group_is_left_alone(self):
         # A finished command whose PID now leads someone else's group: nothing is signalled.
         finished = SimpleNamespace(pid=self.sentinel.pid, returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0)
         self.assertEqual(bench.command_tree(finished, {}), {})
         log = bench.stop_tree(finished)
-        self.assertEqual(log, {'terminated': [], 'killed': [], 'survivors': []})
+        self.assertEqual(log, {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': [], 'exec_transitions': []})
         self.assertIsNone(self.sentinel.poll())
 
 
