@@ -335,6 +335,23 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(self.row()['status'], 'invalid')
         self.assertFalse(self.row()['verified_task'])
 
+    def test_stopped_commands_require_explicit_uncertainty_observations(self):
+        for omitted in ['terminated', 'killed', 'survivors', 'unresolved', 'stopped']:
+            with self.subTest(omitted=omitted):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed()
+                name = 'grade-smoke_task_loop.json'
+                command = json.loads((records.out / name).read_text())
+                stopped = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': []}
+                if omitted == 'stopped':
+                    command['timed_out'] = True
+                else:
+                    stopped.pop(omitted)
+                    command['stopped'] = stopped
+                records.replace_record(name, command)
+                self.assertEqual(self.row()['status'], 'invalid')
+                self.assertFalse(self.row()['verified_task'])
+
     def test_uncertainty_in_every_command_role_survives_later_empty_cleanup(self):
         roles = ['agent', 'agent-cleanup-down', 'agent-cleanup-supervisor-stop', 'final-cleanup-down',
                  'grade-smoke_task_loop', 'grade-cleanup-down', 'grade-control-smoke_task_loop',

@@ -773,10 +773,11 @@ def command_schema(value):
             and all(isinstance(value[key], str) for key in ['launch_error', 'cancelled'] if key in value)):
         return False
     stopped = value.get('stopped')
-    return ('stopped' not in value or (isinstance(stopped, dict)
+    return (not (value['timed_out'] and 'stopped' not in value)
+            and ('stopped' not in value or (isinstance(stopped, dict)
             and all(isinstance(stopped.get(key), list) and all(type(pid) is int and pid > 0 for pid in stopped[key])
                     for key in ['terminated', 'killed', 'survivors'])
-            and isinstance(stopped.get('unresolved', []), list)))
+            and isinstance(stopped.get('unresolved'), list))))
 
 
 def residue_schema(value):
