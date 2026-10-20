@@ -2,9 +2,19 @@
 """Scripted Stack regression checks for findings from the 2026-10-20 hands-on sessions.
 
 Each check reproduces one finding deterministically in its own isolated runtime and
-passes only when Stack behaves as documented. Where possible a control in the same
-check shows the fixture itself is sound. These are product correctness gates, not agent
-results. On Stack 0.1.22 several are expected to fail; that is the point of keeping them.
+passes only when Stack behaves as documented. Each has a control in the same runtime that
+shows the fixture and harness are sound, or says why no control applies. These are product
+correctness gates, not agent results. On Stack 0.1.22 several are expected to fail; that is
+the point of keeping them.
+
+Every check gets a verdict:
+  fixed       Stack behaves as documented; the control passed and cleanup was clean
+  reproduced  the defect is present; the control passed and cleanup was clean
+  invalid     the control failed, the check errored, or owned processes outlived cleanup:
+              the harness or environment is at fault, and the product result is unknown
+The exit status is 0 when every check is fixed, 1 when the run is valid and at least one
+defect reproduced, and 2 when any check is invalid or the user's global Stack, mise or
+Pitchfork state changed during the run.
 
   python3 bench/regressions.py --stack target/debug/stack --out <new dir> [--only ID ...]
 """
@@ -102,7 +112,8 @@ def run_exec_url_parity(rt):
     exec_url = data(rt.stack('exec-url', app, 'exec', '--require', 'web', '--', 'sh', '-c', 'printf %s "$WEB_URL"')).get('stdout')
     run_url = data(rt.stack('run-url', app, 'run', 'url')).get('stdout')
     control = isinstance(exec_url, str) and exec_url.startswith('http://127.0.0.1:')
-    return {'passed': control and run_url == exec_url, 'control_passed': control,
+    return {'passed': control and run_url == exec_url,
+            'control': {'passed': control, 'what': '`exec` in the same checkout gets a loopback URL'},
             'observed': {'exec': exec_url, 'run': run_url}}
 
 
@@ -117,7 +128,8 @@ def postgres_locale_independent(rt):
                 return {'error': f'{label} {step} failed', 'observed': observed}
         query = 'psql "$DATABASE_URL" -Atc "show server_encoding"'
         observed[label] = data(sub.stack(f'{label}-encoding', app, 'exec', '--require', 'postgres', '--', 'sh', '-c', query)).get('stdout', '').strip()
-    return {'passed': observed.get('C') == 'UTF8', 'control_passed': observed.get('utf8') == 'UTF8', 'observed': observed}
+    return {'passed': observed.get('C') == 'UTF8', 'observed': observed,
+            'control': {'passed': observed.get('utf8') == 'UTF8', 'what': 'a first `up` under LANG=en_US.UTF-8 gives UTF8'}}
 
 
 @check('Astra #2: SIGTERM to `stack --json exec` leaves the command and its descendant running')
@@ -161,7 +173,8 @@ def external_sigterm_exec(rt):
             sentinel.wait()
     seen = result['observed']
     result['passed'] = not seen['command_alive'] and not seen['descendant_alive'] and seen['sentinel_alive']
-    result['control_passed'] = seen['sentinel_alive']
+    result['control'] = {'passed': seen['sentinel_alive'] and str(tree['parent']) in result['before'],
+                         'what': 'the command was running before SIGTERM, and an unrelated sentinel survives'}
     return result
 
 
@@ -190,20 +203,36 @@ def removed_checkout_reclaim(rt):
     kept = [entry for entry in registry.get('reservations', []) if entry.get('project') == str(app)]
     daemons = rt.root / 'mise/state/daemons'
     data_kb = int(subprocess.run(['du', '-sk', str(daemons)], capture_output=True, text=True).stdout.split()[0]) if daemons.exists() else 0
-    return {'passed': confirmed and not kept, 'control_passed': confirmed and gc['exit_code'] == 0,
+    return {'passed': confirmed and not kept,
+            'control': {'passed': confirmed and gc['exit_code'] == 0, 'what': '`down` confirmed and `gc` exited 0'},
             'observed': {'reservations_kept': kept, 'gc': data(gc), 'service_data_kb_kept': data_kb}}
 
 
 @check('L5: `stack down` in a fresh checkout that never ran `up` fails instead of reporting nothing to stop')
 def down_before_up(rt):
-    app = rt.project('fresh', {'stack.toml': '[services.web]\nrun = "exec python3 -m http.server $PORT --bind 127.0.0.1"\n'})
+    files = {'stack.toml': '[services.web]\nrun = "exec python3 -m http.server $PORT --bind 127.0.0.1"\n'}
+    app = rt.project('fresh', files)
     if rt.stack('compile', app, 'compile')['exit_code']:
         return {'error': 'compile failed'}
     # A new clone has stack.toml and the committed stack.lock, not the generated provider config.
     shutil.rmtree(app / '.config')
     down = rt.stack('down', app, 'down', timeout=120)
-    return {'passed': down['exit_code'] == 0 and data(down).get('confirmed') is True, 'control_passed': True,
-            'observed': {'exit_code': down['exit_code'], 'result': (down.get('json') or {}).get('error') or data(down)}}
+    # Control: the same project in a sibling checkout, after `up`, stops with a confirmed `down`.
+    # It shows the fixture and `down` work, so a failure above is about never having run `up`.
+    control = rt.project('started', files)
+    steps = {step: rt.stack(f'control-{step}', control, step, *(['--ttl', '20m'] if step == 'up' else []), timeout=300)
+             for step in ['compile', 'up', 'down']}
+    control_ok = all(record['exit_code'] == 0 for record in steps.values()) and data(steps['down']).get('confirmed') is True
+    # Not a gate: `down` before `up` in a checkout that still has its generated config.
+    compiled = rt.project('compiled', files)
+    rt.stack('compiled-compile', compiled, 'compile')
+    compiled_down = rt.stack('compiled-down', compiled, 'down', timeout=120)
+    return {'passed': down['exit_code'] == 0 and data(down).get('confirmed') is True,
+            'control': {'passed': control_ok, 'what': 'a sibling checkout of the same project: compile, up, then a confirmed down'},
+            'observed': {'exit_code': down['exit_code'], 'result': (down.get('json') or {}).get('error') or data(down),
+                         'control_exit_codes': {step: record['exit_code'] for step, record in steps.items()},
+                         'with_generated_config': {'exit_code': compiled_down['exit_code'],
+                                                   'result': (compiled_down.get('json') or {}).get('error') or data(compiled_down)}}}
 
 
 @check('P2-3: `stack run` resolves task secrets before installing the pinned fnox')
@@ -224,7 +253,7 @@ def secrets_before_install(rt):
     sub.stack('install', app, 'install')
     second = sub.stack('run-after-install', app, 'run', 'sign')
     ok = lambda record: record['exit_code'] == 0 and 'key-length 29' in (data(record).get('stdout') or '')
-    return {'passed': ok(first), 'control_passed': ok(second),
+    return {'passed': ok(first), 'control': {'passed': ok(second), 'what': 'the same task passes after `stack install`'},
             'observed': {'before_install': record_error(first), 'after_install_exit': second['exit_code']}}
 
 
@@ -263,13 +292,35 @@ def main():
             finally:
                 entry['cleanup'] = [runtime.close() for runtime in [rt, *rt.children]]
             entry['passed'] = entry.get('passed') is True and 'error' not in entry
+            entry['verdict'], entry['invalid_because'] = verdict(entry)
             summary['checks'][name] = entry
             (directory / 'result.json').write_text(json.dumps(entry, indent=2) + '\n')
-            print(f'{name}: {"PASS" if entry["passed"] else "FAIL"} {json.dumps(entry.get("observed"))}', flush=True)
+            print(f'{name}: {entry["verdict"].upper()} {json.dumps(entry.get("observed"))}'
+                  + (f' ({entry["invalid_because"]})' if entry['invalid_because'] else ''), flush=True)
     summary['globals_changed'] = arms.globals_diff(before, arms.globals_snapshot())
     summary['cleanup_ok'] = all(c['ok'] for entry in summary['checks'].values() for c in entry['cleanup'])
+    verdicts = [entry['verdict'] for entry in summary['checks'].values()]
+    summary['valid'] = 'invalid' not in verdicts and not summary['globals_changed']
+    summary['exit_status'] = 2 if not summary['valid'] else 1 if 'reproduced' in verdicts else 0
     (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-    return 0 if all(entry['passed'] for entry in summary['checks'].values()) else 1
+    return summary['exit_status']
+
+
+def verdict(entry):
+    """fixed, reproduced or invalid, with the reason a check is invalid."""
+    control = entry.get('control')
+    if 'error' in entry:
+        return 'invalid', entry['error']
+    if not isinstance(control, dict):
+        return 'invalid', 'the check reported no control'
+    if control.get('applicable') is False:
+        if not (isinstance(control.get('reason'), str) and control['reason'].strip()):
+            return 'invalid', 'a control marked not applicable needs a reason'
+    elif control.get('passed') is not True:
+        return 'invalid', f'control failed: {control.get("what")}'
+    if not all(cleanup.get('ok') is True for cleanup in entry.get('cleanup') or [{}]):
+        return 'invalid', 'owned processes outlived cleanup'
+    return ('fixed' if entry.get('passed') is True else 'reproduced'), None
 
 
 if __name__ == '__main__':
