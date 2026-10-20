@@ -742,7 +742,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
-    if let Err(e) = check_services_host(&report) {
+    if let Err(e) = check_services_host(&report).and_then(|()| refuse_root(&report)) {
         return Err(steps.fail("install", e, false));
     }
 
@@ -1713,6 +1713,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     }
     let report = ctx.compile(true)?;
     check_services_host(&report)?;
+    refuse_root(&report)?;
     mise::trust(&ctx.root)?;
     if session.launching {
         return Err(StackError::new("session_stale", "the last start or restart of this session did not finish verifying")
@@ -3317,6 +3318,31 @@ fn check_services_host(report: &Report) -> Result<()> {
     mise::check_services_host(&artifacts::Host::current(), &services)
 }
 
+/// Refuse to start services that never run as root when Stack runs as root, before anything is
+/// downloaded: PostgreSQL's `initdb` and server exit at once for root, after every install.
+fn refuse_root(report: &Report) -> Result<()> {
+    #[cfg(unix)]
+    // SAFETY: geteuid only reads the process's credentials.
+    let euid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let euid = 1;
+    refused_as_root(euid, &report.stack.services)
+}
+
+/// [`refuse_root`] for a given effective user id.
+fn refused_as_root(euid: u32, services: &IndexMap<String, Entry<Service>>) -> Result<()> {
+    if euid != 0 {
+        return Ok(());
+    }
+    let refusing: Vec<&str> = services.iter().filter(|(_, e)| e.value.preset.as_deref() == Some("postgres")).map(|(n, _)| n.as_str()).collect();
+    if refusing.is_empty() {
+        return Ok(());
+    }
+    Err(StackError::new("root_unsupported", format!("PostgreSQL ({}) refuses to run as root, and Stack is running as root", refusing.join(", ")))
+        .hint("run Stack as an unprivileged user that owns the checkout, e.g. `useradd -m dev && chown -R dev <checkout> && su dev -c 'stack up'`; installs and tools-only commands work as root")
+        .with_detail(json!({ "services": refusing, "euid": 0 })))
+}
+
 /// Install a task's `missing` pins before it starts, so `mise run` has nothing to install.
 /// Run against the task's configuration copy and the lock beside it (rendered from the
 /// validated stack.lock), with `stack install`'s checks and split: the provider release, the
@@ -4896,6 +4922,20 @@ mod tests {
         let path = format!("{}:/bin:/usr/bin", dir.path().display());
         let env = IndexMap::from([("PATH".to_string(), path)]);
         (dir, env)
+    }
+
+    #[test]
+    fn postgres_is_refused_up_front_only_for_root() {
+        let services: IndexMap<String, Entry<Service>> = [("db", "preset = 'postgres'"), ("cache", "preset = 'redis'")]
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), Entry { value: toml::from_str(t).unwrap(), origin: "project".into() }))
+            .collect();
+        let e = refused_as_root(0, &services).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("root_unsupported", "PostgreSQL (db) refuses to run as root, and Stack is running as root"));
+        assert!(e.hint.unwrap().contains("su dev -c 'stack up'"));
+        assert!(refused_as_root(1000, &services).is_ok());
+        let redis: IndexMap<String, Entry<Service>> = services.into_iter().filter(|(n, _)| n == "cache").collect();
+        assert!(refused_as_root(0, &redis).is_ok());
     }
 
     #[test]

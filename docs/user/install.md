@@ -14,6 +14,19 @@ your `PATH`; if there is none, it downloads the release Stack is tested against 
 SHA-256) into `~/.local/share/stack/bin`, where Stack finds it without a `PATH` change.
 `stack doctor` checks the machine and, inside a project, that it compiles.
 
+### Hosted runners that start as root
+
+PostgreSQL refuses to run as root, so a stack with a Postgres service fails `up` and `restart`
+with `root_unsupported` before anything is downloaded. Create an unprivileged user that owns
+the checkout and run Stack (and its stores) as that user:
+
+```sh
+useradd -m dev && chown -R dev /work/app
+su dev -c 'cd /work/app && stack setup && stack compile --locked && stack up'
+```
+
+`stack install` and tools-only commands work as root.
+
 ### Intel Macs
 
 Pitchfork, which runs services, has no Intel macOS build. Tools-only stacks work. A stack with
