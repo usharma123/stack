@@ -54,6 +54,52 @@ class PlanTest(unittest.TestCase):
             self.assertFalse(out.exists())
 
 
+class OptionsTest(unittest.TestCase):
+    """Planned model options must reach the agent's argv unchanged, or the plan is refused."""
+
+    def plan(self, command, options):
+        with tempfile.TemporaryDirectory() as directory:
+            return bench.make_plan(plan_args(Path(directory) / 'plan.json', options=json.dumps(options),
+                                             agent_command=json.dumps(command)))
+
+    def test_review_counterexample_literal_low_against_planned_high_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'never reach the agent'):
+            self.plan(['agent', '--model', '{model}', '--reasoning-effort', 'low', '--prompt-file', '{prompt_file}'],
+                      {'reasoningEffort': 'high'})
+
+    def test_literal_flag_beside_the_placeholder_is_refused(self):
+        for command in [['agent', '--reasoning-effort', 'low', '--effort', '{option:reasoningEffort}'],
+                        ['agent', '--reasoning_effort=low', '-x', '{option:reasoningEffort}']]:
+            with self.subTest(command), self.assertRaisesRegex(ValueError, 'contradicts or bypasses'):
+                self.plan(command + ['--model', '{model}', '{prompt}'], {'reasoningEffort': 'high'})
+
+    def test_literal_model_flag_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'contradicts or bypasses'):
+            self.plan(['agent', '--model', 'other-model', '--fallback', '{model}', '{prompt}'], {})
+
+    def test_unknown_placeholder_and_unrepresentable_values_are_refused(self):
+        with self.assertRaisesRegex(ValueError, 'not in --options'):
+            self.plan(['agent', '--model', '{model}', '--effort', '{option:effort}', '{prompt}'], {})
+        for value in [{'nested': 1}, None, float('inf')]:
+            with self.subTest(value), self.assertRaises(ValueError):
+                self.plan(['agent', '--model', '{model}', '--effort', '{option:effort}', '{prompt}'], {'effort': value})
+
+    def test_bound_options_are_substituted_verbatim_in_one_pass(self):
+        plan = self.plan(['agent', '--model={model}', '--reasoning-effort', '{option:reasoningEffort}',
+                          '--max-turns', '{option:maxTurns}', '--fast={option:fast}', '-p', '{prompt}'],
+                         {'reasoningEffort': 'high', 'maxTurns': 40, 'fast': False})
+        self.assertEqual(plan['agent_options_binding'], {'reasoningEffort': [3], 'maxTurns': [5], 'fast': [6]})
+        self.assertTrue(plan['agent_options_controlled'])
+        argv = bench.agent_argv(plan, 'model-a', {'prompt': 'use {model} literally', 'prompt_file': '', 'workspace': '',
+                                                  'transcript_dir': ''})
+        self.assertEqual(argv, ['agent', '--model=model-a', '--reasoning-effort', 'high', '--max-turns', '40', '--fast=false',
+                                '-p', 'use {model} literally'])
+
+    def test_a_plan_without_options_is_labelled_uncontrolled(self):
+        plan = self.plan(['agent', '--model', '{model}', '{prompt}'], {})
+        self.assertFalse(plan['agent_options_controlled'])
+
+
 class ReportTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

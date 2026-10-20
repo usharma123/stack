@@ -16,10 +16,12 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -366,6 +368,7 @@ def make_plan(args):
     locale = json.loads(args.locale)
     if not isinstance(options, dict) or not isinstance(locale, dict):
         raise ValueError('--options and --locale must be JSON objects')
+    binding = bind_options(template, options)
     rng = random.Random(args.seed)
     trials = []
     for task in args.tasks:
@@ -377,14 +380,65 @@ def make_plan(args):
                 trials += [{'id': f'{pair}:{arm}', 'pair': pair, 'task': task, 'model': model, 'arm': arm,
                             'repetition': repetition, 'position': position} for position, arm in enumerate(order)]
     binary = Path(args.stack).resolve()
-    payload = {'schema': 'stack-agentdx-plan/2', 'kind': args.kind, 'created_unix_ns': time.time_ns(), 'seed': args.seed,
+    payload = {'schema': 'stack-agentdx-plan/3', 'kind': args.kind, 'created_unix_ns': time.time_ns(), 'seed': args.seed,
                'platform': args.platform, 'host': platform.platform(), 'cache': args.cache, 'locale': locale,
-               'agent_harness': args.harness, 'agent_options': options, 'agent_command': template,
+               'agent_harness': args.harness, 'agent_command': template, 'agent_options': options,
+               # Where each option enters argv. With no options the harness runs on its own
+               # defaults, which this plan neither records nor controls.
+               'agent_options_binding': binding, 'agent_options_controlled': bool(options),
                'human_channel': 'none', 'concurrency': 1, 'budget_seconds': args.budget,
                'stack_binary': str(binary), 'stack_sha256': digest(binary), 'fingerprints': fingerprints(), 'trials': trials}
     with Path(args.out).open('x') as handle:  # A plan is never silently replaced.
         handle.write(json.dumps(payload, indent=2) + '\n')
     return payload
+
+
+PLACEHOLDER = re.compile(r'\{(prompt|prompt_file|model|workspace|transcript_dir|option:[^{}]*)\}')
+
+
+def flag_name(text):
+    return ''.join(character for character in text.lower() if character.isalnum())
+
+
+def option_text(value):
+    """An option's argv text: strings verbatim, numbers and booleans as JSON. Never translated."""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def bind_options(template, options):
+    """Check that every planned option reaches the agent's argv, and nothing contradicts it.
+
+    Each option must appear as `{option:NAME}`, and every placeholder must name a planned
+    option. A literal flag named like a planned option or `model` (`--reasoning-effort`,
+    `--model=...`) must carry that placeholder as its value, so the command cannot quietly
+    pass something else. A harness that takes settings any other way needs a wrapper that
+    does; otherwise plan no options and the run is labelled as using the harness defaults.
+    """
+    used = {match[len('option:'):] for part in template for match in PLACEHOLDER.findall(part) if match.startswith('option:')}
+    if used - set(options):
+        raise ValueError(f'--agent-command uses options not in --options: {sorted(used - set(options))}')
+    if set(options) - used:
+        raise ValueError(f'--options {sorted(set(options) - used)} never reach the agent; pass each as {{option:NAME}} '
+                         'in --agent-command, or plan without it')
+    for name, value in options.items():
+        if not (isinstance(value, (str, int, float, bool)) and (not isinstance(value, float) or math.isfinite(value))):
+            raise ValueError(f'option {name} must be a string, finite number or boolean')
+    expected = {flag_name(name): f'{{option:{name}}}' for name in options}
+    expected['model'] = '{model}'
+    for index, part in enumerate(template):
+        flag, equals, inline = part.partition('=')
+        if part.startswith('-') and flag_name(flag) in expected:
+            value = inline if equals else (template[index + 1] if index + 1 < len(template) else '')
+            if value != expected[flag_name(flag)]:
+                raise ValueError(f'{part!r} {"" if equals else repr(value) + " "}contradicts or bypasses the planned '
+                                 f'{expected[flag_name(flag)]}')
+    return {name: [index for index, part in enumerate(template) if f'{{option:{name}}}' in part] for name in options}
+
+
+def agent_argv(plan, model, values):
+    """The planned agent command with every placeholder replaced in one pass."""
+    values = {**values, 'model': model, **{f'option:{name}': option_text(value) for name, value in plan['agent_options'].items()}}
+    return [PLACEHOLDER.sub(lambda match: values[match.group(1)], part) for part in plan['agent_command']]
 
 
 def trial_key(identifier):
@@ -485,11 +539,8 @@ def experiment_trial(args):
             (root / 'prompt.txt').write_text(prompt)
             transcript = root / 'transcript'
             transcript.mkdir()
-            mapping = {'{prompt}': prompt, '{prompt_file}': str(root / 'prompt.txt'), '{model}': trial['model'],
-                       '{workspace}': str(workspace), '{transcript_dir}': str(transcript)}
-            argv = list(plan['agent_command'])
-            for old, new in mapping.items():
-                argv = [part.replace(old, new) for part in argv]
+            argv = agent_argv(plan, trial['model'], {'prompt': prompt, 'prompt_file': str(root / 'prompt.txt'),
+                                                     'workspace': str(workspace), 'transcript_dir': str(transcript)})
             summary['agent_argv'] = [part.replace(prompt, '<prompt.txt>') for part in argv]
             agent = invoke(argv, workspace, env, plan['budget_seconds'], out / 'agent')
             summary['agent'] = {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']}
@@ -530,21 +581,29 @@ def review_template(args):
     trial = next(entry for entry in plan['trials'] if entry['id'] == args.id)
     directory = Path(args.results) / trial_key(trial['id'])
     summary = directory / 'summary.json'
-    return {'schema': 'stack-agentdx-review/1', 'trial_id': trial['id'], 'trial_summary_sha256': digest(summary),
+    return {'schema': 'stack-agentdx-review/2', 'trial_id': trial['id'], 'trial_summary_sha256': digest(summary),
             'transcript_sha256': {str(path.relative_to(directory)): digest(path) for path in sorted(directory.glob('agent.std*'))
                                   + sorted((directory / 'transcript').rglob('*')) if path.is_file()},
-            'reviewer': None, 'requested_model': trial['model'], 'observed_model': None, 'harness': plan['agent_harness'],
-            'harness_version': None, 'options': plan['agent_options'], 'interventions': [], 'help_requests': [],
-            'workarounds': [], 'tokens': None, 'cost_usd': None, 'notes': ''}
+            'reviewer': None, 'requested_model': trial['model'], 'harness': plan['agent_harness'],
+            'requested_options': plan['agent_options'],
+            # Observed values come from the transcript or the harness's own receipt, never from the plan.
+            'observed_model': None, 'harness_version': None, 'observed_options': None,
+            'interventions': [], 'help_requests': [], 'workarounds': [], 'tokens': None, 'cost_usd': None, 'notes': ''}
 
 
 def review_problems(review, trial, plan, summary_path, directory, result):
     problems = []
-    if not isinstance(review, dict) or review.get('schema') != 'stack-agentdx-review/1':
-        return ['not a stack-agentdx-review/1 object']
+    if not isinstance(review, dict) or review.get('schema') != 'stack-agentdx-review/2':
+        return ['not a stack-agentdx-review/2 object']
     expect = {'trial_id': trial['id'], 'requested_model': trial['model'], 'observed_model': trial['model'],
-              'harness': plan['agent_harness'], 'options': plan['agent_options'], 'trial_summary_sha256': digest(summary_path)}
+              'harness': plan['agent_harness'], 'requested_options': plan['agent_options'],
+              'trial_summary_sha256': digest(summary_path)}
     problems += [f'{key} does not match' for key, value in expect.items() if review.get(key) != value]
+    observed = review.get('observed_options')
+    if plan['agent_options'] and observed != plan['agent_options']:
+        problems.append('observed_options must be the settings the transcript shows in effect, equal to the plan')
+    elif not plan['agent_options'] and observed is not None and not isinstance(observed, dict):
+        problems.append('observed_options must be null or an object')
     if not isinstance(review.get('reviewer'), str) or not review['reviewer'].strip():
         problems.append('reviewer missing')
     if not isinstance(review.get('harness_version'), str) or not review['harness_version'].strip():
