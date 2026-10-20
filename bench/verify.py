@@ -4,10 +4,20 @@
 Run inside the grading workspace's environment, after the harness has started the
 submitted code against grader-only seed data. Prints one JSON object and exits 0 only
 when every check passed.
+
+Threat model: submitted code is untrusted but runs as the same user. Every check is
+computed in this process from values it observes itself (HTTP responses, database rows,
+files, and slug() return values); nothing a submission prints, returns as a verdict or does
+in an exit handler can mark a check passed, and submitted subprocesses never share this
+process's stdout. Out of scope: code that tampers with the host outside the band, such as
+editing the benchmark files, reading this process's memory or the result nonce, or tracing
+it. The workspace boundary is a convention, not a sandbox; the trial re-hashes the benchmark
+files after grading to detect edits to them.
 """
 import json
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import urllib.error
@@ -69,7 +79,9 @@ def ledger(workspace):
         return state['row'] == ('Acme', 1729, note)
 
     def idempotent():
-        subprocess.run([sys.executable, str(workspace / 'migrate.py')], cwd=workspace, check=True, timeout=30)
+        # Output captured: submitted code must not write to the grader's own stdout.
+        subprocess.run([sys.executable, str(workspace / 'migrate.py')], cwd=workspace, check=True, timeout=30,
+                       stdin=subprocess.DEVNULL, capture_output=True)
         with psycopg.connect(database) as connection:
             current = connection.execute('SELECT id, customer, cents, note FROM invoices ORDER BY id').fetchall()
         return current == [(1, 'Acme', 1729, note), (7, 'Zoë Café', 450, '')]
@@ -121,24 +133,56 @@ def catalog(workspace):
     check('storage_matches_response', stored)
 
 
-SLUG_PROGRAM = r'''
-import {slug} from './slug.mjs';
-const cases = [['  Crème & BRÛLÉE! ', 'creme-brulee'], ['a---b', 'a-b'], ['A\t B\nC', 'a-b-c'], ['!!', ''], ['', ''],
-  ['version 42', 'version-42'], ['Ünïcödé -- Test', 'unicode-test'], ['hello world', 'hello-world']];
-const checks = {};
-cases.forEach(([input, expected], i) => { try { checks['case_' + i] = slug(input) === expected; } catch { checks['case_' + i] = false; } });
-try { checks.idempotent = cases.every(([input]) => slug(slug(input)) === slug(input)); } catch { checks.idempotent = false; }
-console.log(JSON.stringify(checks));
-'''
+SLUG_CASES = [('  Crème & BRÛLÉE! ', 'creme-brulee'), ('a---b', 'a-b'), ('A\t B\nC', 'a-b-c'), ('!!', ''), ('', ''),
+              ('version 42', 'version-42'), ('Ünïcödé -- Test', 'unicode-test'), ('hello world', 'hello-world')]
+
+# Runs in a Node process that also loads the submission, so it only reports what slug()
+# returned; this file decides every check. The request is read from stdin before the
+# submission loads, and the one result line carries its random nonce. Results are built by
+# string concatenation of primitives with functions captured before the import, so prototype
+# or global tampering cannot reshape them.
+SLUG_HARNESS = r"""
+import fs from 'node:fs';
+const writeSync = fs.writeSync, readFileSync = fs.readFileSync, stringify = JSON.stringify, parse = JSON.parse;
+const request = parse(readFileSync(0, 'utf8'));
+const nonce = request.nonce, inputs = request.inputs, count = inputs.length;
+const encode = (value) => typeof value === 'string' ? stringify(value) : 'null';
+const { slug } = await import(request.module);
+let line = '\n' + nonce + ' [';
+for (let i = 0; i < count; i++) {
+  let first, second;
+  try { first = slug(inputs[i]); } catch { first = undefined; }
+  try { second = typeof first === 'string' ? slug(first) : undefined; } catch { second = undefined; }
+  line = line + (i ? ',' : '') + encode(first) + ',' + encode(second);
+}
+writeSync(1, line + ']\n');
+"""
 
 
 def slug(workspace):
-    result = subprocess.run(['node', '--input-type=module', '-e', SLUG_PROGRAM], cwd=workspace,
-                            capture_output=True, text=True, timeout=30)
-    if result.returncode:
-        CHECKS['_errors'] = {'node': result.stderr[-2000:]}
+    """Call the submitted slug() on every case and compare here, in the grader."""
+    names = [f'case_{i}' for i in range(len(SLUG_CASES))] + ['idempotent']
+    CHECKS.update({name: False for name in names})
+    nonce = secrets.token_hex(16)
+    request = {'nonce': nonce, 'module': (workspace / 'slug.mjs').as_uri(), 'inputs': [text for text, _ in SLUG_CASES]}
+    try:
+        result = subprocess.run(['node', '--input-type=module', '-e', SLUG_HARNESS], cwd=workspace, input=json.dumps(request),
+                                capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        CHECKS['_errors'] = {'node': 'timed out after 30 s'}
         return
-    CHECKS.update({name: value is True for name, value in json.loads(result.stdout.strip().splitlines()[-1]).items()})
+    frames = [line[len(nonce) + 1:] for line in result.stdout.splitlines() if line.startswith(nonce + ' ')]
+    if result.returncode or len(frames) != 1:
+        CHECKS['_errors'] = {'node': f'exit {result.returncode}, {len(frames)} result lines; {result.stderr[-2000:]}'}
+        return
+    values = json.loads(frames[0])
+    if not (isinstance(values, list) and len(values) == 2 * len(SLUG_CASES)):
+        CHECKS['_errors'] = {'node': 'malformed result line'}
+        return
+    pairs = [values[i:i + 2] for i in range(0, len(values), 2)]
+    for i, ((_, expected), (first, _)) in enumerate(zip(SLUG_CASES, pairs)):
+        CHECKS[f'case_{i}'] = isinstance(first, str) and first == expected
+    CHECKS['idempotent'] = all(isinstance(first, str) and second == first for first, second in pairs)
 
 
 def main():

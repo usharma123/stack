@@ -174,9 +174,25 @@ def last_json(text):
     return None
 
 
+def result_lines(text):
+    """Every stdout line that is a grader result object."""
+    found = []
+    for line in text.splitlines():
+        with contextlib.suppress(ValueError):
+            value = json.loads(line)
+            if isinstance(value, dict) and 'checks' in value:
+                found.append(value)
+    return found
+
+
 def acceptance(task_id, record, out):
-    """Pass only when the grader's own receipt lists exactly the task's checks, all true."""
-    result = last_json(stdout_of(record, out))
+    """Pass only when the grader printed exactly one result listing exactly the task's checks, all true.
+
+    A second result line means something other than the grader wrote to its stdout, so the
+    receipt is rejected rather than resolved by position.
+    """
+    results = result_lines(stdout_of(record, out))
+    result = results[0] if len(results) == 1 else None
     required = set(TASKS[task_id]['required_checks'])
     checks = (result or {}).get('checks')
     passed = (record.get('exit_code') == 0 and not record.get('timed_out') and isinstance(checks, dict)
