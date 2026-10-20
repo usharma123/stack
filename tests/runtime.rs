@@ -3722,6 +3722,18 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_service_is_requested_only_once_the_services_it_depends_on_are_ready() {
+    // Declared first, but it waits for its dependency, which never becomes ready here.
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.api]\nrun='true'\ndepends_on=['db']\n[services.db]\nrun='true'\n");
+    let out = fixture.command(&["up", "--timeout", "3s", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
+    assert_eq!(requests, "daemons start -- db\n", "{requests}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");

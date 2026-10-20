@@ -42,6 +42,9 @@ A few things that are easy to get wrong:
 - **Read connection details from the environment.** `DATABASE_URL`, `REDIS_URL`,
   `<NAME>_PORT` and, for your own services, `<NAME>_URL` (`http://127.0.0.1:<port>`) are set
   for every command. Ports differ per checkout, so never hardcode one.
+- **Declare `depends_on` for a service that holds connections to another**, such as an API to
+  Postgres. Then a restart or recovery of Postgres restarts the API too; without it, the API
+  keeps its dead connection while every check still passes.
 - **`watch` does not reload anything.** When a file listed in a service's `watch` changes,
   `status`, `exec` and `run` tell you to run `stack restart <service>`. `up` leaves a service
   with unchanged configuration running, so it will not pick up your edit either.

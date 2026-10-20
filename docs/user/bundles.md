@@ -88,6 +88,7 @@ watch = ["index.html"]
 | `port` | `"auto"` | `"auto"` takes a free port from this machine's registry (20000-29999), stable per checkout; a number pins it, in the project's `stack.toml` or `[override.services]` only (`bundle_fixed_port` in a bundle) |
 | `identity` | none | An [identity probe](identity-probes.md): without one a custom service is verified for liveness only |
 | `watch` | `[]` | Files whose change after start `status`, `exec` and `run` report, with a `stack restart` hint |
+| `depends_on` | `[]` | Services this one needs: they start, and pass their checks, before it does. `stack restart` of one restarts this one after it, and `up` restarting one (it died, say) stops this one first and starts it again after, so it reconnects. Names must be services of the stack, without cycles (`dependency_cycle`) |
 
 Whatever the readiness settings, `up` verifies every service itself: Pitchfork reports it
 running, its process is alive, and the assigned port accepts connections, plus the preset's

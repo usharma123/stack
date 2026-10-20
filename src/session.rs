@@ -879,7 +879,18 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         let names: Vec<String> = report.stack.services.keys().cloned().collect();
-        if let Err(start_error) = start_watched(ctx, &report, &names) {
+        // A service still running whose dependency is about to start again (it died, or never
+        // ran) would keep its connections to the old one: stopped first, so it starts after it.
+        let running = |name: &String| before.iter().any(|d| d.name == *name && matches!(d.status.as_str(), "running" | "starting") && d.pid.is_some_and(pid_alive));
+        let starting: Vec<String> = names.iter().filter(|n| !running(n)).cloned().collect();
+        let stale: Vec<String> = dependents_of(&report.stack.services, &starting).into_iter().filter(|n| running(n)).collect();
+        if !stale.is_empty() {
+            match stop_and_wait(ctx, &stale, previous.as_ref()) {
+                Ok(()) => steps.ok("stop_dependents", json!(stale)),
+                Err(e) => return Err(steps.fail("stop_dependents", e, true)),
+            }
+        }
+        if let Err(start_error) = start_in_order(ctx, &report, &names) {
             let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
@@ -1069,6 +1080,76 @@ const STALL_LIMIT: Duration = Duration::from_secs(15);
 ///
 /// Every supervisor listing seen is recorded, as during verification.
 fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
+    start_watched_scoped(ctx, report, names, None)
+}
+
+/// Start `names` in the order [`dependency_waves`] gives: each wave of services is requested,
+/// and waited for until it is ready, before the next, so a service starts only once the services
+/// it `depends_on` run. A stack without dependencies among `names` is one wave.
+fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
+    let waves = dependency_waves(&report.stack.services, names);
+    if waves.len() <= 1 {
+        return start_watched(ctx, report, names);
+    }
+    let last = waves.len() - 1;
+    for (i, wave) in waves.iter().enumerate() {
+        start_watched_scoped(ctx, report, wave, Some(wave))?;
+        // A request may return once the provider launched the process; what depends on this
+        // wave starts only once Stack verified it and its declared readiness passes.
+        if i < last {
+            await_readiness(ctx, report, wave).map_err(|e| {
+                let waiting: Vec<&String> = waves[i + 1..].iter().flatten().collect();
+                e.with_detail(json!({ "not_started": waiting }))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// `names` grouped by dependency depth among themselves (no dependency on another of `names`
+/// first), each group in declaration order.
+fn dependency_waves(services: &IndexMap<String, Entry<Service>>, names: &[String]) -> Vec<Vec<String>> {
+    fn depth(services: &IndexMap<String, Entry<Service>>, names: &[String], name: &str, seen: &mut Vec<String>) -> usize {
+        if seen.iter().any(|s| s == name) {
+            return 0; // compile refuses cycles; never loop
+        }
+        seen.push(name.to_string());
+        let deps = services.get(name).map(|e| e.value.depends_on.clone()).unwrap_or_default();
+        let d = deps.iter().filter(|d| names.contains(d)).map(|d| 1 + depth(services, names, d, seen)).max().unwrap_or(0);
+        seen.pop();
+        d
+    }
+    let mut waves: Vec<Vec<String>> = Vec::new();
+    for name in services.keys().filter(|n| names.contains(n)) {
+        let d = depth(services, names, name, &mut Vec::new());
+        if waves.len() <= d {
+            waves.resize(d + 1, Vec::new());
+        }
+        waves[d].push(name.clone());
+    }
+    waves.retain(|w| !w.is_empty());
+    waves
+}
+
+/// Every service that depends on one of `names`, directly or through others, not in `names`.
+fn dependents_of(services: &IndexMap<String, Entry<Service>>, names: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    loop {
+        let more: Vec<String> = services
+            .iter()
+            .filter(|(name, e)| !names.contains(name) && !found.contains(name) && e.value.depends_on.iter().any(|d| names.contains(d) || found.contains(d)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            return found;
+        }
+        found.extend(more);
+    }
+}
+
+/// [`start_watched`]; with `scope`, only those services must verify for the start to be over
+/// early (a wave of [`start_in_order`]: later waves are not started yet).
+fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1116,7 +1197,8 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
             let checks = verify_all(&ctx.root, report, &env, &statuses, &timings);
             // A service whose request returned passed the provider's own readiness checks.
             let returned = completed.lock().expect("not poisoned").clone();
-            if checks.iter().all(|c| c.ready) && names.iter().all(|n| returned.contains(n) || declared_ready(ctx, report, &env, n) == Some(true)) {
+            let in_scope = |c: &&Check| scope.map_or(true, |s| s.contains(&c.service));
+            if checks.iter().filter(in_scope).all(|c| c.ready) && names.iter().all(|n| returned.contains(n) || declared_ready(ctx, report, &env, n) == Some(true)) {
                 return end(Ok(()));
             }
         }
@@ -1147,6 +1229,30 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Stop `names` through the supervisor and wait until the processes `session` recorded for them
+/// are gone and their ports closed (`stop_unconfirmed` otherwise).
+fn stop_and_wait(ctx: &Ctx, names: &[String], session: Option<&Session>) -> Result<()> {
+    mise::stop_daemons(&ctx.root, names)?;
+    let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
+    loop {
+        let alive: Vec<Value> = names
+            .iter()
+            .filter_map(|n| session?.services.get(n).map(|r| (n, r)))
+            .filter(|(_, r)| r.pid.is_some_and(pid_alive) || accepting(r.port))
+            .map(|(n, r)| json!({ "service": n, "pid": r.pid, "port": r.port }))
+            .collect();
+        if alive.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(StackError::new("stop_unconfirmed", "services did not stop")
+                .hint("retry `stack restart`, or `stack down` and `stack up`")
+                .details(alive));
+        }
+        sleep(Duration::from_millis(200));
     }
 }
 
@@ -1594,29 +1700,16 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     if names.is_empty() {
         return Err(StackError::new("unknown_service", "this project defines no services"));
     }
+    // Services that depend on one being restarted restart after it, so they reconnect.
+    let dependents = dependents_of(&report.stack.services, &names);
+    if !dependents.is_empty() {
+        steps.ok("dependents", json!(dependents));
+        names.extend(dependents);
+    }
 
     // Confirm the old processes are gone before starting new ones on the same ports.
-    if let Err(e) = mise::stop_daemons(&ctx.root, &names) {
+    if let Err(e) = stop_and_wait(ctx, &names, Some(&session)) {
         return Err(steps.fail("stop", e, true));
-    }
-    let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
-    loop {
-        let alive: Vec<Value> = names
-            .iter()
-            .filter_map(|n| session.services.get(n).map(|r| (n, r)))
-            .filter(|(_, r)| r.pid.is_some_and(pid_alive) || accepting(r.port))
-            .map(|(n, r)| json!({ "service": n, "pid": r.pid, "port": r.port }))
-            .collect();
-        if alive.is_empty() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let err = StackError::new("stop_unconfirmed", "services did not stop")
-                .hint("retry `stack restart`, or `stack down` and `stack up`")
-                .details(alive);
-            return Err(steps.fail("stop", err, true));
-        }
-        sleep(Duration::from_millis(200));
     }
     steps.ok("stop", json!(names));
 
@@ -1639,7 +1732,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     }
     session.launching = true;
     save(ctx, &session).map_err(|e| steps.clone().fail("record_launch", e, true))?;
-    if let Err(start_error) = start_watched(ctx, &report, &names) {
+    if let Err(start_error) = start_in_order(ctx, &report, &names) {
         let observed = record_after_failed_start(ctx);
         if let Err(error) = observed {
             return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
@@ -4668,6 +4761,7 @@ mod tests {
             port: None,
             identity: None,
             watch: Vec::new(),
+            depends_on: Vec::new(),
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [
@@ -4737,6 +4831,26 @@ mod tests {
         let path = format!("{}:/bin:/usr/bin", dir.path().display());
         let env = IndexMap::from([("PATH".to_string(), path)]);
         (dir, env)
+    }
+
+    #[test]
+    fn dependencies_start_first_and_restarting_one_restarts_what_depends_on_it() {
+        let services: IndexMap<String, Entry<Service>> = [("worker", "depends_on = ['api']"), ("api", "depends_on = ['db', 'cache']"), ("db", ""), ("cache", ""), ("other", "")]
+            .into_iter()
+            .map(|(name, extra)| {
+                let value: Service = toml::from_str(&format!("run = 'x'\n{extra}")).unwrap();
+                (name.to_string(), Entry { value, origin: "project".into() })
+            })
+            .collect();
+        let all: Vec<String> = services.keys().cloned().collect();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Waves by depth, each in declaration order; unrelated services start in the first.
+        assert_eq!(dependency_waves(&services, &all), [names(&["db", "cache", "other"]), names(&["api"]), names(&["worker"])]);
+        // Only dependencies among the services started count.
+        assert_eq!(dependency_waves(&services, &names(&["worker", "db"])), [names(&["worker", "db"])]);
+        assert_eq!(dependents_of(&services, &names(&["db"])), names(&["api", "worker"]));
+        assert_eq!(dependents_of(&services, &names(&["api"])), names(&["worker"]));
+        assert!(dependents_of(&services, &names(&["worker", "other"])).is_empty());
     }
 
     #[cfg(unix)]

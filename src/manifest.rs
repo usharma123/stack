@@ -69,6 +69,10 @@ pub struct Service {
     /// changes after the service started, checks report it so the service can be restarted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch: Vec<String>,
+    /// Services this one needs running first. They are started (and ready) before it; restarting
+    /// one, or `up` starting it again, restarts this one after it, so it reconnects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// A command that asks the running service, through the app's own connection settings, which

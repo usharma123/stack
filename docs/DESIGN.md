@@ -152,6 +152,11 @@ output (mise's answer when no release matches) is an error, not a version.
   still names that checkout, the recorded supervisor confirms the service is not running, and
   no process carrying the token runs. Quarantined `.replaced-` data and data Stack never
   recorded are never removed.
+- **Dependencies.** `depends_on` orders starts in waves: a service is requested only once the
+  services it depends on verified and passed their declared readiness. `restart` adds every
+  service that depends on one it restarts, and `up` stops a running dependent of a service it
+  must start again before starting both, so no dependent keeps a connection to a dead
+  instance. Identity stays per service: a dependent is verified on its own.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
   and the next is made only once the supervisor has recorded the previous service's process.
   mise holds its project lock until a request's service is ready, so a request whose service

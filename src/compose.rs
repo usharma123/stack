@@ -140,6 +140,7 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
     }
 
     validate_task_services(&out)?;
+    validate_service_dependencies(&out)?;
     validate_tool_options(&out)?;
     crate::secrets::validate_tasks(&out)?;
     Ok(out)
@@ -223,6 +224,50 @@ fn override_kind<T: Clone>(
         acc.insert(key.clone(), Entry { value: value.clone(), origin: "override".into() });
         records.push(OverrideRecord { kind, key: key.clone(), replaced });
     }
+}
+
+/// Every `depends_on` names another service, and no service depends on itself through others.
+fn validate_service_dependencies(out: &Composed) -> Result<()> {
+    for (name, service) in &out.services {
+        for dependency in &service.value.depends_on {
+            if dependency == name {
+                return Err(StackError::new("dependency_cycle", format!("service '{name}' ({}) depends on itself", service.origin))
+                    .hint("remove it from its own depends_on"));
+            }
+            if !out.services.contains_key(dependency) {
+                let known: Vec<&str> = out.services.keys().map(String::as_str).collect();
+                return Err(StackError::new(
+                    "unknown_service",
+                    format!("service '{name}' ({}) depends on '{dependency}', which no layer defines", service.origin),
+                )
+                .hint(format!("services: {}", known.join(", "))));
+            }
+        }
+    }
+    // Depth-first, in declaration order: a service met again while its own dependencies are
+    // being walked closes a cycle.
+    fn walk<'a>(out: &'a Composed, name: &'a str, path: &mut Vec<&'a str>, done: &mut Vec<&'a str>) -> Result<()> {
+        if done.contains(&name) {
+            return Ok(());
+        }
+        if let Some(start) = path.iter().position(|n| *n == name) {
+            let cycle: Vec<&str> = path[start..].iter().copied().chain([name]).collect();
+            return Err(StackError::new("dependency_cycle", format!("services depend on each other in a cycle: {}", cycle.join(" -> ")))
+                .hint("remove one of these depends_on entries"));
+        }
+        path.push(name);
+        for dependency in &out.services[name].value.depends_on {
+            walk(out, dependency, path, done)?;
+        }
+        path.pop();
+        done.push(name);
+        Ok(())
+    }
+    let mut done = Vec::new();
+    for name in out.services.keys() {
+        walk(out, name, &mut Vec::new(), &mut done)?;
+    }
+    Ok(())
 }
 
 fn validate_task_services(out: &Composed) -> Result<()> {

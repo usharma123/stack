@@ -283,6 +283,21 @@ fn custom_services_get_their_loopback_address_as_their_url() {
 }
 
 #[test]
+fn service_dependencies_must_name_services_and_never_form_a_cycle() {
+    let sb = Sandbox::new();
+    let error = |text: &str| sb.compile(&sb.project(text), Mode::UseLock).unwrap_err();
+    let e = error("[services.api]\nrun = 'x'\ndepends_on = ['db']\n");
+    assert_eq!(e.code, "unknown_service", "{e:?}");
+    assert!(e.message.contains("service 'api' (project) depends on 'db'"), "{e:?}");
+    let e = error("[services.api]\nrun = 'x'\ndepends_on = ['api']\n");
+    assert_eq!(e.code, "dependency_cycle", "{e:?}");
+    let e = error("[services.a]\nrun = 'x'\ndepends_on = ['b']\n[services.b]\nrun = 'x'\ndepends_on = ['c']\n[services.c]\nrun = 'x'\ndepends_on = ['a']\n");
+    assert_eq!((e.code, e.message.as_str()), ("dependency_cycle", "services depend on each other in a cycle: a -> b -> c -> a"), "{e:?}");
+    let root = sb.project("[services.api]\nrun = 'x'\ndepends_on = ['db']\n[services.db]\npreset = 'postgres'\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+}
+
+#[test]
 fn a_postgres_preset_initializes_with_a_fixed_utf8_locale_whatever_the_callers() {
     let sb = Sandbox::new();
     let root = sb.project("[services.db]\npreset = \"postgres\"\n[services.cache]\npreset = \"redis\"\n[services.web]\nrun = \"serve\"\n");
