@@ -698,7 +698,7 @@ mod tests {
     }
 
     fn captured(stdout: &str, exit_code: Option<i32>) -> Captured {
-        Captured { exit_code, timed_out: false, stdout: stdout.into(), stderr: "SENTINEL-STDERR quoted line".into(), stdout_truncated: false }
+        Captured { exit_code, signal: None, timed_out: false, stdout: stdout.into(), stderr: "SENTINEL-STDERR quoted line".into(), stdout_truncated: false }
     }
 
     fn assert_clean(e: &StackError) {

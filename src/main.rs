@@ -572,7 +572,8 @@ fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) 
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
         return Ok(ExitCode::from(124));
     }
-    let code = result["exit_code"].as_i64().unwrap_or(1).clamp(0, 255) as u8;
+    // Like a shell: a command ended by a signal reports 128 + its number.
+    let code = result["exit_code"].as_i64().or_else(|| result["signal"].as_i64().map(|s| 128 + s)).unwrap_or(1).clamp(0, 255) as u8;
     println!("{}", json!({ "ok": true, "data": result }));
     Ok(ExitCode::from(code))
 }

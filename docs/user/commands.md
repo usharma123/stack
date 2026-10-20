@@ -107,7 +107,8 @@ Runs a command with the stack's tools and environment, in the project directory.
 - `--timeout` counts from the call. When it expires the command's process group is killed and
   Stack exits 124 (`timed_out`).
 - With `--json`, at most 64 KiB of each output stream is captured into the result, and Stack
-  exits with the command's exit code.
+  exits with the command's exit code. A command a signal ended has `exit_code: null` and
+  `signal: <number>`, and Stack exits 128 plus the signal, with or without `--json`.
 - **Cancelling.** SIGINT, SIGTERM or SIGHUP sent to Stack is passed on to the command, and Stack
   waits for it rather than exit and leave it running. A command still running 10 seconds later,
   or when a second signal comes, is killed with its process group. Without a terminal (an agent

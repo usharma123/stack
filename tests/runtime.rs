@@ -1654,6 +1654,15 @@ fn exec_json_reports_the_command_in_one_object_and_keeps_its_exit_code() {
     assert_eq!(result["data"]["exit_code"], 3);
     assert_eq!(result["data"]["stdout"], "out\n");
     assert_eq!(result["data"]["stderr"], "err\n");
+    assert!(result["data"].get("signal").is_none(), "only a command a signal ended names one: {result}");
+
+    // A command a signal ended: no exit code, the signal named, and 128 + it, like a shell.
+    let out = fixture.command(&["--json", "exec", "--", "sh", "-c", "kill -KILL $$"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(137));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((result["ok"].clone(), result["data"]["exit_code"].clone(), result["data"]["signal"].clone()), (json!(true), Value::Null, json!(9)), "{result}");
+    let out = fixture.command(&["exec", "--", "sh", "-c", "kill -KILL $$"]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(137), "the terminal path reports the signal the same way");
 
     // A command stack had to kill did not do its job: an error, with the output so far.
     let out = fixture
@@ -2064,10 +2073,9 @@ fn sigterm_to_a_captured_or_attached_exec_stops_the_command_and_its_descendants_
         if json {
             // The result is still reported: the command ended by the signal it was passed.
             let result: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
-            assert_eq!((result["ok"].clone(), result["data"]["exit_code"].clone()), (json!(true), Value::Null), "{result}");
-        } else {
-            assert_eq!(status.code(), Some(143), "{status:?}");
+            assert_eq!((result["ok"].clone(), result["data"]["exit_code"].clone(), result["data"]["signal"].clone()), (json!(true), Value::Null, json!(15)), "{result}");
         }
+        assert_eq!(status.code(), Some(143), "json={json}: {status:?}");
     }
     assert!(sentinel.try_wait().unwrap().is_none(), "an unrelated process was signalled");
     let _ = sentinel.kill();

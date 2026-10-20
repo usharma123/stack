@@ -89,6 +89,8 @@ fn cancellable() -> bool {
 
 pub struct Captured {
     pub exit_code: Option<i32>,
+    /// The signal that ended the command, when one did and it was not cut short by the deadline.
+    pub signal: Option<i32>,
     pub timed_out: bool,
     pub stdout: String,
     pub stderr: String,
@@ -612,8 +614,10 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
     }
     let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
     let piped = piped?;
+    use std::os::unix::process::ExitStatusExt;
     Ok(Captured {
         exit_code: if piped.timed_out { None } else { child.status.and_then(|s| s.code()) },
+        signal: if piped.timed_out { None } else { child.status.and_then(|s| s.signal()) },
         timed_out: piped.timed_out,
         stdout_truncated: piped.stdout.truncated,
         stdout: piped.stdout.text(),

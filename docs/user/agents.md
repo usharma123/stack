@@ -77,7 +77,8 @@ def succeeded(operation, envelope):
 ```
 
 - A command that exits 7 gives `ok: true` and `data.exit_code: 7`, and the CLI exits 7 too.
-  `exit_code` is `null` when a signal ended the command.
+  `exit_code` is `null` when a signal ended the command; `data.signal` then names it, and the
+  CLI exits 128 plus the signal (137 for SIGKILL), as a shell does.
 - A `status` that finds a service down still gives `ok: true`, with `data.healthy: false` and
   `data.checks` saying which service and why. The CLI exits 1.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
@@ -94,7 +95,7 @@ minutes. When a deadline passes, Stack kills the command's process group and ret
 A runner that cancels Stack with SIGTERM (or SIGINT, SIGHUP) cancels the command: Stack passes
 the signal on to the command's process group, waits up to 10 seconds, then kills the group; a
 second signal kills it at once. With `--json` the result is still printed (`exit_code: null`
-for a command the signal ended). `stack mcp` does the same for the command a call is running,
+and `signal` for a command the signal ended). `stack mcp` does the same for the command a call is running,
 answers that call, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
 
 If `up` times out, services may still be starting. Check `stack status`. Retrying `up` lets

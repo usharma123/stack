@@ -547,6 +547,10 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         "unverified": plan.checks.iter().filter(|c| !c.ready).map(|c| &c.service).collect::<Vec<_>>(),
         "checks": plan.checks,
     });
+    // Only for a command a signal ended, so other results keep their shape.
+    if let Some(signal) = output.signal {
+        result["signal"] = json!(signal);
+    }
     // Names only, and only for commands granted secrets, so other results keep their shape.
     if !plan.secrets.is_empty() {
         result["secrets"] = json!(plan.secrets);
