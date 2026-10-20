@@ -21,7 +21,10 @@ Start with the [development runbook](operations/development.md).
 
 - [Design](DESIGN.md): what Stack owns, the session model, and why
 - [Release](RELEASING.md)
+- [AgentDX benchmark](../bench/README.md): matched agent tasks, Stack against an existing setup
+- [AgentDX hands-on findings, 2026-10-20](../eval/agentdx-20261020/SYNTHESIS.md)
 - [Pilot protocol](pilot-protocol.md): how agent concurrency is measured
-- [Competitor evaluation](../eval/REPORT.md)
+- Historical: [competitor evaluation](../eval/REPORT.md), the retired
+  [26-tool benchmark](../eval/archive/competitor-20261006/README.md)
 
 [Repository home](../README.md)

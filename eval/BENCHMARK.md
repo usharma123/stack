@@ -1,5 +1,9 @@
 # Command-entry benchmark
 
+Scope: command-entry latency of `stack exec` only. For agent task completion, see the
+matched benchmark in [`bench/`](../bench/README.md). The 26-tool competitor benchmark is
+retired to [`archive/competitor-20261006`](archive/competitor-20261006/README.md).
+
 `harness/paired-host.py` compares the released 0.1.4 host binary with an explicitly supplied candidate. It launches both directly on the same host, without Docker transport. Run it once the candidate is built and other performance work has stopped. Its host lock prevents overlapping copies of this harness, not unrelated builds or benchmarks.
 
 ```sh
