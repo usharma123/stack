@@ -5425,7 +5425,8 @@ fn a_tasks_missing_pins_install_from_its_copy_before_it_runs_and_a_warm_run_inst
 #[test]
 fn a_cold_tasks_install_is_given_the_planned_env_its_copy_declares_and_nothing_else() {
     // mise renders the copy's `{{ env["KEY"] }}` declarations while installing, as when running.
-    let (fixture, _) = artifact_fixture("[env]\nTASK_ENV='from-project'\n[tasks.q]\nrun='echo $TASK_ENV'\n");
+    // A template is declared; a literal would be kept as written (and need no value).
+    let (fixture, _) = artifact_fixture("[env]\nTASK_ENV='{{ \"from-project\" }}'\n[tasks.q]\nrun='echo $TASK_ENV'\n");
     let dir = fixture.dir.path();
     let routes = ["cli", "mcp", "terminal"];
     for route in routes {

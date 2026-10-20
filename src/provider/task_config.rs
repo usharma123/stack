@@ -26,9 +26,14 @@
 //! doubled first, so the expansion gives it back unchanged. `PATH`, which mise builds from the
 //! inherited `PATH` and its own directives, and a name the template cannot spell (containing
 //! anything but ASCII letters, digits, `_`, `-` and `.`) are left out, as values the command
-//! inherits. Everything else is copied unchanged: tools, tasks, services and the generated `_`
-//! directives (such as `_.path`), which mise still applies. A value is never written into the
-//! copy, only its name. Whatever loads the copy must therefore be given each declared value
+//! inherits. A literal value (no template syntax, no `$`) that planning read back as written,
+//! such as the loopback `<NAME>_URL` compile renders for a custom service, is kept as written
+//! instead: it means the same in the copy, and only a literal keeps `[env]`'s precedence over
+//! the `<NAME>_URL` mise exports for daemons while it runs a task (the Pitchfork proxy's
+//! `https://<name>.<project>.localhost`, which `{{ env["<NAME>_URL"] }}` would read).
+//! Everything else is copied unchanged: tools, tasks, services and the generated `_`
+//! directives (such as `_.path`), which mise still applies. No value is written into the
+//! copy that compile did not already write there, only names. Whatever loads the copy must therefore be given each declared value
 //! ([`TaskConfig::declared`]): the task's environment holds them, and the install of its
 //! missing pins before it starts is given the same planned values (never a granted secret,
 //! which planning resolves only after that install).
@@ -200,10 +205,18 @@ fn inheriting_planned_env(
     let Some(toml::Value::Table(env)) = doc.get_mut("env") else {
         return Ok((config.to_vec(), Vec::new()));
     };
+    // A literal value (no template, no `$`) that planning read back unchanged is kept as
+    // written: it evaluates to itself in the copy too, and a declared literal keeps `[env]`'s
+    // precedence over what mise exports for daemons when it runs a task. Declared as the
+    // inherited value instead, it would be read from that exported environment: mise sets
+    // `<NAME>_URL` to the Pitchfork proxy's `https://<name>.<project>.localhost` before it
+    // evaluates `{{ env["<NAME>_URL"] }}`, replacing the loopback URL compile wrote.
     let held: Vec<(String, String)> = env
         .iter()
-        .filter(|(_, value)| value.is_str())
-        .filter_map(|(key, _)| Some((key.clone(), planned(key)?)))
+        .filter_map(|(key, value)| Some((key, value.as_str()?)))
+        .filter_map(|(key, value)| Some((key.clone(), value, planned(key)?)))
+        .filter(|(key, value, planned)| key.as_str() == "PATH" || !(literal(value) && value == planned))
+        .map(|(key, _, planned)| (key, planned))
         .collect();
     if held.is_empty() {
         return Ok((config.to_vec(), Vec::new()));
@@ -229,6 +242,12 @@ fn inheriting_planned_env(
     }
     let body = toml::to_string_pretty(&doc).map_err(|e| unreadable(e.to_string()))?;
     Ok((format!("# Copied by stack for one task run, declaring the [env] values the run inherits.\n{body}").into_bytes(), declared))
+}
+
+/// Whether mise reads `value` as written: no template syntax, and no `$` its shell expansion
+/// could replace.
+fn literal(value: &str) -> bool {
+    !["{{", "{%", "{#", "$"].iter().any(|syntax| value.contains(syntax))
 }
 
 /// The declaration that gives `key` the `value` the command inherits, or `None` to leave it
@@ -424,6 +443,35 @@ mod tests {
     }
 
     #[test]
+    fn literal_values_planning_read_back_unchanged_stay_literal_so_daemon_exports_cannot_replace_them() {
+        // A custom service's loopback URL as compile renders it, beside values the copy must
+        // still declare as inherited: a template, a `$`, and a literal planning read otherwise.
+        let config = "[env]\nWEB_URL = \"http://127.0.0.1:28500\"\nROOT = \"{{ config_root }}\"\nHOMELY = \"$HOME/x\"\nCHANGED = \"as-written\"\nPATH = \"/bin\"\n\n[daemons.web]\nport = 28500\n";
+        let root = project(config, None);
+        let cache = tempfile::tempdir().unwrap();
+        let planned = |key: &str| {
+            Some(match key {
+                "WEB_URL" => "http://127.0.0.1:28500".to_string(),
+                "ROOT" => "/project".into(),
+                "HOMELY" => "/home/x".into(),
+                "CHANGED" => "read-otherwise".into(),
+                "PATH" => "/bin".into(),
+                _ => return None,
+            })
+        };
+        let copy = TaskConfig::capture(root.path(), cache.path(), None, planned, || Ok(false)).unwrap();
+        let held: toml::Table = toml::from_str(&std::fs::read_to_string(copy.config()).unwrap()).unwrap();
+        let env = held["env"].as_table().unwrap();
+        assert_eq!(env["WEB_URL"].as_str(), Some("http://127.0.0.1:28500"), "{env:?}");
+        assert_eq!(env["ROOT"].as_str(), Some(r#"{{ env["ROOT"] }}"#));
+        assert_eq!(env["HOMELY"].as_str(), Some(r#"{{ env["HOMELY"] }}"#));
+        assert_eq!(env["CHANGED"].as_str(), Some(r#"{{ env["CHANGED"] }}"#));
+        assert!(!env.contains_key("PATH"), "PATH is still left out: {env:?}");
+        assert_eq!(copy.declared(), ["ROOT", "HOMELY", "CHANGED"]);
+        assert!(!std::fs::read_to_string(copy.config()).unwrap().contains("read-otherwise"));
+    }
+
+    #[test]
     fn a_dollar_is_escaped_only_where_mise_expands_and_the_setting_is_asked_only_then() {
         let root = project("[env]\nA = \"$${HOME}\"\nB = \"plain\"\n", None);
         let cache = tempfile::tempdir().unwrap();
@@ -434,8 +482,9 @@ mod tests {
             let env = held["env"].as_table().unwrap();
             (env["A"].as_str().unwrap().to_string(), env["B"].as_str().unwrap().to_string())
         };
-        assert_eq!(declared(true), (r#"{{ env["A"] | replace(from="$", to="$$") }}"#.into(), r#"{{ env["B"] }}"#.into()));
-        assert_eq!(declared(false), (r#"{{ env["A"] }}"#.into(), r#"{{ env["B"] }}"#.into()));
+        // B is a literal planning read back unchanged: kept as written either way.
+        assert_eq!(declared(true), (r#"{{ env["A"] | replace(from="$", to="$$") }}"#.into(), "plain".into()));
+        assert_eq!(declared(false), (r#"{{ env["A"] }}"#.into(), "plain".into()));
         // No `$` in any planned value: the setting is not asked. A failure to ask is the error.
         assert!(TaskConfig::capture(root.path(), cache.path(), None, |_| Some("plain".into()), never).is_ok());
         let err = TaskConfig::capture(root.path(), cache.path(), None, planned, || Err(StackError::new("provider_failed", "asked"))).unwrap_err();
