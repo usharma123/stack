@@ -723,19 +723,44 @@ def review_problems(review, trial, plan, summary_path, directory, result):
     return problems + metric_problems(review, directory, evidence)
 
 
+def residue_schema(value):
+    """A complete observation, including explicit empty lists when nothing was seen."""
+    return (isinstance(value, dict) and set(value) == {'pids', 'ports', 'owned_processes'}
+            and all(isinstance(value[key], list) and all(type(v) is int and 0 < v <= limit for v in value[key])
+                    for key, limit in [('pids', 2**31 - 1), ('ports', 65535)])
+            and isinstance(value['owned_processes'], list)
+            and all(isinstance(p, dict) and type(p.get('pid')) is int and p['pid'] > 0
+                    and isinstance(p.get('command'), str) and bool(p['command']) for p in value['owned_processes']))
+
+
+def cleanup_schema(value):
+    return (isinstance(value, dict) and residue_schema(value.get('before')) and residue_schema(value.get('left'))
+            and isinstance(value.get('steps'), dict) and type(value['steps'].get('down')) is int
+            and type(value.get('ok')) is bool and value['ok'] == (not any(value['left'].values()))
+            and ('after_reclaim' not in value or residue_schema(value['after_reclaim'])))
+
+
+def globals_schema(value):
+    return (isinstance(value, dict) and all(value.get(key) in ('present', 'absent') for key in arms.GLOBAL_ROOTS)
+            and all(isinstance(key, str) and (isinstance(v, str) or
+                    (isinstance(v, list) and all(isinstance(item, str) for item in v))) for key, v in value.items()))
+
+
 def clean(teardown_record):
     """Nothing owned was running after the arm's own teardown (recomputed, not read from `ok`)."""
     left = (teardown_record or {}).get('left') if isinstance(teardown_record, dict) else None
-    return isinstance(left, dict) and not any(left.values())
+    return residue_schema(left) and not any(left.values())
 
 
 def restored(teardown_record):
     """Clean, or clean once the harness reclaimed the leftovers."""
     after = teardown_record.get('after_reclaim') if isinstance(teardown_record, dict) else None
-    return clean(teardown_record) or (isinstance(after, dict) and not any(after.values()))
+    if isinstance(teardown_record, dict) and 'after_reclaim' in teardown_record:
+        return residue_schema(after) and not any(after.values())
+    return clean(teardown_record)
 
 
-def receipt(directory, name, hashes, problems):
+def receipt(directory, name, hashes, problems, schema=None):
     """A JSON evidence file, only if the summary hashes it and the file still matches."""
     if name not in hashes:
         problems.append(f'{name} missing')
@@ -744,10 +769,14 @@ def receipt(directory, name, hashes, problems):
     if not path.is_file() or digest(path) != hashes[name]:
         return None  # reported once as changed
     try:
-        return json.loads(path.read_text())
+        value = json.loads(path.read_text())
     except ValueError:
         problems.append(f'{name} unreadable')
         return None
+    if not isinstance(value, dict) or (schema is not None and not schema(value)):
+        problems.append(f'{name} malformed observation')
+        return None
+    return value
 
 
 def step_ok(record):
@@ -818,26 +847,29 @@ def derive(result, trial, plan, plan_path, directory):
                 problems.append('agent invocation differs from the planned command, model or options')
 
     # What was running when the agent stopped, and whether cleanup restored the host.
-    left = receipt(directory, 'left-at-agent-exit.json', hashes, problems)
+    left = receipt(directory, 'left-at-agent-exit.json', hashes, problems, residue_schema)
     if left is not None:
         if left != result.get('left_running_at_agent_exit'):
             problems.append('summary left_running contradicts left-at-agent-exit.json')
         split = arms.left_services(left) if isinstance(left, dict) else {'services': True, 'supervisor_processes': []}
         facts.update(left_running=split['services'], supervisor_left=bool(split['supervisor_processes']))
-    agent_cleanup = receipt(directory, 'agent-cleanup.json', hashes, problems)
-    final_cleanup = receipt(directory, 'final-cleanup.json', hashes, problems) if 'final-cleanup.json' in hashes else None
+    agent_cleanup = receipt(directory, 'agent-cleanup.json', hashes, problems, cleanup_schema)
+    final_required = 'final-cleanup.json' in hashes or 'final_cleanup' in result or (agent_cleanup is not None and not clean(agent_cleanup))
+    final_cleanup = receipt(directory, 'final-cleanup.json', hashes, problems, cleanup_schema) if final_required else None
+    if final_cleanup is not None and final_cleanup != result.get('final_cleanup'):
+        problems.append('summary final_cleanup contradicts final-cleanup.json')
     if agent_cleanup is not None:
         if agent_cleanup != result.get('agent_cleanup'):
             problems.append('summary agent_cleanup contradicts agent-cleanup.json')
         facts['arm_teardown_clean'] = clean(agent_cleanup)
-        if not (restored(agent_cleanup) or (final_cleanup is not None and restored(final_cleanup))):
+        if not restored(final_cleanup if final_required else agent_cleanup):
             problems.append('owned processes were still running after cleanup')
         if not clean(agent_cleanup) and final_cleanup is None:
             problems.append('arm teardown left processes but no final cleanup was recorded')
 
     # Global state and benchmark files, before and after.
-    before = receipt(directory, 'globals-before.json', hashes, problems)
-    after = receipt(directory, 'globals-after.json', hashes, problems)
+    before = receipt(directory, 'globals-before.json', hashes, problems, globals_schema)
+    after = receipt(directory, 'globals-after.json', hashes, problems, globals_schema)
     if before is not None and after is not None:
         changed = arms.globals_diff(before, after)
         if changed:
@@ -850,11 +882,17 @@ def derive(result, trial, plan, plan_path, directory):
 
     # The submission and its grade.
     submission = receipt(directory, 'submission.json', hashes, problems)
+    if submission is not None and not (isinstance(submission.get('changed'), list)
+                                       and all(isinstance(item, str) for item in submission['changed'])):
+        problems.append('submission.json malformed changed files')
     if submission is not None and submission.get('changed') != result.get('changed_files'):
         problems.append('summary changed_files contradicts submission.json')
     graded = receipt(directory, 'grade.json', hashes, problems)
     passed = False
     if graded is not None:
+        if not (type(graded.get('passed')) is bool and isinstance(graded.get('outcome'), str)
+                and cleanup_schema(graded.get('cleanup'))):
+            problems.append('grade.json malformed grade or cleanup')
         if graded != result.get('grade'):
             problems.append('summary grade contradicts grade.json')
         outcome = graded.get('outcome')
@@ -875,7 +913,7 @@ def derive(result, trial, plan, plan_path, directory):
             if not (isinstance(control, dict) and step_ok(receipt(directory, 'grade-control-up.json', hashes, problems))
                     and graded_verdict(trial['task'], directory, hashes, 'grade-control', problems)):
                 problems.append('the startup control did not pass, so the failure is not attributable to the submission')
-            elif not clean(control.get('cleanup')):
+            elif not (cleanup_schema(control.get('cleanup')) and clean(control.get('cleanup'))):
                 problems.append('the startup control runtime left owned processes')
         else:
             problems.append(f'grading ended {outcome}: {graded.get("error")}')

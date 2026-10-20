@@ -543,6 +543,10 @@ def reclaim(processes, root):
     return result
 
 
+GLOBAL_ROOTS = ['.config/mise', '.config/pitchfork', '.local/state/pitchfork', '.local/state/stack',
+                '.local/share/stack', '.cache/stack', '.config/stack']
+
+
 def globals_snapshot():
     """Hashes of the user's own Stack, mise and Pitchfork config/state, and install listings.
 
@@ -551,8 +555,7 @@ def globals_snapshot():
     """
     home = Path.home()
     rows = {}
-    for suffix in ['.config/mise', '.config/pitchfork', '.local/state/pitchfork', '.local/state/stack',
-                   '.local/share/stack', '.cache/stack', '.config/stack']:
+    for suffix in GLOBAL_ROOTS:
         base = home / suffix
         rows[suffix] = 'present' if base.exists() else 'absent'
         if base.is_dir():

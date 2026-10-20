@@ -53,7 +53,7 @@ class TrialRecords:
         self.checks = {name: True for name in arms.TASKS[self.task]['required_checks']}
         self.smoke_exit, self.outcome, self.grade_cleanup = 0, 'graded', teardown_record()
         self.control = None
-        self.globals_before = self.globals_after = {'.config/mise': 'absent'}
+        self.globals_before = self.globals_after = {key: 'absent' for key in arms.GLOBAL_ROOTS}
 
     def write_text(self, name, text):
         path = self.out / name
@@ -111,6 +111,15 @@ class TrialRecords:
         summary = json.loads((self.out / 'summary.json').read_text())
         summary.update(changes)
         (self.out / 'summary.json').write_text(json.dumps(summary))
+
+    def replace_record(self, name, value, summary_field=None):
+        """Rehash a malformed observation, so tests check schemas rather than tamper detection."""
+        summary = json.loads((self.out / 'summary.json').read_text())
+        self.write(name, value)
+        summary['evidence_sha256'][name] = arms.digest(self.out / name)
+        if summary_field:
+            summary[summary_field] = value
+        self.edit_summary(**summary)
 
 
 class ReportTest(unittest.TestCase):
@@ -200,7 +209,8 @@ class ReportTest(unittest.TestCase):
         self.assertFalse(self.report()['publishable'])
 
     def test_changed_global_state_is_invalid_even_when_the_summary_hides_it(self):
-        records = self.sealed(globals_after={'.config/mise': 'present', '.config/mise/config.toml': 'abc'})
+        records = self.sealed(globals_after={**{key: 'absent' for key in arms.GLOBAL_ROOTS},
+                                            '.config/mise': 'present', '.config/mise/config.toml': 'abc'})
         self.review(records)
         self.assertEqual(records.summary['valid'], False)
         records.edit_summary(valid=True, globals_changed=[], problems=[])
@@ -223,6 +233,61 @@ class ReportTest(unittest.TestCase):
     def test_grading_runtime_leftovers_make_the_trial_invalid(self):
         self.review(self.sealed(grade_cleanup=teardown_record(LEFT, after=EMPTY)))
         self.assertIn('the grading runtime left owned processes', self.row()['problems'])
+
+    def test_required_observations_reject_hashed_null_arrays_and_incomplete_objects(self):
+        observations = [('agent.json', 'agent'), ('globals-before.json', None), ('globals-after.json', None),
+                        ('left-at-agent-exit.json', 'left_running_at_agent_exit'), ('agent-cleanup.json', 'agent_cleanup'),
+                        ('grade.json', 'grade'), ('submission.json', None), ('fingerprints-after.json', None)]
+        for name, field in observations:
+            for value in [None, [], {}, 'missing observation']:
+                with self.subTest(name=name, value=value):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed()
+                    records.replace_record(name, value, field)
+                    self.review(records)
+                    row = self.row()
+                    self.assertEqual(row['status'], 'invalid')
+                    self.assertFalse(row['verified_task'])
+                    self.assertFalse(row['autonomous'])
+                    self.assertFalse(self.report()['publishable'])
+
+    def test_cleanup_requires_complete_typed_residue_and_consistent_ok(self):
+        malformed = [{}, {'pids': [], 'ports': []}, dict(EMPTY, pids=''), dict(EMPTY, ports=[True]),
+                     dict(EMPTY, owned_processes=[{}]), dict(EMPTY, pids=[-1])]
+        for left in malformed:
+            for target in ['agent', 'grade']:
+                with self.subTest(left=left, target=target):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    cleanup = teardown_record(left)
+                    records = self.sealed(**{f'{target}_cleanup': cleanup})
+                    self.review(records)
+                    self.assertEqual(self.row()['status'], 'invalid')
+        self.assertFalse(bench.clean({'left': {}}))
+        self.assertFalse(bench.restored({'left': LEFT, 'after_reclaim': {}}))
+
+    def test_latest_cleanup_must_show_recovery_even_after_an_earlier_reclaim_succeeded(self):
+        self.review(self.sealed(agent_cleanup=teardown_record(LEFT, after=EMPTY),
+                                final_cleanup=teardown_record(LEFT, after=LEFT)))
+        row = self.row()
+        self.assertEqual(row['status'], 'invalid')
+        self.assertIn('owned processes were still running after cleanup', row['problems'])
+
+    def test_final_cleanup_is_required_typed_and_compared_independently(self):
+        for value in [None, {}, {'left': {}}, teardown_record(LEFT)]:
+            with self.subTest(value=value):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed(final_cleanup=teardown_record())
+                records.replace_record('final-cleanup.json', value)
+                self.review(records)
+                self.assertEqual(self.row()['status'], 'invalid')
+                self.assertFalse(self.row()['verified_task'])
+        shutil.rmtree(self.root / 'results')
+        records = self.sealed(final_cleanup=teardown_record())
+        (records.out / 'final-cleanup.json').unlink()
+        summary = json.loads((records.out / 'summary.json').read_text())
+        summary['evidence_sha256'].pop('final-cleanup.json')
+        records.edit_summary(**summary)
+        self.assertIn('final-cleanup.json missing', self.row()['problems'])
 
     def test_a_missing_record_is_invalid(self):
         records = self.records()
