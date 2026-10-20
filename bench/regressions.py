@@ -42,9 +42,9 @@ class Runtime:
         self.env = arms.isolated_env(self.root, cache, locale)
         self.checkouts, self.children = [], []
 
-    def spawn(self, locale):
+    def spawn(self, locale, cold=False):
         """A second root, so a different locale cannot reuse this root's supervisor."""
-        child = Runtime(self.binary, self.out, locale, self.cache)
+        child = Runtime(self.binary, self.out, locale, None if cold else self.cache)
         self.children.append(child)
         return child
 
@@ -202,12 +202,17 @@ def secrets_before_install(rt):
              'fnox.toml': '# FAKE value for evaluation only.\n[providers.plain]\ntype = "plain"\n\n[secrets]\n'
                           'WEBHOOK_KEY = { provider = "plain", value = "fake-webhook-key-agentdx-5e1f" }\n',
              'sign.py': 'import os\nprint("key-length", len(os.environ["WEBHOOK_KEY"]))\n'}
-    app = rt.project('secrets', files)
-    if rt.stack('compile', app, 'compile')['exit_code']:
+    # Its own cold tool store: a shared cache may already hold fnox from an earlier run.
+    sub = rt.spawn({'LANG': 'en_US.UTF-8'}, cold=True)
+    app = sub.project('secrets', files)
+    if sub.stack('compile', app, 'compile')['exit_code']:
         return {'error': 'compile failed'}
-    first = rt.stack('run-before-install', app, 'run', 'sign')
-    rt.stack('install', app, 'install')
-    second = rt.stack('run-after-install', app, 'run', 'sign')
+    installed = sorted((Path(sub.env['MISE_DATA_DIR']) / 'installs').glob('*fnox*'))
+    if installed:
+        return {'error': f'precondition failed: fnox already installed at {installed}'}
+    first = sub.stack('run-before-install', app, 'run', 'sign')
+    sub.stack('install', app, 'install')
+    second = sub.stack('run-after-install', app, 'run', 'sign')
     ok = lambda record: record['exit_code'] == 0 and 'key-length 29' in (data(record).get('stdout') or '')
     return {'passed': ok(first), 'control_passed': ok(second),
             'observed': {'before_install': record_error(first), 'after_install_exit': second['exit_code']}}
