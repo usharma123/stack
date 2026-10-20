@@ -50,7 +50,8 @@ Only for a command with at least one grant, after services verify:
 
 1. The `fnox` on the command's `PATH` must be the release `stack.lock` pins. Otherwise the
    command does not run (`secret_unavailable`). A pinned fnox that is not installed stops
-   `exec` earlier, with `tools_not_installed`; run `stack install`.
+   `exec` earlier, with `tools_not_installed`; run `stack install`. `stack run` installs it
+   first, like any other missing pin of the task, so a fresh checkout's first secret task works.
 2. Stack runs `fnox env --json --describe`, which reads no values, then `fnox env --json --keys
    <names>`, both non-interactive and bounded by 30 seconds. File secrets, leases and keys that
    cannot be injected into an environment are refused before any value is requested.

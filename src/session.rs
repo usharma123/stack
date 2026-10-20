@@ -2814,6 +2814,13 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     };
     if let Some(config) = task_config.as_mut() {
         install_task_tools(ctx, &report, config, &env, &selection, &missing)?;
+        // A pin's directory joins the provider's PATH only once it is installed, and a granted
+        // secret is resolved through the pinned fnox on that PATH: read the environment again
+        // after installing. The project's `[env]` values, which the copy declares, are the same.
+        if !missing.is_empty() {
+            env = mise::env(&ctx.root)?;
+            timings.mark("env");
+        }
         // Set before secrets resolve, so no grant can replace them.
         env.extend(config.env());
     }

@@ -4842,6 +4842,43 @@ fn a_task_edited_while_its_run_waits_for_the_lock_runs_with_its_new_definition_a
 }
 
 #[test]
+fn a_task_installs_its_missing_pinned_fnox_before_resolving_its_secrets() {
+    let fixture = Fixture::new();
+    let root = fixture.dir.path();
+    let install = root.join("installs/fnox/1.39.0");
+    write_exe(&install.join("fnox"), FAKE_FNOX);
+    fs::create_dir_all(install.join(".mise-bins")).unwrap();
+    std::os::unix::fs::symlink(install.join("fnox"), install.join(".mise-bins/fnox")).unwrap();
+    // As mise reports it before and after the install: not installed and off the stack's
+    // PATH, then installed with its directory first on PATH.
+    installed(&fixture, &[("1.39.0", true)]);
+    fs::rename(root.join("ls.json"), root.join("ls-installed.json")).unwrap();
+    installed(&fixture, &[("1.39.0", false)]);
+    path_first(&fixture, &install.join(".mise-bins"));
+    fs::rename(root.join("env.json"), root.join("env-installed.json")).unwrap();
+    fs::write(root.join("env.json"), json!({ "PATH": format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap()) }).to_string()).unwrap();
+    fs::write(
+        root.join("app/stack.toml"),
+        "[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n[tasks.sign]\nrun = 'x'\nsecrets = ['DEPLOY_KEY']\n",
+    )
+    .unwrap();
+    fixture.ok(&["compile"]);
+    for route in ["cli", "mcp"] {
+        let _ = fs::remove_file(root.join("installed"));
+        let envelope = match route {
+            "cli" => json_run(&fixture, &["run", "sign"]).0,
+            _ => fixture.mcp(&[("stack_run", json!({ "task": "sign" }))], &[])[0]["structuredContent"].clone(),
+        };
+        assert_eq!(envelope["ok"], true, "{route}: {envelope}");
+        assert_eq!(envelope["data"]["exit_code"], 0, "{route}: {envelope}");
+        assert_eq!(envelope["data"]["secrets"], json!(["DEPLOY_KEY"]), "{route}: {envelope}");
+        assert!(fs::read_to_string(root.join("installed")).unwrap().contains("fnox@1.39.0"), "{route}: fnox was installed first");
+        assert_no_leak(&envelope.to_string(), route);
+    }
+    assert!(fnox_log(&fixture).iter().any(|l| l.contains("--keys")), "the pinned fnox resolved the grant");
+}
+
+#[test]
 fn a_task_deleted_or_ungranted_while_its_run_waits_is_refused_or_runs_without_secrets() {
     let head = "[[use]]\nbundle='path:../bundle'\n[tools]\nfnox = \"1.39.0\"\n";
     let granted = format!("{head}[tasks.showenv]\nrun = 'old-definition'\nsecrets = ['DEPLOY_KEY']\n[tasks.plain]\nrun = 'true'\n");

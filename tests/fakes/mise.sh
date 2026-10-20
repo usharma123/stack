@@ -27,7 +27,9 @@ case "$1 $2" in
     { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/ls.log"
     if test "${3-}" = fnox; then
       { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/fnox-ls.log"
-      if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
+      if test -f "$REVIEW_FIXTURE/ls-installed.json" && grep -q '^fnox@' "$REVIEW_FIXTURE/installed" 2>/dev/null; then
+        cat "$REVIEW_FIXTURE/ls-installed.json"
+      elif test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
     else
       # Every release the configuration names, installed when an install recorded it (or a
       # test listed it) in `installed`; `ls.json` stands for fnox's rows when a test gives them.
@@ -110,7 +112,13 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
       touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
     fi
-    cat "$REVIEW_FIXTURE/env.json" ;;
+    # Like mise, a pin's directory joins PATH once it is installed: `env-installed.json` stands for
+    # the environment after the install recorded fnox, when a test gives one.
+    if test -f "$REVIEW_FIXTURE/env-installed.json" && grep -q '^fnox@' "$REVIEW_FIXTURE/installed" 2>/dev/null; then
+      cat "$REVIEW_FIXTURE/env-installed.json"
+    else
+      cat "$REVIEW_FIXTURE/env.json"
+    fi ;;
   'daemons --json')
     if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
       if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
