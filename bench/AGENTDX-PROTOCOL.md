@@ -1,8 +1,10 @@
 # AgentDX benchmark protocol
 
 Status: active pilot protocol. The harness implements everything below unless a line is
-marked **not implemented**. No real agent experiment has been run under it yet. The two
-2026-10-20 hands-on sessions (Opus, Astra) are discovery evidence and stay separate.
+marked **not implemented**. No real agent experiment has been run under it yet. Real testing
+is authorized; a first run still needs its agent CLI, models, options, credentials route and
+spend limit chosen (see the README). The two 2026-10-20 hands-on sessions (Opus, Astra) are
+discovery evidence and stay separate.
 
 ## Question and primary outcome
 
@@ -12,9 +14,11 @@ the project's existing setup?
 Primary outcome: **autonomous completion**. That is the share of assigned trials that meet
 all of the following:
 
-- an independently verified task result,
+- an independently verified task result: the project's existing smoke test and the hidden
+  acceptance checks both pass,
 - a valid human transcript review recording no help,
-- nothing the agent started still running when it stopped.
+- nothing the agent started still running when it stopped,
+- the arm's own teardown stopping everything, without the harness reclaiming by PID.
 
 Every trial in the plan stays in the denominator, so `not_run`, `invalid`, `unreviewed` and
 `review_invalid` are never successes. The agent's final message never decides a result.
@@ -29,7 +33,10 @@ validating them in the review schema.
 ## Matched arms
 
 Each pair runs the same task, model, agent command, model options, prompt, application
-source, tool and service versions, grader, locale and budget in two arms:
+source, tool and service versions, grader, locale and budget in two arms. Model options are
+controlled only when they reach the agent's argv through `{option:NAME}` placeholders, and a
+literal flag that contradicts them refuses the plan. A plan without options runs on the
+harness defaults, and the report says so.
 
 - `stack`: `stack.toml` and a committed `stack.lock`; the pinned `stack` on PATH; a README
   using `stack up`, `run`, `exec`, `restart` and `down`.
@@ -45,7 +52,8 @@ expose. **Not implemented:** Docker Compose or devcontainer control arms.
 Every trial gets fresh runtime stores and a fresh checkout. Trials are serialized per host by
 a lock file. The plan records:
 
-- tasks, models, harness name, options and the agent command (immutable once planned),
+- tasks, models, harness name, options with where each enters argv, and the agent command
+  (immutable once planned),
 - the Stack binary hash, platform label, host, locale and cache mode,
 - the budget, seed and benchmark file hashes.
 
@@ -71,17 +79,40 @@ Every task has:
 - an existing smoke test that must pass before and after the reference,
 - an exact list of `required_checks`, and one designated check the starting code must fail.
 
+A submission passes only through both gates: the existing smoke test, run through the arm's
+`exec`, and the hidden acceptance checks. A change that breaks existing behaviour fails even
+if every hidden check passes. The documented task loop (`stack run test`, `dev.py test`) is
+recorded but not gated, because Stack 0.1.22's `run` gives custom services an unreachable URL
+(R1). Gating on it would fail every Stack trial on a product defect.
+
 `run.py validate` proves all of this through the same `grade` function that scores agent
-work, in fresh runtimes, and records cleanup and global-state receipts.
+work, in fresh runtimes, and records cleanup and global-state receipts. The starting code
+must keep the smoke test green and fail its designated hidden check; the reference must pass
+both gates.
 
 Graders, references and hidden data live outside the agent's workspace, which sits under a
 `/tmp` root. That is an access convention, not a security boundary: an agent that searches
-the host can find this repository.
+the host can find this repository. Within it, the grader computes every check from what it
+observes (HTTP responses, rows, files, returned values). Nothing a submission prints, returns
+as a verdict or does in an exit handler can pass a check. The slug grader reads a random nonce
+and its inputs over stdin before the submission loads. The trial re-hashes the benchmark files
+after grading. Out of scope: editing the benchmark files undetected, reading the grader's
+memory, or tracing it.
 
-Grading uses a new runtime. It overlays the submitted files except benchmark-owned files and
-runtime directories, then lets the harness run setup and startup. Setup is retried twice
-because it only installs locked artifacts; a setup failure that survives the retries makes
-the trial invalid (infrastructure). A submission whose app does not start fails the task.
+Grading uses a new runtime. It applies the submitted checkout, including deletions, except
+benchmark-owned files and runtime directories, then lets the harness run setup and startup.
+Grading ends with one of these outcomes:
+
+| Outcome | Meaning | Trial |
+|---|---|---|
+| `graded` | Every step ran; both gates decide | scored |
+| `startup_failed` | The submitted app did not start, and the reference passed in a fresh control runtime | scored task failure |
+| `infrastructure_failed` | The submitted app did not start, and neither did the reference | invalid |
+| `setup_failed` | Installing locked tools failed three times | invalid |
+| `harness_error` | Anything else | invalid |
+
+A failed start can still be environmental if the environment recovers before the control
+runs; the control makes that unlikely, not impossible.
 
 The pilot bank is three synthetic tasks: a migration plus cache fix (Python, PostgreSQL,
 Redis), an API and storage fix (Node), and a tools-only library fix (Node). That is not
@@ -103,10 +134,16 @@ scripted product checks instead. The full coverage table is in
 
 `run.py trial` saves, per trial:
 
-- the prompt, and full agent stdout/stderr with timing and exit receipts,
-- the agent's own transcript directory, and the diff against the starting commit,
-- what was left running at agent exit,
-- cleanup receipts, and grading receipts with the grader's JSON,
+- the prompt, and full agent stdout/stderr with timing, exit and exact argv receipts,
+- the agent's own transcript directory,
+- the submission (`submission.patch`, `submission.json`), diffed against a copy of the
+  starting commit kept outside the checkout, so commits, rewritten history, deletions and
+  ignored files are all included,
+- what was left running at agent exit (`left-at-agent-exit.json`),
+- each cleanup (`agent-cleanup.json`, `final-cleanup.json`) and the grade (`grade.json`),
+  with every step receipt and the grader's JSON,
+- global state before and after (`globals-before.json`, `globals-after.json`), and the
+  benchmark file hashes after grading (`fingerprints-after.json`),
 - a summary with the hash of every evidence file.
 
 Retries within the budget are agent behavior. A rerun after a harness fault needs a new
@@ -115,12 +152,14 @@ results directory, linked by hand to the original; receipts are never overwritte
 A human reviewer fills `review.json` from `run.py review-template`. The report rejects a
 review whose:
 
-- trial, summary or transcript hashes, model, harness or options differ from the evidence and plan,
-- reviewer or harness version is missing,
+- trial, summary or transcript hashes, model, harness or requested options differ from the evidence and plan,
+- observed model or harness version is missing (the template leaves both empty), or, for a
+  plan with options, `observed_options` from the transcript differ from the plan,
 - interventions are malformed, outside the agent's time window, or recorded although the plan has no human channel,
-- token or cost figures lack a stated source.
+- token or cost figures are not finite nonnegative numbers (token counts integers), or their
+  source is not a file in the trial directory named by path and sha256.
 
-Tokens and cost are `null` unless the provider reports them.
+Tokens and cost are `null` unless the provider reports them; nothing is estimated.
 
 ## Ownership and cleanup
 
@@ -130,7 +169,20 @@ and ports, and for any process whose command line, working directory or an open 
 the trial root. That last check catches failed starts that recorded nothing. A process that
 detached with none of those under the root would be missed, so the record means "none
 observed", not "proven none". Leftovers are recorded as a cleanup failure, then stopped by
-exact PID after rechecking the start time and command. Nothing is ever signalled by name.
+exact PID. Before every signal, the SIGKILL escalation included, the harness rechecks the
+start time, the command line and that the process is still under the root. On Linux a pidfd
+pins the process between check and signal; on macOS a few microseconds remain. Nothing is
+ever signalled by name.
+
+When a command's budget expires, or the run is cancelled, the harness stops the command's
+process group and every descendant it can trace through parent PIDs. That includes children
+that ignore SIGTERM, outlive their leader or leave its group. It uses the same per-process
+identity check. Once the leader is reaped, a group led by a different process is treated as
+someone else's.
+
+A trial whose arm teardown needed the harness to reclaim processes is valid but not
+autonomous. One where owned processes outlived every cleanup, or where a grading runtime
+left any, is invalid.
 
 Global receipts hash the user's mise, Pitchfork and Stack config and state files, and list
 the user's mise installs. Another program on the host can change those too, so a difference
@@ -141,14 +193,19 @@ recorded per grading run. They describe lifecycle cost and are not scored.
 
 ## Reporting
 
-`run.py report` reports, per trial:
+`run.py report` re-derives every verdict from the trial's hashed records and never from the
+summary's own booleans. A summary that contradicts its records, a missing, changed or unhashed
+evidence file, or an agent receipt that is malformed, shows a different argv from the plan or
+falls outside the trial window makes the trial invalid. It reports, per trial:
 
 - status: `passed`, `failed`, `timed_out`, `invalid`, `unreviewed`, `review_invalid` or `not_run`,
-- verified task, autonomous, left running, agent seconds, startup seconds,
-- review counts.
+- grading outcome, verified task, autonomous, left running, whether the arm teardown was clean,
+- agent seconds (from the agent receipt) and startup seconds (from the grading receipts),
+- review counts, usage with its source, and observed options.
 
-Per arm it gives counts, matched pairs with both arms scored, and discordant pairs. A report
-is `publishable` only when every planned trial is scored and the plan is an
+Per arm it gives counts, including scored startup failures, matched pairs with both arms
+scored, and discordant pairs. A `startup_failed` trial is scored, so it stays in its pair.
+A report is `publishable` only when every planned trial is scored and the plan is an
 `agent_experiment` (never a `harness_selftest`).
 
 **Not implemented:** confidence intervals, a task-level bootstrap, or a significance test.

@@ -20,11 +20,15 @@ competitor benchmark is retired to [eval/archive/competitor-20261006](../eval/ar
 | Pre-registered plan, external agent trial, cleanup, grading | `run.py plan`, `run.py trial` | Exercised end to end with the scripted self-test agent only |
 | Human transcript review and report | `run.py review-template`, `run.py report` | Implemented; no real review exists yet |
 | Stack regression checks for the hands-on findings | `regressions.py` | Implemented, run on 0.1.22 |
-| Offline unit tests | `tests/` | 23 tests |
+| Offline unit tests | `tests/` | 78 tests, including one counterexample per review finding |
 
-**No real agent trial has been run.** Running one needs an agent CLI, its credentials and model
-spend, which this checkout does not authorize. Every number so far comes from scripted
-validation, self-tests or regression checks, and none of it is agent evidence.
+**No real agent trial has been run yet.** Real testing is authorized. What is still open is
+the configuration of a first run: which agent CLI and version, which model IDs and options,
+how the CLI's credentials reach a trial (the runner keeps `HOME` and isolates
+`XDG_CONFIG_HOME`), and the spend limit per trial and in total. Once those are chosen, start
+with a bounded pilot, for example one model on the three tasks with two repetitions (12
+trials), before any larger study. Every number so far comes from scripted validation,
+self-tests or regression checks, and none of it is agent evidence.
 
 ## The tasks
 
@@ -96,33 +100,112 @@ python3 bench/run.py plan --kind harness_selftest --models selftest --harness se
 ## How a trial is scored
 
 1. A fresh runtime root and checkout are created, with one git commit as the starting point.
-2. The agent runs within the plan's budget. Whatever it leaves running is recorded
-   (`left_running_at_agent_exit`) before the harness touches anything.
-3. The diff against the starting commit is saved as `submission.patch`.
+   The harness clones that commit into `<root>/harness/baseline.git`, outside the checkout.
+2. The agent runs within the plan's budget, with the planned model and options substituted
+   into the planned command. On budget expiry or cancellation the harness stops everything the
+   command started. That is its process group, plus every descendant it can trace through
+   parent PIDs, including children that outlive the leader or leave its group. A process that
+   both left the group and lost its parent before the stop is found only by the root ownership
+   check in step 4. Whatever is left running when the agent stops is recorded before the
+   harness touches anything.
+3. The submission is the agent's whole change against the kept starting commit: commits,
+   edits, deletions and new files, including files the agent's `.gitignore` hides. It is
+   saved as `submission.patch` and `submission.json`, which also lists the agent's commits.
+   Nothing is written to the agent's `.git`.
 4. The harness stops the agent's workspace with the arm's own `down`, and stops the root's
    Pitchfork supervisor in the Stack arm. It then looks for any process whose command line,
    working directory or an open file is under the runtime root. If any remain, the harness
-   stops them, but the trial's cleanup is still recorded as failed.
-5. Grading uses a second fresh root: grader-only seed data, the submitted files copied over
-   the starting project (never `stack.toml`, `stack.lock`, `mise.toml`, `dev.py`, seeds, smoke
-   tests or runtime directories), harness-driven `setup` and `up`, then `verify.py` through the
-   arm's `exec`. The task passes only when the grader receipt lists exactly the task's
-   `required_checks`, all true.
-6. `report` re-derives pass/fail from the grader receipt, checks every evidence hash, the plan,
-   binary and locale identity, and the review. It counts a trial as autonomous only when:
+   stops them, and the trial is not counted as autonomous.
+5. Grading uses a second fresh root: grader-only seed data, then the submitted checkout
+   applied over the starting project, including its deletions. Benchmark-owned files are never
+   taken from the submission: `stack.toml`, `stack.lock`, `mise.toml`, `dev.py`, seeds, smoke
+   tests and runtime directories. The harness runs `setup` and `up`, the project's existing smoke
+   test through the arm's `exec`, and then `verify.py` through `exec`. The task passes only
+   when two conditions both hold:
+   - the smoke test passes, so existing behaviour still works,
+   - and the grader prints exactly one result listing exactly the task's `required_checks`,
+     all true.
+
+   The documented task loop (`stack run test`, `dev.py test`) is recorded but does not gate,
+   because Stack 0.1.22's `run` breaks it in service apps (R1).
+6. If the submitted app does not start, the harness grades the reference solution in a fresh
+   control runtime. If the reference passes, the trial is a scored task failure
+   (`startup_failed`). If it fails too, the trial is invalid (`infrastructure_failed`). Setup
+   that fails three times is also invalid.
+7. Every observation is written to its own evidence file and hashed: the agent receipt, what
+   was left running, the submission, each cleanup, the grade, global state before and after,
+   and the benchmark files after grading. `report` re-derives every verdict from those files.
+   It never trusts the summary's own booleans. A summary that disagrees with its records,
+   a missing or changed record, or an unhashed file makes the trial invalid. It counts a trial
+   as autonomous only when:
    - the task is verified,
    - the review is valid and records no human help,
-   - and nothing was left running at agent exit.
+   - nothing was left running at agent exit,
+   - and the arm's own teardown stopped everything without the harness reclaiming by PID.
 
    Missing, invalid and unreviewed trials stay in every denominator.
 
 The agent's final message is never read for scoring.
 
+### Model options
+
+Plan options with `--options '{"reasoningEffort": "high"}'`. Each option must reach the agent
+command as a placeholder, as in `--reasoning-effort {option:reasoningEffort}`, or the plan is
+refused. Values are passed verbatim: strings as written, numbers and booleans as JSON. A
+literal flag named like a planned option or like `model` must carry that placeholder, so
+`--reasoning-effort low` next to a planned `high` is refused. The trial's agent receipt must
+show exactly the planned argv. The reviewer then records `observed_options` from the
+transcript; the template leaves it empty, and a review whose observed options differ from
+the plan is invalid. An agent CLI that cannot take a setting on its command line needs a
+wrapper script that can, and the wrapper's receipt belongs in the transcript. Otherwise plan
+no options; the report then labels the run as using the harness defaults, not controlled
+settings.
+
+### Usage and cost
+
+`tokens` (nonnegative integer `input`, `output`, `cache_read`, `cache_write`, `reasoning`,
+`total`) and `cost_usd` (`value`, finite and nonnegative) are `null` unless the provider reports
+them. Each must name its source as `{"path": ..., "sha256": ...}`, pointing either to a file
+in the trial evidence (such as a transcript with usage) or to a file the reviewer adds under
+`review-evidence/` in the trial directory. Nothing is estimated or converted.
+
+### What the grader trusts
+
+Graders, references and hidden data sit outside the agent's workspace by convention; there
+is no sandbox. Within that, `verify.py` computes every check from values it observes itself:
+HTTP responses, database rows, files, and the return values of `slug()`. Submitted code
+cannot print or return its own verdict. For the slug task, the grader reads a random nonce
+and its inputs over stdin before the submission loads, so exit handlers, `process.exit` and
+prototype tampering cannot fake the result. Out of scope are attacks outside the result
+channel: editing the benchmark files, reading the grader's memory or nonce, or tracing it.
+The trial re-hashes the benchmark files after grading, so edits to them are detected.
+
+### Cleanup and PID reuse
+
+Every signal, the SIGKILL escalation included, goes to one recorded process after its start
+time and command line are checked again. For leftovers under a runtime root, the harness also
+checks that the process is still under that root. On Linux a pidfd holds the process between
+the check and the signal, and the kernel start tick catches reuse within the same second. On
+macOS `lstart` has one-second resolution, and a few microseconds separate the check from
+`kill`. The harness never signals by name or by a group it cannot attribute.
+
+## Regression checks
+
+`regressions.py` gives each check a verdict. `fixed` means Stack behaves as documented.
+`reproduced` means the defect is present. Either verdict needs the check's control to pass
+and its cleanup to be clean; otherwise the check is `invalid` and says why. Every control
+states what it shows. `down-before-up`'s control is a sibling checkout of the same project
+that runs `up` and then a confirmed `down`. The exit status is:
+
+- 0 when every check is fixed,
+- 1 when the run is valid and at least one defect reproduced,
+- 2 when any check is invalid or the user's global Stack, mise or Pitchfork state changed.
+
 ## Validation results on Stack 0.1.22
 
 See [eval/agentdx-20261020/SYNTHESIS.md](../eval/agentdx-20261020/SYNTHESIS.md#benchmark-validation)
 for the exact runs. In short, every cell is gradeable. In the Stack arm, the project's
-documented test command `stack run test` fails for both service apps because of finding P1-1.
+documented test command `stack run test` fails for both service apps because of finding R1.
 That is the product defect the agent will meet, so it is part of what the benchmark measures,
 not a reason to drop the cell.
 
