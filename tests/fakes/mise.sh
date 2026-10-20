@@ -104,6 +104,12 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
             f.write("%s@%s\n" % (tool, v["version"] if isinstance(v, dict) else v))' "$REVIEW_FIXTURE" "$config" "$@" ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
+    # A cold cache: mise asks GitHub for its latest release first, unless told not to warn.
+    if test -f "$REVIEW_FIXTURE/version-update-check" && test "${MISE_DISABLE_UPDATE_WARNING-}" != 1; then sleep "$(cat "$REVIEW_FIXTURE/version-update-check")"; fi
+    # A first run that is slow for any other reason: only the first call waits.
+    if test -f "$REVIEW_FIXTURE/version-slow-once" && ! test -f "$REVIEW_FIXTURE/version-slowed"; then
+      touch "$REVIEW_FIXTURE/version-slowed"; sleep "$(cat "$REVIEW_FIXTURE/version-slow-once")"
+    fi
     echo 'mise WARN  mise version 2099.1.1 available' >&2
     if test -f "$REVIEW_FIXTURE/mise-version"; then cat "$REVIEW_FIXTURE/mise-version"; else echo '2026.10.3 macos-arm64 (2026-10-05)'; fi ;;
   'env --json')

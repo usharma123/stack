@@ -258,21 +258,49 @@ pub struct Requirement {
 }
 
 const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A second, longer wait for a `mise version` that missed [`VERSION_TIMEOUT`] once: a first run
+/// in a fresh mise root is slower than any later one.
+const VERSION_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The release of the mise on PATH, from `mise version` with no configuration loaded.
+///
+/// mise's update check is turned off for it (`MISE_DISABLE_UPDATE_WARNING`): with a fresh
+/// cache, `mise version` otherwise asks GitHub for the latest release before it answers, and
+/// stack reads only the release it prints. One that still misses the deadline is asked once
+/// more, for longer; one that never answers is reported as installed but not answering,
+/// never as missing.
 pub fn provider_version(root: &Path) -> Result<CalVer> {
-    let mut command = Command::new("mise");
-    configure_command(&mut command, root);
-    command.args(["version"]).current_dir(root).env("MISE_NO_CONFIG", "1").env("NO_COLOR", "1");
-    let out = crate::process::capture(&mut command, VERSION_TIMEOUT, 16 * 1024).map_err(|e| {
-        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
-    })?;
+    let ask = |wait: std::time::Duration| {
+        let mut command = Command::new("mise");
+        configure_command(&mut command, root);
+        command
+            .args(["version"])
+            .current_dir(root)
+            .env("MISE_NO_CONFIG", "1")
+            .env("MISE_DISABLE_UPDATE_WARNING", "1")
+            .env("NO_COLOR", "1");
+        crate::process::capture(&mut command, wait, 16 * 1024).map_err(|e| {
+            StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
+        })
+    };
+    let mut out = ask(VERSION_TIMEOUT)?;
+    if out.timed_out && !crate::process::expired() {
+        out = ask(VERSION_RETRY_TIMEOUT)?;
+    }
     if out.timed_out && crate::process::expired() {
         return Err(StackError::new("timed_out", "`mise version` was cut short by the deadline"));
     }
-    if out.timed_out || out.exit_code != Some(0) {
-        let why = if out.timed_out { format!("did not answer within {}s", VERSION_TIMEOUT.as_secs()) } else { "failed".into() };
-        return Err(StackError::new("provider_unavailable", format!("`mise version` {why}")).hint(crate::setup::MISE_INSTALL_HINT));
+    if out.timed_out {
+        let mise = crate::setup::find_on_path_from(root).map_or_else(|| "mise".to_string(), |p| p.display().to_string());
+        return Err(StackError::new(
+            "provider_unavailable",
+            format!("`mise version` did not answer within {}s, nor within {}s when asked again", VERSION_TIMEOUT.as_secs(), VERSION_RETRY_TIMEOUT.as_secs()),
+        )
+        .hint(format!("{mise} is installed but is not answering; check that it runs (`{mise} version`) and that nothing holds its state directory, then retry"))
+        .with_detail(serde_json::json!({ "mise": mise })));
+    }
+    if out.exit_code != Some(0) {
+        return Err(StackError::new("provider_unavailable", "`mise version` failed").hint(crate::setup::MISE_INSTALL_HINT));
     }
     CalVer::parse(&out.stdout).ok_or_else(|| {
         StackError::new("provider_outdated", format!("cannot read a release from `mise version`: {:?}", out.stdout.trim()))

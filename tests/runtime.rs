@@ -4571,6 +4571,28 @@ fn install_and_up_refuse_a_mise_too_old_for_mr_boxington_before_installing() {
 }
 
 #[test]
+fn a_cold_mise_update_check_cannot_hold_up_the_provider_release_probe() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    // Longer than the probe's whole budget: only skipping the update check gets an answer.
+    fs::write(fixture.dir.path().join("version-update-check"), "60").unwrap();
+    let start = Instant::now();
+    fixture.ok(&["install", "--json"]);
+    assert!(start.elapsed() < Duration::from_secs(8), "{:?}", start.elapsed());
+}
+
+#[test]
+fn a_mise_version_that_misses_its_first_deadline_is_asked_again() {
+    let fixture = Fixture::with_bundle(RUST_MBX);
+    fs::write(fixture.dir.path().join("version-slow-once"), "12").unwrap();
+    let out = fixture.command(&["install", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert!(out.status.success(), "a slow first answer is not `provider_unavailable`: {result}");
+    assert!(fixture.dir.path().join("version-slowed").exists(), "the first answer was slow");
+    let asked = fs::read_to_string(fixture.dir.path().join("version.log")).unwrap();
+    assert!(asked.lines().count() >= 2, "asked once more: {asked}");
+}
+
+#[test]
 fn stacks_without_mr_boxington_never_ask_for_the_provider_release() {
     let fixture = Fixture::new();
     fs::write(fixture.dir.path().join("mise-version"), "2020.1.1\n").unwrap();
