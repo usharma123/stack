@@ -105,5 +105,55 @@ class GradeTest(unittest.TestCase):
         self.assertEqual((result['outcome'], result['setup_attempts'], result['passed']), ('graded', 2, True))
 
 
+class HiddenDataTest(unittest.TestCase):
+    """Only declared grader files are copied; caches beside them are not benchmark data (review round 2, D)."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.out = Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def hidden_root(self):
+        root = self.out / 'hidden'
+        (root / 'ledger' / '__pycache__').mkdir(parents=True)
+        (root / 'ledger' / 'seed.py').write_text('SEED = 1\n')
+        (root / 'ledger' / '__pycache__' / 'seed.cpython-312.pyc').write_bytes(b'cache')
+        (root / 'ledger' / 'notes.txt~').write_text('editor backup')
+        return root
+
+    def test_interpreter_cache_beside_hidden_data_is_ignored(self):
+        root = self.hidden_root()
+        with mock.patch.object(arms, 'HIDDEN_ROOT', root):
+            result = FakeRuntime(self.out).grade()
+        self.assertEqual((result['outcome'], result['passed']), ('graded', True))
+        self.assertEqual(result['hidden_files'], {'seed.py': arms.digest(root / 'ledger' / 'seed.py')})
+        self.assertFalse((self.out / 'workspace' / '__pycache__').exists())
+        self.assertFalse((self.out / 'workspace' / 'notes.txt~').exists())
+        self.assertTrue((root / 'ledger' / '__pycache__' / 'seed.cpython-312.pyc').exists())  # left as it was
+
+    def test_this_checkout_grades_whatever_caches_it_holds(self):
+        # The real hidden/ directory, including any __pycache__ earlier runs left there.
+        result = FakeRuntime(self.out).grade()
+        self.assertEqual((result['outcome'], result['passed']), ('graded', True))
+        self.assertEqual(set(result['hidden_files']), {'seed.py'})
+
+    def test_missing_declared_hidden_file_is_a_harness_error(self):
+        root = self.hidden_root()
+        (root / 'ledger' / 'seed.py').unlink()
+        with mock.patch.object(arms, 'HIDDEN_ROOT', root):
+            result = FakeRuntime(self.out).grade()
+        self.assertEqual(result['outcome'], 'harness_error')
+        self.assertIn('seed.py', result['error'])
+
+    def test_declared_files_are_exactly_the_hidden_data(self):
+        for project in arms.PROJECTS:
+            directory = arms.HIDDEN_ROOT / project
+            present = sorted(path.name for path in directory.iterdir()
+                             if path.is_file() and path.name not in arms.RUNTIME_DIRS) if directory.is_dir() else []
+            self.assertEqual(sorted(arms.HIDDEN[project]), present, project)
+
+
 if __name__ == '__main__':
     unittest.main()

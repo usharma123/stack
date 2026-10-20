@@ -271,10 +271,7 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_c
         workspace = arms.prepare(task_id, arm, root, binary, env)
         if arm == 'stack':
             result['lock_backends'] = arms.lock_backends(workspace)
-        hidden = HERE / 'hidden' / project
-        if hidden.is_dir():
-            for path in hidden.iterdir():
-                shutil.copy2(path, workspace / path.name)
+        result['hidden_files'] = arms.copy_hidden(project, workspace)
         result['submitted_files'] = arms.overlay(submission, workspace, full_tree) if submission else {}
         steps = arms.commands(arm, project, binary, arms.verifier_argv(task_id, workspace))
         timings, result['setup_attempts'] = {}, 0

@@ -37,6 +37,10 @@ PROJECTS = {
 # Files the grader always takes from the benchmark, never from a submission.
 PROTECTED = {'stack.toml', 'stack.lock', 'mise.toml', 'mise.lock', 'dev.py', '.dev.json', 'seed.py', 'smoke.py',
              'smoke.mjs', 'products.json', 'README.md', '.gitignore'}
+# Grader-only data copied into each grading workspace, by declared name. Nothing else under
+# `hidden/` is copied: an interpreter cache or editor file there is not benchmark data.
+HIDDEN_ROOT = HERE / 'hidden'
+HIDDEN = {'ledger': ['seed.py'], 'catalog': ['products.json'], 'slug': []}
 RUNTIME_DIRS = {'.git', '.stack', '.dev', '.venv', '.config', 'node_modules', '__pycache__'}
 GITIGNORE = '.stack/\n.dev/\n.venv/\n.config/mise/\nnode_modules/\n__pycache__/\n'
 
@@ -248,6 +252,18 @@ def overlay(source, workspace, full_tree=False):
             if relative not in PROTECTED and relative not in submitted:
                 (workspace / relative).unlink()
                 copied[relative] = 'deleted'
+    return copied
+
+
+def copy_hidden(project, workspace):
+    """Copy the project's declared grader-only files; a missing or non-regular one is an error."""
+    copied = {}
+    for name in HIDDEN[project]:
+        source = HIDDEN_ROOT / project / name
+        if source.is_symlink() or not source.is_file():
+            raise FileNotFoundError(f'declared hidden file {source} is missing or not a regular file')
+        shutil.copy2(source, workspace / name)
+        copied[name] = digest(workspace / name)
     return copied
 
 
