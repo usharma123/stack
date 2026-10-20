@@ -248,6 +248,28 @@ class ReportTest(unittest.TestCase):
         self.review(self.sealed(grade_cleanup=teardown_record(LEFT, after=EMPTY)))
         self.assertIn('the grading runtime left owned processes', self.row()['problems'])
 
+    def test_every_runtime_rejects_impossible_or_later_dirty_cleanup(self):
+        self.catalog_plan()
+        for runtime in ['agent', 'grade', 'control', 'final']:
+            for cleanup in [teardown_record(EMPTY, after=LEFT), teardown_record(EMPTY, after=EMPTY),
+                            teardown_record(LEFT, after=LEFT)]:
+                with self.subTest(runtime=runtime, cleanup=cleanup):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed(outcome='startup_failed', control=True)
+                    if runtime in ['grade', 'control']:
+                        grade = json.loads((records.out / 'grade.json').read_text())
+                        target = grade if runtime == 'grade' else grade['startup_control']
+                        target['cleanup'] = cleanup
+                        records.replace_record('grade.json', grade, 'grade')
+                    else:
+                        records.replace_record(f'{runtime}-cleanup.json', cleanup, f'{runtime}_cleanup')
+                    self.review(records)
+                    row = self.row()
+                    self.assertEqual(row['status'], 'invalid')
+                    self.assertFalse(row['verified_task'])
+                    self.assertFalse(row['autonomous'])
+                    self.assertFalse(self.report()['publishable'])
+
     def test_required_observations_reject_hashed_null_arrays_and_incomplete_objects(self):
         observations = [('agent.json', 'agent'), ('globals-before.json', None), ('globals-after.json', None),
                         ('left-at-agent-exit.json', 'left_running_at_agent_exit'), ('agent-cleanup.json', 'agent_cleanup'),

@@ -760,7 +760,9 @@ def cleanup_schema(value):
     return (isinstance(value, dict) and residue_schema(value.get('before')) and residue_schema(value.get('left'))
             and isinstance(value.get('steps'), dict) and type(value['steps'].get('down')) is int
             and type(value.get('ok')) is bool and value['ok'] == (not any(value['left'].values()))
-            and ('after_reclaim' not in value or residue_schema(value['after_reclaim'])))
+            and (('after_reclaim' in value) == ('reclaimed_by_harness' in value))
+            and ('after_reclaim' not in value or (residue_schema(value['after_reclaim'])
+                 and bool(value['left']['owned_processes']) and isinstance(value['reclaimed_by_harness'], dict))))
 
 
 def globals_schema(value):
@@ -772,12 +774,15 @@ def globals_schema(value):
 def clean(teardown_record):
     """Nothing owned was running after the arm's own teardown (recomputed, not read from `ok`)."""
     left = (teardown_record or {}).get('left') if isinstance(teardown_record, dict) else None
-    return residue_schema(left) and not any(left.values())
+    return (cleanup_schema(teardown_record) and not any(left.values())
+            and 'after_reclaim' not in teardown_record)
 
 
 def restored(teardown_record):
     """Clean, or clean once the harness reclaimed the leftovers."""
     after = teardown_record.get('after_reclaim') if isinstance(teardown_record, dict) else None
+    if not cleanup_schema(teardown_record):
+        return False
     if isinstance(teardown_record, dict) and 'after_reclaim' in teardown_record:
         return residue_schema(after) and not any(after.values())
     return clean(teardown_record)
