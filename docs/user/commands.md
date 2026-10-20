@@ -131,7 +131,8 @@ Runs a command with the stack's tools and environment, in the project directory.
 - Services that do not verify keep their variables, but with the host replaced by
   `unverified.stack.invalid`, so an app that falls back to `localhost` fails loudly instead of
   reaching another server. `--require <service>` or `--require-all` refuses to run instead
-  (`service_unavailable`).
+  (`service_unavailable`). Repeat `--require` for several services (`--require postgres
+  --require redis`); `--require postgres,redis` names one service called `postgres,redis`.
 - `--timeout` counts from the call. When it expires the command's process group is killed and
   Stack exits 124 (`timed_out`).
 - With `--json`, at most 64 KiB of each output stream is captured into the result, and Stack

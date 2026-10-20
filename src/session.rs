@@ -1990,8 +1990,13 @@ pub fn logs(ctx: &Ctx, service: &str, tail: usize, since_start: bool) -> Result<
 /// `unknown_service`, naming the services the project does define.
 fn unknown_service(report: &Report, name: &str) -> StackError {
     let known: Vec<&str> = report.stack.services.keys().map(String::as_str).collect();
+    let listed = name.contains(',') && name.split(',').all(|n| known.contains(&n.trim()));
     StackError::new("unknown_service", format!("no service named '{name}'")).hint(if known.is_empty() {
         "this project defines no services".to_string()
+    } else if listed {
+        // `--require postgres,redis`: one name per flag.
+        let flags: Vec<String> = name.split(',').map(|n| format!("--require {}", n.trim())).collect();
+        format!("name one service per flag: {} (services: {})", flags.join(" "), known.join(", "))
     } else {
         format!("services: {}", known.join(", "))
     })

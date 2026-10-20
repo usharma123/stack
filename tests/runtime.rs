@@ -132,6 +132,16 @@ esac
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_comma_list_given_to_require_is_answered_with_one_flag_per_service() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
+    let out = fixture.command(&["--json", "exec", "--require", "web,api", "--", "true"]).output().unwrap();
+    let error = json_result(&out)["error"].clone();
+    assert_eq!(error["code"], "unknown_service", "{error}");
+    assert_eq!(error["hint"], "name one service per flag: --require web --require api (services: web, api)", "{error}");
+}
+
+#[test]
 fn init_writes_a_project_that_compiles_and_never_replaces_one() {
     let fixture = Fixture::new();
     let fresh = fixture.dir.path().join("fresh");
