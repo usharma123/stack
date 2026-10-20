@@ -66,24 +66,30 @@ class TrialRecords:
         self.write_text(name, json.dumps(value))
 
     def step(self, name, exit_code, stdout=''):
+        self.write_text(f'{name}.stdout', stdout)
+        self.write_text(f'{name}.stderr', '')
         self.write(f'{name}.json', {'exit_code': exit_code, 'timed_out': False, 'elapsed_ns': 2 * 10**9,
                                    'started_unix_ns': self.step_started, 'receipt': name,
-                                   'argv': ['synthetic-step', name], 'cwd': self.summary['workspace']})
+                                   'argv': ['synthetic-step', name], 'cwd': self.summary['workspace'],
+                                   **{f'{suffix}_sha256': arms.digest(self.out / f'{name}.{suffix}')
+                                      for suffix in ['stdout', 'stderr']}})
         self.step_started += 2 * 10**9
-        self.write_text(f'{name}.stdout', stdout)
 
     def graded_steps(self, prefix, checks):
         self.step(f'{prefix}-smoke_exec', self.smoke_exit if prefix == 'grade' else 0)
+        self.step(f'{prefix}-smoke_task_loop', 0)
         result = json.dumps({'ok': all(checks.values()), 'checks': checks, 'errors': {}})
         self.step(f'{prefix}-verify', 0 if all(checks.values()) else 1, result + '\n')
 
     def seal(self, task_passed=None):
         for name in ['agent.stdout', 'agent.stderr', 'submission.patch']:
             self.write_text(name, f'{name} contents\n')
+        self.agent.update({f'{suffix}_sha256': arms.digest(self.out / f'agent.{suffix}') for suffix in ['stdout', 'stderr']})
         self.write('agent.json', self.agent)
         self.write('left-at-agent-exit.json', self.left)
         self.write('submission.json', {'changed': ['M\tslug.mjs']})
         self.write('agent-cleanup.json', self.agent_cleanup)
+        self.cleanup_steps('agent-cleanup', self.agent_cleanup)
         grade = {'outcome': self.outcome, 'cleanup': self.grade_cleanup, 'seconds': {'setup': 2.0}}
         self.step('grade-setup', 0)
         if self.outcome == 'graded':
@@ -101,8 +107,11 @@ class TrialRecords:
                 self.step('grade-control-up', 0 if self.control else 1)
                 self.graded_steps('grade-control', {name: self.control for name in self.checks})
                 grade['startup_control'] = {'outcome': 'graded', 'passed': self.control, 'cleanup': teardown_record()}
+                self.cleanup_steps('grade-control-cleanup', grade['startup_control']['cleanup'])
+        self.cleanup_steps('grade-cleanup', self.grade_cleanup)
         self.write('grade.json', grade)
         if self.final_cleanup is not None:
+            self.cleanup_steps('final-cleanup', self.final_cleanup)
             self.write('final-cleanup.json', self.final_cleanup)
         self.write('globals-before.json', self.globals_before)
         self.write('globals-after.json', self.globals_after)
@@ -115,6 +124,10 @@ class TrialRecords:
             self.summary['final_cleanup'] = self.final_cleanup
         self.summary = bench.seal(self.summary, self.out, self.trial, self.test.plan, self.test.plan_path)
         return self.summary
+
+    def cleanup_steps(self, prefix, cleanup):
+        for role, code in cleanup.get('steps', {}).items():
+            self.step(f'{prefix}-{role.replace("_", "-")}', code)
 
     def edit_summary(self, **changes):
         """Tampering after the seal: the summary changes, its records do not."""
@@ -130,6 +143,15 @@ class TrialRecords:
         if summary_field:
             summary[summary_field] = value
         self.edit_summary(**summary)
+
+    def retry(self, name, command):
+        for suffix in ['stdout', 'stderr']:
+            self.write_text(f'{name}.{suffix}', '')
+            command[f'{suffix}_sha256'] = arms.digest(self.out / f'{name}.{suffix}')
+            summary = json.loads((self.out / 'summary.json').read_text())
+            summary['evidence_sha256'][f'{name}.{suffix}'] = command[f'{suffix}_sha256']
+            self.edit_summary(**summary)
+        self.replace_record(name + '.json', command)
 
 
 class ReportTest(unittest.TestCase):
@@ -442,6 +464,59 @@ class ReportTest(unittest.TestCase):
         self.review(self.sealed(checks={'case_0': True}, task_passed=True))
         self.assertEqual(self.row()['status'], 'invalid')
 
+    def test_verifier_cannot_redirect_to_agent_stdout_even_when_both_are_hashed(self):
+        self.catalog_plan()
+        for control in [False, True]:
+            with self.subTest(control=control):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed(outcome='startup_failed' if control else 'graded', control=True)
+                prefix = 'grade-control' if control else 'grade'
+                records.write_text('agent.stdout', (records.out / f'{prefix}-verify.stdout').read_text())
+                records.write_text(f'{prefix}-verify.stdout', '{}\n')
+                summary = json.loads((records.out / 'summary.json').read_text())
+                for name in ['agent.stdout', f'{prefix}-verify.stdout']:
+                    summary['evidence_sha256'][name] = arms.digest(records.out / name)
+                records.edit_summary(**summary)
+                verify = json.loads((records.out / f'{prefix}-verify.json').read_text())
+                records.replace_record(f'{prefix}-verify.json', dict(verify, receipt='agent',
+                                       stdout_sha256=arms.digest(records.out / 'agent.stdout')))
+                self.review(records)
+                self.assertEqual(self.row()['status'], 'invalid')
+                self.assertFalse(self.row()['verified_task'])
+                self.assertFalse(self.report()['publishable'])
+
+    def test_all_command_roles_require_their_own_outputs_and_receipt_stem(self):
+        for stem in ['agent', 'grade-setup', 'grade-smoke_exec', 'grade-smoke_task_loop', 'grade-verify',
+                     'agent-cleanup-down', 'grade-cleanup-down']:
+            for change in [{'receipt': 'agent' if stem != 'agent' else 'grade-verify'},
+                           {'stdout_sha256': '0' * 64}, {'stderr_sha256': None}]:
+                with self.subTest(stem=stem, change=change):
+                    shutil.rmtree(self.root / 'results', ignore_errors=True)
+                    records = self.sealed()
+                    command = json.loads((records.out / (stem + '.json')).read_text())
+                    records.replace_record(stem + '.json', dict(command, **change))
+                    self.review(records)
+                    self.assertEqual(self.row()['status'], 'invalid')
+                    self.assertFalse(self.row()['verified_task'])
+
+    def test_required_cleanup_and_observation_commands_cannot_disappear(self):
+        for name in ['agent-cleanup-down.json', 'grade-cleanup-down.json', 'grade-smoke_task_loop.json']:
+            with self.subTest(name=name):
+                shutil.rmtree(self.root / 'results', ignore_errors=True)
+                records = self.sealed()
+                (records.out / name).unlink()
+                summary = json.loads((records.out / 'summary.json').read_text())
+                summary['evidence_sha256'].pop(name)
+                records.edit_summary(**summary)
+                self.assertEqual(self.row()['status'], 'invalid')
+
+    def test_observation_command_timestamp_must_be_inside_trial(self):
+        records = self.sealed()
+        name = 'grade-smoke_task_loop.json'
+        command = json.loads((records.out / name).read_text())
+        records.replace_record(name, dict(command, started_unix_ns=0, elapsed_ns=2**63-1))
+        self.assertEqual(self.row()['status'], 'invalid')
+
     # ---- finding 9: timing and usage provenance ----
 
     def test_malformed_or_inconsistent_agent_timing_is_invalid(self):
@@ -519,7 +594,7 @@ class ReportTest(unittest.TestCase):
         setup = json.loads((records.out / 'grade-setup.json').read_text())
         records.replace_record('grade-setup.json', dict(setup, exit_code=1))
         retry = dict(setup, receipt='grade-setup-attempt-2', started_unix_ns=setup['started_unix_ns'] + setup['elapsed_ns'])
-        records.replace_record('grade-setup-attempt-2.json', retry)
+        records.retry('grade-setup-attempt-2', retry)
         grade = json.loads((records.out / 'grade.json').read_text())
         grade['seconds']['setup'] = 4.0
         records.replace_record('grade.json', grade, 'grade')
@@ -552,7 +627,7 @@ class ReportTest(unittest.TestCase):
         records.replace_record('grade-setup.json', dict(setup, exit_code=1))
         for attempt in [2, 3]:
             name = f'grade-setup-attempt-{attempt}'
-            records.replace_record(name + '.json', dict(setup, exit_code=1, receipt=name,
+            records.retry(name, dict(setup, exit_code=1, receipt=name,
                                    started_unix_ns=setup['started_unix_ns'] + (attempt - 1) * setup['elapsed_ns']))
         grade = json.loads((records.out / 'grade.json').read_text())
         grade.update(failed_step='setup', failed_receipt='grade-setup-attempt-3', seconds={'setup': 6.0})

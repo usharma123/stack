@@ -837,10 +837,57 @@ def step_ok(record):
             and record.get('timed_out') is False and 'cancelled' not in record and 'launch_error' not in record)
 
 
+def command_receipt(directory, stem, hashes, problems, window=None):
+    """One command role, its exact output files, and the digests written by invoke()."""
+    record = receipt(directory, stem + '.json', hashes, problems, command_schema)
+    if record is None:
+        return None
+    valid = record['receipt'] == stem
+    if not valid:
+        problems.append(f'{stem}.json receipt does not match command role')
+    for suffix in ['stdout', 'stderr']:
+        name = f'{stem}.{suffix}'
+        path = directory / name
+        expected = record.get(f'{suffix}_sha256')
+        if not (isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected)
+                and hashes.get(name) == expected and path.is_file() and digest(path) == expected):
+            problems.append(f'{stem}.json {suffix} digest does not match {name}')
+            valid = False
+    if uncertain_command(record):
+        problems.append(f'{stem}.json command cleanup left survivors or unresolved identities')
+        valid = False
+    if window is not None and not (all(number(t, integer=True) for t in window)
+            and window[0] <= record['started_unix_ns']
+            and record['started_unix_ns'] + record['elapsed_ns'] <= window[1] + 10**9):
+        problems.append(f'{stem}.json command timing is outside the trial window')
+        valid = False
+    return record if valid else None
+
+
+def cleanup_commands(cleanup, directory, prefix, hashes, problems):
+    """Require the down receipt, and supervisor stop if that step was recorded."""
+    if not cleanup_schema(cleanup):
+        return
+    if set(cleanup['steps']) - {'down', 'supervisor_stop'}:
+        problems.append(f'{prefix} unknown cleanup step')
+    uncertainty = {}
+    for role, code in cleanup['steps'].items():
+        stem = f'{prefix}-{role.replace("_", "-")}'
+        command = command_receipt(directory, stem, hashes, problems)
+        if command is not None and command['exit_code'] != code:
+            problems.append(f'{prefix} step {role} contradicts its command receipt')
+        raw = receipt(directory, stem + '.json', hashes, problems, command_schema)
+        if raw is not None and uncertain_command(raw):
+            uncertainty[stem] = raw['stopped']
+    if cleanup.get('command_cleanup', {}) != uncertainty:
+        problems.append(f'{prefix} command cleanup contradicts its command receipts')
+
+
 def graded_verdict(task, directory, hashes, prefix, problems):
     """Both gates from the receipts: the smoke test through exec, and the hidden checks."""
-    smoke = receipt(directory, f'{prefix}-smoke_exec.json', hashes, problems, command_schema)
-    verify = receipt(directory, f'{prefix}-verify.json', hashes, problems, command_schema)
+    smoke = command_receipt(directory, f'{prefix}-smoke_exec', hashes, problems)
+    command_receipt(directory, f'{prefix}-smoke_task_loop', hashes, problems)
+    verify = command_receipt(directory, f'{prefix}-verify', hashes, problems)
     if f'{prefix}-verify.stdout' not in hashes:
         problems.append(f'{prefix}-verify.stdout missing')
         return False
@@ -952,9 +999,8 @@ def derive(result, trial, plan, plan_path, directory):
     # evidence for an identity the command already lost. Never signal that identity here.
     for name in sorted(hashes):
         if name.endswith('.json') and COMMAND_STEM.fullmatch(name[:-5]):
-            command = receipt(directory, name, hashes, problems, command_schema)
-            if command is not None and uncertain_command(command):
-                problems.append(f'{name} command cleanup left survivors or unresolved identities')
+            command_receipt(directory, name[:-5], hashes, problems,
+                            (result.get('started_unix_ns'), result.get('finished_unix_ns')))
     for name in ['prompt.txt', 'agent.stdout', 'agent.stderr', 'submission.patch']:
         if name not in hashes:
             problems.append(f'{name} missing')
@@ -990,8 +1036,11 @@ def derive(result, trial, plan, plan_path, directory):
         split = arms.left_services(left) if isinstance(left, dict) else {'services': True, 'supervisor_processes': []}
         facts.update(left_running=split['services'], supervisor_left=bool(split['supervisor_processes']))
     agent_cleanup = receipt(directory, 'agent-cleanup.json', hashes, problems, cleanup_schema)
+    cleanup_commands(agent_cleanup, directory, 'agent-cleanup', hashes, problems)
     final_required = 'final-cleanup.json' in hashes or 'final_cleanup' in result or (agent_cleanup is not None and not clean(agent_cleanup))
     final_cleanup = receipt(directory, 'final-cleanup.json', hashes, problems, cleanup_schema) if final_required else None
+    if final_required:
+        cleanup_commands(final_cleanup, directory, 'final-cleanup', hashes, problems)
     if final_cleanup is not None and final_cleanup != result.get('final_cleanup'):
         problems.append('summary final_cleanup contradicts final-cleanup.json')
     if agent_cleanup is not None:
@@ -1032,6 +1081,7 @@ def derive(result, trial, plan, plan_path, directory):
         if graded != result.get('grade'):
             problems.append('summary grade contradicts grade.json')
         outcome = graded.get('outcome')
+        cleanup_commands(graded.get('cleanup'), directory, 'grade-cleanup', hashes, problems)
         facts['outcome'] = outcome
         window = (result.get('started_unix_ns'), result.get('finished_unix_ns'))
         facts['startup_seconds'] = startup_metrics(graded, trial['task'], trial['arm'], Path(plan['stack_binary']),
@@ -1056,6 +1106,7 @@ def derive(result, trial, plan, plan_path, directory):
             elif not (cleanup_schema(control.get('cleanup')) and clean(control.get('cleanup'))):
                 problems.append('the startup control runtime left owned processes')
             if isinstance(control, dict):
+                cleanup_commands(control.get('cleanup'), directory, 'grade-control-cleanup', hashes, problems)
                 startup_metrics(control, trial['task'], trial['arm'], Path(plan['stack_binary']), directory, hashes,
                                 'grade-control', window, problems)
         else:
