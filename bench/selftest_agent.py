@@ -16,15 +16,20 @@ Modes:
 import argparse
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
+
+import arms
 
 HERE = Path(__file__).resolve().parent
 MODES = ['reference', 'reference-commit', 'reference-leave-running', 'reference-break-health', 'broken-start', 'noop']
 BROKEN = {'ledger': ('app.py', 'raise SystemExit("broken on purpose by the self-test")\n'),
           'catalog': ('server.mjs', 'throw new Error("broken on purpose by the self-test");\n'),
           'slug': ('slug.mjs', 'throw new Error("broken on purpose by the self-test");\n')}
+
+
+def apply_reference(project, workspace):
+    return arms.overlay(HERE / 'oracles' / project, workspace)
 
 
 def main():
@@ -43,8 +48,7 @@ def main():
         name, text = BROKEN[project]
         (workspace / name).write_text(text)
     elif args.mode != 'noop':
-        for path in (HERE / 'oracles' / project).iterdir():
-            shutil.copy2(path, workspace / path.name)
+        apply_reference(project, workspace)
         if args.mode == 'reference-break-health':
             app = workspace / 'app.py'
             app.write_text(app.read_text().replace("if self.path=='/health': return self.reply({'ok':True})",

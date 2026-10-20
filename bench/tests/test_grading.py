@@ -14,6 +14,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
 import arms  # noqa: E402
 import run as bench  # noqa: E402
+import selftest_agent  # noqa: E402
 
 TASK = 'ledger-note-cache'
 PASSING = json.dumps({'ok': True, 'checks': {name: True for name in arms.TASKS[TASK]['required_checks']}, 'errors': {}})
@@ -139,6 +140,19 @@ class HiddenDataTest(unittest.TestCase):
         result = FakeRuntime(self.out).grade()
         self.assertEqual((result['outcome'], result['passed']), ('graded', True))
         self.assertEqual(set(result['hidden_files']), {'seed.py'})
+
+    def test_scripted_reference_copy_also_excludes_interpreter_caches(self):
+        oracle = self.out / 'oracles' / 'ledger'
+        (oracle / '__pycache__').mkdir(parents=True)
+        (oracle / 'app.py').write_text('reference code')
+        (oracle / '__pycache__' / 'app.pyc').write_bytes(b'cache')
+        workspace = self.out / 'workspace'
+        workspace.mkdir()
+        with mock.patch.object(selftest_agent, 'HERE', self.out):
+            copied = selftest_agent.apply_reference('ledger', workspace)
+        self.assertEqual(copied, {'app.py': arms.digest(oracle / 'app.py')})
+        self.assertFalse((workspace / '__pycache__').exists())
+        self.assertTrue((oracle / '__pycache__' / 'app.pyc').exists())
 
     def test_missing_declared_hidden_file_is_a_harness_error(self):
         root = self.hidden_root()
