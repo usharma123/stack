@@ -2,6 +2,7 @@
 
 | Command | Does |
 |---|---|
+| `stack init [--tool NAME[=VERSION]]... [--service NAME[=PRESET][@VERSION]]...` | Write a starting `stack.toml` (never replaces one) |
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve bundles and versions, write `stack.lock`, assign ports, write mise config |
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack install` | Install the locked tools and service binaries; start nothing |
@@ -21,6 +22,17 @@
 
 Every command accepts `-C <dir>` (the project directory) and `--json` (one result object on
 stdout; see [reading results](agents.md#reading-results)).
+
+## init
+
+Writes `stack.toml` in the project directory with the tools and preset services you name, and
+commented examples of a service of your own and a task. It never replaces an existing file
+(`project_exists`) and writes nothing else: run `stack compile` next. A tool without a version
+is `latest`, pinned to an exact release at the first compile.
+
+```sh
+stack init --tool python=3.13 --tool uv --service postgres@17 --service cache=redis
+```
 
 ## compile
 

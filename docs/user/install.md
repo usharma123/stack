@@ -21,7 +21,8 @@ services fails with `services_unsupported` before anything is installed.
 
 ## First run
 
-In an empty directory, create `stack.toml`:
+In an empty directory, run `stack init --tool python=3.13 --service redis@7`, or create
+`stack.toml` yourself:
 
 ```toml
 [tools]

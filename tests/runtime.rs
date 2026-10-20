@@ -132,6 +132,23 @@ esac
 }
 
 #[test]
+fn init_writes_a_project_that_compiles_and_never_replaces_one() {
+    let fixture = Fixture::new();
+    let fresh = fixture.dir.path().join("fresh");
+    fs::create_dir(&fresh).unwrap();
+    let out = fixture.command_at(&fresh, &["--json", "init", "--tool", "jq=1.7.1", "--service", "db=postgres@17"]).output().unwrap();
+    let result = json_result(&out);
+    assert!(out.status.success(), "{result}");
+    assert_eq!((result["data"]["tools"].clone(), result["data"]["services"].clone()), (json!(["jq"]), json!(["db"])), "{result}");
+    let compiled = fixture.command_at(&fresh, &["--json", "compile"]).output().unwrap();
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stdout));
+    let again = fixture.command_at(&fresh, &["--json", "init"]).output().unwrap();
+    assert_eq!(json_result(&again)["error"]["code"], "project_exists");
+    let bad = fixture.command_at(&fresh, &["--json", "init", "--service", "web=nginx"]).output().unwrap();
+    assert_eq!(json_result(&bad)["error"]["code"], "project_exists", "an existing file is checked first");
+}
+
+#[test]
 fn cli_exec_runs_in_the_selected_project_directory() {
     let fixture = Fixture::new();
     let out = fixture.ok(&["exec", "--", "pwd"]);

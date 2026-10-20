@@ -30,6 +30,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Write a starting stack.toml in the project directory (never replaces one)
+    Init {
+        /// A tool to pin, as NAME or NAME=VERSION (repeatable), e.g. --tool python=3.13
+        #[arg(long = "tool", value_name = "NAME[=VERSION]")]
+        tools: Vec<String>,
+        /// A preset service, as NAME, NAME=PRESET and either with @VERSION (repeatable), e.g. --service postgres@17
+        #[arg(long = "service", value_name = "NAME[=PRESET][@VERSION]")]
+        services: Vec<String>,
+    },
     /// Resolve bundles, write stack.lock and the generated provider config
     Compile {
         /// Re-resolve every bundle ref (tags and branches may move)
@@ -199,6 +208,12 @@ fn main() -> ExitCode {
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
+        Cmd::Init { tools, services } => stack::init::init(&root, tools, services).map(|r| {
+            emit(cli.json, &r, || {
+                println!("wrote {}", r.path.display());
+                println!("next: {}", r.next.join(", then "));
+            })
+        }),
         Cmd::Compile { update, locked, reassign_ports } => {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
             project::compile(&opts(mode, true, *reassign_ports)).map(|mut r| {
