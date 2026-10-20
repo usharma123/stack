@@ -83,7 +83,8 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Ports.** Assigned per checkout from 20000-29999 via a locked machine-wide registry; reused
   across restarts; never inside the system's ephemeral range, where an outgoing connection can
   hold a stopped service's port (a reservation made there earlier is replaced); pruned when a
-  project directory disappears; `--reassign-ports` after a foreign program takes one. Projects
+  project directory disappears (by the next compile anywhere, and by `gc` once no session of
+  it is left); `--reassign-ports` after a foreign program takes one. Projects
   may pin ports in `[override.services]`; pins are checked against other projects'
   reservations. Service defaults (5432, 6379) are never used. Before starting,
   `up` checks every assigned port: one that accepts connections without a running or starting
@@ -143,7 +144,12 @@ output (mise's answer when no release matches) is an error, not a version.
   marked for another checkout is moved, with its marker, to `<data dir>.replaced-<unix time>`
   (never deleted) and named in `warnings`; the new checkout starts empty. Unmarked data, from
   before markers or with an unreadable marker, is adopted. A running service's data is not
-  touched.
+  touched. `up` also records each data directory, with the token and the service's supervisor
+  identity, in the machine state (`data.json`). Once a checkout is deleted and no session of
+  it is left, `gc` reports that data and `gc --reclaim-data` removes it, only while its marker
+  still names that checkout, the recorded supervisor confirms the service is not running, and
+  no process carrying the token runs. Quarantined `.replaced-` data and data Stack never
+  recorded are never removed.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
   and the next is made only once the supervisor has recorded the previous service's process.
   mise holds its project lock until a request's service is ready, so a request whose service

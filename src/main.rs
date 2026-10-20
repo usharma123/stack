@@ -136,6 +136,9 @@ enum Cmd {
         /// Stop after this many passes with --watch (default: run until terminated)
         #[arg(long, value_name = "N", requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
         max_passes: Option<u64>,
+        /// Also remove the service data of deleted checkouts (otherwise only reported)
+        #[arg(long)]
+        reclaim_data: bool,
     },
     /// Publish a bundle directory to an OCI registry
     Publish {
@@ -306,8 +309,8 @@ fn main() -> ExitCode {
             })
         }),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc { watch: true, interval, max_passes } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes),
-        Cmd::Gc { .. } => session::gc_checked(&ctx.state).map(|r| {
+        Cmd::Gc { watch: true, interval, max_passes, reclaim_data } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data),
+        Cmd::Gc { reclaim_data, .. } => session::gc_checked(&ctx.state, *reclaim_data).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
@@ -355,6 +358,11 @@ fn print_gc(entries: &[session::GcEntry]) {
         if let Some(error) = &e.error {
             println!("  {error}");
         }
+        for service in &e.services {
+            if let Some(outcome) = &service.outcome {
+                println!("  {}: {outcome}", service.service);
+            }
+        }
     }
     if entries.is_empty() {
         println!("nothing to reclaim");
@@ -364,7 +372,7 @@ fn print_gc(entries: &[session::GcEntry]) {
 /// Foreground periodic collection. Each pass is reported as it completes (one JSON object per
 /// line with --json). A failing pass is reported and retried at the next interval; the exit
 /// code after --max-passes reflects the last pass.
-fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>) -> Result<ExitCode> {
+fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>, reclaim_data: bool) -> Result<ExitCode> {
     let interval = interval.map(parse_duration).transpose()?.unwrap_or(60);
     if interval == 0 {
         return Err(StackError::new("usage", "--interval must be at least 1s"));
@@ -372,7 +380,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
     let mut pass = 0u64;
     loop {
         pass += 1;
-        let result = session::gc_checked(state);
+        let result = session::gc_checked(state, reclaim_data);
         let ok = result.is_ok();
         if as_json {
             let line = match &result {

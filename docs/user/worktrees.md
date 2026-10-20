@@ -8,6 +8,9 @@ should call it from their hooks:
 
 - when a checkout appears: `stack compile --locked && stack up`
 - before it is removed: `stack down`
+- after it is removed, from anywhere: `stack gc --reclaim-data` releases its ports (plain
+  `stack gc` does that too) and removes its databases. Without the flag the data is kept and
+  reported, so a checkout removed by mistake loses nothing until you ask.
 
 Stopping first matters. Stack will not stop a deleted checkout's services by name, so a
 checkout removed while its services run leaves them running until you stop them yourself

@@ -832,7 +832,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             return Err(steps.fail("ports", port_conflict_error(conflicts), false));
         }
         steps.ok("ports", if mine.is_empty() { json!(null) } else { json!({ "stopped": mine.iter().map(Stray::json).collect::<Vec<_>>() }) });
-        match claim_data(ctx, &report, &statuses) {
+        match claim_data(ctx, &report, &statuses, provider.as_ref()) {
             Ok(moved) => warnings.extend(moved),
             Err(e) => return Err(steps.fail("data", e, false)),
         }
@@ -1002,22 +1002,24 @@ fn data_marker(dir: &Path) -> PathBuf {
 /// Data from before markers existed (or with an unreadable marker) cannot be told apart and is
 /// adopted. Running services are
 /// left alone: their data is in use.
-fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus]) -> Result<Vec<String>> {
+fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], provider: Option<&ProviderRecord>) -> Result<Vec<String>> {
     let Some(token) = crate::checkout::token(&ctx.root) else { return Ok(Vec::new()) };
     let mut moved = Vec::new();
     for daemon in statuses {
         let Some(dir) = daemon.data_dir.as_deref().map(PathBuf::from) else { continue };
         let running = matches!(daemon.status.as_str(), "running" | "starting") || daemon.pid.is_some_and(pid_alive);
-        if running || !report.stack.services.contains_key(&daemon.name) {
+        if !report.stack.services.contains_key(&daemon.name) {
             continue;
         }
         let marker = data_marker(&dir);
-        // An unreadable marker says no more than a missing one.
-        let owner = fs::read(&marker)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|v| v["checkout"].as_str().map(String::from));
-        if owner.as_deref() == Some(token.as_str()) {
+        let owner = data_owner(&dir);
+        // Where this checkout's data is, so `gc` can find it once the checkout is deleted.
+        let supervisor = provider.zip(daemon.id.as_ref()).map(|(p, id)| crate::datadirs::Supervisor { pitchfork: p.pitchfork.clone(), state_dir: p.state_dir.clone(), id: id.clone() });
+        let entry = crate::datadirs::Entry { project: ctx.root.clone(), service: daemon.name.clone(), dir: dir.clone(), checkout: token.clone(), supervisor };
+        if running || owner.as_deref() == Some(token.as_str()) {
+            if owner.as_deref() == Some(token.as_str()) {
+                crate::datadirs::record(&ctx.state, entry)?;
+            }
             continue;
         }
         if owner.is_some() && dir.exists() {
@@ -1041,8 +1043,18 @@ fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus]) -> Result<V
             ));
         }
         crate::state::write_json(&marker, &json!({ "checkout": token }))?;
+        crate::datadirs::record(&ctx.state, entry)?;
     }
     Ok(moved)
+}
+
+/// The checkout token a data directory's marker names. An unreadable marker says no more than
+/// a missing one.
+fn data_owner(dir: &Path) -> Option<String> {
+    fs::read(data_marker(dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|v| v["checkout"].as_str().map(String::from))
 }
 
 /// How often a running start is checked on.
@@ -3222,6 +3234,88 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
     Ok(out)
 }
 
+/// What a deleted checkout leaves once no session record of it is left (after `down`, or once
+/// GC confirmed its services stopped): its port reservations, released here, and its services'
+/// data, which mise keeps under its own state directory and nothing else removes. Data is
+/// reported, and removed only with `remove_data`, and only data `up` recorded for that checkout
+/// (see [`crate::datadirs`]) whose marker still names it, while no process carrying the
+/// checkout's token runs. A checkout whose session record is kept (`gc_incomplete`), and a
+/// path that holds a directory again, keep everything.
+fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
+    let recorded = |project: &Path| index_path(state, project).exists();
+    let mut found: IndexMap<PathBuf, Vec<GcService>> = IndexMap::new();
+    let mut note = |project: &Path, service: &str, outcome: String| {
+        found.entry(project.to_path_buf()).or_default().push(GcService { service: service.into(), outcome: Some(outcome), error: None, recovery: None });
+    };
+    for reservation in crate::ports::release_gone(state, recorded)? {
+        note(&reservation.project, &reservation.service, format!("port {} released", reservation.port));
+    }
+    let mut settled = Vec::new();
+    for entry in crate::datadirs::entries(state)? {
+        if entry.project.exists() || recorded(&entry.project) {
+            continue;
+        }
+        // A checkout created at the path meanwhile takes this lock for `up`; checked again under it.
+        let _guard = project_lock(state, &entry.project)?;
+        if entry.project.exists() {
+            continue;
+        }
+        let (outcome, done) = reclaim_data(&entry, remove_data);
+        if done {
+            settled.push(entry.clone());
+        }
+        note(&entry.project, &entry.service, outcome);
+    }
+    crate::datadirs::forget(state, |e| settled.contains(e))?;
+    Ok(found
+        .into_iter()
+        .map(|(project, services)| GcEntry { project, reason: "project directory deleted".into(), stopped: true, error: None, services })
+        .collect())
+}
+
+/// One deleted checkout's recorded data directory: what happened to it, and whether its record
+/// is settled (removed now, gone already, or no longer that checkout's).
+fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) {
+    let dir = &entry.dir;
+    let shown = dir.display();
+    match fs::symlink_metadata(dir) {
+        Err(_) => return (format!("data directory {shown} is already gone"), true),
+        Ok(meta) if !meta.is_dir() => return (format!("{shown} is no longer a directory; left alone"), true),
+        Ok(_) => {}
+    }
+    if !dir.is_absolute() || data_owner(dir).as_deref() != Some(entry.checkout.as_str()) {
+        return (format!("data in {shown} no longer carries this checkout's marker; left alone"), true);
+    }
+    // Whatever the supervisor says first: a process whose environment cannot be read (another
+    // user's, a macOS platform binary's) does not show up as carrying the token.
+    let Some(supervisor) = &entry.supervisor else {
+        return (format!("data kept in {shown}: no supervisor identity was recorded to confirm its service stopped"), false);
+    };
+    match mise::supervised(&supervisor.pitchfork, &supervisor.state_dir, &supervisor.id) {
+        Ok(mise::Supervised::NotFound) => {}
+        Ok(mise::Supervised::Found { status, pid, .. }) if status == "stopped" && !pid.is_some_and(pid_alive) => {}
+        Ok(mise::Supervised::Found { status, .. }) => {
+            return (format!("data kept in {shown}: the supervisor reports {} as {status:?}", supervisor.id), false);
+        }
+        Err(why) => return (format!("data kept in {shown}: cannot confirm its service stopped ({why})"), false),
+    }
+    let running: Vec<u32> = crate::procinfo::carrying(crate::checkout::TOKEN_VAR, &entry.checkout).iter().map(|p| p.pid).collect();
+    if !running.is_empty() {
+        return (format!("data kept in {shown}: process {running:?} of the deleted checkout still runs; stop it, then run `stack gc` again"), false);
+    }
+    let bytes = crate::datadirs::size(dir);
+    if !remove {
+        return (format!("data kept in {shown} ({bytes} bytes); `stack gc --reclaim-data` removes it"), false);
+    }
+    match fs::remove_dir_all(dir).and_then(|()| match fs::remove_file(data_marker(dir)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }) {
+        Ok(()) => (format!("data in {shown} removed ({bytes} bytes)"), true),
+        Err(e) => (format!("data in {shown} could not be removed: {e}"), false),
+    }
+}
+
 /// Why a session's project no longer exists: deleted, or replaced by another directory at the
 /// same path (which must never inherit the authority to stop this session's services).
 fn project_gone(session: &Session) -> Option<&'static str> {
@@ -3374,9 +3468,12 @@ fn recovery_steps(entries: &[GcEntry]) -> Vec<String> {
 }
 
 /// Like [`gc`], but fails when any session it tried to reclaim is still running or could not
-/// be confirmed stopped. Ownership records are kept for a retry.
-pub fn gc_checked(state: &Path) -> Result<Vec<GcEntry>> {
-    let entries = gc(state)?;
+/// be confirmed stopped. Ownership records are kept for a retry. Then what deleted checkouts
+/// with no session record left behind (see [`reclaim_deleted`]): their port reservations are
+/// released, and their data reported, or removed with `remove_data`.
+pub fn gc_checked(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
+    let mut entries = gc(state)?;
+    entries.extend(reclaim_deleted(state, remove_data)?);
     let failed = entries.iter().filter(|e| !e.stopped).count();
     if failed == 0 {
         return Ok(entries);

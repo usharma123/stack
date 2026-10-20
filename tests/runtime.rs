@@ -3463,6 +3463,85 @@ fn services_are_started_one_request_at_a_time() {
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_and_safe() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let app = dir.join("app");
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    let data = dir.join("mise-state/daemons/0123/data/web");
+    let daemon = |status: &str| json!([{ "id": "app-test/web", "name": "web", "status": status, "port": port, "data_dir": data }]).to_string();
+    fs::write(dir.join("daemons-started.json"), daemon("running")).unwrap();
+    fs::write(dir.join("daemons.json"), daemon("stopped")).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("rows"), "seeded").unwrap();
+    let token = stack::checkout::token(&app).unwrap();
+    fixture.ok(&["up"]);
+    fixture.ok(&["down"]);
+    // `up` recorded where the data is, whose it is and which supervisor runs the service.
+    let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
+    assert_eq!(ledger["entries"][0]["checkout"], token.as_str(), "{ledger}");
+    assert_eq!(ledger["entries"][0]["supervisor"]["id"], "app-test/web", "{ledger}");
+    // Removed after a confirmed `down`, as a worktree manager's hook does.
+    fs::remove_dir_all(&app).unwrap();
+    let gc = |args: &[&str]| -> Vec<String> {
+        let out = fixture.command_at(dir, args).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{result}");
+        result["data"].as_array().unwrap().iter().filter(|e| e["project"].as_str().is_some_and(|p| p.ends_with("/app"))).flat_map(|e| e["services"].as_array().unwrap().clone()).map(|s| s["outcome"].as_str().unwrap().to_string()).collect()
+    };
+    let ports = || fs::read_to_string(dir.join("state/ports.json")).unwrap();
+    assert!(ports().contains(app.to_str().unwrap()));
+
+    // Ports come back at once; the data is only reported.
+    let outcomes = gc(&["gc", "--json"]);
+    assert!(outcomes.contains(&format!("port {port} released")), "{outcomes:?}");
+    assert!(outcomes.iter().any(|o| o.starts_with("data kept in") && o.ends_with("`stack gc --reclaim-data` removes it")), "{outcomes:?}");
+    assert!(!ports().contains(app.to_str().unwrap()), "{}", ports());
+    assert!(data.join("rows").exists());
+
+    // A process still carrying the deleted checkout's token keeps it, even when asked.
+    // Not a macOS platform binary such as /bin/sleep, whose environment nobody may read.
+    let mut carrier = Command::new(python::python()).args(["-c", "import time; time.sleep(30)"]).env("STACK_CHECKOUT_TOKEN", &token).spawn().unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
+    let _ = carrier.kill();
+    let _ = carrier.wait();
+    assert!(outcomes.iter().any(|o| o.contains("still runs") && o.contains(&carrier.id().to_string())), "{outcomes:?}");
+    assert!(data.join("rows").exists());
+
+    // Nor while the recorded supervisor still reports the service running.
+    let mut busy = Command::new("sleep").arg("30").spawn().unwrap();
+    fs::write(dir.join("pf-status.json"), json!({ "id": "app-test/web", "status": "running", "pid": busy.id() }).to_string()).unwrap();
+    let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
+    let _ = busy.kill();
+    let _ = busy.wait();
+    fs::remove_file(dir.join("pf-status.json")).unwrap();
+    assert!(outcomes.iter().any(|o| o.contains("the supervisor reports app-test/web as \"running\"")), "{outcomes:?}");
+    assert!(data.join("rows").exists());
+
+    // Data whose marker now names another checkout is never touched, and no longer reported.
+    let marker = data.with_file_name("web.stack-checkout");
+    let mine = fs::read(&marker).unwrap();
+    fs::write(&marker, json!({ "checkout": "another-checkout" }).to_string()).unwrap();
+    let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
+    assert!(outcomes.iter().any(|o| o.contains("no longer carries this checkout's marker")), "{outcomes:?}");
+    assert!(data.join("rows").exists());
+    assert!(gc(&["gc", "--reclaim-data", "--json"]).is_empty(), "settled");
+
+    // Asked, with the marker its own and nothing running: removed with its marker, once.
+    fs::write(&marker, mine).unwrap();
+    let supervisor = json!({ "pitchfork": dir.join("bin/pitchfork"), "state_dir": dir.join("pf"), "id": "app-test/web" });
+    fs::write(dir.join("state/data.json"), json!({ "entries": [{ "project": app, "service": "web", "dir": data, "checkout": token, "supervisor": supervisor }] }).to_string()).unwrap();
+    let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
+    assert!(outcomes.iter().any(|o| o.starts_with(&format!("data in {} removed", data.display()))), "{outcomes:?}");
+    assert!(!data.exists() && !marker.exists());
+    assert!(data.parent().unwrap().exists(), "only the recorded directory is removed");
+    assert!(gc(&["gc", "--json"]).is_empty());
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");

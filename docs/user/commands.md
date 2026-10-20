@@ -13,7 +13,7 @@
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
 | `stack down` | Stop services and confirm they are gone |
 | `stack renew` | Renew this session's lease |
-| `stack gc [--watch [--interval 60s]]` | Reclaim expired sessions and those of deleted checkouts, machine-wide |
+| `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
@@ -154,9 +154,24 @@ by name.
 ## gc
 
 Stops sessions whose lease expired. For a checkout that was deleted, it drops the session
-once its services are confirmed stopped. Data directories are kept. `--watch` repeats every `--interval` until stopped (with `--json`, one object per
+once its services are confirmed stopped. `--watch` repeats every `--interval` until stopped (with `--json`, one object per
 pass). Stack installs no background service, so run `gc --watch` under systemd, launchd or
 your agent runner if you want unattended cleanup.
+
+A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
+confirmed its services stopped) gets its port reservations released at once. Its services'
+data, which mise keeps under its state directory (`$MISE_STATE_DIR/daemons/<hash>/data`, by
+default `~/.local/state/mise`), is reported with its size and kept; `--reclaim-data` removes
+it. Data is removed only when all of these hold, otherwise it is kept and the result says why:
+
+- `up` recorded that directory for that checkout, and its `.stack-checkout` marker still names
+  it (data a later checkout at the path took over, or data Stack never recorded, is never touched),
+- the supervisor recorded with it confirms the service is not running, and
+- no process carrying the checkout's token runs.
+
+A path that holds a directory again keeps everything: `up` moves the old data aside there (see
+[recreated checkouts](#up)). mise's own small state files for the project stay; `mise daemons
+prune` removes them, along with the data of any other deleted project mise knows about.
 
 When it cannot confirm that a deleted checkout's service stopped, `gc` fails with
 `gc_incomplete` and keeps the record. Each such service comes with `recovery.inspect`, a

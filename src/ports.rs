@@ -196,6 +196,26 @@ fn assign_outside(
     Ok(out)
 }
 
+/// Release the reservations of projects whose directory is gone, except those `keep` holds
+/// on to (a project whose session record is still kept: its services may still listen there).
+/// Returns what was released. `assign` prunes gone projects too, but only when some project
+/// compiles; GC calls this so a removed checkout's ports come back without that.
+pub fn release_gone(state: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<Reservation>> {
+    let (file, lock) = paths(state);
+    if !file.exists() {
+        return Ok(Vec::new());
+    }
+    let _guard = FileLock::acquire(&lock)?;
+    let mut reg: Registry = read_json(&file)?;
+    let (gone, kept): (Vec<Reservation>, Vec<Reservation>) =
+        reg.reservations.into_iter().partition(|r| !r.project.exists() && !keep(&r.project));
+    reg.reservations = kept;
+    if !gone.is_empty() {
+        write_json(&file, &reg)?;
+    }
+    Ok(gone)
+}
+
 /// Current reservations for a project, without assigning anything.
 pub fn lookup(state: &Path, project: &Path) -> Result<IndexMap<String, u16>> {
     let reg: Registry = read_json(&paths(state).0)?;
