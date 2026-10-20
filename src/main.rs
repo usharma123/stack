@@ -634,15 +634,35 @@ fn usage_error(e: clap::Error) -> ExitCode {
     if !as_json {
         e.exit();
     }
-    let rendered = e.render().to_string();
-    let message = rendered
-        .lines()
+    let (message, hint) = usage_text(&e.render().to_string());
+    fail(true, StackError::new("usage", message).hint(hint));
+    ExitCode::from(2)
+}
+
+/// clap's rendered error as one message and a hint: the error with the lines that continue it
+/// (the missing arguments, each on its own line), and the usage line and any tip clap printed.
+fn usage_text(rendered: &str) -> (String, String) {
+    let mut blocks = rendered.split("\n\n");
+    let message = blocks
         .next()
         .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
         .trim_start_matches("error: ")
         .to_string();
-    fail(true, StackError::new("usage", message).hint("run `stack --help` for usage"));
-    ExitCode::from(2)
+    let mut hint: Vec<String> = Vec::new();
+    for line in blocks.flat_map(str::lines).map(str::trim) {
+        if let Some(usage) = line.strip_prefix("Usage: ") {
+            hint.push(format!("usage: {usage}"));
+        } else if let Some(tip) = line.strip_prefix("tip: ") {
+            hint.push(tip.to_string());
+        }
+    }
+    hint.push("run `stack --help` for usage".into());
+    (message, hint.join("; "))
 }
 
 fn fail(as_json: bool, e: StackError) -> ExitCode {

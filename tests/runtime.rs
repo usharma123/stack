@@ -2185,6 +2185,11 @@ fn argument_errors_honour_json() {
         assert_eq!(result["error"]["code"], "usage", "{args:?}");
         assert!(result["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()), "{args:?}: {result}");
     }
+    // The missing argument is named, not cut off after "were not provided:".
+    let out = fixture.command(&["--json", "logs"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["message"], "the following required arguments were not provided: <SERVICE>", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("usage: stack logs <SERVICE>"), "{error}");
     let mcp = fixture.mcp(&[("stack_up", json!({ "ttl": "banana" })), ("stack_exec", json!({ "command": ["true"], "timeout_secs": 0, "require": ["nope"], "require_all": true }))], &[]);
     for result in &mcp {
         let error = &result["structuredContent"]["error"];
