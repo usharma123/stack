@@ -49,10 +49,13 @@ throwaway check), point every store at one disposable directory.
 [`examples/isolated-stack.sh`](../../examples/isolated-stack.sh) does this:
 
 ```sh
-bash examples/isolated-stack.sh 0.1.21 ~/src/app stack exec -- pytest
+bash examples/isolated-stack.sh <version> ~/src/app stack exec -- pytest   # e.g. latest
 ```
 
-It installs the given Stack version from npm into a fresh `/tmp/stack-iso.*` root, moves the
+Pick the release to evaluate; npm's `latest` is the newest published one. Release 0.1.21 gives
+`exec` and `stack run` tasks a custom service's proxy URL instead of its loopback URL, and
+0.1.22 fixed `exec` only, so evaluate the task loop with a newer release. It installs the given Stack
+version from npm into a fresh `/tmp/stack-iso.*` root, moves the
 Stack, mise, Pitchfork, XDG, uv and npm stores there, runs `stack up` and your command, then
 stops everything. It keeps `HOME`, so your Git and SSH configuration still work. It needs
 `node`, `npm` and `python3`.
