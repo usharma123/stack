@@ -123,13 +123,51 @@ Design, in [bench/AGENTDX-PROTOCOL.md](../../bench/AGENTDX-PROTOCOL.md):
 - **What the old benchmark lacked.** The retired 26-tool benchmark had no agent at all; this
   one measures agent task completion.
 
+### Corrections after independent review round 1
+
+An independent review of `6175a0b` returned eleven findings, each with a reproducing
+counterexample. All eleven are fixed, and each counterexample is now a unit test run against the
+corrected code (78 offline tests in `bench/tests/`). The tests were not run against the old
+code; the review's own probes showed the old behaviour.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | A submitted `slug()` could print a forged all-true result from an exit handler | The grader decides every check from the values `slug()` returned; nonce-framed single result line; forgery, `process.exit` and prototype tampering tested |
+| 2 | Cleanup re-checked a PID only before SIGTERM, not before SIGKILL | Identity and root ownership rechecked before every signal; pidfd on Linux |
+| 3 | The report trusted the summary's cleanup and global-state fields | Each observation is its own hashed record; the report re-derives everything and rejects contradicting summaries |
+| 4 | An app that failed to start made the trial invalid | `startup_failed` is a scored failure when a fresh reference control passes; otherwise `infrastructure_failed` |
+| 5 | Model options were metadata only | Options must enter argv through `{option:NAME}`; contradicting literals refuse the plan; the review records observed options |
+| 6 | Timeout cleanup waited for the leader only | The whole tree is stopped, including children that ignore SIGTERM, outlive the leader or leave its group |
+| 7 | The existing smoke test did not gate grading | A pass needs the smoke test through `exec` and the hidden checks; the documented loop is observed only (R1) |
+| 8 | A committed solution produced an empty submission patch | Diffed against a kept copy of the starting commit, including commits, deletions and ignored files |
+| 9 | Negative, infinite or unsourced metrics were accepted | Agent timing from its receipt and window; usage finite, typed and bound to a file by sha256 |
+| 10 | `regressions.py` exited 0 despite failed controls, cleanup or globals | Verdicts `fixed`/`reproduced`/`invalid` and exit 0/1/2; real `down-before-up` control |
+| 11 | The docs claimed real trials lacked authorization | Corrected: real testing is authorized; the first run's configuration is what remains open |
+
 ### Benchmark validation
 
 `run.py validate` runs the starting code and the reference solution through the same grading
-path agent work uses. Each run is cold, with a fresh root, under the locale shown. Raw
-evidence is in `eval/results/agentdx-opus-impl-20261020/`.
+path agent work uses. Each run is cold, with a fresh root, under the locale shown.
 
-Final run at `17d8f2f` (`eval/results/agentdx-opus-impl-20261020/final3/`). Unit tests,
+Round-2 run at `59744d0`
+(`eval/results/agentdx-opus-round2-20261020/`, script `round2.sh`). Unit tests, validation,
+regression checks and the self-tests all ran against this one committed head, after the host
+had rebooted. The pass now also needs the smoke test through `exec`.
+
+| Cell | Locale | Valid | No-op fails its check (failed checks) | Reference passes both gates | Documented test loop before/after | Cleanup, globals | Reference setup + up (s) |
+|---|---|---|---|---|---|---|---|
+| slug / stack | UTF-8 | yes | yes (5 of 9) | yes | pass/pass | clean, unchanged | 6.0 |
+| slug / existing | UTF-8 | yes | yes (5 of 9) | yes | pass/pass | clean, unchanged | 3.5 |
+| catalog / stack | UTF-8 | yes | yes (4 of 5) | yes | **fail/fail (R1)** | clean, unchanged | 3.9 + 3.1 |
+| catalog / existing | UTF-8 | yes | yes (4 of 5) | yes | pass/pass | clean, unchanged | 4.2 + 0.3 |
+| ledger / stack | UTF-8 | yes | yes (6 of 8) | yes | **fail/fail (R1)** | clean, unchanged | 4.3 + 12.6 |
+| ledger / existing | UTF-8 | yes | yes (6 of 8) | yes | pass/pass | clean, unchanged | 9.2 + 7.6 |
+| ledger / stack | `LC_ALL=C` | **no** | — (`up` fails: `startup_failed` for both) | — | — | clean, unchanged | R3, as before |
+| ledger / existing | `LC_ALL=C` | yes | yes (6 of 8) | yes | pass/pass | clean, unchanged | 6.5 + 8.2 |
+
+The round-1 run below is kept unchanged. The two runs agree cell for cell.
+
+Round-1 run at `17d8f2f` (`eval/results/agentdx-opus-impl-20261020/final3/`). Unit tests,
 validation, regression checks and the self-test all ran against this one committed head.
 The earlier final runs (`final/` at `b462162`, `final2/` at `b8296cd`) are kept. They differ
 only in the regression-check fixes described below.
@@ -169,7 +207,25 @@ Earlier attempts are kept, not replaced:
 
 ### Harness self-test
 
-Three `harness_selftest` plans ran through `plan`, `trial`, `review-template` and `report`
+**Round 2** (`agentdx-opus-round2-20261020/selftest/`, warm cache). Seven `harness_selftest`
+plans ran 18 trials. The reviews take the observed model and options from the scripted
+agent's transcript, not from the plan. Every trial's own derivation and every report found
+no problems, and no global receipt changed:
+
+| Plan | Scripted agent | Result in both arms |
+|---|---|---|
+| `reference` (3 tasks) | Reference, then `down` | passed, autonomous; the Stack ledger and catalog trials flagged `supervisor_left` (L6) |
+| `leave-running` (catalog) | Reference, services left up | passed, not autonomous (left running) |
+| `noop` (slug) | Nothing | failed |
+| `commit` (slug) | Reference committed in the agent's checkout | passed; `changed: M slug.mjs`, one agent commit (finding 8 end to end) |
+| `broken-start` (catalog) | App exits at startup | failed as `startup_failed`, reference control passed; scored, in the pair (finding 4) |
+| `break-health` (ledger) | Reference with `/health` broken | hidden checks all pass, smoke test fails, so the task fails (finding 7) |
+| `options` (slug, `effort=high`) | Reference; records the options it received | passed; agent argv carries `effort=high`; report shows controlled options (finding 5) |
+
+Every report is `publishable: false` because the plans are self-tests. The failed start took
+60.1 s in the native arm, where `dev.py up` waits 60 s for readiness, and 1.2 s in the Stack arm.
+
+**Round 1.** Three `harness_selftest` plans ran through `plan`, `trial`, `review-template` and `report`
 with `bench/selftest_agent.py` as the agent, on a warm cache
 (`agentdx-opus-impl-20261020/selftest-final3-selftest/`). The reviews say they are a harness self-check, not a
 human transcript review. The self-test validates the plumbing, not agents:
@@ -190,7 +246,17 @@ human transcript review. The self-test validates the plumbing, not agents:
 
 ### Regression checks on 0.1.22
 
-`bench/regressions.py` at `17d8f2f` (`final3/regressions/`). Every check failed on 0.1.22,
+**Round 2** at `59744d0` (`agentdx-opus-round2-20261020/regressions/`): every check
+`reproduced`, with its control passed and its cleanup clean. No global receipt changed, and
+the run exited 1 (valid, defects present). `down-before-up` now has a real control: a sibling
+checkout ran `compile`, `up` and a confirmed `down`, all exit 0. Its new observation
+localizes L5. In a checkout that still has its generated `.config`, `down` before any `up`
+succeeds (`confirmed: true`). So the failure comes from a fresh clone missing the generated
+provider config, where mise reports `mise daemons is experimental`. Other observations match
+round 1 (exec `http://127.0.0.1:27988` vs run `https://web.urlparity.localhost`; `SQL_ASCII`
+under `LC_ALL=C`; one reservation and 28 KB kept after removal).
+
+**Round 1** at `17d8f2f` (`final3/regressions/`). Every check failed on 0.1.22,
 reproducing its finding, while its control passed. Cleanup was confirmed for all of them, and
 no global receipt changed.
 
@@ -200,7 +266,7 @@ no global receipt changed.
 | `postgres-locale-independent` | R3 | `LC_ALL=C` → `SQL_ASCII`; `LANG=en_US.UTF-8` → `UTF8` | UTF-8 locale gives `UTF8` |
 | `external-sigterm-exec` | R2 | Stack exits -15; the command and its grandchild are still alive | Unrelated sentinel survives |
 | `removed-checkout-reclaim` | L1 | After a confirmed `down`, deleting the checkout and `gc`: 1 port reservation kept, 28 KB of service data kept, `gc` reclaimed nothing | `down` confirmed, `gc` exit 0 |
-| `down-before-up` | L5 | `down` exit 1 `provider_failed` ("mise daemons is experimental") | — |
+| `down-before-up` | L5 | `down` exit 1 `provider_failed` ("mise daemons is experimental") | None in round 1 (hard-coded); round 2 adds a sibling checkout that runs `up` and then a confirmed `down` |
 | `secrets-before-install` | R4 | `secret_unavailable`: "fnox is not on the stack's PATH" | Passes after `stack install` |
 
 Two harness mistakes in these checks were found and fixed before the final run. Their runs
@@ -221,7 +287,7 @@ are kept:
 | Tools-only change | Both | `slug-unicode` | Validation | Rust, Go |
 | Documented task loop (`stack run`) | Both (R1) | Implicit in both service tasks | `run-exec-url-parity` | |
 | Locale / encoding | Both (R3) | Plan `locale` variable | `postgres-locale-independent`, ledger under `LC_ALL=C` | Locale-normalized hosted images |
-| External cancellation | Astra (R2) | Harness kills an agent's group on budget expiry | `external-sigterm-exec` | MCP server cancellation; other signals |
+| External cancellation | Astra (R2) | Harness stops an agent's whole process tree on budget expiry or cancellation | `external-sigterm-exec` | MCP server cancellation; other signals |
 | Secrets | Both (fake keys) | | `secrets-before-install` | Real providers; secrets as an agent task |
 | Removal / reclaim | Opus (L1), Astra (recreate) | Disk and port receipts per run | `removed-checkout-reclaim`, `down-before-up` | Disposal agent task family |
 | Concurrent worktrees | Both | | | Two concurrent agents |
@@ -236,12 +302,27 @@ are kept:
 
 ## Limitations
 
-- **No agent results.** The pilot needs your authorization for a real agent CLI, its
-  credentials, and model spend.
+- **No agent results.** No controlled agent trial has been run, so there are no completion,
+  time or cost numbers and no statistical claims. Real testing is authorized. What is unresolved
+  is the configuration of a first bounded pilot: the agent CLI and its version, the model IDs and
+  options, how its credentials reach a trial, and the spend limit. This checkout has not
+  verified any of those.
+- **No hosted Linux run of the benchmark.** Hosted evidence is limited to Astra's LinuxKit
+  container and Opus's `env -i` shell from the hands-on sessions.
 - Three small synthetic tasks on one Mac. The existing arm is glue written for the benchmark,
   not a real team's setup, and Compose/devcontainer control arms are not implemented.
 - The benchmark computes no confidence intervals. Five pairs per cell is diagnostic only.
-- Graders sit in this repository. Agents are kept out by convention, not by a sandbox.
+- Graders sit in this repository. Agents are kept out by convention, not by a sandbox. Within
+  that convention, graders decide every check from what they observe, so submitted code cannot
+  print its own pass. Editing the benchmark files is detected by re-hashing them after grading;
+  reading the grader's memory is not defended against.
+- On macOS, cleanup identifies a process by its `lstart` (one-second resolution) and command
+  line, and a few microseconds separate the last check from the signal. Linux uses a pidfd and
+  the kernel start tick.
+- Runtime roots live under `/tmp`, which macOS clears on reboot. The 143 roots from the first
+  implementation runs, listed in `agentdx-opus-impl-20261020/runtime-roots.json`, were gone after
+  the host rebooted at 11:22 on 2026-10-20, before round 2 began. Their receipts and summaries
+  in `eval/results/` are intact.
 - Cleanup can only report "none observed". A process that detached without its command line,
   working directory or an open file under the trial root would be missed.
 - Global receipts cover the user's mise, Pitchfork and Stack files and the mise install
@@ -249,9 +330,11 @@ are kept:
 
 ## Decisions pending for you
 
-1. **Run the real pilot?** Which agent CLI(s) and models, the budget, and whether the agent
-   may use its normal config and credentials. The harness keeps `HOME` and isolates
-   `XDG_CONFIG_HOME`.
+1. **Configure the first real pilot.** Real testing is authorized; choose the agent CLI(s)
+   and version, model IDs and options, and the spend limit, and decide how the CLI's
+   credentials reach a trial. The harness keeps `HOME` and isolates `XDG_CONFIG_HOME`, so a
+   CLI that keeps credentials there needs a wrapper. A bounded first run is one model on the
+   three tasks with two repetitions (12 trials).
 2. **Add a Compose or devcontainer control arm** alongside the native-script one?
 3. **A hosted Linux runner** for the same plan, instead of extrapolating from this Mac.
 
