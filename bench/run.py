@@ -243,11 +243,26 @@ def new_runtime(prefix, task_id, arm, binary, cache, locale):
     return root, env
 
 
-def grade(task_id, arm, binary, out, label, submission, cache, locale):
-    """Fresh runtime, grader-only data, submitted files overlaid, then hidden checks."""
+def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_control=False):
+    """Fresh runtime, grader-only data, submitted files overlaid, then the smoke test and hidden checks.
+
+    `passed` needs both gates. The project's existing smoke test, run through the arm's
+    `exec`, shows existing behaviour still works; the hidden acceptance checks show the change
+    was made. The documented task loop (`stack run test`, `dev.py test`) is recorded as a
+    product observation only, because Stack 0.1.22's `run` breaks it in service apps (R1).
+
+    `outcome` says how grading ended:
+      graded                 every step ran, and `passed` is the verdict
+      startup_failed         the submitted app did not start, and the reference solution did
+                             start and pass in a fresh control runtime: a task failure
+      infrastructure_failed  the submitted app did not start, and neither did the reference
+      setup_failed           installing the locked tools failed after retries: infrastructure
+      harness_error          anything else
+    `startup_control` runs that control; validation grades the reference itself and needs none.
+    """
     project = TASKS[task_id]['project']
     root, env = new_runtime('ag.', task_id, arm, binary, cache, locale)
-    result = {'runtime': str(root), 'passed': False}
+    result = {'runtime': str(root), 'passed': False, 'outcome': 'harness_error'}
     workspace = None
     try:
         workspace = arms.prepare(task_id, arm, root, binary, env)
@@ -264,26 +279,36 @@ def grade(task_id, arm, binary, out, label, submission, cache, locale):
             for index, argv in enumerate(steps[name]):
                 # Setup only installs locked artifacts, so the harness retries it twice; `up`
                 # runs the submitted code and gets one attempt.
-                for attempt in range(3 if name == 'setup' else 1):
+                attempts = 3 if name == 'setup' else 1
+                for attempt in range(attempts):
                     record = invoke(argv, workspace, env, 900, out / f'{label}-{name}{index or ""}')
                     result['setup_attempts'] += name == 'setup'
-                    if record['exit_code'] == 0:
+                    if record['exit_code'] == 0 or attempt == attempts - 1:
                         break
                     time.sleep(5 * (attempt + 1))
                 timings[name] = timings.get(name, 0) + record['elapsed_ns'] / 1e9
                 if record['exit_code'] != 0:
-                    result['failed_step'] = name
+                    result.update(failed_step=name, failed_receipt=record['receipt'],
+                                  outcome='setup_failed' if name == 'setup' else 'startup_failed')
                     raise RuntimeError(f'{name} failed; see {record["receipt"]}')
         result['seconds'] = timings
         for name in ['smoke_exec', 'smoke_task_loop']:
             result[name] = invoke(steps[name], workspace, env, 120, out / f'{label}-{name}')['exit_code'] == 0
         verify = invoke(steps['verify'], workspace, env, 180, out / f'{label}-verify')
-        result['passed'], result['acceptance'] = acceptance(task_id, verify, out)
+        result['acceptance_passed'], result['acceptance'] = acceptance(task_id, verify, out)
+        result['passed'] = result['acceptance_passed'] and result['smoke_exec']
+        result['outcome'] = 'graded'
     except Exception as error:
         result['error'] = f'{type(error).__name__}: {error}'
     finally:
         if workspace is not None:
             result['cleanup'] = teardown(arm, workspace, root, env, binary, out, f'{label}-cleanup')
+    if result['outcome'] == 'startup_failed' and startup_control:
+        # After the failed runtime is cleaned up, so the control cannot collide with it.
+        control = grade(task_id, arm, binary, out, f'{label}-control', HERE / 'oracles' / project, cache, locale)
+        result['startup_control'] = control
+        if not (control['outcome'] == 'graded' and control['passed'] is True):
+            result['outcome'] = 'infrastructure_failed'
     return result
 
 
@@ -308,7 +333,10 @@ def validate(args):
         summary['globals_changed'] = arms.globals_diff(before, arms.globals_snapshot())
         no_op, ref = summary.get('no_op', {}), summary.get('reference', {})
         no_op_checks = ((no_op.get('acceptance') or {}).get('checks') or {})
-        summary['no_op_rejected'] = no_op.get('passed') is False and no_op_checks.get(task['no_op_failing_check']) is False
+        # The starting code must keep the existing smoke test green and fail the designated
+        # hidden check; the reference must pass both gates.
+        summary['no_op_rejected'] = (no_op.get('outcome') == 'graded' and no_op.get('passed') is False
+                                     and no_op_checks.get(task['no_op_failing_check']) is False)
         summary['reference_passed'] = ref.get('passed') is True
         summary['smoke_exec_before_and_after'] = no_op.get('smoke_exec') is True and ref.get('smoke_exec') is True
         summary['documented_task_loop'] = {'before': no_op.get('smoke_task_loop'), 'after': ref.get('smoke_task_loop')}
@@ -419,13 +447,13 @@ def experiment_trial(args):
             summary['changed_files'] = changed
             shutil.copytree(transcript, out / 'transcript')
             summary['agent_cleanup'] = teardown(trial['arm'], workspace, root, env, binary, out, 'agent-cleanup')
-            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', workspace, cache, plan['locale'])
+            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', workspace, cache, plan['locale'], startup_control=True)
             summary['grade'] = graded
             summary['task_passed'] = graded['passed'] is True
-            # A submission whose app cannot start fails the task; the reference passed the same
-            # step during validation. A setup failure that survives retries is treated as an
-            # infrastructure block, and any other grading error leaves the trial invalid too.
-            summary['valid'] = ('error' not in graded or graded.get('failed_step') == 'up') and (graded.get('cleanup') or {}).get('ok') is True
+            # A submitted app that cannot start, while the reference can, fails the task. Setup,
+            # infrastructure and harness failures leave the trial invalid.
+            cleanups = [graded.get('cleanup'), (graded.get('startup_control') or {}).get('cleanup', {'ok': True})]
+            summary['valid'] = graded['outcome'] in ('graded', 'startup_failed') and all((c or {}).get('ok') is True for c in cleanups)
     except Cancelled as error:
         summary['cancelled'] = str(error)
         raise
