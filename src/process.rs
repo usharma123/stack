@@ -858,6 +858,32 @@ static SETTLED: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::
 #[cfg(all(unix, test))]
 static READER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Where a command's admission is (see [`spawn_named`]), for a test that delivers a signal
+/// there: `Deciding` before it takes the registry's lock, `Admitted` holding it, its boundary
+/// checked, before the spawn.
+#[cfg(all(unix, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Deciding,
+    Admitted,
+}
+
+/// Run by a test at each [`Admission`] point, in the thread admitting the command.
+#[cfg(all(unix, test))]
+#[allow(clippy::type_complexity)]
+static ADMISSION_HOOK: std::sync::Mutex<Option<Box<dyn FnMut(Admission) + Send>>> = std::sync::Mutex::new(None);
+
+#[cfg(all(unix, test))]
+fn admission(stage: Admission) {
+    if let Some(hook) = ADMISSION_HOOK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        hook(stage);
+    }
+}
+
+/// Times [`settle`] had to wait, for a test that holds the reader back.
+#[cfg(all(unix, test))]
+static SETTLE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Wait until every report numbered up to `arrival` was handled: passed on, with what stack
 /// owes it recorded (see [`passed_on`]), or ending stack. Reports are handled in
 /// [`forwarder`]'s thread, which may run only after the command a signal was for is done, or
@@ -868,6 +894,10 @@ static READER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn settle(arrival: u64) {
     let (lock, moved) = &SETTLED;
     let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(test)]
+    if HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrival {
+        SETTLE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrival {
         guard = moved.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
@@ -1040,12 +1070,32 @@ fn decide(commands: &mut [Named], arrival: u64, signal: libc::c_int) -> (Vec<(i3
 /// already arrived is still to be handled (see [`settle`]): one that ends stack does so first.
 #[cfg(unix)]
 fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<Child> {
-    settle(ARRIVALS.load(std::sync::atomic::Ordering::SeqCst));
-    let mut registry = registry();
-    let since = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+    let (mut registry, since) = admitted();
+    #[cfg(test)]
+    admission(Admission::Admitted);
     let child = spawn(command)?;
     registry.commands.push(Named { group: child.id() as i32, passing, since, until: None, leader, forwarded: 0 });
     Ok(child)
+}
+
+/// The registry's lock, with every signal that arrived so far handled, and that arrival
+/// number: one decision, so a signal is either already handled (and one that ends stack did
+/// so) or arrives after it, for the command spawned under this lock. Handling takes the lock,
+/// and [`HANDLED`] moves only under it, so until it is released no report handled meanwhile
+/// can change the decision. Settling waits without the lock, then decides again.
+#[cfg(unix)]
+fn admitted() -> (std::sync::MutexGuard<'static, Registry>, u64) {
+    loop {
+        #[cfg(test)]
+        admission(Admission::Deciding);
+        let registry = registry();
+        let arrival = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
+        if HANDLED.load(std::sync::atomic::Ordering::SeqCst) >= arrival {
+            return (registry, arrival);
+        }
+        drop(registry);
+        settle(arrival);
+    }
 }
 
 /// Unname `child`'s group and end it (`kill`: with its group, else only reap it), under the
@@ -1573,7 +1623,8 @@ mod tests {
         // A user's command unnamed as it exited, after the signal arrived for it: nothing is
         // signalled, but the signal was its, so stack goes on and owes the signal its end.
         assert_eq!(decide(&mut [named(50, true, 0, Some(3))], 3, term), (vec![], true));
-        // A command named after a signal arrived is not its; with no command it ends stack.
+        // A command named after a signal arrived is not its; with no command it ends stack. Such
+        // a signal is handled before that command is spawned (see `admitted`).
         assert_eq!(decide(&mut [named(30, true, 5, None)], 5, term), (vec![], false));
         assert_eq!(decide(&mut [], 1, term), (vec![], false));
         // A terminal's foreground command is passed SIGTERM alone, as its own PID; the
@@ -1670,6 +1721,155 @@ mod tests {
         drop(gate);
         std::thread::sleep(Duration::from_secs(20));
         panic!("still running after the signal was handled");
+    }
+
+    /// Run `hook` in the thread admitting a command, the first time one reaches `stage`.
+    fn at_admission(stage: Admission, hook: impl FnOnce() + Send + 'static) {
+        let mut hook = Some(hook);
+        *ADMISSION_HOOK.lock().unwrap() = Some(Box::new(move |reached| {
+            if reached == stage {
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+            }
+        }));
+    }
+
+    /// Send this process SIGTERM, and wait until stack's handler counted it as arrival `n`.
+    fn terminate_self(n: u64) {
+        // SAFETY: signals this process alone, which runs no other test.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        arrived(n);
+    }
+
+    /// Wait until `done`, bounded so a schedule that never gets there fails.
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < until, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Writes its PID to `$1` whole, then runs on: a command that would outlive stack.
+    const STARTS: &str = r#"echo $$ > "$1.tmp" && mv "$1.tmp" "$1" && exec sleep 30"#;
+
+    /// The PID a command running [`STARTS`] wrote to `file`.
+    fn pid_in(file: &std::path::Path) -> Option<i32> {
+        std::fs::read_to_string(file).ok()?.trim().parse().ok()
+    }
+
+    /// End a test's own command left running, so a failing schedule leaves nothing behind.
+    fn reap_left(file: &std::path::Path) -> Option<i32> {
+        let pid = pid_in(file).filter(|pid| alive(*pid))?;
+        // SAFETY: the PID of the test's own `sleep`, just checked to be running.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        Some(pid)
+    }
+
+    #[test]
+    fn a_signal_that_arrives_as_a_command_is_admitted_is_handled_before_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_alone("signal_during_admission", dir.path());
+        let left = reap_left(&dir.path().join("started"));
+        let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert_eq!(left, None, "a command admitted after the signal arrived, but before it was handled, outlived stack\n{shown}");
+        // With no command to pass it on to, the signal ended stack (this child) as it asked.
+        assert_eq!((run.exit_code, run.signal), (None, Some(libc::SIGTERM)), "{shown}");
+        assert!(!dir.path().join("started").exists(), "a command started after the signal that ended stack\n{shown}");
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_that_arrives_as_a_command_is_admitted_is_handled_before_it_starts"]
+    fn signal_during_admission() {
+        let Some(dir) = std::env::var_os(ALONE).map(std::path::PathBuf::from) else { return };
+        forwarder().unwrap();
+        // The signal is read but not handled until this is dropped, as a busy machine may delay it.
+        let gate = READER_GATE.lock().unwrap();
+        // It arrives after any settling an earlier admission did, before this one's decision.
+        at_admission(Admission::Deciding, || terminate_self(1));
+        let waits = SETTLE_WAITS.load(std::sync::atomic::Ordering::SeqCst);
+        let started = dir.join("started");
+        let file = started.clone();
+        std::thread::spawn(move || capture_redacted(Command::new("sh").args(["-c", STARTS, "sh"]).arg(file), Duration::from_secs(30), 1024, None));
+        // The admission waits for the signal to be handled, or (wrongly) the command starts.
+        wait_for("the admission to wait or its command to start", || started.exists() || SETTLE_WAITS.load(std::sync::atomic::Ordering::SeqCst) > waits);
+        drop(gate);
+        std::thread::sleep(Duration::from_secs(20));
+        panic!("still running after the signal was handled");
+    }
+
+    #[test]
+    fn a_signal_after_a_commands_admission_boundary_reaches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_alone("signal_after_admission", dir.path());
+        let started = dir.path().join("started");
+        let pid = pid_in(&started);
+        let ended = pid.is_some_and(|pid| ends_soon(pid as u32));
+        let left = reap_left(&started);
+        let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert!(pid.is_some() && ended && left.is_none(), "the admitted command {pid:?} was not passed the signal\n{shown}");
+        // A provider command's signal is passed on, then ends stack.
+        assert_eq!((run.exit_code, run.signal), (None, Some(libc::SIGTERM)), "{shown}");
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_after_a_commands_admission_boundary_reaches_it"]
+    fn signal_after_admission() {
+        let Some(dir) = std::env::var_os(ALONE).map(std::path::PathBuf::from) else { return };
+        forwarder().unwrap();
+        let gate = READER_GATE.lock().unwrap();
+        // Holding the registry's lock, the boundary checked: the signal is the command's.
+        at_admission(Admission::Admitted, || terminate_self(1));
+        let started = dir.join("started");
+        let file = started.clone();
+        std::thread::spawn(move || capture(Command::new("sh").args(["-c", STARTS, "sh"]).arg(file), Duration::from_secs(30), 1024));
+        wait_for("the command to start", || started.exists());
+        drop(gate);
+        std::thread::sleep(Duration::from_secs(20));
+        panic!("still running after the signal was handled");
+    }
+
+    #[test]
+    fn a_signal_for_a_running_command_is_handled_before_another_is_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_alone("signal_between_overlapping_admissions", dir.path());
+        let left = reap_left(&dir.path().join("first"));
+        let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert_eq!(left, None, "the running command outlived stack\n{shown}");
+        assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "{shown}");
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_for_a_running_command_is_handled_before_another_is_admitted"]
+    fn signal_between_overlapping_admissions() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(dir) = std::env::var_os(ALONE).map(std::path::PathBuf::from) else { return };
+        let (first, second) = (dir.join("first"), dir.join("second"));
+        // A user's command running throughout: the signal is its, so stack goes on.
+        let file = first.clone();
+        let running = std::thread::spawn(move || capture_redacted(Command::new("sh").args(["-c", STARTS, "sh"]).arg(file), Duration::from_secs(30), 1024, None).unwrap());
+        wait_for("the first command to start", || first.exists());
+        let gate = READER_GATE.lock().unwrap();
+        at_admission(Admission::Deciding, || terminate_self(1));
+        let waits = SETTLE_WAITS.load(SeqCst);
+        let file = second.clone();
+        let admitted = std::thread::spawn(move || capture_redacted(Command::new("sh").args(["-c", r#"echo $$ > "$1""#, "sh"]).arg(file), Duration::from_secs(30), 1024, None).unwrap());
+        wait_for("the admission to wait or its command to start", || second.exists() || SETTLE_WAITS.load(SeqCst) > waits);
+        assert!(!second.exists(), "the second command started before the signal that arrived first was handled");
+        assert_eq!((HANDLED.load(SeqCst), passed_on()), (0, None));
+        // What the admission saw once it went ahead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        at_admission(Admission::Admitted, move || tx.send((HANDLED.load(SeqCst), passed_on())).unwrap());
+        drop(gate);
+        let running = running.join().unwrap();
+        let admitted = admitted.join().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok((1, Some(libc::SIGTERM))), "admitted before the signal was handled");
+        assert_eq!(running.signal, Some(libc::SIGTERM), "the running command was passed the signal");
+        assert_eq!((admitted.exit_code, admitted.signal), (Some(0), None), "the command admitted after it was not");
+        assert_eq!(passed_on(), Some(libc::SIGTERM));
+        // Both retired once done, and forgotten: every signal they received was handled.
+        assert!(registry().commands.is_empty());
     }
 
     #[test]
