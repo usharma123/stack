@@ -13,6 +13,8 @@ supervise() {
     echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
   fi
 }
+# The owner mark of every request that may start the supervisor (see `OWNER_VAR`).
+case "$1 $2" in 'daemons start'|'daemons stop'|'x --') echo "$1 $2 ${STACK_SUPERVISOR_OWNER-unset}" >>"$REVIEW_FIXTURE/owner-marks.log" ;; esac
 case "$1 $2" in
   'latest '*)
     # Where resolution ran and the only configuration it could see.

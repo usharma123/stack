@@ -17,7 +17,7 @@ use crate::provider::scratch;
 pub use crate::provider::task_config::TaskConfig;
 use crate::secrets::{self, Grant};
 use crate::source::Mode;
-use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json};
+use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json, SharedLock};
 use crate::timing::Timings;
 use crate::tool::ToolSpec;
 use indexmap::IndexMap;
@@ -1340,13 +1340,16 @@ fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Opt
         .iter()
         .map(|n| report.stack.services.get(n).is_some_and(|e| matches!(e.value.preset.as_deref(), None | Some("postgres" | "redis")) || e.value.ready_cmd.is_some()))
         .collect();
+    // The launch record names the supervisor before anything starts.
+    let _using = using_supervisor(&ctx.state, load(ctx).ok().flatten().and_then(|s| s.provider).as_ref())?;
+    let owner = supervisor_owner(&ctx.state, true).ok();
     let starter = {
         let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
         let (checkable, completed) = (checkable.clone(), completed.clone());
         std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             let _cancel = crate::process::cancel_scope(cancel.clone());
-            let _ = done.send(request_starts(&root, &names, &checkable, &cancel, &completed));
+            let _ = done.send(request_starts(&root, &names, &checkable, &cancel, &completed, owner.as_deref()));
         })
     };
     let end = |outcome: Result<()>| {
@@ -1415,7 +1418,10 @@ fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Opt
 /// Stop `names` through the supervisor and wait until the processes `session` recorded for them
 /// are gone and their ports closed (`stop_unconfirmed` otherwise).
 fn stop_and_wait(ctx: &Ctx, names: &[String], session: Option<&Session>) -> Result<()> {
-    mise::stop_daemons(&ctx.root, names)?;
+    {
+        let _using = using_supervisor(&ctx.state, session.and_then(|s| s.provider.as_ref()))?;
+        mise::stop_daemons(&ctx.root, names, supervisor_owner(&ctx.state, true).ok().as_deref())?;
+    }
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     loop {
         let alive: Vec<Value> = names
@@ -1491,10 +1497,11 @@ fn request_starts(
     hand_off: &[bool],
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     completed: &std::sync::Mutex<Vec<String>>,
+    owner: Option<&str>,
 ) -> Result<Vec<String>> {
     let mut ends = Vec::new();
     let mut threads = Vec::new();
-    let outcome = request_each(root, names, hand_off, cancel, completed, &mut ends, &mut threads);
+    let outcome = request_each((root, owner), names, hand_off, cancel, completed, &mut ends, &mut threads);
     // No request outlives this: one still waiting is ended (its process group) and waited for,
     // so a stack that exits next cannot leave it behind.
     for end in &ends {
@@ -1506,9 +1513,10 @@ fn request_starts(
     outcome
 }
 
-/// [`request_starts`], leaving the requests' end flags and threads to the caller.
+/// [`request_starts`], leaving the requests' end flags and threads to the caller. Each
+/// request goes to the project at `root`, marked with `owner` (see [`mise::OWNER_VAR`]).
 fn request_each(
-    root: &Path,
+    (root, owner): (&Path, Option<&str>),
     names: &[String],
     hand_off: &[bool],
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1518,7 +1526,7 @@ fn request_each(
 ) -> Result<Vec<String>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
-    mise::prepare_start(root)?;
+    mise::prepare_start(root, owner)?;
     let (sent, answers) = mpsc::channel::<(usize, Result<()>)>();
     let mut done: Vec<bool> = Vec::new();
     let mut handed: Vec<String> = Vec::new();
@@ -1550,10 +1558,11 @@ fn request_each(
     for (i, name) in names.iter().enumerate() {
         let end = Arc::new(AtomicBool::new(false));
         let (dir, service, sent, deadline, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::deadline(), end.clone());
+        let owner = owner.map(str::to_string);
         threads.push(std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             let _cancel = crate::process::cancel_scope(flag);
-            let _ = sent.send((i, mise::start_daemon(&dir, &service)));
+            let _ = sent.send((i, mise::start_daemon(&dir, &service, owner.as_deref())));
         }));
         ends.push(end);
         done.push(false);
@@ -2232,8 +2241,9 @@ pub struct DownReport {
     /// nothing stack started is behind them, and `up` refuses to start over them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<PortConflict>,
-    /// What `--stop-supervisor` did with the supervisor that ran this checkout's services:
-    /// `{stopped, reason}`. Absent without it.
+    /// What happened to the supervisor that ran this checkout's services: `{stopped, reason}`
+    /// or `{stopped, state_dir}` (see [`stop_owned_supervisor`]). Absent for a checkout without
+    /// services.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<Value>,
 }
@@ -2250,68 +2260,262 @@ pub struct PortConflict {
 }
 
 /// Stop the project's services. Succeeds only once their processes are gone and ports closed.
+/// Then stops the supervisor that ran them when Stack started it and nothing else uses it
+/// (see [`stop_owned_supervisor`]).
 pub fn down(ctx: &Ctx) -> Result<DownReport> {
-    down_with(ctx, false)
+    down_with(ctx, true)
 }
 
-/// [`down`], then with `stop_supervisor` the Pitchfork supervisor that ran this checkout's
-/// services, once they are confirmed gone and only while nothing else needs it (see
-/// [`stop_idle_supervisor`]). For runners that give each agent a root of its own; the
-/// supervisor is otherwise shared, and kept.
+/// [`down`]; with `stop_supervisor` false the supervisor is kept whoever started it.
 pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     restore_provider_config(ctx)?;
-    let recorded = load(ctx)?.and_then(|s| s.provider);
+    let session = load(ctx)?;
+    // As in `down_locked`: a checkout with neither owns no services, and has no supervisor.
+    let owns_services = !ports::lookup(&ctx.state, &ctx.root)?.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
+    let recorded = session.and_then(|s| s.provider);
     let mut report = down_locked(ctx, None)?;
-    if stop_supervisor {
-        report.supervisor = Some(stop_idle_supervisor(ctx, recorded));
+    if owns_services || recorded.is_some() {
+        report.supervisor = Some(if stop_supervisor {
+            stop_owned_supervisor(ctx, recorded)
+        } else {
+            json!({ "stopped": false, "reason": "asked to keep it" })
+        });
     }
     Ok(report)
 }
 
+/// How long `down` waits for other Stack commands to finish their requests to the supervisor
+/// before it keeps the supervisor instead.
+const SUPERVISOR_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Pitchfork's id for its supervisor, under which `pitchfork status` reports its PID.
+const SUPERVISOR_ID: &str = "global/pitchfork";
+
 /// Stop the supervisor that ran this checkout's services (the one its session recorded, else
-/// the one its configuration names now), unless another checkout's session on this machine
-/// uses the same supervisor or any daemon it tracks is running, waiting or stopping: the
-/// supervisor is shared by every project using its state directory, including ones Stack does
-/// not manage. What happened, and why not, is the result; nothing here fails `down`.
-fn stop_idle_supervisor(ctx: &Ctx, recorded: Option<ProviderRecord>) -> Value {
+/// the one its configuration names now), once they are confirmed gone, only when all of these
+/// hold, each checked with every other Stack command's requests to it shut out (see
+/// [`using_supervisor`]):
+///
+/// - it runs, and Stack started it: the process Pitchfork names as its supervisor carries this
+///   Stack state's owner mark (see [`supervisor_owner`]). One already running when Stack first
+///   used it, started by anything else or by another Stack state, or whose environment cannot
+///   be read, is not Stack's;
+/// - no other checkout's session on this machine records the same supervisor, by its resolved
+///   state directory, or records services without naming their supervisor, and every session
+///   record can be read;
+/// - no daemon it tracks (Stack's or anyone's) is anything but stopped, failed or errored, or
+///   has a live process.
+///
+/// What happened, and why not, is the result; nothing here fails `down`. A supervisor that is
+/// not running is not started, and is reported as stopped.
+fn stop_owned_supervisor(ctx: &Ctx, recorded: Option<ProviderRecord>) -> Value {
     let kept = |reason: String| json!({ "stopped": false, "reason": reason });
-    let provider = recorded.or_else(|| {
-        let (socket, _) = preflight_socket(ctx).ok()?;
-        let state_dir = socket?.path.parent()?.parent()?.to_path_buf();
-        Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
-    });
-    let Some(provider) = provider else {
+    let Some(provider) = recorded.or_else(|| discover_provider(ctx)) else {
         return kept("no supervisor is configured for this checkout".into());
     };
-    let sharing: Vec<String> = fs::read_dir(ctx.state.join("sessions"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| read_json::<Session>(&e.path()).ok())
-        .filter(|s| s.project != ctx.root && s.provider.as_ref().is_some_and(|p| p.state_dir == provider.state_dir))
-        .map(|s| s.project.display().to_string())
-        .collect();
-    if let Some(project) = sharing.first() {
-        return kept(format!("the session of {project} uses this supervisor"));
-    }
-    let daemons = match mise::supervisor_daemons(&provider.pitchfork, &provider.state_dir) {
-        Ok(daemons) => daemons,
-        Err(why) => return kept(format!("cannot list the supervisor's daemons: {why}")),
+    let lock = supervisor_lock(&ctx.state, &provider.state_dir);
+    let _alone = match SharedLock::exclusive_within(&lock, SUPERVISOR_LOCK_WAIT) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return kept("another Stack command is starting or stopping services through this supervisor".into()),
+        Err(e) => return kept(format!("cannot lock {}: {}", lock.display(), e.message)),
     };
-    if let Some((id, status)) = daemons.iter().find(|(_, status)| matches!(status.as_str(), "running" | "waiting" | "stopping")) {
-        return kept(format!("daemon {id} is {status}"));
-    }
+    // Asked first: listing daemons would start a supervisor that is not running.
     match mise::supervisor_running(&provider.pitchfork, &provider.state_dir) {
         Ok(false) => return json!({ "stopped": true, "reason": "it was not running" }),
         Ok(true) => {}
         Err(why) => return kept(why),
     }
-    match mise::stop_supervisor(&provider.pitchfork, &provider.state_dir) {
-        Ok(true) => json!({ "stopped": true, "state_dir": provider.state_dir }),
-        Ok(false) => kept("it still answers after `pitchfork supervisor stop`".into()),
-        Err(why) => kept(why),
+    let (supervisor, mark) = match owned_supervisor(ctx, &provider) {
+        Ok(found) => found,
+        Err(why) => return kept(why),
+    };
+    if let Some(why) = supervisor_in_use(ctx, &provider) {
+        return kept(why);
     }
+    if supervisor.current().is_none() {
+        return kept(format!("supervisor pid {} changed while Stack checked it", supervisor.pid));
+    }
+    match mise::stop_supervisor(&provider.pitchfork, &provider.state_dir) {
+        Ok(true) => {}
+        Ok(false) => return kept("it still answers after `pitchfork supervisor stop`".into()),
+        Err(why) => return kept(why),
+    }
+    let left = supervisor_left(&supervisor, &mark);
+    if !left.is_empty() {
+        let pids: Vec<String> = left.iter().map(u32::to_string).collect();
+        return kept(format!("`pitchfork supervisor stop` returned, but its processes {} still run", pids.join(", ")));
+    }
+    json!({ "stopped": true, "state_dir": provider.state_dir })
+}
+
+/// The running supervisor of `provider` and this Stack state's owner mark, when the process
+/// Pitchfork names as that supervisor carries the mark; otherwise why it is not Stack's to stop.
+fn owned_supervisor(ctx: &Ctx, provider: &ProviderRecord) -> std::result::Result<(crate::procinfo::Process, String), String> {
+    let mark = supervisor_owner(&ctx.state, false).map_err(|why| format!("Stack cannot tell whether it started this supervisor: {why}"))?;
+    let pid = match mise::supervised(&provider.pitchfork, &provider.state_dir, SUPERVISOR_ID)? {
+        mise::Supervised::Found { status, pid: Some(pid), .. } if status == "running" => pid,
+        other => return Err(format!("cannot identify the running supervisor: Pitchfork reports {other:?} for {SUPERVISOR_ID}")),
+    };
+    let Some(seen) = crate::procinfo::process(pid) else {
+        return Err(format!("supervisor pid {pid} is not running"));
+    };
+    match crate::procinfo::environ_has(pid, mise::OWNER_VAR, &mark) {
+        Some(true) if seen.current().is_some() => Ok((seen, mark)),
+        Some(true) => Err(format!("supervisor pid {pid} changed while Stack checked it")),
+        Some(false) => Err(format!(
+            "this Stack state did not start supervisor pid {pid}: it was running before Stack used it, or something else started it"
+        )),
+        None => Err(format!("cannot read the environment of supervisor pid {pid} to confirm Stack started it")),
+    }
+}
+
+/// Why the supervisor of `provider` may still be needed, if it may (see [`stop_owned_supervisor`]).
+fn supervisor_in_use(ctx: &Ctx, provider: &ProviderRecord) -> Option<String> {
+    let mine = resolved(&provider.state_dir);
+    let sessions = ctx.state.join("sessions");
+    let entries = match fs::read_dir(&sessions) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return daemons_in_use(provider),
+        Err(e) => return Some(format!("cannot read {}: {e}", sessions.display())),
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => return Some(format!("cannot read {}: {e}", sessions.display())),
+        };
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let session = match read_json::<Session>(&path) {
+            Ok(session) => session,
+            Err(e) => return Some(format!("cannot read the session record {}: {}", path.display(), e.message)),
+        };
+        if session.project == ctx.root {
+            continue;
+        }
+        match &session.provider {
+            Some(p) if resolved(&p.state_dir) == mine => {
+                return Some(format!("the session of {} uses this supervisor", session.project.display()))
+            }
+            None if !session.services.is_empty() => {
+                return Some(format!("the session of {} does not record which supervisor runs its services", session.project.display()))
+            }
+            _ => {}
+        }
+    }
+    daemons_in_use(provider)
+}
+
+/// A daemon the supervisor tracks that is not over: anything but stopped, failed or errored
+/// (an unreported state included), or with a live process.
+fn daemons_in_use(provider: &ProviderRecord) -> Option<String> {
+    let daemons = match mise::supervisor_daemons(&provider.pitchfork, &provider.state_dir) {
+        Ok(daemons) => daemons,
+        Err(why) => return Some(format!("cannot list the supervisor's daemons: {why}")),
+    };
+    daemons.iter().filter(|d| d.id != SUPERVISOR_ID).find_map(|d| {
+        let over = d.status == "stopped" || d.status.starts_with("failed") || d.status.starts_with("errored");
+        if !over {
+            let status = if d.status.is_empty() { "in a state Pitchfork did not report" } else { &d.status };
+            return Some(format!("daemon {} is {status}", d.id));
+        }
+        d.pid.filter(|p| pid_alive(*p)).map(|pid| format!("daemon {} is {}, but its process {pid} is alive", d.id, d.status))
+    })
+}
+
+/// What is left, up to 5 seconds after `pitchfork supervisor stop` returned, of the supervisor
+/// observed as `supervisor`: itself, or a process of its group or a child of it carrying the
+/// same owner mark (its `log-sink` helpers).
+fn supervisor_left(supervisor: &crate::procinfo::Process, mark: &str) -> Vec<u32> {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut left: Vec<u32> = supervisor.current().map(|p| p.pid).into_iter().collect();
+        left.extend(
+            crate::procinfo::carrying(mise::OWNER_VAR, mark)
+                .iter()
+                .filter(|p| p.group == supervisor.group || p.parent == supervisor.pid)
+                .map(|p| p.pid),
+        );
+        left.sort_unstable();
+        left.dedup();
+        if left.is_empty() || Instant::now() >= until {
+            return left;
+        }
+        sleep(Duration::from_millis(200));
+    }
+}
+
+/// This Stack state's owner mark (see [`mise::OWNER_VAR`]): a random value Stack writes once to
+/// `<state>/supervisor-owner`. A missing record is created only when `create` (a command about
+/// to ask the supervisor to start or stop something). A record that does not hold such a mark
+/// is never overwritten or trusted: no supervisor is then Stack's, until a person removes it.
+fn supervisor_owner(state: &Path, create: bool) -> std::result::Result<String, String> {
+    use std::io::Write;
+    let path = state.join("supervisor-owner");
+    let read = |path: &Path| -> std::result::Result<Option<String>, String> {
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                let mark = text.strip_suffix('\n').unwrap_or(&text);
+                let valid = mark.len() == 38
+                    && mark.starts_with("stack-")
+                    && mark[6..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if valid { Ok(Some(mark.to_string())) } else { Err(format!("{} does not hold an owner mark Stack wrote", path.display())) }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
+    };
+    match read(&path)? {
+        Some(mark) => return Ok(mark),
+        None if !create => return Err(format!("{} does not exist", path.display())),
+        None => {}
+    }
+    let mark = crate::identity::random_token().map_err(|e| e.message)?;
+    fs::create_dir_all(state).map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(state).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    tmp.write_all(format!("{mark}\n").as_bytes())
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    match tmp.persist_noclobber(&path) {
+        Ok(_) => Ok(mark),
+        // Another command wrote it first: its mark is the one.
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => read(&path)?.ok_or_else(|| format!("{} vanished", path.display())),
+        Err(e) => Err(format!("cannot write {}: {}", path.display(), e.error)),
+    }
+}
+
+/// `path` with its longest existing ancestor resolved, so one supervisor state directory has
+/// one name however it was reached (`/tmp` and `/private/tmp` on macOS, a link).
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The lock of the supervisor whose state directory is `state_dir`, in this Stack state.
+fn supervisor_lock(state: &Path, state_dir: &Path) -> PathBuf {
+    let key = sha256_hex(resolved(state_dir).to_string_lossy().as_bytes());
+    state.join("supervisors").join(format!("{}.lock", &key[..16]))
+}
+
+/// Held, shared, while a command asks the supervisor of `provider` to start or stop something
+/// (which starts it when none runs). `down` takes it alone to decide on stopping that
+/// supervisor, so it never stops one between another checkout's look and its request; such a
+/// checkout records its session before it asks. Nothing is held for an unknown supervisor.
+fn using_supervisor(state: &Path, provider: Option<&ProviderRecord>) -> Result<Option<SharedLock>> {
+    provider.map(|p| SharedLock::shared(&supervisor_lock(state, &p.state_dir))).transpose()
 }
 
 /// Write the generated provider configuration from stack.lock when this checkout owns services
@@ -2366,7 +2570,9 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
     let needs_stop = pids.iter().any(|(_, pid)| pid_alive(*pid))
         || before.iter().any(|d| matches!(d.status.as_str(), "running" | "starting"));
     if needs_stop {
-        mise::stop(&ctx.root)?;
+        let known = provider.clone().or_else(|| discover_provider(ctx));
+        let _using = using_supervisor(&ctx.state, known.as_ref())?;
+        mise::stop(&ctx.root, supervisor_owner(&ctx.state, true).ok().as_deref())?;
     }
 
     // A port still open once every recorded process is gone is held by something else: when
@@ -5214,6 +5420,45 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&out.stdout), *value, "{shell}: {script}");
             }
         }
+    }
+
+    #[test]
+    fn the_owner_mark_is_written_once_and_a_replaced_record_is_never_trusted_or_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let path = state.join("supervisor-owner");
+        assert_eq!(supervisor_owner(&state, false), Err(format!("{} does not exist", path.display())));
+        assert!(!path.exists(), "only a command that may start the supervisor creates it");
+        // Commands racing to create it agree on one mark.
+        let marks: Vec<String> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..8).map(|_| scope.spawn(|| supervisor_owner(&state, true).unwrap())).collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert!(marks.iter().all(|m| *m == marks[0]), "{marks:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", marks[0]));
+        assert_eq!(supervisor_owner(&state, false).unwrap(), marks[0]);
+        for replaced in ["", "stack-\n", "stack-0123\n", &marks[0].to_uppercase(), &format!("{}x", marks[0]), &format!("{}\n\n", marks[0])] {
+            fs::write(&path, replaced).unwrap();
+            for create in [false, true] {
+                assert_eq!(supervisor_owner(&state, create), Err(format!("{} does not hold an owner mark Stack wrote", path.display())), "{replaced:?}");
+            }
+            assert_eq!(fs::read_to_string(&path).unwrap(), replaced);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_supervisor_state_directory_has_one_lock_whatever_it_is_called() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("pf");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("alias")).unwrap();
+        let state = dir.path().join("state");
+        let lock = supervisor_lock(&state, &real.join("state"));
+        // Through a link, and before the directory exists.
+        assert_eq!(supervisor_lock(&state, &dir.path().join("alias/state")), lock);
+        assert_eq!(resolved(&dir.path().join("alias/state/sock")), fs::canonicalize(&real).unwrap().join("state/sock"));
+        assert_ne!(supervisor_lock(&state, &dir.path().join("other/state")), lock);
     }
 
     #[test]

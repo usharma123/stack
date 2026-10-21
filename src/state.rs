@@ -75,6 +75,66 @@ impl FileLock {
     }
 }
 
+/// A lock that many holders may share, and one holder may take alone (see [`SharedLock`]).
+fn open_lock(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| io_error(path.display(), e))
+}
+
+/// Cross-process lock, shared or exclusive, held for the lifetime of the guard. Like
+/// [`FileLock`], its file is never removed and the kernel releases it with its holder.
+pub struct SharedLock {
+    _file: File,
+}
+
+impl SharedLock {
+    /// Share the lock, waiting for an exclusive holder as long as the caller's deadline allows.
+    pub fn shared(path: &Path) -> Result<Self> {
+        let file = open_lock(path)?;
+        if crate::process::deadline().is_none() {
+            FileExt::lock_shared(&file).map_err(|e| io_error(path.display(), e))?;
+            return Ok(Self { _file: file });
+        }
+        loop {
+            match FileExt::try_lock_shared(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e) if e.raw_os_error() != fs2::lock_contended_error().raw_os_error() => {
+                    return Err(io_error(path.display(), e))
+                }
+                Err(_) if crate::process::expired() => {
+                    return Err(StackError::new("lock_busy", format!("{} is still locked by another stack command", path.display()))
+                        .hint("another checkout's `stack down` may be stopping this supervisor; retry when it finishes"))
+                }
+                Err(_) => std::thread::sleep(crate::process::bounded(std::time::Duration::from_millis(50))),
+            }
+        }
+    }
+
+    /// Take the lock alone within `wait`; `None` while anyone else holds it.
+    pub fn exclusive_within(path: &Path, wait: std::time::Duration) -> Result<Option<Self>> {
+        let file = open_lock(path)?;
+        let until = std::time::Instant::now() + crate::process::bounded(wait);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(e) if e.raw_os_error() != fs2::lock_contended_error().raw_os_error() => {
+                    return Err(io_error(path.display(), e))
+                }
+                Err(_) if std::time::Instant::now() >= until => return Ok(None),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
+}
+
 /// Serialize compile and lifecycle changes for this project, outside its mutable directory.
 pub fn project_lock(state: &Path, root: &Path) -> Result<FileLock> {
     FileLock::acquire(
@@ -148,6 +208,42 @@ pub fn pid_alive(pid: u32) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_lock_shuts_out_an_exclusive_holder_and_waits_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisors/x.lock");
+        let first = SharedLock::shared(&path).unwrap();
+        let second = SharedLock::shared(&path).unwrap();
+        let start = std::time::Instant::now();
+        assert!(SharedLock::exclusive_within(&path, std::time::Duration::from_millis(300)).unwrap().is_none());
+        assert!(start.elapsed() >= std::time::Duration::from_millis(300));
+        drop(first);
+        assert!(SharedLock::exclusive_within(&path, std::time::Duration::ZERO).unwrap().is_none(), "one holder still shares it");
+        drop(second);
+        let alone = SharedLock::exclusive_within(&path, std::time::Duration::ZERO).unwrap().expect("nobody holds it");
+        // A sharer waits for the exclusive holder, and gets it once that one is done.
+        let (sent, got) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let lock = SharedLock::shared(&path).unwrap();
+                sent.send(()).unwrap();
+                lock
+            }
+        });
+        assert!(got.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "shared while held alone");
+        drop(alone);
+        got.recv_timeout(std::time::Duration::from_secs(5)).expect("shared once released");
+        let _shared = waiter.join().unwrap();
+        // Under a deadline, a sharer gives up when it passes.
+        let _alone = {
+            drop(_shared);
+            SharedLock::exclusive_within(&path, std::time::Duration::ZERO).unwrap().unwrap()
+        };
+        let _expired = crate::process::deadline_scope(Some(std::time::Instant::now() + std::time::Duration::from_millis(100)));
+        assert_eq!(SharedLock::shared(&path).err().map(|e| e.code), Some("lock_busy"));
+    }
 
     #[test]
     fn a_held_lock_is_waited_for_only_until_the_deadline() {

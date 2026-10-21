@@ -308,8 +308,8 @@ fn tool_definitions() -> Value {
               "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before it fails and the task is killed (default 600)" }
           }), &["task"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone. stop_supervisor then stops the Pitchfork supervisor that ran them too, unless another checkout's session or a running daemon still uses it.", "inputSchema": schema(json!({
-              "stop_supervisor": { "type": "boolean", "description": "Also stop the supervisor when nothing else uses it (for a root of its own per agent; default false)" },
+        { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone. Then stops the Pitchfork supervisor that ran them too, if Stack started it and no other checkout's session or daemon still uses it; data.supervisor says what happened and why.", "inputSchema": schema(json!({
+              "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
           }), &[]) },
         { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": schema(json!({
               "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
@@ -441,7 +441,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
-        "stack_down" => session::down_with(ctx, args["stop_supervisor"] == true).map(to_value),
+        "stack_down" => session::down_with(ctx, args["stop_supervisor"] != false).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_exec" => exec(args, ctx),

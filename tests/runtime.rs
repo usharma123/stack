@@ -56,8 +56,15 @@ impl Fixture {
             &pitchfork,
             r#"#!/bin/sh
 echo "$PITCHFORK_STATE_DIR $*" >>"$REVIEW_FIXTURE/pitchfork.log"
+# `pf-supervisor`, when it exists, is a running supervisor: the PID it holds, if any, is its
+# process, which `supervisor stop` ends.
 case "$1" in
   status)
+    if test "$3" = global/pitchfork; then
+      pid=$(cat "$REVIEW_FIXTURE/pf-supervisor" 2>/dev/null)
+      if test -n "$pid"; then echo "{\"id\":\"global/pitchfork\",\"status\":\"running\",\"pid\":$pid}"; exit 0; fi
+      echo "Error: Daemon $3 not found" >&2; exit 1
+    fi
     if test -f "$REVIEW_FIXTURE/pf-status.json"; then cat "$REVIEW_FIXTURE/pf-status.json"; exit 0; fi
     echo "Error: Daemon $3 not found" >&2; exit 1 ;;
   list)
@@ -65,7 +72,10 @@ case "$1" in
   supervisor)
     case "$2" in
       status) test -f "$REVIEW_FIXTURE/pf-supervisor" ;;
-      stop) rm -f "$REVIEW_FIXTURE/pf-supervisor" ;;
+      stop)
+        if test -f "$REVIEW_FIXTURE/pf-fail-supervisor-stop"; then echo 'cannot stop the supervisor' >&2; exit 1; fi
+        pid=$(cat "$REVIEW_FIXTURE/pf-supervisor" 2>/dev/null); test -n "$pid" && kill "$pid"
+        rm -f "$REVIEW_FIXTURE/pf-supervisor" ;;
     esac ;;
   stop)
     if test -f "$REVIEW_FIXTURE/pf-fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
@@ -2209,9 +2219,29 @@ fn sigterm_to_the_mcp_server_stops_a_running_command_answers_and_ends_the_server
     drop(input);
 }
 
+/// A supervisor stand-in for the fake Pitchfork: a Python process (whose environment macOS lets
+/// its owner read, unlike a platform binary's) running until killed, outside the test's own
+/// children so it is reaped when it ends, carrying `mark` as its owner mark when given.
+fn fake_supervisor(fixture: &Fixture, mark: Option<&str>) -> u32 {
+    let mut command = Command::new("sh");
+    command.args(["-c", r#""$0" -c 'import time; time.sleep(600)' </dev/null >/dev/null 2>&1 & echo $!"#]).arg(python::python());
+    command.env_remove("STACK_SUPERVISOR_OWNER");
+    if let Some(mark) = mark {
+        command.env("STACK_SUPERVISOR_OWNER", mark);
+    }
+    let pid: u32 = String::from_utf8(command.output().unwrap().stdout).unwrap().trim().parse().unwrap();
+    fs::write(fixture.dir.path().join("pf-supervisor"), pid.to_string()).unwrap();
+    pid
+}
+
+/// End a stand-in a test left running.
+fn end(pid: u32) {
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+}
+
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn down_stops_the_supervisor_only_when_asked_and_nothing_else_uses_it() {
+fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
     let pf = dir.join("pf");
@@ -2221,37 +2251,176 @@ fn down_stops_the_supervisor_only_when_asked_and_nothing_else_uses_it() {
         assert!(out.status.success(), "{args:?}: {result}");
         result
     };
+    let supervisor = |args: &[&str]| run(args)["data"]["supervisor"].clone();
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     run(&["up", "--json"]);
-    fs::write(dir.join("pf-supervisor"), "").unwrap();
-    // Another checkout's session records the same supervisor (a copy of this one's record).
+    // Every request of `up` that could start the supervisor carried this Stack state's mark.
+    let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
+    assert!(mark.starts_with("stack-") && mark.len() == 38, "{mark}");
+    let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
+    assert!(marks.contains(&format!("daemons start {mark}")) && !marks.contains("unset"), "{marks}");
+    let pid = fake_supervisor(&fixture, Some(&mark));
+
+    // Another checkout's session records the same supervisor, through another name for its
+    // state directory.
+    std::os::unix::fs::symlink(&pf, dir.join("pf-alias")).unwrap();
+    fs::create_dir_all(&pf).unwrap();
     let sessions = dir.join("state/sessions");
     let mine = fs::read_dir(&sessions).unwrap().next().unwrap().unwrap().path();
     let mut theirs: Value = serde_json::from_slice(&fs::read(&mine).unwrap()).unwrap();
     theirs["project"] = json!(dir.join("other"));
+    theirs["provider"]["state_dir"] = json!(dir.join("pf-alias"));
     let theirs_path = sessions.join("0000000000000000.json");
     fs::write(&theirs_path, theirs.to_string()).unwrap();
-    // A plain down never touches the supervisor.
-    assert!(run(&["down", "--json"])["data"].get("supervisor").is_none());
-    let kept = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
+    let kept = supervisor(&["down", "--json"]);
     assert_eq!(kept["stopped"], false, "{kept}");
-    assert!(kept["reason"].as_str().unwrap().contains("other") && kept["reason"].as_str().unwrap().contains("uses this supervisor"), "{kept}");
-    assert!(dir.join("pf-supervisor").exists());
+    assert_eq!(kept["reason"], format!("the session of {} uses this supervisor", dir.join("other").display()), "{kept}");
+    assert!(alive(pid));
+    // Services recorded without their supervisor might be its too.
+    theirs.as_object_mut().unwrap().remove("provider");
+    fs::write(&theirs_path, theirs.to_string()).unwrap();
+    let kept = supervisor(&["down", "--json"]);
+    assert!(kept["reason"].as_str().unwrap().contains("does not record which supervisor"), "{kept}");
+    // A record that cannot be read could be anyone's.
+    fs::write(&theirs_path, "{").unwrap();
+    let kept = supervisor(&["down", "--json"]);
+    assert!(kept["reason"].as_str().unwrap().starts_with("cannot read the session record"), "{kept}");
     fs::remove_file(&theirs_path).unwrap();
-    // A daemon it tracks, Stack's or not, is still running.
-    fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "running" }]).to_string()).unwrap();
-    let kept = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
-    assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!("daemon someone-else/db is running")), "{kept}");
-    assert!(dir.join("pf-supervisor").exists());
-    // Nothing uses it: stopped, and stopping it again is a no-op.
-    fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }]).to_string()).unwrap();
-    let stopped = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
-    assert_eq!(stopped["stopped"], true, "{stopped}");
-    assert!(!dir.join("pf-supervisor").exists());
-    let again = run(&["down", "--stop-supervisor", "--json"])["data"]["supervisor"].clone();
-    assert_eq!((again["stopped"].clone(), again["reason"].clone()), (json!(true), json!("it was not running")), "{again}");
-    let mcp = fixture.mcp(&[("stack_down", json!({ "stop_supervisor": true }))], &[("PITCHFORK_STATE_DIR", pf.to_str().unwrap())]);
+    assert!(alive(pid));
+
+    // A daemon it tracks, Stack's or not, that is not over.
+    let me = std::process::id();
+    for (list, reason) in [
+        (json!([{ "id": "someone-else/db", "status": "running" }]), "daemon someone-else/db is running".to_string()),
+        (json!([{ "id": "someone-else/db", "status": "waiting" }]), "daemon someone-else/db is waiting".to_string()),
+        (json!([{ "id": "someone-else/db", "status": "restarting" }]), "daemon someone-else/db is restarting".to_string()),
+        (json!([{ "id": "someone-else/db" }]), "daemon someone-else/db is in a state Pitchfork did not report".to_string()),
+        (json!([{ "id": "someone-else/db", "status": "stopped", "pid": me }]), format!("daemon someone-else/db is stopped, but its process {me} is alive")),
+    ] {
+        fs::write(dir.join("pf-list.json"), list.to_string()).unwrap();
+        let kept = supervisor(&["down", "--json"]);
+        assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!(reason)), "{list}: {kept}");
+        assert!(alive(pid));
+    }
+    fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }, { "id": "x/y", "status": "failed" }]).to_string()).unwrap();
+
+    // Asked to keep it, through the CLI and MCP.
+    assert_eq!(supervisor(&["down", "--keep-supervisor", "--json"]), json!({ "stopped": false, "reason": "asked to keep it" }));
+    let mcp = fixture.mcp(&[("stack_down", json!({ "stop_supervisor": false }))], &[("PITCHFORK_STATE_DIR", pf.to_str().unwrap())]);
+    assert_eq!(mcp[0]["structuredContent"]["data"]["supervisor"], json!({ "stopped": false, "reason": "asked to keep it" }), "{}", mcp[0]);
+    let out = fixture.command(&["down", "--keep-supervisor", "--stop-supervisor"]).output().unwrap();
+    assert!(!out.status.success(), "the two flags contradict each other");
+    assert!(alive(pid));
+
+    // Another Stack command asking it something meanwhile holds its lock: kept.
+    let locks: Vec<_> = fs::read_dir(dir.join("state/supervisors")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(locks.len(), 1, "one supervisor, one lock, whatever it was called: {locks:?}");
+    let held = fs::File::open(&locks[0]).unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_SH) }, 0);
+    let kept = supervisor(&["down", "--json"]);
+    assert_eq!(kept["reason"], "another Stack command is starting or stopping services through this supervisor", "{kept}");
+    drop(held);
+    assert!(alive(pid));
+
+    // Nothing uses it: a plain `down` stops it, and its processes are gone when it returns.
+    let stopped = supervisor(&["down", "--json"]);
+    assert_eq!(stopped, json!({ "stopped": true, "state_dir": pf }), "{stopped}");
+    assert!(!alive(pid) && !dir.join("pf-supervisor").exists());
+    // Again, and in a checkout that never ran `up`: nothing to stop, and nothing is started to
+    // find that out (listing daemons would start a supervisor).
+    let before = fs::read_to_string(dir.join("pitchfork.log")).unwrap().len();
+    assert_eq!(supervisor(&["down", "--json"]), json!({ "stopped": true, "reason": "it was not running" }));
+    let fresh = dir.join("fresh");
+    fs::create_dir(&fresh).unwrap();
+    for file in ["stack.toml", "stack.lock"] {
+        fs::copy(dir.join("app").join(file), fresh.join(file)).unwrap();
+    }
+    fixture.command_at(&fresh, &["compile"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+    let out = fixture.command_at(&fresh, &["--json", "down"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+    assert_eq!(json_result(&out)["data"]["supervisor"], json!({ "stopped": true, "reason": "it was not running" }), "{}", json_result(&out));
+    let asked = &fs::read_to_string(dir.join("pitchfork.log")).unwrap()[before..];
+    assert!(!asked.contains(" list") && !asked.contains(" stop"), "{asked}");
+
+    // MCP without the field stops it by default, and the old flag still works.
+    let pid = fake_supervisor(&fixture, Some(&mark));
+    let mcp = fixture.mcp(&[("stack_down", json!({}))], &[("PITCHFORK_STATE_DIR", pf.to_str().unwrap())]);
     assert_eq!(mcp[0]["structuredContent"]["data"]["supervisor"]["stopped"], true, "{}", mcp[0]);
+    assert!(!alive(pid));
+    let pid = fake_supervisor(&fixture, Some(&mark));
+    assert_eq!(supervisor(&["down", "--stop-supervisor", "--json"])["stopped"], true);
+    assert!(!alive(pid));
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_keeps_a_supervisor_stack_cannot_show_it_started() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let pf = dir.join("pf");
+    let supervisor = || -> Value {
+        let out = fixture.command(&["down", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{result}");
+        result["data"]["supervisor"].clone()
+    };
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    // A mark in stack's own environment (a service of another Stack state running it, say)
+    // never reaches a request.
+    let foreign = "stack-ffffffffffffffffffffffffffffffff";
+    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).env("STACK_SUPERVISOR_OWNER", foreign).output().unwrap();
+    assert!(out.status.success(), "{}", json_result(&out));
+    let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
+    let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
+    assert!(marks.lines().all(|l| l.ends_with(&mark)) && marks.contains("daemons start"), "{marks}");
+    let not_started = |pid: u32| format!("this Stack state did not start supervisor pid {pid}: it was running before Stack used it, or something else started it");
+
+    // Running before Stack used it, or started by another Stack state.
+    for other in [None, Some("stack-00000000000000000000000000000000")] {
+        let pid = fake_supervisor(&fixture, other);
+        assert_eq!(supervisor(), json!({ "stopped": false, "reason": not_started(pid) }), "{other:?}");
+        assert!(alive(pid));
+        end(pid);
+    }
+    // Pitchfork names a process that is not the one Stack started (its PID reused, say).
+    let me = std::process::id();
+    fs::write(dir.join("pf-supervisor"), me.to_string()).unwrap();
+    assert_eq!(supervisor(), json!({ "stopped": false, "reason": not_started(me) }));
+    // Pitchfork answers but names no process.
+    fs::write(dir.join("pf-supervisor"), "").unwrap();
+    assert!(supervisor()["reason"].as_str().unwrap().starts_with("cannot identify the running supervisor"));
+
+    // A replaced or missing owner record proves nothing, and is not rewritten.
+    let pid = fake_supervisor(&fixture, Some(&mark));
+    let record = dir.join("state/supervisor-owner");
+    fs::write(&record, "not a mark\n").unwrap();
+    let kept = supervisor();
+    assert_eq!(kept["reason"], format!("Stack cannot tell whether it started this supervisor: {} does not hold an owner mark Stack wrote", record.display()), "{kept}");
+    fs::remove_file(dir.join("owner-marks.log")).unwrap();
+    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).env("STACK_SUPERVISOR_OWNER", foreign).output().unwrap();
+    assert!(out.status.success(), "{}", json_result(&out));
+    assert_eq!(fs::read_to_string(&record).unwrap(), "not a mark\n");
+    // Its requests carry no mark at all.
+    let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
+    assert!(marks.lines().all(|l| l.ends_with(" unset")) && marks.contains("daemons start"), "{marks}");
+    fixture.command(&["down"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+    fs::remove_file(&record).unwrap();
+    assert!(supervisor()["reason"].as_str().unwrap().ends_with("supervisor-owner does not exist"));
+    assert!(alive(pid));
+    fs::write(&record, format!("{mark}\n")).unwrap();
+
+    // A stop Pitchfork refuses is reported, and `down` still succeeds.
+    fs::write(dir.join("pf-fail-supervisor-stop"), "").unwrap();
+    assert_eq!(supervisor(), json!({ "stopped": false, "reason": "pitchfork supervisor stop: cannot stop the supervisor" }));
+    assert!(alive(pid));
+    fs::remove_file(dir.join("pf-fail-supervisor-stop")).unwrap();
+    assert_eq!(supervisor()["stopped"], true);
+    assert!(!alive(pid));
+
+    // A checkout without services has no supervisor to report.
+    let tools = Fixture::new();
+    let out = tools.ok(&["down", "--json"]);
+    assert!(json_result(&out)["data"].get("supervisor").is_none(), "{}", json_result(&out));
 }
 
 #[test]

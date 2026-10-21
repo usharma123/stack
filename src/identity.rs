@@ -69,7 +69,7 @@ pub fn lookup(state: &Path, project: &Path) -> Result<IndexMap<String, String>> 
         .collect())
 }
 
-fn random_token() -> Result<String> {
+pub(crate) fn random_token() -> Result<String> {
     let mut seed = Vec::with_capacity(64);
     #[cfg(unix)]
     {

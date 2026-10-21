@@ -63,14 +63,15 @@ stops everything. It keeps `HOME`, so your Git and SSH configuration still work.
 - The root is deleted only when every service is confirmed stopped, the supervisor is down,
   your global mise and Pitchfork files are unchanged, and the command exited 0. Otherwise it is
   kept, and its path is printed on the first line.
-- To clean up a kept root, run `stack down --stop-supervisor` from the checkout with that
-  root's environment (with a Stack that has no `--stop-supervisor`, `stack down` and then
-  `stack exec -- pitchfork supervisor stop`). Delete only that exact path. Never delete by
-  pattern: another run's root looks the same.
+- To clean up a kept root, run `stack down` from the checkout with that root's environment: it
+  also stops the root's supervisor when Stack started it and nothing else uses it, and says why
+  not otherwise (a Stack older than this default needs `stack down --stop-supervisor`, or
+  `stack down` and then `stack exec -- pitchfork supervisor stop`). Delete only that exact path.
+  Never delete by pattern: another run's root looks the same.
 - Ctrl-C, SIGTERM or SIGHUP cancels the running step and still runs cleanup. The script exits
   128 plus the signal number.
-- For several checkouts, run `stack down` in each; `--stop-supervisor` on the last one stops
-  the supervisor, and on an earlier one it is kept while the others' sessions use it.
+- For several checkouts, run `stack down` in each: the supervisor is kept while the others'
+  sessions use it, and the last one stops it.
 - On Linux, if `XDG_STATE_HOME` is set, add its Pitchfork path to the script's receipt check.
 
 [All docs](../README.md)

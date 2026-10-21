@@ -195,6 +195,27 @@ output (mise's answer when no release matches) is an error, not a version.
   `pitchfork status --json` for its active port; if that cannot be established the recorded
   (else configured) port is waited for. A foreign listener on a reserved port is reported in
   `conflicts`, not stopped and not a failure.
+- **Supervisor lifetime.** Once its services are confirmed gone, `down` stops the Pitchfork
+  supervisor that ran them when Stack can show it started it and nothing else uses it
+  (`--keep-supervisor` opts out). Ownership: every Stack request that may start a supervisor
+  (`mise x -- pitchfork supervisor start`, `mise daemons start` and `stop`) sets
+  `STACK_SUPERVISOR_OWNER` to a random mark of the Stack state, written once to
+  `<state>/supervisor-owner` and never rewritten; the supervisor and its `log-sink` helpers
+  inherit it. At `down` the process `pitchfork status --json global/pitchfork` names must carry
+  the mark, observed before and after its environment is read and still the same process
+  before the stop. Usage: no other session records the supervisor (state directories compared
+  resolved) or records services without a supervisor, every session record is readable, and
+  no tracked daemon is in any state but stopped, failed or errored, or has a live process.
+  `pitchfork list` starts a supervisor when none answers, so it is asked only after
+  `pitchfork supervisor status` (which never starts one) says one runs. Coordination: each
+  command holds a shared lock per resolved supervisor state directory
+  (`<state>/supervisors/<hash>.lock`) while it asks that supervisor to start or stop
+  something, after recording its session; `down` takes it alone, waiting at most 5 seconds,
+  for the whole check and stop. Stopped means `supervisor status` no longer answers and no
+  process of the supervisor's group or child of it carries the mark. Every other outcome keeps
+  the supervisor and gives the reason. The lock lives in Stack's state, so it orders this
+  Stack state's commands only; another Stack state sharing the Pitchfork state directory is
+  seen through its daemons, not its in-flight requests.
 - **Checkout token.** Every service gets `STACK_CHECKOUT_TOKEN` in its own daemon environment
   (never in `[env]`, so no task, `exec` command or `mise x` has it): a hash of the checkout's
   path, device, inode and creation time, so stable for one directory and different for one

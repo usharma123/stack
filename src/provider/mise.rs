@@ -628,6 +628,8 @@ pub fn configure_command(command: &mut Command, root: &Path) {
     for key in inherited_config_keys() {
         command.env_remove(key);
     }
+    // Only a request that asks for it carries an owner mark, never one stack inherited.
+    command.env_remove(OWNER_VAR);
     command.envs(config_env(root));
 }
 
@@ -671,7 +673,7 @@ fn mise_with(root: &Path, args: &[&str], overrides: &[(String, String)]) -> Resu
 /// Without either, Pitchfork only looks in a few fixed places, and when mise is installed
 /// elsewhere it runs every project's daemons without mise, with the tools on its own PATH:
 /// the tools of whichever project started it.
-fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
+fn detach_supervisor(root: &Path, code: &'static str, owner: Option<&str>) -> Result<()> {
     const START: &str = "mise x -- pitchfork supervisor start";
     let Some(wait) = crate::process::remaining() else { return Ok(()) };
     if wait.is_zero() {
@@ -690,6 +692,9 @@ fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
         .env("PITCHFORK_MISE_BIN", &mise_bin)
         .env("MISE_YES", "1")
         .env("NO_COLOR", "1");
+    if let Some(owner) = owner {
+        command.env(OWNER_VAR, owner);
+    }
     let status = crate::process::run_detached(&mut command, wait).map_err(|e| {
         StackError::new("provider_unavailable", format!("cannot run {}: {e}", mise_bin.display()))
             .hint(crate::setup::MISE_INSTALL_HINT)
@@ -703,7 +708,14 @@ fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
 }
 
 fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
-    let out = mise(root, args)?;
+    checked_by(root, args, code, None)
+}
+
+/// [`checked`] for a request that may start the supervisor, marked with `owner` (see
+/// [`OWNER_VAR`]).
+fn checked_by(root: &Path, args: &[&str], code: &'static str, owner: Option<&str>) -> Result<Output> {
+    let mark: Vec<(String, String)> = owner.map(|o| (OWNER_VAR.to_string(), o.to_string())).into_iter().collect();
+    let out = mise_with(root, args, &mark)?;
     if out.status.success() {
         return Ok(out);
     }
@@ -1090,7 +1102,8 @@ fn pitchfork(bin: &Path, state_dir: &Path, args: &[&str]) -> std::result::Result
     command
         .args(args)
         .env("PITCHFORK_STATE_DIR", state_dir)
-        .env("NO_COLOR", "1");
+        .env("NO_COLOR", "1")
+        .env_remove(OWNER_VAR);
     let out = crate::process::capture(&mut command, SUPERVISOR_TIMEOUT, 64 * 1024)
         .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
     if out.timed_out {
@@ -1099,9 +1112,18 @@ fn pitchfork(bin: &Path, state_dir: &Path, args: &[&str]) -> std::result::Result
     Ok(out)
 }
 
-/// Daemons the supervisor of `state_dir` tracks (`pitchfork list --json`, which reads its state
-/// without starting a supervisor): each one's qualified id and status.
-pub fn supervisor_daemons(bin: &Path, state_dir: &Path) -> std::result::Result<Vec<(String, String)>, String> {
+/// One daemon the supervisor tracks: its qualified id, status and process, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tracked {
+    pub id: String,
+    pub status: String,
+    pub pid: Option<u32>,
+}
+
+/// Daemons the supervisor of `state_dir` tracks (`pitchfork list --json`). Pitchfork 2.29.0
+/// starts a supervisor for this when none answers, in the command's process group, which
+/// stack ends when the command does: ask only once [`supervisor_running`] says one runs.
+pub fn supervisor_daemons(bin: &Path, state_dir: &Path) -> std::result::Result<Vec<Tracked>, String> {
     let out = pitchfork(bin, state_dir, &["list", "--json"])?;
     if out.exit_code != Some(0) {
         let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
@@ -1110,11 +1132,16 @@ pub fn supervisor_daemons(bin: &Path, state_dir: &Path) -> std::result::Result<V
     let list: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).map_err(|e| format!("unexpected `pitchfork list --json` output: {e}"))?;
     Ok(list
         .iter()
-        .map(|d| (d["id"].as_str().unwrap_or_default().to_string(), d["status"].as_str().unwrap_or_default().to_string()))
+        .map(|d| Tracked {
+            id: d["id"].as_str().unwrap_or_default().to_string(),
+            status: d["status"].as_str().unwrap_or_default().to_string(),
+            pid: d["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+        })
         .collect())
 }
 
-/// Whether the supervisor of `state_dir` answers (`pitchfork supervisor status`).
+/// Whether the supervisor of `state_dir` answers (`pitchfork supervisor status`, which never
+/// starts one).
 pub fn supervisor_running(bin: &Path, state_dir: &Path) -> std::result::Result<bool, String> {
     Ok(pitchfork(bin, state_dir, &["supervisor", "status"])?.exit_code == Some(0))
 }
@@ -1241,28 +1268,35 @@ fn local_datetime(_: u64) -> Option<String> {
     None
 }
 
-pub fn stop(root: &Path) -> Result<()> {
-    detach_supervisor(root, "stop_failed")?;
-    checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
+/// Set, to the Stack state's owner mark, on every request of Stack's that may start Pitchfork's
+/// supervisor (the start below, and `mise daemons start` and `stop`, whose client starts one
+/// when none answers). The supervisor inherits it, as do its `log-sink` helpers, so its own
+/// environment shows which Stack state started it; a supervisor already running when Stack
+/// first used it, or started by anything else, lacks it. `None` sets nothing.
+pub const OWNER_VAR: &str = "STACK_SUPERVISOR_OWNER";
+
+pub fn stop(root: &Path, owner: Option<&str>) -> Result<()> {
+    detach_supervisor(root, "stop_failed", owner)?;
+    checked_by(root, &["daemons", "stop"], "stop_failed", owner).map(|_| ())
 }
 
 /// Make sure the supervisor runs before start requests are made under a deadline (see
 /// [`detach_supervisor`]).
-pub fn prepare_start(root: &Path) -> Result<()> {
-    detach_supervisor(root, "start_failed")
+pub fn prepare_start(root: &Path, owner: Option<&str>) -> Result<()> {
+    detach_supervisor(root, "start_failed", owner)
 }
 
 /// Ask the supervisor to start one daemon of this project; returns once it is ready.
-pub fn start_daemon(root: &Path, name: &str) -> Result<()> {
-    checked(root, &["daemons", "start", "--", name], "start_failed").map(|_| ())
+pub fn start_daemon(root: &Path, name: &str, owner: Option<&str>) -> Result<()> {
+    checked_by(root, &["daemons", "start", "--", name], "start_failed", owner).map(|_| ())
 }
 
 /// Stop only the named daemons of this project.
-pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
+pub fn stop_daemons(root: &Path, names: &[String], owner: Option<&str>) -> Result<()> {
     let mut args = vec!["daemons", "stop", "--"];
     args.extend(names.iter().map(String::as_str));
-    detach_supervisor(root, "stop_failed")?;
-    checked(root, &args, "stop_failed").map(|_| ())
+    detach_supervisor(root, "stop_failed", owner)?;
+    checked_by(root, &args, "stop_failed", owner).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1277,7 +1311,7 @@ mod tests {
     fn a_deadline_already_past_starts_no_supervisor_and_makes_no_request() {
         let root = tempfile::tempdir().unwrap();
         let _expired = crate::process::deadline_scope(Some(std::time::Instant::now()));
-        let e = prepare_start(root.path()).unwrap_err();
+        let e = prepare_start(root.path(), None).unwrap_err();
         assert_eq!(e.code, "timed_out", "{e:?}");
         assert!(e.message.contains("before `mise x -- pitchfork supervisor start`"), "{e:?}");
     }

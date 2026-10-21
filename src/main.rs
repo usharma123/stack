@@ -132,10 +132,14 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Stop services; succeeds only once their processes are gone
+    /// Stop services; succeeds only once their processes are gone. Then stops the Pitchfork
+    /// supervisor that ran them if Stack started it and no other session or daemon uses it
     Down {
-        /// Then stop the Pitchfork supervisor that ran them, unless another session or any
-        /// running daemon still uses it (for a root of its own per agent)
+        /// Leave the supervisor running even when Stack started it and nothing else uses it
+        #[arg(long, conflicts_with = "stop_supervisor")]
+        keep_supervisor: bool,
+        /// Stop the supervisor as above: what `down` does unless told to keep it (accepted for
+        /// scripts written when this was not the default)
         #[arg(long)]
         stop_supervisor: bool,
     },
@@ -322,12 +326,13 @@ fn main() -> ExitCode {
         Cmd::Run { task, timeout, args } => {
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
         }
-        Cmd::Down { stop_supervisor } => session::down_with(&ctx, *stop_supervisor).map(|r| {
+        Cmd::Down { keep_supervisor, stop_supervisor: _ } => session::down_with(&ctx, !*keep_supervisor).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
                 if let Some(supervisor) = &r.supervisor {
                     match (supervisor["stopped"].as_bool(), supervisor["reason"].as_str()) {
-                        (Some(true), _) => println!("supervisor stopped"),
+                        (Some(true), Some(_)) => println!("supervisor not running"),
+                        (Some(true), None) => println!("supervisor stopped"),
                         (_, Some(reason)) => println!("supervisor kept: {reason}"),
                         _ => {}
                     }

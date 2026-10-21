@@ -12,7 +12,7 @@
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
-| `stack down [--stop-supervisor]` | Stop services and confirm they are gone |
+| `stack down [--keep-supervisor]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it |
 | `stack renew` | Renew this session's lease |
 | `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
@@ -188,12 +188,29 @@ alone. A service process the supervisor started for this checkout but lost track
 stopped too, listed with `"unrecorded": true`. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
 by name.
 
-The Pitchfork supervisor that ran the services (and its `log-sink` helpers) keeps running
-after `down`: every project using its state directory shares it. `--stop-supervisor` stops it
-too, for a runner that gives each agent a root of its own, but only once this checkout's
-services are confirmed gone, no other checkout's session on the machine records the same
-supervisor, and no daemon it tracks (Stack's or anyone's) is running, waiting or stopping.
-Otherwise it is kept, and `supervisor.reason` says why.
+Once the services are confirmed gone, `down` also stops the Pitchfork supervisor that ran them,
+and with it its `log-sink` helpers, when all of these hold:
+
+- Stack started it. Every request of Stack's that may start the supervisor carries a random
+  mark of this Stack state (kept in `<state dir>/supervisor-owner`), and the supervisor and its
+  helpers inherit it. One that was already running when Stack first used it, that something
+  else or another Stack state started, or whose environment cannot be read, is kept. So is
+  every supervisor if that file holds anything but a mark Stack wrote (delete it to reset).
+- No other checkout's session on the machine records the same supervisor (its state directory
+  compared after resolving links), or records services without naming their supervisor, and
+  every session record can be read.
+- No daemon it tracks, Stack's or anyone's, is anything but stopped, failed or errored, or has
+  a process still alive. A stopped daemon counts as stopped even if it has a schedule.
+- No other Stack command is starting or stopping services through it. Those commands share a
+  lock per supervisor, which `down` waits up to 5 seconds to take alone before deciding, so it
+  cannot stop the supervisor between another checkout's look and its request.
+
+Otherwise the supervisor is kept and `supervisor.reason` says why; that never fails `down`. A
+supervisor that is not running is not started: `supervisor` is then `{"stopped": true, "reason":
+"it was not running"}`, so `down` stays safe to repeat, including in a checkout that never ran
+`up`. A checkout without services gets no `supervisor` field. `--keep-supervisor` (MCP:
+`"stop_supervisor": false`) keeps it in every case. `--stop-supervisor`, which turned this on
+before it was the default, is still accepted and changes nothing.
 
 ## gc
 
