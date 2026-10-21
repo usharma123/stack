@@ -208,6 +208,12 @@ it. Data is removed only when all of these hold, otherwise it is kept and the re
 
 - `up` recorded that directory for that checkout, and its `.stack-checkout` marker still names
   it (data a later checkout at the path took over, or data Stack never recorded, is never touched),
+- it is the very directory `up` saw while its service ran: found where it resolved then
+  (aliases such as macOS's `/tmp` and `/var` resolved), with no link on the way and the same
+  device and inode. A directory above it replaced by a link, even to the same place, or a copy
+  put in its place marker and all, is left alone; it is removed through the directory checked,
+  never by looking its path up again. Data recorded before its directory existed is kept until
+  an `up` sees it,
 - the supervisor recorded with it confirms the service is not running, and
 - no process carrying the checkout's token runs.
 

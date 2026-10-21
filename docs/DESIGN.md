@@ -150,7 +150,13 @@ output (mise's answer when no release matches) is an error, not a version.
   identity, in the machine state (`data.json`). Once a checkout is deleted and no session of
   it is left, `gc` reports that data and `gc --reclaim-data` removes it, only while its marker
   still names that checkout, the recorded supervisor confirms the service is not running, and
-  no process carrying the token runs. Quarantined `.replaced-` data and data Stack never
+  no process carrying the token runs. A path names whatever is there when it is looked up, so
+  `up` also records where the directory resolved and, once a verified service uses it, its
+  device and inode. `gc` reaches it from `/` down that resolved path with `O_NOFOLLOW` at each
+  step, requires the same device and inode, reads the marker and removes the tree through the
+  descriptors it opened (`openat`/`unlinkat`), and removes the directory's own name only if it
+  is still that directory: a replaced ancestor, a link, a copy in its place or a swap after
+  the check never redirects the removal. Quarantined `.replaced-` data and data Stack never
   recorded are never removed.
 - **Dependencies.** `depends_on` orders starts in waves: a service is requested only once the
   services it depends on verified and passed their declared readiness. `restart` adds every

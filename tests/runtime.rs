@@ -3685,10 +3685,17 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
     let token = stack::checkout::token(&app).unwrap();
     fixture.ok(&["up"]);
     fixture.ok(&["down"]);
-    // `up` recorded where the data is, whose it is and which supervisor runs the service.
+    // `up` recorded where the data is, whose it is, which directory it is (where it resolves,
+    // device and inode) and which supervisor runs the service.
     let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
     assert_eq!(ledger["entries"][0]["checkout"], token.as_str(), "{ledger}");
     assert_eq!(ledger["entries"][0]["supervisor"]["id"], "app-test/web", "{ledger}");
+    assert_eq!(ledger["entries"][0]["location"], json!(data.canonicalize().unwrap()), "{ledger}");
+    assert!(ledger["entries"][0]["identity"].is_array(), "{ledger}");
+    let recorded = ledger["entries"][0].clone();
+    // A checkout that still exists keeps its data, even when asked.
+    let out = fixture.command_at(dir, &["gc", "--reclaim-data", "--json"]).output().unwrap();
+    assert!(out.status.success() && data.join("rows").exists(), "{}", json_result(&out));
     // Removed after a confirmed `down`, as a worktree manager's hook does.
     fs::remove_dir_all(&app).unwrap();
     let gc = |args: &[&str]| -> Vec<String> {
@@ -3736,14 +3743,56 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
     assert!(data.join("rows").exists());
     assert!(gc(&["gc", "--reclaim-data", "--json"]).is_empty(), "settled");
 
-    // Asked, with the marker its own and nothing running: removed with its marker, once.
+    // From here the supervisor the record names reports nothing for it, so only where the
+    // directory is and which one it is decide.
     fs::write(&marker, mine).unwrap();
-    let supervisor = json!({ "pitchfork": dir.join("bin/pitchfork"), "state_dir": dir.join("pf"), "id": "app-test/web" });
-    fs::write(dir.join("state/data.json"), json!({ "entries": [{ "project": app, "service": "web", "dir": data, "checkout": token, "supervisor": supervisor }] }).to_string()).unwrap();
+    let mut entry = recorded.clone();
+    entry["supervisor"] = json!({ "pitchfork": dir.join("bin/pitchfork"), "state_dir": dir.join("pf"), "id": "app-test/web" });
+    let record = || fs::write(dir.join("state/data.json"), json!({ "entries": [entry.clone()] }).to_string()).unwrap();
+    let parent = data.parent().unwrap().to_path_buf();
+    let (original, backup) = (dir.join("original-moved"), dir.join("independent-backup"));
+    let copy = |from: &Path, to: &Path| assert!(Command::new("cp").arg("-Rp").arg(from).arg(to).status().unwrap().success());
+    let untouched = |root: &Path, case: &str| {
+        assert_eq!(fs::read_to_string(root.join("web/rows")).unwrap(), "seeded", "{case}: data under {}", root.display());
+        assert!(root.join("web.stack-checkout").exists(), "{case}: marker under {}", root.display());
+    };
+    fs::write(parent.join("unsaved.txt"), "keep me").unwrap();
+
+    // The recorded directory's parent moved away and replaced by a link to an independent
+    // copy, marker and all, with a file of its own: neither is touched.
+    fs::rename(&parent, &original).unwrap();
+    copy(&original, &backup);
+    fs::write(backup.join("web/backup-only"), "only here").unwrap();
+    std::os::unix::fs::symlink(&backup, &parent).unwrap();
+    record();
+    let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
+    assert!(outcomes.iter().any(|o| o.contains("left alone") && o.contains("link")), "{outcomes:?}");
+    untouched(&original, "redirected parent");
+    untouched(&backup, "redirected parent");
+    assert!(backup.join("web/backup-only").exists());
+    fs::remove_file(&parent).unwrap();
+
+    // A copy put in its place, marker and all, with no link: not the directory `up` saw.
+    copy(&original, &parent);
+    record();
+    let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
+    assert!(outcomes.iter().any(|o| o.contains("left alone") && o.contains("not the directory")), "{outcomes:?}");
+    untouched(&parent, "copied in place");
+    untouched(&original, "copied in place");
+    fs::remove_dir_all(&parent).unwrap();
+
+    // The recorded directory back where it was: asked, with the marker its own and nothing
+    // running, it is removed with its marker, once, and nothing beside it.
+    fs::rename(&original, &parent).unwrap();
+    record();
+    let outcomes = gc(&["gc", "--json"]);
+    assert!(outcomes.iter().any(|o| o.starts_with("data kept in") && o.ends_with("`stack gc --reclaim-data` removes it")), "{outcomes:?}");
+    untouched(&parent, "not asked");
     let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
     assert!(outcomes.iter().any(|o| o.starts_with(&format!("data in {} removed", data.display()))), "{outcomes:?}");
     assert!(!data.exists() && !marker.exists());
-    assert!(data.parent().unwrap().exists(), "only the recorded directory is removed");
+    assert_eq!(fs::read_to_string(parent.join("unsaved.txt")).unwrap(), "keep me", "only the recorded directory is removed");
+    untouched(&backup, "the independent copy");
     assert!(gc(&["gc", "--json"]).is_empty());
 }
 

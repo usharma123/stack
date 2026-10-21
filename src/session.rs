@@ -908,6 +908,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                 .collect::<IndexMap<_, _>>()),
         );
         warnings.extend(encoding_warnings(ctx, &report, &checks));
+        bind_data(ctx, &checks);
     }
 
     // Startup and verification are not idle time: the lease starts once services are verified.
@@ -990,11 +991,14 @@ fn encoding_warning(env: &IndexMap<String, String>, check: &Check) -> Option<Str
     ))
 }
 
+/// What [`data_marker`] adds to the data directory's name.
+const MARKER_SUFFIX: &str = ".stack-checkout";
+
 /// The file beside a service's data directory naming the checkout (by token, see
 /// [`crate::checkout`]) whose data it is.
 fn data_marker(dir: &Path) -> PathBuf {
     let mut name = dir.file_name().unwrap_or_default().to_os_string();
-    name.push(".stack-checkout");
+    name.push(MARKER_SUFFIX);
     dir.with_file_name(name)
 }
 
@@ -1019,7 +1023,8 @@ fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], provider: O
         let owner = data_owner(&dir);
         // Where this checkout's data is, so `gc` can find it once the checkout is deleted.
         let supervisor = provider.zip(daemon.id.as_ref()).map(|(p, id)| crate::datadirs::Supervisor { pitchfork: p.pitchfork.clone(), state_dir: p.state_dir.clone(), id: id.clone() });
-        let entry = crate::datadirs::Entry { project: ctx.root.clone(), service: daemon.name.clone(), dir: dir.clone(), checkout: token.clone(), supervisor };
+        let (location, identity) = crate::datadirs::locate(&dir);
+        let entry = crate::datadirs::Entry { project: ctx.root.clone(), service: daemon.name.clone(), dir: dir.clone(), checkout: token.clone(), supervisor, location, identity };
         if running || owner.as_deref() == Some(token.as_str()) {
             if owner.as_deref() == Some(token.as_str()) {
                 crate::datadirs::record(&ctx.state, entry)?;
@@ -1055,10 +1060,25 @@ fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], provider: O
 /// The checkout token a data directory's marker names. An unreadable marker says no more than
 /// a missing one.
 fn data_owner(dir: &Path) -> Option<String> {
-    fs::read(data_marker(dir))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|v| v["checkout"].as_str().map(String::from))
+    fs::read(data_marker(dir)).ok().and_then(|bytes| marker_owner(&bytes))
+}
+
+fn marker_owner(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(bytes).ok().and_then(|v| v["checkout"].as_str().map(String::from))
+}
+
+/// Bind the data directories of verified services, which a first start may only now have
+/// created, to where they resolve and which directories they are (see
+/// [`crate::datadirs::bind`]), when their markers name this checkout. Best effort: data whose
+/// directory was never bound is kept by `gc`, never removed.
+fn bind_data(ctx: &Ctx, checks: &[Check]) {
+    let Some(token) = crate::checkout::token(&ctx.root) else { return };
+    for check in checks.iter().filter(|c| c.ready) {
+        let Some(dir) = check.data_dir.as_deref().map(Path::new) else { continue };
+        if data_owner(dir).as_deref() == Some(token.as_str()) {
+            let _ = crate::datadirs::bind(&ctx.state, dir, &token);
+        }
+    }
 }
 
 /// How often a running start is checked on.
@@ -1907,6 +1927,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     steps.ok("start", json!(names));
     let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
     steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
+    bind_data(ctx, &checks);
 
     for check in &checks {
         // Untouched services keep their start time while they are the same process.
@@ -3722,15 +3743,23 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
 
 /// One deleted checkout's recorded data directory: what happened to it, and whether its record
 /// is settled (removed now, gone already, or no longer that checkout's).
+///
+/// The directory is only ever the one `up` recorded, reached by its recorded location with no
+/// link followed (see [`crate::datadirs::hold`]); its marker is read, and it is removed, through
+/// the handles that check opened, never by looking a path up again.
 fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) {
+    use crate::datadirs::Found;
     let dir = &entry.dir;
     let shown = dir.display();
-    match fs::symlink_metadata(dir) {
-        Err(_) => return (format!("data directory {shown} is already gone"), true),
-        Ok(meta) if !meta.is_dir() => return (format!("{shown} is no longer a directory; left alone"), true),
-        Ok(_) => {}
-    }
-    if !dir.is_absolute() || data_owner(dir).as_deref() != Some(entry.checkout.as_str()) {
+    let held = match crate::datadirs::hold(entry) {
+        Found::Held(held) => held,
+        Found::Gone => return (format!("data directory {shown} is already gone"), true),
+        Found::Other(why) => return (format!("data in {shown} left alone: {why}"), true),
+        Found::Unbound(why) => {
+            return (format!("data kept in {shown}: {why}; check it and remove it by hand if it is no longer needed"), false);
+        }
+    };
+    if held.beside(MARKER_SUFFIX).as_deref().and_then(marker_owner).as_deref() != Some(entry.checkout.as_str()) {
         return (format!("data in {shown} no longer carries this checkout's marker; left alone"), true);
     }
     // Whatever the supervisor says first: a process whose environment cannot be read (another
@@ -3750,15 +3779,11 @@ fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) 
     if !running.is_empty() {
         return (format!("data kept in {shown}: process {running:?} of the deleted checkout still runs; stop it, then run `stack gc` again"), false);
     }
-    let bytes = crate::datadirs::size(dir);
     if !remove {
-        return (format!("data kept in {shown} ({bytes} bytes); `stack gc --reclaim-data` removes it"), false);
+        return (format!("data kept in {shown} ({} bytes); `stack gc --reclaim-data` removes it", held.size()), false);
     }
-    match fs::remove_dir_all(dir).and_then(|()| match fs::remove_file(data_marker(dir)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }) {
-        Ok(()) => (format!("data in {shown} removed ({bytes} bytes)"), true),
+    match held.remove(MARKER_SUFFIX) {
+        Ok(bytes) => (format!("data in {shown} removed ({bytes} bytes)"), true),
         Err(e) => (format!("data in {shown} could not be removed: {e}"), false),
     }
 }
