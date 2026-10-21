@@ -156,7 +156,9 @@ output (mise's answer when no release matches) is an error, not a version.
   services it depends on verified and passed their declared readiness. `restart` adds every
   service that depends on one it restarts, and `up` stops a running dependent of a service it
   must start again before starting both, so no dependent keeps a connection to a dead
-  instance. Identity stays per service: a dependent is verified on its own. A service's
+  instance. A dependency outside what `restart` starts is never started by it: it must
+  verify and pass its readiness before anything is stopped, and again before each wave's
+  setups, or the restart fails `dependency_not_ready` without side effects of its own. Identity stays per service: a dependent is verified on its own. A service's
   `setup` runs just before it is requested (never for one left running), with the environment
   `exec` would get, so migrations and seeding need not be chained into `run`.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,

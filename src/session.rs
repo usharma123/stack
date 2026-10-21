@@ -1092,6 +1092,7 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
 fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
     let waves = dependency_waves(&report.stack.services, names);
     if waves.len() <= 1 {
+        prerequisites_ready(ctx, report, names, names)?;
         run_setups(ctx, report, names)?;
         cancelled(names)?;
         return start_watched(ctx, report, names);
@@ -1099,6 +1100,7 @@ fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
     let last = waves.len() - 1;
     for (i, wave) in waves.iter().enumerate() {
         let later = || json!({ "not_started": waves[i + 1..].iter().flatten().collect::<Vec<_>>() });
+        prerequisites_ready(ctx, report, wave, names).map_err(|e| e.with_detail(later()))?;
         run_setups(ctx, report, wave).and_then(|()| cancelled(wave)).map_err(|e| if e.code == "cancelled" { e.with_detail(later()) } else { e })?;
         start_watched_scoped(ctx, report, wave, Some(wave))?;
         // A request may return once the provider launched the process; what depends on this
@@ -1223,6 +1225,61 @@ fn dependency_waves(services: &IndexMap<String, Entry<Service>>, names: &[String
     }
     waves.retain(|w| !w.is_empty());
     waves
+}
+
+/// Every service one of `names` depends on, directly or through others, not in `names`.
+fn prerequisites_of(services: &IndexMap<String, Entry<Service>>, names: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut next: Vec<String> = names.to_vec();
+    while let Some(name) = next.pop() {
+        for dep in services.get(&name).map(|e| e.value.depends_on.clone()).unwrap_or_default() {
+            if !names.contains(&dep) && !found.contains(&dep) {
+                found.push(dep.clone());
+                next.push(dep);
+            }
+        }
+    }
+    services.keys().filter(|n| found.contains(n)).cloned().collect()
+}
+
+/// Fail, before anything of `starting` is set up or started, unless every service it depends
+/// on that is not among `names` (whose own starts come first, in waves) runs, verifies and
+/// passes its declared readiness. Such a service is never started here: `restart` starts only
+/// the services it was given and their dependents, so a prerequisite it was not given must
+/// already be up. `stack restart <it>` (which restarts its dependents too) or `stack up`
+/// recovers it. Nothing is asked of the supervisor when there is no such service.
+fn prerequisites_ready(ctx: &Ctx, report: &Report, starting: &[String], names: &[String]) -> Result<()> {
+    let outside: Vec<String> = prerequisites_of(&report.stack.services, starting).into_iter().filter(|p| !names.contains(p)).collect();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let (env, statuses) = mise::env_and_daemons(&ctx.root)?;
+    let mut unready = Vec::new();
+    for name in &outside {
+        let Some(entry) = report.stack.services.get(name) else { continue };
+        let status = statuses.iter().find(|d| d.name == *name);
+        let token = report.identities.get(name).map(String::as_str);
+        let reason = match verify_one(&ctx.root, &entry.value, report.ports.get(name).copied(), status, &env, token) {
+            Err(reason) => Some((reason, None)),
+            // A declared ready_cmd runs once, kept with what it answered when it fails.
+            Ok(_) if entry.value.ready_cmd.is_some() => ready_failure(ctx, report, &env, name)
+                .map(|failure| (format!("its ready_cmd does not pass ({})", failure["ready_cmd"].as_str().unwrap_or_default()), Some(failure))),
+            Ok(_) => (declared_ready(ctx, report, &env, name) == Some(false)).then(|| ("its ready_port is not accepting connections".to_string(), None)),
+        };
+        if let Some((reason, readiness)) = reason {
+            let needed_by: Vec<&String> = starting.iter().filter(|s| prerequisites_of(&report.stack.services, &[(*s).clone()]).contains(name)).collect();
+            unready.push(json!({ "service": name, "needed_by": needed_by, "reason": reason, "readiness": readiness }));
+        }
+    }
+    let Some(first) = unready.first() else { return Ok(()) };
+    let (dep, reason) = (first["service"].as_str().unwrap_or_default(), first["reason"].as_str().unwrap_or_default());
+    let needers: Vec<&str> = first["needed_by"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    Err(StackError::new(
+        "dependency_not_ready",
+        format!("{} depends on {dep}, which is not ready: {reason}; nothing was stopped, set up or started", needers.join(", ")),
+    )
+    .hint(format!("start it first: `stack restart {dep}` restarts it and what depends on it, `stack up` starts every service that is not running"))
+    .with_detail(json!({ "not_ready": unready, "not_started": starting })))
 }
 
 /// Every service that depends on one of `names`, directly or through others, not in `names`.
@@ -1808,6 +1865,11 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     if !dependents.is_empty() {
         steps.ok("dependents", json!(dependents));
         names.extend(dependents);
+    }
+
+    // What they depend on and are not restarted with must already run, or nothing is touched.
+    if let Err(e) = prerequisites_ready(ctx, &report, &names, &names) {
+        return Err(steps.fail("dependencies", e, false));
     }
 
     // Confirm the old processes are gone before starting new ones on the same ports.
@@ -4999,6 +5061,11 @@ mod tests {
         assert_eq!(dependents_of(&services, &names(&["db"])), names(&["api", "worker"]));
         assert_eq!(dependents_of(&services, &names(&["api"])), names(&["worker"]));
         assert!(dependents_of(&services, &names(&["worker", "other"])).is_empty());
+        // What a restart of only some services needs running first, through others too.
+        assert_eq!(prerequisites_of(&services, &names(&["worker"])), names(&["api", "db", "cache"]));
+        assert_eq!(prerequisites_of(&services, &names(&["worker", "api"])), names(&["db", "cache"]));
+        assert!(prerequisites_of(&services, &all).is_empty());
+        assert!(prerequisites_of(&services, &names(&["db", "other"])).is_empty());
     }
 
     #[cfg(unix)]

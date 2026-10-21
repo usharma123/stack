@@ -3791,6 +3791,74 @@ fn a_service_is_requested_only_once_the_services_it_depends_on_are_ready() {
     fixture.ok(&["down"]);
 }
 
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_nothing_when_it_is_not_ready() {
+    let fixture = Fixture::with_bundle(
+        "[bundle]\nname='test'\n[services.db]\nrun='true'\nready_cmd='test -f db-ready'\n[services.api]\nrun='true'\ndepends_on=['db']\nsetup='echo setup >> setup.log'\n",
+    );
+    let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
+    let (db, api) = (assigned_port(&fixture, "db"), assigned_port(&fixture, "api"));
+    // The supervisor's own listener stands for api; db is a socket this test holds, bound
+    // once the supervisor was first asked to start something.
+    fs::write(dir.join("listen-port"), api.to_string()).unwrap();
+    fs::write(dir.join("listen-service"), "api").unwrap();
+    let running = json!([{ "id": "app-test/db", "name": "db", "status": "running", "port": db }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
+    fs::write(dir.join("daemons-started.json"), running.to_string()).unwrap();
+    let (send, held) = std::sync::mpsc::channel();
+    let started = dir.join("started");
+    let binder = thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(60);
+        while !started.exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        send.send(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap()).unwrap();
+    });
+    fs::write(app.join("db-ready"), "").unwrap();
+    fixture.ok(&["up"]);
+    let mut db_socket = Some(held.recv().unwrap());
+    binder.join().unwrap();
+    let log = || fs::read_to_string(app.join("setup.log")).unwrap();
+    let requests = || fs::read_to_string(dir.join("start-requests.log")).unwrap();
+    let api_pid = || -> u32 { fs::read_to_string(dir.join("pf-tracked-pid")).unwrap().trim().parse().unwrap() };
+    assert_eq!((log(), requests()), ("setup\n".to_string(), "daemons start -- db\ndaemons start -- api\n".to_string()));
+    let pid = api_pid();
+
+    // db alive but failing its ready_cmd, then db stopped: `restart api` stops, sets up and
+    // starts nothing, and says why.
+    let refused = |case: &str| {
+        let session = fs::read(app.join(".stack/session.json")).unwrap();
+        let out = fixture.command(&["restart", "api", "--json"]).output().unwrap();
+        let error = json_result(&out)["error"].clone();
+        assert!(!out.status.success(), "{case}: {error}");
+        assert_eq!(error["code"], "dependency_not_ready", "{case}: {error}");
+        assert!(error["message"].as_str().unwrap().contains("api depends on db"), "{case}: {error}");
+        assert!(error["hint"].as_str().unwrap().contains("stack restart db"), "{case}: {error}");
+        assert_eq!((log(), requests()), ("setup\n".to_string(), "daemons start -- db\ndaemons start -- api\n".to_string()), "{case}: api was set up or requested");
+        assert!(pid_alive(pid) && api_pid() == pid, "{case}: the running api was stopped");
+        assert_eq!(fs::read(app.join(".stack/session.json")).unwrap(), session, "{case}: the session record changed");
+        error
+    };
+    fs::remove_file(app.join("db-ready")).unwrap();
+    let error = refused("db not ready");
+    assert!(error.to_string().contains("ready_cmd"), "{error}");
+    fs::write(app.join("db-ready"), "").unwrap();
+    drop(db_socket.take());
+    let stopped = json!([{ "id": "app-test/db", "name": "db", "status": "stopped", "port": db }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
+    fs::write(dir.join("daemons.json"), stopped.to_string()).unwrap();
+    refused("db stopped");
+
+    // With db running and ready again, the same restart sets api up and starts it anew.
+    db_socket = Some(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap());
+    fs::write(dir.join("daemons.json"), running.to_string()).unwrap();
+    let restarted = json_result(&fixture.ok(&["restart", "api", "--json"]));
+    assert_eq!(restarted["data"]["restarted"], json!(["api"]), "{restarted}");
+    assert_eq!(log(), "setup\nsetup\n");
+    assert_ne!(api_pid(), pid, "api was not started anew");
+    drop(db_socket);
+    fixture.ok(&["down"]);
+}
+
 /// A bundle whose `web` setup records its PID in `setup-ready` and waits; on SIGTERM it exits 0
 /// (`graceful`), or ignores it. `api`'s setup, run after it, would log to `api-setup.log`.
 fn cancellable_setup(graceful: bool) -> Fixture {

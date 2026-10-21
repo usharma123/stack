@@ -137,8 +137,9 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     fi
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     # A supervised listener (see `daemons start`) is reported with its real PID while alive.
+    # `listen-service`, when a test names one, is the only service the listener stands for.
     if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      "$py" -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
+      "$py" -c 'import json,sys; pid=int(sys.argv[2]); only=sys.argv[3]; d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting") and only in ("", e.get("name"))]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" "$(cat "$REVIEW_FIXTURE/listen-service" 2>/dev/null)"
     else
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
@@ -169,7 +170,8 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       exec sleep 600
     fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
-    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
+    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null \
+      && { ! test -f "$REVIEW_FIXTURE/listen-service" || test "$4" = "$(cat "$REVIEW_FIXTURE/listen-service")"; }; then
       # In a session of its own, as Pitchfork runs a service, when the request is to outlive it.
       detach=; test -f "$REVIEW_FIXTURE/hang-after-start" && detach=1
       "$py" -c 'import os,socket,sys,time; sys.argv[2] and os.setsid(); s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" "$detach" </dev/null >/dev/null 2>&1 &
@@ -231,6 +233,14 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
+    # With `listen-service`, `daemons stop -- NAME...` stops only those services, as mise does.
+    shift 2; test "${1-}" = -- && shift
+    if test -f "$REVIEW_FIXTURE/listen-service" && test $# -gt 0; then
+      only=" $* "
+      case "$only" in *" $(cat "$REVIEW_FIXTURE/listen-service") "*) kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null ;; esac
+      "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d if e.get("name") in sys.argv[2:] ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json" "$@"
+      exit 0
+    fi
     if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
     # A stopped supervised listener is reported stopped, like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port"; then
