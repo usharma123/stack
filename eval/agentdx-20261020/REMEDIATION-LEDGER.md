@@ -8,7 +8,9 @@ hands-on reports ([Opus](opus/REPORT.md), [Astra](astra/REPORT.md)) and the
 new. Raw evidence (git-ignored) is under `eval/results/agentdx-product-fixes-20261020/`.
 
 How these were checked, with the exact tested head, binary and every gate result, is in
-[REMEDIATION.md](REMEDIATION.md). Every row names its proof; "remaining limit" is what the fix
+[REMEDIATION.md](REMEDIATION.md). The independent review of `a401cfe` found four defects in this
+branch's own fixes; they and the statements they made wrong are in
+[Corrections after the independent review](#corrections-after-the-independent-review-round-2). Every row names its proof; "remaining limit" is what the fix
 does not do.
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
@@ -106,6 +108,37 @@ changes. Commit hashes are listed in the table at the end.
 | B1 | Benchmark follow-ups from the synthesis: a Compose/devcontainer control arm, a hosted Linux runner, a disposal task family, gating on the documented task loop now that R1 is fixed | benchmark, not product | Not done here: the benchmark files are unchanged on this branch so the approved harness still applies |
 | P5 | Not run in the sessions: OCI publish/pull, Worktrunk, Intel macOS, registering a real MCP client, skills, git/OCI bundles | coverage | Unchanged; e2e scenario 5 (OCI) still needs a registry |
 
+## Corrections after the independent review (round 2)
+
+The independent AI review of `a401cfe` (Astra) requested changes: four defects in this branch's
+own fixes, each reproduced against the frozen binary `1cad8602…`, and two evidence corrections
+(made in REMEDIATION.md). Each defect has one commit with its code, a test that fails without
+it, and its docs. "Before" is the reviewer's receipts (kept with the review, outside this
+repository) and the `before/` runs; "after" paths are under
+`eval/results/agentdx-product-corrections-r2-20261020/`.
+
+| # | Finding | Severity | Kind | Before | Fix | Proof after | Remaining limit |
+|---|---|---|---|---|---|---|---|
+| F1 | `gc --reclaim-data` followed a replaced directory above the data: with the recorded directory's parent moved and replaced by a link to an independent copy, marker included, it removed the copy's data and marker, exited 0 and reported the recorded path removed | P1 | defect, introduced by L1 (`227f9c0`) | reviewer `gc-copy-probe.json`, `gc-parent-symlink.json`; `before/f1-gc-bound-probe.json`: the old binary also removes a copy put in place | `18e50a7` | 6 unit tests in `datadirs` (link as the directory, link above it to a copy and to the directory itself, copy in place, swaps between the check and the removal, platform alias, links never followed, binding); runtime `gc_releases_…` (redirected parent and copy in place leave both trees whole; default keeps; a live checkout keeps; a normal reclaim removes only the directory and its marker, not a file beside them); `after/f1-gc-bound-probe.json`; reviewer probes rerun (`probes/reviewer/after`): nothing removed | Entries written before this fix, and data whose directory no verified `up` saw, are kept with a message, never removed. Unix only. If the data directory itself is swapped after the check, its contents go through the checked handle; the name that replaced it is kept |
+| F2 | A signal during a service's `setup` was passed on, but a setup that handled it and exited 0 counted as success: `up` started the service and exited 0 (real mise 2026.10.3, Pitchfork 2.29.0); MCP did the same | P1 | defect, R6b with R2 | reviewer `setup-cancel.json`, `setup-after-cancel-status.json`; `before/f2-setup-cancel-runtime.log` | `33a9a07` | runtime tests: setup exiting 0 on SIGTERM, and one ignoring it until a second signal, via CLI and MCP: `cancelled`, exit 143, the later setup not run, no start request, an unrelated process survives; `decide` unit case; reviewer `lifecycle_probes.py` rerun: exit 143, nothing started, status unhealthy; `after/lifecycle-supplement/`: an ignoring setup with one SIGTERM ends after the 10 s grace, exit 143, the second service's setup not run | A signal at any other point of `up` or `restart` still ends Stack at once, with no JSON result, as before; the launch record is kept either way |
+| F3 | Restarting a dependent alone ran its setup and started it while a dependency outside the restart was down; only final verification failed (exit 124) | P2 | defect, R6a/R6b | reviewer `dep-restart-with-dead-db.json`; `before/f3-dependency-restart-runtime.log` (restart succeeded with the dependency failing its ready_cmd) | `2afca9f` | runtime test: dependency failing its ready_cmd, then stopped: `dependency_not_ready`, nothing stopped, set up or started, session record byte-identical; then a positive control; unit test of `prerequisites_of`; reviewer probe rerun: exit 1, setup log unchanged; `after/lifecycle-supplement/` (real): an unready dependency refused with db, cache and api PIDs, process identities and session id kept, then the control restarts only api | Documented policy: `restart` never starts a dependency it was not given; `stack restart <dependency>` or `stack up` recovers it |
+| F4 | `stack init` checked `exists()` then wrote: 12 concurrent inits gave several successes on one path; a dangling `stack.toml` link was followed to create a file outside the project | P2 | defect, X2 | reviewer `init-race-*.json`, `init-dangling-link.json`; `probes/reviewer/before`: 6 of 12 succeeded; `before/f4-init-unit.log` (12 of 12) | `c25702f` | unit tests: 12 threads with 250 tools each, one winner, the rest `project_exists`, the file whole, no temporary file left, mode as `fs::write`; dangling and live links untouched; reviewer `file_probes.py` rerun: 1 of 12 succeed, the dangling link is refused and nothing is created outside | An interrupted init can leave a hidden `.stack.toml.*` temporary file, never a partial `stack.toml` |
+
+### Statements the findings made wrong
+
+These rows above were accurate about what was tested, but claimed more than the code did:
+
+- **L1** said data is removed only if `up` recorded it and its marker still names the checkout.
+  The path could be redirected above the marker (F1). Data is now also bound to where it
+  resolved and which directory it is.
+- **R2** said a signal is passed on and Stack then ends as the signal asked. During a setup
+  (R6b) the start went on (F2).
+- **R6a/R6b** and `bundles.md` said a setup runs once the services it depends on verified. That
+  held for `up`'s waves, not for `restart` of a dependent alone (F3).
+- **X2** "never replaces" was a check followed by a write (F4).
+- The pilot's isolation and transcript wording, and who can satisfy the review gate, are
+  corrected in [REMEDIATION.md](REMEDIATION.md#real-agent-pilot).
+
 ## Commits
 
 | Commit | Subject |
@@ -141,3 +174,7 @@ changes. Commit hashes are listed in the table at the end.
 | `2aef819` | docs(identity): say that commands see the identity tokens |
 | `ec06451` | docs(up): say where a service's data directory is |
 | `15ff636` | fix(redis): start under any caller's locale |
+| `c25702f` | fix(init): publish stack.toml whole and never over another file (F4) |
+| `33a9a07` | fix(up): let a signal during a service's setup cancel the start (F2) |
+| `2afca9f` | fix(restart): check what a service depends on before touching it (F3) |
+| `18e50a7` | fix(gc): reclaim only the data directory up saw, through what was checked (F1) |

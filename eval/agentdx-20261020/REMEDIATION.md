@@ -12,10 +12,98 @@ fingerprints changed, so the harness that was approved at `065086d` is still the
 Raw evidence is git-ignored, under `eval/results/agentdx-product-fixes-20261020/`. Paths
 below are relative to that directory.
 
-Independent review of this branch has not happened yet. Nothing here was pushed, released or
-published, and 0.1.22 is still not on npm. Every binary below is a source build.
+The first independent review (Astra, an AI reviewer, of `a401cfe`) requested changes: four
+defects in this branch's own fixes and two evidence corrections. Both are dealt with in
+[round 2](#round-2-corrections-after-the-independent-review); a new independent review of the
+corrected head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
+not on npm. Every binary below is a source build.
 
-## Tested code
+## Round 2: corrections after the independent review
+
+| | |
+|---|---|
+| Tested head | `18e50a79c6a39a34d5457af0e1df50f01d5bf293`, clean tree: the 31 round-1 commits plus one per finding, F4 `c25702f`, F2 `33a9a07`, F3 `2afca9f`, F1 `18e50a7`. The documentation commits after it change no code |
+| Binary | `cargo build --locked` (cargo 1.93.1, debug), `stack 0.1.22`, sha256 `03fd21e68bdee0205850121228b43ec895c09ea3307c2fd57852d118cf4a8784`, frozen in `gates/bin/stack`. `cargo test` rebuilt the same hash |
+| Evidence | `eval/results/agentdx-product-corrections-r2-20261020/` (git-ignored; paths in this section are relative to it). Round 1's directories are untouched |
+
+What each finding was, its fix, proof and remaining limit are in the
+[ledger](REMEDIATION-LEDGER.md#corrections-after-the-independent-review-round-2). In short:
+
+- **F1** `gc --reclaim-data` followed a directory above the data that had been replaced by a
+  link, and removed an independent copy. Data is now bound to where it resolved and which
+  directory it is, reached without following links, and removed through the handles checked.
+- **F2** A setup that handled SIGTERM and exited 0 let `up` start the service and exit 0. A
+  signal passed on to a setup now cancels the start (`cancelled`, exit 128 plus the signal).
+- **F3** `restart` of a dependent alone ran its setup and started it with a dependency down.
+  A dependency outside the restart must now run and be ready first, or nothing is touched.
+- **F4** Concurrent `stack init`s could overwrite each other, and a dangling link was
+  followed. The manifest is now published whole by a rename that never replaces anything.
+
+Each fix's new tests fail on the code before it (`before/*.log`) and pass after (`after/*.log`). F1's
+runtime test fails first at its new assertion that `up` records the location; the unsafe
+removal itself is shown by the old binary in `before/f1-gc-bound-probe.json`.
+
+### Gates at the round-2 head (`gates/`)
+
+| Gate | Result |
+|---|---|
+| `cargo clippy --locked --all-targets -- -D warnings` (1.93.1) | exit 0 |
+| `cargo test --locked --all-targets` | exit 0: 518 passed, 0 failed, 1 ignored, across 15 test binaries (round 1's 508 plus 10 new tests) |
+| `node --test tests/*.test.mjs` | exit 0: 41 pass, 1 skipped |
+| Provider boundary against the real mise (`/opt/homebrew/bin/mise` 2026.10.3) | exit 0 |
+| `tests/e2e/native.sh`, macOS 15.7.2 arm64 | exit 0: 12 of 12, including `5-oci` against a run-owned `registry:2` container removed afterwards, and `7-deleted-project`, whose `gc --reclaim-data` removes real Redis data through the new binding |
+| `bench/regressions.py`, cold | exit 0: all six `FIXED`, controls passed, cleanup clean, `globals_changed: []` |
+| Eight validation cells, cold | all valid, as in round 1, task loop passing before and after in every cell |
+| Bench unit tests | 124 pass in the checkout and in a clean `git archive HEAD` export |
+| Linux, local Docker LinuxKit arm64 (`linux/`), not a hosted runner | Debian, `rust:1.93`, built from `18e50a7` as an unprivileged user (binary `afa55da9…`). Unit tests 227 passed, 1 ignored; the runtime tests these fixes touch 25 passed; the six regressions cold all `FIXED`, cleanup clean, `globals_changed: []` (`linux/`). The native e2e suite passed 11 of 11 run scenarios, OCI skipped for want of a registry, `7-deleted-project` included (`linux-e2e/`). Both containers were run-owned and removed |
+
+The global Stack/mise/Pitchfork hash receipt (`globals-before.json`, `globals-after.json`,
+taken with the benchmark's `globals_snapshot()`) is identical to round 1's.
+
+### Probes
+
+- **The reviewer's own scripts** (`probes/reviewer/`) ran against the round-1 binary
+  (`before/`) and the round-2 binary (`after/`). Only their output directory and binary path
+  were changed (`adaptation.diff`; original hashes in `original-sha256.txt`). Concurrent init:
+  6 of 12 succeeded before, 1 after, every other one `project_exists`; the dangling link was
+  followed before and is refused, with nothing created, after. GC: the copy's data and marker
+  were removed before and nothing is removed after. Those GC probes write a ledger without the
+  new location, which the round-2 binary keeps for that reason alone, so
+  `scripts/gc_bound_probe.py` repeats them with an entry bound as `up` now records it:
+  before, the redirected parent and a copy in place lose their data; after, both are left
+  whole and say why, the default keeps the data, and a normal reclaim removes only the
+  directory and its marker, not a file beside them (`before|after/f1-gc-bound-probe.json`).
+- **Real mise 2026.10.3 and Pitchfork 2.29.0**, every Stack, mise, Pitchfork and XDG directory
+  isolated: the reviewer's `lifecycle_probes.py` now gives `dependency_not_ready` (exit 1,
+  setup log unchanged) and `cancelled` (exit 143, nothing started, status unhealthy).
+  `scripts/lifecycle_supplement.py` adds a setup ignoring SIGTERM (cancelled after the 10 s
+  grace, exit 143, the second service's setup not run), an alive dependency failing its
+  ready_cmd (refused, with db, cache and api PIDs, process identities and the session id
+  unchanged), and a positive control restarting only api. Signals went only to
+  identity-checked PIDs, the unrelated sentinel survived, unsaved files were unchanged and no
+  process of the probe roots was left.
+
+### What was not rerun
+
+- The six-trial pilot (below) ran against round 1's binary and describes it only. No new agent
+  trial was run.
+- On Linux the whole Rust suite was not run: the unit tests and the runtime tests these fixes
+  touch were (above).
+- No hosted runner, Linux x64 or Intel macOS (an Intel macOS `cargo check` compiles).
+
+### Remaining limits of round 2
+
+- Data recorded before F1's fix, and data whose directory no verified `up` saw, are reported
+  and kept, never removed, until an `up` binds them. Reclaiming is Unix only.
+- Outside a setup, a signal during `up` or `restart` still ends Stack at once, with no JSON
+  result, as before; the launch record is kept for `status` and `down`.
+- `restart` never starts a dependency it was not given: `stack restart <dependency>` or
+  `stack up` does.
+- An interrupted `stack init` can leave a hidden `.stack.toml.*` temporary file.
+
+## Round 1
+
+### Tested code
 
 - Tested head: `15ff636c190d6e8ee96cc9ab7be4e16df19db9a8`, clean tree. It has 31 commits since
   `065086d`; the ledger maps each one to its finding.
@@ -28,7 +116,7 @@ published, and 0.1.22 is still not on npm. Every binary below is a source build.
   fixed in that same commit (`gates-r2/amend-note.txt`), and `gates-r2/clippy-2.log` exits 0.
   The product code is identical, and so is the binary hash.
 
-## Gates at the tested head (all from `gates-r2/`)
+### Gates at the tested head (all from `gates-r2/`)
 
 | Gate | Result |
 |---|---|
@@ -46,7 +134,7 @@ The global Stack/mise/Pitchfork hash receipt was taken with the benchmark's own
 `globals_snapshot()`, and it records hashes only. It is identical to the predecessor's
 start-of-work receipt (`gates-r2/globals-before.json` against `globals-before-start.json`).
 
-### Earlier gate runs, kept as they were
+#### Earlier gate runs, kept as they were
 
 These ran at `ec06451`, before the Redis fix, with binary `9d99203b…`. They are in `gates/`:
 
@@ -63,7 +151,7 @@ These ran at `ec06451`, before the Redis fix, with binary `9d99203b…`. They ar
   `task-env-provenance-real-mise-2.log` passes.
 - Warm and cold validation, cold regressions and both bench test runs passed there too.
 
-### Linux (local Docker LinuxKit arm64, Debian 13, not a hosted runner)
+#### Linux (local Docker LinuxKit arm64, Debian 13, not a hosted runner)
 
 - `linux/`, at `ec06451`: the source build and `setup` succeeded as an unprivileged user, and
   e2e passed 11 of 11 run scenarios. As root, `up` refused Postgres in 9 ms, before any download
@@ -76,12 +164,12 @@ These ran at `ec06451`, before the Redis fix, with binary `9d99203b…`. They ar
 - Linux was not re-run after the test-only amend.
 - There was no hosted Linux, Linux x64 or Intel macOS run, and no hosted-agent vendor run.
 
-## Real-agent pilot
+### Real-agent pilot
 
 This is the first real-agent run of the benchmark: one model, three tasks, both arms, one
-repetition, so six trials. It ran in `pilot-r2/` against the final binary above.
+repetition, so six trials. It ran in `pilot-r2/` against the round-1 binary above (`1cad8602…`).
 
-### Setup
+#### Setup
 
 | | |
 |---|---|
@@ -90,7 +178,7 @@ repetition, so six trials. It ran in `pilot-r2/` against the final binary above.
 | Plan | `pilot-r2/plan.json`: seed 20261020, warm cache `/tmp/afx-warm`, `LANG=en_US.UTF-8`, a 600 s budget per trial (60 minutes at most in total), counterbalanced order, run by `pilot-r2/run.sh` |
 | The predecessor's plan | `pilot/plan.json` was kept unchanged and never run. Its argv put the prompt after the variadic `--disallowedTools`, which swallows it: `argv-check/old-argv.*` exits 1 with "Input must be provided". This plan moves `{prompt}` to straight after `-p` (`argv-check/new-argv.*`, exit 0) and binds the final binary. The arm order is the same |
 
-### Outcome (`pilot-r2/report.json`, re-derived from hashed receipts)
+#### Outcome (`pilot-r2/report.json`, re-derived from hashed receipts)
 
 | Trial | Hidden checks + smoke | Agent seconds | Turns | Bash / Write calls | Left at agent exit | CLI-reported cost (USD, list) |
 |---|---|---|---|---|---|---|
@@ -116,7 +204,7 @@ repetition, so six trials. It ran in `pilot-r2/` against the final binary above.
   record and assistant message; high effort is shown by the launch argv, and no server-side
   effort value is observable.
 
-### What the transcripts show
+#### What the transcripts show
 
 These are facts only; reading them is the reviewer's job.
 
@@ -134,7 +222,7 @@ These are facts only; reading them is the reviewer's job.
 - **Global state was not touched.** The Stack/mise/Pitchfork hash receipts are identical
   before and after (`pilot-r2/globals-*.json`), and no trial process remained afterwards.
 
-### Independent AI transcript review (not a human review)
+#### Independent AI transcript review (not a human review)
 
 The independent reviewer of `a401cfe` (Astra, an AI agent: GPT-6-Astra, high effort) read all six
 complete transcripts. Its summary, its six per-trial reviews and its supplement report are kept
@@ -164,7 +252,7 @@ unchanged (sha256 `60aa3b11…`), and the reviewer re-derived it exactly with th
 harness: 6 verified, 6 unreviewed, no scored pairs, `complete: false`, `publishable: false`, and
 no autonomy claim.
 
-### Limits
+#### Limits
 
 - Six trials with one repetition is a smoke test of the method. It supports no comparison
   between arms, no speedup and no statistics.
