@@ -86,7 +86,7 @@ repetition, so six trials. It ran in `pilot-r2/` against the final binary above.
 | | |
 |---|---|
 | Agent | Claude Code 2.1.304 (`/Users/utsavsharma/.local/bin/claude`), model `claude-opus-5-5`, `--effort high`. The effort setting is bound into argv by the plan (`agent_options_binding`) |
-| Isolation | Each trial gets a fresh CLI process and context, with `--safe-mode` (no CLAUDE.md, memory, plugins, hooks or MCP), `--strict-mcp-config`, `--no-session-persistence` and `--disable-slash-commands`. `Read`/`Edit` of the source checkout are denied, and stdin is closed. The CLI's normal login route was used; no credential was copied or printed |
+| Isolation | Each trial gets a fresh CLI process and context. Its hashed argv (`agent.json`) passes `--safe-mode`, `--strict-mcp-config`, `--no-session-persistence` and `--disable-slash-commands`, denies `Read`/`Edit` of the source checkout, and stdin is closed. That is what was asked, not proof of what the CLI did: every init record lists no MCP servers, skills or slash commands, but all six also list 13 plugins. No plugin tool use appears in any transcript, which does not show that plugins had no effect. The `Read`/`Edit` denials are not a sandbox; Bash could still have reached the checkout. The CLI's normal login route was used; no credential was copied or printed |
 | Plan | `pilot-r2/plan.json`: seed 20261020, warm cache `/tmp/afx-warm`, `LANG=en_US.UTF-8`, a 600 s budget per trial (60 minutes at most in total), counterbalanced order, run by `pilot-r2/run.sh` |
 | The predecessor's plan | `pilot/plan.json` was kept unchanged and never run. Its argv put the prompt after the variadic `--disallowedTools`, which swallows it: `argv-check/old-argv.*` exits 1 with "Input must be provided". This plan moves `{prompt}` to straight after `-p` (`argv-check/new-argv.*`, exit 0) and binds the final binary. The arm order is the same |
 
@@ -112,7 +112,9 @@ repetition, so six trials. It ran in `pilot-r2/` against the final binary above.
 - **Usage and cost** are the CLI's own `result` figures, at list prices. They are not a billing
   record. Total: $1.04 and 242 s of agent time.
 - **Background model calls.** The CLI also made tiny `claude-haiku-5-5` calls of its own,
-  visible in `modelUsage` at about $0.0001 each.
+  visible in `modelUsage` at about $0.0001 each. Opus 5.5 is the main model in every init
+  record and assistant message; high effort is shown by the launch argv, and no server-side
+  effort value is observable.
 
 ### What the transcripts show
 
@@ -125,11 +127,42 @@ These are facts only; reading them is the reviewer's job.
   documented L6 behaviour, since `--stop-supervisor` is opt-in. The ledger records it as
   pilot observation O1. The harness stopped the supervisor in teardown, which it does for every
   Stack trial.
-- **No agent read or referenced the source checkout.** Its path appears in no transcript.
-  Agents edited the arm's smoke test in the slug task. The grader never takes benchmark-owned
-  files from a submission.
+- **No source-checkout access was observed.** Its path appears in none of the six transcripts.
+  That describes these transcripts; it is not a sandbox guarantee (see Isolation). Both slug
+  agents extended the arm's smoke test. The grader never takes benchmark-owned files from a
+  submission, so the protected original smoke test and the hidden checks decided those grades.
 - **Global state was not touched.** The Stack/mise/Pitchfork hash receipts are identical
   before and after (`pilot-r2/globals-*.json`), and no trial process remained afterwards.
+
+### Independent AI transcript review (not a human review)
+
+The independent reviewer of `a401cfe` (Astra, an AI agent: GPT-6-Astra, high effort) read all six
+complete transcripts. Its summary, its six per-trial reviews and its supplement report are kept
+with their source hashes in
+`../agentdx-product-corrections-r2-20261020/ai-pilot-review/` (relative to the evidence root
+above). It found:
+
+- All six receipt-verified task outcomes stand. No human intervention or help request, and no
+  source-checkout, hidden-grader, oracle or private-configuration access, appears in the tool
+  calls, and nothing suggests an answer passed between trials.
+- The ledger/existing agent's own test changed a seeded amount, so its baseline smoke failed
+  after a restart. The agent restored the seed and reran the smoke itself: recovery, not help.
+- Both Stack service agents stopped with a plain `stack down`, leaving the root's supervisor to
+  the harness's teardown (O1). That is not complete cleanup by the agent.
+- The Stack slug agent left `/tmp/slugcheck.mjs`, outside the trial root: a file-hygiene limit.
+  The file is still there. It was not deleted, because nothing proves it belongs to that trial
+  alone.
+- The two catalog agents used the same global temporary backup name, one after the other; each
+  removed it.
+- The CLI-reported list cost of all six is $1.0382743 (not a billing record), and the agent time
+  242.2 s, excluding harness start-up and grading.
+
+That review is an AI review. The protocol requires a human one: "A human reviewer fills
+`review.json`" (`bench/AGENTDX-PROTOCOL.md` line 158, also its line 19 and `run.py`'s report limits). So
+it does not satisfy that gate. No `review.json` was written, `pilot-r2/report.json` is
+unchanged (sha256 `60aa3b11…`), and the reviewer re-derived it exactly with the unchanged
+harness: 6 verified, 6 unreviewed, no scored pairs, `complete: false`, `publishable: false`, and
+no autonomy claim.
 
 ### Limits
 
@@ -138,8 +171,11 @@ These are facts only; reading them is the reviewer's job.
 - The tasks are small and synthetic, and every trial passed in both arms. These tasks therefore
   do not separate the arms on this model.
 - Local macOS only. No hosted agent ran, because no safely configured hosted route existed here.
-- An independent human or Astra transcript review is still needed before any trial can count
-  as autonomous.
+- No trial counts as autonomous until a human reviews its transcript and fills `review.json`,
+  as the protocol requires. The AI review above does not satisfy that, and no human review has
+  been done.
+- The pilot describes binary `1cad8602…` (tested head `15ff636`) only. It was not rerun after
+  the corrections that followed the independent review.
 
 ## What remains open
 
