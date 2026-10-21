@@ -14,9 +14,112 @@ below are relative to that directory.
 
 The first independent review (Astra, an AI reviewer, of `a401cfe`) requested changes: four
 defects in this branch's own fixes and two evidence corrections. Both are dealt with in
-[round 2](#round-2-corrections-after-the-independent-review); a new independent review of the
-corrected head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
+[round 2](#round-2-corrections-after-the-independent-review). The second (Astra, of `f58c09f`)
+passed F1 and F4 and the ordinary F2 and F3 cases, and requested changes for one boundary case
+of each of F2 and F3; they are dealt with in
+[round 3](#round-3-corrections-after-the-second-independent-review). A new independent review of
+the round-3 head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
 not on npm. Every binary below is a source build.
+
+## Round 3: corrections after the second independent review
+
+| | |
+|---|---|
+| Tested head | `ba5360f5af432fd0a98a97da3d1e3f83ef849b33`, clean tree: round 2's head `f58c09f` plus one commit per finding, R3-F2 `dbb5085`, R3-F3 `ba5360f`. The documentation commit after it changes no code |
+| Binary | `cargo build --locked` (cargo 1.93.1, debug), `stack 0.1.22`, sha256 `ce14a650eedd7c1c5345a276adf8e920864b15f402900304a0cfac7c05217b99`, frozen in `gates/bin/stack`. `cargo test` rebuilt the same hash |
+| Evidence | `eval/results/agentdx-product-corrections-r3-20261020/` (git-ignored; paths in this section are relative to it). Rounds 1 and 2's directories are untouched |
+
+What each finding was, its fix, proof and remaining limit are in the
+[ledger](REMEDIATION-LEDGER.md#corrections-after-the-second-independent-review-round-3). In short:
+
+- **R3-F2** Stack's signal handler only records a signal; a separate thread acts on it. A
+  command's run returned without waiting for that thread, so when it ran late a setup that got
+  SIGTERM and exited 0 was judged by its exit status: `up` went on and succeeded. A run now
+  returns only once every signal that arrived while its command ran was acted on, and no
+  command starts while a signal that already arrived is unhandled.
+- **R3-F3** The restart prerequisite gate took a `ready_cmd` that could not be spawned or read
+  as passing, and stopped the dependent. A `ready_cmd` now passes only when it ran and exited 0
+  in time; one that could not run is `dependency_not_ready` with the reason, before anything is
+  touched, and timeout reports name it too.
+
+Both reproduced on round 2's frozen binary `03fd21e6…` before any change, with the reviewer's
+own scripts unmodified (`before/late-signal/`: exit 0, the later setup ran, status healthy;
+`before/readiness-spawn/`: api stopped, then `setup_failed`). R3-F2's schedule is controlled:
+the reviewer's test-only interposer (`probes/reviewer/delay_forwarder_v2.*`, hashes in
+`source-sha256.txt`) holds Stack's signal thread 500 ms after it reads a real SIGTERM. It was
+loaded only into the probes' own Stack invocations and changes no source. That shows the
+ordering defect; it is not a claim about how often a scheduler stalls that long.
+
+Each fix's new tests fail on the code before it and pass after (`before|after/*.log`). R3-F2's
+two unit tests run in a process of their own, with Stack's signal thread held by a test-only
+gate (compiled into test builds only), so the schedule is deterministic rather than timed;
+without the fix one returns before the signal was handled and the other starts a command first
+(`before/f2-unit-revert.diff` is exactly what was removed for that run). Both passed 20 of 20
+repeated runs (`after/f2-unit-repeat20.txt`).
+
+### Gates at the round-3 head (`gates/`)
+
+| Gate | Result |
+|---|---|
+| `cargo clippy --locked --all-targets -- -D warnings` (1.93.1) | exit 0 |
+| `cargo test --locked --all-targets` | exit 0: 520 passed, 0 failed, 3 ignored, across 15 test binaries (round 2's 518 plus R3-F2's two; R3-F3 extends two existing runtime tests; the two new ignored tests are R3-F2's inner halves, run by the passing ones) |
+| `node --test tests/*.test.mjs` | exit 0: 41 pass, 1 skipped |
+| Provider boundary against the real mise (`/opt/homebrew/bin/mise` 2026.10.3) | exit 0 |
+| `tests/e2e/native.sh`, macOS 15.7.2 arm64 | exit 0: 12 of 12, including `5-oci` against a run-owned `registry:2` container removed afterwards |
+| `bench/regressions.py`, cold | exit 0: all six `FIXED`, controls passed, cleanup clean, `globals_changed: []` |
+| Eight validation cells, cold | all valid: no-op rejected, reference passing, task loop passing before and after, cleanup clean, `globals_changed: []` in every cell |
+| Bench unit tests | 124 pass in the checkout and in a clean `git archive HEAD` export |
+| Linux, local Docker LinuxKit arm64 (`linux/`, `linux-e2e/`), not a hosted runner | Debian, `rust:1.93`, built from `ba5360f` as an unprivileged user (binary `9aef4e56…`). Unit tests 229 passed, 3 ignored, R3-F2's two included; the runtime tests these fixes touch 26 passed, R3-F3's two included; the six regressions cold all `FIXED`, `globals_changed: []`. The native e2e suite passed 11 of 11 run scenarios, OCI skipped for want of a registry. Both containers were run-owned and removed |
+
+The global Stack/mise/Pitchfork hash receipt (`globals-before.json`, `globals-after.json`) is
+identical before and after, and to round 2's final one.
+
+### Probes, on the frozen binary
+
+- **The reviewer's scripts, unmodified** (`probes/reviewer/`, hashes checked against the review
+  directory; only the binary and output directory arguments differ; `file_probes.py`, which
+  names both inside the script, has `file_probes.py.adaptation.diff`). `late_signal_v2.py`
+  (delayed thread) and its control: exit 143, `cancelled`, the later setup not run, status
+  unhealthy, sentinel alive. `readiness_spawn_v2.py`: the ordinary-PATH control and the no-`sh`
+  restart are both `dependency_not_ready`, db and api identities and the session bytes kept.
+  F1 and F4 controls still pass: `real_gc_v2.py` (real Redis 7.4.7 ledger entry from `up`)
+  keeps the data by default, leaves the redirected-parent and copy-in-place trees whole, and a
+  normal reclaim removes only the data directory and its marker; `file_probes.py` gives 1 of 12
+  concurrent inits succeeding (`after/reviewer/`).
+- **`scripts/late_signal_r3.py`**, real mise 2026.10.3 and Pitchfork 2.29.0, every Stack, mise,
+  Pitchfork and XDG directory isolated, under the same delayed thread: a setup exiting 0 via
+  the CLI, a setup ignoring SIGTERM (ended after the 10 s grace), the same via MCP (the call is
+  answered `cancelled`, `isError`, and the server exits 143), and a dependency wave already
+  started before the cancelled setup. Every case is `cancelled`, exit 143, no later setup ran,
+  the cancelled service was not started; in the last case the started dependency stays
+  recorded and `down` stops it. Round 2's binary (`before/late-signal-r3/`) instead succeeds via
+  the CLI and MCP and starts the cancelled service in the wave case.
+- **`scripts/readiness_r3.py`**, real mise and Pitchfork: with db's ready_cmd failing, unable to
+  run with its marker absent, and unable to run with its marker present, `restart api` is
+  `dependency_not_ready` with identities, setup log and session bytes kept; with db ready, the
+  restart replaces only api; with db's process ended (identity-checked SIGTERM), it is refused.
+  Round 2's binary (`before/readiness-r3/`) stops api in the no-`sh` case and then reports the
+  session stale.
+
+Signals went only to identity-checked PIDs; the unrelated sentinels survived, unsaved files
+were unchanged, and no process of any probe root was left.
+
+### What was not rerun
+
+- No agent trial. The six-trial pilot describes round 1's binary only; its report still hashes
+  `60aa3b11…`, and it remains unreviewed by a human.
+- On Linux the whole Rust suite was not run: the unit tests and the runtime tests these fixes
+  touch were.
+- No hosted runner, Linux x64 or Intel macOS.
+
+### Remaining limits of round 3
+
+- A signal the kernel has not yet delivered to Stack's handler when a setup's command is
+  retired belongs to what follows: it is passed on to the next command, or ends Stack. It is
+  never taken as success. Waiting for the signal thread is not bounded by a timeout; that
+  thread does nothing but read reports and pass signals on.
+- A `ready_cmd` that cannot run blocks `restart` of what depends on it until it can; `up`
+  waits for it, then times out naming why.
 
 ## Round 2: corrections after the independent review
 

@@ -10,7 +10,10 @@ new. Raw evidence (git-ignored) is under `eval/results/agentdx-product-fixes-202
 How these were checked, with the exact tested head, binary and every gate result, is in
 [REMEDIATION.md](REMEDIATION.md). The independent review of `a401cfe` found four defects in this
 branch's own fixes; they and the statements they made wrong are in
-[Corrections after the independent review](#corrections-after-the-independent-review-round-2). Every row names its proof; "remaining limit" is what the fix
+[Corrections after the independent review](#corrections-after-the-independent-review-round-2).
+The second independent review, of `f58c09f`, found one boundary case of each of round 2's F2
+and F3 fixes still wrong; they are in
+[round 3](#corrections-after-the-second-independent-review-round-3). Every row names its proof; "remaining limit" is what the fix
 does not do.
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
@@ -139,6 +142,28 @@ These rows above were accurate about what was tested, but claimed more than the 
 - The pilot's isolation and transcript wording, and who can satisfy the review gate, are
   corrected in [REMEDIATION.md](REMEDIATION.md#real-agent-pilot).
 
+## Corrections after the second independent review (round 3)
+
+The independent AI review of `f58c09f` (Astra) found F1 and F4 passing the checks it made, and
+the ordinary F2 and F3 cases passing, but requested changes for one boundary case of each. Both
+reproduced against the frozen round-2 binary `03fd21e6…` here before any change
+(`before/late-signal`, `before/readiness-spawn`). Each has one commit with its code, tests that
+fail without it, and its docs. "After" paths are under
+`eval/results/agentdx-product-corrections-r3-20261020/`.
+
+| # | Finding | Severity | Kind | Before | Fix | Proof after | Remaining limit |
+|---|---|---|---|---|---|---|---|
+| R3-F2 | A signal Stack received during a setup could be acted on only after later setups and starts: the handler records a signal and a separate thread acts on it, but a command's run returned without waiting for that thread. With that thread held 500 ms after reading a real SIGTERM (a test-only interposer, no source change), a setup that signalled Stack and exited 0 let `up` run the next setup, start both services and exit 0; MCP answered success; a dependent wave started the service whose setup was cancelled | P1 | defect in F2's fix (`33a9a07`) | reviewer `late-signal-v2/`, `late-signal-rebuilt/`; `before/late-signal/` (exit 0, later setup ran, healthy); `before/late-signal-r3/` (CLI and MCP succeed, partial case starts api) | `dbb5085` | unit tests in a process of their own, the signal thread held by a test-only gate: a command that signals Stack and exits 0 does not return until the signal is handled, then counts it; a signal that arrived between commands ends Stack before the next command starts (`before|after/f2-unit.log`); reviewer `late_signal_v2.py` and its control rerun unmodified on the frozen binary (`after/reviewer/`): exit 143, `cancelled`, the later setup not run, status unhealthy; `after/late-signal-r3/`: CLI graceful, CLI ignoring SIGTERM (10 s grace), MCP, and a started dependency wave, all `cancelled` exit 143 under the delayed thread, no later setup, the cancelled service not started, the started dependency recorded and stopped by `down`, sentinel alive | A signal the kernel has not yet delivered to Stack's handler when a setup is retired belongs to what follows: it is passed on to the next command or ends Stack, never a success. Handling waits for the signal thread; it is not bounded by a timeout |
+| R3-F3 | The restart prerequisite gate took a `ready_cmd` Stack could not spawn or read as passing: with real mise and Pitchfork and no `sh` on the stack's PATH, `restart api` stopped the running api, then failed `setup_failed`; db's readiness was never established and the session was left unverified | P2 | defect in F3's fix (`2afca9f`) | reviewer `readiness-spawn-v2/`, `readiness-spawn-rebuilt/`; `before/readiness-spawn/`; `before/readiness-r3/` (api stopped, later commands `session_stale`) | `ba5360f` | runtime restart test gains the no-`sh` case: `dependency_not_ready` naming why the check could not run, identities, setup log, requests and session bytes kept; the declared-readiness test checks the timeout report names an unrunnable check (`before|after/f3-*.log`); reviewer `readiness_spawn_v2.py` rerun unmodified (`after/reviewer/`): `dependency_not_ready`, both identities and the session bytes kept; `after/readiness-r3/` (real): nonzero readiness, unrunnable with the marker absent and present, all refused with identities and session bytes kept; a successful restart replaces only api; a dead dependency is refused | An unrunnable `ready_cmd` blocks `restart` of its dependents until it can run; `up` waits for it, then times out naming why |
+
+### Statements the findings made wrong
+
+- **F2** (round 2) said a signal passed on to a setup cancels the start "whatever the setup's
+  exit status". That held only once the signal thread had acted on it before the setup's run
+  returned (R3-F2).
+- **F3** (round 2) said a dependency outside the restart must "pass its declared readiness".
+  A check that could not run was counted as passing (R3-F3).
+
 ## Commits
 
 | Commit | Subject |
@@ -178,3 +203,5 @@ These rows above were accurate about what was tested, but claimed more than the 
 | `33a9a07` | fix(up): let a signal during a service's setup cancel the start (F2) |
 | `2afca9f` | fix(restart): check what a service depends on before touching it (F3) |
 | `18e50a7` | fix(gc): reclaim only the data directory up saw, through what was checked (F1) |
+| `dbb5085` | fix(process): act on every signal a command got before judging it (R3-F2) |
+| `ba5360f` | fix(restart): never take a ready_cmd that could not run as passing (R3-F3) |
