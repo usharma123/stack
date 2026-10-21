@@ -2582,7 +2582,7 @@ fn supervisor_lock(state_dir: &Path) -> PathBuf {
 fn using_supervisor(ctx: &Ctx, state_dir: &Path) -> Result<UsingSupervisor> {
     let lock = SharedLock::shared(&supervisor_lock(state_dir))?;
     confirm_addressed(&ctx.root, state_dir)?;
-    let target = mise::Target::bind(&ctx.state.join("supervisor-bindings"), state_dir)?;
+    let target = mise::Target::bind(&ctx.root, &ctx.state.join("supervisor-bindings"), state_dir)?;
     Ok(UsingSupervisor { _lock: lock, target })
 }
 

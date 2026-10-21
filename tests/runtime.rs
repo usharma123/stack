@@ -3012,6 +3012,99 @@ fn every_request_reaches_the_supervisor_its_command_chose_however_the_environmen
     }
 }
 
+/// The `[env._]` table a Stack from before the binding never wrote (see `mise::BINDING_VAR`).
+const BINDING_DIRECTIVE: &str = "[env._]\nfile = \"{{ get_env(name='STACK_SUPERVISOR_BINDING', default='.stack/provider-config/no-supervisor-binding.json') }}\"\n\n";
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_configuration_written_before_the_binding_still_binds_the_stop_of_down() {
+    // A Stack from before the binding started the service under `pf-old` and wrote the
+    // configuration without the `_.file` directive; `down`, from the CLI or MCP, uses it as it
+    // finds it, even once stack.toml changed since (`stale`). `provider-target` names `pf-old`
+    // whenever Stack looks and `pf` as mise renders the stop, while another command holds
+    // `pf`'s lock alone. The stop must still reach `pf-old`, the configuration gaining the
+    // directive and nothing else: exactly what `compile` writes.
+    for case in ["down", "mcp", "stale"] {
+        let fixture = Fixture::with_bundle(WEB);
+        let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
+        let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
+        fs::write(app.join("provider-target"), old.to_str().unwrap()).unwrap();
+        fs::write(app.join("desired-target"), pf.to_str().unwrap()).unwrap();
+        let port = assigned_port(&fixture, "web");
+        supervise_listener(&fixture, port);
+        fixture.ok(&["up"]);
+        let path = app.join(".config/mise/conf.d/stack.toml");
+        let current = fs::read_to_string(&path).unwrap();
+        assert!(current.contains(BINDING_DIRECTIVE), "{current}");
+        fs::write(&path, current.replacen(BINDING_DIRECTIVE, "", 1)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        if case == "stale" {
+            let manifest = fs::read_to_string(app.join("stack.toml")).unwrap();
+            fs::write(app.join("stack.toml"), format!("{manifest}[services.api]\nrun='true'\n")).unwrap();
+        }
+        fs::create_dir_all(&pf).unwrap();
+        let held = fs::File::create(pf.join("stack-supervisor.lock")).unwrap();
+        // SAFETY: flock on a descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) }, 0);
+        let requested = request_count(&dir);
+        fs::write(dir.join("retarget-at"), "daemons stop").unwrap();
+        let result = if case == "mcp" {
+            let mcp = fixture.mcp(&[("stack_down", json!({}))], &[]);
+            assert_ne!(mcp[0]["isError"], json!(true), "{case}: {}", mcp[0]);
+            mcp[0]["structuredContent"].clone()
+        } else {
+            let out = fixture.command(&["down", "--json"]).output().unwrap();
+            let result = json_result(&out);
+            assert!(out.status.success(), "{case}: {result}");
+            result
+        };
+        assert!(dir.join("retargeted").exists(), "{case}: the environment never changed");
+        let made = requests_from(&dir, &app, requested);
+        assert!(made.iter().any(|r| r.starts_with("daemons stop")), "{case}: {made:?}");
+        assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{case}: a request reached `pf`: {made:?} {result}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), current, "{case}");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640, "{case}");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "{case}: the service still runs");
+        drop(held);
+    }
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_configuration_that_cannot_bind_a_stop_asks_the_supervisor_nothing() {
+    // A configuration Stack cannot make bind its requests (another `_.file`, or a file `compile` did not
+    // write) is left as it is, and nothing is asked: `supervisor_unbound`, the service running.
+    // `compile` writes it again, and `down` then stops the service.
+    let other = "[env._]\nfile = \"elsewhere.json\"\n\n";
+    for (case, edit) in [("other file", other), ("not generated", "")] {
+        let fixture = Fixture::with_bundle(WEB);
+        let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
+        let port = assigned_port(&fixture, "web");
+        supervise_listener(&fixture, port);
+        fixture.ok(&["up"]);
+        let path = app.join(".config/mise/conf.d/stack.toml");
+        let current = fs::read_to_string(&path).unwrap();
+        let mut changed = current.replacen(BINDING_DIRECTIVE, edit, 1);
+        if case == "not generated" {
+            changed = changed.replacen("# Generated by `stack compile`", "# Written by hand", 1);
+        }
+        fs::write(&path, &changed).unwrap();
+        let requested = request_count(&dir);
+        let out = fixture.command(&["down", "--json"]).output().unwrap();
+        let result = json_result(&out);
+        assert!(!out.status.success(), "{case}: {result}");
+        assert_eq!(result["error"]["code"], "supervisor_unbound", "{case}: {result}");
+        assert!(result["error"]["hint"].as_str().unwrap().contains("stack compile"), "{case}: {result}");
+        assert_eq!(requests_from(&dir, &app, requested), Vec::<String>::new(), "{case}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed, "{case}");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "{case}: the service was stopped");
+        fixture.ok(&["compile"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), current, "{case}");
+        fixture.ok(&["down"]);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "{case}: the service still runs");
+    }
+}
+
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_command_that_cannot_tell_which_supervisor_it_reaches_asks_it_nothing() {

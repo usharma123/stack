@@ -239,7 +239,19 @@ output (mise's answer when no release matches) is an error, not a version.
   inherits. The supervisor such a request starts inherits it, so a service it runs has
   `PITCHFORK_STATE_DIR` naming that supervisor. A binding file path mise would read as a glob
   pattern (`*`, `?`, `[`, `]` in `STACK_STATE_DIR`) is refused with `supervisor_unbound` before
-  the request. The supervisor is still chosen once per command, and before the supervisor's
+  the request. The directive binds only where the configuration mise loads carries it, and a
+  Stack from before it wrote configurations without it, which `down` and lease expiry use as
+  they find them (`up` and `restart` write theirs again first). A `mise::Target` is therefore
+  made only once the project's generated configuration ends its `[env]` with the directive:
+  under the project's lock, one starting with the line `stack compile` writes gains it there,
+  after every other `[env]` entry, with nothing else changed (exactly what `compile` writes for
+  the same inputs), in one rename that keeps its permissions; stack.toml and stack.lock are not
+  read, so a project whose manifest changed or went since is still stopped through the
+  configuration it was started with. One that is not valid TOML, was not written by `compile`,
+  or already loads another `_.file` is left alone, and nothing is asked (`supervisor_unbound`,
+  hint `stack compile`). Each start, stop and supervisor-start request confirms the directive is
+  still last as it is made, and is refused otherwise. A project without the file has no `[env]`
+  that could name another supervisor. The supervisor is still chosen once per command, and before the supervisor's
   own start and each start or stop request the environment is confirmed, after every install,
   setup and earlier wave, to still name it. A change is refused with `supervisor_changed`
   before the request: the session keeps naming the chosen supervisor, under which everything

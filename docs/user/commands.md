@@ -223,7 +223,11 @@ and with it its `log-sink` helpers, when all of these hold:
   configuration ends its `[env]` with a `_.file` directive that loads, for Stack's start and
   stop requests only, a file naming the chosen directory (in `$STACK_STATE_DIR/supervisor-bindings`).
   When `STACK_STATE_DIR`'s path contains `*`, `?`, `[` or `]`, which mise would read as a
-  pattern, such a request fails with `supervisor_unbound` before it is made. Every other
+  pattern, such a request fails with `supervisor_unbound` before it is made. A configuration an
+  earlier Stack generated without the directive gains it in place when `down` (or lease expiry)
+  first needs to stop something, nothing else in it changed and stack.toml not read; one Stack
+  did not generate, or that cannot take the directive, fails with `supervisor_unbound` before
+  anything is asked (run `stack compile`, then retry). Every other
   command (`exec`, `run`, `mise env`) renders the project's environment as written. A service
   that a supervisor Stack started runs has `PITCHFORK_STATE_DIR` naming that supervisor.
 
