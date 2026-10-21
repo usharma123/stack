@@ -34,6 +34,9 @@ supervisor than the one locked; that is corrected in
 Its review found that a request could still reach another supervisor than the one locked, when
 what the template reads changed after Stack's last look; that is corrected in
 [Correction 2026-10-21, round 5](#correction-2026-10-21-round-5-review-of-b7d95c9-sc4-f1-still-open).
+Its review found that a configuration generated before that binding, which `down` reuses as it
+finds it, did not apply it; that is corrected in
+[Correction 2026-10-21, round 6](#correction-2026-10-21-round-6-review-of-d1f6dba-sc5-f1).
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
 agents need that Stack did not have), **docs** (behaviour was right or deliberate but undocumented
@@ -419,6 +422,39 @@ MCP defaults and opt-outs, `gc`, leases, disposal, snapshots and H1. Evidence is
 `eval/results/agentdx-supervisor-corrections-r5-20261021/` (git-ignored). The pilot report is
 unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 
+## Correction 2026-10-21, round 6: review of `d1f6dba` (SC5-F1)
+
+A fresh independent review (Astra HIGH) of `d1f6dba` (code `71e401b`) confirmed the round-5
+binding for a configuration generated since `71e401b`, and found SC5-F1 (P1). A `mise::Target`
+did not establish that the configuration its requests load carries the binding directive. `down`
+reuses the generated configuration as it finds it, and one generated before `71e401b` lacks the
+directive, so its `PITCHFORK_STATE_DIR` template still decided where the stop went. The round-5
+entry above stays as written; the claim this correction qualifies is listed after the table.
+
+| # | Problem | Kind | Before | Fix | Proof | Remaining limit |
+|---|---|---|---|---|---|---|
+| SC5-F1 | After an upgrade, `down` (CLI and MCP `stack_down`) and lease expiry used a pre-binding generated configuration unchanged. The binding file was written and the chosen supervisor's lock held, but nothing loaded the file, so the stop reached whatever supervisor the project's template rendered at that moment, including one whose lock another command held alone | defect | The review's real-provider probe (`review-evidence/agentdx-supervisor-d1f6dba.llUw5L/legacy-config-service`), repeated here with the frozen r5 binary `9c86dec0…4faf` in new isolated roots (`probes/before-cli`, `probes/before-mcp`). r4's binary wrote the configuration and started the service on O. A separate instance with the same qualified id ran on S, whose lock the probe held exclusively, and the template rendered S only for `mise daemons stop`. The CLI `down` and the MCP `stack_down` each ended S's instance (PID gone, port closed), left O's recorded service running, and returned `stop_unconfirmed` after 20.2 s and 20.4 s; the configuration stayed unchanged. On the `71e401b` source (`before/`), both new runtime tests fail: the stop of a pre-binding configuration reached `pf`, and an unbindable configuration was stopped instead of refused | `b66e70a` | A Target is made only once the project's generated configuration applies the binding (`mise::bind_config`, under the project's lock). A configuration that starts with the line `stack compile` writes but lacks the directive gains it in place, after every other `[env]` entry, with nothing else changed, in one rename that keeps the file's permissions; the result is what `compile` writes for the same inputs. stack.toml and stack.lock are not read, so a project whose manifest changed since is still stopped through the configuration it was started with. A configuration that is not valid TOML, was not written by `compile`, or already loads another `_.file` is left alone, and nothing is asked (`supervisor_unbound`, hint `stack compile`). Every start, stop and supervisor-start request also confirms, as it is made, that the directive is still last, and is refused otherwise. Audit: `up`, `stop_previous` and `restart` write the configuration again before any request; `down` and lease expiry reuse it and now go through the migration; deleted-project reclaim asks Pitchfork directly by the recorded state directory, not through mise. Tests: `a_configuration_written_before_the_binding_still_binds_the_stop_of_down` (CLI, MCP and changed-manifest cases; S's lock held alone; the template renders `pf` at the stop; every request reaches `pf-old`; the configuration becomes byte-for-byte what `compile` wrote, mode kept; the service stops), `a_configuration_that_cannot_bind_a_stop_asks_the_supervisor_nothing` (another `_.file`, a hand-written file: `supervisor_unbound`, no request, file unchanged, service running, then `compile` and `down` stop it), and two unit tests (migration with a bundle `_.path`, absent `[env]`, the per-request refusal after a later change; refusals and directive order). Real mise + Pitchfork 2.29.0 with the frozen `93c013b6…2ce2` (`probes/after-cli`, `probes/after-mcp`): same probe, same held lock and template; `down` returned `ok` in 2.1 s (CLI) and 1.5 s (MCP), stopped O's service and O's Stack-owned supervisor, and left S's instance alive with its port open. The migrated configuration is byte-identical to the one the control's `compile` wrote. Each run's control (current compile, S's instance restored, the same lock and template) also stopped O and kept S's instance | Bound only where the generated configuration is the one mise loads (the selection Stack sets, unchanged since round 5). A project without the file has no `[env]` that could name another supervisor, and its requests are not refused. A configuration `compile` did not write, or one carrying another `_.file`, is refused rather than repaired; `stack compile` fixes it, and that needs a manifest and lock that compile. Checked with mise 2026.10.3 (macOS) and Pitchfork 2.29.0; on local LinuxKit arm64 with mise 2026.9.18 too (not a hosted runner). Forced interleavings, not natural frequencies |
+
+Qualified claim of the round-5 correction above: "every start, stop and supervisor-start request
+is bound" held only for configurations generated since `71e401b`. Since `b66e70a` it holds for a
+pre-binding configuration too, which is migrated before the first request, and any other
+configuration that does not end its `[env]` with the directive is refused before a request.
+
+Probe note: in the first attempt (`probes/attempt1/EXCLUDED.txt`, kept), both fixed-binary runs
+returned the expected `down` result, but their controls timed out. The review's probe registered
+S's instance in the probe root's single Pitchfork config directory, under the project's
+namespace. Once the fixed `down` stopped O's supervisor, the control's `up` started a fresh one,
+which read that registration and launched S's definition. The second attempt gives S its own
+`PITCHFORK_CONFIG_DIR` (`scripts/legacy-config-service.py.diff`); `probes/diag-up-after-cleanup`
+shows `up` after a supervisor-stopping `down` taking 2.96 s without it.
+
+Unchanged: the binding mechanism and its file, the confirmation before each request, the choice
+of supervisor and its lock, SC2-F2 and its schedule rules, ownership marks, the usage checks, the
+lock's location and replacement handling, the never-start-to-check rule, the CLI and MCP
+defaults and opt-outs, `gc`, leases, disposal, snapshots and H1. Evidence is in
+`eval/results/agentdx-supervisor-corrections-r6-20261021/` (git-ignored). The pilot report is
+unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
+
 ## Commits
 
 | Commit | Subject |
@@ -470,3 +506,4 @@ unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 | `3e0cd74` | fix(supervisor): lock the supervisor each request reaches, not the recorded one (SC3-F1) |
 | `ea8cbd9` | fix(supervisor): refuse a request once the environment names another supervisor (SC4-F1) |
 | `71e401b` | fix(supervisor): bind every start and stop request to the supervisor whose lock is held (SC4-F1, round 5) |
+| `b66e70a` | fix(supervisor): bind the stop of a configuration written before the binding (SC5-F1) |

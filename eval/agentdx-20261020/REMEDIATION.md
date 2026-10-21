@@ -448,7 +448,95 @@ Not done: push, PR, merge or release; any agent trial (the pilot report stays at
 `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
 by a person, with `complete` and `publishable` false); a hosted Linux or x64 run.
 
-Next: a new independent review of `71e401b` and the notes commit after it.
+Next: a new independent review of `71e401b` and the notes commit after it. It found SC5-F1 (a
+configuration generated before the binding did not apply it), which the
+[correction below](#correction-2026-10-21-round-6-the-review-of-d1f6dba-sc5-f1) deals with.
+
+## Correction 2026-10-21, round 6: the review of `d1f6dba` (SC5-F1)
+
+| | |
+|---|---|
+| Review | Astra HIGH, fresh and independent, of `d1f6dba` (code `71e401b`): request changes, SC5-F1 as a P1. It confirmed the round-5 binding for a current generated configuration, its precedence over other selected configuration, the Target guard's lifetime and call graph, and the ownership, schedule and lock controls. Earlier review texts, read in full, were left unchanged |
+| Start | Clean `d1f6dbaf9ffba7119b93e188f9477606e645c6fa`; every earlier commit kept as it is |
+| Tested head | `b66e70ae5b7f6750f0230b819f9b23e87a2f785c`, clean tree: code, tests and user and design docs. The documentation commit after it changes only `eval/agentdx-20261020/` |
+| Binary | `cargo build --locked` (debug, macOS arm64), sha256 `93c013b6ec9585599292f98f6f768421f0d3c3b954ac2d2ccd980cc00be22ce2`, frozen in `gates/bin/stack`; the gate's `cargo test` rebuilt the same hash. `git archive b66e70a src` sha256 `81e01d3abdbcee97e0f64221f5f2aa1ee2217f605c51270d9556189015577273` |
+| Evidence | `eval/results/agentdx-supervisor-corrections-r6-20261021/` (git-ignored; paths below are relative to it) |
+
+What changed and why is in the
+[ledger](REMEDIATION-LEDGER.md#correction-2026-10-21-round-6-review-of-d1f6dba-sc5-f1). In
+short, a binding file only matters if the configuration mise loads reads it, and `down` reuses
+whatever configuration it finds. A `mise::Target` is now made only after the project's generated
+configuration ends its `[env]` with the directive. A pre-binding configuration written by
+`compile` gains the directive in place, nothing else changed and the manifest not read. Any other
+configuration that cannot take it is refused before a request. Each request checks the
+directive again as it is made.
+
+Before and after:
+
+- **Before, tests** (`before/`, `scripts/before.sh`): `git archive 71e401b` (production source,
+  `before/source-*.sha256`; `d1f6dba` changed only docs) with only the new `tests/runtime.rs`.
+  Both new runtime tests fail at their intended assertions: the stop of a pre-binding
+  configuration reached `pf` (`daemons stop => …/pf`), and a configuration loading another
+  `_.file` was stopped through instead of refused. The other runtime tests: 181 passed, 1 failed
+  (`interrupting_up_stops_its_start_request_so_nothing_launches_after_down`, see the flake note
+  below).
+- **Real provider** (`scripts/sc6-probes.sh` through the fail-fast `scripts/probe-launch.sh`;
+  the review's `legacy-config-service.py` with a disclosed diff). r4's binary writes the
+  configuration and starts the service on O. A separate instance with the same qualified id runs
+  on S, whose lock the probe holds exclusively, and the template renders S only for `mise daemons
+  stop`.
+  - frozen r5 binary `9c86dec0…4faf`, CLI (`probes/before-cli`) and MCP `stack_down`
+    (`probes/before-mcp`): S's instance ended (PID gone, port closed), O's service kept running,
+    `stop_unconfirmed` after 20.2 s and 20.4 s, configuration unchanged;
+  - frozen `93c013b6…2ce2`, CLI (`probes/after-cli`) and MCP (`probes/after-mcp`): `ok` in 2.1 s
+    and 1.5 s, O's service and O's Stack-owned supervisor stopped, S's instance alive with its
+    port open, and the configuration migrated to exactly what the control's `compile` wrote;
+  - every run's control (current compile, S's instance restored, same lock and template):
+    O stopped, S's instance kept.
+  - The first attempt (`probes/attempt1/`, kept, `EXCLUDED.txt`) had the review probe's shared
+    Pitchfork config directory: once the fixed `down` stopped O's supervisor, the control's `up`
+    started a fresh one that launched S's registered definition and waited past the probe's
+    bound. Its `down` results agree with the second attempt. `probes/diag-up-after-cleanup`:
+    `up`, `down` (supervisor stopped), `up` again in 2.96 s.
+
+Gates, all with the frozen binary at the tested head (`gates/summary.txt`,
+`gates/gates-summary.txt`, `scripts/gates-r6.sh`; clippy, cargo, node and the real-mise test ran
+under an isolated root):
+
+| Gate | Result |
+|---|---|
+| clippy `--all-targets -D warnings` | 0 findings |
+| `cargo test --locked --all-targets` | 551 passed, 0 failed, 13 ignored (lib 249 with two new tests, runtime 184 with two new tests) |
+| node tests | 41 passed, 1 skipped |
+| real-mise provider boundary | 2 passed |
+| macOS native e2e, with a run-owned local registry | 12/12, including 5-oci; registry container removed |
+| six regressions, cold | 6 FIXED |
+| eight validation cells, cold | 8/8 valid, `globals_changed` [] |
+| bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export; `bench/` unchanged since `4f7201c` |
+| LinuxKit | Local Docker arm64, rust:1.93, unprivileged user; not a hosted runner. Built from `git archive b66e70a` (binary `c5c435fa…f596`), with mise 2026.9.18 from `stack setup`; the pre-binding configuration written by a Linux build of `git archive ea8cbd9` (`cf5d4693…8fd6`). Lib 248 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp every_request the_generated_environment a_configuration_` 85 passed; six regressions 6 FIXED. Real-provider probes (`linux/`): legacy configuration, CLI `down` `ok` in 1.9 s and MCP `stack_down` in 1.4 s, O's service stopped, S's instance (same id, S locked) alive with its port open, configuration migrated to exactly what `compile` wrote, controls the same; r5's at-request race as a control: B under O only (PID 31824) while the template rendered S for both starts, healthy after A stopped S, record `pf-old`. Container `sc6-linux-54fcb309` removed |
+
+Flake note: two full runtime runs under a fresh isolated root took about 625 s, and in both
+`interrupting_up_stops_its_start_request_so_nothing_launches_after_down` failed ("a client of
+the interrupted start acted after down"). Three tests ran over 60 s in each. One was a
+preliminary run of the fix (`focused/cargo-all-prelim.log`), the other the old `71e401b` source
+(`before/runtime-others.log`). The test passed three times alone (`focused/interrupt-rerun-*`),
+and the full runtime suite passed in 54 s (`focused/runtime-prelim2.log`) and in the gate. It is
+timing-sensitive under load, and the old source fails it the same way.
+
+Writer incident (`notes/INCIDENTS.md`): early this round, before the global snapshot, `which
+mise; mise --version` ran once without an isolated launcher (version text only; it asks no
+supervisor). Every other provider-capable command ran under an isolated root asserted by its
+launcher, or inside a test fixture or harness that isolates itself. This round's
+`globals-before.json` matched r5's final receipt exactly; the final one is compared with it,
+which covers this round's own interval only. The review launch incident recorded in round 4 is
+unchanged: possible default-provider residue remains unverified, and nothing there was read or
+cleaned.
+
+Not done: push, PR, merge or release; any agent trial (the pilot report stays at
+`60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
+by a person, with `complete` and `publishable` false); a hosted Linux or x64 run.
+
+Next: a new independent review of `b66e70a` and the notes commit after it.
 
 ## Round 5: corrections after the fourth independent review
 

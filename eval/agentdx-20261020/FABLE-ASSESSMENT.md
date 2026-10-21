@@ -365,3 +365,11 @@ every start, stop and supervisor-start request is bound to the supervisor whose 
 holds, through a directive Stack writes at the end of the project's own `[env]`. The template
 can no longer redirect the request. See the
 [ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-5-review-of-b7d95c9-sc4-f1-still-open).
+
+Addendum 2026-10-21 (round 6): the round-5 binding is a directive in the generated
+configuration, and `down` reuses the configuration it finds. After an upgrade, a configuration
+generated before `71e401b` lacked the directive, so `down` could still stop a service through a
+supervisor whose lock another command held. Since `b66e70a`, Stack adds the directive to such a
+configuration, under the project's lock, before any request, and changes nothing else in it. It
+refuses one it cannot bind. See the
+[ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-6-review-of-d1f6dba-sc5-f1).
