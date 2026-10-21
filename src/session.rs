@@ -2304,8 +2304,9 @@ const SUPERVISOR_ID: &str = "global/pitchfork";
 /// - no other checkout's session in this Stack state records the same supervisor, by its
 ///   resolved state directory, or records services without naming their supervisor, and every
 ///   session record can be read (another Stack state's sessions are seen through their daemons);
-/// - no daemon it tracks (Stack's or anyone's) is anything but stopped, failed or errored, or
-///   has a live process.
+/// - no daemon it tracks (Stack's or anyone's) is anything but stopped, failed or errored, has
+///   a live process, or has a schedule, which only a running supervisor keeps (see
+///   [`daemons_in_use`]).
 ///
 /// What happened, and why not, is the result; nothing here fails `down`. A supervisor that is
 /// not running is not started, and is reported as stopped.
@@ -2412,19 +2413,30 @@ fn supervisor_in_use(ctx: &Ctx, provider: &ProviderRecord) -> Option<String> {
 }
 
 /// A daemon the supervisor tracks that is not over: anything but stopped, failed or errored
-/// (an unreported state included), or with a live process.
+/// (an unreported state included), with a live process, or with a schedule. Between runs, and
+/// after a failed one, a scheduled daemon is stopped or failed, yet only a running supervisor
+/// starts it again, disabled or not (Pitchfork 2.29.0 runs a disabled daemon on its schedule
+/// too). One whose schedule cannot be read may have one.
 fn daemons_in_use(provider: &ProviderRecord) -> Option<String> {
     let daemons = match mise::supervisor_daemons(&provider.pitchfork, &provider.state_dir) {
         Ok(daemons) => daemons,
         Err(why) => return Some(format!("cannot list the supervisor's daemons: {why}")),
     };
-    daemons.iter().filter(|d| d.id != SUPERVISOR_ID).find_map(|d| {
+    let daemons: Vec<&mise::Tracked> = daemons.iter().filter(|d| d.id != SUPERVISOR_ID).collect();
+    let busy = daemons.iter().find_map(|d| {
         let over = d.status == "stopped" || d.status.starts_with("failed") || d.status.starts_with("errored");
         if !over {
             let status = if d.status.is_empty() { "in a state Pitchfork did not report" } else { &d.status };
             return Some(format!("daemon {} is {status}", d.id));
         }
         d.pid.filter(|p| pid_alive(*p)).map(|pid| format!("daemon {} is {}, but its process {pid} is alive", d.id, d.status))
+    });
+    busy.or_else(|| {
+        daemons.iter().find_map(|d| match mise::schedule(&provider.pitchfork, &provider.state_dir, &d.id) {
+            Ok(None) => None,
+            Ok(Some(cron)) => Some(format!("daemon {} runs on the schedule `{cron}`, which needs the supervisor between runs", d.id)),
+            Err(why) => Some(format!("cannot tell whether daemon {} runs on a schedule: {why}", d.id)),
+        })
     })
 }
 

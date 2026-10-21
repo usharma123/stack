@@ -200,8 +200,12 @@ and with it its `log-sink` helpers, when all of these hold:
   directory compared after resolving links), or records services without naming their
   supervisor, and every session record can be read. Checkouts using another Stack state are
   seen through their daemons.
-- No daemon it tracks, Stack's or anyone's, is anything but stopped, failed or errored, or has
-  a process still alive. A stopped daemon counts as stopped even if it has a schedule.
+- No daemon it tracks, Stack's or anyone's, is anything but stopped, failed or errored, has a
+  process still alive, or has a schedule (`cron` in its Pitchfork configuration). Only a running
+  supervisor starts a scheduled daemon, so one between runs or after a failed run keeps it, and
+  so does a disabled one, which Pitchfork 2.29.0 still runs on its schedule. So does a daemon
+  whose schedule `pitchfork status --json` does not report in a way Stack can read. Remove the
+  schedule from its configuration to let `down` stop the supervisor.
 - No other Stack command, in any Stack state, is starting or stopping services through it.
   Those commands share a lock kept in the supervisor's own state directory
   (`stack-supervisor.lock`), which `down` waits up to 5 seconds to take alone before deciding,

@@ -205,7 +205,11 @@ output (mise's answer when no release matches) is an error, not a version.
   the mark, observed before and after its environment is read and still the same process
   before the stop. Usage: no other session records the supervisor (state directories compared
   resolved) or records services without a supervisor, every session record is readable, and
-  no tracked daemon is in any state but stopped, failed or errored, or has a live process.
+  no tracked daemon is in any state but stopped, failed or errored, has a live process, or has
+  a schedule. A scheduled daemon is stopped or failed between runs, yet only a running
+  supervisor starts it again, so the `cron_schedule` `pitchfork status --json` reports for each
+  daemon (omitted when it has none) keeps it, disabled or not: Pitchfork 2.29.0 runs a disabled
+  daemon on its schedule too. An answer Stack cannot read keeps it as well.
   `pitchfork list` starts a supervisor when none answers, so it is asked only after
   `pitchfork supervisor status` (which never starts one) says one runs. Coordination: each
   command holds a shared lock on `stack-supervisor.lock` in the resolved supervisor state

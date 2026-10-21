@@ -65,6 +65,8 @@ case "$1" in
       if test -n "$pid"; then echo "{\"id\":\"global/pitchfork\",\"status\":\"running\",\"pid\":$pid}"; exit 0; fi
       echo "Error: Daemon $3 not found" >&2; exit 1
     fi
+    # `pf-status/<id>.json`, when a test gives one, is what Pitchfork says about that daemon.
+    if test -f "$REVIEW_FIXTURE/pf-status/$3.json"; then cat "$REVIEW_FIXTURE/pf-status/$3.json"; exit 0; fi
     if test -f "$REVIEW_FIXTURE/pf-status.json"; then cat "$REVIEW_FIXTURE/pf-status.json"; exit 0; fi
     echo "Error: Daemon $3 not found" >&2; exit 1 ;;
   list)
@@ -2308,7 +2310,45 @@ fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it(
         assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!(reason)), "{list}: {kept}");
         assert!(alive(pid));
     }
+    // A daemon with a schedule needs the supervisor between runs, after a failed run and while
+    // disabled (Pitchfork 2.29.0 runs a disabled daemon on its schedule too); one whose
+    // schedule Stack cannot read might have one.
+    let status = |id: &str, body: Value| {
+        let path = dir.join("pf-status").join(format!("{id}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body.to_string()).unwrap();
+    };
+    let cron = "*/10 * * * * *";
+    let scheduled = format!("daemon someone-else/timer runs on the schedule `{cron}`, which needs the supervisor between runs");
+    for (listed, said, reason) in [
+        (json!({ "status": "stopped", "pid": null, "disabled": false }), json!({ "status": "stopped", "pid": null, "cron_schedule": cron }), scheduled.clone()),
+        (json!({ "status": "failed" }), json!({ "status": "failed", "cron_schedule": cron, "cron_last_run": "2026-10-21T09:52:29-04:00" }), scheduled.clone()),
+        (json!({ "status": "stopped", "disabled": true }), json!({ "status": "stopped", "cron_schedule": cron }), scheduled.clone()),
+        (json!({ "status": "stopped" }), json!({ "status": "stopped", "cron_schedule": 10 }), "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer reported the schedule 10".to_string()),
+        (json!({ "status": "stopped" }), json!({ "cron_schedule": null }), "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer reported no status".to_string()),
+        (json!({ "status": "stopped" }), json!({ "id": "someone-else/other", "status": "stopped" }), "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer described '\"someone-else/other\"'".to_string()),
+        (json!({ "status": "stopped" }), Value::Null, "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer: not found".to_string()),
+    ] {
+        let mut listed = listed;
+        listed["id"] = json!("someone-else/timer");
+        fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }, listed]).to_string()).unwrap();
+        status("someone-else/db", json!({ "id": "someone-else/db", "status": "stopped" }));
+        let _ = fs::remove_file(dir.join("pf-status/someone-else/timer.json"));
+        if !said.is_null() {
+            let mut said = said;
+            if said.get("id").is_none() {
+                said["id"] = json!("someone-else/timer");
+            }
+            status("someone-else/timer", said);
+        }
+        let kept = supervisor(&["down", "--json"]);
+        assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!(reason)), "{listed}: {kept}");
+        assert!(alive(pid));
+    }
+    // Without a schedule (omitted, as Pitchfork omits it, or null), a stopped or failed daemon
+    // is over.
     fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }, { "id": "x/y", "status": "failed" }]).to_string()).unwrap();
+    status("x/y", json!({ "id": "x/y", "status": "failed", "pid": null, "cron_schedule": null }));
 
     // Asked to keep it, through the CLI and MCP.
     assert_eq!(supervisor(&["down", "--keep-supervisor", "--json"]), json!({ "stopped": false, "reason": "asked to keep it" }));

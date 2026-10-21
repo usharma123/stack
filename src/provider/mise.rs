@@ -1166,10 +1166,21 @@ pub fn stop_supervisor(bin: &Path, state_dir: &Path) -> std::result::Result<bool
 
 /// `pitchfork status --json <id>` against the recorded supervisor state directory.
 pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Supervised, String> {
+    let Some(v) = status_json(bin, state_dir, id)? else { return Ok(Supervised::NotFound) };
+    Ok(Supervised::Found {
+        status: v["status"].as_str().unwrap_or_default().to_string(),
+        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+        port: v["active_port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+    })
+}
+
+/// `pitchfork status --json <id>`, which reads the supervisor's state and starts none: what it
+/// says about `id`, or `None` when it knows no such daemon.
+fn status_json(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Option<serde_json::Value>, String> {
     let out = pitchfork(bin, state_dir, &["status", "--json", id])?;
     if out.exit_code != Some(0) {
         if out.stderr.contains("not found") {
-            return Ok(Supervised::NotFound);
+            return Ok(None);
         }
         let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
         return Err(format!("pitchfork status {id}: {err}"));
@@ -1179,11 +1190,23 @@ pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result
     if v["id"].as_str() != Some(id) {
         return Err(format!("pitchfork status {id} described '{}'", v["id"]));
     }
-    Ok(Supervised::Found {
-        status: v["status"].as_str().unwrap_or_default().to_string(),
-        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
-        port: v["active_port"].as_u64().and_then(|p| u16::try_from(p).ok()),
-    })
+    Ok(Some(v))
+}
+
+/// The schedule on which the supervisor of `state_dir` starts daemon `id` (the `cron_schedule`
+/// `pitchfork status --json` reports, which Pitchfork 2.29.0 keeps between runs and omits for a
+/// daemon without one), if it has one. A daemon Pitchfork no longer knows, or an answer that
+/// does not read as Pitchfork's, is an error: Stack cannot tell.
+pub fn schedule(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Option<String>, String> {
+    let v = status_json(bin, state_dir, id)?.ok_or_else(|| format!("pitchfork status {id}: not found"))?;
+    if !v["status"].is_string() {
+        return Err(format!("pitchfork status {id} reported no status"));
+    }
+    match v.get("cron_schedule") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(cron)) if !cron.trim().is_empty() => Ok(Some(cron.clone())),
+        Some(other) => Err(format!("pitchfork status {id} reported the schedule {other}")),
+    }
 }
 
 const LOGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
