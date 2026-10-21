@@ -13,7 +13,9 @@ branch's own fixes; they and the statements they made wrong are in
 [Corrections after the independent review](#corrections-after-the-independent-review-round-2).
 The second independent review, of `f58c09f`, found one boundary case of each of round 2's F2
 and F3 fixes still wrong; they are in
-[round 3](#corrections-after-the-second-independent-review-round-3). Every row names its proof; "remaining limit" is what the fix
+[round 3](#corrections-after-the-second-independent-review-round-3). The third, of `b1bcd9e`,
+found one command-admission case next to round 3's signal fix; it is in
+[round 4](#corrections-after-the-third-independent-review-round-4). Every row names its proof; "remaining limit" is what the fix
 does not do.
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
@@ -164,6 +166,28 @@ fail without it, and its docs. "After" paths are under
 - **F3** (round 2) said a dependency outside the restart must "pass its declared readiness".
   A check that could not run was counted as passing (R3-F3).
 
+## Corrections after the third independent review (round 4)
+
+The independent AI review of `b1bcd9e` (Astra) found R3-F2's retirement ordering and R3-F3
+corrected, and F1 and F4 still correct, but requested changes for one command-admission case
+next to R3-F2's fix. Unlike earlier rounds, the reviewer derived it from the source rather than
+reproducing it at runtime, and it was not observed in a real Stack run here either. It was
+reproduced deterministically by unit tests against the unfixed code, with test-only hooks
+at the admission points. "After" paths are under
+`eval/results/agentdx-product-corrections-r4-20261020/`.
+
+| # | Finding | Severity | Kind | Before | Fix | Proof after | Remaining limit |
+|---|---|---|---|---|---|---|---|
+| R4-F1 | A command was admitted in two steps: settle the signals counted so far, then take the registry lock and count again for the command's `since`. A signal that reached Stack's signal thread between the two was outside the new command's lifetime but not yet handled when it was spawned. With no other command running, the signal thread then found no recipient and ended Stack with the default action, leaving the new setup, exec or provider command running in its own process group after Stack was gone | P1 | defect in R3-F2's fix (`dbb5085`) | review of `b1bcd9e` (source schedule; the existing `decide` case for `since == arrival`); `before/r4-unit.log`, with the tests and hooks applied to the unfixed `spawn_named` (`before/r4-tests-on-unfixed.diff`): the signal arriving before the decision leaves the admitted `sleep` (PID 23917) alive after its Stack process died of SIGTERM; with a user's command running, the next command starts before the signal is handled | `f6a87b6` | admission is one decision under the registry lock: take it, read the arrival count, spawn with that same boundary only if every report through it was handled, else release the lock, wait for it, and decide again. Three tests, each in a process of its own, with test-only hooks at the admission points and the signal thread held by its test gate: a signal arriving after an earlier settlement and before the decision, with no other command, ends Stack before the command starts; a signal arriving after the boundary, held under the lock, is passed on to the admitted provider command, which does not outlive Stack; with a user's command running, the next admission waits until the signal is handled and passed on to it, then runs unsignalled, and both are forgotten afterwards (`after/r4-unit.log`, 20 of 20 repeats in `after/r4-repeat20.txt`). R3-F2's two schedule tests still pass. Gates and real-binary probes in REMEDIATION.md round 4 | A signal the kernel has not yet delivered to Stack's handler is still the next command's, or ends Stack, as before. Admission waits for the signal thread without a timeout, as retirement does; a run of signals that keeps arriving can keep a command from being admitted, and a signal with no recipient ends Stack anyway. With a user's command running, the signal reaches it and Stack goes on, so a command admitted on another thread afterwards still runs; whether to start it is the caller's check (`up` checks before each setup) |
+
+### Statements the findings made wrong
+
+- **R3-F2** (round 3) said "no command is spawned while a signal that already arrived is
+  unhandled". It settled the signals counted before taking the registry lock, then counted
+  again under it without checking that the second count was handled, so a signal arriving
+  between the two was neither handled first nor the new command's (R4-F1). That round-3 row and
+  section are kept as written.
+
 ## Commits
 
 | Commit | Subject |
@@ -205,3 +229,4 @@ fail without it, and its docs. "After" paths are under
 | `18e50a7` | fix(gc): reclaim only the data directory up saw, through what was checked (F1) |
 | `dbb5085` | fix(process): act on every signal a command got before judging it (R3-F2) |
 | `ba5360f` | fix(restart): never take a ready_cmd that could not run as passing (R3-F3) |
+| `f6a87b6` | fix(process): admit a command only past a boundary every signal before was handled at (R4-F1) |

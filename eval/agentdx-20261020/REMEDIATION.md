@@ -17,9 +17,96 @@ defects in this branch's own fixes and two evidence corrections. Both are dealt 
 [round 2](#round-2-corrections-after-the-independent-review). The second (Astra, of `f58c09f`)
 passed F1 and F4 and the ordinary F2 and F3 cases, and requested changes for one boundary case
 of each of F2 and F3; they are dealt with in
-[round 3](#round-3-corrections-after-the-second-independent-review). A new independent review of
-the round-3 head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
+[round 3](#round-3-corrections-after-the-second-independent-review). The third (Astra, of
+`b1bcd9e`) found round 3's corrections in place and requested changes for one command-admission
+case next to them, derived from the source; it is dealt with in
+[round 4](#round-4-correction-after-the-third-independent-review). A new independent review of
+the round-4 head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
 not on npm. Every binary below is a source build.
+
+## Round 4: correction after the third independent review
+
+| | |
+|---|---|
+| Tested head | `f6a87b6327804fb47763b98b31e69843a0c1cdf1`, clean tree: round 3's head `b1bcd9e` plus one commit, R4-F1 `f6a87b6`. The documentation commit after it changes no code |
+| Binary | `cargo build --locked` (cargo 1.93.1, debug), `stack 0.1.22`, sha256 `bf7a01c3fb9f41e717048aa8c93f2af6520b577177a4c1e498b316d79aca4f85`, frozen in `gates/bin/stack`. `cargo test` rebuilt the same hash |
+| Evidence | `eval/results/agentdx-product-corrections-r4-20261020/` (git-ignored; paths in this section are relative to it). Earlier rounds' directories are untouched |
+
+What the finding was, its fix, proof and remaining limit are in the
+[ledger](REMEDIATION-LEDGER.md#corrections-after-the-third-independent-review-round-4). In short:
+
+- **R4-F1** A command was admitted in two steps: the signals counted so far were settled, then
+  the registry lock was taken and the count read again as the command's start. A signal that
+  reached Stack's signal thread between the two belonged to no command and was not yet
+  handled. With nothing else running, that thread would then end Stack with the signal's
+  default action while the new command (a setup, an exec, a provider command) kept running in
+  its own process group. Admission is now one decision under the lock: the count read there is
+  spawned with only if every signal through it was handled; otherwise the lock is released, the
+  wait happens, and the decision is taken again.
+
+This finding is source-derived: the reviewer gave the schedule from the code and did not run it,
+and no real Stack run here showed it either. It was reproduced deterministically by unit
+tests against the unfixed `spawn_named`. Test-only hooks at the admission points (compiled
+into test builds only, like round 3's reader gate) deliver a real SIGTERM at the chosen point
+while the signal thread is held. `before/r4-unit.log` (tests and hooks applied to the unfixed
+code: `before/r4-tests-on-unfixed.diff`) shows the defect. With the signal arriving after the
+earlier settlement and before the decision, the command was admitted, and its `sleep`
+(PID 23917) was still alive after its Stack process died of SIGTERM; the outer test then killed
+it. With a user's command running, the next command started before the signal was handled.
+After the fix, all three new tests pass (`after/r4-unit.log`), 20 of 20 repeats
+(`after/r4-repeat20.txt`). The third test, a signal arriving after the boundary that must reach
+the admitted provider command, passes both before and after: it guards the boundary rather than
+reproducing the defect.
+
+### Gates at the round-4 head (`gates/`)
+
+| Gate | Result |
+|---|---|
+| `cargo clippy --locked --all-targets -- -D warnings` (1.93.1) | exit 0 |
+| `cargo test --locked --all-targets` | exit 0: 523 passed, 0 failed, 6 ignored, across 15 test binaries (round 3's 520 plus R4-F1's three; the three new ignored tests are their inner halves, run in their own process by the passing outer tests, as R3-F2's two are) |
+| `node --test tests/*.test.mjs` | exit 0: 41 pass, 1 skipped |
+| Provider boundary against the real mise (`/opt/homebrew/bin/mise` 2026.10.3) | exit 0: 2 passed |
+| `tests/e2e/native.sh`, macOS 15.7.2 arm64 | exit 0: 12 of 12, including `5-oci` against a run-owned `registry:2` container removed afterwards |
+| `bench/regressions.py`, cold | exit 0: all six `FIXED`, controls passed, cleanup clean, `globals_changed: []` |
+| Eight validation cells, cold | all valid: no-op rejected, reference passing, task loop passing before and after, cleanup clean, `globals_changed: []` in every cell |
+| Bench unit tests | 124 pass in the checkout and in a clean `git archive HEAD` export |
+| Linux, local Docker LinuxKit arm64 (`linux/`, `linux-e2e/`), not a hosted runner | Debian, `rust:1.93`, built from `f6a87b6` as an unprivileged user (binary `fbd244cb…`). Unit tests 232 passed, 6 ignored (the five inner halves, each run by its outer test, and `procinfo`'s sleeper helper, as before), R4-F1's three and R3-F2's two included; the runtime tests the signal and setup fixes touch 26 passed; the six regressions cold all `FIXED`, `globals_changed: []`. The native e2e suite passed 11 of 11 run scenarios, OCI skipped for want of a registry. Both containers were run-owned and removed |
+
+The global Stack/mise/Pitchfork hash receipt before (`globals-before.json`) equals round 3's
+final one; the receipt after (`globals-after.json`) equals it too.
+
+### Probes, on the frozen binary (`after/probes/`)
+
+`scripts/probes.sh` reruns round 3's cancellation probes against real mise 2026.10.3 and
+Pitchfork 2.29.0, under the reviewer's delayed signal thread (`delay_forwarder_v2.dylib`, hash
+unchanged). The reviewer's `late_signal_v2.py` and its control are copied unmodified from round
+3's `probes/reviewer/`, with hashes checked. Both give exit 143, `cancelled`, the later setup
+not run, status unhealthy, the sentinel alive and unsaved work kept. Round 3's
+`late_signal_r3.py` covers a CLI setup exiting 0, one ignoring SIGTERM (10 s grace), MCP, and a
+started dependency wave. Every case is `cancelled`, exit 143, with no later setup, and the
+started dependency is stopped by `down`. These match round 3's results. No probe root left a
+process. They do not exercise the new admission schedule itself, which only the unit tests
+control.
+
+### What was not rerun
+
+- No agent trial. The six-trial pilot describes round 1's binary only; its report still hashes
+  `60aa3b11…`, and it remains unreviewed by a human.
+- The F1/F4 and readiness probes (`real_gc_v2.py`, `file_probes.py`, `readiness_spawn_v2.py`,
+  `readiness_r3.py`) were not rerun: this change touches only command admission in
+  `src/process.rs`, and the unit and runtime tests for those paths pass at this head.
+- No hosted runner, Linux x64 or Intel macOS.
+
+### Remaining limits of round 4
+
+- A signal the kernel has not yet delivered to Stack's handler still belongs to what follows,
+  as in round 3.
+- Admission, like retirement, waits for the signal thread without a timeout. A stream of
+  signals can keep re-running the decision. A signal with no recipient ends Stack in any case.
+- With a user's command running, a signal reaches it and Stack goes on, so a command admitted
+  on another thread afterwards still runs, owned and named, once the signal has been handled.
+  Whether to start it after a cancellation is the caller's check, as before (`up` checks before
+  each setup).
 
 ## Round 3: corrections after the second independent review
 
@@ -37,6 +124,10 @@ What each finding was, its fix, proof and remaining limit are in the
   SIGTERM and exited 0 was judged by its exit status: `up` went on and succeeded. A run now
   returns only once every signal that arrived while its command ran was acted on, and no
   command starts while a signal that already arrived is unhandled.
+  *(Note added in round 4: the second half held only for signals counted before admission
+  took the registry lock. One arriving in between was neither handled first nor the new
+  command's: R4-F1, [round 4](#round-4-correction-after-the-third-independent-review). The
+  text above is kept as written.)*
 - **R3-F3** The restart prerequisite gate took a `ready_cmd` that could not be spawned or read
   as passing, and stopped the dependent. A `ready_cmd` now passes only when it ran and exited 0
   in time; one that could not run is `dependency_not_ready` with the reason, before anything is
