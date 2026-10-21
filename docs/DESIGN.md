@@ -244,7 +244,11 @@ output (mise's answer when no release matches) is an error, not a version.
   server then answers the call and exits with 128 + the signal. A service's `setup` is run the
   same way, and the signal cancels the start whatever the setup's exit status: `up` and
   `restart` run no later setup, request nothing more, and fail `cancelled`. A signal that comes
-  as the command exits, too late to reach it, is still owed. A provider command gets the
+  as the command exits, too late to reach it, is still owed. The handler only records a
+  signal; a separate thread acts on it, and may run late on a busy machine. A command's run
+  therefore returns only once every signal that arrived while it was running was acted on,
+  and no command starts while a signal that already arrived is still unhandled, so a signal is
+  never judged after the step it cancelled. A provider command gets the
   signal and Stack ends at once, as before. Groups are named and unnamed under one lock with
   the spawn and the reap, so a signal never reaches a group ID that may have been reused. A
   command attached to a terminal stays in Stack's foreground group and is passed only SIGTERM,

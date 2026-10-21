@@ -781,6 +781,8 @@ static TERMINATION: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 /// of ending: once that command is done, stack should end too (exit 128 + the signal), as the
 /// signal asked, whatever the command's own exit status, and start nothing more. `None` while
 /// none came. Also set for a signal that came as the command was exiting, too late to reach it.
+/// Every signal that arrived while a command ran is handled before its run returns (see
+/// [`settle`]), so read once it returns, this already counts them.
 #[cfg(unix)]
 pub fn passed_on() -> Option<i32> {
     Some(TERMINATION.load(std::sync::atomic::Ordering::SeqCst)).filter(|s| *s != 0)
@@ -846,6 +848,30 @@ static ARRIVALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// ends stack leaves nothing to wait for).
 #[cfg(unix)]
 static HANDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notified each time [`HANDLED`] moves, for [`settle`].
+#[cfg(unix)]
+static SETTLED: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+
+/// Held by a test to keep reports read meanwhile from being handled, as a busy machine may
+/// delay the thread that handles them.
+#[cfg(all(unix, test))]
+static READER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Wait until every report numbered up to `arrival` was handled: passed on, with what stack
+/// owes it recorded (see [`passed_on`]), or ending stack. Reports are handled in
+/// [`forwarder`]'s thread, which may run only after the command a signal was for is done, or
+/// after a signal that came between commands; what ran it must not judge it, nor start the
+/// next, before then. A report counted is already being written (see [`report_signal`]), so
+/// this ends. Never called holding the registry's lock, which handling takes.
+#[cfg(unix)]
+fn settle(arrival: u64) {
+    let (lock, moved) = &SETTLED;
+    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while HANDLED.load(std::sync::atomic::Ordering::SeqCst) < arrival {
+        guard = moved.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
 
 /// The write end of the pipe the handler reports signals through, once [`forwarder`] runs.
 #[cfg(unix)]
@@ -936,6 +962,8 @@ fn forwarder() -> io::Result<()> {
                             continue;
                         }
                         filled = 0;
+                        #[cfg(test)]
+                        drop(READER_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
                         let signal = libc::c_int::from(record[0]);
                         let arrival = u64::from_ne_bytes(record[8..].try_into().expect("eight bytes"));
                         let mut registry = registry();
@@ -962,6 +990,8 @@ fn forwarder() -> io::Result<()> {
                             }
                             HANDLED.store(boundary, std::sync::atomic::Ordering::SeqCst);
                             forget_settled(&mut registry);
+                            let _waiting = SETTLED.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            SETTLED.1.notify_all();
                             continue;
                         }
                         // SAFETY: restore the default action, unblock it here and raise it in
@@ -1006,9 +1036,11 @@ fn decide(commands: &mut [Named], arrival: u64, signal: libc::c_int) -> (Vec<(i3
 
 /// Spawn `command` and name its process group (see [`Registry`]), under the registry's lock.
 /// A signal arriving from the moment the spawn begins is the command's too. A `leader` command
-/// stays in stack's own group; its PID names it.
+/// stays in stack's own group; its PID names it. Nothing is spawned while a signal that
+/// already arrived is still to be handled (see [`settle`]): one that ends stack does so first.
 #[cfg(unix)]
 fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<Child> {
+    settle(ARRIVALS.load(std::sync::atomic::Ordering::SeqCst));
     let mut registry = registry();
     let since = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
     let child = spawn(command)?;
@@ -1018,7 +1050,8 @@ fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl F
 
 /// Unname `child`'s group and end it (`kill`: with its group, else only reap it), under the
 /// registry's lock, so the group is never signalled once its ID may be reused. A signal that
-/// arrived while it was named still counts it (see [`Named`]).
+/// arrived while it was named still counts it (see [`Named`]), and is handled before this
+/// returns (see [`settle`]): what ran the command then sees it in [`passed_on`].
 #[cfg(unix)]
 fn retire(child: &mut OwnedChild, kill: bool) {
     let mut registry = registry();
@@ -1035,6 +1068,8 @@ fn retire(child: &mut OwnedChild, kill: bool) {
         (false, _) => child.reap(),
     }
     forget_settled(&mut registry);
+    drop(registry);
+    settle(until);
 }
 
 /// Forget unnamed commands every signal they received was handled for.
@@ -1547,6 +1582,94 @@ mod tests {
         assert_eq!(decide(&mut attached, 1, term), (vec![(40, true)], true));
         assert_eq!(decide(&mut attached, 2, libc::SIGINT), (vec![], false));
         assert_eq!(decide(&mut attached, 3, libc::SIGHUP), (vec![], false));
+    }
+
+    /// Set, to a scratch directory, in the process [`run_alone`] starts.
+    const ALONE: &str = "STACK_PROCESS_TEST_ALONE";
+
+    /// Run ignored test `name` of this module in a process of its own, which it may send signals
+    /// that would end it, and return how that process ended. Bounded, so one that hangs fails.
+    fn run_alone(name: &str, scratch: &std::path::Path) -> Captured {
+        let name = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([name.as_str(), "--exact", "--ignored", "--test-threads=1", "--nocapture"]).env(ALONE, scratch);
+        let run = capture(&mut command, Duration::from_secs(60), 1 << 20).unwrap();
+        assert!(!run.timed_out, "{name} did not finish within 60s\nstdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        run
+    }
+
+    /// Wait until stack's handler counted `n` signals.
+    fn arrived(n: u64) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while ARRIVALS.load(std::sync::atomic::Ordering::SeqCst) < n {
+            assert!(Instant::now() < until, "no signal arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_signal_a_command_got_counts_once_its_run_returns_however_late_it_is_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_alone("late_signal_for_a_command", dir.path());
+        assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_a_command_got_counts_once_its_run_returns_however_late_it_is_handled"]
+    fn late_signal_for_a_command() {
+        let Some(dir) = std::env::var_os(ALONE).map(std::path::PathBuf::from) else { return };
+        let go = dir.join("go");
+        let path = std::ffi::CString::new(go.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // The signal is read but not handled until this is dropped, as a busy machine may delay it.
+        let gate = READER_GATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo = go.clone();
+        std::thread::spawn(move || {
+            // A setup that handles SIGTERM: it sends stack (this process) one, then exits 0.
+            let mut sh = Command::new("sh");
+            sh.args(["-c", "kill -TERM $PPID && read go < \"$1\" && exit 0", "sh"]).arg(fifo);
+            let out = capture_redacted(&mut sh, Duration::from_secs(30), 1024, None).map(|o| o.exit_code);
+            tx.send((out.map_err(|e| e.to_string()), passed_on())).unwrap();
+        });
+        // The signal arrived while the command ran; only then may it exit.
+        arrived(1);
+        std::fs::write(&go, "\n").unwrap();
+        if let Ok(early) = rx.recv_timeout(Duration::from_secs(2)) {
+            panic!("the run returned before the signal it got was handled: {early:?}");
+        }
+        drop(gate);
+        let (out, passed) = rx.recv_timeout(Duration::from_secs(10)).expect("the run returns once the signal is handled");
+        assert_eq!(out, Ok(Some(0)));
+        assert_eq!(passed, Some(libc::SIGTERM), "the signal is owed, though the command exited 0");
+    }
+
+    #[test]
+    fn nothing_starts_while_a_signal_that_arrived_is_still_to_be_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_alone("late_signal_between_commands", dir.path());
+        // The signal came while no command ran, so it ended stack (this child) as it asked,
+        // before the next command could start.
+        assert_eq!((run.exit_code, run.signal), (None, Some(libc::SIGTERM)), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert!(!dir.path().join("started").exists(), "a command started before the signal was handled");
+    }
+
+    #[test]
+    #[ignore = "run by nothing_starts_while_a_signal_that_arrived_is_still_to_be_handled"]
+    fn late_signal_between_commands() {
+        let Some(dir) = std::env::var_os(ALONE).map(std::path::PathBuf::from) else { return };
+        forwarder().unwrap();
+        let gate = READER_GATE.lock().unwrap();
+        // SAFETY: signals this process alone, which runs no other test.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        arrived(1);
+        let started = dir.join("started");
+        std::thread::spawn(move || capture_redacted(Command::new("touch").arg(started), Duration::from_secs(30), 1024, None));
+        std::thread::sleep(Duration::from_secs(1));
+        drop(gate);
+        std::thread::sleep(Duration::from_secs(20));
+        panic!("still running after the signal was handled");
     }
 
     #[test]
