@@ -251,8 +251,12 @@ output (mise's answer when no release matches) is an error, not a version.
   therefore returns only once every signal that arrived while it was running was acted on,
   and no command starts while a signal that already arrived is still unhandled, so a signal is
   never judged after the step it cancelled. A provider command gets the
-  signal and Stack ends at once, as before. Groups are named and unnamed under one lock with
-  the spawn and the reap, so a signal never reaches a group ID that may have been reused. A
+  signal and Stack ends at once, as before. A command that exits on its own leaves what it
+  started running, as under a shell, unless a signal was its, including one that arrived as it
+  exited and is acted on only after: its leader is then reaped only once that signal was
+  handled, and its group gets the signal and, for a user's command, is killed first. Groups are
+  named and unnamed under one lock with the spawn and the reap, so a signal never reaches a
+  group ID that may have been reused. A
   command attached to a terminal stays in Stack's foreground group and is passed only SIGTERM,
   as its own PID: the terminal's own interrupt and hangup already reach it.
 - **Projects without services** never query the supervisor: `down`, `status` and `exec` have
