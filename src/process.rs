@@ -779,7 +779,8 @@ static TERMINATION: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 
 /// The first interrupt, terminate or hangup signal stack passed on to a user's command instead
 /// of ending: once that command is done, stack should end too (exit 128 + the signal), as the
-/// signal asked. `None` while none came.
+/// signal asked, whatever the command's own exit status, and start nothing more. `None` while
+/// none came. Also set for a signal that came as the command was exiting, too late to reach it.
 #[cfg(unix)]
 pub fn passed_on() -> Option<i32> {
     Some(TERMINATION.load(std::sync::atomic::Ordering::SeqCst)).filter(|s| *s != 0)
@@ -944,8 +945,13 @@ fn forwarder() -> io::Result<()> {
                             // it cannot be reaped while this lock is held.
                             unsafe { libc::kill(if *leader { *group } else { -group }, signal) };
                         }
-                        if goes_on && !targets.is_empty() {
+                        // Stack still owes the signal its end once the command is done, also
+                        // when the command was unnamed (it was exiting) before this was read:
+                        // what runs it must not take the command's own exit as the outcome.
+                        if goes_on {
                             let _ = TERMINATION.compare_exchange(0, signal, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if goes_on && !targets.is_empty() {
                             PASSED_ON.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         if goes_on {
@@ -1529,6 +1535,9 @@ mod tests {
         assert_eq!(decide(&mut commands, 2, term), (vec![(10, false)], true));
         // Each command counts what was passed on to it.
         assert_eq!((commands[0].forwarded, commands[1].forwarded), (3, 1));
+        // A user's command unnamed as it exited, after the signal arrived for it: nothing is
+        // signalled, but the signal was its, so stack goes on and owes the signal its end.
+        assert_eq!(decide(&mut [named(50, true, 0, Some(3))], 3, term), (vec![], true));
         // A command named after a signal arrived is not its; with no command it ends stack.
         assert_eq!(decide(&mut [named(30, true, 5, None)], 5, term), (vec![], false));
         assert_eq!(decide(&mut [], 1, term), (vec![], false));

@@ -42,7 +42,8 @@
   [secrets](secrets.md#boundary).
 - **Failures say what happened.** `up` reports which steps finished, whether anything changed,
   and whether a retry is safe. Deadlines report `timed_out` and keep the launch record, so
-  `status` and `down` still work.
+  `status` and `down` still work. A signal that cancels a service's `setup` is `cancelled`,
+  never a success, and nothing more is started after it.
 - **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
   `stack.lock` pins.
 - **Results are structured.** `--json` prints one object on stdout, even for argument errors,

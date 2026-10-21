@@ -369,6 +369,12 @@ fn main() -> ExitCode {
             fail(cli.json, e);
             ExitCode::from(124)
         }
+        // A start the caller's signal cancelled ends as that signal would have ended it.
+        Err(e) if e.code == "cancelled" => {
+            let signal = stack::process::passed_on().unwrap_or(15);
+            fail(cli.json, e);
+            ExitCode::from((128 + signal) as u8)
+        }
         // Like an argument error clap rejects: the same code, a hint, and exit 2.
         Err(e) if e.code == "usage" => {
             let help = format!("run `stack {} --help` for usage", subcommand());

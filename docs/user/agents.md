@@ -104,6 +104,11 @@ the signal on to the command's process group, waits up to 10 seconds, then kills
 second signal kills it at once. With `--json` the result is still printed (`exit_code: null`
 and `signal` for a command the signal ended). `stack mcp` does the same for the command a call is running,
 answers that call, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
+A signal that comes while `up` or `restart` runs a service's `setup` cancels the start, even
+when the setup handles it and exits 0: no further setup runs and nothing more is started. The
+result is `cancelled` (CLI exit 128 plus the signal), and anything launched before stays
+recorded for `stack status` and `stack down`. At any other point of `up` or `restart` the
+signal ends Stack at once, as before; that launch record is kept too.
 
 If `up` times out, services may still be starting. Check `stack status`. Retrying `up` lets
 a slow service finish; a service that will never become ready needs `stack down` before you

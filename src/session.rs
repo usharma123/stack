@@ -895,7 +895,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
             }
-            return Err(steps.fail("start", with_readiness(ctx, &report, &names, start_error), true));
+            return Err(steps.fail("start", with_readiness_unless_cancelled(ctx, &report, &names, start_error), true));
         }
         steps.ok("start", json!(null));
 
@@ -1086,15 +1086,20 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
 /// Start `names` in the order [`dependency_waves`] gives: each wave of services is requested,
 /// and waited for until it is ready, before the next, so a service starts only once the services
 /// it `depends_on` run. A stack without dependencies among `names` is one wave.
+///
+/// A signal stack passed on to a setup (see [`cancelled`]) ends it there: no later setup runs
+/// and nothing more is requested, however the setup itself exited.
 fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
     let waves = dependency_waves(&report.stack.services, names);
     if waves.len() <= 1 {
         run_setups(ctx, report, names)?;
+        cancelled(names)?;
         return start_watched(ctx, report, names);
     }
     let last = waves.len() - 1;
     for (i, wave) in waves.iter().enumerate() {
-        run_setups(ctx, report, wave)?;
+        let later = || json!({ "not_started": waves[i + 1..].iter().flatten().collect::<Vec<_>>() });
+        run_setups(ctx, report, wave).and_then(|()| cancelled(wave)).map_err(|e| if e.code == "cancelled" { e.with_detail(later()) } else { e })?;
         start_watched_scoped(ctx, report, wave, Some(wave))?;
         // A request may return once the provider launched the process; what depends on this
         // wave starts only once Stack verified it and its declared readiness passes.
@@ -1106,6 +1111,31 @@ fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `cancelled` once stack passed an interrupt, terminate or hangup signal on to a command it ran
+/// (a setup) instead of ending: the caller cancelled this start, so `names`, not yet requested,
+/// must not be. The signal is stack's to honour whatever the command did with it (a setup may
+/// handle it and exit 0); the CLI then exits 128 + the signal, and the MCP server ends once it
+/// answered.
+fn cancelled(names: &[String]) -> Result<()> {
+    match crate::process::passed_on() {
+        None => Ok(()),
+        Some(signal) => Err(cancellation(signal, None, names)),
+    }
+}
+
+fn cancellation(signal: i32, setup: Option<&str>, names: &[String]) -> StackError {
+    let which = match signal {
+        1 => "SIGHUP".to_string(),
+        2 => "SIGINT".into(),
+        15 => "SIGTERM".into(),
+        n => format!("signal {n}"),
+    };
+    let during = setup.map(|s| format!(" during {s}'s setup")).unwrap_or_default();
+    StackError::new("cancelled", format!("stack received {which}{during}, so the start was cancelled: {} not started", names.join(", ")))
+        .hint("nothing more was started; anything launched before stays recorded: `stack status` shows it, `stack down` stops it, `stack up` starts again")
+        .with_detail(json!({ "signal": signal, "setup": setup, "not_started": names }))
 }
 
 /// Most a service's `setup` may take, within the startup deadline.
@@ -1141,8 +1171,13 @@ fn run_setups(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
         if let Some(port) = report.ports.get(name) {
             sh.env("PORT", port.to_string());
         }
+        cancelled(names)?;
         let out = crate::process::capture_redacted(&mut sh, crate::process::bounded(SETUP_TIMEOUT), SETUP_OUTPUT_LIMIT, None)
             .map_err(|e| StackError::new("setup_failed", format!("cannot run {name}'s setup: {e}")))?;
+        // Before its exit status: a setup that handled the signal and exited 0 did not succeed.
+        if let Some(signal) = crate::process::passed_on() {
+            return Err(cancellation(signal, Some(name), names).with_detail(json!({ "exit_code": out.exit_code, "signal_ended_setup": out.signal })));
+        }
         if out.exit_code == Some(0) && !out.timed_out {
             continue;
         }
@@ -1571,6 +1606,14 @@ fn with_readiness(ctx: &Ctx, report: &Report, names: &[String], error: StackErro
     error.with_detail(json!({ "readiness": failing }))
 }
 
+/// [`with_readiness`], except for a cancelled start: the caller asked that nothing more run.
+fn with_readiness_unless_cancelled(ctx: &Ctx, report: &Report, names: &[String], error: StackError) -> StackError {
+    if error.code == "cancelled" {
+        return error;
+    }
+    with_readiness(ctx, report, names, error)
+}
+
 /// Time a failed or cut-short start may take to run each `ready_cmd` once more for its report.
 const READINESS_GRACE: Duration = Duration::from_secs(6);
 
@@ -1797,7 +1840,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         if let Err(error) = observed {
             return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
         }
-        return Err(steps.fail("start", with_readiness(ctx, &report, &names, start_error), true));
+        return Err(steps.fail("start", with_readiness_unless_cancelled(ctx, &report, &names, start_error), true));
     }
     steps.ok("start", json!(names));
     let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;

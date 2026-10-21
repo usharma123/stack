@@ -3791,6 +3791,86 @@ fn a_service_is_requested_only_once_the_services_it_depends_on_are_ready() {
     fixture.ok(&["down"]);
 }
 
+/// A bundle whose `web` setup records its PID in `setup-ready` and waits; on SIGTERM it exits 0
+/// (`graceful`), or ignores it. `api`'s setup, run after it, would log to `api-setup.log`.
+fn cancellable_setup(graceful: bool) -> Fixture {
+    let trap = if graceful { "trap \"exit 0\" TERM" } else { "trap \"\" TERM" };
+    Fixture::with_bundle(&format!(
+        "[bundle]\nname='test'\n[services.web]\nrun='true'\nsetup='{trap}; echo $$ > setup-ready; sleep 30 & wait; echo after-wait >> setup-ready'\n[services.api]\nrun='true'\nsetup='echo api >> api-setup.log'\n"
+    ))
+}
+
+/// The setup's PID, once it is waiting.
+fn setup_waiting(app: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(pid) = fs::read_to_string(app.join("setup-ready")).ok().and_then(|s| s.lines().next()?.trim().parse().ok()) {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "setup never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_signal_during_setup_cancels_the_start_however_the_setup_ends() {
+    let mut sentinel = Command::new("sleep").arg("60").spawn().unwrap();
+    // A setup that exits 0 on SIGTERM, then one that ignores it until a second signal.
+    for graceful in [true, false] {
+        let fixture = cancellable_setup(graceful);
+        let (dir, app) = (fixture.dir.path(), fixture.dir.path().join("app"));
+        let mut stack = fixture.command(&["--json", "up", "--timeout", "1m"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let setup = setup_waiting(&app);
+        let (status, _) = terminate(&mut stack, (!graceful).then_some(Duration::from_millis(300)));
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(stack.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+        let result: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("graceful={graceful}: {e}: {stdout:?}"));
+        assert_eq!(status.code(), Some(143), "graceful={graceful}: {status:?} {result}");
+        let error = &result["error"];
+        assert_eq!(error["code"], "cancelled", "graceful={graceful}: {result}");
+        assert!(error["message"].as_str().unwrap().contains("web's setup"), "{result}");
+        assert!(gone_soon(setup), "graceful={graceful}: setup {setup} outlived stack");
+        // Nothing after the cancelled setup ran: no other setup, no start request.
+        assert!(!app.join("api-setup.log").exists(), "graceful={graceful}: api's setup ran after the cancel");
+        assert!(!dir.join("start-requests.log").exists(), "graceful={graceful}: a service was requested after the cancel");
+        // The launch stays recorded, unverified, for `down`.
+        let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+        assert_eq!(status["data"]["healthy"], false, "{status}");
+        assert_eq!(status["data"]["session"]["launching"], true, "{status}");
+        fixture.ok(&["down"]);
+    }
+    assert!(sentinel.try_wait().unwrap().is_none(), "an unrelated process was signalled");
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn a_signal_to_the_mcp_server_during_setup_cancels_the_start_and_ends_the_server() {
+    let fixture = cancellable_setup(true);
+    let (dir, app) = (fixture.dir.path(), fixture.dir.path().join("app"));
+    let mut server = fixture.command(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_up","arguments":{"dir":app,"timeout_secs":60}}});
+    use std::io::Write;
+    // Input stays open: only the signal may end the server.
+    let mut input = server.stdin.take().unwrap();
+    writeln!(input, "{call}").unwrap();
+    let setup = setup_waiting(&app);
+    let (status, _) = terminate(&mut server, None);
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(server.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout:?}"));
+    let envelope = &response["result"]["structuredContent"];
+    assert_eq!(envelope["error"]["code"], "cancelled", "{response}");
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert!(gone_soon(setup), "setup {setup} outlived the server");
+    assert!(!app.join("api-setup.log").exists() && !dir.join("start-requests.log").exists(), "work went on after the cancel");
+    drop(input);
+    fixture.ok(&["down"]);
+}
+
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_is_kept() {
