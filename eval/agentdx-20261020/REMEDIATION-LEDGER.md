@@ -305,6 +305,10 @@ Superseded claims of the follow-up entry above:
 - "A stopped daemon that has a schedule counts as stopped": it now keeps the supervisor,
   disabled or not.
 
+After both fixes, the runtime tests that ran `up` without naming a Pitchfork state directory
+put the new lock file in the caller's default directory. `8205aa9` gives every runtime fixture a
+directory of its own (see REMEDIATION.md).
+
 Unchanged: ownership marks, the other usage checks, the never-start-to-check rule, the CLI and
 MCP defaults and opt-outs, `gc`, leases, disposal, snapshots and H1. The review's 19 ordinary
 assertions (its `positive.py`, paths only changed) all pass with the corrected binary. Evidence
@@ -358,3 +362,4 @@ is unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 | `b80318c` | feat(down): stop the supervisor Stack started once nothing else uses it (follow-up 2026-10-21, O1 decision) |
 | `9946319` | fix(down): coordinate with every Stack state that uses the same supervisor (SC2-F1) |
 | `4ae0435` | fix(down): keep the supervisor while a daemon it runs has a schedule (SC2-F2) |
+| `8205aa9` | test(runtime): give every fixture its own Pitchfork state directory (after SC2-F1) |

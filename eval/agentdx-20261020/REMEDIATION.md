@@ -171,11 +171,23 @@ Gates, all with the frozen binary at the tested head (`gates/summary.txt`, `gate
 | bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export; `bench/` unchanged since `fd76459` |
 | LinuxKit (local Docker arm64, rust:1.93, unprivileged user; not a hosted runner) | built from `git archive 4ae0435` (binary `6d419ea3…71b4`); lib 243 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp` 75 passed, including both changed supervisor tests and the new cross-state one; six regressions 6 FIXED; the schedule probe (`linux/scheduled/`, Linux spellings in `linux/scheduled-r2-linux.diff`) gave the same outcome at every step; container removed. The first launch failed in my wrapper before any container started (`drafts/linux-launch-failure.txt`) |
 
+Test isolation, found at the final global check. The hash-only receipt of the user's global
+files then showed a new empty `~/.local/state/pitchfork/stack-supervisor.lock`. With the lock now
+in the Pitchfork state directory, runtime tests that ran `up` without naming one had used the
+caller's default directory. The macOS `cargo test` runs at `4ae0435`, the gate's included,
+created it. `8205aa9` gives every runtime fixture its own Pitchfork state directory, and only
+that empty file, which this work's tests had created, was removed. Afterwards clippy gave 0
+findings and `cargo test --all-targets` gave 536 passed, 0 failed and 13 ignored, with the same
+binary hash, the file not recreated, and the global receipt identical to the start
+(`gates-r2b/`, `drafts/global-lock-leak.txt`). The binary-level gates were not rerun: the e2e
+run, the regressions, the validation cells, the bench tests and the LinuxKit run do not use
+`tests/runtime.rs` against the host, and the source did not change.
+
 Not done: push, PR, merge or release; any agent trial (the pilot report stays at
 `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
 by a person, with `complete` and `publishable` false); a hosted Linux run.
 
-Next: a new independent review of `4ae0435` and the notes commit after it.
+Next: a new independent review of the head after `8205aa9` and the notes commits.
 
 ## Round 5: corrections after the fourth independent review
 
