@@ -27,6 +27,92 @@ the callers of the shared process helpers, derived from the source; they are dea
 the round-5 head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
 not on npm. Every binary below is a source build.
 
+After round 5 was approved, pushed and assessed, the owner decided the open supervisor question
+(ledger O1). The change is recorded in the
+[follow-up of 2026-10-21](#follow-up-2026-10-21-default-supervisor-cleanup). The rounds below
+describe the branch as it was at their heads.
+
+## Follow-up 2026-10-21: default supervisor cleanup
+
+| | |
+|---|---|
+| Decision | The owner was asked: "when `stack down` stops the last session using a supervisor that Stack owns, should it stop that supervisor too?" The answer was "Stop it automatically for complete cleanup" |
+| Start | Clean `4f7201c1fbf4013ca084832d4f4ea65126b3b128`, which is `c73f38a` (the approved code) plus the documentation-only Fable assessment |
+| Tested head | `b80318cc51b680ceb64f9f12ba719723494f9d94`, clean tree, one plain commit: code, tests and user and design docs. The documentation commit after it changes only `eval/agentdx-20261020/` |
+| Binary | `cargo build --locked` (cargo 1.93.1, debug, macOS 15.7.2 arm64), sha256 `ec32d2363c1c11c07f7263c4d0f221c56e4df8d7bef1e300d40d8a6f2ec296ed`, frozen in `gates/bin/stack`. `cargo test` rebuilt the same hash |
+| Evidence | `eval/results/agentdx-supervisor-default-20261021/` (git-ignored; paths in this section are relative to it) |
+
+What changed, and why each safeguard exists, is in the
+[ledger](REMEDIATION-LEDGER.md#follow-up-2026-10-21-plain-down-stops-the-supervisor-stack-started-owner-decision-on-o1).
+In short:
+
+- Plain `down`, `session::down` and MCP `stack_down` with the field omitted stop the supervisor
+  and its `log-sink` helpers. This happens only after the services are confirmed gone, and only
+  when the supervisor carries this Stack state's owner mark and nothing else uses it.
+- Otherwise the supervisor is kept and `supervisor.reason` says why.
+- `--keep-supervisor` and `"stop_supervisor": false` opt out. `--stop-supervisor` is still
+  accepted.
+
+While making the change, one more defect turned up. The old opt-in, run on a root where no
+supervisor was running, started one through `pitchfork list`, and that supervisor was then
+killed with the command's process group (`before/probe-4f7201c.txt`). Now nothing is listed
+unless a supervisor is already running.
+
+Gates, all with the frozen binary at the tested head (`gates/summary.txt`, `gates/gates-summary.txt`):
+
+| Gate | Result |
+|---|---|
+| clippy `--all-targets -D warnings` | 0 findings |
+| `cargo test --locked --all-targets` | 534 passed, 0 failed, 13 ignored (lib 243, runtime 173: 4 more than round 5's 530) |
+| node tests | 41 passed, 1 skipped |
+| real-mise provider boundary | passed |
+| macOS native e2e, with a run-owned local registry | 12/12, including 5-oci; registry container removed |
+| six regressions, cold | 6 FIXED; `down-before-up` now also reports `supervisor` |
+| eight validation cells, cold | 8/8 valid, `globals_changed` [] |
+| bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export. `bench/` and its fingerprints are unchanged |
+| LinuxKit (local Docker arm64, rust:1.93, unprivileged user; not a hosted runner) | built from `git archive b80318c` (binary `0a12e5be…0488`); lib 242 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp` 74 passed, including both new supervisor tests (environment read from `/proc`); six regressions 6 FIXED; the same probe (`linux/probe.txt`) gave the same outcomes in every step; container removed |
+
+Proof beyond the gates:
+
+- **Real mise and Pitchfork 2.29.0 probe** (`probes/probe.txt`; script `scripts/probe.sh`,
+  hash in `probes/script.sha256`). The root is isolated, and tool installs come from the
+  existing `/tmp/afc` cache. What it showed:
+  - Two sessions shared one supervisor. The first `down` kept it ("the session of …/b uses
+    this supervisor"), and b stayed healthy. The last `down` stopped the supervisor and both
+    log-sinks, leaving none.
+  - A repeated `down`, and one in a checkout that never ran `up`, reported "it was not
+    running". No supervisor start was logged.
+  - These all behaved as documented: MCP with `{}`, `--keep-supervisor` and MCP `false`
+    (kept, then a plain `down` stopped it), and the legacy `--stop-supervisor`.
+  - A non-Stack `pitchfork run` daemon kept the supervisor until that daemon was stopped. A
+    supervisor that was already running when Stack first used it was kept and is still alive;
+    the probe stopped it itself. A held shared lock kept the supervisor for 5 s.
+  - Concurrent down and up ran 5 rounds in one order (down first: stopped, and c's up
+    started a fresh supervisor and verified) and 3 in the other (c's up in flight: kept for
+    c's session). c was healthy after every round.
+  - At the end, the unrelated sentinel process and an unsaved file were intact.
+  - These race rounds depend on timing. The lock ordering itself is proven by the
+    deterministic unit and runtime tests.
+- **Before** (`before/`):
+  - The 4f7201c binary on the same setup left `supervisor run` and a `log-sink` running after
+    two plain downs. Its opt-in, on an idle root, started a supervisor.
+  - The two new runtime tests, on the 4f7201c source, fail (`before/runtime-on-4f7201c.log`).
+    They fail at their first step that needs the new owner record, so the binary probe is the
+    behavioural before.
+- **Globals**: hash-only receipts of the user's Stack, mise and Pitchfork files
+  (`globals-before.json`, `globals-after.json`) are identical. The user's global supervisor
+  was not running at the start, and no command here addressed it.
+
+Not done:
+
+- push, PR, merge or release;
+- a rerun of any agent trial: the pilot report stays at
+  `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
+  by a person, and `complete` and `publishable` remain false;
+- a hosted Linux run.
+
+Next: a new independent review of the follow-up.
+
 ## Round 5: corrections after the fourth independent review
 
 | | |

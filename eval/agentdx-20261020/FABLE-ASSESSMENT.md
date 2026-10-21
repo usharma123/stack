@@ -323,3 +323,13 @@ enforces that separation in its report derivation; the gap is in what it is fed.
    as 0.1.23 after merge, and on which platforms, is outside this branch. It gates any claim
    about a published install; hosted measurement with a source-built binary stays valid when it
    is labelled as such.
+
+## Follow-up after this assessment (2026-10-21)
+
+This assessment describes `c73f38a` and is otherwise unchanged. On question 1 of section 7,
+the owner chose to stop the supervisor automatically. Since `b80318c`, plain `down` stops the
+supervisor once Stack can show it started it and nothing else uses it. That is a narrower test
+than the "state directory under a Stack-owned per-root path" option above, and it applies to
+any state directory. It is recorded in the
+[ledger follow-up](REMEDIATION-LEDGER.md#follow-up-2026-10-21-plain-down-stops-the-supervisor-stack-started-owner-decision-on-o1).
+The other questions, and the disposal and lease items of the roadmap, are still open.

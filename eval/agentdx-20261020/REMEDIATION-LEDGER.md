@@ -20,6 +20,11 @@ found two cancellation cases in the callers of the shared process helpers; they 
 [round 5](#corrections-after-the-fourth-independent-review-round-5). Every row names its proof; "remaining limit" is what the fix
 does not do.
 
+After round 5, the owner decided O1: plain `down` now stops the supervisor Stack started when
+nothing else uses it. That dated change is in
+[Follow-up 2026-10-21](#follow-up-2026-10-21-plain-down-stops-the-supervisor-stack-started-owner-decision-on-o1);
+the O1 and L6 rows below still describe the opt-in behaviour they were recorded with.
+
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
 agents need that Stack did not have), **docs** (behaviour was right or deliberate but undocumented
 or documented wrongly), **external** (outside Stack's code: a prerequisite or another tool), and
@@ -217,6 +222,65 @@ same tests pass after. "After" paths are under
   to clean its group up was taken before that wait (R5-F2). The round-3 and round-4 rows are kept
   as written.
 
+## Follow-up 2026-10-21: plain `down` stops the supervisor Stack started (owner decision on O1)
+
+The owner was asked: "when `stack down` stops the last session using a supervisor that Stack
+owns, should it stop that supervisor too?" The answer was "Stop it automatically for complete
+cleanup". This entry records that change. It does not rewrite O1 or L6 above, which describe
+the opt-in behaviour at the commits they name. The pilot evidence (`pilot-r2/report.json`,
+sha256 `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`) is unchanged. It
+still shows that both pilot agents left the supervisor running. No agent was rerun with the new
+default.
+
+| # | Change | Kind | Before | Fix | Proof | Remaining limit |
+|---|---|---|---|---|---|---|
+| O1/L6 follow-up | Plain `stack down`, `session::down` and MCP `stack_down` (field omitted) stop the Pitchfork supervisor and its `log-sink` helpers once the checkout's services are confirmed gone. This happens only when Stack can show it started the supervisor and nothing else uses it; otherwise it keeps the supervisor and gives the reason | product decision (owner) + one defect found while doing it | 4f7201c binary (`eval/results/agentdx-supervisor-default-20261021/before/`): two plain downs left `supervisor run` and a `log-sink` running. `down --stop-supervisor` on a root with no supervisor started one through `pitchfork list` (Pitchfork 2.29.0 starts a supervisor for `list`), and that supervisor was then killed with the command's process group. The two new runtime tests also fail on 4f7201c, but at its first missing piece (no owner record), so the binary probe is the behavioural before | `b80318c` | runtime tests `down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it` and `down_keeps_a_supervisor_stack_cannot_show_it_started`, plus unit tests for the owner record, resolved lock keys and shared/exclusive locking. Real mise and Pitchfork probe (`eval/results/agentdx-supervisor-default-20261021/probes/probe.txt`): two sessions; the first down keeps the supervisor and the last stops it and its log-sinks. A repeated down and a never-up down start nothing. MCP default, `--keep-supervisor`, MCP `false` and `--stop-supervisor` all behave as documented. A non-Stack daemon, a supervisor that was already running and a held lock each keep the supervisor. Concurrent down/up passed in both orders. The sentinel and unsaved work were intact | See below |
+
+How ownership is shown. Every Stack request that may start a supervisor sets
+`STACK_SUPERVISOR_OWNER` to a random mark of the Stack state. These requests are
+`mise x -- pitchfork supervisor start`, `mise daemons start` and `mise daemons stop`. The mark
+is written once to `<state>/supervisor-owner`. Stack never rewrites it, and stops trusting it
+if the file is replaced. Stack never passes on a mark it inherited. The supervisor and its
+helpers inherit the mark. `down` stops only the process that
+`pitchfork status --json global/pitchfork` names, and only when that process carries the mark.
+`ProviderRecord` (pitchfork, state_dir) is used only to see who uses the supervisor, never as
+proof of ownership.
+
+How usage is checked. The supervisor is kept in any of these cases:
+
+- another session records it, with state directories compared after resolving links;
+- another session records services without naming a supervisor;
+- a session record cannot be read;
+- a tracked daemon is in any state other than stopped, failed or errored, or has a live
+  process.
+
+`pitchfork list` is asked only after `pitchfork supervisor status` has said a supervisor is
+running.
+
+How commands are coordinated. A command holds a shared lock per resolved supervisor state
+directory (`<state>/supervisors/<hash>.lock`) while it asks that supervisor to start or stop
+something. It takes the lock after recording its session. `down` takes the lock alone for the
+check and the stop, and waits at most 5 seconds for it.
+
+Compatibility:
+
+- `--keep-supervisor` and MCP `"stop_supervisor": false` keep the supervisor.
+- An MCP call that omits the field gets the new default.
+- `--stop-supervisor` is still accepted and changes nothing.
+- A checkout without services gets no `supervisor` field.
+- When no supervisor is running, the result is `{"stopped": true, "reason": "it was not running"}`, as before.
+
+Remaining limits:
+
+- The lock orders this Stack state's commands only. Another Stack state that shares the
+  Pitchfork state directory is seen through its daemons, not through its in-flight requests.
+- A stopped daemon that has a schedule counts as stopped.
+- The real race rounds depend on timing. The lock ordering itself is proven by deterministic
+  tests.
+- Supervisors started before this change carry no mark, so they are kept until someone stops
+  them.
+- `gc`, lease expiry, disposal, snapshots and H1 are unchanged.
+
 ## Commits
 
 | Commit | Subject |
@@ -261,3 +325,4 @@ same tests pass after. "After" paths are under
 | `f6a87b6` | fix(process): admit a command only past a boundary every signal before was handled at (R4-F1) |
 | `c0e6238` | fix(process): watch a command for signals from its naming, not its run's first look (R5-F1) |
 | `34369ef` | fix(process): decide what an exited command keeps only once its signals are handled (R5-F2) |
+| `b80318c` | feat(down): stop the supervisor Stack started once nothing else uses it (follow-up 2026-10-21, O1 decision) |
