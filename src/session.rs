@@ -1340,14 +1340,15 @@ fn dependents_of(services: &IndexMap<String, Entry<Service>>, names: &[String]) 
 /// [`start_watched`]; with `scope`, only those services must verify for the start to be over
 /// early (a wave of [`start_in_order`]: later waves are not started yet).
 fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>, supervisor: &Path) -> Result<()> {
-    // The supervisor the requests reach, not whichever one a session last recorded, and still
-    // the one the command chose: this wave's setups ran since (see [`using_supervisor`]).
-    let using = using_supervisor(&ctx.root, supervisor)?;
-    using.after(watch_starts(ctx, report, names, scope, supervisor))
+    // The supervisor the command chose, not whichever one a session last recorded, still the
+    // one the environment names after this wave's setups, and the one every request reaches
+    // (see [`using_supervisor`]).
+    let using = using_supervisor(ctx, supervisor)?;
+    watch_starts(ctx, report, names, scope, using.target())
 }
 
-/// [`start_watched_scoped`], once it holds the lock of `supervisor`.
-fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>, supervisor: &Path) -> Result<()> {
+/// [`start_watched_scoped`], once it holds the lock of `supervisor`'s supervisor.
+fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>, supervisor: &mise::Target) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1361,7 +1362,7 @@ fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[St
     let owner = supervisor_owner(&ctx.state, true).ok();
     let starter = {
         let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
-        let (checkable, completed, supervisor) = (checkable.clone(), completed.clone(), supervisor.to_path_buf());
+        let (checkable, completed, supervisor) = (checkable.clone(), completed.clone(), supervisor.clone());
         std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             let _cancel = crate::process::cancel_scope(cancel.clone());
@@ -1436,8 +1437,8 @@ fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[St
 /// are gone and their ports closed (`stop_unconfirmed` otherwise).
 fn stop_and_wait(ctx: &Ctx, names: &[String], session: Option<&Session>, supervisor: &Path) -> Result<()> {
     {
-        let using = using_supervisor(&ctx.root, supervisor)?;
-        using.after(mise::stop_daemons(&ctx.root, names, supervisor_owner(&ctx.state, true).ok().as_deref()))?;
+        let using = using_supervisor(ctx, supervisor)?;
+        mise::stop_daemons(&ctx.root, names, supervisor_owner(&ctx.state, true).ok().as_deref(), using.target())?;
     }
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     loop {
@@ -1509,11 +1510,11 @@ const HANDOFF: Duration = Duration::from_secs(5);
 /// next service is requested. Services whose requests returned successfully, so passed the
 /// provider's readiness checks, are added to `completed` as they do.
 ///
-/// Each request is made only once the project's environment is confirmed to still name
-/// `supervisor` (see [`confirm_addressed`]): the supervisor's own start comes first, and
-/// services already started run their own code meanwhile.
+/// Every request, the supervisor's own start first, is bound to `supervisor` (see
+/// [`mise::Target`]). Each is made only once the project's environment is confirmed to still
+/// name it (see [`confirm_addressed`]): services already started run their own code meanwhile.
 fn request_starts(
-    (root, supervisor): (&Path, &Path),
+    (root, supervisor): (&Path, &mise::Target),
     names: &[String],
     hand_off: &[bool],
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1535,9 +1536,10 @@ fn request_starts(
 }
 
 /// [`request_starts`], leaving the requests' end flags and threads to the caller. Each
-/// request goes to the project at `root`, marked with `owner` (see [`mise::OWNER_VAR`]).
+/// request goes to the project at `root`, bound to `supervisor` and marked with `owner` (see
+/// [`mise::OWNER_VAR`]).
 fn request_each(
-    (root, supervisor, owner): (&Path, &Path, Option<&str>),
+    (root, supervisor, owner): (&Path, &mise::Target, Option<&str>),
     names: &[String],
     hand_off: &[bool],
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1547,7 +1549,7 @@ fn request_each(
 ) -> Result<Vec<String>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
-    mise::prepare_start(root, owner)?;
+    mise::prepare_start(root, owner, supervisor)?;
     let (sent, answers) = mpsc::channel::<(usize, Result<()>)>();
     let mut done: Vec<bool> = Vec::new();
     let mut handed: Vec<String> = Vec::new();
@@ -1577,14 +1579,15 @@ fn request_each(
         Ok(true)
     };
     for (i, name) in names.iter().enumerate() {
-        confirm_addressed(root, supervisor)?;
+        confirm_addressed(root, supervisor.state_dir())?;
         let end = Arc::new(AtomicBool::new(false));
         let (dir, service, sent, deadline, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::deadline(), end.clone());
+        let target = supervisor.clone();
         let owner = owner.map(str::to_string);
         threads.push(std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             let _cancel = crate::process::cancel_scope(flag);
-            let _ = sent.send((i, mise::start_daemon(&dir, &service, owner.as_deref())));
+            let _ = sent.send((i, mise::start_daemon(&dir, &service, owner.as_deref(), &target)));
         }));
         ends.push(end);
         done.push(false);
@@ -2568,43 +2571,31 @@ fn supervisor_lock(state_dir: &Path) -> PathBuf {
 /// start or stop something (which starts it when none runs). `down` takes it alone to decide on
 /// stopping that supervisor, so it never stops one between another command's look and its
 /// request, whichever Stack state that command uses; a checkout records its session before it
-/// asks. It is the lock of the supervisor the request reaches, as this command's environment
-/// names it (see [`addressed_supervisor`]), never one a session recorded earlier: a request is
-/// not made without it. Once it is held, the environment of the project at `root` must still
-/// name `state_dir` (see [`confirm_addressed`]): waiting for it, or what ran since the command
-/// chose `state_dir` (an install, a service's `setup`), may have changed that.
-fn using_supervisor(root: &Path, state_dir: &Path) -> Result<UsingSupervisor> {
+/// asks. It is the lock of the supervisor this command's environment named when the command
+/// chose it (see [`addressed_supervisor`]), never one a session recorded earlier, and only its
+/// holder can make a request: every start and stop goes through [`UsingSupervisor::target`],
+/// which binds it to `state_dir` whatever the project's environment renders by the time mise
+/// makes it (see [`mise::BINDING_VAR`]). Once the lock is held, the environment of the project
+/// must still name `state_dir` (see [`confirm_addressed`]): waiting for it, or what ran since
+/// the command chose `state_dir` (an install, a service's `setup`), may have changed that, and
+/// the command then stops rather than go on under a supervisor the project no longer names.
+fn using_supervisor(ctx: &Ctx, state_dir: &Path) -> Result<UsingSupervisor> {
     let lock = SharedLock::shared(&supervisor_lock(state_dir))?;
-    confirm_addressed(root, state_dir)?;
-    Ok(UsingSupervisor { _lock: lock, root: root.to_path_buf(), state_dir: state_dir.to_path_buf() })
+    confirm_addressed(&ctx.root, state_dir)?;
+    let target = mise::Target::bind(&ctx.state.join("supervisor-bindings"), state_dir)?;
+    Ok(UsingSupervisor { _lock: lock, target })
 }
 
 /// A command's hold on the supervisor its requests reach (see [`using_supervisor`]).
 struct UsingSupervisor {
     _lock: SharedLock,
-    root: PathBuf,
-    state_dir: PathBuf,
+    target: mise::Target,
 }
 
 impl UsingSupervisor {
-    /// After the requests, still holding the lock: `supervisor_changed` when the environment
-    /// now names another supervisor, which a request may then have reached instead of this one.
-    /// Each request was confirmed just before it was made, so only a change by another program
-    /// in between can do that; this reports it rather than the request's success. Not being
-    /// able to tell now is no such evidence, and leaves `outcome` as it is.
-    fn after(&self, outcome: Result<()>) -> Result<()> {
-        if outcome.as_ref().is_err_and(|e| e.code == "cancelled" || e.code == "supervisor_changed") {
-            return outcome;
-        }
-        let Ok(now) = addressed_at(&self.root) else { return outcome };
-        if resolved(&now) == resolved(&self.state_dir) {
-            return outcome;
-        }
-        let changed = supervisor_changed(&self.state_dir, &now, true);
-        Err(match outcome {
-            Ok(()) => changed,
-            Err(e) => changed.with_detail(json!({ "request_error": e })),
-        })
+    /// What every request made under this hold is bound to.
+    fn target(&self) -> &mise::Target {
+        &self.target
     }
 }
 
@@ -2669,8 +2660,8 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>, addressed: Option<&
             Some(dir) => dir.to_path_buf(),
             None => addressed_supervisor(ctx)?,
         };
-        let using = using_supervisor(&ctx.root, &addressed)?;
-        using.after(mise::stop(&ctx.root, supervisor_owner(&ctx.state, true).ok().as_deref()))?;
+        let using = using_supervisor(ctx, &addressed)?;
+        mise::stop(&ctx.root, supervisor_owner(&ctx.state, true).ok().as_deref(), using.target())?;
     }
 
     // A port still open once every recorded process is gone is held by something else: when
@@ -2834,47 +2825,37 @@ fn addressed_at(root: &Path) -> Result<PathBuf> {
 
 /// Before a request: fail unless the environment of the project at `root` still names the
 /// supervisor whose state directory is `chosen`, the one the command chose when it began and
-/// whose lock it holds (see [`using_supervisor`]). mise renders `PITCHFORK_STATE_DIR` again for
-/// every request, and a project's `[env]` template can depend on anything (a file a service's
-/// `setup` writes, a command's output); what it gives wins over any value Stack could pass, so
-/// a request cannot be pinned to `chosen`. A change is refused, never followed: the command
-/// then asks neither supervisor anything more, and the session keeps naming `chosen`, under
-/// which anything it already started runs. Not knowing is refused too.
+/// whose lock it holds (see [`using_supervisor`]). A project's `[env]` template can depend on
+/// anything (a file a service's `setup` writes, a command's output). The requests themselves
+/// reach `chosen` whatever it renders (see [`mise::Target`]); this keeps a command from going on
+/// under a supervisor its project no longer names. A change is refused, never followed: the
+/// command then asks neither supervisor anything more, and the session keeps naming `chosen`,
+/// under which anything it already started runs. Not knowing is refused too.
 fn confirm_addressed(root: &Path, chosen: &Path) -> Result<()> {
     let now = addressed_at(root)?;
     if resolved(&now) == resolved(chosen) {
         return Ok(());
     }
-    Err(supervisor_changed(chosen, &now, false))
+    Err(supervisor_changed(chosen, &now))
 }
 
 /// The environment names the supervisor in `now`, not the one in `chosen` whose lock the command
-/// holds: found before a request (nothing more is asked), or once requests returned (`asked`,
-/// see [`UsingSupervisor::after`]), when they may have reached `now` instead.
-fn supervisor_changed(chosen: &Path, now: &Path, asked: bool) -> StackError {
+/// holds, before a request: nothing more is asked.
+fn supervisor_changed(chosen: &Path, now: &Path) -> StackError {
     let (chosen_text, now_text) = (chosen.display(), now.display());
-    let (message, hint) = if asked {
-        (
-            format!(
-                "this command asked the Pitchfork supervisor in {chosen_text} to start or stop services, holding its lock, but once \
-                 those requests returned the project's environment named the one in {now_text} (PITCHFORK_STATE_DIR rendered again: \
-                 another program changed what it depends on meanwhile), so they may have reached that one, outside the lock"
-            ),
-            "`stack status` shows what runs and `stack down` stops it; then run the command again, leaving what \
-             PITCHFORK_STATE_DIR depends on unchanged while it runs",
-        )
-    } else {
-        (
-            format!(
-                "this command chose the Pitchfork supervisor in {chosen_text} and holds its lock, but the project's environment now \
-                 names the one in {now_text} (PITCHFORK_STATE_DIR rendered again: a setup, an install or another program changed \
-                 what it depends on), so nothing more was started or stopped through either"
-            ),
-            "run the command again: it uses the supervisor the environment names when it begins. Anything this command \
-             already started stays recorded under the first one: `stack status` shows it, `stack down` stops it",
-        )
-    };
-    StackError::new("supervisor_changed", message).hint(hint).with_detail(json!({ "chosen": chosen, "now": now, "asked": asked }))
+    StackError::new(
+        "supervisor_changed",
+        format!(
+            "this command chose the Pitchfork supervisor in {chosen_text} and holds its lock, but the project's environment now \
+             names the one in {now_text} (PITCHFORK_STATE_DIR rendered again: a setup, an install or another program changed \
+             what it depends on), so nothing more was started or stopped through either"
+        ),
+    )
+    .hint(
+        "run the command again: it uses the supervisor the environment names when it begins. Anything this command \
+         already started stays recorded under the first one: `stack status` shows it, `stack down` stops it",
+    )
+    .with_detail(json!({ "chosen": chosen, "now": now, "asked": false }))
 }
 
 /// Pitchfork's state directory, of which `socket` is `sock/main.sock`.

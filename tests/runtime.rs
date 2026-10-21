@@ -83,7 +83,15 @@ case "$1" in
       stop)
         if test -f "$REVIEW_FIXTURE/pf-fail-supervisor-stop"; then echo 'cannot stop the supervisor' >&2; exit 1; fi
         pid=$(cat "$REVIEW_FIXTURE/pf-supervisor" 2>/dev/null); test -n "$pid" && kill "$pid"
-        rm -f "$REVIEW_FIXTURE/pf-supervisor" ;;
+        rm -f "$REVIEW_FIXTURE/pf-supervisor"
+        # With `supervisor-owns-services`, a supervisor takes the services it runs with it: those
+        # a request that reached this state directory started (see the fake mise).
+        if test -f "$REVIEW_FIXTURE/supervisor-owns-services" && test -f "$REVIEW_FIXTURE/supervised-by.log"; then
+          while read -r state service; do
+            if test "$state" = "$PITCHFORK_STATE_DIR"; then kill "$service" 2>/dev/null; fi
+          done <"$REVIEW_FIXTURE/supervised-by.log"
+        fi
+        true ;;
     esac ;;
   stop)
     if test -f "$REVIEW_FIXTURE/pf-fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
@@ -2838,36 +2846,170 @@ fn a_later_wave_whose_setup_changes_the_supervisor_is_refused_before_its_request
 }
 
 #[test]
+fn the_generated_environment_ends_with_the_binding_of_supervisor_requests() {
+    // A project's own PITCHFORK_STATE_DIR comes first, as written; Stack's `_.file` directive
+    // last, which mise applies after it (see `mise::BINDING_VAR`). Tools alone get none.
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[env]\nPITCHFORK_STATE_DIR=\"{{ exec(command='cat provider-target') | trim }}\"\n[services.web]\nrun='true'\n");
+    let config = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    let declared = config.find("PITCHFORK_STATE_DIR = \"{{ exec(command='cat provider-target') | trim }}\"").expect(&config);
+    let binding = config
+        .find("[env._]\nfile = \"{{ get_env(name='STACK_SUPERVISOR_BINDING', default='.stack/provider-config/no-supervisor-binding.json') }}\"")
+        .expect(&config);
+    assert!(declared < binding, "{config}");
+    let table: toml::Table = config.parse().unwrap();
+    let env = table["env"].as_table().unwrap();
+    assert_eq!(env.keys().next_back().map(String::as_str), Some("_"), "{config}");
+    let tools = Fixture::with_bundle("[bundle]\nname='test'\n[env]\nA='1'\n");
+    let config = fs::read_to_string(tools.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    assert!(!config.contains("STACK_SUPERVISOR_BINDING"), "{config}");
+}
+
+#[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_change_made_as_a_start_is_requested_is_reported_not_claimed_as_a_start() {
-    // Another program makes the environment name `pf` exactly as mise renders the start
-    // request's environment, after Stack confirmed it still named `pf-old` (see the fake mise):
-    // the request reaches `pf`, outside the lock Stack holds. Stack cannot prevent that, but
-    // must not report the start as done: it says the requests may have reached `pf`.
+fn a_supervisor_change_made_as_a_start_is_requested_cannot_take_it_outside_the_lock() {
+    // A owns `pf`'s supervisor and its `down` is deciding to stop it, holding `pf`'s lock alone
+    // with the daemons it saw (none running) in hand. B, another checkout in another Stack
+    // state, renders PITCHFORK_STATE_DIR from `provider-target` (see the fake mise), which names
+    // `pf-old` whenever Stack looks; another program makes it name `pf` exactly as mise renders
+    // B's start request, after Stack's last look (`retarget-at-start`). The request must still
+    // reach `pf-old`, whose lock B holds and which its record names: nothing may start under
+    // `pf`, and A's stop of `pf` (which takes the services it runs with it, see the fake
+    // pitchfork) must leave B's service running.
     let fixture = Fixture::with_bundle(WEB);
-    let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
+    let dir = fixture.dir.path();
     let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-    fs::write(app.join("provider-target"), old.to_str().unwrap()).unwrap();
-    fs::write(app.join("desired-target"), pf.to_str().unwrap()).unwrap();
+    fs::write(dir.join("supervisor-owns-services"), "").unwrap();
+    let b = dir.join("b");
+    fs::create_dir(&b).unwrap();
+    for file in ["stack.toml", "stack.lock"] {
+        fs::copy(dir.join("app").join(file), b.join(file)).unwrap();
+    }
+    let in_b = |args: &[&str]| {
+        let mut command = fixture.command_at(&b, args);
+        // An inherited binding never decides where a request goes, nor anything else.
+        command
+            .env("PITCHFORK_STATE_DIR", dir.join("pf-inherited"))
+            .env("STACK_STATE_DIR", dir.join("state-b"))
+            .env("STACK_SUPERVISOR_BINDING", dir.join("not-a-binding.json"));
+        command
+    };
+    fs::write(dir.join("not-a-binding.json"), json!({ "PITCHFORK_STATE_DIR": pf }).to_string()).unwrap();
+    fs::write(b.join("provider-target"), old.to_str().unwrap()).unwrap();
+    fs::write(b.join("desired-target"), pf.to_str().unwrap()).unwrap();
+    assert!(in_b(&["compile"]).output().unwrap().status.success());
+    let inspected = json_result(&in_b(&["inspect", "--json"]).output().unwrap());
+    let b_port = u16::try_from(inspected["data"]["ports"]["web"].as_u64().unwrap()).unwrap();
+
+    // A runs under `pf`, which Stack started for it.
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+    assert!(out.status.success(), "{}", json_result(&out));
+    let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
+    let supervisor = fake_supervisor(&fixture, Some(&mark));
+
+    fs::write(dir.join("pf-list-gate"), "").unwrap();
+    let mut down = fixture
+        .command(&["down", "--json"])
+        .env("PITCHFORK_STATE_DIR", &pf)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(30);
+    while !dir.join("list-ready").exists() {
+        assert!(Instant::now() < until, "A never asked what the supervisor runs");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let requested = request_count(dir);
+    let bound = fs::read_to_string(dir.join("bindings.log")).unwrap().lines().count();
+    fs::write(dir.join("daemons.json"), "[]").unwrap();
+    supervise_listener(&fixture, b_port);
     fs::write(dir.join("retarget-at-start"), "").unwrap();
-    let port = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, port);
-    let out = fixture.command(&["up", "--json"]).output().unwrap();
+
+    // B starts while A still decides: it never needs `pf`'s lock, as it never asks `pf`.
+    let out = in_b(&["up", "--json"]).output().unwrap();
     let result = json_result(&out);
-    assert!(!out.status.success(), "{result}");
-    let error = &result["error"];
-    assert_eq!(error["code"], "supervisor_changed", "{result}");
-    let changed = error["details"].as_array().unwrap().iter().find(|d| d.get("chosen").is_some()).unwrap().clone();
-    assert_eq!(changed, json!({ "chosen": old, "now": pf, "asked": true }), "{result}");
-    assert!(error["message"].as_str().unwrap().contains("may have reached that one"), "{result}");
-    let made = requests_from(&dir, &app, 0);
-    assert_eq!(made.last().unwrap(), &format!("daemons start -- web => {}", pf.display()), "{made:?}");
-    assert!(made[..made.len() - 1].iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{made:?}");
-    let session = fixture.session();
-    assert_eq!((session["launching"].clone(), session["provider"]["state_dir"].clone()), (json!(true), json!(old)), "{session}");
-    // As the hint says, `down` stops what may have started.
-    fixture.ok(&["down"]);
-    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "the service still runs");
+    assert!(out.status.success(), "{result}");
+    assert!(down.try_wait().unwrap().is_none(), "A finished before B");
+    // The input changed as the start request was rendered, after every look Stack took ...
+    assert!(dir.join("retargeted").exists());
+    assert_eq!(fs::read_to_string(b.join("provider-target")).unwrap(), pf.to_str().unwrap());
+    // ... and every request B made, that start included, reached `pf-old`.
+    let made = requests_from(dir, &b, requested);
+    assert!(made.contains(&format!("daemons start -- web => {}", old.display())), "{made:?}");
+    assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{made:?}");
+    let session: Value = serde_json::from_slice(&fs::read(b.join(".stack/session.json")).unwrap()).unwrap();
+    assert_ne!(session["launching"], json!(true), "{session}");
+    assert_eq!(session["provider"]["state_dir"], json!(old), "{session}");
+    // Only the requests that may start or stop something carried a binding, Stack's own.
+    let bindings = fs::read_to_string(dir.join("bindings.log")).unwrap();
+    let expected = dir.join("state-b/supervisor-bindings").canonicalize().unwrap();
+    for line in bindings.lines().skip(bound) {
+        let (call, binding) = line.rsplit_once(' ').unwrap();
+        match call {
+            "daemons start" | "daemons stop" | "x --" => assert!(Path::new(binding).starts_with(&expected), "{line}"),
+            _ => assert_eq!(binding, "unset", "{line}"),
+        }
+    }
+    let service: u32 = fs::read_to_string(dir.join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+
+    // A goes on and stops the supervisor nothing used; B's service, run by `pf-old`, runs on.
+    fs::write(dir.join("release-list"), "").unwrap();
+    let down = down.wait_with_output().unwrap();
+    let result = json_result(&down);
+    assert!(down.status.success(), "{result}");
+    assert_eq!(result["data"]["supervisor"], json!({ "stopped": true, "state_dir": pf }), "{result}");
+    assert!(!alive(supervisor));
+    assert!(alive(service), "A's stop of `pf` ended B's service");
+    assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok(), "B's service is not listening");
+    let status = json_result(&in_b(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["healthy"], true, "{status}");
+    assert!(in_b(&["down"]).output().unwrap().status.success());
+    assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_err(), "B's service still runs");
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn every_request_reaches_the_supervisor_its_command_chose_however_the_environment_renders_it() {
+    // `provider-target` names `pf-old` whenever Stack looks; another program makes it name `pf`
+    // exactly as mise renders one request (see the fake mise): the supervisor's own start in
+    // `up`, the stop of `restart` or of `down`. That request still reaches `pf-old`, whose lock
+    // the command holds; a command with more to ask then finds the environment naming `pf` and
+    // asks nothing more of either (`supervisor_changed`), its record still naming `pf-old`.
+    for (case, at, args) in [
+        ("up", "x --", &["up", "--json"][..]),
+        ("restart", "daemons stop", &["restart", "web", "--json"][..]),
+        ("down", "daemons stop", &["down", "--json"][..]),
+    ] {
+        let fixture = Fixture::with_bundle(WEB);
+        let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
+        let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
+        fs::write(app.join("provider-target"), old.to_str().unwrap()).unwrap();
+        fs::write(app.join("desired-target"), pf.to_str().unwrap()).unwrap();
+        let port = assigned_port(&fixture, "web");
+        supervise_listener(&fixture, port);
+        if case != "up" {
+            fixture.ok(&["up"]);
+        }
+        let requested = request_count(&dir);
+        fs::write(dir.join("retarget-at"), at).unwrap();
+        let out = fixture.command(args).output().unwrap();
+        let result = json_result(&out);
+        assert!(dir.join("retargeted").exists(), "{case}: the environment never changed");
+        let made = requests_from(&dir, &app, requested);
+        assert!(made.iter().any(|r| r.starts_with(at)), "{case}: {made:?}");
+        assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{case}: a request reached `pf`: {made:?}");
+        if case == "down" {
+            assert!(out.status.success(), "{case}: {result}");
+            assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "{case}: the service still runs");
+            continue;
+        }
+        assert!(!out.status.success(), "{case}: {result}");
+        assert_eq!(result["error"]["code"], "supervisor_changed", "{case}: {result}");
+        assert!(!made.iter().any(|r| r.starts_with("daemons start")), "{case}: started after the change: {made:?}");
+        assert_eq!(fixture.session()["provider"]["state_dir"], json!(old), "{case}");
+        fixture.ok(&["down"]);
+    }
 }
 
 #[test]
@@ -5547,10 +5689,6 @@ fn mcp_up_cut_short_while_verifying_keeps_what_launched_for_down() {
     let service = Detached::spawn();
     supervise_never_ready(&fixture, &service);
     fs::write(fixture.dir.path().join("slow-env-after-start"), "30").unwrap();
-    // Not the start's own look, once its request returned, at which supervisor the environment
-    // names (see `a_setup_that_changes_the_supervisor_the_environment_names_starts_nothing_through_either`):
-    // the one after it, verifying.
-    fs::write(fixture.dir.path().join("slow-env-skip"), "").unwrap();
     let start = Instant::now();
     let cause = mcp_up_times_out_and_down_stops(&fixture, &service);
     assert_eq!(cause["code"], "provider_failed", "{cause}");

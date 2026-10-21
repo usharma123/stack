@@ -221,17 +221,30 @@ output (mise's answer when no release matches) is an error, not a version.
   none). `up` and `restart` record it in the session before starting anything there. A command
   that cannot predict it asks nothing and fails with `supervisor_unknown`. mise renders
   `PITCHFORK_STATE_DIR` again for every request, and a project `[env]` template may depend on
-  anything (a file a service's `setup` writes, a command's output); its value wins over any
-  Stack could pass, so a request cannot be pinned to the chosen supervisor. Instead the
-  supervisor is chosen once per command, and each request is made only after the lock is held
-  and the environment is confirmed, after every install, setup and earlier wave, to still name
-  it: before the supervisor's own start and each start or stop request. A change is refused
-  with `supervisor_changed`, before the request: the session keeps naming the chosen supervisor,
-  under which everything the command started runs, and a retry chooses the new one from its
-  beginning. A change another program makes between that confirmation and mise's own rendering
-  cannot be prevented; it is looked for again, still under the lock, once the requests return,
-  and a change found then fails the command with `supervisor_changed` (`asked: true`) instead of
-  reporting the start or stop as done.
+  anything (a file a service's `setup` writes, a command's output); its value wins over any the
+  request inherits. Each request is therefore bound to the chosen supervisor inside the
+  project's own `[env]`: the generated configuration ends it with `_.file = "{{
+  get_env(name='STACK_SUPERVISOR_BINDING', default=<never written>) }}"`. Only Stack's start and
+  stop requests (the supervisor's own detached start, `mise daemons start` and `stop`) carry
+  `STACK_SUPERVISOR_BINDING`, and only from the holder of the supervisor's lock
+  (`mise::Target`); it names `$STACK_STATE_DIR/supervisor-bindings/<sha256 of the directory>.json`,
+  `{"PITCHFORK_STATE_DIR": <chosen directory>}`, and the request also inherits that directory
+  as `PITCHFORK_STATE_DIR`. mise 2026.10.3 renders the environment once per `mise daemons`
+  command and gives it to each Pitchfork call it makes (`usage`, `config add`, `start`/`stop`);
+  a later directive decides over an earlier one and over a tool's environment, and a `.json`
+  file is read literally (no template or `$` expansion), so the request reaches the chosen
+  directory whatever the project's template renders then. Without the variable the directive
+  names a file that never exists and loads nothing, so `mise env`, tasks and `exec` render the
+  project's environment as written; the variable is removed from whatever any provider command
+  inherits. The supervisor such a request starts inherits it, so a service it runs has
+  `PITCHFORK_STATE_DIR` naming that supervisor. A binding file path mise would read as a glob
+  pattern (`*`, `?`, `[`, `]` in `STACK_STATE_DIR`) is refused with `supervisor_unbound` before
+  the request. The supervisor is still chosen once per command, and before the supervisor's
+  own start and each start or stop request the environment is confirmed, after every install,
+  setup and earlier wave, to still name it. A change is refused with `supervisor_changed`
+  before the request: the session keeps naming the chosen supervisor, under which everything
+  the command started runs, and a retry chooses the new one from its beginning. A change made
+  after that confirmation cannot redirect the request.
   Being the supervisor's, the lock orders every Stack state's commands that use it, though
   sessions are read from `down`'s own Stack state only: another state's checkouts are seen
   through their daemons, which their requests started before they let go of the lock. A lock

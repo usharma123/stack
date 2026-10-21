@@ -217,9 +217,15 @@ and with it its `log-sink` helpers, when all of these hold:
   while it runs (a service's `setup` rewrites a file an `[env]` template reads, say), it fails
   with `supervisor_changed` before asking either supervisor anything more. Anything it already
   started stays recorded under the first one (`stack status` shows it, `stack down` stops it);
-  run the command again to use the new one. A change another program makes at the very moment
-  of a request is found once the request returns, and fails the command the same way, with
-  `asked: true`, rather than reporting success.
+  run the command again to use the new one. Every request itself reaches the supervisor the
+  command chose, whatever `PITCHFORK_STATE_DIR` renders by the time mise makes it, even when
+  another program changes what it renders from at that very moment: the generated provider
+  configuration ends its `[env]` with a `_.file` directive that loads, for Stack's start and
+  stop requests only, a file naming the chosen directory (in `$STACK_STATE_DIR/supervisor-bindings`).
+  When `STACK_STATE_DIR`'s path contains `*`, `?`, `[` or `]`, which mise would read as a
+  pattern, such a request fails with `supervisor_unbound` before it is made. Every other
+  command (`exec`, `run`, `mise env`) renders the project's environment as written. A service
+  that a supervisor Stack started runs has `PITCHFORK_STATE_DIR` naming that supervisor.
 
 Otherwise the supervisor is kept and `supervisor.reason` says why; that never fails `down`. A
 supervisor that is not running is not started: `supervisor` is then `{"stopped": true, "reason":

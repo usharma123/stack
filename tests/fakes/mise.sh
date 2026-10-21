@@ -25,7 +25,20 @@ target=${PITCHFORK_STATE_DIR-}
 if test "$1 $2" = 'daemons start' && test -f desired-target && mv "$REVIEW_FIXTURE/retarget-at-start" "$REVIEW_FIXTURE/retargeted" 2>/dev/null; then
   cp desired-target provider-target
 fi
+# `retarget-at` does the same for the first request whose `$1 $2` it names (`x --` for the
+# supervisor's own start, `daemons stop`).
+if test -f "$REVIEW_FIXTURE/retarget-at" && test "$1 $2" = "$(cat "$REVIEW_FIXTURE/retarget-at")" && test -f desired-target \
+  && mv "$REVIEW_FIXTURE/retarget-at" "$REVIEW_FIXTURE/retargeted" 2>/dev/null; then
+  cp desired-target provider-target
+fi
 if test -f provider-target; then target=$(cat provider-target); fi
+# Like mise, the generated config's last [env] directive decides over the template: `_.file` of
+# the file STACK_SUPERVISOR_BINDING names, when a request carries it (see `BINDING_VAR`).
+if test -n "${STACK_SUPERVISOR_BINDING-}" && test -f "$STACK_SUPERVISOR_BINDING" \
+  && grep -q "get_env(name='STACK_SUPERVISOR_BINDING'" .config/mise/conf.d/stack.toml 2>/dev/null; then
+  target=$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["PITCHFORK_STATE_DIR"])' "$STACK_SUPERVISOR_BINDING")
+fi
+echo "$1 $2 ${STACK_SUPERVISOR_BINDING-unset}" >>"$REVIEW_FIXTURE/bindings.log"
 case "$1 $2" in 'daemons start'|'daemons stop'|'x --') echo "$(pwd -P) $* => $target" >>"$REVIEW_FIXTURE/request-targets.log" ;; esac
 case "$1 $2" in
   'latest '*)
@@ -129,13 +142,8 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
   'env --json')
     if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
     # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
-    # With `slow-env-skip`, the one before it answers at once too.
     if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
-      if test -f "$REVIEW_FIXTURE/slow-env-skip" && ! test -f "$REVIEW_FIXTURE/env-skipped"; then
-        touch "$REVIEW_FIXTURE/env-skipped"
-      else
-        touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
-      fi
+      touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
     fi
     # Like mise, a pin's directory joins PATH once it is installed: `env-installed.json` stands for
     # the environment after the install recorded fnox, when a test gives one.
@@ -197,6 +205,8 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       detach=; test -f "$REVIEW_FIXTURE/hang-after-start" && detach=1
       "$py" -c 'import os,socket,sys,time; sys.argv[2] and os.setsid(); s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" "$detach" </dev/null >/dev/null 2>&1 &
       echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
+      # Which supervisor runs it: the one this request reached (see `supervisor stop`).
+      echo "$target $!" >>"$REVIEW_FIXTURE/supervised-by.log"
       sleep 0.3
     fi
     if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
