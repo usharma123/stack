@@ -31,6 +31,9 @@ The next review found that the SC2-F1 lock did not cover a reused session; that 
 The review after that found that a service's `setup` could still send a request to another
 supervisor than the one locked; that is corrected in
 [Correction 2026-10-21, round 4](#correction-2026-10-21-round-4-review-of-a49f271-sc4-f1).
+Its review found that a request could still reach another supervisor than the one locked, when
+what the template reads changed after Stack's last look; that is corrected in
+[Correction 2026-10-21, round 5](#correction-2026-10-21-round-5-review-of-b7d95c9-sc4-f1-still-open).
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
 agents need that Stack did not have), **docs** (behaviour was right or deliberate but undocumented
@@ -384,6 +387,38 @@ and ran Pitchfork against the default location) is separate from SC4-F1 and is r
 this round's evidence (`review-incident/INCIDENT.md`). Possible residue in the default Pitchfork
 state remains unverified; nothing there was inspected or cleaned.
 
+## Correction 2026-10-21, round 5: review of `b7d95c9` (SC4-F1, still open)
+
+A fresh independent review (Astra HIGH) of `b7d95c9` (code `ea8cbd9`) kept SC4-F1 open as a P1.
+Its own at-request test accepted a start that reached the other supervisor (last request `=> pf`,
+an error with `asked: true`, the session still naming `pf-old`), and the review gave a
+source-derived schedule in which that start runs under S while A's `down` holds S's lock, and A
+then kills it. The round-4 entry above stays as written; the claims this correction supersedes
+are listed after the table.
+
+| # | Problem | Kind | Before | Fix | Proof | Remaining limit |
+|---|---|---|---|---|---|---|
+| SC4-F1 | Every start, stop and supervisor-start request rendered the project's `[env]` again inside mise, after Stack's last look, and nothing bound that rendering to the supervisor whose lock the command held: a `PITCHFORK_STATE_DIR` template whose input changed in between sent the request to a supervisor another checkout was stopping. A check after the request could only report it | defect | Real mise at the dispatch boundary (`probes/gate-real-mise`): with a template that renders O for `mise env` and S while `mise daemons start` renders, a logging stand-in `pitchfork` received `PITCHFORK_STATE_DIR=S` for `usage`, `config add` and `start`. Real mise + Pitchfork 2.29.0 with r4's frozen binary `44cf6f67…f424f` (`probes/sc5/old-at-request`, repeat `old-at-request-repeat`): A's `down` held S's lock, deciding; B's service ran under S (PID 23648; repeat 75215), its record naming `pf-old`; A then stopped S (`stopped: true`), B's process was gone, its port closed and B unhealthy. Because the template rendered O again afterwards, the r4 after-request check saw nothing. The three new runtime tests fail on the `b7d95c9` source (`before/`): B's `up` returned `supervisor_changed` with `asked: true` after its start reached `pf`; the supervisor's own start in `up` reached `pf`; no binding directive | `71e401b` | The binding is inside the project's own `[env]`, which wins. The generated configuration ends its `[env]` with `_.file = "{{ get_env(name='STACK_SUPERVISOR_BINDING', default='.stack/provider-config/no-supervisor-binding.json') }}"`. Only Stack's start-capable requests set the variable: the supervisor's own detached start, `mise daemons start`, and `mise daemons stop` (from `up`, every wave, `restart`, `stop_previous`, `stop_dependents`, `down`, lease GC). They do so through a `mise::Target` that only `using_supervisor`, the lock holder, creates. It names `$STACK_STATE_DIR/supervisor-bindings/<sha256 of the directory>.json`, holding `{"PITCHFORK_STATE_DIR": <chosen directory>}`, and the request also inherits that directory. mise 2026.10.3 renders the environment once per `mise daemons` command and gives it to each Pitchfork call it makes (`src/daemons/runtime.rs`). A later directive decides over an earlier one and over a tool's environment (`src/toolset/toolset_env.rs`), and a `.json` env file is read literally (`src/config/env_directive/file.rs`). So the request reaches the chosen directory whatever the template renders. Without the variable the directive's path never exists and loads nothing. The variable is removed from what every provider command inherits. A binding path mise would read as a glob pattern is refused (`supervisor_unbound`) before the request. The confirmation before each request stays; the after-request check, which could only report, is removed, and with it r4's slow-env fixture adjustment. Tests: `a_supervisor_change_made_as_a_start_is_requested_cannot_take_it_outside_the_lock` replaces the at-request test. With A's shutdown of `pf` in progress and the input changed as mise renders B's start, every request B makes reaches `pf-old`; only start, stop and supervisor-start carry a binding, and an inherited one is ignored. B returns while A decides, its record names `pf-old`, and A's stop of `pf` (which, in the fake, ends the services that supervisor runs) leaves B's process alive and B healthy. `every_request_reaches_the_supervisor_its_command_chose_however_the_environment_renders_it` makes the change at the supervisor's own start (`up`), at restart's stop and at down's stop: each reaches `pf-old`, then `supervisor_changed` before any start. `the_generated_environment_ends_with_the_binding_of_supervisor_requests` covers the directive's place, and unit tests cover the binding file, the refusals and the stripped inherited variable. The fake mise models the directive as mise applies it. Real mise + Pitchfork 2.29.0 with the frozen `9c86dec0…4faf` (`probes/sc5/new-at-request`, repeat): the template rendered S for both start requests, yet B ran only under O (PID 74069; repeat 74655), returned healthy while A decided, record O, and kept the same PID, open port and health after A stopped S | Bound are the requests that may start or stop a daemon or the supervisor; `mise daemons --json` and `mise env` listings, which start nothing, still render the project's environment as written (status checks may then look at another supervisor's records; nothing is started or stopped by them). The generated configuration of every project with services now carries one fixed Stack-owned template (`get_env`), whichever the project declares; no project value is placed in it. A supervisor such a request starts inherits the variable, so the services it runs have `PITCHFORK_STATE_DIR` naming that supervisor, as long as the file is there, rather than their template's rendering. A `STACK_STATE_DIR` containing `*`, `?`, `[` or `]` cannot bind and refuses service requests (`supervisor_unbound`). Binding files are not removed (one small file per directory used). Checked with Pitchfork 2.29.0 (the pinned release) and mise 2026.10.3 (macOS: source, dispatch-boundary probe, races) and 2026.9.18 (local LinuxKit arm64: the at-request race); another mise's `_.file` or rendering rules would need the same check. Forced interleavings, not natural frequencies |
+
+Superseded claims of the round-4 correction above:
+
+- "mise's `[env]` wins over any value Stack could pass, so a request cannot be pinned to the
+  chosen supervisor": an inherited value cannot, but a directive Stack writes into that `[env]`
+  can. Since `71e401b` every start-capable request is pinned that way.
+- "A change another program makes between the confirmation and mise's own rendering cannot be
+  prevented: it is found afterwards ... and the command fails rather than claiming success":
+  that after-request check is removed. Such a change no longer redirects the request, and a
+  command whose requests all reached the chosen supervisor reports what they did.
+- The at-request test `a_supervisor_change_made_as_a_start_is_requested_is_reported_not_claimed_as_a_start`,
+  which required the start to reach `pf`, is replaced by the prevention test above.
+
+Unchanged: the confirmation before each request and its `supervisor_changed` refusal, the
+choice of supervisor and its lock, SC2-F2 and its schedule rules, ownership marks, the usage
+checks, the lock's location and replacement handling, the never-start-to-check rule, the CLI and
+MCP defaults and opt-outs, `gc`, leases, disposal, snapshots and H1. Evidence is in
+`eval/results/agentdx-supervisor-corrections-r5-20261021/` (git-ignored). The pilot report is
+unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
+
 ## Commits
 
 | Commit | Subject |
@@ -434,3 +469,4 @@ state remains unverified; nothing there was inspected or cleaned.
 | `8205aa9` | test(runtime): give every fixture its own Pitchfork state directory (after SC2-F1) |
 | `3e0cd74` | fix(supervisor): lock the supervisor each request reaches, not the recorded one (SC3-F1) |
 | `ea8cbd9` | fix(supervisor): refuse a request once the environment names another supervisor (SC4-F1) |
+| `71e401b` | fix(supervisor): bind every start and stop request to the supervisor whose lock is held (SC4-F1, round 5) |

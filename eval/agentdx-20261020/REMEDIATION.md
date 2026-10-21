@@ -342,7 +342,113 @@ Not done: push, PR, merge or release; any agent trial (the pilot report stays at
 `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
 by a person, with `complete` and `publishable` false); a hosted Linux run.
 
-Next: a new independent review of `ea8cbd9` and the notes commit after it.
+Next: a new independent review of `ea8cbd9` and the notes commit after it. It kept SC4-F1 open
+(a request could still reach another supervisor after the last confirmation), which the
+[correction below](#correction-2026-10-21-round-5-the-review-of-b7d95c9-sc4-f1-still-open) deals with.
+
+## Correction 2026-10-21, round 5: the review of `b7d95c9` (SC4-F1, still open)
+
+| | |
+|---|---|
+| Review | Astra HIGH, fresh and independent, of `b7d95c9` (code `ea8cbd9`): request changes, SC4-F1 still open as a P1. The current at-request test accepted a start that reached the other supervisor, and the review gave a source-derived schedule for the service loss. It confirmed the setup-transition refusal and the earlier controls. Earlier review texts, read in full, were left unchanged |
+| Start | Clean `b7d95c92116c00218e0e08fa2a9598755694749d`; every earlier commit kept as it is |
+| Tested head | `71e401b9ede69872d4f075b7d2d10492004b1ad6`, clean tree: code, tests and user and design docs. The documentation commit after it changes only `eval/agentdx-20261020/` |
+| Binary | `cargo build --locked` (debug, macOS arm64), sha256 `9c86dec0becf98e5db98f65cd1b9bcade69022be603523a2f5ac12e014a34faf`, frozen in `gates/bin/stack`; the gate's `cargo test` rebuilt the same hash. `git archive 71e401b src` sha256 `dae06792e9a5d424c6fe9ba866481d42c26f8f673734494ff6c6c3690d84b5ab` |
+| Evidence | `eval/results/agentdx-supervisor-corrections-r5-20261021/` (git-ignored; paths below are relative to it) |
+
+What changed and why is in the
+[ledger](REMEDIATION-LEDGER.md#correction-2026-10-21-round-5-review-of-b7d95c9-sc4-f1-still-open).
+In short, an inherited value cannot pin a request, but a directive in the project's own `[env]`
+can. The generated configuration now ends `[env]` with a `_.file` directive that loads, for
+Stack's start-capable requests only, a JSON file naming the supervisor whose lock the command
+holds. Every start, stop and supervisor-start request reaches that supervisor whatever the
+project's template renders when mise makes it. The after-request check is removed, since a
+detection after the fact could not prevent anything.
+
+How the binding was chosen (`notes/STRATEGY-CHECKPOINT.md`). mise 2026.10.3's source (tag tree
+`33a839a4`): each `mise daemons` command renders the environment once and passes it to every
+Pitchfork call it makes. Config `[env]` beats tool env, and tool env beats the inherited
+environment. Directives apply in order; `_.file` takes a templated, globbed path, and `.json`
+files are read literally. A probe at the real dispatch boundary (`probes/gate-real-mise`,
+`scripts/gate-probe.sh`; a logging stand-in `pitchfork` first on the PATH mise builds; isolated
+root) used a template that renders O for `mise env` and S while mise renders `daemons start`:
+
+- ungated (the old configuration, and the new one without the variable): Pitchfork received S
+  for `usage`, `config add` and `start`;
+- gated: Pitchfork received O for all three;
+- with no `PITCHFORK_STATE_DIR` declared: ungated kept the inherited value, gated gave O.
+
+Before and after:
+
+- **Before** (`before/`, `scripts/before.sh`): `git archive b7d95c9` (production source
+  identical to `ea8cbd9`, `before/source-*.sha256`) with only the new `tests/runtime.rs` and
+  `tests/fakes/mise.sh`. All three new runtime tests fail at their intended assertions:
+  - the at-request test: B's `up` returned `supervisor_changed`, `asked: true`, after its start
+    reached `pf`;
+  - the every-request test: `x -- pitchfork supervisor start => pf`;
+  - no binding directive.
+  The restored slow-environment test fails there too, as expected: r4's after-request lookup
+  takes the slow answer, which is why r4 had adjusted it. The other 178 runtime tests pass.
+- **Real provider, at the moment of the request** (`probes/sc5/race-at-request.py`, adapted from
+  the a49f271 review's repeat race; `scripts/sc5-probes.sh` through the fail-fast
+  `scripts/probe-launch.sh`). A's `down` holds S's lock, deciding (the review's wrapper gate on
+  A's real `pitchfork list`). B's template runs `target.sh`, which names O for every render
+  except one made by `mise daemons start`, where it names S. Where B's service runs is read from
+  each supervisor directly.
+  - r4's frozen binary `44cf6f67…f424f`: B's service ran under S while A decided (PID 23648;
+    repeat 75215), and B's record named `pf-old`. A stopped S, after which the PID was gone, the
+    port closed and B was unhealthy. B's own `up` was still waiting, and the probe ended it.
+  - frozen `9c86dec0…4faf`: the template rendered S for both start requests, but B ran only
+    under O (PID 74069; repeat 74655). B returned healthy while A decided, with its record naming
+    `pf-old`. After A stopped S, B kept the same PID, an open port and its health.
+  - a first old-binary attempt hit the probe's 65-second bound (its start had also reached S) and
+    broke the receipt flow. It is kept as `old-at-request-attempt1` and excluded; the probe was
+    reworked to observe B while its `up` runs (`race-at-request.attempt2.diff`).
+- **Round-4 controls, frozen binary** (r4's unmodified `race.py`, `paths.py`):
+  - setup changed: refused in 0.60 s while A decided, then healthy under S on retry;
+  - stable template: waited 16.31 s and stayed healthy;
+  - restart and later wave: refused, nothing answering in S, both starting under S when run again.
+- **The review's earlier probes** (`probes/reviewer-*`, `scripts/reviewer-probes.sh`,
+  `probes/summary.json`): moved-registered 16.03 s, legacy 16.02 s, current-record control
+  16.28 s, new-session race 16.45 s, same-state control 16.12 s, configured relative path
+  16.36 s. B waits for A each time and stays healthy with the same PID. Positive checks 19/19;
+  lock refusal 4/4.
+- **Schedule probe** (`probes/scheduled/`, `scripts/scheduled-r5.sh`): kept between runs (2 to 4
+  in 23 s), kept while disabled (4 to 7), stopped once the schedules were removed, after which
+  ticks stayed at 7.
+
+Gates, all with the frozen binary at the tested head (`gates/summary.txt`,
+`gates/gates-summary.txt`, `scripts/gates-r5.sh`; clippy, cargo, node and the real-mise test ran
+under an isolated root):
+
+| Gate | Result |
+|---|---|
+| clippy `--all-targets -D warnings` | 0 findings |
+| `cargo test --locked --all-targets` | 547 passed, 0 failed, 13 ignored (lib 247 with three new binding tests, runtime 182 with two new tests; the at-request test replaced) |
+| node tests | 41 passed, 1 skipped |
+| real-mise provider boundary | 2 passed |
+| macOS native e2e, with a run-owned local registry | 12/12, including 5-oci; registry container removed |
+| six regressions, cold | 6 FIXED |
+| eight validation cells, cold | 8/8 valid, `globals_changed` [] |
+| bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export; `bench/` unchanged since `4f7201c` |
+| LinuxKit | Local Docker arm64, rust:1.93, unprivileged user; not a hosted runner. Built from `git archive 71e401b` (binary `662e1dd1…6098`), with mise 2026.9.18 from `stack setup`. Lib 246 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp every_request the_generated_environment` 83 passed; six regressions 6 FIXED. Real-provider probes (`linux/`): at-request race B under O only (PID 25027) while the template rendered S for both starts, healthy after A stopped S, record `pf-old`; setup-changed refused in 0.21 s, then healthy; stable control 14.75 s; restart and wave refused. Container `sc5-linux-4d7a0cbb` removed |
+
+Writer incident (`notes/INCIDENTS.md`): one focused `cargo test` run early this round was
+launched directly, not through the isolated launcher. TMPDIR and the target were set; HOME, XDG
+and inherited provider variables were the shell's. The runtime fixture puts its fake `mise` and
+`pitchfork` first on PATH and sets its own Stack and Pitchfork directories, so no real provider
+was expected to run, but this was not verified for the whole process tree. The run is excluded
+from evidence; every later run used `scripts/iso-cargo.sh` or the fail-fast probe launchers.
+This round's global snapshot (`globals-before.json`, taken after that run) matched r4's final
+receipt exactly, and the final one is compared with it; that covers this round's own interval
+only. The review launch incident recorded in round 4 is unchanged: possible default-provider
+residue remains unverified, and nothing there was read or cleaned.
+
+Not done: push, PR, merge or release; any agent trial (the pilot report stays at
+`60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
+by a person, with `complete` and `publishable` false); a hosted Linux or x64 run.
+
+Next: a new independent review of `71e401b` and the notes commit after it.
 
 ## Round 5: corrections after the fourth independent review
 

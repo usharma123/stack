@@ -356,3 +356,12 @@ and a command whose environment now names another supervisor stops there with
 request is found once it returns and fails the command rather than being reported as success.
 See the
 [ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-4-review-of-a49f271-sc4-f1).
+
+Addendum 2026-10-21 (round 5): the round-4 confirmation came before mise rendered each request's
+environment, so a change to what a `PITCHFORK_STATE_DIR` template reads, made after Stack's last
+look, could still send a start to a supervisor another checkout was stopping. The round-4 text
+above says such a change "is found once it returns"; that only reported it. Since `71e401b`,
+every start, stop and supervisor-start request is bound to the supervisor whose lock the command
+holds, through a directive Stack writes at the end of the project's own `[env]`. The template
+can no longer redirect the request. See the
+[ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-5-review-of-b7d95c9-sc4-f1-still-open).
