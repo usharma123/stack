@@ -215,6 +215,11 @@ output (mise's answer when no release matches) is an error, not a version.
   command holds a shared lock on `stack-supervisor.lock` in the resolved supervisor state
   directory while it asks that supervisor to start or stop something, after recording its
   session; `down` takes it alone, waiting at most 5 seconds, for the whole check and stop.
+  The lock is that of the supervisor the request reaches: the state directory Pitchfork gets
+  from the command's environment and provider configuration, as `up` predicts its socket, never
+  one a session recorded earlier (a reused session may have run under another one, or recorded
+  none). `up` and `restart` record it in the session before starting anything there. A command
+  that cannot predict it asks nothing and fails with `supervisor_unknown`.
   Being the supervisor's, the lock orders every Stack state's commands that use it, though
   sessions are read from `down`'s own Stack state only: another state's checkouts are seen
   through their daemons, which their requests started before they let go of the lock. A lock

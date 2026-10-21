@@ -755,13 +755,18 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     }
     // Pitchfork refuses a socket path longer than `sun_path`, but only once it starts, after
     // every download. Check the path it will use first, with the env mise will give it.
-    let mut socket = None;
+    // That directory is also the supervisor every request below reaches, whatever an earlier
+    // session recorded: its lock is the one held while asking (see [`using_supervisor`]).
+    let mut addressed = None;
     if !report.stack.services.is_empty() {
         match preflight_socket(ctx) {
-            Ok((path, detail)) => {
-                socket = path;
-                steps.ok("preflight", detail);
-            }
+            Ok((path, detail)) => match path.as_ref().and_then(state_dir_of) {
+                Some(dir) => {
+                    addressed = Some(dir);
+                    steps.ok("preflight", detail);
+                }
+                None => return Err(steps.fail("preflight", unknown_supervisor(detail), false)),
+            },
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
@@ -771,10 +776,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     }
     let mut warnings = steps.skills(ctx, &report);
     // Recorded before anything starts, so a deleted project's services can still be found.
-    let provider = socket.and_then(|socket| {
-        let state_dir = socket.path.parent()?.parent()?.to_path_buf();
-        Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
-    });
+    let provider = addressed.clone().and_then(|state_dir| Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir }));
     let project_dir_id = dir_id(&ctx.root);
     let project_dir_created = dir_created(&ctx.root);
 
@@ -784,7 +786,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     let restart = previous.as_ref().is_some_and(|s| !same_config(s, ctx, &report));
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
     if restart || unrecorded {
-        match down_locked(ctx, provider.as_ref()) {
+        match down_locked(ctx, provider.as_ref(), addressed.as_deref()) {
             Err(e) => return Err(steps.fail("stop_previous", e, true)),
             // Processes no record accounted for are worth saying; the rest is routine.
             Ok(down) => {
@@ -874,7 +876,13 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                 project_dir_created,
             };
             save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        } else if let Some(previous) = previous.as_ref().filter(|p| p.provider != provider) {
+            // The same generation, started again through the supervisor this environment
+            // reaches now: the record names it before anything starts there.
+            let moved = Session { provider: provider.clone(), ..previous.clone() };
+            save(ctx, &moved).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         }
+        let supervisor = addressed.as_deref().expect("services have a known supervisor (preflight)");
         // Capture qualified IDs before launch when available, including interrupted starts.
         let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
@@ -885,12 +893,12 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         let starting: Vec<String> = names.iter().filter(|n| !running(n)).cloned().collect();
         let stale: Vec<String> = dependents_of(&report.stack.services, &starting).into_iter().filter(|n| running(n)).collect();
         if !stale.is_empty() {
-            match stop_and_wait(ctx, &stale, previous.as_ref()) {
+            match stop_and_wait(ctx, &stale, previous.as_ref(), supervisor) {
                 Ok(()) => steps.ok("stop_dependents", json!(stale)),
                 Err(e) => return Err(steps.fail("stop_dependents", e, true)),
             }
         }
-        if let Err(start_error) = start_in_order(ctx, &report, &names) {
+        if let Err(start_error) = start_in_order(ctx, &report, &names, supervisor) {
             let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
@@ -1099,8 +1107,8 @@ const STALL_LIMIT: Duration = Duration::from_secs(15);
 ///   `down` stops such a process.
 ///
 /// Every supervisor listing seen is recorded, as during verification.
-fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
-    start_watched_scoped(ctx, report, names, None)
+fn start_watched(ctx: &Ctx, report: &Report, names: &[String], supervisor: &Path) -> Result<()> {
+    start_watched_scoped(ctx, report, names, None, supervisor)
 }
 
 /// Start `names` in the order [`dependency_waves`] gives: each wave of services is requested,
@@ -1108,21 +1116,22 @@ fn start_watched(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
 /// it `depends_on` run. A stack without dependencies among `names` is one wave.
 ///
 /// A signal stack passed on to a setup (see [`cancelled`]) ends it there: no later setup runs
-/// and nothing more is requested, however the setup itself exited.
-fn start_in_order(ctx: &Ctx, report: &Report, names: &[String]) -> Result<()> {
+/// and nothing more is requested, however the setup itself exited. `supervisor` is the state
+/// directory of the supervisor the requests reach (see [`addressed_supervisor`]).
+fn start_in_order(ctx: &Ctx, report: &Report, names: &[String], supervisor: &Path) -> Result<()> {
     let waves = dependency_waves(&report.stack.services, names);
     if waves.len() <= 1 {
         prerequisites_ready(ctx, report, names, names)?;
         run_setups(ctx, report, names)?;
         cancelled(names)?;
-        return start_watched(ctx, report, names);
+        return start_watched(ctx, report, names, supervisor);
     }
     let last = waves.len() - 1;
     for (i, wave) in waves.iter().enumerate() {
         let later = || json!({ "not_started": waves[i + 1..].iter().flatten().collect::<Vec<_>>() });
         prerequisites_ready(ctx, report, wave, names).map_err(|e| e.with_detail(later()))?;
         run_setups(ctx, report, wave).and_then(|()| cancelled(wave)).map_err(|e| if e.code == "cancelled" { e.with_detail(later()) } else { e })?;
-        start_watched_scoped(ctx, report, wave, Some(wave))?;
+        start_watched_scoped(ctx, report, wave, Some(wave), supervisor)?;
         // A request may return once the provider launched the process; what depends on this
         // wave starts only once Stack verified it and its declared readiness passes.
         if i < last {
@@ -1329,7 +1338,7 @@ fn dependents_of(services: &IndexMap<String, Entry<Service>>, names: &[String]) 
 
 /// [`start_watched`]; with `scope`, only those services must verify for the start to be over
 /// early (a wave of [`start_in_order`]: later waves are not started yet).
-fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>) -> Result<()> {
+fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>, supervisor: &Path) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1340,8 +1349,8 @@ fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Opt
         .iter()
         .map(|n| report.stack.services.get(n).is_some_and(|e| matches!(e.value.preset.as_deref(), None | Some("postgres" | "redis")) || e.value.ready_cmd.is_some()))
         .collect();
-    // The launch record names the supervisor before anything starts.
-    let _using = using_supervisor(load(ctx).ok().flatten().and_then(|s| s.provider).as_ref())?;
+    // The supervisor the requests reach, not whichever one a session last recorded.
+    let _using = using_supervisor(supervisor)?;
     let owner = supervisor_owner(&ctx.state, true).ok();
     let starter = {
         let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
@@ -1415,11 +1424,12 @@ fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Opt
     }
 }
 
-/// Stop `names` through the supervisor and wait until the processes `session` recorded for them
+/// Stop `names` through the supervisor whose state directory is `supervisor` (the one requests
+/// reach, see [`addressed_supervisor`]) and wait until the processes `session` recorded for them
 /// are gone and their ports closed (`stop_unconfirmed` otherwise).
-fn stop_and_wait(ctx: &Ctx, names: &[String], session: Option<&Session>) -> Result<()> {
+fn stop_and_wait(ctx: &Ctx, names: &[String], session: Option<&Session>, supervisor: &Path) -> Result<()> {
     {
-        let _using = using_supervisor(session.and_then(|s| s.provider.as_ref()))?;
+        let _using = using_supervisor(supervisor)?;
         mise::stop_daemons(&ctx.root, names, supervisor_owner(&ctx.state, true).ok().as_deref())?;
     }
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
@@ -1925,8 +1935,14 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         return Err(steps.fail("dependencies", e, false));
     }
 
+    // Every request below reaches the supervisor this environment names now, which may not be
+    // the one the session recorded.
+    let supervisor = match addressed_supervisor(ctx) {
+        Ok(dir) => dir,
+        Err(e) => return Err(steps.fail("preflight", e, false)),
+    };
     // Confirm the old processes are gone before starting new ones on the same ports.
-    if let Err(e) = stop_and_wait(ctx, &names, Some(&session)) {
+    if let Err(e) = stop_and_wait(ctx, &names, Some(&session), &supervisor) {
         return Err(steps.fail("stop", e, true));
     }
     steps.ok("stop", json!(names));
@@ -1949,8 +1965,12 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         }
     }
     session.launching = true;
+    // The record names the supervisor the replacements start under before they start.
+    if session.provider.as_ref().map_or(true, |p| resolved(&p.state_dir) != resolved(&supervisor)) {
+        session.provider = mise::which_pitchfork(&ctx.root).map(|pitchfork| ProviderRecord { pitchfork, state_dir: supervisor.clone() });
+    }
     save(ctx, &session).map_err(|e| steps.clone().fail("record_launch", e, true))?;
-    if let Err(start_error) = start_in_order(ctx, &report, &names) {
+    if let Err(start_error) = start_in_order(ctx, &report, &names, &supervisor) {
         let observed = record_after_failed_start(ctx);
         if let Err(error) = observed {
             return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
@@ -2274,7 +2294,7 @@ pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
     // As in `down_locked`: a checkout with neither owns no services, and has no supervisor.
     let owns_services = !ports::lookup(&ctx.state, &ctx.root)?.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
     let recorded = session.and_then(|s| s.provider);
-    let mut report = down_locked(ctx, None)?;
+    let mut report = down_locked(ctx, None, None)?;
     if owns_services || recorded.is_some() {
         report.supervisor = Some(if stop_supervisor {
             stop_owned_supervisor(ctx, recorded)
@@ -2527,13 +2547,15 @@ fn supervisor_lock(state_dir: &Path) -> PathBuf {
     resolved(state_dir).join("stack-supervisor.lock")
 }
 
-/// Held, shared, while a command asks the supervisor of `provider` to start or stop something
-/// (which starts it when none runs). `down` takes it alone to decide on stopping that
-/// supervisor, so it never stops one between another command's look and its request, whichever
-/// Stack state that command uses; a checkout records its session before it asks. Nothing is
-/// held for an unknown supervisor.
-fn using_supervisor(provider: Option<&ProviderRecord>) -> Result<Option<SharedLock>> {
-    provider.map(|p| SharedLock::shared(&supervisor_lock(&p.state_dir))).transpose()
+/// Held, shared, while a command asks the supervisor whose state directory is `state_dir` to
+/// start or stop something (which starts it when none runs). `down` takes it alone to decide on
+/// stopping that supervisor, so it never stops one between another command's look and its
+/// request, whichever Stack state that command uses; a checkout records its session before it
+/// asks. It is the lock of the supervisor the request reaches, as this command's environment
+/// names it (see [`addressed_supervisor`]), never one a session recorded earlier: a request is
+/// not made without it.
+fn using_supervisor(state_dir: &Path) -> Result<SharedLock> {
+    SharedLock::shared(&supervisor_lock(state_dir))
 }
 
 /// Write the generated provider configuration from stack.lock when this checkout owns services
@@ -2553,7 +2575,10 @@ fn restore_provider_config(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownReport> {
+/// Stop this checkout's services. `provider` is the supervisor `up` found for a project without
+/// a launch record; `addressed`, the state directory of the supervisor this environment's
+/// requests reach, when the caller already found it (see [`addressed_supervisor`]).
+fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>, addressed: Option<&Path>) -> Result<DownReport> {
     let session = load(ctx)?;
     let reserved = ports::lookup(&ctx.state, &ctx.root)?;
     // Services always hold a port reservation from compile, and a launch record names any
@@ -2588,8 +2613,13 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>) -> Result<DownRepor
     let needs_stop = pids.iter().any(|(_, pid)| pid_alive(*pid))
         || before.iter().any(|d| matches!(d.status.as_str(), "running" | "starting"));
     if needs_stop {
-        let known = provider.clone().or_else(|| discover_provider(ctx));
-        let _using = using_supervisor(known.as_ref())?;
+        // `mise daemons stop` reaches the supervisor this environment names, which may not be
+        // the one the session recorded: that one's lock is held.
+        let addressed = match addressed {
+            Some(dir) => dir.to_path_buf(),
+            None => addressed_supervisor(ctx)?,
+        };
+        let _using = using_supervisor(&addressed)?;
         mise::stop(&ctx.root, supervisor_owner(&ctx.state, true).ok().as_deref())?;
     }
 
@@ -2733,8 +2763,30 @@ fn owned_ports(
 /// The supervisor as `up` would record it, for a project without a launch record.
 fn discover_provider(ctx: &Ctx) -> Option<ProviderRecord> {
     let (socket, _) = preflight_socket(ctx).ok()?;
-    let state_dir = socket?.path.parent()?.parent()?.to_path_buf();
+    let state_dir = state_dir_of(socket.as_ref()?)?;
     Some(ProviderRecord { pitchfork: mise::which_pitchfork(&ctx.root)?, state_dir })
+}
+
+/// The state directory of the supervisor that Stack's requests through mise reach from this
+/// checkout now: Pitchfork's, with the environment mise gives it for this command (see
+/// [`preflight_socket`]). A session's recorded supervisor says where its services ran, not
+/// where the next request goes. When this cannot be predicted no request is made: nothing could
+/// keep another checkout's `down` from stopping the supervisor while it is asked.
+fn addressed_supervisor(ctx: &Ctx) -> Result<PathBuf> {
+    let (socket, detail) = preflight_socket(ctx)?;
+    socket.as_ref().and_then(state_dir_of).ok_or_else(|| unknown_supervisor(detail))
+}
+
+/// Pitchfork's state directory, of which `socket` is `sock/main.sock`.
+fn state_dir_of(socket: &mise::SocketPath) -> Option<PathBuf> {
+    Some(socket.path.parent()?.parent()?.to_path_buf())
+}
+
+/// Stack cannot tell which supervisor a request would reach (`detail` says why).
+fn unknown_supervisor(detail: Value) -> StackError {
+    StackError::new("supervisor_unknown", "cannot tell which Pitchfork supervisor the request would reach, so nothing was asked of it")
+        .hint("set PITCHFORK_STATE_DIR to an absolute directory")
+        .with_detail(detail)
 }
 
 fn conflict(service: &str, port: u16, pinned: bool) -> PortConflict {
@@ -3938,7 +3990,7 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
         if busy {
             continue;
         }
-        let result = down_locked(&ctx, None);
+        let result = down_locked(&ctx, None, None);
         out.push(GcEntry {
             project: session.project,
             reason,

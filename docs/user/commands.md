@@ -209,7 +209,10 @@ and with it its `log-sink` helpers, when all of these hold:
 - No other Stack command, in any Stack state, is starting or stopping services through it.
   Those commands share a lock kept in the supervisor's own state directory
   (`stack-supervisor.lock`), which `down` waits up to 5 seconds to take alone before deciding,
-  so it cannot stop the supervisor between another checkout's look and its request.
+  so it cannot stop the supervisor between another checkout's look and its request. Each
+  command takes the lock of the supervisor its own environment reaches (where
+  `PITCHFORK_STATE_DIR` points now), whatever its session recorded; one that cannot tell which
+  supervisor that is fails with `supervisor_unknown` before asking it anything.
 
 Otherwise the supervisor is kept and `supervisor.reason` says why; that never fails `down`. A
 supervisor that is not running is not started: `supervisor` is then `{"stopped": true, "reason":
