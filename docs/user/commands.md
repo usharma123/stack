@@ -196,14 +196,16 @@ and with it its `log-sink` helpers, when all of these hold:
   helpers inherit it. One that was already running when Stack first used it, that something
   else or another Stack state started, or whose environment cannot be read, is kept. So is
   every supervisor if that file holds anything but a mark Stack wrote (delete it to reset).
-- No other checkout's session on the machine records the same supervisor (its state directory
-  compared after resolving links), or records services without naming their supervisor, and
-  every session record can be read.
+- No other checkout's session in this Stack state records the same supervisor (its state
+  directory compared after resolving links), or records services without naming their
+  supervisor, and every session record can be read. Checkouts using another Stack state are
+  seen through their daemons.
 - No daemon it tracks, Stack's or anyone's, is anything but stopped, failed or errored, or has
   a process still alive. A stopped daemon counts as stopped even if it has a schedule.
-- No other Stack command is starting or stopping services through it. Those commands share a
-  lock per supervisor, which `down` waits up to 5 seconds to take alone before deciding, so it
-  cannot stop the supervisor between another checkout's look and its request.
+- No other Stack command, in any Stack state, is starting or stopping services through it.
+  Those commands share a lock kept in the supervisor's own state directory
+  (`stack-supervisor.lock`), which `down` waits up to 5 seconds to take alone before deciding,
+  so it cannot stop the supervisor between another checkout's look and its request.
 
 Otherwise the supervisor is kept and `supervisor.reason` says why; that never fails `down`. A
 supervisor that is not running is not started: `supervisor` is then `{"stopped": true, "reason":

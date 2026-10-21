@@ -68,6 +68,12 @@ case "$1" in
     if test -f "$REVIEW_FIXTURE/pf-status.json"; then cat "$REVIEW_FIXTURE/pf-status.json"; exit 0; fi
     echo "Error: Daemon $3 not found" >&2; exit 1 ;;
   list)
+    # With `pf-list-gate`, the next list is answered only once `release-list` exists (at most
+    # 30 seconds), after `list-ready` says it was asked: a caller held right after it looked.
+    if mv "$REVIEW_FIXTURE/pf-list-gate" "$REVIEW_FIXTURE/pf-list-gated" 2>/dev/null; then
+      touch "$REVIEW_FIXTURE/list-ready"; n=0
+      while ! test -f "$REVIEW_FIXTURE/release-list" && test $n -lt 600; do sleep 0.05; n=$((n + 1)); done
+    fi
     if test -f "$REVIEW_FIXTURE/pf-list.json"; then cat "$REVIEW_FIXTURE/pf-list.json"; else echo '[]'; fi ;;
   supervisor)
     case "$2" in
@@ -2312,10 +2318,10 @@ fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it(
     assert!(!out.status.success(), "the two flags contradict each other");
     assert!(alive(pid));
 
-    // Another Stack command asking it something meanwhile holds its lock: kept.
-    let locks: Vec<_> = fs::read_dir(dir.join("state/supervisors")).unwrap().map(|e| e.unwrap().path()).collect();
-    assert_eq!(locks.len(), 1, "one supervisor, one lock, whatever it was called: {locks:?}");
-    let held = fs::File::open(&locks[0]).unwrap();
+    // Another Stack command asking it something meanwhile holds its lock: kept. The lock is
+    // the supervisor's, in its state directory, whatever Stack state or name reached it.
+    assert!(!dir.join("state/supervisors").exists());
+    let held = fs::File::open(pf.join("stack-supervisor.lock")).unwrap();
     // SAFETY: flock on a descriptor this test owns.
     assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_SH) }, 0);
     let kept = supervisor(&["down", "--json"]);
@@ -2350,6 +2356,79 @@ fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it(
     let pid = fake_supervisor(&fixture, Some(&mark));
     assert_eq!(supervisor(&["down", "--stop-supervisor", "--json"])["stopped"], true);
     assert!(!alive(pid));
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn an_up_through_the_same_supervisor_waits_for_a_down_deciding_to_stop_it_whatever_its_stack_state() {
+    // A's `down` has looked at what the supervisor runs and is about to stop it when B, another
+    // checkout using the same Pitchfork state directory, runs `up`: from another Stack state,
+    // and from the same one as a control. B must not ask the supervisor anything until A is
+    // done, or A stops it under B's freshly started service.
+    for b_state in ["state-b", "state"] {
+        let fixture = Fixture::with_bundle(WEB);
+        let dir = fixture.dir.path();
+        let pf = dir.join("pf");
+        supervise_listener(&fixture, assigned_port(&fixture, "web"));
+        let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+        assert!(out.status.success(), "{}", json_result(&out));
+        let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
+        let supervisor = fake_supervisor(&fixture, Some(&mark));
+
+        let b = dir.join("b");
+        fs::create_dir(&b).unwrap();
+        for file in ["stack.toml", "stack.lock"] {
+            fs::copy(dir.join("app").join(file), b.join(file)).unwrap();
+        }
+        let in_b = |args: &[&str]| {
+            let mut command = fixture.command_at(&b, args);
+            command.env("PITCHFORK_STATE_DIR", &pf).env("STACK_STATE_DIR", dir.join(b_state));
+            command
+        };
+        assert!(in_b(&["compile"]).output().unwrap().status.success());
+        let inspected = json_result(&in_b(&["inspect", "--json"]).output().unwrap());
+        let b_port = u16::try_from(inspected["data"]["ports"]["web"].as_u64().unwrap()).unwrap();
+
+        // A holds its lock alone, with the daemons it saw (none running) in hand.
+        fs::write(dir.join("pf-list-gate"), "").unwrap();
+        let down = fixture
+            .command(&["down", "--json"])
+            .env("PITCHFORK_STATE_DIR", &pf)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while !dir.join("list-ready").exists() {
+            assert!(Instant::now() < until, "A never asked what the supervisor runs");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let asked = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
+        supervise_listener(&fixture, b_port);
+        let mut up = in_b(&["up", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        thread::sleep(Duration::from_millis(1500));
+        assert!(up.try_wait().unwrap().is_none(), "{b_state}: B's `up` finished while A was deciding");
+        assert_eq!(fs::read_to_string(dir.join("owner-marks.log")).unwrap(), asked, "{b_state}: B asked the supervisor while A was deciding");
+        assert!(alive(supervisor));
+
+        // A goes on and stops the supervisor nothing used; then B starts afresh.
+        fs::write(dir.join("release-list"), "").unwrap();
+        let down = down.wait_with_output().unwrap();
+        let result = json_result(&down);
+        assert!(down.status.success(), "{result}");
+        assert_eq!(result["data"]["supervisor"], json!({ "stopped": true, "state_dir": pf }), "{b_state}: {result}");
+        assert!(!alive(supervisor));
+        let up = up.wait_with_output().unwrap();
+        let result = json_result(&up);
+        assert!(up.status.success(), "{b_state}: {result}");
+        let b_mark = fs::read_to_string(dir.join(b_state).join("supervisor-owner")).unwrap().trim().to_string();
+        let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
+        assert!(marks[asked.len()..].contains(&format!("daemons start {b_mark}")), "{b_state}: {marks}");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok(), "{b_state}: B's service is not listening");
+        let status = json_result(&in_b(&["status", "--json"]).output().unwrap());
+        assert_eq!(status["data"]["healthy"], true, "{b_state}: {status}");
+        assert!(in_b(&["down"]).output().unwrap().status.success());
+    }
 }
 
 #[test]

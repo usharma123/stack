@@ -208,14 +208,16 @@ output (mise's answer when no release matches) is an error, not a version.
   no tracked daemon is in any state but stopped, failed or errored, or has a live process.
   `pitchfork list` starts a supervisor when none answers, so it is asked only after
   `pitchfork supervisor status` (which never starts one) says one runs. Coordination: each
-  command holds a shared lock per resolved supervisor state directory
-  (`<state>/supervisors/<hash>.lock`) while it asks that supervisor to start or stop
-  something, after recording its session; `down` takes it alone, waiting at most 5 seconds,
-  for the whole check and stop. Stopped means `supervisor status` no longer answers and no
-  process of the supervisor's group or child of it carries the mark. Every other outcome keeps
-  the supervisor and gives the reason. The lock lives in Stack's state, so it orders this
-  Stack state's commands only; another Stack state sharing the Pitchfork state directory is
-  seen through its daemons, not its in-flight requests.
+  command holds a shared lock on `stack-supervisor.lock` in the resolved supervisor state
+  directory while it asks that supervisor to start or stop something, after recording its
+  session; `down` takes it alone, waiting at most 5 seconds, for the whole check and stop.
+  Being the supervisor's, the lock orders every Stack state's commands that use it, though
+  sessions are read from `down`'s own Stack state only: another state's checkouts are seen
+  through their daemons, which their requests started before they let go of the lock. A lock
+  file found replaced after locking is opened and locked again, and `down` keeps the
+  supervisor if its own was replaced while it decided. Stopped means `supervisor status` no
+  longer answers and no process of the supervisor's group or child of it carries the mark.
+  Every other outcome keeps the supervisor and gives the reason.
 - **Checkout token.** Every service gets `STACK_CHECKOUT_TOKEN` in its own daemon environment
   (never in `[env]`, so no task, `exec` command or `mise x` has it): a hash of the checkout's
   path, device, inode and creation time, so stable for one directory and different for one
