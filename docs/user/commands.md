@@ -128,7 +128,9 @@ services.
 `restart` also restarts every service that `depends_on` one it restarts, and starts nothing
 else. A service it would restart that depends on one outside that set needs that service
 running, verified and passing its readiness first: otherwise `restart` fails with
-`dependency_not_ready`, naming it and why, before anything is stopped, set up or started.
+`dependency_not_ready`, naming it and why, before anything is stopped, set up or started. A
+`ready_cmd` that cannot be run (no `sh` on the stack's `PATH`, say) has not passed: the error
+says why it could not run.
 `stack restart <that service>` restarts it with what depends on it; `stack up` starts every
 service that is not running.
 

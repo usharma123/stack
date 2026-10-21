@@ -3620,7 +3620,18 @@ fn a_declared_readiness_check_holds_the_start_until_it_passes() {
     let readiness = &cause.as_array().unwrap().iter().find_map(|d| d.get("readiness")).unwrap_or_else(|| panic!("{result}"))[0];
     assert_eq!((readiness["service"].clone(), readiness["exit_code"].clone()), (json!("web"), json!(1)), "{result}");
     assert_eq!(readiness["ready_cmd"], "test -f ready && test -n \"$PORT\"", "{result}");
+    // A check that cannot run at all (no `sh` on the stack's PATH) never passes, and the
+    // report says why it did not run, rather than nothing.
     fs::write(fixture.dir.path().join("app/ready"), "").unwrap();
+    let env = fs::read(fixture.dir.path().join("env.json")).unwrap();
+    let no_shell = fixture.dir.path().join("no-shell");
+    fs::create_dir(&no_shell).unwrap();
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": no_shell }).to_string()).unwrap();
+    let result = json_result(&fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap());
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    let hint = result["error"]["hint"].as_str().unwrap();
+    assert!(hint.starts_with("web's ready_cmd could not be run (cannot run it through sh"), "{hint}");
+    fs::write(fixture.dir.path().join("env.json"), env).unwrap();
     let started = Instant::now();
     let up = json_result(&fixture.ok(&["up", "--timeout", "2m", "--json"]));
     assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
@@ -3891,6 +3902,16 @@ fn restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_noth
     fs::remove_file(app.join("db-ready")).unwrap();
     let error = refused("db not ready");
     assert!(error.to_string().contains("ready_cmd"), "{error}");
+    // The same while db's ready_cmd cannot run at all (no `sh` on the stack's PATH): a check
+    // that answered nothing does not say db is ready, and why it did not run is reported.
+    let env = fs::read(dir.join("env.json")).unwrap();
+    let no_shell = dir.join("no-shell");
+    fs::create_dir(&no_shell).unwrap();
+    fs::write(dir.join("env.json"), json!({ "PATH": no_shell }).to_string()).unwrap();
+    let error = refused("db's ready_cmd cannot run");
+    assert!(error["message"].as_str().unwrap().contains("could not be run"), "{error}");
+    assert!(error.to_string().contains("cannot run it through sh"), "{error}");
+    fs::write(dir.join("env.json"), env).unwrap();
     fs::write(app.join("db-ready"), "").unwrap();
     drop(db_socket.take());
     let stopped = json!([{ "id": "app-test/db", "name": "db", "status": "stopped", "port": db }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);

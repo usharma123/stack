@@ -83,7 +83,7 @@ watch = ["index.html"]
 | `preset` | none | Use mise's preset for that server; `version` picks its release (default `latest`, pinned in stack.lock) |
 | `version` | `latest` | Preset services only |
 | `run` | the preset's | Shell command Pitchfork starts. It gets `$PORT`, the port stack assigned; the app gets it as `$<NAME>_PORT`, and a service without a preset also as `$<NAME>_URL` (`http://127.0.0.1:<port>`) |
-| `ready_cmd` | none | Command Pitchfork runs until it succeeds before it reports the service started |
+| `ready_cmd` | none | Command Pitchfork runs until it succeeds before it reports the service started. Stack runs it the same way (`sh -c`) where it checks readiness itself; one it cannot run does not pass, and the error says why |
 | `ready_port` | none (postgres and redis: the assigned port) | A port Pitchfork waits to accept connections before it reports the service started |
 | `port` | `"auto"` | `"auto"` takes a free port from this machine's registry (20000-29999), stable per checkout; a number pins it, in the project's `stack.toml` or `[override.services]` only (`bundle_fixed_port` in a bundle) |
 | `identity` | none | An [identity probe](identity-probes.md): without one a custom service is verified for liveness only |

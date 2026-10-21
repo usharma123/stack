@@ -1279,12 +1279,21 @@ fn prerequisites_ready(ctx: &Ctx, report: &Report, starting: &[String], names: &
         let Some(entry) = report.stack.services.get(name) else { continue };
         let status = statuses.iter().find(|d| d.name == *name);
         let token = report.identities.get(name).map(String::as_str);
-        let reason = match verify_one(&ctx.root, &entry.value, report.ports.get(name).copied(), status, &env, token) {
-            Err(reason) => Some((reason, None)),
-            // A declared ready_cmd runs once, kept with what it answered when it fails.
-            Ok(_) if entry.value.ready_cmd.is_some() => ready_failure(ctx, report, &env, name)
-                .map(|failure| (format!("its ready_cmd does not pass ({})", failure["ready_cmd"].as_str().unwrap_or_default()), Some(failure))),
-            Ok(_) => (declared_ready(ctx, report, &env, name) == Some(false)).then(|| ("its ready_port is not accepting connections".to_string(), None)),
+        let reason = match (verify_one(&ctx.root, &entry.value, report.ports.get(name).copied(), status, &env, token), &entry.value.ready_cmd) {
+            (Err(reason), _) => Some((reason, None)),
+            // A declared ready_cmd runs once, kept with what it answered when it fails. One that
+            // cannot be run says nothing of readiness, so it does not pass either.
+            (Ok(_), Some(command)) => match check_ready_cmd(ctx, report, &env, name, command) {
+                Ok(()) => None,
+                Err(failure) => {
+                    let reason = match failure["error"].as_str() {
+                        Some(error) => format!("its ready_cmd could not be run, so its readiness is unknown ({command}: {error})"),
+                        None => format!("its ready_cmd does not pass ({command})"),
+                    };
+                    Some((reason, Some(failure)))
+                }
+            },
+            (Ok(_), None) => (declared_ready(ctx, report, &env, name) == Some(false)).then(|| ("its ready_port is not accepting connections".to_string(), None)),
         };
         if let Some((reason, readiness)) = reason {
             let needed_by: Vec<&String> = starting.iter().filter(|s| prerequisites_of(&report.stack.services, &[(*s).clone()]).contains(name)).collect();
@@ -1582,13 +1591,10 @@ fn request_each(
     Ok(handed)
 }
 
-/// Whether `name` passes the readiness check its definition declares, as the supervisor would
-/// run it (`sh -c` in the project, with the app's environment and `$PORT`). Postgres and
-/// Redis without one are checked by verification itself, through their protocol. `None` when
-/// stack cannot tell: another preset's check is the provider's own.
 /// `name`'s `ready_cmd` once, as the supervisor runs it: through `sh` in the project, with the
-/// stack's environment and `$PORT`, bounded at 5 seconds and 4 KiB of output.
-fn run_ready_cmd(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str, command: &str) -> Option<crate::process::Captured> {
+/// stack's environment and `$PORT`, bounded at 5 seconds and 4 KiB of output. An error is a
+/// check that could not be run or read: it answered nothing, so it never counts as passing.
+fn run_ready_cmd(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str, command: &str) -> std::io::Result<crate::process::Captured> {
     let mut sh = Command::new("sh");
     sh.args(["-c", command]).current_dir(&ctx.root);
     mise::configure_command(&mut sh, &ctx.root);
@@ -1596,14 +1602,18 @@ fn run_ready_cmd(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, nam
     if let Some(port) = report.ports.get(name) {
         sh.env("PORT", port.to_string());
     }
-    crate::process::capture(&mut sh, crate::process::bounded(Duration::from_secs(5)), 4096).ok()
+    crate::process::capture(&mut sh, crate::process::bounded(Duration::from_secs(5)), 4096)
 }
 
+/// Whether `name` passes the readiness check its definition declares, as the supervisor would
+/// run it (`sh -c` in the project, with the app's environment and `$PORT`). Postgres and
+/// Redis without one are checked by verification itself, through their protocol. `None` when
+/// stack cannot tell: another preset's check is the provider's own. A `ready_cmd` that cannot
+/// be run does not pass.
 fn declared_ready(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str) -> Option<bool> {
     let service = &report.stack.services.get(name)?.value;
     if let Some(command) = &service.ready_cmd {
-        let out = run_ready_cmd(ctx, report, env, name, command)?;
-        return Some(!out.timed_out && out.exit_code == Some(0));
+        return Some(run_ready_cmd(ctx, report, env, name, command).is_ok_and(|out| !out.timed_out && out.exit_code == Some(0)));
     }
     match service.preset.as_deref() {
         Some("postgres" | "redis") | None => Some(service.ready_port.map_or(true, accepting)),
@@ -1694,18 +1704,29 @@ fn with_readiness_unless_cancelled(ctx: &Ctx, report: &Report, names: &[String],
 /// Time a failed or cut-short start may take to run each `ready_cmd` once more for its report.
 const READINESS_GRACE: Duration = Duration::from_secs(6);
 
-/// What `name`'s declared `ready_cmd` answers, when it does not succeed.
+/// What `name`'s declared `ready_cmd` answers, when it does not succeed (see
+/// [`check_ready_cmd`]). `None` for a service that declares none.
 fn ready_failure(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str) -> Option<Value> {
-    let command = report.stack.services.get(name)?.value.ready_cmd.clone()?;
-    let out = run_ready_cmd(ctx, report, env, name, &command)?;
+    let command = report.stack.services.get(name)?.value.ready_cmd.as_deref()?;
+    check_ready_cmd(ctx, report, env, name, command).err()
+}
+
+/// Run `name`'s `command` (its `ready_cmd`) once. `Ok` only when it ran and exited 0 in time;
+/// otherwise its exit status and last lines, or, when it could not be run or read, why
+/// (`error`): a check that answered nothing never passes.
+fn check_ready_cmd(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, name: &str, command: &str) -> std::result::Result<(), Value> {
+    let out = match run_ready_cmd(ctx, report, env, name, command) {
+        Ok(out) => out,
+        Err(e) => return Err(json!({ "service": name, "ready_cmd": command, "error": format!("cannot run it through sh: {e}") })),
+    };
     if !out.timed_out && out.exit_code == Some(0) {
-        return None;
+        return Ok(());
     }
     let tail = |text: &str| -> String {
         let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
         truncate(&lines[lines.len().saturating_sub(3)..].join("\n"), 400)
     };
-    Some(json!({
+    Err(json!({
         "service": name,
         "ready_cmd": command,
         "exit_code": out.exit_code,
@@ -1723,6 +1744,9 @@ fn unready_hint(error: &StackError) -> Option<String> {
         .iter()
         .map(|f| {
             let service = f["service"].as_str().unwrap_or_default();
+            if let Some(error) = f["error"].as_str() {
+                return format!("{service}'s ready_cmd could not be run ({error})");
+            }
             let how = match f["exit_code"].as_i64() {
                 _ if f["timed_out"] == true => "does not answer".to_string(),
                 Some(code) => format!("exits {code}"),

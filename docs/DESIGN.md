@@ -164,7 +164,9 @@ output (mise's answer when no release matches) is an error, not a version.
   must start again before starting both, so no dependent keeps a connection to a dead
   instance. A dependency outside what `restart` starts is never started by it: it must
   verify and pass its readiness before anything is stopped, and again before each wave's
-  setups, or the restart fails `dependency_not_ready` without side effects of its own. Identity stays per service: a dependent is verified on its own. A service's
+  setups, or the restart fails `dependency_not_ready` without side effects of its own. A
+  `ready_cmd` passes only when it ran and exited 0 in time; one Stack could not run or read
+  answered nothing and fails, with the reason in the error. Identity stays per service: a dependent is verified on its own. A service's
   `setup` runs just before it is requested (never for one left running), with the environment
   `exec` would get, so migrations and seeding need not be chained into `run`.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
