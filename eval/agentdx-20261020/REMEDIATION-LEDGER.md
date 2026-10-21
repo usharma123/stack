@@ -26,6 +26,8 @@ nothing else uses it. That dated change is in
 the O1 and L6 rows below still describe the opt-in behaviour they were recorded with. Its
 review found two cases where it stopped a supervisor still in use; they are corrected in
 [Correction 2026-10-21](#correction-2026-10-21-review-of-the-follow-up-sc2-f1-sc2-f2).
+The next review found that the SC2-F1 lock did not cover a reused session; that is corrected in
+[Correction 2026-10-21, round 3](#correction-2026-10-21-round-3-review-of-a09676d-sc3-f1).
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
 agents need that Stack did not have), **docs** (behaviour was right or deliberate but undocumented
@@ -315,6 +317,35 @@ assertions (its `positive.py`, paths only changed) all pass with the corrected b
 is in `eval/results/agentdx-supervisor-corrections-r2-20261021/` (git-ignored). The pilot report
 is unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 
+## Correction 2026-10-21, round 3: review of `a09676d` (SC3-F1)
+
+A fresh independent review (Astra) of `a09676d` (code `4ae0435`) confirmed SC2-F2 and the
+new-session case of SC2-F1, and requested changes for one P1 left in SC2-F1, reproduced with the
+frozen `c4f04430…3255` binary and real Pitchfork 2.29.0. It is corrected below. The entries above
+stay as written; the claims this correction supersedes are listed after the table.
+
+| # | Problem | Kind | Before | Fix | Proof | Remaining limit |
+|---|---|---|---|---|---|---|
+| SC3-F1 | A reused session (an unchanged generation `up` starts again) took no supervisor lock when its record named no supervisor, or the lock of the supervisor it had recorded when its environment now reached another one, while its start requests went to the supervisor another checkout's `down` was deciding to stop. That `down` then stopped it under B's freshly started service | defect | The start helper chose its lock by reloading the session's optional `provider`, which `up` rewrites only for a new or changed generation, and only after starting. `restart` and `down` chose theirs from the recorded provider too. The review's wrapper (real `pitchfork list` answer held at most 12 s): with B's record naming an older Pitchfork directory, B's `up` returned healthy in 1.57 s, then A stopped the supervisor and B's service died; the same with B's record lacking `provider` (1.46 s). The new runtime test fails on the `a09676d` source for a moved and a legacy record under `up` and `restart`, and a moved record under `down`, each at "B's `…` finished while A was deciding"; its current-record control passes | `3e0cd74` | `up` and `restart` pass the state directory of the supervisor their requests reach (predicted from the command's own environment and provider configuration, as for the socket preflight) to every start and stop helper, which lock it; `down` and lease GC lock the supervisor `mise daemons stop` reaches. A reused session's record names that supervisor before anything starts there (`restart`: in its launch record). A command that cannot predict it asks the supervisor nothing and fails with `supervisor_unknown`. Runtime tests `a_reused_session_asks_the_supervisor_its_environment_reaches_only_once_a_down_deciding_to_stop_it_is_done` (moved, legacy and current records; `up`, `restart`, `down`) and `a_command_that_cannot_tell_which_supervisor_it_reaches_asks_it_nothing` (fails on the old source: `up` succeeded). The review's scripts, with only their output path and binary changed: B now waits for A in the moved-registered case (15.79 s) and the legacy case (16.36 s), as in the current-record control (15.96 s); A stops the then-unused supervisor and B starts afresh and stays healthy with the same PID and open port; its record names the current supervisor with unchanged configuration and lock digests | `down`'s decision to stop a supervisor still targets the one the session recorded (else the one the environment names), explicitly and under that one's lock; `down` on a session that ran elsewhere does not stop services under a supervisor its environment no longer reaches (unchanged). Without `PITCHFORK_STATE_DIR` and `HOME` (or as root without `PITCHFORK_STATE_DIR`) `up`, `restart` and a `down` with something to stop now fail instead of asking unguarded. `mise daemons` listings, which may start a supervisor, stay outside the lock as before. Forced interleavings, not natural frequencies |
+
+Superseded claims of the round-2 correction above:
+
+- SC2-F1 "corrected": it was corrected for a new session only. A reused session with a moved or
+  missing provider record was still unguarded until `3e0cd74`; the round-2 proof (B waits 16.0 s)
+  used a new session.
+- "Nothing is held for an unknown supervisor" (the shared-lock design): a command now asks
+  nothing of a supervisor it cannot name.
+- "A checkout records its session before it asks": it now does so for a reused session too;
+  before `3e0cd74` the record was refreshed only after the start.
+
+Unchanged: SC2-F2 and its schedule rules, ownership marks, the other usage checks, the lock's
+location and replacement handling, the never-start-to-check rule, the CLI and MCP defaults and
+opt-outs, `gc`'s handling of deleted checkouts, leases, disposal, snapshots and H1. Two restart
+runtime tests now make the environment fail after the restart's own start rather than `up`'s,
+since `restart` reads it before stopping. Evidence is in
+`eval/results/agentdx-supervisor-corrections-r3-20261021/` (git-ignored). The pilot report is
+unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
+
 ## Commits
 
 | Commit | Subject |
@@ -363,3 +394,4 @@ is unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 | `9946319` | fix(down): coordinate with every Stack state that uses the same supervisor (SC2-F1) |
 | `4ae0435` | fix(down): keep the supervisor while a daemon it runs has a schedule (SC2-F2) |
 | `8205aa9` | test(runtime): give every fixture its own Pitchfork state directory (after SC2-F1) |
+| `3e0cd74` | fix(supervisor): lock the supervisor each request reaches, not the recorded one (SC3-F1) |

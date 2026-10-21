@@ -339,3 +339,10 @@ Stack state starting through it, and an external daemon's schedule. Since `99463
 `4ae0435`, every Stack state using a supervisor shares one coordination lock, and a scheduled
 daemon keeps the supervisor running. See the
 [ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-review-of-the-follow-up-sc2-f1-sc2-f2).
+
+Addendum 2026-10-21 (round 3): the shared lock did not yet cover a reused session whose record
+named an older Pitchfork directory or no supervisor at all; such a session could start through
+the supervisor another checkout was stopping. Since `3e0cd74`, every start and stop request
+locks the supervisor it actually reaches, and a command that cannot tell which one that is asks
+nothing. See the
+[ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-3-review-of-a09676d-sc3-f1).

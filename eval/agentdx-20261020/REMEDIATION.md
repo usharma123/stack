@@ -187,7 +187,70 @@ Not done: push, PR, merge or release; any agent trial (the pilot report stays at
 `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
 by a person, with `complete` and `publishable` false); a hosted Linux run.
 
-Next: a new independent review of the head after `8205aa9` and the notes commits.
+Next: a new independent review of the head after `8205aa9` and the notes commits. It
+requested changes (SC3-F1), which the
+[correction below](#correction-2026-10-21-round-3-the-review-of-a09676d-sc3-f1) deals with.
+
+## Correction 2026-10-21, round 3: the review of `a09676d` (SC3-F1)
+
+| | |
+|---|---|
+| Review | Astra, fresh and independent, of `a09676d` (code `4ae0435`): request changes, one P1 (SC3-F1) reproduced with the frozen `c4f04430…3255` binary, real mise and Pitchfork 2.29.0. SC2-F2 and the new-session case of SC2-F1 confirmed. Its sources were read and left unchanged; their hashes are in `review-sources.sha256`. Its excluded first launches (old `b80318c` binary path) are not used here |
+| Start | Clean `a09676dcf880c631c5f6e1e5bd9b3aa477d11d8d`; every earlier commit kept as it is |
+| Tested head | `3e0cd74bb3e817c872117f01e98a4fa872144883`, clean tree: code, tests and user and design docs. The documentation commit after it changes only `eval/agentdx-20261020/` |
+| Binary | `cargo build --locked` (debug, macOS arm64), sha256 `de8b453679782924ef6286b7000f33d5221f21780f955c35dd060ef59c82f7e6`, frozen in `gates/bin/stack`; `cargo test` rebuilt the same hash. `git archive 3e0cd74 src` sha256 `ac0f9053828fcd3c61ab0ee23674a8dd29439724e063e62243a96d0ebb5a2038` |
+| Evidence | `eval/results/agentdx-supervisor-corrections-r3-20261021/` (git-ignored; paths below are relative to it) |
+
+What changed and why is in the
+[ledger](REMEDIATION-LEDGER.md#correction-2026-10-21-round-3-review-of-a09676d-sc3-f1). In
+short: every start and stop request locks the supervisor it reaches, predicted from the
+command's own environment, instead of the one a session recorded (or none); a reused session
+records that supervisor before anything starts there; a command that cannot predict it asks
+nothing (`supervisor_unknown`).
+
+Before and after:
+
+- **Before** (`before/`, `scripts/before.sh`): `git archive a09676d` with only the new
+  `tests/runtime.rs`, each case of the new race test run alone (`before/case-*.diff` shows the
+  only edit). Moved and legacy records under `up` and `restart`, and a moved record under `down`,
+  all fail at "B's `…` finished while A was deciding"; the current-record control passes. The
+  unknown-supervisor test fails (`up` succeeded unguarded). The other 31 `supervisor` runtime
+  tests pass there, as do the two edited restart tests.
+- **Review scripts**, with only their output path and binary changed (`probes/reviewer-*`, each
+  with `*.diff` and `sources.sha256`; `probes/summary.json`):
+  - moved-registered: B waits 15.79 s (was 1.57 s and then killed), A stops the then-unused
+    supervisor, B is healthy after with the same PID and open port; B's record goes from
+    `pf-old/state` to `pf/state` with the same configuration and lock digests.
+  - legacy (no `provider` in B's records): B waits 16.36 s (was 1.46 s and then killed), same
+    outcome; the record now names `pf/state`.
+  - current-record control: 15.96 s, same outcome (review: 15.84 s).
+  - the original new-session race and same-state control: 16.01 s and 16.18 s, same outcome.
+  - the move without a registered daemon: A keeps the supervisor (B's daemon `available`), B
+    healthy, as in the review.
+  - `positive.py`: 19 of 19; lock refusal: 4 of 4.
+- **Schedule probe** (`probes/scheduled/`, `scripts/scheduled-r2.sh`, no wrapper): kept between
+  runs (ticks and failures 2 to 4 in 23 s), kept while disabled (4 to 7), stopped once the
+  schedules were removed, after which ticks stayed at 7.
+
+Gates, all with the frozen binary at the tested head (`gates/summary.txt`, `gates/gates-summary.txt`):
+
+| Gate | Result |
+|---|---|
+| clippy `--all-targets -D warnings` | 0 findings |
+| `cargo test --locked --all-targets` | 538 passed, 0 failed, 13 ignored (lib 244, runtime 176: the two new tests) |
+| node tests | 41 passed, 1 skipped |
+| real-mise provider boundary | passed |
+| macOS native e2e, with a run-owned local registry | 12/12, including 5-oci; registry container removed |
+| six regressions, cold | 6 FIXED |
+| eight validation cells, cold | 8/8 valid, `globals_changed` [] |
+| bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export; `bench/` unchanged since `4f7201c` |
+| LinuxKit (local Docker arm64, rust:1.93, unprivileged user; not a hosted runner) | built from `git archive 3e0cd74` (binary `1f5d19d5…056c`); lib 243 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp` 77 passed, including both new tests and the original cross-state one; six regressions 6 FIXED; the schedule probe (`linux/scheduled/`, Linux spellings in `linux/scheduled-r2-linux.diff`) gave the same outcome at every step; container `sc3-linux-7fab6ae7` removed |
+
+Not done: push, PR, merge or release; any agent trial (the pilot report stays at
+`60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
+by a person, with `complete` and `publishable` false); a hosted Linux run.
+
+Next: a new independent review of `3e0cd74` and the notes commit after it.
 
 ## Round 5: corrections after the fourth independent review
 
