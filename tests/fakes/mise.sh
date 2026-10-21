@@ -15,6 +15,18 @@ supervise() {
 }
 # The owner mark of every request that may start the supervisor (see `OWNER_VAR`).
 case "$1 $2" in 'daemons start'|'daemons stop'|'x --') echo "$1 $2 ${STACK_SUPERVISOR_OWNER-unset}" >>"$REVIEW_FIXTURE/owner-marks.log" ;; esac
+# A project whose provider config renders PITCHFORK_STATE_DIR from its file `provider-target`
+# (as `{{ exec(command='cat provider-target') | trim }}` would, read again by every mise
+# command): that value wins over the one the command inherited. Each request records, from
+# where it ran, the state directory it reached.
+target=${PITCHFORK_STATE_DIR-}
+# With `retarget-at-start`, once: another program copies `desired-target` there just as mise
+# renders the environment of a start request, after anything Stack could look at first.
+if test "$1 $2" = 'daemons start' && test -f desired-target && mv "$REVIEW_FIXTURE/retarget-at-start" "$REVIEW_FIXTURE/retargeted" 2>/dev/null; then
+  cp desired-target provider-target
+fi
+if test -f provider-target; then target=$(cat provider-target); fi
+case "$1 $2" in 'daemons start'|'daemons stop'|'x --') echo "$(pwd -P) $* => $target" >>"$REVIEW_FIXTURE/request-targets.log" ;; esac
 case "$1 $2" in
   'latest '*)
     # Where resolution ran and the only configuration it could see.
@@ -117,13 +129,20 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
   'env --json')
     if test -f "$REVIEW_FIXTURE/fail-env-after-start" && test -f "$REVIEW_FIXTURE/started"; then exit 1; fi
     # The first lookup after a start takes `slow-env-after-start` seconds; later ones answer at once.
+    # With `slow-env-skip`, the one before it answers at once too.
     if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
-      touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
+      if test -f "$REVIEW_FIXTURE/slow-env-skip" && ! test -f "$REVIEW_FIXTURE/env-skipped"; then
+        touch "$REVIEW_FIXTURE/env-skipped"
+      else
+        touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
+      fi
     fi
     # Like mise, a pin's directory joins PATH once it is installed: `env-installed.json` stands for
     # the environment after the install recorded fnox, when a test gives one.
     if test -f "$REVIEW_FIXTURE/env-installed.json" && grep -q '^fnox@' "$REVIEW_FIXTURE/installed" 2>/dev/null; then
       cat "$REVIEW_FIXTURE/env-installed.json"
+    elif test -f provider-target; then
+      "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); d["PITCHFORK_STATE_DIR"]=sys.argv[2]; print(json.dumps(d))' "$REVIEW_FIXTURE/env.json" "$target"
     else
       cat "$REVIEW_FIXTURE/env.json"
     fi ;;

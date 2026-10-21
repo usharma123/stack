@@ -219,7 +219,19 @@ output (mise's answer when no release matches) is an error, not a version.
   from the command's environment and provider configuration, as `up` predicts its socket, never
   one a session recorded earlier (a reused session may have run under another one, or recorded
   none). `up` and `restart` record it in the session before starting anything there. A command
-  that cannot predict it asks nothing and fails with `supervisor_unknown`.
+  that cannot predict it asks nothing and fails with `supervisor_unknown`. mise renders
+  `PITCHFORK_STATE_DIR` again for every request, and a project `[env]` template may depend on
+  anything (a file a service's `setup` writes, a command's output); its value wins over any
+  Stack could pass, so a request cannot be pinned to the chosen supervisor. Instead the
+  supervisor is chosen once per command, and each request is made only after the lock is held
+  and the environment is confirmed, after every install, setup and earlier wave, to still name
+  it: before the supervisor's own start and each start or stop request. A change is refused
+  with `supervisor_changed`, before the request: the session keeps naming the chosen supervisor,
+  under which everything the command started runs, and a retry chooses the new one from its
+  beginning. A change another program makes between that confirmation and mise's own rendering
+  cannot be prevented; it is looked for again, still under the lock, once the requests return,
+  and a change found then fails the command with `supervisor_changed` (`asked: true`) instead of
+  reporting the start or stop as done.
   Being the supervisor's, the lock orders every Stack state's commands that use it, though
   sessions are read from `down`'s own Stack state only: another state's checkouts are seen
   through their daemons, which their requests started before they let go of the lock. A lock

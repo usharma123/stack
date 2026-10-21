@@ -756,7 +756,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     // Pitchfork refuses a socket path longer than `sun_path`, but only once it starts, after
     // every download. Check the path it will use first, with the env mise will give it.
     // That directory is also the supervisor every request below reaches, whatever an earlier
-    // session recorded: its lock is the one held while asking (see [`using_supervisor`]).
+    // session recorded: its lock is the one held while asking (see [`using_supervisor`]), and
+    // a request is refused if the environment names another by then (see [`confirm_addressed`]).
     let mut addressed = None;
     if !report.stack.services.is_empty() {
         match preflight_socket(ctx) {
@@ -1339,6 +1340,14 @@ fn dependents_of(services: &IndexMap<String, Entry<Service>>, names: &[String]) 
 /// [`start_watched`]; with `scope`, only those services must verify for the start to be over
 /// early (a wave of [`start_in_order`]: later waves are not started yet).
 fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>, supervisor: &Path) -> Result<()> {
+    // The supervisor the requests reach, not whichever one a session last recorded, and still
+    // the one the command chose: this wave's setups ran since (see [`using_supervisor`]).
+    let using = using_supervisor(&ctx.root, supervisor)?;
+    using.after(watch_starts(ctx, report, names, scope, supervisor))
+}
+
+/// [`start_watched_scoped`], once it holds the lock of `supervisor`.
+fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[String]>, supervisor: &Path) -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1349,16 +1358,14 @@ fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Opt
         .iter()
         .map(|n| report.stack.services.get(n).is_some_and(|e| matches!(e.value.preset.as_deref(), None | Some("postgres" | "redis")) || e.value.ready_cmd.is_some()))
         .collect();
-    // The supervisor the requests reach, not whichever one a session last recorded.
-    let _using = using_supervisor(supervisor)?;
     let owner = supervisor_owner(&ctx.state, true).ok();
     let starter = {
         let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
-        let (checkable, completed) = (checkable.clone(), completed.clone());
+        let (checkable, completed, supervisor) = (checkable.clone(), completed.clone(), supervisor.to_path_buf());
         std::thread::spawn(move || {
             let _deadline = crate::process::deadline_scope(deadline);
             let _cancel = crate::process::cancel_scope(cancel.clone());
-            let _ = done.send(request_starts(&root, &names, &checkable, &cancel, &completed, owner.as_deref()));
+            let _ = done.send(request_starts((&root, &supervisor), &names, &checkable, &cancel, &completed, owner.as_deref()));
         })
     };
     let end = |outcome: Result<()>| {
@@ -1429,8 +1436,8 @@ fn start_watched_scoped(ctx: &Ctx, report: &Report, names: &[String], scope: Opt
 /// are gone and their ports closed (`stop_unconfirmed` otherwise).
 fn stop_and_wait(ctx: &Ctx, names: &[String], session: Option<&Session>, supervisor: &Path) -> Result<()> {
     {
-        let _using = using_supervisor(supervisor)?;
-        mise::stop_daemons(&ctx.root, names, supervisor_owner(&ctx.state, true).ok().as_deref())?;
+        let using = using_supervisor(&ctx.root, supervisor)?;
+        using.after(mise::stop_daemons(&ctx.root, names, supervisor_owner(&ctx.state, true).ok().as_deref()))?;
     }
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     loop {
@@ -1501,8 +1508,12 @@ const HANDOFF: Duration = Duration::from_secs(5);
 /// has its request ended (its process group only; the supervisor keeps the service) and the
 /// next service is requested. Services whose requests returned successfully, so passed the
 /// provider's readiness checks, are added to `completed` as they do.
+///
+/// Each request is made only once the project's environment is confirmed to still name
+/// `supervisor` (see [`confirm_addressed`]): the supervisor's own start comes first, and
+/// services already started run their own code meanwhile.
 fn request_starts(
-    root: &Path,
+    (root, supervisor): (&Path, &Path),
     names: &[String],
     hand_off: &[bool],
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1511,7 +1522,7 @@ fn request_starts(
 ) -> Result<Vec<String>> {
     let mut ends = Vec::new();
     let mut threads = Vec::new();
-    let outcome = request_each((root, owner), names, hand_off, cancel, completed, &mut ends, &mut threads);
+    let outcome = request_each((root, supervisor, owner), names, hand_off, cancel, completed, &mut ends, &mut threads);
     // No request outlives this: one still waiting is ended (its process group) and waited for,
     // so a stack that exits next cannot leave it behind.
     for end in &ends {
@@ -1526,7 +1537,7 @@ fn request_starts(
 /// [`request_starts`], leaving the requests' end flags and threads to the caller. Each
 /// request goes to the project at `root`, marked with `owner` (see [`mise::OWNER_VAR`]).
 fn request_each(
-    (root, owner): (&Path, Option<&str>),
+    (root, supervisor, owner): (&Path, &Path, Option<&str>),
     names: &[String],
     hand_off: &[bool],
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1566,6 +1577,7 @@ fn request_each(
         Ok(true)
     };
     for (i, name) in names.iter().enumerate() {
+        confirm_addressed(root, supervisor)?;
         let end = Arc::new(AtomicBool::new(false));
         let (dir, service, sent, deadline, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::deadline(), end.clone());
         let owner = owner.map(str::to_string);
@@ -2184,8 +2196,13 @@ fn unknown_service(report: &Report, name: &str) -> StackError {
 
 /// The supervisor socket Pitchfork will use for this project, or `socket_path_too_long`.
 fn preflight_socket(ctx: &Ctx) -> Result<(Option<mise::SocketPath>, Value)> {
-    let effective = mise::env(&ctx.root)?;
-    let env = mise::SocketEnv::effective(&ctx.root, &effective);
+    socket_at(&ctx.root)
+}
+
+/// [`preflight_socket`] for the project at `root`.
+fn socket_at(root: &Path) -> Result<(Option<mise::SocketPath>, Value)> {
+    let effective = mise::env(root)?;
+    let env = mise::SocketEnv::effective(root, &effective);
     match mise::socket_path(&env, mise::socket_capacity()) {
         Ok(socket) if socket.fits() => {
             let detail = json!({ "socket": socket });
@@ -2553,9 +2570,42 @@ fn supervisor_lock(state_dir: &Path) -> PathBuf {
 /// request, whichever Stack state that command uses; a checkout records its session before it
 /// asks. It is the lock of the supervisor the request reaches, as this command's environment
 /// names it (see [`addressed_supervisor`]), never one a session recorded earlier: a request is
-/// not made without it.
-fn using_supervisor(state_dir: &Path) -> Result<SharedLock> {
-    SharedLock::shared(&supervisor_lock(state_dir))
+/// not made without it. Once it is held, the environment of the project at `root` must still
+/// name `state_dir` (see [`confirm_addressed`]): waiting for it, or what ran since the command
+/// chose `state_dir` (an install, a service's `setup`), may have changed that.
+fn using_supervisor(root: &Path, state_dir: &Path) -> Result<UsingSupervisor> {
+    let lock = SharedLock::shared(&supervisor_lock(state_dir))?;
+    confirm_addressed(root, state_dir)?;
+    Ok(UsingSupervisor { _lock: lock, root: root.to_path_buf(), state_dir: state_dir.to_path_buf() })
+}
+
+/// A command's hold on the supervisor its requests reach (see [`using_supervisor`]).
+struct UsingSupervisor {
+    _lock: SharedLock,
+    root: PathBuf,
+    state_dir: PathBuf,
+}
+
+impl UsingSupervisor {
+    /// After the requests, still holding the lock: `supervisor_changed` when the environment
+    /// now names another supervisor, which a request may then have reached instead of this one.
+    /// Each request was confirmed just before it was made, so only a change by another program
+    /// in between can do that; this reports it rather than the request's success. Not being
+    /// able to tell now is no such evidence, and leaves `outcome` as it is.
+    fn after(&self, outcome: Result<()>) -> Result<()> {
+        if outcome.as_ref().is_err_and(|e| e.code == "cancelled" || e.code == "supervisor_changed") {
+            return outcome;
+        }
+        let Ok(now) = addressed_at(&self.root) else { return outcome };
+        if resolved(&now) == resolved(&self.state_dir) {
+            return outcome;
+        }
+        let changed = supervisor_changed(&self.state_dir, &now, true);
+        Err(match outcome {
+            Ok(()) => changed,
+            Err(e) => changed.with_detail(json!({ "request_error": e })),
+        })
+    }
 }
 
 /// Write the generated provider configuration from stack.lock when this checkout owns services
@@ -2619,8 +2669,8 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>, addressed: Option<&
             Some(dir) => dir.to_path_buf(),
             None => addressed_supervisor(ctx)?,
         };
-        let _using = using_supervisor(&addressed)?;
-        mise::stop(&ctx.root, supervisor_owner(&ctx.state, true).ok().as_deref())?;
+        let using = using_supervisor(&ctx.root, &addressed)?;
+        using.after(mise::stop(&ctx.root, supervisor_owner(&ctx.state, true).ok().as_deref()))?;
     }
 
     // A port still open once every recorded process is gone is held by something else: when
@@ -2773,8 +2823,58 @@ fn discover_provider(ctx: &Ctx) -> Option<ProviderRecord> {
 /// where the next request goes. When this cannot be predicted no request is made: nothing could
 /// keep another checkout's `down` from stopping the supervisor while it is asked.
 fn addressed_supervisor(ctx: &Ctx) -> Result<PathBuf> {
-    let (socket, detail) = preflight_socket(ctx)?;
+    addressed_at(&ctx.root)
+}
+
+/// [`addressed_supervisor`] for the project at `root`.
+fn addressed_at(root: &Path) -> Result<PathBuf> {
+    let (socket, detail) = socket_at(root)?;
     socket.as_ref().and_then(state_dir_of).ok_or_else(|| unknown_supervisor(detail))
+}
+
+/// Before a request: fail unless the environment of the project at `root` still names the
+/// supervisor whose state directory is `chosen`, the one the command chose when it began and
+/// whose lock it holds (see [`using_supervisor`]). mise renders `PITCHFORK_STATE_DIR` again for
+/// every request, and a project's `[env]` template can depend on anything (a file a service's
+/// `setup` writes, a command's output); what it gives wins over any value Stack could pass, so
+/// a request cannot be pinned to `chosen`. A change is refused, never followed: the command
+/// then asks neither supervisor anything more, and the session keeps naming `chosen`, under
+/// which anything it already started runs. Not knowing is refused too.
+fn confirm_addressed(root: &Path, chosen: &Path) -> Result<()> {
+    let now = addressed_at(root)?;
+    if resolved(&now) == resolved(chosen) {
+        return Ok(());
+    }
+    Err(supervisor_changed(chosen, &now, false))
+}
+
+/// The environment names the supervisor in `now`, not the one in `chosen` whose lock the command
+/// holds: found before a request (nothing more is asked), or once requests returned (`asked`,
+/// see [`UsingSupervisor::after`]), when they may have reached `now` instead.
+fn supervisor_changed(chosen: &Path, now: &Path, asked: bool) -> StackError {
+    let (chosen_text, now_text) = (chosen.display(), now.display());
+    let (message, hint) = if asked {
+        (
+            format!(
+                "this command asked the Pitchfork supervisor in {chosen_text} to start or stop services, holding its lock, but once \
+                 those requests returned the project's environment named the one in {now_text} (PITCHFORK_STATE_DIR rendered again: \
+                 another program changed what it depends on meanwhile), so they may have reached that one, outside the lock"
+            ),
+            "`stack status` shows what runs and `stack down` stops it; then run the command again, leaving what \
+             PITCHFORK_STATE_DIR depends on unchanged while it runs",
+        )
+    } else {
+        (
+            format!(
+                "this command chose the Pitchfork supervisor in {chosen_text} and holds its lock, but the project's environment now \
+                 names the one in {now_text} (PITCHFORK_STATE_DIR rendered again: a setup, an install or another program changed \
+                 what it depends on), so nothing more was started or stopped through either"
+            ),
+            "run the command again: it uses the supervisor the environment names when it begins. Anything this command \
+             already started stays recorded under the first one: `stack status` shows it, `stack down` stops it",
+        )
+    };
+    StackError::new("supervisor_changed", message).hint(hint).with_detail(json!({ "chosen": chosen, "now": now, "asked": asked }))
 }
 
 /// Pitchfork's state directory, of which `socket` is `sock/main.sock`.
