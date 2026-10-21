@@ -3,11 +3,13 @@
 pub mod artifacts;
 pub mod checkout;
 pub mod compose;
+pub mod datadirs;
 pub mod doctor;
 pub mod error;
 pub mod git;
 pub mod hash;
 pub mod identity;
+pub mod init;
 pub mod ignore;
 pub mod lock;
 pub mod manifest;

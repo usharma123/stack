@@ -14,7 +14,10 @@ timeout = "5s"                                    # default 5s, at most 30s
 ```
 
 The probe runs with `sh -c` in the project, with the stack's environment minus every
-`STACK_IDENTITY_*` variable, so it can only learn the token from the service. Exit status other
+`STACK_IDENTITY_*` variable, so it can only learn the token from the service. The token is in
+the stack's `[env]`, so commands run through `exec` and `run` see it too: it identifies an
+instance, it is not a secret, and a command that echoes it back does not make another server
+this checkout's. Exit status other
 than 0, no output, any other output, more than 4 KiB, or the deadline (its whole process group is
 killed) all fail verification and withhold the service's endpoints. A server that is healthy but
 belongs to another checkout or to nothing stack started cannot pass. Probes, like `run`, are

@@ -1,0 +1,21 @@
+[tools]
+python = "3.13"
+uv = "0.12.23"
+[services.postgres]
+preset = "postgres"
+version = "17"
+[services.redis]
+preset = "redis"
+version = "7"
+[tasks.test]
+run = "uv run python test_api.py"
+services = ["postgres", "redis"]
+
+[services.api]
+run = "exec uv run python app.py"
+watch = ["app.py"]
+[services.api.identity]
+command = "python -c 'import os,urllib.request; print(urllib.request.urlopen(os.environ[\"API_URL\"]+\"/identity\").read().decode())'"
+
+[tasks.endpoints]
+run = "python -c 'import os,json;print(json.dumps({k:os.environ.get(k) for k in [\"API_URL\",\"API_PORT\",\"DATABASE_URL\",\"REDIS_URL\"]}))'"

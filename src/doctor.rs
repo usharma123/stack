@@ -32,6 +32,7 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
         ));
     }
     checks.push(writable(state));
+    checks.push(stack_release(root));
     let mut configured = indexmap::IndexMap::new();
     if root.join(crate::manifest::PROJECT_FILE).exists() {
         let compiled = project::compile(&Options {
@@ -112,6 +113,41 @@ fn provider_release(root: &Path, requirements: &[crate::provider::mise::Requirem
     };
     let needs: Vec<String> = requirements.iter().map(|r| format!("{} ({})", r.minimum, r.reason)).collect();
     Some(Check { name: "mise_release", ok: true, detail: format!("mise {version}; needs {}", needs.join(", ")), hint: None })
+}
+
+/// This Stack's release and binary, and anything that disagrees with it: another `stack` first
+/// on PATH (which agents, hooks and `stack mcp` registrations run), or a stack.lock another
+/// release last wrote. A notice, not a failure: running a build by its path is legitimate.
+fn stack_release(root: &Path) -> Check {
+    let me = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let mut notes = vec![format!("{} at {}", crate::lock::writer(), me.as_ref().map_or("?".into(), |p| p.display().to_string()))];
+    let on_path = std::env::var("PATH").ok().and_then(|path| crate::session::which_in(Some(&path), "stack")).and_then(|p| p.canonicalize().ok());
+    match on_path {
+        Some(found) if Some(&found) != me.as_ref() => {
+            let mut command = Command::new(&found);
+            command.arg("--version");
+            let version = crate::process::capture(&mut command, std::time::Duration::from_secs(5), 4096)
+                .ok()
+                .map(|o| o.stdout.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "an unknown release".into());
+            notes.push(format!("warning: `stack` on PATH is {} ({version}), not this one", found.display()));
+        }
+        Some(_) => {}
+        None => notes.push("warning: no `stack` on PATH; hooks and MCP clients that run `stack` will not find this one".into()),
+    }
+    if let Ok(Some(lock)) = crate::lock::read(root) {
+        if let Some(other) = lock.written_by.filter(|w| *w != crate::lock::writer()) {
+            notes.push(format!("note: stack.lock was last written by {other}"));
+        }
+    }
+    let warned = notes.iter().any(|n| n.starts_with("warning:") || n.starts_with("note:"));
+    Check {
+        name: "stack",
+        ok: true,
+        detail: notes.join("; "),
+        hint: warned.then_some("run the same Stack everywhere: put it first on PATH, or register MCP and hooks with its full path"),
+    }
 }
 
 fn writable(state: &Path) -> Check {

@@ -1,607 +1,1352 @@
 #!/usr/bin/env python3
-"""Real-world competitor benchmark runner. See bench/README.md.
+"""Matched Stack-vs-existing-setup agent task benchmark.
 
-  python3 bench/run.py --tool stack --out bench/results/<new-dir> [--repeats 20 --warmups 3]
-  python3 bench/run.py --tool flox --dry-run          # print the planned bodies, run nothing
+  validate  scripted check that a task cell is gradeable: the starting code fails and the
+            reference solution passes through the same grading path agent work uses
+  plan      pre-register an experiment (tasks, models, agent command, binary, locale, cache)
+  trial     run one planned trial: external agent, then cleanup and independent grading
+  review-template  print the transcript review a human must complete for one trial
+  report    tabulate every planned trial; missing and invalid trials stay in the denominator
 
-One tool per invocation; the parent serializes runs. The output directory must not exist.
-Every run is diagnostic (meta.reportable stays false); final timings come only from a
-parent-declared session manifest checked by bench/report.py.
+No model, agent or human help is simulated. Validation and harness self-tests are
+labelled as such and can never produce publishable agent results.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import platform
+import random
+import re
+import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
 import time
-import traceback
-import uuid
 
-BENCH = Path(__file__).resolve().parent
-sys.path.insert(0, str(BENCH))
+import arms
+from arms import HERE, TASKS, digest
 
-from rwb.adapters import registry  # noqa: E402
-from rwb.adapters.base import FEATURES  # noqa: E402
-from rwb.outcomes import Outcomes  # noqa: E402
-from rwb.record import Recorder, utc  # noqa: E402
-from rwb.scenario import ProvisionBlocked, ProvisionError, Scenario  # noqa: E402
-from rwb.transport import DockerTransport, HostTransport  # noqa: E402
-from rwb.verify import BOUNDARIES  # noqa: E402
+LOCK = Path('/tmp/stack-agentdx-bench.lock')
+DEFAULT_LOCALE = {'LANG': 'en_US.UTF-8'}
+INTERVENTION_KINDS = {'clarification', 'hint', 'command_fix', 'environment_repair', 'code_change', 'other'}
+COMMAND_STEM = re.compile(r'(?:agent|(?:agent|final|grade(?:-control)?)-cleanup-(?:down|supervisor-stop)'
+                          r'|grade(?:-control)?-(?:setup\d*|up\d*|smoke_exec|smoke_task_loop|verify))'
+                          r'(?:-attempt-[1-9]\d*)?')
 
 
-def sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+class Cancelled(BaseException):
+    """SIGTERM/SIGHUP. Not an OSError, so no `except OSError` can swallow it."""
 
 
-def tree_hashes(root):
-    root = Path(root)
-    return {str(p.relative_to(root)): sha256(p) for p in sorted(root.rglob("*"))
-            if p.is_file() and "__pycache__" not in p.parts and ".venv" not in p.parts}
+def fingerprints():
+    """Hashes of every file that affects a run. Docs and unit tests are excluded."""
+    return {str(path.relative_to(HERE)): digest(path) for path in sorted(HERE.rglob('*'))
+            if path.is_file() and '__pycache__' not in path.parts and path.suffix not in {'.pyc', '.md'}
+            and path.relative_to(HERE).parts[0] != 'tests'}
 
 
-def git(*args):
-    try:
-        return subprocess.check_output(["git", *args], cwd=BENCH, text=True, stderr=subprocess.DEVNULL).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-
-def parse(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tool", required=True, help="adapter name, optionally name:variant")
-    p.add_argument("--out", help="new results directory (default bench/results/<tool>-<run id>)")
-    p.add_argument("--repeats", type=int, default=20)
-    p.add_argument("--warmups", type=int, default=3)
-    p.add_argument("--option", action="append", default=[], metavar="KEY=VALUE",
-                   help="adapter option, e.g. stack_binary=/path/to/linux/stack")
-    p.add_argument("--cpus", help="docker --cpus limit (recorded)")
-    p.add_argument("--memory", help="docker --memory limit (recorded)")
-    p.add_argument("--keep", action="store_true", help="keep the container after the run (diagnosis)")
-    p.add_argument("--dry-run", action="store_true", help="print planned bodies; touch nothing")
-    return p.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse(argv)
-    cls, variant = registry.load(args.tool)
-    run_id = time.strftime("%Y%m%dt%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
-    options = dict(kv.split("=", 1) for kv in args.option)
-    adapter = cls(options, variant, run_id)
-    if adapter.isolation_boundary not in BOUNDARIES:
-        raise SystemExit(f"{adapter.name}: unknown isolation boundary {adapter.isolation_boundary}")
-    if args.dry_run:
-        return dry_run(adapter)
-
-    out = Path(args.out or BENCH / "results" / f"{adapter.name}-{adapter.variant}-{run_id}").resolve()
-    rec = Recorder(out)
-    # Everything between creating the results directory and the protected run below is
-    # initialization: a failure here still leaves a truthful receipt and removes only the
-    # exact tempdir this process created, then re-raises the original error.
-    init = dict(run_id=run_id, tool=adapter.name, variant=adapter.variant, title=adapter.title,
-                transport=adapter.transport, isolation_boundary=adapter.isolation_boundary,
-                started_utc=utc(), started_unix_ns=time.time_ns())
-    workdir = workdir_id = meta = None
-
-    def on_signal(signum, _frame):
-        raise KeyboardInterrupt(f"signal {signum}")
-    try:
-        signal.signal(signal.SIGTERM, on_signal)
-        if adapter.transport == "host":
-            workdir = Path(tempfile.mkdtemp(prefix=f"rwb-{run_id}-"))
-            workdir_id = dir_identity(workdir)
-        if adapter.transport == "docker":
-            resources = [x for flag, v in (("--cpus", args.cpus), ("--memory", args.memory)) if v for x in (flag, v)]
-            tx = DockerTransport(rec, run_id, adapter.name, adapter.image, adapter.mounts(), adapter.user,
-                                 resources=resources)
-        else:
-            adapter.root = str(workdir / "w")
-            tx = HostTransport(rec, workdir, env=adapter.host_env(workdir))
-        meta = initial_meta(adapter, args, options, init)
-        rec.write_json("meta.json", meta)
-
-        scenario = Scenario(adapter, tx, rec, args.repeats, args.warmups)
-    except BaseException as error:
-        initialization_failed(rec, out, init, meta, workdir, workdir_id, error)
-        raise
-    try:
-        if adapter.transport == "docker":
-            tx.start()
-            meta["image_id"] = tx.image_id
-        scenario.execute()
-        meta["completed"] = True
-    except ProvisionBlocked as error:
-        # Environment prerequisite missing: explicit blocked evidence; the run stays valid.
-        scenario.block_all(str(error), [error.result] if error.result is not None else [])
-        meta["blocked"] = str(error)
-        meta["completed"] = True
-    except ProvisionError as error:
-        meta["errors"].append(f"provision: {error}")
-        scenario.add("provision", "fail", detail=str(error))
-    except KeyboardInterrupt as error:
-        meta["errors"].append(f"interrupted: {error}")
-    except Exception as error:  # harness fault: invalid run, but still clean up
-        meta["errors"].append(f"harness: {type(error).__name__}: {error}")
-        scenario.add("harness", "error", detail=f"{type(error).__name__}: {error}")
-    finally:
-        cleanup_problems = teardown(scenario, adapter, tx, out, meta, keep=args.keep)
-        meta.update(cleanup_problems=cleanup_problems, finished_utc=utc(), finished_unix_ns=time.time_ns(),
-                    timings=scenario.timings, isolation=getattr(scenario, "isolation_receipt", None))
-        meta["valid"] = meta["completed"] and scenario.out.valid() and not cleanup_problems and not meta["errors"]
-        # valid: the evidence is trustworthy (no harness error, clean teardown). It says nothing
-        # about the tool passing. measurement: whether the run can carry any timing at all.
-        # Every run of this harness is diagnostic; only a manifest-selected report (report.py)
-        # can carry final timings. Blocked/invalid runs publish none (raw receipts stay in steps.jsonl).
-        if meta.get("blocked"):
-            meta["measurement"] = "blocked-prerequisite: no checks executed, no timings"
-            meta["timings"] = {}
-        elif not meta["valid"]:
-            meta["measurement"] = "invalid: harness error, interruption or unclean teardown; no timings usable"
-            meta["timings"] = {}
-        else:
-            meta["measurement"] = "diagnostic: timings recorded per check; only passing checks' samples count"
-        meta["reportable"] = False
-        rec.write_json("outcomes.json", scenario.out.as_list())
-        rec.write_json("meta.json", meta)
-        (out / "summary.md").write_text(render_summary(meta, scenario.out.as_list()))
-        rec.close()
-        if workdir and not cleanup_problems:
-            subprocess.run(["rm", "-rf", str(workdir)])
-    print(out)
-    return 0 if meta["valid"] else 1
-
-
-def initial_meta(adapter, args, options, init):
-    """The meta.json written before any command runs; it must be JSON-serializable."""
-    return dict(init, valid=False, completed=False,
-                host=dict(system=platform.system(), machine=platform.machine(), release=platform.release(),
-                          python=platform.python_version()),
-                harness=dict(commit=git("rev-parse", "HEAD"), dirty=bool(git("status", "--porcelain", "--", ".")),
-                             files=tree_hashes(BENCH / "rwb") | {"run.py": sha256(BENCH / "run.py")}),
-                fixture=tree_hashes(BENCH / "fixtures" / "app"),
-                shared_glue=tree_hashes(BENCH / "adapters" / "_shared"),
-                config=tree_hashes(adapter.config_dir()) if adapter.config_dir().exists() else {},
-                features={k: adapter.features[k] for k in FEATURES},
-                image=adapter.image, options=options, repeats=args.repeats, warmups=args.warmups,
-                keep=args.keep, resources=dict(cpus=args.cpus, memory=args.memory),
-                pins=getattr(adapter, "pins", {}), errors=[],
-                setup_scope=adapter.setup_scope or "not declared",
-                prepare_scope=adapter.prepare_scope, start_scope=adapter.start_scope,
-                cache_note=adapter.cache_note)
-
-
-def dir_identity(path):
-    st = os.lstat(path)
-    return dict(dev=st.st_dev, ino=st.st_ino, uid=st.st_uid)
-
-
-def same_dir(st, identity):
-    return (stat.S_ISDIR(st.st_mode) and dict(dev=st.st_dev, ino=st.st_ino, uid=st.st_uid) == identity
-            and st.st_uid == os.getuid())
-
-
-JSON_DEPTH, JSON_NODES, REPR_LIMIT = 32, 20000, 300
-
-
-def safe_text(obj, render=repr):
-    """repr()/str() that cannot raise (an Exception) and is bounded in length."""
-    try:
-        text = render(obj)
-        if not isinstance(text, str):
-            raise TypeError("not a str")
-    except Exception:
-        text = f"<{render.__name__} of {type(obj).__name__} failed>"
-    return text if len(text) <= REPR_LIMIT else text[:REPR_LIMIT] + "...<truncated>"
-
-
-def jsonable(value):
-    """A JSON-safe copy that keeps what cannot be serialized visible as marker strings instead
-    of failing on it: unsupported values, unsupported or colliding mapping keys, circular
-    containers (tracked by the identity of each container on the active path), nesting deeper
-    than JSON_DEPTH and anything past JSON_NODES values. Container subclasses are read through
-    the base type's own iteration, so overridden methods are never called. Containers are
-    iterated lazily and stop at the budget with one remainder marker, so the copy holds at most
-    JSON_NODES values plus one marker per container open at the cutoff, and no key past the
-    cutoff is rendered."""
-    active, budget = set(), [JSON_NODES]
-    omitted = f"<omitted: more than {JSON_NODES} values>"
-
-    def key_text(key):
-        if isinstance(key, str):
-            return str.__str__(key)
-        if key is None or key is True or key is False:
-            return json.dumps(key)
-        if isinstance(key, int):
-            return int.__repr__(key)
-        if isinstance(key, float):
-            return float.__repr__(key)
-        return f"<invalid key {type(key).__name__}: {safe_text(key)}>"
-
-    def walk(obj, depth):
-        budget[0] -= 1
-        if budget[0] < 0:
-            return omitted
-        if obj is None or obj is True or obj is False:
-            return obj
-        if isinstance(obj, str):
-            return str.__str__(obj)
-        if isinstance(obj, int):
-            return int.__index__(obj)
-        if isinstance(obj, float):
-            obj = float.__float__(obj)
-            return obj if math.isfinite(obj) else f"<non-finite float: {obj!r}>"
-        if not isinstance(obj, (dict, list, tuple)):
-            return f"<unserializable {type(obj).__name__}: {safe_text(obj)}>"
-        if id(obj) in active:
-            return f"<circular reference: {type(obj).__name__}>"
-        if depth >= JSON_DEPTH:
-            return f"<omitted: {type(obj).__name__} nested deeper than {JSON_DEPTH}>"
-        active.add(id(obj))
+@contextlib.contextmanager
+def host_lock():
+    """One benchmark run per host: trials share ports, CPU and caches."""
+    with LOCK.open('a') as handle:
         try:
-            if isinstance(obj, dict):
-                copy = {}
-                for key, item in dict.items(obj):
-                    text = omitted if budget[0] <= 0 else key_text(key)
-                    while text in copy:
-                        text += " <duplicate key>"
-                    if budget[0] <= 0:
-                        copy[text] = omitted
-                        break
-                    copy[text] = walk(item, depth + 1)
-                return copy
-            copy = []
-            for item in list.__iter__(obj) if isinstance(obj, list) else tuple.__iter__(obj):
-                if budget[0] <= 0:
-                    copy.append(omitted)
-                    break
-                copy.append(walk(item, depth + 1))
-            return copy
-        finally:
-            active.discard(id(obj))
-    return walk(value, 0)
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f'another benchmark run holds {LOCK}; runs are serialized') from None
+        yield
 
 
-TRUSTED_INIT_FIELDS = ("run_id", "tool", "variant", "title", "transport", "isolation_boundary",
-                       "started_utc", "started_unix_ns")
+STOP_GRACE_SECONDS = 5
 
 
-def minimal_record(init, detail, tb, cleanup, fault):
-    """The fallback receipt when the full one cannot be built: only exact str/int fields of the
-    harness-built init dict plus harness-built text. No adapter-supplied object is touched."""
-    def scalar(value):
-        return value if type(value) in (str, int) else f"<omitted {type(value).__name__}>"
-    problems = [p for p in cleanup.get("problems", []) if type(p) is str]
-    record = {k: scalar(init.get(k)) for k in TRUSTED_INIT_FIELDS}
-    record.update(
-        valid=False, completed=False, reportable=False, timings={},
-        errors=[f"initialization: {detail}"], cleanup_problems=problems,
-        finished_utc=utc(), finished_unix_ns=time.time_ns(),
-        measurement="invalid: initialization failed before the protected run; no checks executed, no timings",
-        initialization_failure=dict(
-            error=detail, traceback=tb, receipt=f"minimal: the full receipt could not be written ({fault})",
-            workdir=dict(action=scalar(cleanup.get("action")), problems=problems)))
+def command_tree(process, known):
+    """What the command started and is still running, keyed by PID, with identities.
+
+    Members are the leader's process group (the command runs in a new session, so it owns
+    that group) and every descendant of the leader or of a process already found, which
+    catches children that moved to their own group. Once the leader is reaped its PID may
+    be reused; a group led by a process that is not the recorded leader is then foreign.
+    """
+    rows = arms.process_table()
+    leader = known.get(process.pid)
+    foreign_group = process.returncode is not None and process.pid in rows and not (
+        leader and all(rows[process.pid].get(key) == leader.get(key) for key in ['started', 'command', 'start_ticks']))
+    members = {pid: row for pid, row in rows.items() if not foreign_group and row['pgid'] == process.pid}
+    parents = {pid for pid, row in known.items() if arms.same_process(row)} | ({process.pid} if process.returncode is None else set())
+    parents |= set(members)
+    grew = True
+    while grew:
+        grew = False
+        for pid, row in rows.items():
+            if pid not in members and row['ppid'] in parents and pid != os.getpid():
+                members[pid] = row
+                parents.add(pid)
+                grew = True
+    # Never adopt a replacement for a process already recorded, even if its current
+    # group/ancestry would otherwise qualify. exec keeps the original start identity.
+    return {pid: row for pid, row in members.items() if pid not in known or arms.same_start(known[pid], row)}
+
+
+def stop_tree(process):
+    """SIGTERM, then SIGKILL, everything the command started, including after its leader exits.
+
+    Each signal goes to one recorded process after `arms.signal_if_same` has checked its
+    start time and command line again, so an unrelated process that later reuses a PID is
+    never signalled. A member that replaces its program with exec() keeps its PID and start
+    time but changes its command line; when it is found in the tree again it is tracked under
+    its new command (`exec_transitions`). One that cannot be found in the tree again, whose PID
+    still has the recorded start time but another command, is never signalled and is reported
+    as `unresolved` rather than dropped. Returns what was signalled, what survived and what
+    could not be identified.
+    """
+    known, sent = {}, {signal.SIGTERM: set(), signal.SIGKILL: set()}
+    log = {'terminated': [], 'killed': [], 'survivors': [], 'unresolved': [], 'exec_transitions': []}
+
+    def refresh():
+        for pid, row in command_tree(process, known).items():
+            previous = known.get(pid)
+            if previous is not None and arms.same_start(previous, row) and previous['command'] != row['command']:
+                log['exec_transitions'].append({'pid': pid, 'from': previous['command'], 'to': row['command']})
+            # A different start time means the recorded process is gone and this tree member is new.
+            known[pid] = row
+
+    def signal_all(signum, done):
+        for pid, row in known.items():
+            key = (pid, row['started'], row.get('start_ticks'))
+            if key not in sent[signum] and arms.signal_if_same(row, signum):
+                sent[signum].add(key)
+                if pid not in done:
+                    done.append(pid)
+
+    for signum, done in [(signal.SIGTERM, log['terminated']), (signal.SIGKILL, log['killed'])]:
+        deadline = time.monotonic() + STOP_GRACE_SECONDS
+        while True:
+            process.poll()  # reap the leader once it exits
+            refresh()  # children forked or exec'd while stopping are found and stopped too
+            signal_all(signum, done)
+            if time.monotonic() >= deadline or not any(arms.same_process(row) for row in known.values()):
+                break
+            time.sleep(0.1)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=5)
+    refresh()
+    for pid, row in sorted(known.items()):
+        now = arms.process_identity(pid)
+        if now is None:
+            continue
+        if arms.same_process(row):
+            log['survivors'].append(pid)
+        elif arms.same_start(row, now):
+            log['unresolved'].append({'pid': pid, 'recorded': row, 'now': now})
+    return log
+
+
+def invoke(argv, cwd, env, timeout, receipt):
+    """Run one command with file-backed output and an immutable receipt.
+
+    An existing receipt is never overwritten: a repeat gets an `-attempt-N` suffix.
+    """
+    stem, attempt = receipt, 1
+    while any(stem.with_name(stem.name + suffix).exists() for suffix in ['.json', '.stdout', '.stderr']):
+        attempt += 1
+        stem = receipt.with_name(f'{receipt.name}-attempt-{attempt}')
+    record = {'argv': argv, 'cwd': str(cwd), 'started_unix_ns': time.time_ns(), 'timed_out': False,
+              'receipt': stem.name, 'process_started': False}
+    started, process, cancelled = time.monotonic_ns(), None, None
+    with stem.with_name(stem.name + '.stdout').open('wb') as out, stem.with_name(stem.name + '.stderr').open('wb') as err:
+        try:
+            process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                       start_new_session=True)
+            record['process_started'] = True
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                record['timed_out'] = True
+                record['stopped'] = stop_tree(process)
+            record['exit_code'] = process.returncode
+        except (Cancelled, KeyboardInterrupt) as error:
+            cancelled = error
+            record['cancelled'] = type(error).__name__
+            if process is not None:
+                record['stopped'] = stop_tree(process)
+            record['exit_code'] = process.returncode if process is not None else None
+        except OSError as error:
+            record.update(exit_code=None, launch_error=str(error))
+    record['elapsed_ns'] = time.monotonic_ns() - started
+    for suffix in ['stdout', 'stderr']:
+        record[f'{suffix}_sha256'] = digest(stem.with_name(f'{stem.name}.{suffix}'))
+    stem.with_name(stem.name + '.json').write_text(json.dumps(record, indent=2) + '\n')
+    if cancelled is not None:
+        raise cancelled
     return record
 
 
-DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-WORKDIR_DEPTH = 64
+def stdout_of(record, out):
+    return (out / f'{record["receipt"]}.stdout').read_text(errors='replace')
 
 
-def fd_removal_supported():
-    return (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and os.scandir in os.supports_fd
-            and {os.open, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd)
+def last_json(text):
+    for line in reversed(text.strip().splitlines()):
+        with contextlib.suppress(ValueError):
+            value = json.loads(line)
+            if isinstance(value, dict):
+                return value
+    with contextlib.suppress(ValueError):
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    return None
 
 
-def remove_init_workdir(workdir, identity, steps_run):
-    """Remove the tempdir created by this initialization, and nothing else.
+def result_lines(text):
+    """Every stdout line that is a grader result object."""
+    found = []
+    for line in text.splitlines():
+        with contextlib.suppress(ValueError):
+            value = json.loads(line)
+            if isinstance(value, dict) and 'checks' in value:
+                found.append(value)
+    return found
 
-    Only the exact path returned by mkdtemp is considered, and only while it is still a real
-    (non-symlink) directory with the device, inode and owner recorded at creation, and no
-    transport command has run in it (so everything inside was written by harness code).
-    Otherwise it is left in place and the reason is returned as a problem. The deletion itself
-    is bound to that identity through a directory descriptor (remove_verified_dir)."""
-    receipt = dict(path=str(workdir) if workdir else None, identity=identity, action="none", problems=[])
-    if workdir is None:
-        receipt["action"] = "none created"
-        return receipt
-    problems = receipt["problems"]
+
+def acceptance(task_id, record, out):
+    """Pass only when the grader printed exactly one result listing exactly the task's checks, all true.
+
+    A second result line means something other than the grader wrote to its stdout, so the
+    receipt is rejected rather than resolved by position.
+    """
+    results = result_lines(stdout_of(record, out))
+    result = results[0] if len(results) == 1 else None
+    required = set(TASKS[task_id]['required_checks'])
+    checks = (result or {}).get('checks')
+    passed = (record.get('exit_code') == 0 and not record.get('timed_out') and isinstance(checks, dict)
+              and set(checks) == required and all(value is True for value in checks.values()) and result.get('ok') is True)
+    return passed, result
+
+
+def uncertain_command(record):
+    """A later root scan cannot resolve a command's known survivors or lost identities."""
+    return any(record.get('stopped', {}).get(key) for key in ['survivors', 'unresolved'])
+
+
+def teardown(arm, workspace, root, env, binary, out, label, seen=None):
+    """Stop through the arm's own commands, then look for anything owned still running."""
+    project = TASKS[json.loads((root / 'context.json').read_text())['task']]['project']
+    seen = seen or {'pids': [], 'ports': []}
+    before = arms.residue(arm, workspace, root, seen)
+    tracked = {'pids': sorted(set(seen['pids']) | set(before['pids']) | {p['pid'] for p in before['owned_processes']}),
+               'ports': sorted(set(seen['ports']) | set(before['ports']))}
+    steps = arms.commands(arm, project, binary)
+    result = {'before': before, 'steps': {}, 'command_cleanup': {}}
+    down = invoke(steps['down'], workspace, env, 120, out / f'{label}-down')
+    if uncertain_command(down):
+        result['command_cleanup'][down['receipt']] = down['stopped']
+    result['steps']['down'] = down['exit_code']
+    down_ok = down['exit_code'] == 0
+    if arm == 'stack':
+        confirmed = ((last_json(stdout_of(down, out)) or {}).get('data') or {}).get('confirmed')
+        result['down_confirmed'] = confirmed
+        down_ok = down_ok and confirmed is True
+        if (root / 'pf/state').is_dir() and any((root / 'pf/state').iterdir()):
+            stop = invoke([str(binary), 'exec', '--', 'pitchfork', 'supervisor', 'stop'], workspace, env, 60, out / f'{label}-supervisor-stop')
+            result['steps']['supervisor_stop'] = stop['exit_code']
+            if uncertain_command(stop):
+                result['command_cleanup'][stop['receipt']] = stop['stopped']
+    deadline = time.monotonic() + 15
+    left = arms.residue(arm, workspace, root, tracked)
+    while time.monotonic() < deadline and any(left.values()):
+        time.sleep(0.25)
+        left = arms.residue(arm, workspace, root, tracked)
+    # Clean means nothing owned is left. A failing `down` with nothing running is a product
+    # observation (`down_ok`), not a leak.
+    result.update(left=left, down_ok=down_ok, ok=not any(left.values()) and not result['command_cleanup'])
+    if left['owned_processes']:
+        # Arm teardown failed to stop these; the harness stops them so trials cannot interfere.
+        result['reclaimed_by_harness'] = arms.reclaim(left['owned_processes'], root)
+        result['after_reclaim'] = arms.residue(arm, workspace, root, tracked)
+    result['disk_after_down'] = arms.disk_usage(root, arm, workspace)
+    return result
+
+
+def new_runtime(prefix, task_id, arm, binary, cache, locale):
+    root = Path(tempfile.mkdtemp(prefix=prefix, dir='/tmp')).resolve()
+    (root / 'context.json').write_text(json.dumps({'task': task_id, 'arm': arm}))
+    bin_dir = arms.install_bin(root, arm, binary)
+    env = arms.isolated_env(root, cache, locale, bin_dir)
+    return root, env
+
+
+def grade(task_id, arm, binary, out, label, submission, cache, locale, startup_control=False, full_tree=False,
+          expected_submission=None):
+    """Fresh runtime, grader-only data, submitted files overlaid, then the smoke test and hidden checks.
+
+    `passed` needs both gates. The project's existing smoke test, run through the arm's
+    `exec`, shows existing behaviour still works; the hidden acceptance checks show the change
+    was made. The documented task loop (`stack run test`, `dev.py test`) is recorded as a
+    product observation only, because Stack 0.1.22's `run` breaks it in service apps (R1).
+
+    `outcome` says how grading ended:
+      graded                 every step ran, and `passed` is the verdict
+      startup_failed         the submitted app did not start, and the reference solution did
+                             start and pass in a fresh control runtime: a task failure
+      infrastructure_failed  the submitted app did not start, and neither did the reference
+      setup_failed           installing the locked tools failed after retries: infrastructure
+      harness_error          anything else
+    `startup_control` runs that control; validation grades the reference itself and needs none.
+    `full_tree` marks `submission` as a whole checkout, so files it deleted are deleted too.
+    """
+    project = TASKS[task_id]['project']
+    root, env = new_runtime('ag.', task_id, arm, binary, cache, locale)
+    result = {'runtime': str(root), 'passed': False, 'outcome': 'harness_error', 'command_cleanup': {}}
+    workspace = None
+
+    def step(argv, timeout, stem):
+        record = invoke(argv, workspace, env, timeout, out / stem)
+        if uncertain_command(record):
+            result['command_cleanup'][record['receipt']] = record['stopped']
+        return record
+
     try:
-        st = os.lstat(workdir)
-    except FileNotFoundError:
-        receipt["action"] = "already absent"
-        return receipt
-    if identity is None:
-        problems.append(f"{workdir}: no creation identity recorded; left in place")
-    elif stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        problems.append(f"{workdir}: no longer a real directory; left in place")
-    elif not same_dir(st, identity):
-        problems.append(f"{workdir}: identity changed since creation; left in place")
-    elif steps_run:
-        problems.append(f"{workdir}: {steps_run} command(s) ran in it; left in place for inspection")
-    elif not fd_removal_supported():
-        problems.append(f"{workdir}: descriptor-relative removal is unavailable here; left in place")
-    if problems:
-        receipt["action"] = "left"
-        return receipt
-    return remove_verified_dir(Path(workdir), identity, receipt)
-
-
-def remove_verified_dir(workdir, identity, receipt):
-    """Open workdir without following a symlink, require the descriptor (and the name in its
-    parent) to match the creation identity, delete the contents relative to that descriptor,
-    and rmdir the name only if it still names the same directory. No fresh path lookup is ever
-    traversed for deletion, so a directory swapped in at the path is left alone and reported.
-    Residual limit: a replacement swapped in between the final identity check and rmdir is
-    removed only if it is an empty directory (rmdir never deletes contents)."""
-    problems, name = receipt["problems"], workdir.name
-    parent = fd = None
-    receipt["action"] = "left"
-    try:
-        parent = os.open(workdir.parent, os.O_RDONLY | os.O_DIRECTORY)
-        fd = os.open(name, DIR_FLAGS, dir_fd=parent)
-        if not (same_dir(os.fstat(fd), identity)
-                and same_dir(os.stat(name, dir_fd=parent, follow_symlinks=False), identity)):
-            problems.append(f"{workdir}: identity changed since creation; left in place")
-            return receipt
-        remove_dir_contents(fd, 0)
-        if not same_dir(os.stat(name, dir_fd=parent, follow_symlinks=False), identity):
-            problems.append(f"{workdir}: replaced during removal; owned contents were removed through the"
-                            " verified descriptor, the entry now at the path was left in place")
-            return receipt
-        os.rmdir(name, dir_fd=parent)
-        receipt["action"] = "removed"
-        try:
-            os.stat(name, dir_fd=parent, follow_symlinks=False)
-            receipt["verified_absent"] = False
-            problems.append(f"{workdir}: still present after removal")
-        except FileNotFoundError:
-            receipt["verified_absent"] = True
-    except OSError as error:
-        receipt["action"] = "failed"
-        problems.append(f"{workdir}: removal raised {type(error).__name__}: {error}; rest left in place")
-    finally:
-        for descriptor in (fd, parent):
-            if descriptor is not None:
-                os.close(descriptor)
-    return receipt
-
-
-def remove_dir_contents(dir_fd, depth):
-    """Delete everything below dir_fd without following symlinks. A subdirectory is entered only
-    through a descriptor matching the entry lstat'ed here; nesting is bounded by WORKDIR_DEPTH."""
-    if depth >= WORKDIR_DEPTH:
-        raise OSError(f"nested deeper than {WORKDIR_DEPTH} directories")
-    with os.scandir(dir_fd) as entries:
-        names = [entry.name for entry in entries]
-    for name in names:
-        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(st.st_mode):
-            os.unlink(name, dir_fd=dir_fd)
-            continue
-        child = os.open(name, DIR_FLAGS, dir_fd=dir_fd)
-        try:
-            cst = os.fstat(child)
-            if (cst.st_dev, cst.st_ino) != (st.st_dev, st.st_ino):
-                raise OSError(f"{name} changed while being removed")
-            remove_dir_contents(child, depth + 1)
-        finally:
-            os.close(child)
-        os.rmdir(name, dir_fd=dir_fd)
-
-
-def defer_signals(arrived, saved):
-    """Replace the SIGTERM/SIGINT handlers with ones that only record the signal (main thread
-    only; elsewhere, or for a handler not installed from Python, nothing is changed)."""
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        try:
-            previous = signal.getsignal(signum)
-            if previous is not None:
-                signal.signal(signum, lambda s, _frame: arrived.append(s))
-                saved[signum] = previous
-        except (ValueError, OSError):
-            pass
-
-
-def restore_signals(saved):
-    for signum, previous in saved.items():
-        try:
-            signal.signal(signum, previous)
-        except (ValueError, OSError):
-            pass
-
-
-def initialization_failed(rec, out, init, meta, workdir, workdir_id, error):
-    """Record an initialization failure and remove its exact tempdir. Never raises, not even for
-    a second interrupt: SIGTERM/SIGINT are deferred while it runs, every recovery stage is
-    guarded against BaseException, and Recorder.close runs in an outer finally. Each secondary
-    fault is attached to the original error as a note; the caller re-raises that same object.
-    Limit: a signal landing after the handlers are restored, before the caller's raise, is not
-    deferred."""
-    def note(text):
-        try:
-            error.add_note(text)
-        except BaseException:
-            print(text, file=sys.stderr)
-
-    def fault_text(fault):
-        return f"{type(fault).__name__}: {safe_text(fault, str)}"
-    arrived, saved = [], {}
-    cleanup = dict(path=str(workdir) if workdir else None, action="unknown",
-                   problems=["tempdir cleanup was not attempted"])
-    recorded = None
-    try:
-        defer_signals(arrived, saved)
-        try:
-            cleanup = remove_init_workdir(workdir, workdir_id, rec.seq)
-            if not isinstance(cleanup, dict) or not isinstance(cleanup.get("problems"), list):
-                raise TypeError(f"tempdir cleanup returned {type(cleanup).__name__}, not a receipt")
-        except BaseException as fault:
-            cleanup = dict(path=str(workdir) if workdir else None, action="unknown",
-                           problems=[f"tempdir cleanup raised {fault_text(fault)}"])
-        detail = f"{type(error).__name__}: {safe_text(error, str)}"
-        try:
-            tb = "".join(traceback.format_exception(error))
-        except BaseException as fault:
-            tb = f"<traceback unavailable: {fault_text(fault)}>"
-        outcomes = Outcomes()
-        outcomes.add("harness", "error", detail=f"initialization: {detail}")
-        full_fault = None
-        try:
-            record = jsonable(dict(meta or init))
-            errors = record.get("errors")
-            record.update(
-                valid=False, completed=False, reportable=False, timings={},
-                errors=(errors if isinstance(errors, list) else []) + [f"initialization: {detail}"],
-                cleanup_problems=cleanup["problems"], finished_utc=utc(), finished_unix_ns=time.time_ns(),
-                measurement="invalid: initialization failed before the protected run; no checks executed, no timings",
-                initialization_failure=dict(
-                    error=detail, traceback=tb, initial_meta_written=(out / "meta.json").exists(),
-                    steps_run=rec.seq, workdir=jsonable(cleanup)))
-            rec.write_json("outcomes.json", outcomes.as_list())
-            rec.write_json("meta.json", record)
-            (out / "summary.md").write_text(render_summary(record, outcomes.as_list()))
-            recorded = "receipt"
-        except BaseException as fault:
-            full_fault = fault_text(fault)
-            note(f"rwb: recording the initialization failure in {out} raised {full_fault}")
-        if recorded is None:
-            try:
-                record = minimal_record(init, detail, tb, cleanup, full_fault)
-                rec.write_json("outcomes.json", outcomes.as_list())
-                rec.write_json("meta.json", record)
-                (out / "summary.md").write_text(render_summary(record, outcomes.as_list()))
-                recorded = "minimal receipt"
-            except BaseException as fault:
-                note(f"rwb: recording the minimal initialization receipt in {out} raised {fault_text(fault)}")
-        receipt = f"{recorded} in {out}/meta.json" if recorded else f"receipt NOT completed in {out}"
-        note(f"rwb: initialization failed; {receipt}; tempdir {cleanup.get('action')}"
-             + (f" ({'; '.join(map(str, cleanup['problems']))})" if cleanup.get("problems") else ""))
-    except BaseException as fault:
-        note(f"rwb: recording the initialization failure was interrupted by {fault_text(fault)}")
-    finally:
-        try:
-            rec.close()
-        except BaseException as fault:
-            note(f"rwb: closing {out}/steps.jsonl raised {fault_text(fault)}")
-        for signum in list(arrived):
-            note(f"rwb: signal {signum} arrived during initialization-failure recovery; deferred, the"
-                 " original error is re-raised")
-        restore_signals(saved)
-
-
-def teardown(scenario, adapter, tx, out, meta, keep=False):
-    """Diagnostics and artifact copies first (before anything is torn down), then checkout
-    cleanup, host cleanup and container removal. Each stage is guarded on its own: a failed
-    diagnostic or copy is recorded and can never skip a later teardown stage."""
-    problems = []
-    meta.setdefault("artifact_errors", [])
-    live = tx.__class__ is HostTransport or getattr(tx, "created", False)
-    if live:
-        try:
-            scenario.diagnose()
-        except Exception as error:
-            meta["artifact_errors"].append(f"diagnostics raised {type(error).__name__}: {error}")
-        try:
-            meta["artifacts"] = scenario.collect_artifacts(out / "artifacts")
-        except Exception as error:
-            meta["artifact_errors"].append(f"artifact copy raised {type(error).__name__}: {error}")
-        try:
-            problems += scenario.cleanup()
-        except Exception as error:
-            problems.append(f"checkout cleanup raised {type(error).__name__}: {error}")
-    try:
-        if adapter.transport == "host" and adapter.cleanup_host():
-            r = tx.exec("host-cleanup", "cleanup", adapter.cleanup_host(), timeout=600)
-            if not r.ok:
-                problems.append(f"host cleanup exit {r.code}")
-            left = adapter.host_resources()
-            if left:
-                r = tx.exec("host-leftovers", "cleanup", left, timeout=120)
-                if r.stdout.strip() or not r.ok:
-                    problems.append("owned host resources remain")
+        workspace = arms.prepare(task_id, arm, root, binary, env)
+        if arm == 'stack':
+            result['lock_backends'] = arms.lock_backends(workspace)
+        result['hidden_files'] = arms.copy_hidden(project, workspace)
+        before_overlay = arms.tree_files(workspace)
+        if expected_submission is not None and arms.tree_files(submission) != expected_submission:
+            raise ValueError('retained submitted tree changed before grading')
+        result['submitted_files'] = arms.overlay(submission, workspace, full_tree) if submission else {}
+        if expected_submission is not None and result['submitted_files'] != arms.overlay_manifest(before_overlay, expected_submission):
+            raise ValueError('graded files differ from the retained submission')
+        steps = arms.commands(arm, project, binary, arms.verifier_argv(task_id, workspace))
+        timings, result['setup_attempts'] = {}, 0
+        result['seconds'] = timings
+        for name in ['setup', 'up']:
+            for index, argv in enumerate(steps[name]):
+                # Setup only installs locked artifacts, so the harness retries it twice; `up`
+                # runs the submitted code and gets one attempt.
+                attempts = 3 if name == 'setup' else 1
+                for attempt in range(attempts):
+                    record = step(argv, 900, f'{label}-{name}{index or ""}')
+                    result['setup_attempts'] += name == 'setup'
+                    timings[name] = timings.get(name, 0) + record['elapsed_ns'] / 1e9
+                    if record['exit_code'] == 0 or attempt == attempts - 1:
+                        break
+                    time.sleep(5 * (attempt + 1))
+                if record['exit_code'] != 0:
+                    result.update(failed_step=name, failed_receipt=record['receipt'],
+                                  outcome='setup_failed' if name == 'setup' else 'startup_failed')
+                    raise RuntimeError(f'{name} failed; see {record["receipt"]}')
+        result['seconds'] = timings
+        for name in ['smoke_exec', 'smoke_task_loop']:
+            result[name] = step(steps[name], 120, f'{label}-{name}')['exit_code'] == 0
+        verify = step(steps['verify'], 180, f'{label}-verify')
+        result['acceptance_passed'], result['acceptance'] = acceptance(task_id, verify, out)
+        result['passed'] = result['acceptance_passed'] and result['smoke_exec']
+        result['outcome'] = 'graded'
     except Exception as error:
-        problems.append(f"host cleanup raised {type(error).__name__}: {error}")
-    if adapter.transport == "docker" and not keep:
-        try:
-            removed = tx.destroy()
-            if removed is not None and not removed.ok or not tx.gone():
-                problems.append(f"container {tx.name} not removed")
-        except Exception as error:
-            problems.append(f"container removal raised {type(error).__name__}: {error}")
+        result['error'] = f'{type(error).__name__}: {error}'
+    finally:
+        if workspace is not None:
+            result['cleanup'] = teardown(arm, workspace, root, env, binary, out, f'{label}-cleanup')
+    if result['command_cleanup'] or (result.get('cleanup') or {}).get('command_cleanup'):
+        result.update(passed=False, outcome='harness_error', error='command cleanup left survivors or unresolved identities')
+    if result['outcome'] == 'startup_failed' and startup_control:
+        # After the failed runtime is cleaned up, so the control cannot collide with it.
+        control = grade(task_id, arm, binary, out, f'{label}-control', HERE / 'oracles' / project, cache, locale)
+        result['startup_control'] = control
+        if not (control['outcome'] == 'graded' and control['passed'] is True):
+            result['outcome'] = 'infrastructure_failed'
+    return result
+
+
+def validate(args):
+    """No-op must fail its designated check; the reference must pass. Both via `grade`."""
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    binary = Path(args.stack).resolve()
+    cache = Path(args.cache_root).resolve() if args.cache_root else None
+    locale = json.loads(args.locale)
+    task = TASKS[args.task]
+    summary = {'kind': 'scripted_task_validation', 'task': args.task, 'arm': args.arm, 'locale': locale,
+               'cache': str(cache) if cache else 'cold', 'stack_sha256': digest(binary), 'platform': platform.platform(),
+               'benchmark_fingerprints': fingerprints(), 'started_unix_ns': time.time_ns()}
+    before = arms.globals_snapshot()
+    try:
+        with host_lock():
+            summary['no_op'] = grade(args.task, args.arm, binary, out, 'no-op', None, cache, locale)
+            reference = HERE / 'oracles' / task['project']
+            summary['reference'] = grade(args.task, args.arm, binary, out, 'reference', reference, cache, locale)
+    finally:
+        summary['globals_changed'] = arms.globals_diff(before, arms.globals_snapshot())
+        no_op, ref = summary.get('no_op', {}), summary.get('reference', {})
+        no_op_checks = ((no_op.get('acceptance') or {}).get('checks') or {})
+        # The starting code must keep the existing smoke test green and fail the designated
+        # hidden check; the reference must pass both gates.
+        summary['no_op_rejected'] = (no_op.get('outcome') == 'graded' and no_op.get('passed') is False
+                                     and no_op_checks.get(task['no_op_failing_check']) is False)
+        summary['reference_passed'] = ref.get('passed') is True
+        summary['smoke_exec_before_and_after'] = no_op.get('smoke_exec') is True and ref.get('smoke_exec') is True
+        summary['documented_task_loop'] = {'before': no_op.get('smoke_task_loop'), 'after': ref.get('smoke_task_loop')}
+        summary['cleanup_ok'] = all((run.get('cleanup') or {}).get('ok') is True for run in [no_op, ref])
+        summary['valid'] = (summary['no_op_rejected'] and summary['reference_passed'] and summary['smoke_exec_before_and_after']
+                            and summary['cleanup_ok'] and not summary['globals_changed'])
+        summary['finished_unix_ns'] = time.time_ns()
+        (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    return summary
+
+
+def make_plan(args):
+    if len(set(args.tasks)) != len(args.tasks) or len(set(args.models)) != len(args.models):
+        raise ValueError('tasks and models must be unique')
+    template = json.loads(args.agent_command)
+    if not isinstance(template, list) or not template or not all(isinstance(part, str) for part in template):
+        raise ValueError('--agent-command must be a nonempty JSON argv list')
+    if not any('{model}' in part for part in template):
+        raise ValueError('--agent-command must pass the planned {model} explicitly')
+    if not any('{prompt}' in part or '{prompt_file}' in part for part in template):
+        raise ValueError('--agent-command must pass {prompt} or {prompt_file}')
+    selftest = any('selftest_agent.py' in part for part in template)
+    if selftest != (args.kind == 'harness_selftest'):
+        raise ValueError('the self-test agent belongs only in a harness_selftest plan')
+    options = json.loads(args.options)
+    locale = json.loads(args.locale)
+    if not isinstance(options, dict) or not isinstance(locale, dict):
+        raise ValueError('--options and --locale must be JSON objects')
+    binding = bind_options(template, options)
+    rng = random.Random(args.seed)
+    trials = []
+    for task in args.tasks:
+        for model in args.models:
+            flip = rng.getrandbits(1)
+            for repetition in range(args.repeats):
+                order = list(arms.ARMS) if (repetition + flip) % 2 == 0 else list(reversed(arms.ARMS))
+                pair = f'{task}:{model}:{repetition}'
+                trials += [{'id': f'{pair}:{arm}', 'pair': pair, 'task': task, 'model': model, 'arm': arm,
+                            'repetition': repetition, 'position': position} for position, arm in enumerate(order)]
+    binary = Path(args.stack).resolve()
+    payload = {'schema': 'stack-agentdx-plan/3', 'kind': args.kind, 'created_unix_ns': time.time_ns(), 'seed': args.seed,
+               'platform': args.platform, 'host': platform.platform(), 'cache': args.cache, 'locale': locale,
+               'agent_harness': args.harness, 'agent_command': template, 'agent_options': options,
+               # Where each option enters argv. With no options the harness runs on its own
+               # defaults, which this plan neither records nor controls.
+               'agent_options_binding': binding, 'agent_options_controlled': bool(options),
+               'human_channel': 'none', 'concurrency': 1, 'budget_seconds': args.budget,
+               'stack_binary': str(binary), 'stack_sha256': digest(binary), 'fingerprints': fingerprints(), 'trials': trials}
+    with Path(args.out).open('x') as handle:  # A plan is never silently replaced.
+        handle.write(json.dumps(payload, indent=2) + '\n')
+    return payload
+
+
+PLACEHOLDER = re.compile(r'\{(prompt|prompt_file|model|workspace|transcript_dir|option:[^{}]*)\}')
+
+
+def flag_name(text):
+    return ''.join(character for character in text.lower() if character.isalnum())
+
+
+def option_text(value):
+    """An option's argv text: strings verbatim, numbers and booleans as JSON. Never translated."""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def bind_options(template, options):
+    """Check that every planned option reaches the agent's argv, and nothing contradicts it.
+
+    Each option must appear as `{option:NAME}`, and every placeholder must name a planned
+    option. A literal flag named like a planned option or `model` (`--reasoning-effort`,
+    `--model=...`) must carry that placeholder as its value, so the command cannot quietly
+    pass something else. A harness that takes settings any other way needs a wrapper that
+    does; otherwise plan no options and the run is labelled as using the harness defaults.
+    """
+    used = {match[len('option:'):] for part in template for match in PLACEHOLDER.findall(part) if match.startswith('option:')}
+    if used - set(options):
+        raise ValueError(f'--agent-command uses options not in --options: {sorted(used - set(options))}')
+    if set(options) - used:
+        raise ValueError(f'--options {sorted(set(options) - used)} never reach the agent; pass each as {{option:NAME}} '
+                         'in --agent-command, or plan without it')
+    for name, value in options.items():
+        if not (isinstance(value, (str, int, float, bool)) and (not isinstance(value, float) or math.isfinite(value))):
+            raise ValueError(f'option {name} must be a string, finite number or boolean')
+    expected = {flag_name(name): f'{{option:{name}}}' for name in options}
+    expected['model'] = '{model}'
+    for index, part in enumerate(template):
+        flag, equals, inline = part.partition('=')
+        if part.startswith('-') and flag_name(flag) in expected:
+            value = inline if equals else (template[index + 1] if index + 1 < len(template) else '')
+            if value != expected[flag_name(flag)]:
+                raise ValueError(f'{part!r} {"" if equals else repr(value) + " "}contradicts or bypasses the planned '
+                                 f'{expected[flag_name(flag)]}')
+    return {name: [index for index, part in enumerate(template) if f'{{option:{name}}}' in part] for name in options}
+
+
+def agent_argv(plan, model, values):
+    """The planned agent command with every placeholder replaced in one pass."""
+    values = {**values, 'model': model, **{f'option:{name}': option_text(value) for name, value in plan['agent_options'].items()}}
+    return [PLACEHOLDER.sub(lambda match: values[match.group(1)], part) for part in plan['agent_command']]
+
+
+def trial_key(identifier):
+    return hashlib.sha256(identifier.encode()).hexdigest()[:20]
+
+
+# Harness git never reads the user's or the agent's hooks, global config or fsmonitor.
+GIT_ENV = {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0'}
+GIT = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.excludesFile=/dev/null']
+
+
+def git(argv, cwd, env=None, check=True):
+    return subprocess.run([*GIT, *argv], cwd=cwd, env={**os.environ, **GIT_ENV, **(env or {})}, capture_output=True, check=check)
+
+
+def keep_baseline(workspace, root):
+    """Copy the starting commit into a bare repository outside the agent's checkout.
+
+    The agent may commit, amend, reset or garbage-collect in its own `.git`; the submission
+    is still diffed against this copy of the commit the trial started from.
+    """
+    commit = git(['rev-parse', 'HEAD'], workspace).stdout.decode().strip()
+    store = root / 'harness' / 'baseline.git'
+    store.parent.mkdir()
+    git(['clone', '-q', '--bare', '--no-local', str(workspace), str(store)], root)
+    return {'commit': commit, 'git_dir': str(store), 'files': arms.tree_files(workspace)}
+
+
+def submission_record(baseline, workspace, tree=None):
+    """The whole submitted change against the starting commit: commits, edits, deletions and new files.
+
+    Copy once outside the agent workspace, hash and diff that copy, and retain it read-only
+    for grading. A scratch Git index is removed after capture; the submitted tree survives.
+    Runtime/private files are excluded and links are never followed. This is an access
+    convention on the same host, not protection against a hostile agent searching the host.
+    """
+    tree = tree or Path(baseline['git_dir']).parent / 'submitted-tree'
+    tree.mkdir(parents=True, exist_ok=False)
+    with tempfile.TemporaryDirectory(prefix='index.', dir=Path(baseline['git_dir']).parent) as scratch:
+        for relative, value in arms.tree_files(workspace).items():
+            target = tree / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if value.startswith('symlink:'):
+                target.symlink_to(value[len('symlink:'):])
+            elif value != 'special':
+                shutil.copy2(workspace / relative, target)
+        files = arms.tree_files(tree)  # hash the captured bytes, never the live workspace
+        env = {'GIT_DIR': baseline['git_dir'], 'GIT_WORK_TREE': str(tree), 'GIT_INDEX_FILE': str(Path(scratch) / 'index')}
+        git(['read-tree', baseline['commit']], tree, env)
+        git(['add', '--all', '--force', '.'], tree, env)
+        diff = ['diff', '--cached', '--no-renames', '--no-ext-diff', '--no-textconv', baseline['commit']]
+        patch = git([*diff, '--binary', '--full-index'], tree, env).stdout
+        changed = git([*diff, '--name-status'], tree, env).stdout.decode().splitlines()
+    for current, directories, names in os.walk(tree, topdown=False):
+        for name in names:
+            path = Path(current) / name
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o222)
+        Path(current).chmod(Path(current).stat().st_mode & ~0o222)
+    head = git(['rev-parse', 'HEAD'], workspace, check=False)
+    head = head.stdout.decode().strip() if head.returncode == 0 else None
+    commits = git(['rev-list', '--reverse', f'{baseline["commit"]}..HEAD'], workspace, check=False)
+    descends = git(['merge-base', '--is-ancestor', baseline['commit'], 'HEAD'], workspace, check=False).returncode == 0
+    record = {'initial_commit': baseline['commit'], 'baseline_git_dir': baseline['git_dir'], 'changed': changed,
+              'agent_head': head, 'head_descends_from_initial': descends,
+              'agent_commits': commits.stdout.decode().split() if commits.returncode == 0 else None,
+              'files_before': baseline['files'], 'files_after': files, 'tree': tree.name}
+    return patch, record
+
+
+def write_record(out, name, value):
+    """One observation as its own evidence file. The report re-derives every verdict from these."""
+    (out / name).write_text(json.dumps(value, indent=2) + '\n')
+    return value
+
+
+def experiment_trial(args):
+    plan_path = Path(args.plan).resolve()
+    plan = json.loads(plan_path.read_text())
+    if fingerprints() != plan['fingerprints']:
+        raise SystemExit('benchmark files changed after planning; make a new plan')
+    binary = Path(plan['stack_binary'])
+    if not binary.is_file() or digest(binary) != plan['stack_sha256']:
+        raise SystemExit('the planned Stack binary is missing or changed')
+    trial = next((entry for entry in plan['trials'] if entry['id'] == args.id), None)
+    if trial is None:
+        raise SystemExit('this trial is not in the plan')
+    if (plan['cache'] == 'warm') != bool(args.cache_root):
+        raise SystemExit('a warm-cache plan needs --cache-root; a cold-cache plan must not have one')
+    cache = Path(args.cache_root).resolve() if args.cache_root else None
+    out = Path(args.results).resolve() / trial_key(trial['id'])
+    out.mkdir(parents=True, exist_ok=False)
+    summary = {'kind': 'agent_trial', 'plan_kind': plan['kind'], 'trial': trial, 'plan_sha256': digest(plan_path),
+               'started_unix_ns': time.time_ns(), 'host': platform.platform(), 'stack_sha256': plan['stack_sha256'],
+               'locale': plan['locale'], 'cache': str(cache) if cache else 'cold', 'task_passed': False, 'valid': False}
+    before = write_record(out, 'globals-before.json', arms.globals_snapshot())
+    workspace = root = env = None
+    try:
+        with host_lock():
+            root, env = new_runtime('at.', trial['task'], trial['arm'], binary, cache, plan['locale'])
+            summary['runtime'] = str(root)
+            workspace = arms.prepare(trial['task'], trial['arm'], root, binary, env)
+            summary['workspace'] = str(workspace)
+            baseline = keep_baseline(workspace, root)
+            summary['initial_commit'] = baseline['commit']
+            prompt = TASKS[trial['task']]['instruction']
+            (out / 'prompt.txt').write_text(prompt)
+            (root / 'prompt.txt').write_text(prompt)
+            transcript = root / 'transcript'
+            transcript.mkdir()
+            argv = agent_argv(plan, trial['model'], agent_paths(summary, prompt))
+            summary['agent_argv'] = [part.replace(prompt, '<prompt.txt>') for part in argv]
+            agent = invoke(argv, workspace, env, plan['budget_seconds'], out / 'agent')
+            summary['agent'] = {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']}
+            summary['finished_agent_unix_ns'] = time.time_ns()
+            summary['left_running_at_agent_exit'] = write_record(out, 'left-at-agent-exit.json', arms.residue(trial['arm'], workspace, root, {}))
+            captured = out / 'submitted-tree'
+            patch, submission = submission_record(baseline, workspace, captured)
+            (out / 'submission.patch').write_bytes(patch)
+            write_record(out, 'submission.json', submission)
+            summary['changed_files'] = submission['changed']
+            shutil.copytree(transcript, out / 'transcript', symlinks=True)
+            summary['agent_cleanup'] = write_record(out, 'agent-cleanup.json',
+                                                    teardown(trial['arm'], workspace, root, env, binary, out, 'agent-cleanup'))
+            graded = grade(trial['task'], trial['arm'], binary, out, 'grade', captured, cache, plan['locale'],
+                           startup_control=True, full_tree=True, expected_submission=submission['files_after'])
+            summary['grade'] = write_record(out, 'grade.json', graded)
+            summary['task_passed'] = graded['passed'] is True
+    except Cancelled as error:
+        summary['cancelled'] = str(error)
+        raise
+    except Exception as error:
+        summary['error'] = f'{type(error).__name__}: {error}'
+    finally:
+        if workspace is not None and not clean(summary.get('agent_cleanup')):
+            summary['final_cleanup'] = write_record(out, 'final-cleanup.json',
+                                                    teardown(trial['arm'], workspace, root, env, binary, out, 'final-cleanup'))
+        summary['globals_changed'] = arms.globals_diff(before, write_record(out, 'globals-after.json', arms.globals_snapshot()))
+        write_record(out, 'fingerprints-after.json', fingerprints())
+        summary['finished_unix_ns'] = time.time_ns()
+        summary = seal(summary, out, trial, plan, plan_path)
+    return summary
+
+
+def seal(summary, out, trial, plan, plan_path):
+    """Hash every evidence file, judge the trial with the report's own derivation, write the summary."""
+    summary['evidence_sha256'] = {str(path.relative_to(out)): digest(path) for path in sorted(out.rglob('*'))
+                                  if not path.is_symlink() and path.is_file()}
+    summary = json.loads(json.dumps(summary))  # judged exactly as the report will read it
+    summary['problems'] = derive(summary, trial, plan, plan_path, out)[1]
+    summary['valid'] = not summary['problems']
+    (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    return summary
+
+
+def agent_paths(summary, prompt):
+    root = Path(summary['runtime'])
+    return {'prompt': prompt, 'prompt_file': str(root / 'prompt.txt'), 'workspace': summary['workspace'],
+            'transcript_dir': str(root / 'transcript')}
+
+
+def review_template(args):
+    plan = json.loads(Path(args.plan).read_text())
+    trial = next(entry for entry in plan['trials'] if entry['id'] == args.id)
+    directory = Path(args.results) / trial_key(trial['id'])
+    summary = directory / 'summary.json'
+    return {'schema': 'stack-agentdx-review/2', 'trial_id': trial['id'], 'trial_summary_sha256': digest(summary),
+            'transcript_sha256': {str(path.relative_to(directory)): digest(path) for path in sorted(directory.glob('agent.std*'))
+                                  + sorted((directory / 'transcript').rglob('*')) if not path.is_symlink() and path.is_file()},
+            'reviewer': None, 'requested_model': trial['model'], 'harness': plan['agent_harness'],
+            'requested_options': plan['agent_options'],
+            # Observed values come from the transcript or the harness's own receipt, never from the plan.
+            'observed_model': None, 'harness_version': None, 'observed_options': None,
+            'interventions': [], 'help_requests': [], 'workarounds': [],
+            # Provider-reported usage only, each bound to a file by path and sha256; null when absent.
+            'tokens': None, 'cost_usd': None, 'notes': ''}
+
+
+def number(value, integer=False):
+    """A finite, nonnegative number (an int when `integer`); booleans are not numbers here."""
+    if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+        return False
+    if integer:
+        return 0 <= value <= 2**63 - 1
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+TOKEN_FIELDS = {'input', 'output', 'cache_read', 'cache_write', 'reasoning', 'total'}
+REVIEW_EVIDENCE = 'review-evidence/'
+
+
+def source_problems(source, directory, hashes):
+    """A usage figure's source must be a file in the trial directory whose sha256 matches.
+
+    Files the trial produced (the agent's transcript) are in the evidence hashes already. A file
+    a reviewer adds later, such as a provider usage export, goes under `review-evidence/`.
+    """
+    if not (isinstance(source, dict) and set(source) == {'path', 'sha256'} and isinstance(source['path'], str)
+            and isinstance(source['sha256'], str)):
+        return ['source must be {"path": ..., "sha256": ...}']
+    relative = Path(source['path'])
+    if relative.is_absolute() or '..' in relative.parts:
+        return ['source path must be inside the trial directory']
+    path = directory / relative
+    if not path.is_file() or digest(path) != source['sha256']:
+        return [f'source {source["path"]} is missing or its sha256 differs']
+    if source['path'] in hashes:
+        return [] if hashes[source['path']] == source['sha256'] else [f'source {source["path"]} differs from the trial evidence']
+    return [] if source['path'].startswith(REVIEW_EVIDENCE) else [f'source {source["path"]} is neither trial evidence nor under {REVIEW_EVIDENCE}']
+
+
+def metric_problems(review, directory, hashes):
+    problems = []
+    tokens, cost = review.get('tokens'), review.get('cost_usd')
+    if tokens is not None:
+        counts = {key: value for key, value in tokens.items() if key != 'source'} if isinstance(tokens, dict) else {}
+        if not counts or set(counts) - TOKEN_FIELDS or not all(number(value, integer=True) for value in counts.values()):
+            problems.append(f'tokens must be null or nonnegative integer counts ({", ".join(sorted(TOKEN_FIELDS))}) with a source')
+        else:
+            problems += [f'tokens: {problem}' for problem in source_problems(tokens.get('source'), directory, hashes)]
+    if cost is not None:
+        if not (isinstance(cost, dict) and set(cost) == {'value', 'source'} and number(cost['value'])):
+            problems.append('cost_usd must be null or {"value": finite nonnegative number, "source": ...}')
+        else:
+            problems += [f'cost_usd: {problem}' for problem in source_problems(cost['source'], directory, hashes)]
     return problems
 
 
-def render_summary(meta, outcomes):
-    lines = [f"# {meta['title']} ({meta['tool']}:{meta['variant']}) run {meta['run_id']}", "",
-             f"valid: {meta['valid']} · completed: {meta['completed']} · transport: {meta['transport']}"
-             f" · isolation boundary: {meta['isolation_boundary']}",
-             f"measurement: {meta.get('measurement', '')} · reportable: {meta.get('reportable', False)}", ""]
-    if meta.get("blocked"):
-        lines += [f"BLOCKED (environment prerequisite, not a tool result): {meta['blocked']}", ""]
-    if meta["errors"] or meta.get("cleanup_problems"):
-        lines += ["Errors: " + "; ".join(meta["errors"] + meta.get("cleanup_problems", [])), ""]
-    lines += [f"Setup scope: {meta.get('setup_scope', 'not declared')}",
-              f"Cache state: {meta.get('cache_note', '')}", ""]
-    lines += ["| check | status | mode | detail |", "|---|---|---|---|"]
-    for o in outcomes:
-        lines.append(f"| {o['check']} | {o['status']} | {o['mode']} | {o['detail'].replace('|', '/')[:200]} |")
-    if meta.get("blocked") or not meta.get("valid"):
-        # Independent of meta["timings"]: an older or edited meta may still carry numbers.
-        lines += ["", "No timings: the run is blocked or invalid. Raw command receipts remain in steps.jsonl."]
-        return "\n".join(lines) + "\n"
-    timings = meta.get("timings") or {}
-    tasks = {k: v for k, v in timings.items() if k.startswith("first_task.")}
-    if tasks:
-        lines += ["", "End-to-end time to first verified work (setup, start, readiness, app deps, identity,",
-                  "migrate, mark/CRUD/cache, pytest). `steps` sums those receipts; `wall` also includes",
-                  "harness verification steps. This, not any single setup command, is the cross-tool task time.",
-                  f"It starts from an already PREPARED checkout; prepare (reported separately as prepare.<co>) "
-                  f"covers: {meta.get('prepare_scope', 'not declared')}.", "",
-                  "| task | steps s | wall s | receipts | checkout |", "|---|---|---|---|---|"]
-        for key, v in sorted(tasks.items()):
-            if v.get("ok"):
-                lines.append(f"| {key} | {round(v['steps_ns'] / 1e9, 2)} | {round(v['wall_ns'] / 1e9, 2)} | "
-                             f"{len(v['steps'])} | {v['checkout']} |")
-            else:
-                lines.append(f"| {key} | | | | {v.get('reason', '')} |")
-    lines += ["", "Phase timings (single commands; scopes differ by tool, see Setup scope; do not rank across tools):", "",
-              "| timing | outer p50 ms | outer p95 ms | inner p50 ms | inner p95 ms | ok/n |", "|---|---|---|---|---|---|"]
-    for key, value in sorted(timings.items()):
-        if key.startswith("first_task."):
+def review_problems(review, trial, plan, summary_path, directory, result):
+    problems = []
+    if not isinstance(review, dict) or review.get('schema') != 'stack-agentdx-review/2':
+        return ['not a stack-agentdx-review/2 object']
+    expect = {'trial_id': trial['id'], 'requested_model': trial['model'], 'observed_model': trial['model'],
+              'harness': plan['agent_harness'], 'requested_options': plan['agent_options'],
+              'trial_summary_sha256': digest(summary_path)}
+    problems += [f'{key} does not match' for key, value in expect.items() if review.get(key) != value]
+    observed = review.get('observed_options')
+    if plan['agent_options'] and observed != plan['agent_options']:
+        problems.append('observed_options must be the settings the transcript shows in effect, equal to the plan')
+    elif not plan['agent_options'] and observed is not None and not isinstance(observed, dict):
+        problems.append('observed_options must be null or an object')
+    if not isinstance(review.get('reviewer'), str) or not review['reviewer'].strip():
+        problems.append('reviewer missing')
+    if not isinstance(review.get('harness_version'), str) or not review['harness_version'].strip():
+        problems.append('harness_version missing')
+    evidence = result.get('evidence_sha256') or {}
+    hashes = review.get('transcript_sha256')
+    if not isinstance(hashes, dict) or 'agent.stdout' not in hashes:
+        problems.append('transcript hashes missing')
+    else:
+        for name, value in hashes.items():
+            path = directory / name
+            if not path.is_file() or digest(path) != value or evidence.get(name) != value:
+                problems.append(f'transcript {name} does not match the trial evidence')
+    window = (result.get('started_unix_ns', 0), result.get('finished_agent_unix_ns', 0))
+    events = review.get('interventions')
+    if not isinstance(events, list):
+        problems.append('interventions must be a list')
+        events = []
+    if events and plan.get('human_channel') == 'none':
+        problems.append('interventions recorded although the plan gives the agent no human channel')
+    for event in events:
+        if not (isinstance(event, dict) and event.get('kind') in INTERVENTION_KINDS and isinstance(event.get('reason'), str)
+                and number(event.get('active_seconds')) and number(event.get('at_unix_ns'), integer=True)
+                and window[0] <= event['at_unix_ns'] <= window[1]):
+            problems.append(f'malformed intervention {event!r}')
+    for key in ['help_requests', 'workarounds']:
+        if not isinstance(review.get(key), list) or not all(isinstance(item, str) for item in review[key]):
+            problems.append(f'{key} must be a list of strings')
+    return problems + metric_problems(review, directory, evidence)
+
+
+def stopped_schema(value):
+    """The same complete stop observation in commands and their uncertainty maps."""
+    return (isinstance(value, dict)
+            and all(isinstance(value.get(key), list) and all(type(pid) is int and pid > 0 for pid in value[key])
+                    for key in ['terminated', 'killed', 'survivors'])
+            and isinstance(value.get('unresolved'), list)
+            and all(isinstance(item, dict) and type(item.get('pid')) is int and item['pid'] > 0
+                    for item in value['unresolved']))
+
+
+def command_schema(value):
+    if not (isinstance(value, dict) and isinstance(value.get('argv'), list) and value['argv']
+            and all(isinstance(part, str) for part in value['argv'])
+            and isinstance(value.get('cwd'), str) and value['cwd']
+            and isinstance(value.get('receipt'), str) and value['receipt']
+            and number(value.get('started_unix_ns'), integer=True) and number(value.get('elapsed_ns'), integer=True)
+            and type(value.get('timed_out')) is bool and 'exit_code' in value
+            and (value['exit_code'] is None or type(value['exit_code']) is int)
+            and all(isinstance(value[key], str) for key in ['launch_error', 'cancelled'] if key in value)):
+        return False
+    if 'cancelled' in value and value['cancelled'] not in {'Cancelled', 'KeyboardInterrupt'}:
+        return False
+    if 'process_started' in value:
+        if type(value['process_started']) is not bool:
+            return False
+        if not value['process_started'] and (value['exit_code'] is not None or value['timed_out']
+                or 'stopped' in value or not any(key in value for key in ['cancelled', 'launch_error'])):
+            return False
+    # Older receipts omit process_started. Only an explicit false can establish that
+    # cancellation happened before a child existed; otherwise stopping must be observed.
+    needs_stop = value['timed_out'] or ('cancelled' in value and value.get('process_started') is not False)
+    return (not (needs_stop and 'stopped' not in value)
+            and ('stopped' not in value or stopped_schema(value['stopped'])))
+
+
+def residue_schema(value):
+    """A complete observation, including explicit empty lists when nothing was seen."""
+    return (isinstance(value, dict) and set(value) == {'pids', 'ports', 'owned_processes'}
+            and all(isinstance(value[key], list) and all(type(v) is int and 0 < v <= limit for v in value[key])
+                    for key, limit in [('pids', 2**31 - 1), ('ports', 65535)])
+            and isinstance(value['owned_processes'], list)
+            and all(isinstance(p, dict) and type(p.get('pid')) is int and p['pid'] > 0
+                    and isinstance(p.get('command'), str) and bool(p['command']) for p in value['owned_processes']))
+
+
+def cleanup_schema(value):
+    return (isinstance(value, dict) and residue_schema(value.get('before')) and residue_schema(value.get('left'))
+            and isinstance(value.get('steps'), dict) and type(value['steps'].get('down')) is int
+            and isinstance(value.get('command_cleanup', {}), dict)
+            and type(value.get('ok')) is bool
+            and value['ok'] == (not any(value['left'].values()) and not value.get('command_cleanup'))
+            and (('after_reclaim' in value) == ('reclaimed_by_harness' in value))
+            and ('after_reclaim' not in value or (residue_schema(value['after_reclaim'])
+                 and bool(value['left']['owned_processes']) and isinstance(value['reclaimed_by_harness'], dict))))
+
+
+def globals_schema(value):
+    return (isinstance(value, dict) and all(value.get(key) in ('present', 'absent') for key in arms.GLOBAL_ROOTS)
+            and all(isinstance(key, str) and (isinstance(v, str) or
+                    (isinstance(v, list) and all(isinstance(item, str) for item in v))) for key, v in value.items()))
+
+
+def submission_schema(value):
+    def files_schema(files):
+        return (isinstance(files, dict) and all(isinstance(name, str) and name and not Path(name).is_absolute()
+                and '..' not in Path(name).parts and not any(arms.excluded_submission_name(part) for part in Path(name).parts)
+                and isinstance(v, str) and (re.fullmatch('[0-9a-f]{64}', v) or v.startswith('symlink:') or v == 'special')
+                for name, v in files.items()))
+    return (isinstance(value, dict) and value.get('tree') == 'submitted-tree'
+            and isinstance(value.get('changed'), list) and all(isinstance(item, str) for item in value['changed'])
+            and all(files_schema(value.get(key)) for key in ['files_before', 'files_after']))
+
+
+def clean(teardown_record):
+    """Nothing owned was running after the arm's own teardown (recomputed, not read from `ok`)."""
+    left = (teardown_record or {}).get('left') if isinstance(teardown_record, dict) else None
+    return (cleanup_schema(teardown_record) and not any(left.values()) and not teardown_record.get('command_cleanup')
+            and 'after_reclaim' not in teardown_record)
+
+
+def restored(teardown_record):
+    """Clean, or clean once the harness reclaimed the leftovers."""
+    after = teardown_record.get('after_reclaim') if isinstance(teardown_record, dict) else None
+    if not cleanup_schema(teardown_record):
+        return False
+    if teardown_record.get('command_cleanup'):
+        return False
+    if isinstance(teardown_record, dict) and 'after_reclaim' in teardown_record:
+        return residue_schema(after) and not any(after.values())
+    return clean(teardown_record)
+
+
+def receipt(directory, name, hashes, problems, schema=None):
+    """A JSON evidence file, only if the summary hashes it and the file still matches."""
+    if name not in hashes:
+        problems.append(f'{name} missing')
+        return None
+    path = directory / name
+    if not path.is_file() or digest(path) != hashes[name]:
+        return None  # reported once as changed
+    try:
+        value = json.loads(path.read_text())
+    except ValueError:
+        problems.append(f'{name} unreadable')
+        return None
+    if not isinstance(value, dict) or (schema is not None and not schema(value)):
+        problems.append(f'{name} malformed observation')
+        return None
+    return value
+
+
+def step_ok(record):
+    return (isinstance(record, dict) and type(record.get('exit_code')) is int and record['exit_code'] == 0
+            and record.get('timed_out') is False and 'cancelled' not in record and 'launch_error' not in record)
+
+
+def command_receipt(directory, stem, hashes, problems, window=None):
+    """One command role, its exact output files, and the digests written by invoke()."""
+    record = receipt(directory, stem + '.json', hashes, problems)
+    if record is None:
+        return None
+    # invoke() always re-raises external cancellation after saving this receipt. Even a
+    # clean stop or a cancellation before launch cannot belong to a completed trial.
+    if 'cancelled' in record:
+        problems.append(f'{stem}.json command was cancelled: {record["cancelled"]}')
+    if not command_schema(record):
+        problems.append(f'{stem}.json malformed observation')
+        return None
+    role_matches = record['receipt'] == stem
+    valid = role_matches and 'cancelled' not in record
+    if not role_matches:
+        problems.append(f'{stem}.json receipt does not match command role')
+    for suffix in ['stdout', 'stderr']:
+        name = f'{stem}.{suffix}'
+        path = directory / name
+        expected = record.get(f'{suffix}_sha256')
+        if not (isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected)
+                and hashes.get(name) == expected and path.is_file() and digest(path) == expected):
+            problems.append(f'{stem}.json {suffix} digest does not match {name}')
+            valid = False
+    if uncertain_command(record):
+        problems.append(f'{stem}.json command cleanup left survivors or unresolved identities')
+        valid = False
+    if window is not None and not (all(number(t, integer=True) for t in window)
+            and window[0] <= record['started_unix_ns']
+            and record['started_unix_ns'] + record['elapsed_ns'] <= window[1] + 10**9):
+        problems.append(f'{stem}.json command timing is outside the trial window')
+        valid = False
+    return record if valid else None
+
+
+def command_cleanup_consistency(observation, directory, prefix, stems, hashes, problems):
+    """Bind each runtime's uncertainty map to only the commands it actually invoked.
+
+    Maps contain only uncertain stop observations, not every successfully stopped command.
+    Missing maps mean empty for older clean evidence; malformed or contradictory maps do not.
+    """
+    actual = observation.get('command_cleanup', {})
+    if not (isinstance(actual, dict) and all(isinstance(stem, str) and stopped_schema(value)
+                                           for stem, value in actual.items())):
+        problems.append(f'{prefix} malformed command cleanup map')
+    expected = {}
+    for stem in stems:
+        raw = receipt(directory, stem + '.json', hashes, problems, command_schema)
+        if raw is not None and uncertain_command(raw):
+            expected[stem] = raw['stopped']
+    if actual != expected:
+        problems.append(f'{prefix} command cleanup contradicts its command receipts')
+    if isinstance(actual, dict) and any(stopped_schema(value) and any(value[key] for key in ['survivors', 'unresolved'])
+                                        for value in actual.values()):
+        problems.append(f'{prefix} command cleanup left survivors or unresolved identities')
+
+
+def grading_commands(graded, directory, prefix, hashes, problems):
+    roles = re.compile(re.escape(prefix) + r'-(?:setup\d*|up\d*|smoke_exec|smoke_task_loop|verify)'
+                       r'(?:-attempt-[1-9]\d*)?\.json')
+    stems = [name[:-5] for name in sorted(hashes) if roles.fullmatch(name)]
+    command_cleanup_consistency(graded, directory, prefix, stems, hashes, problems)
+
+
+def cleanup_commands(cleanup, directory, prefix, hashes, problems):
+    """Require the down receipt, and supervisor stop if that step was recorded."""
+    if not cleanup_schema(cleanup):
+        return
+    if set(cleanup['steps']) - {'down', 'supervisor_stop'}:
+        problems.append(f'{prefix} unknown cleanup step')
+    stems = []
+    for role, code in cleanup['steps'].items():
+        stem = f'{prefix}-{role.replace("_", "-")}'
+        stems.append(stem)
+        command = command_receipt(directory, stem, hashes, problems)
+        if command is not None and command['exit_code'] != code:
+            problems.append(f'{prefix} step {role} contradicts its command receipt')
+    command_cleanup_consistency(cleanup, directory, prefix, stems, hashes, problems)
+
+
+def graded_verdict(task, directory, hashes, prefix, problems):
+    """Both gates from the receipts: the smoke test through exec, and the hidden checks."""
+    smoke = command_receipt(directory, f'{prefix}-smoke_exec', hashes, problems)
+    command_receipt(directory, f'{prefix}-smoke_task_loop', hashes, problems)
+    verify = command_receipt(directory, f'{prefix}-verify', hashes, problems)
+    if f'{prefix}-verify.stdout' not in hashes:
+        problems.append(f'{prefix}-verify.stdout missing')
+        return False
+    if verify is None or smoke is None:
+        return False
+    if any(record.get('stopped', {}).get(key) for record in [smoke, verify] for key in ['survivors', 'unresolved']):
+        problems.append(f'{prefix} command cleanup left survivors or unresolved identities')
+        return False
+    return step_ok(smoke) and step_ok(verify) and acceptance(task, verify, directory)[0]
+
+
+def startup_metrics(graded, task, arm, binary, directory, hashes, prefix, window, problems):
+    """Require the steps reachable on this terminal path, including every setup retry.
+
+    Receipt names come from the arm's commands, never from the supplied hash map. Missing
+    or malformed timing stays None; an arm with no up command has no up timing.
+    """
+    metrics = {'setup': None, 'up': None}
+    outcome = graded.get('outcome')
+    if outcome not in {'graded', 'startup_failed', 'setup_failed', 'infrastructure_failed'}:
+        return metrics
+    steps = arms.commands(arm, TASKS[task]['project'], binary)
+    previous_end, total, consumed = window[0], 0, set()
+    for phase in ['setup', 'up']:
+        if not steps[phase] or (phase == 'up' and outcome == 'setup_failed'):
             continue
-        if isinstance(value, dict) and "outer" in value:
-            o, i = value["outer"], value["inner"]
-            lines.append(f"| {key} | {o['p50_ms']} | {o['p95_ms']} | {i['p50_ms']} | {i['p95_ms']} | {o['ok']}/{o['n']} |")
-        elif isinstance(value, int):
-            lines.append(f"| {key} (single, outer) | {round(value / 1e6, 1)} | | | | 1/1 |")
-    if meta.get("start_scope"):
-        lines += ["", f"Start scope: {meta['start_scope']}."]
-    lines += ["", "`ready.<co>` sums start, native readiness and the first verified identity (app deps excluded).",
-              "First-checkout timings start from the image's cache state above; they are not universal cold installs."]
-    return "\n".join(lines) + "\n"
+        elapsed, complete = 0, True
+        for index, _ in enumerate(steps[phase]):
+            base = f'{prefix}-{phase}{index or ""}'
+            last = None
+            for attempt in range(1, (3 if phase == 'setup' else 1) + 1):
+                stem = base if attempt == 1 else f'{base}-attempt-{attempt}'
+                consumed.add(f'{stem}.json')
+                record = receipt(directory, f'{stem}.json', hashes, problems)
+                if record is None:
+                    complete = False
+                    break
+                started, duration = record.get('started_unix_ns'), record.get('elapsed_ns')
+                code = record.get('exit_code')
+                valid = (command_schema(record) and not any(record.get('stopped', {}).get(key) for key in ['survivors', 'unresolved'])
+                         and number(started, integer=True) and number(duration, integer=True)
+                         and type(record.get('timed_out')) is bool and (code is None or type(code) is int)
+                         and record.get('receipt') == stem and number(window[0], integer=True)
+                         and number(window[1], integer=True) and window[0] <= started
+                         and started + duration <= window[1] + 10**9 and started >= previous_end - 10**9)
+                if not valid:
+                    problems.append(f'{stem}.json malformed startup timing or command result')
+                    complete = False
+                else:
+                    elapsed += duration
+                    previous_end = started + duration
+                last = record
+                if step_ok(record):
+                    break
+            should_fail = (phase == 'setup' and outcome == 'setup_failed') or (
+                phase == 'up' and outcome in {'startup_failed', 'infrastructure_failed'})
+            if last is None or step_ok(last) == should_fail:
+                problems.append(f'{base} result contradicts grading outcome {outcome}')
+            if should_fail:
+                if graded.get('failed_step') != phase or last is None or graded.get('failed_receipt') != last.get('receipt'):
+                    problems.append(f'{prefix} failed step contradicts startup receipts')
+                break
+        if complete:
+            metrics[phase] = elapsed / 1e9
+            total += elapsed
+    if number(window[0], integer=True) and number(window[1], integer=True) and total > window[1] - window[0] + 10**9:
+        problems.append(f'{prefix} cumulative startup timing exceeds the trial window')
+        metrics = {'setup': None, 'up': None}
+    if 'seconds' in graded:
+        seconds = graded['seconds']
+        expected = {key: value for key, value in metrics.items() if value is not None}
+        if not (isinstance(seconds, dict) and set(seconds) == set(expected)
+                and all(number(seconds[k]) and math.isclose(seconds[k], v, rel_tol=1e-9, abs_tol=1e-9)
+                        for k, v in expected.items())):
+            problems.append(f'{prefix} seconds contradict startup receipts')
+    unexpected = {name for name in hashes if re.fullmatch(re.escape(prefix) + r'-(?:setup|up)\d*(?:-attempt-\d+)?\.json', name)} - consumed
+    problems += [f'{name} is unreachable on the recorded startup path' for name in sorted(unexpected)]
+    return metrics
 
 
-def dry_run(adapter):
-    """Print every body the scenario would send, using a fake transport."""
-    from rwb.testing import FakeTransport, FakeRecorder
-    rec = FakeRecorder()
-    tx = FakeTransport(rec, adapter)
-    if adapter.transport == "host":
-        adapter.root = adapter.root or "/tmp/rwb-dry-run"  # checkout paths derive from it
-    scenario = Scenario(adapter, tx, rec, repeats=1, warmups=0)
-    tx.world.scenario = scenario  # the fake app reports each checkout's real source token
-    scenario.execute()
-    scenario.cleanup()
-    for label, phase, body in tx.calls:
-        print(f"### {label} [{phase}]\n{body}\n")
-    return 0
+def derive(result, trial, plan, plan_path, directory):
+    """Re-derive a trial's verdict from its hashed records; return (facts, problems).
+
+    The summary's own booleans are never trusted. Each critical value is recomputed from the
+    record that observed it, and a summary that disagrees with its records is invalid.
+    """
+    problems, facts = [], {}
+    if result.get('kind') != 'agent_trial' or result.get('plan_kind') != plan['kind']:
+        problems.append('not an agent trial of this plan')
+    if result.get('trial') != trial or result.get('plan_sha256') != digest(plan_path):
+        problems.append('trial or plan identity differs')
+    if result.get('stack_sha256') != plan['stack_sha256'] or result.get('locale') != plan['locale']:
+        problems.append('binary or locale differs from the plan')
+    if not result.get('started_unix_ns', 0) >= plan['created_unix_ns']:
+        problems.append('started before the plan existed')
+    for key in ['error', 'cancelled']:
+        if key in result:
+            problems.append(f'trial {key}: {result[key]}')
+    hashes = result.get('evidence_sha256')
+    if not isinstance(hashes, dict):
+        return facts, problems + ['evidence hashes missing']
+    problems += [f'{name} changed' for name, value in hashes.items() if (directory / name).is_symlink()
+                 or not (directory / name).is_file() or digest(directory / name) != value]
+    extra = sorted(str(path.relative_to(directory)) for path in directory.rglob('*')
+                   if not path.is_symlink() and path.is_file())
+    extra = [name for name in extra if name not in hashes and name not in {'summary.json', 'review.json'}
+             and not name.startswith(REVIEW_EVIDENCE)]
+    problems += [f'{name} is not in the trial evidence' for name in extra]
+    # Audit every invoked command, including observation-only loops and cleanup commands.
+    # Uncertainty is terminal for this trial; a later empty ownership scan is not recovery
+    # evidence for an identity the command already lost. Never signal that identity here.
+    for name in sorted(hashes):
+        if name.endswith('.json') and COMMAND_STEM.fullmatch(name[:-5]):
+            command_receipt(directory, name[:-5], hashes, problems,
+                            (result.get('started_unix_ns'), result.get('finished_unix_ns')))
+    for name in ['prompt.txt', 'agent.stdout', 'agent.stderr', 'submission.patch']:
+        if name not in hashes:
+            problems.append(f'{name} missing')
+
+    # The agent: its receipt, the exact planned invocation, and timing.
+    agent = receipt(directory, 'agent.json', hashes, problems, command_schema)
+    if agent is not None:
+        if any(agent.get('stopped', {}).get(key) for key in ['survivors', 'unresolved']):
+            problems.append('agent command cleanup left survivors or unresolved identities')
+        exit_code = agent.get('exit_code')
+        if not (number(agent.get('elapsed_ns'), integer=True) and isinstance(agent.get('timed_out'), bool)
+                and (exit_code is None or (isinstance(exit_code, int) and not isinstance(exit_code, bool)))
+                and number(agent.get('started_unix_ns'), integer=True)):
+            problems.append('agent receipt is malformed')
+        else:
+            if {key: agent.get(key) for key in ['exit_code', 'timed_out', 'elapsed_ns', 'launch_error', 'receipt']} != result.get('agent'):
+                problems.append('summary agent result contradicts agent.json')
+            finished = result.get('finished_agent_unix_ns')
+            if not (number(finished, integer=True) and result.get('started_unix_ns', 0) <= agent['started_unix_ns']
+                    and agent['started_unix_ns'] + agent['elapsed_ns'] <= finished + 10**9):
+                problems.append('agent timing is outside the trial window')
+            facts.update(agent_seconds=agent['elapsed_ns'] / 1e9, agent_exit=agent['exit_code'], timed_out=agent['timed_out'])
+        if (directory / 'prompt.txt').is_file() and 'runtime' in result and 'workspace' in result:
+            expected = agent_argv(plan, trial['model'], agent_paths(result, (directory / 'prompt.txt').read_text()))
+            if agent.get('argv') != expected:
+                problems.append('agent invocation differs from the planned command, model or options')
+
+    # What was running when the agent stopped, and whether cleanup restored the host.
+    left = receipt(directory, 'left-at-agent-exit.json', hashes, problems, residue_schema)
+    if left is not None:
+        if left != result.get('left_running_at_agent_exit'):
+            problems.append('summary left_running contradicts left-at-agent-exit.json')
+        split = arms.left_services(left) if isinstance(left, dict) else {'services': True, 'supervisor_processes': []}
+        facts.update(left_running=split['services'], supervisor_left=bool(split['supervisor_processes']))
+    agent_cleanup = receipt(directory, 'agent-cleanup.json', hashes, problems, cleanup_schema)
+    cleanup_commands(agent_cleanup, directory, 'agent-cleanup', hashes, problems)
+    final_required = 'final-cleanup.json' in hashes or 'final_cleanup' in result or (agent_cleanup is not None and not clean(agent_cleanup))
+    final_cleanup = receipt(directory, 'final-cleanup.json', hashes, problems, cleanup_schema) if final_required else None
+    if final_required:
+        cleanup_commands(final_cleanup, directory, 'final-cleanup', hashes, problems)
+    if final_cleanup is not None and final_cleanup != result.get('final_cleanup'):
+        problems.append('summary final_cleanup contradicts final-cleanup.json')
+    if agent_cleanup is not None:
+        if agent_cleanup != result.get('agent_cleanup'):
+            problems.append('summary agent_cleanup contradicts agent-cleanup.json')
+        facts['arm_teardown_clean'] = clean(agent_cleanup)
+        if not restored(final_cleanup if final_required else agent_cleanup):
+            problems.append('owned processes were still running after cleanup')
+        if not clean(agent_cleanup) and final_cleanup is None:
+            problems.append('arm teardown left processes but no final cleanup was recorded')
+
+    # Global state and benchmark files, before and after.
+    before = receipt(directory, 'globals-before.json', hashes, problems, globals_schema)
+    after = receipt(directory, 'globals-after.json', hashes, problems, globals_schema)
+    if before is not None and after is not None:
+        changed = arms.globals_diff(before, after)
+        if changed:
+            problems.append(f'global state changed: {changed}')
+        if changed != result.get('globals_changed'):
+            problems.append('summary globals_changed contradicts the global receipts')
+    after_files = receipt(directory, 'fingerprints-after.json', hashes, problems)
+    if after_files is not None and after_files != plan['fingerprints']:
+        problems.append('benchmark files changed during the trial')
+
+    # The submission and its grade.
+    submission = receipt(directory, 'submission.json', hashes, problems, submission_schema)
+    if submission is not None:
+        captured = directory / 'submitted-tree'
+        if not captured.is_dir() or arms.tree_files(captured) != submission['files_after']:
+            problems.append('retained submitted tree differs from submission.json or is missing')
+    if submission is not None and submission.get('changed') != result.get('changed_files'):
+        problems.append('summary changed_files contradicts submission.json')
+    graded = receipt(directory, 'grade.json', hashes, problems)
+    passed = False
+    if graded is not None:
+        if submission is not None and graded.get('submitted_files') != arms.overlay_manifest(
+                submission['files_before'], submission['files_after']):
+            problems.append('graded submitted_files differ from the captured submission')
+        if not (type(graded.get('passed')) is bool and isinstance(graded.get('outcome'), str)
+                and cleanup_schema(graded.get('cleanup'))):
+            problems.append('grade.json malformed grade or cleanup')
+        if graded != result.get('grade'):
+            problems.append('summary grade contradicts grade.json')
+        outcome = graded.get('outcome')
+        control = graded.get('startup_control')
+        if 'startup_control' in graded:
+            if outcome not in {'startup_failed', 'infrastructure_failed'} or not isinstance(control, dict):
+                problems.append('startup control is malformed or unreachable on the grading outcome')
+            if isinstance(control, dict):
+                grading_commands(control, directory, 'grade-control', hashes, problems)
+        grading_commands(graded, directory, 'grade', hashes, problems)
+        cleanup_commands(graded.get('cleanup'), directory, 'grade-cleanup', hashes, problems)
+        facts['outcome'] = outcome
+        window = (result.get('started_unix_ns'), result.get('finished_unix_ns'))
+        facts['startup_seconds'] = startup_metrics(graded, trial['task'], trial['arm'], Path(plan['stack_binary']),
+                                                   directory, hashes, 'grade', window, problems)
+        if not clean(graded.get('cleanup')):
+            problems.append('the grading runtime left owned processes')
+        if outcome == 'graded':
+            passed = graded_verdict(trial['task'], directory, hashes, 'grade', problems)
+        elif outcome == 'startup_failed':
+            # A task failure only if the receipts show the submitted app failing to start and the
+            # reference passing in its control runtime.
+            up = receipt(directory, 'grade-up.json', hashes, problems)
+            if up is None or step_ok(up):
+                problems.append('startup_failed without a failing grade-up receipt')
+            if 'grade-verify.json' in hashes:
+                problems.append('startup_failed but a verifier receipt exists')
+            if not (isinstance(control, dict) and control.get('outcome') == 'graded' and control.get('passed') is True
+                    and step_ok(receipt(directory, 'grade-control-up.json', hashes, problems, command_schema))
+                    and graded_verdict(trial['task'], directory, hashes, 'grade-control', problems)):
+                problems.append('the startup control did not pass, so the failure is not attributable to the submission')
+            elif not (cleanup_schema(control.get('cleanup')) and clean(control.get('cleanup'))):
+                problems.append('the startup control runtime left owned processes')
+            if isinstance(control, dict):
+                cleanup_commands(control.get('cleanup'), directory, 'grade-control-cleanup', hashes, problems)
+                startup_metrics(control, trial['task'], trial['arm'], Path(plan['stack_binary']), directory, hashes,
+                                'grade-control', window, problems)
+        else:
+            problems.append(f'grading ended {outcome}: {graded.get("error")}')
+        if passed != (graded.get('passed') is True) or passed != (result.get('task_passed') is True):
+            problems.append('task_passed disagrees with the grader receipts')
+    facts['verified_task'] = passed and not problems
+    return facts, problems
 
 
-if __name__ == "__main__":
+def report(args):
+    plan_path = Path(args.plan).resolve()
+    plan = json.loads(plan_path.read_text())
+    rows = []
+    for trial in plan['trials']:
+        directory = Path(args.results).resolve() / trial_key(trial['id'])
+        row = {**trial, 'status': 'not_run', 'verified_task': False, 'autonomous': False, 'problems': []}
+        summary_path = directory / 'summary.json'
+        if summary_path.exists():
+            try:
+                result = json.loads(summary_path.read_text())
+            except ValueError:
+                result = {}
+            try:
+                facts, row['problems'] = derive(result, trial, plan, plan_path, directory)
+            except (TypeError, ValueError, KeyError, AttributeError, OverflowError, OSError) as error:
+                # One corrupt trial cannot hide the rest of the pre-registered assignments.
+                facts, row['problems'] = {}, [f'malformed trial evidence: {type(error).__name__}: {error}']
+            if not isinstance(result, dict):
+                result = {}
+            if result.get('valid') is not True and not row['problems']:
+                row['problems'].append('trial marked itself invalid')
+            row.update({key: facts.get(key) for key in ['outcome', 'agent_seconds', 'agent_exit', 'timed_out', 'startup_seconds',
+                                                         'left_running', 'supervisor_left', 'arm_teardown_clean']})
+            row['verified_task'] = facts.get('verified_task') is True and not row['problems']
+            review_path = directory / 'review.json'
+            review = None
+            if review_path.exists():
+                with contextlib.suppress(ValueError):
+                    review = json.loads(review_path.read_text())
+                try:
+                    row['review_problems'] = review_problems(review, trial, plan, summary_path, directory, result)
+                except (TypeError, ValueError, KeyError, AttributeError, OverflowError, OSError) as error:
+                    row['review_problems'] = [f'malformed review evidence: {type(error).__name__}: {error}']
+            if row['problems']:
+                row['status'] = 'invalid'
+            elif review is None or row.get('review_problems'):
+                row['status'] = 'unreviewed' if review is None else 'review_invalid'
+            else:
+                row['status'] = 'passed' if row['verified_task'] else ('timed_out' if row['timed_out'] else 'failed')
+                # Autonomous: verified, no human help, nothing left running at agent exit, and the
+                # arm's own teardown stopped everything without the harness reclaiming by PID.
+                row['autonomous'] = (row['verified_task'] and not review['interventions'] and row['left_running'] is False
+                                     and row['arm_teardown_clean'] is True)
+                row.update(interventions=len(review['interventions']), help_requests=len(review['help_requests']),
+                           workarounds=review['workarounds'], tokens=review['tokens'], cost_usd=review['cost_usd'],
+                           observed_options=review['observed_options'])
+        rows.append(row)
+    scored = {'passed', 'failed', 'timed_out'}
+    counts = {}
+    for arm in arms.ARMS:
+        subset = [row for row in rows if row['arm'] == arm]
+        counts[arm] = {'assigned': len(subset), 'autonomous': sum(row['autonomous'] for row in subset),
+                       'verified_task': sum(row['verified_task'] for row in subset),
+                       'startup_failed': sum(row.get('outcome') == 'startup_failed' and row['status'] in scored for row in subset),
+                       'left_services_running': sum(bool(row.get('left_running')) for row in subset),
+                       'supervisor_left_running': sum(bool(row.get('supervisor_left')) for row in subset),
+                       **{status: sum(row['status'] == status for row in subset)
+                          for status in ['passed', 'failed', 'timed_out', 'invalid', 'unreviewed', 'review_invalid', 'not_run']}}
+    pairs = []
+    for pair in dict.fromkeys(row['pair'] for row in rows):
+        both = {row['arm']: row for row in rows if row['pair'] == pair}
+        if all(both[arm]['status'] in scored for arm in arms.ARMS):
+            pairs.append({'pair': pair, 'stack': both['stack']['autonomous'], 'existing': both['existing']['autonomous']})
+    complete = all(row['status'] in scored for row in rows)
+    return {'kind': 'agent_experiment_report', 'plan_kind': plan['kind'], 'plan_sha256': digest(plan_path),
+            'publishable': complete and plan['kind'] == 'agent_experiment',
+            'complete': complete, 'counts': counts, 'pairs': pairs,
+            'discordant': {'stack_only': sum(p['stack'] and not p['existing'] for p in pairs),
+                           'existing_only': sum(p['existing'] and not p['stack'] for p in pairs)},
+            'agent_options': plan['agent_options'] if plan.get('agent_options_controlled') else 'harness defaults (not controlled by the plan)',
+            'rows': rows,
+            'limits': ['Synthetic pilot tasks on one host; descriptive only. No speedup or significance is computed.',
+                       'Every assigned trial stays in the denominator; not_run, invalid and unreviewed are not successes.',
+                       'Autonomous = verified task (hidden checks and smoke test), no recorded human help, nothing left '
+                       'running at agent exit, and the arm teardown stopped everything itself.',
+                       'Every verdict is re-derived from hashed receipts; a summary that contradicts them is invalid.',
+                       'Model identity, effective options, help and usage come from a human transcript review, not the agent.']}
+
+
+def main():
+    def cancel(signum, frame):
+        raise Cancelled(f'signal {signum}')
+    for signum in [signal.SIGTERM, signal.SIGHUP]:
+        signal.signal(signum, cancel)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest='command', required=True)
+    validation = commands.add_parser('validate')
+    validation.add_argument('--task', choices=list(TASKS), required=True)
+    validation.add_argument('--arm', choices=arms.ARMS, required=True)
+    validation.add_argument('--stack', required=True)
+    validation.add_argument('--locale', default=json.dumps(DEFAULT_LOCALE))
+    validation.add_argument('--cache-root', help='share tool downloads/installs here (warm); default is cold')
+    validation.add_argument('--out', required=True)
+    planning = commands.add_parser('plan')
+    planning.add_argument('--kind', choices=['agent_experiment', 'harness_selftest'], required=True)
+    planning.add_argument('--tasks', nargs='+', choices=list(TASKS), default=list(TASKS))
+    planning.add_argument('--models', nargs='+', required=True)
+    planning.add_argument('--harness', required=True)
+    planning.add_argument('--options', default='{}')
+    planning.add_argument('--agent-command', required=True,
+                          help='JSON argv; placeholders {model} {prompt} {prompt_file} {workspace} {transcript_dir}')
+    planning.add_argument('--stack', required=True)
+    planning.add_argument('--platform', required=True)
+    planning.add_argument('--locale', default=json.dumps(DEFAULT_LOCALE))
+    planning.add_argument('--cache', choices=['cold', 'warm'], required=True)
+    planning.add_argument('--seed', type=int, required=True)
+    planning.add_argument('--repeats', type=int, default=5)
+    planning.add_argument('--budget', type=int, default=1800)
+    planning.add_argument('--out', required=True)
+    trial = commands.add_parser('trial')
+    trial.add_argument('--plan', required=True)
+    trial.add_argument('--id', required=True)
+    trial.add_argument('--results', required=True)
+    trial.add_argument('--cache-root')
+    template = commands.add_parser('review-template')
+    template.add_argument('--plan', required=True)
+    template.add_argument('--id', required=True)
+    template.add_argument('--results', required=True)
+    reporting = commands.add_parser('report')
+    reporting.add_argument('--plan', required=True)
+    reporting.add_argument('--results', required=True)
+    reporting.add_argument('--out', required=True)
+    args = parser.parse_args()
+    if args.command == 'validate':
+        result = validate(args)
+    elif args.command == 'plan':
+        if args.repeats < 1 or args.budget < 1:
+            parser.error('repeats and budget must be positive')
+        result = make_plan(args)
+    elif args.command == 'trial':
+        result = experiment_trial(args)
+    elif args.command == 'review-template':
+        result = review_template(args)
+    else:
+        result = report(args)
+        with Path(args.out).open('x') as handle:
+            handle.write(json.dumps(result, indent=2) + '\n')
+    print(json.dumps(result, indent=2))
+    return 1 if result.get('valid') is False else 0
+
+
+if __name__ == '__main__':
     sys.exit(main())

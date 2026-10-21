@@ -8,6 +8,9 @@ should call it from their hooks:
 
 - when a checkout appears: `stack compile --locked && stack up`
 - before it is removed: `stack down`
+- after it is removed, from anywhere: `stack gc --reclaim-data` releases its ports (plain
+  `stack gc` does that too) and removes its databases. Without the flag the data is kept and
+  reported, so a checkout removed by mistake loses nothing until you ask.
 
 Stopping first matters. Stack will not stop a deleted checkout's services by name, so a
 checkout removed while its services run leaves them running until you stop them yourself
@@ -46,10 +49,13 @@ throwaway check), point every store at one disposable directory.
 [`examples/isolated-stack.sh`](../../examples/isolated-stack.sh) does this:
 
 ```sh
-bash examples/isolated-stack.sh 0.1.21 ~/src/app stack exec -- pytest
+bash examples/isolated-stack.sh <version> ~/src/app stack exec -- pytest   # e.g. latest
 ```
 
-It installs the given Stack version from npm into a fresh `/tmp/stack-iso.*` root, moves the
+Pick the release to evaluate; npm's `latest` is the newest published one. Release 0.1.21 gives
+`exec` and `stack run` tasks a custom service's proxy URL instead of its loopback URL, and
+0.1.22 fixed `exec` only, so evaluate the task loop with a newer release. It installs the given Stack
+version from npm into a fresh `/tmp/stack-iso.*` root, moves the
 Stack, mise, Pitchfork, XDG, uv and npm stores there, runs `stack up` and your command, then
 stops everything. It keeps `HOME`, so your Git and SSH configuration still work. It needs
 `node`, `npm` and `python3`.
@@ -57,12 +63,15 @@ stops everything. It keeps `HOME`, so your Git and SSH configuration still work.
 - The root is deleted only when every service is confirmed stopped, the supervisor is down,
   your global mise and Pitchfork files are unchanged, and the command exited 0. Otherwise it is
   kept, and its path is printed on the first line.
-- To clean up a kept root, run `stack down` from the checkout with that root's environment,
-  then stop its supervisor. Delete only that exact path. Never delete by pattern: another run's
-  root looks the same.
+- To clean up a kept root, run `stack down` from the checkout with that root's environment: it
+  also stops the root's supervisor when Stack started it and nothing else uses it, and says why
+  not otherwise (a Stack older than this default needs `stack down --stop-supervisor`, or
+  `stack down` and then `stack exec -- pitchfork supervisor stop`). Delete only that exact path.
+  Never delete by pattern: another run's root looks the same.
 - Ctrl-C, SIGTERM or SIGHUP cancels the running step and still runs cleanup. The script exits
   128 plus the signal number.
-- For several checkouts, run `stack down` in each before stopping the supervisor.
+- For several checkouts, run `stack down` in each: the supervisor is kept while the others'
+  sessions use it, and the last one stops it.
 - On Linux, if `XDG_STATE_HOME` is set, add its Pitchfork path to the script's receipt check.
 
 [All docs](../README.md)

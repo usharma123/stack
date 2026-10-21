@@ -30,6 +30,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Write a starting stack.toml in the project directory (never replaces one)
+    Init {
+        /// A tool to pin, as NAME or NAME=VERSION (repeatable), e.g. --tool python=3.13
+        #[arg(long = "tool", value_name = "NAME[=VERSION]")]
+        tools: Vec<String>,
+        /// A preset service, as NAME, NAME=PRESET and either with @VERSION (repeatable), e.g. --service postgres@17
+        #[arg(long = "service", value_name = "NAME[=PRESET][@VERSION]")]
+        services: Vec<String>,
+    },
     /// Resolve bundles, write stack.lock and the generated provider config
     Compile {
         /// Re-resolve every bundle ref (tags and branches may move)
@@ -80,6 +89,9 @@ enum Cmd {
     Restart {
         /// Services to restart; the others keep running
         services: Vec<String>,
+        /// Restart only the services whose `watch` files changed since they started
+        #[arg(long, conflicts_with = "services")]
+        changed: bool,
         /// Give up after this long (e.g. 5m) and exit 124, like `up --timeout`. Default 10m
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
@@ -120,8 +132,17 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Stop services; succeeds only once their processes are gone
-    Down,
+    /// Stop services; succeeds only once their processes are gone. Then stops the Pitchfork
+    /// supervisor that ran them if Stack started it and no other session or daemon uses it
+    Down {
+        /// Leave the supervisor running even when Stack started it and nothing else uses it
+        #[arg(long, conflicts_with = "stop_supervisor")]
+        keep_supervisor: bool,
+        /// Stop the supervisor as above: what `down` does unless told to keep it (accepted for
+        /// scripts written when this was not the default)
+        #[arg(long)]
+        stop_supervisor: bool,
+    },
     /// Renew this project's session lease
     Renew,
     /// Reclaim sessions with expired leases or deleted projects (machine-wide)
@@ -136,6 +157,9 @@ enum Cmd {
         /// Stop after this many passes with --watch (default: run until terminated)
         #[arg(long, value_name = "N", requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
         max_passes: Option<u64>,
+        /// Also remove the service data of deleted checkouts (otherwise only reported)
+        #[arg(long)]
+        reclaim_data: bool,
     },
     /// Publish a bundle directory to an OCI registry
     Publish {
@@ -167,7 +191,7 @@ fn main() -> ExitCode {
     };
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
     }
@@ -188,6 +212,12 @@ fn main() -> ExitCode {
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
+        Cmd::Init { tools, services } => stack::init::init(&root, tools, services).map(|r| {
+            emit(cli.json, &r, || {
+                println!("wrote {}", r.path.display());
+                println!("next: {}", r.next.join(", then "));
+            })
+        }),
         Cmd::Compile { update, locked, reassign_ports } => {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
             project::compile(&opts(mode, true, *reassign_ports)).map(|mut r| {
@@ -250,8 +280,8 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Restart { services, timeout } => startup_timeout(timeout.as_deref())
-            .and_then(|timeout| session::restart(&ctx, services, timeout))
+        Cmd::Restart { services, changed, timeout } => startup_timeout(timeout.as_deref())
+            .and_then(|timeout| if *changed { session::restart_changed(&ctx, timeout) } else { session::restart(&ctx, services, timeout) })
             .map(|r| {
                 emit(cli.json, &r, || {
                     for c in &r.checks {
@@ -296,9 +326,17 @@ fn main() -> ExitCode {
         Cmd::Run { task, timeout, args } => {
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
         }
-        Cmd::Down => session::down(&ctx).map(|r| {
+        Cmd::Down { keep_supervisor, stop_supervisor: _ } => session::down_with(&ctx, !*keep_supervisor).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                if let Some(supervisor) = &r.supervisor {
+                    match (supervisor["stopped"].as_bool(), supervisor["reason"].as_str()) {
+                        (Some(true), Some(_)) => println!("supervisor not running"),
+                        (Some(true), None) => println!("supervisor stopped"),
+                        (_, Some(reason)) => println!("supervisor kept: {reason}"),
+                        _ => {}
+                    }
+                }
                 for c in &r.conflicts {
                     println!("note: port {} reserved for {} is held by another program{}", c.port, c.service,
                         c.holder.as_ref().map(|h| format!(" (pid {} {})", h.pid, h.command)).unwrap_or_default());
@@ -306,8 +344,8 @@ fn main() -> ExitCode {
             })
         }),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc { watch: true, interval, max_passes } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes),
-        Cmd::Gc { .. } => session::gc_checked(&ctx.state).map(|r| {
+        Cmd::Gc { watch: true, interval, max_passes, reclaim_data } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data),
+        Cmd::Gc { reclaim_data, .. } => session::gc_checked(&ctx.state, *reclaim_data).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
@@ -336,8 +374,30 @@ fn main() -> ExitCode {
             fail(cli.json, e);
             ExitCode::from(124)
         }
+        // A start the caller's signal cancelled ends as that signal would have ended it.
+        Err(e) if e.code == "cancelled" => {
+            let signal = stack::process::passed_on().unwrap_or(15);
+            fail(cli.json, e);
+            ExitCode::from((128 + signal) as u8)
+        }
+        // Like an argument error clap rejects: the same code, a hint, and exit 2.
+        Err(e) if e.code == "usage" => {
+            let help = format!("run `stack {} --help` for usage", subcommand());
+            fail(cli.json, mcp::with_usage_hint(e, &help));
+            ExitCode::from(2)
+        }
         Err(e) => fail(cli.json, e),
     }
+}
+
+/// The subcommand's name, as clap parsed the arguments it already accepted.
+fn subcommand() -> String {
+    use clap::CommandFactory;
+    Cli::command()
+        .try_get_matches_from(std::env::args_os())
+        .ok()
+        .and_then(|m| m.subcommand_name().map(String::from))
+        .unwrap_or_default()
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.
@@ -355,6 +415,11 @@ fn print_gc(entries: &[session::GcEntry]) {
         if let Some(error) = &e.error {
             println!("  {error}");
         }
+        for service in &e.services {
+            if let Some(outcome) = &service.outcome {
+                println!("  {}: {outcome}", service.service);
+            }
+        }
     }
     if entries.is_empty() {
         println!("nothing to reclaim");
@@ -364,7 +429,7 @@ fn print_gc(entries: &[session::GcEntry]) {
 /// Foreground periodic collection. Each pass is reported as it completes (one JSON object per
 /// line with --json). A failing pass is reported and retried at the next interval; the exit
 /// code after --max-passes reflects the last pass.
-fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>) -> Result<ExitCode> {
+fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>, reclaim_data: bool) -> Result<ExitCode> {
     let interval = interval.map(parse_duration).transpose()?.unwrap_or(60);
     if interval == 0 {
         return Err(StackError::new("usage", "--interval must be at least 1s"));
@@ -372,7 +437,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
     let mut pass = 0u64;
     loop {
         pass += 1;
-        let result = session::gc_checked(state);
+        let result = session::gc_checked(state, reclaim_data);
         let ok = result.is_ok();
         if as_json {
             let line = match &result {
@@ -543,7 +608,12 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     command.args(&plan.args).envs(&plan.env).current_dir(&ctx.root);
     let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
     let code = match timeout {
-        None => command.status().map_err(start_error)?.code(),
+        None => {
+            // Like a shell: a command ended by a signal reports 128 + its number.
+            use std::os::unix::process::ExitStatusExt;
+            let status = stack::process::run_attached(&mut command).map_err(start_error)?;
+            status.code().or_else(|| status.signal().map(|s| 128 + s))
+        }
         Some(timeout) => {
             // What planning left of the timeout.
             let (code, timed_out) = stack::process::run_with_deadline(&mut command, stack::process::bounded(timeout)).map_err(start_error)?;
@@ -567,7 +637,8 @@ fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) 
         println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
         return Ok(ExitCode::from(124));
     }
-    let code = result["exit_code"].as_i64().unwrap_or(1).clamp(0, 255) as u8;
+    // Like a shell: a command ended by a signal reports 128 + its number.
+    let code = result["exit_code"].as_i64().or_else(|| result["signal"].as_i64().map(|s| 128 + s)).unwrap_or(1).clamp(0, 255) as u8;
     println!("{}", json!({ "ok": true, "data": result }));
     Ok(ExitCode::from(code))
 }
@@ -604,15 +675,35 @@ fn usage_error(e: clap::Error) -> ExitCode {
     if !as_json {
         e.exit();
     }
-    let rendered = e.render().to_string();
-    let message = rendered
-        .lines()
+    let (message, hint) = usage_text(&e.render().to_string());
+    fail(true, StackError::new("usage", message).hint(hint));
+    ExitCode::from(2)
+}
+
+/// clap's rendered error as one message and a hint: the error with the lines that continue it
+/// (the missing arguments, each on its own line), and the usage line and any tip clap printed.
+fn usage_text(rendered: &str) -> (String, String) {
+    let mut blocks = rendered.split("\n\n");
+    let message = blocks
         .next()
         .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
         .trim_start_matches("error: ")
         .to_string();
-    fail(true, StackError::new("usage", message).hint("run `stack --help` for usage"));
-    ExitCode::from(2)
+    let mut hint: Vec<String> = Vec::new();
+    for line in blocks.flat_map(str::lines).map(str::trim) {
+        if let Some(usage) = line.strip_prefix("Usage: ") {
+            hint.push(format!("usage: {usage}"));
+        } else if let Some(tip) = line.strip_prefix("tip: ") {
+            hint.push(tip.to_string());
+        }
+    }
+    hint.push("run `stack --help` for usage".into());
+    (message, hint.join("; "))
 }
 
 fn fail(as_json: bool, e: StackError) -> ExitCode {

@@ -203,15 +203,20 @@ printf 'template-java=%s\ntemplate-go=%s\n' '{{{{ env.JAVA_HOME }}}}' '{{{{ env.
     assert_eq!((code, &ran["data"]["exit_code"]), (0, &Value::from(0)), "{ran}");
     assert_eq!(lines(&ran), expected, "{ran}");
 
-    // The copy `mise run` read names each variable; it holds none of the planned values.
+    // The copy `mise run` read declares an evaluated value by name only, and keeps a literal
+    // exactly as compile wrote it in the project's own file; a literal keeps its precedence
+    // over the tool's environment, as the run above shows.
     let seen: Vec<String> = fs::read_dir(work.join("seen"))
         .unwrap()
         .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
         .filter(|config| config.contains("Copied by stack"))
         .collect();
     assert_eq!(seen.len(), 1, "{seen:?}");
-    for value in [at("explicit-java"), at("explicit-go"), "cost".to_string()] {
-        assert!(!seen[0].contains(&value), "{value} written into the copy: {}", seen[0]);
+    assert!(!seen[0].contains("cost"), "an evaluated value written into the copy: {}", seen[0]);
+    assert!(seen[0].contains(r#"DOLLAR = '{{ env["DOLLAR"]"#), "{}", seen[0]);
+    let generated = fs::read_to_string(work.join("app/.config/mise/conf.d/stack.toml")).unwrap();
+    for literal in [format!("JAVA_HOME = \"{}\"", at("explicit-java")), format!("GOROOT = \"{}\"", at("explicit-go"))] {
+        assert!(generated.contains(&literal) && seen[0].contains(&literal), "{literal}: {}", seen[0]);
     }
     let copies: Vec<_> = fs::read_dir(work.join("cache/task-config")).unwrap().collect();
     assert!(copies.is_empty(), "{copies:?}");

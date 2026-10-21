@@ -1,0 +1,29 @@
+{
+  "version": "stack-agentdx-tasks/2",
+  "tasks": [
+    {
+      "id": "ledger-note-cache",
+      "project": "ledger",
+      "family": "migration-and-cache",
+      "instruction": "Add an optional note to invoices in this ledger API. Change the schema with an idempotent migration that keeps every existing invoice and its customer and amount. GET /invoices/<id> must include \"note\", which is the empty string for invoices that had none. PATCH /invoices/<id> with {\"cents\": ..., \"note\": ...} must update both, and every later GET, including one answered from the Redis cache, must show the update. Read README.md to learn how to run and test the project. Keep the existing data. When you finish, leave the project's services stopped.",
+      "no_op_failing_check": "old_note_default",
+      "required_checks": ["existing_invoices_preserved", "old_note_default", "patch_accepted", "read_after_write", "cache_after_write", "database_after_write", "other_invoice_untouched", "migration_idempotent"]
+    },
+    {
+      "id": "catalog-sku-uniqueness",
+      "project": "catalog",
+      "family": "api-and-storage",
+      "instruction": "Fix the catalog API so SKU uniqueness ignores surrounding whitespace and letter case. Store newly accepted SKUs trimmed and in uppercase. A duplicate POST must return HTTP 409 and leave the products file unchanged. Existing products must survive. Read README.md to learn how to run and test the project. When you finish, leave the project's services stopped.",
+      "no_op_failing_check": "duplicates_rejected",
+      "required_checks": ["existing_products_preserved", "duplicates_rejected", "rejection_preserves_bytes", "new_product_normalized", "storage_matches_response"]
+    },
+    {
+      "id": "slug-unicode",
+      "project": "slug",
+      "family": "tools-only",
+      "instruction": "Fix slug(text) in slug.mjs. It must return lowercase ASCII words joined by single hyphens: remove diacritics, treat punctuation and whitespace as separators, and drop leading and trailing separators. Empty or punctuation-only input gives an empty string. For example, '  Crème & BRÛLÉE! ' becomes 'creme-brulee'. Applying slug to its own output must not change it. Read README.md to learn how to run and test the project.",
+      "no_op_failing_check": "case_0",
+      "required_checks": ["case_0", "case_1", "case_2", "case_3", "case_4", "case_5", "case_6", "case_7", "idempotent"]
+    }
+  ]
+}

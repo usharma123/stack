@@ -13,6 +13,33 @@ supervise() {
     echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
   fi
 }
+# The owner mark of every request that may start the supervisor (see `OWNER_VAR`).
+case "$1 $2" in 'daemons start'|'daemons stop'|'x --') echo "$1 $2 ${STACK_SUPERVISOR_OWNER-unset}" >>"$REVIEW_FIXTURE/owner-marks.log" ;; esac
+# A project whose provider config renders PITCHFORK_STATE_DIR from its file `provider-target`
+# (as `{{ exec(command='cat provider-target') | trim }}` would, read again by every mise
+# command): that value wins over the one the command inherited. Each request records, from
+# where it ran, the state directory it reached.
+target=${PITCHFORK_STATE_DIR-}
+# With `retarget-at-start`, once: another program copies `desired-target` there just as mise
+# renders the environment of a start request, after anything Stack could look at first.
+if test "$1 $2" = 'daemons start' && test -f desired-target && mv "$REVIEW_FIXTURE/retarget-at-start" "$REVIEW_FIXTURE/retargeted" 2>/dev/null; then
+  cp desired-target provider-target
+fi
+# `retarget-at` does the same for the first request whose `$1 $2` it names (`x --` for the
+# supervisor's own start, `daemons stop`).
+if test -f "$REVIEW_FIXTURE/retarget-at" && test "$1 $2" = "$(cat "$REVIEW_FIXTURE/retarget-at")" && test -f desired-target \
+  && mv "$REVIEW_FIXTURE/retarget-at" "$REVIEW_FIXTURE/retargeted" 2>/dev/null; then
+  cp desired-target provider-target
+fi
+if test -f provider-target; then target=$(cat provider-target); fi
+# Like mise, the generated config's last [env] directive decides over the template: `_.file` of
+# the file STACK_SUPERVISOR_BINDING names, when a request carries it (see `BINDING_VAR`).
+if test -n "${STACK_SUPERVISOR_BINDING-}" && test -f "$STACK_SUPERVISOR_BINDING" \
+  && grep -q "get_env(name='STACK_SUPERVISOR_BINDING'" .config/mise/conf.d/stack.toml 2>/dev/null; then
+  target=$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["PITCHFORK_STATE_DIR"])' "$STACK_SUPERVISOR_BINDING")
+fi
+echo "$1 $2 ${STACK_SUPERVISOR_BINDING-unset}" >>"$REVIEW_FIXTURE/bindings.log"
+case "$1 $2" in 'daemons start'|'daemons stop'|'x --') echo "$(pwd -P) $* => $target" >>"$REVIEW_FIXTURE/request-targets.log" ;; esac
 case "$1 $2" in
   'latest '*)
     # Where resolution ran and the only configuration it could see.
@@ -27,7 +54,9 @@ case "$1 $2" in
     { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/ls.log"
     if test "${3-}" = fnox; then
       { echo "dir=$(pwd -P) args=$*"; cat .config/mise/conf.d/stack.toml 2>/dev/null; } >>"$REVIEW_FIXTURE/fnox-ls.log"
-      if test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
+      if test -f "$REVIEW_FIXTURE/ls-installed.json" && grep -q '^fnox@' "$REVIEW_FIXTURE/installed" 2>/dev/null; then
+        cat "$REVIEW_FIXTURE/ls-installed.json"
+      elif test -f "$REVIEW_FIXTURE/ls.json"; then cat "$REVIEW_FIXTURE/ls.json"; else echo '[]'; fi
     else
       # Every release the configuration names, installed when an install recorded it (or a
       # test listed it) in `installed`; `ls.json` stands for fnox's rows when a test gives them.
@@ -102,6 +131,12 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
             f.write("%s@%s\n" % (tool, v["version"] if isinstance(v, dict) else v))' "$REVIEW_FIXTURE" "$config" "$@" ;;
   'version ')
     echo "no_config=${MISE_NO_CONFIG-unset}" >>"$REVIEW_FIXTURE/version.log"
+    # A cold cache: mise asks GitHub for its latest release first, unless told not to warn.
+    if test -f "$REVIEW_FIXTURE/version-update-check" && test "${MISE_DISABLE_UPDATE_WARNING-}" != 1; then sleep "$(cat "$REVIEW_FIXTURE/version-update-check")"; fi
+    # A first run that is slow for any other reason: only the first call waits.
+    if test -f "$REVIEW_FIXTURE/version-slow-once" && ! test -f "$REVIEW_FIXTURE/version-slowed"; then
+      touch "$REVIEW_FIXTURE/version-slowed"; sleep "$(cat "$REVIEW_FIXTURE/version-slow-once")"
+    fi
     echo 'mise WARN  mise version 2099.1.1 available' >&2
     if test -f "$REVIEW_FIXTURE/mise-version"; then cat "$REVIEW_FIXTURE/mise-version"; else echo '2026.10.3 macos-arm64 (2026-10-05)'; fi ;;
   'env --json')
@@ -110,16 +145,30 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/slow-env-after-start" && test -f "$REVIEW_FIXTURE/started" && ! test -f "$REVIEW_FIXTURE/env-slowed"; then
       touch "$REVIEW_FIXTURE/env-slowed"; sleep "$(cat "$REVIEW_FIXTURE/slow-env-after-start")"
     fi
-    cat "$REVIEW_FIXTURE/env.json" ;;
+    # Like mise, a pin's directory joins PATH once it is installed: `env-installed.json` stands for
+    # the environment after the install recorded fnox, when a test gives one.
+    if test -f "$REVIEW_FIXTURE/env-installed.json" && grep -q '^fnox@' "$REVIEW_FIXTURE/installed" 2>/dev/null; then
+      cat "$REVIEW_FIXTURE/env-installed.json"
+    elif test -f provider-target; then
+      "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); d["PITCHFORK_STATE_DIR"]=sys.argv[2]; print(json.dumps(d))' "$REVIEW_FIXTURE/env.json" "$target"
+    else
+      cat "$REVIEW_FIXTURE/env.json"
+    fi ;;
   'daemons --json')
+    # Like mise, without the generated configuration (which enables experimental features)
+    # there are no daemons to ask about.
+    if test -n "${MISE_OVERRIDE_CONFIG_FILENAMES-}" && ! test -f "$MISE_OVERRIDE_CONFIG_FILENAMES"; then
+      echo 'mise ERROR mise daemons is experimental. Enable it with `mise settings experimental=true`' >&2; exit 1
+    fi
     if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then
       if test -f "$REVIEW_FIXTURE/query-observed"; then exit 1; fi
       touch "$REVIEW_FIXTURE/query-observed"
     fi
     if test -f "$REVIEW_FIXTURE/fail-query"; then echo 'supervisor unavailable' >&2; exit 1; fi
     # A supervised listener (see `daemons start`) is reported with its real PID while alive.
+    # `listen-service`, when a test names one, is the only service the listener stands for.
     if test -f "$REVIEW_FIXTURE/listen-port" && kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
-      "$py" -c 'import json,sys; pid=int(sys.argv[2]); d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting")]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")"
+      "$py" -c 'import json,sys; pid=int(sys.argv[2]); only=sys.argv[3]; d=json.load(open(sys.argv[1])); [e.__setitem__("pid", pid) for e in d if e.get("status") in ("running", "starting") and only in ("", e.get("name"))]; print(json.dumps(d))' "$REVIEW_FIXTURE/daemons.json" "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" "$(cat "$REVIEW_FIXTURE/listen-service" 2>/dev/null)"
     else
       cat "$REVIEW_FIXTURE/daemons.json"
     fi ;;
@@ -150,11 +199,14 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
       exec sleep 600
     fi
     # A supervised listener on the configured port, ended by `daemons stop` like a real daemon.
-    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null; then
+    if test -f "$REVIEW_FIXTURE/listen-port" && ! kill -0 "$(cat "$REVIEW_FIXTURE/pf-tracked-pid" 2>/dev/null)" 2>/dev/null \
+      && { ! test -f "$REVIEW_FIXTURE/listen-service" || test "$4" = "$(cat "$REVIEW_FIXTURE/listen-service")"; }; then
       # In a session of its own, as Pitchfork runs a service, when the request is to outlive it.
       detach=; test -f "$REVIEW_FIXTURE/hang-after-start" && detach=1
       "$py" -c 'import os,socket,sys,time; sys.argv[2] and os.setsid(); s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(600)' "$(cat "$REVIEW_FIXTURE/listen-port")" "$detach" </dev/null >/dev/null 2>&1 &
       echo $! >"$REVIEW_FIXTURE/pf-tracked-pid"
+      # Which supervisor runs it: the one this request reached (see `supervisor stop`).
+      echo "$target $!" >>"$REVIEW_FIXTURE/supervised-by.log"
       sleep 0.3
     fi
     if test -f "$REVIEW_FIXTURE/daemons-started.json"; then
@@ -212,6 +264,14 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
+    # With `listen-service`, `daemons stop -- NAME...` stops only those services, as mise does.
+    shift 2; test "${1-}" = -- && shift
+    if test -f "$REVIEW_FIXTURE/listen-service" && test $# -gt 0; then
+      only=" $* "
+      case "$only" in *" $(cat "$REVIEW_FIXTURE/listen-service") "*) kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null ;; esac
+      "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); [ (e.__setitem__("status", "stopped"), e.pop("pid", None)) for e in d if e.get("name") in sys.argv[2:] ]; json.dump(d, open(sys.argv[1], "w"))' "$REVIEW_FIXTURE/daemons.json" "$@"
+      exit 0
+    fi
     if test -f "$REVIEW_FIXTURE/pf-tracked-pid"; then kill "$(cat "$REVIEW_FIXTURE/pf-tracked-pid")" 2>/dev/null; fi
     # A stopped supervised listener is reported stopped, like a real daemon.
     if test -f "$REVIEW_FIXTURE/listen-port"; then

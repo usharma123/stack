@@ -22,6 +22,20 @@ services = ["postgres"]
 secrets = ["DEPLOY_KEY", "SENTRY_DSN"]
 ```
 
+The values come from fnox's own `fnox.toml`, beside `stack.toml` (or fnox's global
+configuration). For a first try, or a test, a plain provider holds fake values in the file
+itself; real projects use a provider that keeps them elsewhere (see fnox's documentation):
+
+```toml
+# fnox.toml: fake values for trying grants out; never put a real secret in a plain provider
+[providers.plain]
+type = "plain"
+
+[secrets]
+DEPLOY_KEY = { provider = "plain", value = "fake-deploy-key-0001" }
+SENTRY_DSN = { provider = "plain", value = "https://fake@example.invalid/1" }
+```
+
 ```sh
 stack run deploy                                   # granted DEPLOY_KEY and SENTRY_DSN
 stack exec --secret DEPLOY_KEY -- ./release.sh     # one command, repeat --secret for more
@@ -50,7 +64,8 @@ Only for a command with at least one grant, after services verify:
 
 1. The `fnox` on the command's `PATH` must be the release `stack.lock` pins. Otherwise the
    command does not run (`secret_unavailable`). A pinned fnox that is not installed stops
-   `exec` earlier, with `tools_not_installed`; run `stack install`.
+   `exec` earlier, with `tools_not_installed`; run `stack install`. `stack run` installs it
+   first, like any other missing pin of the task, so a fresh checkout's first secret task works.
 2. Stack runs `fnox env --json --describe`, which reads no values, then `fnox env --json --keys
    <names>`, both non-interactive and bounded by 30 seconds. File secrets, leases and keys that
    cannot be injected into an environment are refused before any value is requested.

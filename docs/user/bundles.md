@@ -83,11 +83,13 @@ watch = ["index.html"]
 | `preset` | none | Use mise's preset for that server; `version` picks its release (default `latest`, pinned in stack.lock) |
 | `version` | `latest` | Preset services only |
 | `run` | the preset's | Shell command Pitchfork starts. It gets `$PORT`, the port stack assigned; the app gets it as `$<NAME>_PORT`, and a service without a preset also as `$<NAME>_URL` (`http://127.0.0.1:<port>`) |
-| `ready_cmd` | none | Command Pitchfork runs until it succeeds before it reports the service started |
+| `ready_cmd` | none | Command Pitchfork runs until it succeeds before it reports the service started. Stack runs it the same way (`sh -c`) where it checks readiness itself; one it cannot run does not pass, and the error says why |
 | `ready_port` | none (postgres and redis: the assigned port) | A port Pitchfork waits to accept connections before it reports the service started |
 | `port` | `"auto"` | `"auto"` takes a free port from this machine's registry (20000-29999), stable per checkout; a number pins it, in the project's `stack.toml` or `[override.services]` only (`bundle_fixed_port` in a bundle) |
 | `identity` | none | An [identity probe](identity-probes.md): without one a custom service is verified for liveness only |
 | `watch` | `[]` | Files whose change after start `status`, `exec` and `run` report, with a `stack restart` hint |
+| `setup` | none | Command run before each start of the service (migrations, seeding, `uv sync --frozen`): `sh -c` in the project, with the stack's tools and environment and `$PORT`, once the services it `depends_on` verified. Not run when `up` keeps a running service. A failure is `setup_failed` with its exit status and last lines, and the service is not started. A signal sent to Stack meanwhile is passed on to the setup and cancels the start (`cancelled`), however the setup exits |
+| `depends_on` | `[]` | Services this one needs: they start, and pass their checks, before it does. `stack restart` of one restarts this one after it, and `up` restarting one (it died, say) stops this one first and starts it again after, so it reconnects. `stack restart` of this one alone needs the ones it depends on running and ready, or fails `dependency_not_ready` before stopping, setting up or starting anything. Names must be services of the stack, without cycles (`dependency_cycle`) |
 
 Whatever the readiness settings, `up` verifies every service itself: Pitchfork reports it
 running, its process is alive, and the assigned port accepts connections, plus the preset's

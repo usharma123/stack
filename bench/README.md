@@ -1,177 +1,261 @@
-# Real-world competitor benchmark
+# Stack AgentDX benchmark
 
-Stack and the 25 tools frozen in `SCOPE.md` run the same developer workload: a pinned Python
-3.13 app with migrations, CRUD, a Redis read-through cache, PostgreSQL 17 and Redis 8, in two
-simultaneous checkouts. Each tool uses its documented workflow. Glue that the tool does not
-provide is checked in under `adapters/<tool>/`, and the feature is declared `scripted`.
-There is no combined score or rank.
+Does a coding agent finish the same development task with less human help when the project
+uses Stack than when it uses the project's existing setup? This benchmark runs matched trials
+to measure that, plus scripted regression checks for the Stack defects that block agents.
 
-The [reviewed 2026-10-06 session](measurements/final-20261006-reviewed-1/README.md)
-contains all 26 coverage rows, 96 eligible metrics, known failures and restorable raw evidence.
-Use its review for the final per-lane transports and realized versions.
+The method is in [AGENTDX-PROTOCOL.md](AGENTDX-PROTOCOL.md). The findings that shaped it are in
+[eval/agentdx-20261020/SYNTHESIS.md](../eval/agentdx-20261020/SYNTHESIS.md). The former 26-tool
+competitor benchmark is retired to [eval/archive/competitor-20261006](../eval/archive/competitor-20261006/README.md).
 
-Plan, checks and the status log: `IMPLEMENTATION.md`. Adapter API: `ADAPTER-CONTRACT.md`.
-Per-tool research: `research/`. Reviews: `reviews/`.
+## What is implemented
 
-## Requirements
+| Part | File | Status |
+|---|---|---|
+| 3 synthetic pilot tasks in 3 small apps | `tasks.json`, `fixtures/`, `oracles/`, `hidden/` | Validated in both arms (see below) |
+| Stack arm: `stack.toml` + `stack.lock`, agent uses `stack` directly | `arms.py` | Implemented |
+| Existing arm: `mise.toml` + project-written `dev.py` running native services | `existing/dev.py`, `arms.py` | Implemented |
+| Hidden acceptance checks on grader-only data | `verify.py` | Implemented |
+| Validation: starting code fails, reference passes, same grading path as agents | `run.py validate` | Implemented |
+| Pre-registered plan, external agent trial, cleanup, grading | `run.py plan`, `run.py trial` | Exercised end to end with the scripted self-test agent only |
+| Human transcript review and report | `run.py review-template`, `run.py report` | Implemented; no real review exists yet |
+| Stack regression checks for the hands-on findings | `regressions.py` | Implemented, run on 0.1.22 |
+| Offline unit tests | `tests/` | Counterexamples for grading, required observations, timing, cleanup and submission capture; run counts in the synthesis |
 
-- macOS or Linux host with Python 3.9+ (the harness itself is stdlib only) and bash.
-- Docker with the local images `ev-base`, `ev-nix`, `ev-flox`, `ev-devbox` and `ev-devenv`
-  (`eval/images/Dockerfile.*`). Those images were built from "latest" installers. Each run
-  records the actual CLI version from the binary, not from the image tag.
-- Outbound HTTPS from the containers (port 443 only): GitHub releases, nixpkgs/cachix
-  substitutes, conda-forge, PyPI and Docker Hub.
-- Stack: a Linux ARM64 `stack` binary built from the checkout under test, passed with
-  `--option stack_binary=... --option stack_sha256=...`. See `provenance/stack-20261006/` for the
-  build receipts and verified binary hash.
-- Tools that are not in an image are provisioned per run into run-owned locations and checked
-  against pinned hashes. Provisioning is recorded but never timed:
-  - mise 2026.10.3 (Stack and mise lanes)
-  - Pixi 0.81.0
-  - devenv 2.4.0, installed into a private Nix profile
-  - standalone docker-compose 5.6.0 (macOS ARM64)
-- Compose lane: Docker Desktop's credential helper fails when run non-interactively here
-  (exit 1, no output). The lane therefore uses a run-owned `DOCKER_CONFIG` with the same
-  current context and no `credsStore`, so public images are pulled anonymously.
-  `~/.docker` is only read.
+**One bounded real-agent pilot has run**, on the remediation branch
+(`fix/agentdx-findings-20261020`). It used Claude Code 2.1.304 with `claude-opus-5-5`, effort
+`high`, on the three tasks in both arms, one repetition each: six trials, 600 s budget, warm
+cache, local macOS.
+
+- All six passed the hidden checks and the smoke test.
+- None is counted autonomous, because no human transcript review exists yet.
+- The report is not publishable, and six trials support no comparison between the arms.
+
+The plan, receipts and report are described in
+[eval/agentdx-20261020/REMEDIATION.md](../eval/agentdx-20261020/REMEDIATION.md#real-agent-pilot).
+A larger study, other models and hosted runs are not configured. All other numbers come from
+scripted validation, self-tests or regression checks.
+
+## The tasks
+
+| Task | App | What the agent must do | Hidden checks |
+|---|---|---|---|
+| `ledger-note-cache` | Python API, PostgreSQL 17.11, Redis 7.4.7 | Add an invoice note with an idempotent migration; fix a stale Redis read after PATCH | A second pre-existing invoice the agent never sees (with non-ASCII text), cache content, rerun of the migration |
+| `catalog-sku-uniqueness` | Node HTTP API with a JSON file | Make SKU uniqueness ignore whitespace and case; keep the file unchanged on 409 | A second existing product, four duplicate spellings, file bytes |
+| `slug-unicode` | Node library, tools only | Fix `slug()` for diacritics, punctuation and idempotence | Eight cases, two not in the prompt |
+
+The apps are small, made-up projects, not established repositories. The existing arm's
+`dev.py` is glue written for this benchmark in the style of a project's own scripts, not a
+real project's history. It pins the same tool versions and the same mise backends that Stack
+locks (`conda:postgresql`, `conda:redis-server`), and it initializes PostgreSQL with `-E UTF8`.
+
+Each arm's README describes only its own workflow. In the existing arm a `stack` stub on
+PATH answers "command not found", so a host-wide `stack` cannot leak into the control.
 
 ## Running
 
-```sh
-python3 -m unittest discover -s bench/tests          # offline: no network, Docker or services
-python3 bench/run.py --tool nix --dry-run            # print every planned body, run nothing
-python3 bench/run.py --tool stack --out bench/results/<new-dir> \
-  --option stack_binary=/tmp/stack-bench-build/target/release/stack \
-  --option stack_sha256=<sha256> --repeats 20 --warmups 3
-```
-
-Run one tool per invocation, and never run two at once. The output directory must not exist
-yet. `--keep` leaves the container for diagnosis; remove it afterwards only after checking its
-`rwb.run` label. A kept run can never carry final timings.
-
-## Final measurement report
-
-Every `run.py` output is diagnostic, whatever its repeat count or exit code: `meta.reportable`
-stays `false` and is never edited. Final numbers come only from `report.py`, which checks a
-session manifest the parent writes and emits a separate report directory.
+The host needs `python3` 3.11+, `git`, `mise` on PATH (for the existing arm; Stack can download
+its own with `stack setup`), network access to conda-forge, GitHub releases, nodejs.org and
+PyPI, and `lsof` on macOS. PostgreSQL refuses to run as root. Runs are serialized per host by
+`/tmp/stack-agentdx-bench.lock`.
 
 ```sh
-python3 bench/report.py template --session-id <id> --out <manifest.json>   # current hashes, reviews null
-python3 bench/report.py attempt --run bench/results/<session>/<tool>         # hashes of one run, to paste
-python3 bench/report.py --manifest <manifest.json> --out <new-report-dir> [--require-complete]
+cargo build --locked
+python3 -m unittest discover -s bench/tests -v                       # offline
+
+# 1. Validate each task/arm cell (about 1-3 minutes each, cold).
+python3 bench/run.py validate --task ledger-note-cache --arm stack \
+  --stack target/debug/stack --out eval/results/<new>/validate-ledger-stack
+
+# 2. Product regression checks (expected to fail on 0.1.22, see below).
+python3 bench/regressions.py --stack target/debug/stack --out eval/results/<new>/regressions
+
+# 3. Pre-register an experiment. The agent command is fixed in the plan.
+python3 bench/run.py plan --kind agent_experiment --models <model-id> --harness <name> \
+  --agent-command '["<agent-cli>", "--model", "{model}", "--prompt-file", "{prompt_file}"]' \
+  --stack target/debug/stack --platform macos-arm64-local --cache cold --seed <n> --repeats 5 \
+  --out eval/results/<new>/plan.json
+
+# 4. Run every planned trial in plan order, one at a time.
+python3 bench/run.py trial --plan <plan.json> --id '<trial id>' --results eval/results/<new>/trials
+
+# 5. A human reviews each transcript and saves review.json next to its summary.
+python3 bench/run.py review-template --plan <plan.json> --id '<trial id>' --results <trials dir>
+
+# 6. Report over the whole plan.
+python3 bench/run.py report --plan <plan.json> --results <trials dir> --out <report.json>
 ```
 
-Manifest (`rwb-measurement-manifest/1`; relative paths resolve against the repository root):
+The agent starts in the trial checkout, so give the agent command absolute paths.
+Placeholders in the agent command: `{model}` (required), `{prompt}` or `{prompt_file}`
+(required), `{workspace}` and `{transcript_dir}` (save tool-call transcripts there). The agent
+runs with its working directory in a fresh checkout, stdin closed and no way to ask a human,
+under per-trial Stack, mise, Pitchfork, XDG, uv and npm stores. `HOME` is kept. An agent CLI
+that keeps its credentials under `XDG_CONFIG_HOME` needs a wrapper that restores that one
+variable for itself only.
 
-- `session`: `id`, `purpose: final-measurement`, `plan_created_utc`, the ordered 26-entry
-  `roster` (`entry`, `tool`, `variant`), `sample_policy` (`repeats`, `warmups`),
-  `timing_policy`, `serialization_declaration`, and `review` (null until a real review exists).
-- `protocol`: reviewed `harness` commit and file hashes, `fixture`, `shared_glue`
-  (`adapters/_shared`), per-tool `lanes` (`config` hashes, `version_contains` strings expected
-  in the `tool-version` receipt, `deviations`, optional `transport`/`image_id`), `platform`
-  (optional exact `host`), `resources` (`cpus`, `memory`) and `cache_policy`.
-- `attempts`, in execution order: `tool`, `variant`, `state` (`selected`, `excluded`, `blocked`
-  or `untested`), `path`, `run_id`, `reason`, `result_review`, and `hashes` (meta, outcomes,
-  steps and a digest of the whole run directory). Stack attempts also need `stack`:
-  `source_revision` or `source_fingerprint`, `binary_sha256`, and `build_receipt`
-  (`path`, `sha256`). Each tool has at most one non-excluded attempt; reruns stay as
-  `excluded` with their reason.
+To test the harness without a model, use `--kind harness_selftest` with
+`selftest_agent.py` as the command. Such plans are never publishable:
 
-The report keeps a row for each of the 26 entries: a missing lane is `missing`, and a blocked
-or invalid run shows its evidence without a number. Only `first_task.a`, `first_task.b`,
-`repeat.entry` and `repeat.app_read` can be reported. A metric is reported only when:
+```sh
+python3 bench/run.py plan --kind harness_selftest --models selftest --harness selftest \
+  --agent-command '["python3", "'"$PWD"'/bench/selftest_agent.py", "--mode", "reference", "--model", "{model}",
+                    "--prompt-file", "{prompt_file}", "--transcript-dir", "{transcript_dir}"]' ...
+```
 
-- the session and the attempt name a review;
-- every hash matches, every receipt parses, and every cited step and raw log exists;
-- tool, variant, run id, harness bytes, fixture, glue, config, sample policy and resources
-  match the declaration, the tool-version output contains the declared strings, and `keep` is false;
-- the run is complete, valid and not blocked, with every main outcome present;
-- the run started after the plan was created and does not overlap any other declared attempt;
-- for `first_task.<co>`, the six gates of that checkout pass, and the step receipts succeed,
-  match the declared task and sum to the recorded time;
-- for `repeat.*`, the check passes, isolation and both checkouts' gates pass, and every warmup
-  and sample receipt exists and succeeds. App reads are reparsed and must return `keeper-a`.
-  The p50/p95 values are recomputed from the receipts, and warmups never count.
+## How a trial is scored
 
-Everything else is listed under `omitted` with its reason. A failure in one check removes only
-the metrics that depend on it. The report describes one host, image/cache state, transport and
-recipe. It has no rank, score or confidence claim.
+1. A fresh runtime root and checkout are created, with one git commit as the starting point.
+   The harness clones that commit into `<root>/harness/baseline.git`, outside the checkout.
+2. The agent runs within the plan's budget, with the planned model and options substituted
+   into the planned command. On budget expiry or cancellation the harness stops everything the
+   command started. That is its process group, plus every descendant it can trace through
+   parent PIDs, including children that outlive the leader or leave its group. A process that
+   both left the group and lost its parent before the stop is found only by the root ownership
+   check in step 4. Whatever is left running when the agent stops is recorded before the
+   harness touches anything.
+3. The submission is the agent's whole change against the kept starting commit: commits,
+   edits, deletions and new files, including files the agent's `.gitignore` hides. It is
+   captured once into a retained read-only `submitted-tree/` outside the agent workspace.
+   `submission.patch` and `submission.json` describe those captured bytes and list the agent's
+   commits. Runtime and private-config paths are excluded; symlink targets are never read.
+   Nothing is written to the agent's `.git`.
+4. The harness stops the agent's workspace with the arm's own `down`, and stops the root's
+   Pitchfork supervisor in the Stack arm. It then looks for any process whose command line,
+   working directory or an open file is under the runtime root. If any remain, the harness
+   stops them, and the trial is not counted as autonomous.
+5. Grading uses a second fresh root: grader-only seed data, then the retained submitted tree
+   applied over the starting project, including its deletions. Cleanup writes to the live agent
+   workspace cannot change the files graded. The report compares the overlay manifest with
+   the captured file hashes and checks that the retained tree still matches. Benchmark-owned
+   files are never taken from the submission: `stack.toml`, `stack.lock`, `mise.toml`, `dev.py`, seeds, smoke
+   tests and runtime directories. The harness runs `setup` and `up`, the project's existing smoke
+   test through the arm's `exec`, and then `verify.py` through `exec`. The task passes only
+   when two conditions both hold:
+   - the smoke test passes, so existing behaviour still works,
+   - and the grader prints exactly one result listing exactly the task's `required_checks`,
+     all true.
 
-## Reading a run
+   The documented task loop (`stack run test`, `dev.py test`) is recorded but does not gate,
+   because Stack 0.1.22's `run` breaks it in service apps (R1).
+6. If the submitted app does not start, the harness grades the reference solution in a fresh
+   control runtime. If the reference passes, the trial is a scored task failure
+   (`startup_failed`). If it fails too, the trial is invalid (`infrastructure_failed`). Setup
+   that fails three times is also invalid.
+7. Every observation is written to its own evidence file and hashed: the agent receipt, what
+   was left running, the submission, each cleanup, the grade, global state before and after,
+   and the benchmark files after grading. `report` re-derives every verdict from those files.
+   It never trusts the summary's own booleans. A summary that disagrees with its records,
+   a missing or changed record, or an unhashed file makes the trial invalid. It counts a trial
+   as autonomous only when:
+   - the task is verified,
+   - the review is valid and records no human help,
+   - nothing was left running at agent exit,
+   - and the arm's own teardown stopped everything without the harness reclaiming by PID.
 
-- `summary.md`: outcomes, then the end-to-end task times, then the phase timings.
-- `outcomes.json`: one record per check, with `status`, `mode` and the evidence step numbers.
-- `steps.jsonl` and `logs/`: every command's argv, exit code, timings and raw stdout/stderr.
-- `artifacts/`: service and tool logs copied before teardown.
-- `meta.json`: versions, pins, config, fixture and shared-glue hashes, image ID, feature modes,
-  setup/prepare/start scopes, cache state, `keep`, requested `resources`, the run interval
-  (`started_unix_ns`/`finished_unix_ns`, next to the human UTC labels), `valid`, `measurement`,
-  and `reportable` (always false here).
+   Missing, invalid and unreviewed trials stay in every denominator.
 
-Statuses:
+Required observations must be complete objects with correctly typed fields. JSON `null`,
+an empty cleanup object or omitted residue lists do not establish a clean runtime. Final
+cleanup is compared independently with its summary, and the latest cleanup must show
+recovery even when an earlier reclaim succeeded. This applies to agent, final, grading and
+reference-control runtimes. Reclaim after an already empty observation is contradictory;
+grading or control cleanup requiring reclaim is invalid even if it succeeds.
 
-| Status | Meaning |
-|---|---|
-| `pass` / `fail` | Decided by the receipts |
-| `unsupported` | The tool lacks the capability; nothing ran. This is not a failure |
-| `not_applicable` | The check does not apply to the tool's model; the reason is recorded |
-| `blocked` | A prerequisite failed, or the evidence was inconclusive (for example a nonzero exit without the intended diagnostic, or provisioning exit 77 `RWB-BLOCKED`) |
-| `observed` | Informational |
-| `error` | Harness fault. The run is invalid |
+Every command receipt must match its expected role and exact stdout/stderr digests. This
+includes setup retries, the observed task loop, down and supervisor stop. Missing outputs or
+out-of-window command timing invalidate the row. Known survivors or unresolved identities
+from any command invalidate the trial, even if a later root scan is empty. A nonzero down
+with no leak remains a product observation.
 
-`valid` means the evidence is trustworthy and teardown was clean. It does not mean the tool
-passed. A blocked or invalid run publishes no timings in `meta.json` or `summary.md`; its raw
-command timings stay in `steps.jsonl` as diagnostics.
+Grade, reference-control and cleanup uncertainty maps must agree with their own command
+receipts. Malformed maps, wrong command roles or contradictory stop observations invalidate
+the row. External cancellation in any invoked receipt also invalidates the trial, even when
+the summary omits it and the command stopped cleanly. A cancellation before launch needs no
+stop observation; a started cancelled command requires all four stop lists. Ordinary budget
+timeouts retain their separate scoring rules.
 
-## Timing boundaries (do not rank across tools by a single command)
+Startup seconds come from the setup and startup steps required by the arm and grading
+outcome. All setup attempts count. Missing or malformed timing stays missing and invalidates
+the row; it is never converted to zero. Tools-only tasks have no `up` timing. Failed setup
+does not require later unreachable steps. A malformed trial cannot abort the other assigned rows.
 
-- `first_task.<co>`: the time to first verified work. It starts from a prepared checkout and
-  covers setup, start, readiness, app dependencies, first identity, migrate, mark/CRUD/cache
-  and pytest. `steps` sums those receipts, and `wall` also includes harness verification.
-  Use this, not `setup.*`, for cross-tool task time. Tool operations performed in `prepare`
-  (native worktree creation) are listed in `prepare_scope`, excluded from first_task, and
-  reported as `prepare.<co>`.
-- `setup.first_checkout` / `setup.second_checkout`: one command each, with different scope per
-  tool (`setup_scope`). For example, Stack's is `stack compile` only, and its tools install
-  at `stack up`.
-- "First checkout" means first in this run. It is not a universal cold install: images may
-  hold preseeded Nix stores or Docker layers (`cache_note`).
-- `ready.<co>`: start, native readiness and the first identity. `start_scope` labels lanes
-  whose start also does readiness, such as dnvr's PTY driver.
-- `repeat.*`: outer times (host `docker exec`, including transport) and inner times (inside
-  the container), reported separately.
+The agent's final message is never read for scoring.
 
-## Correctness gates (fail closed)
+### Model options
 
-- App receipts need exit 0, an `ok` JSON object and the exact result shape.
-- The running code must carry the checkout's source token and live under its path.
-- URL ports must equal the server ports, or be proven equal by an adapter's Docker port-map
-  receipt. A declared port map that prints no valid receipt fails.
-- Isolation depends on the declared boundary (separate servers, separate containers, or
-  per-checkout databases on shared servers).
-- Persistence: PostgreSQL rows, and Redis data after an explicit SAVE.
-- Bad config and occupied port pass only on the intended diagnostic: the bad version or
-  endpoint, or an address-in-use message near the port. A failed scripted readiness counts
-  only if the tool's own service logs or status (`conflict_logs`) name the conflict.
-- The benchmark-owned listener is ownership-tagged and confirmed to hold the port. Cleanup
-  signals only a pid that still runs that tag.
+Plan options with `--options '{"reasoningEffort": "high"}'`. Each option must reach the agent
+command as a placeholder, as in `--reasoning-effort {option:reasoningEffort}`, or the plan is
+refused. Values are passed verbatim: strings as written, numbers and booleans as JSON. A
+literal flag named like a planned option or like `model` must carry that placeholder, so
+`--reasoning-effort low` next to a planned `high` is refused. The trial's agent receipt must
+show exactly the planned argv. The reviewer then records `observed_options` from the
+transcript; the template leaves it empty, and a review whose observed options differ from
+the plan is invalid. An agent CLI that cannot take a setting on its command line needs a
+wrapper script that can, and the wrapper's receipt belongs in the transcript. Otherwise plan
+no options; the report then labels the run as using the harness defaults, not controlled
+settings.
 
-## Known limitations
+### Usage and cost
 
-- Versions differ between lanes. Stack, mise and Compose run Python 3.13.16. Nix, devenv,
-  Pixi, Flox and Devbox run 3.13.15, because nixpkgs and conda-forge have no 3.13.16. Devbox
-  runs PostgreSQL 17.10 and Flox runs uv 0.12.17. Some container/worktree lanes use
-  PostgreSQL 17.6 images. Guix is PostgreSQL 16 / Redis 7. Each lane's pins record its
-  deviations.
-- devenv uses the shared Nix-lane nixpkgs, not the research pin, for version parity
-  (recorded as `deviation`).
-- Pixi installs the PyPI set with its own resolver (same top-level pins as `uv.lock`).
-- Some features are user scripting, not tool features, and are declared `scripted`:
-  - Nix and Pixi service lifecycles (`adapters/_shared/rwb-services.sh`)
-  - the activation holder that keeps Flox services alive
-  - the Devbox initdb and stop confirmation
-- All results so far come from Linux containers on an Apple Silicon host. Most lanes run inside
-  one container through `docker exec`. The Compose lane is the exception: `docker compose` runs
-  on the macOS host (host transport), while its services and app run in Linux containers. None
-  of these are native macOS results. Each run records its `transport`.
-- Smoke runs used 2 samples and 1 warmup and are diagnostic only.
+`tokens` (nonnegative integer `input`, `output`, `cache_read`, `cache_write`, `reasoning`,
+`total`) and `cost_usd` (`value`, finite and nonnegative) are `null` unless the provider reports
+them. Each must name its source as `{"path": ..., "sha256": ...}`, pointing either to a file
+in the trial evidence (such as a transcript with usage) or to a file the reviewer adds under
+`review-evidence/` in the trial directory. Nothing is estimated or converted.
+
+### What the grader trusts
+
+Graders, references and hidden data sit outside the agent's workspace by convention; there
+is no sandbox. Within that, `verify.py` computes every check from values it observes itself:
+HTTP responses, database rows, files, and the return values of `slug()`. Submitted code
+cannot print or return its own verdict. For the slug task, the grader reads a random nonce
+and its inputs over stdin before the submission loads, so exit handlers, `process.exit` and
+prototype tampering cannot fake the result. Out of scope are attacks outside the result
+channel: editing the benchmark files, reading the grader's memory or nonce, or tracing it.
+The trial re-hashes the benchmark files after grading, so edits to them are detected.
+
+### Cleanup and PID reuse
+
+Every signal, the SIGKILL escalation included, goes to one recorded process after its start
+time and command line are checked again. For leftovers under a runtime root, the harness also
+checks that the process is still under that root. On Linux a pidfd holds the process between
+the check and the signal, and the kernel start tick catches reuse within the same second. On
+macOS `lstart` has one-second resolution, and a few microseconds separate the check from
+`kill`. The harness never signals by name or by a group it cannot attribute.
+
+A child that calls `exec` retains its start identity. If the command tree still establishes
+ownership, cleanup tracks its new command before escalation. If it cannot establish that
+ownership, the receipt lists the process as `unresolved` and leaves it unsignalled. A reused
+PID is never adopted as the old process.
+
+## Regression checks
+
+`regressions.py` gives each check a verdict. `fixed` means Stack behaves as documented.
+`reproduced` means the defect is present. Either verdict needs the check's control to pass
+and its cleanup to be clean; otherwise the check is `invalid` and says why. Every control
+states what it shows. `down-before-up`'s control is a sibling checkout of the same project
+that runs `up` and then a confirmed `down`. The exit status is:
+
+- 0 when every check is fixed,
+- 1 when the run is valid and at least one defect reproduced,
+- 2 when any check is invalid or the user's global Stack, mise or Pitchfork state changed.
+
+## Validation results on Stack 0.1.22
+
+On the remediation branch, all eight cells validate. That includes ledger/Stack under
+`LC_ALL=C`, and `stack run test` now passes in the Stack arm, so the R1 and R3 notes below
+describe 0.1.22 only. See
+[eval/agentdx-20261020/REMEDIATION.md](../eval/agentdx-20261020/REMEDIATION.md). The
+documented task loop still does not gate grading, because the benchmark files are unchanged.
+
+See [eval/agentdx-20261020/SYNTHESIS.md](../eval/agentdx-20261020/SYNTHESIS.md#benchmark-validation)
+for the exact runs. In short, every cell is gradeable. In the Stack arm, the project's
+documented test command `stack run test` fails for both service apps because of finding R1.
+That is the product defect the agent will meet, so it is part of what the benchmark measures,
+not a reason to drop the cell.
+
+Under `--locale '{"LC_ALL": "C"}'` the ledger task fails validation in the Stack arm. Its
+PostgreSQL cluster is `SQL_ASCII` (finding R3), and even the grader's seed cannot be
+inserted. Do not plan that cell until R3 is fixed. The native arm validates under both
+locales.

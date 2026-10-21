@@ -18,7 +18,7 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
 /// What the server tells a client about using its tools, once, at initialization.
-const INSTRUCTIONS: &str = "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
+const INSTRUCTIONS: &str = "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
 
 fn startup_timeout_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
@@ -64,6 +64,11 @@ pub fn serve() -> std::io::Result<()> {
             Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
         };
         send(&mut stdout, response)?;
+        // A signal that would have ended the server was passed on to the command a tool call
+        // ran instead; now that it was answered, the server ends as the signal asked.
+        if crate::process::passed_on().is_some() {
+            break;
+        }
     }
     Ok(())
 }
@@ -96,7 +101,7 @@ fn secret_name(s: &str) -> bool {
 }
 
 /// Arguments of one tool that cannot be given together, as on the command line.
-const CONFLICTS: &[(&str, &str, &str)] = &[("stack_compile", "update", "locked"), ("stack_exec", "require", "require_all")];
+const CONFLICTS: &[(&str, &str, &str)] = &[("stack_compile", "update", "locked"), ("stack_exec", "require", "require_all"), ("stack_restart", "services", "changed")];
 
 /// Check a call's arguments against the tool's advertised `inputSchema` before anything else
 /// happens: no project is opened, no provider asked, nothing written. Unknown names, wrong
@@ -127,6 +132,12 @@ fn validate(name: &str, args: &Value) -> Result<serde_json::Map<String, Value>> 
             };
             return Err(usage(format!("unknown argument `{key}`")).hint(hint));
         };
+        // A malformed secret name is the same `invalid_secret` the CLI's `--secret` reports.
+        if key == "secrets" {
+            if let Some(names) = value.as_array().and_then(|items| items.iter().map(|v| v.as_str().map(String::from)).collect::<Option<Vec<_>>>()) {
+                crate::secrets::malformed(&names)?;
+            }
+        }
         if !value.is_null() {
             check_value(value, property).map_err(|why| {
                 let e = usage(format!("`{key}` {why}"));
@@ -233,7 +244,40 @@ fn closest<'a>(given: &str, known: &[&'a str]) -> Option<&'a str> {
         .map(|(_, k)| k)
 }
 
+/// What every tool's `structuredContent` is: the `--json` envelope. `data` is the operation's
+/// result (see each command's documentation); `error` is set instead when `ok` is false.
+fn output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": { "type": "boolean", "description": "Whether Stack did what was asked (for stack_exec and stack_run, check data.exit_code too; for stack_status, data.healthy)" },
+            "data": { "description": "The operation's result, when ok is true" },
+            "error": {
+                "type": "object",
+                "description": "Why Stack could not do it, when ok is false",
+                "properties": {
+                    "code": { "type": "string", "description": "Stable error code, such as usage, service_unavailable or timed_out" },
+                    "message": { "type": "string" },
+                    "hint": { "type": "string", "description": "What to do next, where Stack knows" },
+                    "details": { "type": "array", "description": "Specifics: affected services, captured output, progress records" },
+                },
+                "required": ["code", "message"],
+            },
+        },
+        "required": ["ok"],
+    })
+}
+
+/// The tools, each with its `inputSchema` and the [`output_schema`] its results follow.
 fn tools() -> Value {
+    let mut tools = tool_definitions();
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        tool["outputSchema"] = output_schema();
+    }
+    tools
+}
+
+fn tool_definitions() -> Value {
     json!([
         { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything. `skills` lists the agent skills of the exact releases stack.lock pins (status available, no_skill, not_installed or unavailable); all_skills also lists the provider's own under provider_skills, for people.",
           "inputSchema": schema(json!({ "all_skills": { "type": "boolean" } }), &[]) },
@@ -244,8 +288,8 @@ fn tools() -> Value {
         { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up. A service already running with unchanged configuration is kept, not restarted: after editing code it loaded, use stack_restart.",
           "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded (files under a service's `watch` included: watching only reports changes, it never reloads), then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up.",
-          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "timeout_secs": startup_timeout_schema() }), &[]) },
+        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded (files under a service's `watch` included: watching only reports changes, it never reloads), then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up. changed: true restarts exactly the services whose watched files changed since they started (changed_since_start), and nothing when none did.",
+          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "changed": { "type": "boolean", "description": "Restart only the services whose watched files changed since they started" }, "timeout_secs": startup_timeout_schema() }), &[]) },
         { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
           "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
         { "name": "stack_status", "description": "Live verification of every service, plus session and lease state. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.", "inputSchema": schema(json!({}), &[]) },
@@ -264,18 +308,24 @@ fn tools() -> Value {
               "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before it fails and the task is killed (default 600)" }
           }), &["task"]) },
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept.", "inputSchema": schema(json!({}), &[]) },
+        { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone. Then stops the Pitchfork supervisor that ran them too, if Stack started it and no other checkout's session or daemon still uses it; data.supervisor says what happened and why.", "inputSchema": schema(json!({
+              "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
+          }), &[]) },
+        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": schema(json!({
+              "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
+          }), &[]) },
         { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
 
 fn call(params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
-    let outcome = validate(name, &params["arguments"]).and_then(|args| {
-        let args = Value::Object(args);
-        ctx(&args).and_then(|ctx| dispatch(name, &args, &ctx))
-    });
+    let outcome = validate(name, &params["arguments"])
+        .and_then(|args| {
+            let args = Value::Object(args);
+            ctx(&args).and_then(|ctx| dispatch(name, &args, &ctx))
+        })
+        .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
     let envelope = match outcome {
         Ok(data) => json!({ "ok": true, "data": data }),
         Err(e) => json!({ "ok": false, "error": e }),
@@ -383,12 +433,16 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 v => return Err(StackError::new("usage", format!("services must be an array of service names, not {v}"))),
             };
             let timeout = startup_timeout(args)?;
-            session::restart(ctx, &services, timeout).map(to_value)
+            if args["changed"] == true {
+                session::restart_changed(ctx, timeout).map(to_value)
+            } else {
+                session::restart(ctx, &services, timeout).map(to_value)
+            }
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
-        "stack_down" => session::down(ctx).map(to_value),
-        "stack_gc" => session::gc_checked(&ctx.state).map(to_value),
+        "stack_down" => session::down_with(ctx, args["stop_supervisor"] != false).map(to_value),
+        "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_exec" => exec(args, ctx),
         "stack_run" => run(args, ctx),
@@ -542,6 +596,10 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         "unverified": plan.checks.iter().filter(|c| !c.ready).map(|c| &c.service).collect::<Vec<_>>(),
         "checks": plan.checks,
     });
+    // Only for a command a signal ended, so other results keep their shape.
+    if let Some(signal) = output.signal {
+        result["signal"] = json!(signal);
+    }
     // Names only, and only for commands granted secrets, so other results keep their shape.
     if !plan.secrets.is_empty() {
         result["secrets"] = json!(plan.secrets);
@@ -552,11 +610,12 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
 
 /// `90`, `90s`, `30m`, `2h`, `1d`.
 pub fn parse_duration(s: &str) -> Result<u64> {
+    const HINT: &str = "give whole seconds, minutes, hours or days: 90, 90s, 30m, 2h or 1d";
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num
         .parse()
-        .map_err(|_| StackError::new("usage", format!("invalid duration '{s}'")))?;
+        .map_err(|_| StackError::new("usage", format!("invalid duration '{s}'")).hint(HINT))?;
     let mult = match unit {
         "" | "s" => 1,
         "m" => 60,
@@ -566,11 +625,20 @@ pub fn parse_duration(s: &str) -> Result<u64> {
             return Err(StackError::new(
                 "usage",
                 format!("invalid duration unit in '{s}'; use s, m, h or d"),
-            ))
+            )
+            .hint(HINT))
         }
     };
     n.checked_mul(mult)
-        .ok_or_else(|| StackError::new("usage", "duration is too large"))
+        .ok_or_else(|| StackError::new("usage", "duration is too large").hint(HINT))
+}
+
+/// Every `usage` error says where to look, even one raised without a hint of its own.
+pub fn with_usage_hint(e: StackError, help: &str) -> StackError {
+    if e.code == "usage" && e.hint.is_none() {
+        return e.hint(help.to_string());
+    }
+    e
 }
 
 #[cfg(test)]
@@ -602,6 +670,42 @@ mod tests {
             let e = startup_timeout(&json!({ "timeout_secs": bad })).unwrap_err();
             assert_eq!(e.code, "usage", "{bad}");
         }
+    }
+
+    /// Whether `value` fits `schema`, for the keywords the output schema uses.
+    fn fits(value: &Value, schema: &Value) -> bool {
+        let typed = match schema["type"].as_str() {
+            Some("object") => value.is_object(),
+            Some("boolean") => value.is_boolean(),
+            Some("string") => value.is_string(),
+            Some("array") => value.is_array(),
+            Some(_) => false,
+            None => true,
+        };
+        let required = schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).all(|k| value.get(k).is_some());
+        let properties = schema["properties"].as_object().into_iter().flatten().all(|(k, s)| value.get(k).map_or(true, |v| fits(v, s)));
+        typed && required && properties
+    }
+
+    #[test]
+    fn every_tool_advertises_the_envelope_its_results_follow() {
+        for tool in tools().as_array().unwrap() {
+            assert_eq!(tool["outputSchema"], output_schema(), "{}", tool["name"]);
+        }
+        // An error result and a success result both fit it.
+        let failed = call(&json!({ "name": "stack_nope", "arguments": {} }));
+        assert_eq!(failed["isError"], true);
+        assert!(fits(&failed["structuredContent"], &output_schema()), "{failed}");
+        let usage = call(&json!({ "name": "stack_exec", "arguments": { "command": "echo hi" } }));
+        assert!(fits(&usage["structuredContent"], &output_schema()) && usage["structuredContent"]["error"]["hint"].is_string(), "{usage}");
+        // Read-only: inspect writes nothing and asks no provider for an `[env]`-only project.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        let fine = call(&json!({ "name": "stack_inspect", "arguments": { "dir": dir.path() } }));
+        assert_eq!(fine["structuredContent"]["ok"], true, "{fine}");
+        assert!(fits(&fine["structuredContent"], &output_schema()), "{fine}");
+        assert!(!dir.path().join(".stack").exists() && !dir.path().join("stack.lock").exists());
+        assert!(!fits(&json!({ "data": 1 }), &output_schema()) && !fits(&json!({ "ok": false, "error": { "code": 1 } }), &output_schema()));
     }
 
     #[test]

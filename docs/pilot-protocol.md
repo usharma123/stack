@@ -6,8 +6,10 @@ Two different things are measured, and their results must never be mixed:
    an agent task would, several projects at once, with controlled failures. It measures whether
    stack keeps instances separate and cleans up under concurrency. It says nothing about how
    productive agents are.
-2. **Real-agent task completion** (this document, sections below): independent coding agents do
-   real tasks in their own checkouts. It has not been run yet; no productivity claim exists.
+2. **Real-agent task completion**: independent coding agents do real tasks in their own
+   checkouts. The matched Stack-vs-existing-setup benchmark in [`bench/`](../bench/README.md)
+   now implements this, and its protocol supersedes the real-agent section below. It has not
+   been run with a real agent yet; no productivity claim exists.
 
 ## Scripted concurrency pilot
 
@@ -47,7 +49,7 @@ recovery checks do not always fail the run. The recorded successful run had no u
 command failures, so its task counts remain observations; zero orphans is not a general
 guarantee. Strengthen these checks before using the runner as an acceptance gate.
 
-## Real-agent protocol (not yet executed)
+## Real-agent protocol (superseded by [bench/AGENTDX-PROTOCOL.md](../bench/AGENTDX-PROTOCOL.md))
 
 Goal: measure task completion, wrong-instance incidents and orphaned processes when
 independent agents, not scripts, use stack concurrently.

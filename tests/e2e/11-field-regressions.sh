@@ -16,6 +16,13 @@ bundle = "path:$EX/bundles/pybase"
 [services.api]
 run = "exec python3 -m http.server \$PORT --bind 127.0.0.1"
 ready_cmd = "curl -fsS http://127.0.0.1:\$PORT/ >/dev/null"
+
+[tasks.url]
+run = 'curl -fsS "\$API_URL/" >/dev/null && printf %s "\$API_URL"'
+
+[tasks.url_listing_service]
+run = 'printf %s "\$API_URL"'
+services = ["api"]
 EOF
 stack compile >/dev/null
 
@@ -29,6 +36,13 @@ echo "A custom service's URL is its loopback address and answers"
 port=$(checked api port "$T/up-appR.json")
 url=$(stack exec --require api -- sh -c 'curl -fsS "$API_URL/" >/dev/null && printf %s "$API_URL"')
 [[ "$url" == "http://127.0.0.1:$port" ]] || fail "API_URL is $url"
+
+echo 'Tasks see the same loopback URL as exec, through the CLI and MCP'
+[[ "$(stack run url)" == "$url" ]] || fail "stack run url: $(stack run url 2>&1)"
+[[ "$(stack run url_listing_service)" == "$url" ]] || fail "a task listing the service: $(stack run url_listing_service 2>&1)"
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":{"task":"url"}}}' | stack mcp >"$T/mcp-run-url.out"
+jq -se --arg url "$url" 'length == 1 and (.[0].result.structuredContent.data | .exit_code == 0 and .stdout == $url)' "$T/mcp-run-url.out" >/dev/null \
+  || fail "MCP stack_run: $(cat "$T/mcp-run-url.out")"
 
 echo 'Services carry the checkout token; commands do not'
 token=$(stack exec -- python3 -c 'import tomllib; print(tomllib.load(open(".config/mise/conf.d/stack.toml", "rb"))["daemons"]["postgres"]["env"]["STACK_CHECKOUT_TOKEN"])')

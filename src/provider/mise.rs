@@ -258,21 +258,49 @@ pub struct Requirement {
 }
 
 const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A second, longer wait for a `mise version` that missed [`VERSION_TIMEOUT`] once: a first run
+/// in a fresh mise root is slower than any later one.
+const VERSION_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The release of the mise on PATH, from `mise version` with no configuration loaded.
+///
+/// mise's update check is turned off for it (`MISE_DISABLE_UPDATE_WARNING`): with a fresh
+/// cache, `mise version` otherwise asks GitHub for the latest release before it answers, and
+/// stack reads only the release it prints. One that still misses the deadline is asked once
+/// more, for longer; one that never answers is reported as installed but not answering,
+/// never as missing.
 pub fn provider_version(root: &Path) -> Result<CalVer> {
-    let mut command = Command::new("mise");
-    configure_command(&mut command, root);
-    command.args(["version"]).current_dir(root).env("MISE_NO_CONFIG", "1").env("NO_COLOR", "1");
-    let out = crate::process::capture(&mut command, VERSION_TIMEOUT, 16 * 1024).map_err(|e| {
-        StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
-    })?;
+    let ask = |wait: std::time::Duration| {
+        let mut command = Command::new("mise");
+        configure_command(&mut command, root);
+        command
+            .args(["version"])
+            .current_dir(root)
+            .env("MISE_NO_CONFIG", "1")
+            .env("MISE_DISABLE_UPDATE_WARNING", "1")
+            .env("NO_COLOR", "1");
+        crate::process::capture(&mut command, wait, 16 * 1024).map_err(|e| {
+            StackError::new("provider_unavailable", format!("cannot run mise: {e}")).hint(crate::setup::MISE_INSTALL_HINT)
+        })
+    };
+    let mut out = ask(VERSION_TIMEOUT)?;
+    if out.timed_out && !crate::process::expired() {
+        out = ask(VERSION_RETRY_TIMEOUT)?;
+    }
     if out.timed_out && crate::process::expired() {
         return Err(StackError::new("timed_out", "`mise version` was cut short by the deadline"));
     }
-    if out.timed_out || out.exit_code != Some(0) {
-        let why = if out.timed_out { format!("did not answer within {}s", VERSION_TIMEOUT.as_secs()) } else { "failed".into() };
-        return Err(StackError::new("provider_unavailable", format!("`mise version` {why}")).hint(crate::setup::MISE_INSTALL_HINT));
+    if out.timed_out {
+        let mise = crate::setup::find_on_path_from(root).map_or_else(|| "mise".to_string(), |p| p.display().to_string());
+        return Err(StackError::new(
+            "provider_unavailable",
+            format!("`mise version` did not answer within {}s, nor within {}s when asked again", VERSION_TIMEOUT.as_secs(), VERSION_RETRY_TIMEOUT.as_secs()),
+        )
+        .hint(format!("{mise} is installed but is not answering; check that it runs (`{mise} version`) and that nothing holds its state directory, then retry"))
+        .with_detail(serde_json::json!({ "mise": mise })));
+    }
+    if out.exit_code != Some(0) {
+        return Err(StackError::new("provider_unavailable", "`mise version` failed").hint(crate::setup::MISE_INSTALL_HINT));
     }
     CalVer::parse(&out.stdout).ok_or_else(|| {
         StackError::new("provider_outdated", format!("cannot read a release from `mise version`: {:?}", out.stdout.trim()))
@@ -411,14 +439,20 @@ pub fn render(
     for (key, url) in loopback_urls(stack, ports) {
         env.entry(key).or_insert(Value::String(url));
     }
+    let mut directives = Table::new();
     if !stack.bin_paths.is_empty() {
         let paths = stack
             .bin_paths
             .iter()
             .map(|p| Value::String(p.to_string_lossy().into()))
             .collect();
-        let mut directives = Table::new();
         directives.insert("path".into(), Value::Array(paths));
+    }
+    if has_services {
+        // After every value above, so it decides over the project's own: see [`BINDING_VAR`].
+        directives.insert("file".into(), Value::String(BINDING_FILE.into()));
+    }
+    if !directives.is_empty() {
         env.insert("_".into(), Value::Table(directives));
     }
     if !env.is_empty() {
@@ -440,9 +474,14 @@ pub fn render(
                 put(&mut t, "ready_port", s.ready_port.map(|p| Value::Integer(p.into())));
                 // The daemon's own environment, unlike `[env]`, reaches only what the
                 // supervisor launches for it: never a task, `exec` command or `mise x`.
+                let mut env = Table::new();
                 if let Some(token) = checkout {
-                    let mut env = Table::new();
                     env.insert(crate::checkout::TOKEN_VAR.into(), Value::String(token.into()));
+                }
+                for &(key, value) in preset_env(s.preset.as_deref()) {
+                    env.insert(key.into(), Value::String(value.into()));
+                }
+                if !env.is_empty() {
                     t.insert("env".into(), Value::Table(env));
                 }
                 if let Some(port) = ports.get(name) {
@@ -483,8 +522,36 @@ pub fn render(
     }
 
     let body = toml::to_string_pretty(&doc).expect("mise config serializes");
-    format!("# Generated by `stack compile` from stack.toml + stack.lock. Do not edit.\n{body}")
+    format!("{HEADER}\n{body}")
 }
+
+/// The first line of the generated provider configuration.
+const HEADER: &str = "# Generated by `stack compile` from stack.toml + stack.lock. Do not edit.";
+
+/// Environment a preset's daemon (and so its one-time initialization) always gets, whatever
+/// the caller's. mise's postgres preset runs a bare `initdb`, which takes the cluster's
+/// encoding and collation from the locale it inherits: `SQL_ASCII` with collation `C` under
+/// `LC_ALL=C` or no locale at all (CI, `env -i`, containers), `UTF8` in a UTF-8 shell, and fixed
+/// at the first `up`. `C.UTF-8` gives every checkout a `UTF8` cluster with the same
+/// code-point collation on macOS and Linux. Only a new cluster is affected: an existing one
+/// keeps the encoding and collation it was created with, and `up` warns when it is not UTF8.
+/// A locale the project sets in `[env]` reaches the daemon too and takes precedence (mise
+/// applies `[env]` after a daemon's own environment): that is the project's committed choice,
+/// the same on every machine, not the caller's.
+///
+/// Redis takes its collation (for `SORT ... ALPHA`) from the inherited locale and exits at
+/// once when that names a locale the machine lacks (`LANG=en_US.UTF-8` in a minimal Linux
+/// image): `C`, which every system has, makes it start anywhere and sort the same everywhere.
+pub fn preset_env(preset: Option<&str>) -> &'static [(&'static str, &'static str)] {
+    match preset {
+        Some("postgres") => &[("LC_ALL", POSTGRES_LOCALE)],
+        Some("redis") => &[("LC_ALL", "C")],
+        _ => &[],
+    }
+}
+
+/// The locale a new Postgres cluster is initialized with (see [`preset_env`]).
+pub const POSTGRES_LOCALE: &str = "C.UTF-8";
 
 /// `<NAME>_URL` of each service without a preset, as the loopback address stack assigns and
 /// verifies. mise would export the Pitchfork proxy's `https://<name>.<project>.localhost`,
@@ -570,7 +637,197 @@ pub fn configure_command(command: &mut Command, root: &Path) {
     for key in inherited_config_keys() {
         command.env_remove(key);
     }
+    // Only a request that asks for it carries an owner mark or a binding, never one stack
+    // inherited.
+    command.env_remove(OWNER_VAR);
+    command.env_remove(BINDING_VAR);
     command.envs(config_env(root));
+}
+
+/// Names, to every request of Stack's that may start or stop a daemon or the supervisor, the
+/// file that binds it to the supervisor its command chose and holds the lock of (see
+/// [`Target`]).
+///
+/// mise renders the project's environment again for each request, and its `[env]` wins over
+/// anything the request inherits: a `PITCHFORK_STATE_DIR` template could name another
+/// supervisor by the time a request renders it than when the command chose. Each `mise daemons`
+/// command renders once and hands that environment to every Pitchfork call it makes (mise
+/// 2026.10.3 `src/daemons/runtime.rs`). The generated configuration therefore ends its `[env]`
+/// with [`BINDING_FILE`], a `_.file` directive that loads the file this variable names: a later
+/// directive decides over an earlier one, and over a tool's environment, and a `.json` file is
+/// read as written, never as a template. The file names the chosen directory as
+/// `PITCHFORK_STATE_DIR`, so the request reaches it whatever the project's template renders
+/// then. Without this variable the directive names a file that never exists, which mise loads
+/// nothing from: every other command (`mise env`, tasks, `stack exec`) renders the project's
+/// environment as it did.
+///
+/// The supervisor a request starts inherits the variable, so a service it runs (through `mise
+/// x` in its project) has `PITCHFORK_STATE_DIR` naming that supervisor, as long as the file is
+/// there.
+pub const BINDING_VAR: &str = "STACK_SUPERVISOR_BINDING";
+
+/// The `_.file` directive that ends the generated `[env]` (see [`BINDING_VAR`]). Its fallback
+/// is relative to the project, in Stack's own directory, and never written.
+const BINDING_FILE: &str = "{{ get_env(name='STACK_SUPERVISOR_BINDING', default='.stack/provider-config/no-supervisor-binding.json') }}";
+
+/// Whether the generated provider configuration `config` ends its `[env]` with
+/// [`BINDING_FILE`], which a request carrying [`BINDING_VAR`] needs to reach the supervisor it
+/// names: the last `[env]` key is `_`, and the last of its directives that `file`.
+fn binds(config: &Table) -> bool {
+    let last = config.get("env").and_then(Value::as_table).and_then(|env| env.iter().next_back());
+    let Some(("_", Value::Table(directives))) = last.map(|(k, v)| (k.as_str(), v)) else { return false };
+    directives.iter().next_back().is_some_and(|(k, v)| k == "file" && v.as_str() == Some(BINDING_FILE))
+}
+
+/// `supervisor_unbound`: the project's generated configuration at `path` cannot bind a request.
+fn config_unbound(path: &Path, why: &str) -> StackError {
+    StackError::new(
+        "supervisor_unbound",
+        format!("{} {why}, so it cannot bind a request to the supervisor whose lock Stack holds; nothing was asked of it", path.display()),
+    )
+    .hint("run `stack compile` to write the configuration again, then retry")
+}
+
+/// Make the project's generated provider configuration bind requests before any is made (see
+/// [`BINDING_VAR`]). A Stack from before the binding wrote it without [`BINDING_FILE`], and
+/// `down` and lease expiry use the configuration as they find it (`up` and `restart` write it
+/// again first): such a file gains
+/// the directive where `render` puts it, after every other `[env]` entry, with nothing else
+/// changed, in one rename that keeps its permissions. Its stack.toml and stack.lock are not
+/// read, so a project whose manifest changed or went since is still stopped as it was started.
+/// Only a file starting with the line Stack writes is changed; one that is not valid TOML or
+/// has an `[env]` that cannot take the directive fails with `supervisor_unbound`. A project
+/// without the file has no `[env]` that could name another supervisor. Called under the
+/// project's lock, which every command writing the file holds.
+fn bind_config(root: &Path) -> Result<()> {
+    let path = output_path(root);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(crate::error::io_error(path.display(), e)),
+    };
+    let doc: Table = text.parse().map_err(|_| config_unbound(&path, "is not valid TOML"))?;
+    if binds(&doc) {
+        return Ok(());
+    }
+    if text.lines().next() != Some(HEADER) {
+        return Err(config_unbound(&path, "was not written by `stack compile`"));
+    }
+    // Rebuilt in order, so every other entry keeps its place.
+    let mut migrated = Table::new();
+    let mut found_env = false;
+    for (key, value) in doc {
+        if key != "env" {
+            migrated.insert(key, value);
+            continue;
+        }
+        let Value::Table(env) = value else { return Err(config_unbound(&path, "has an [env] that is not a table")) };
+        found_env = true;
+        migrated.insert(key, Value::Table(with_binding(&path, env)?));
+    }
+    if !found_env {
+        migrated.insert("env".into(), Value::Table(with_binding(&path, Table::new())?));
+    }
+    let body = toml::to_string_pretty(&migrated).map_err(|_| config_unbound(&path, "cannot be written again"))?;
+    let mut new = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(root)).map_err(|e| crate::error::io_error(path.display(), e))?;
+    std::io::Write::write_all(&mut new, format!("{HEADER}\n{body}").as_bytes()).map_err(|e| crate::error::io_error(path.display(), e))?;
+    let permissions = std::fs::metadata(&path).map_err(|e| crate::error::io_error(path.display(), e))?.permissions();
+    std::fs::set_permissions(new.path(), permissions).map_err(|e| crate::error::io_error(path.display(), e))?;
+    new.persist(&path).map_err(|e| crate::error::io_error(path.display(), e.error))?;
+    confirm_bound(root)
+}
+
+/// `env` with [`BINDING_FILE`] as its last entry's last directive, as `render` writes it.
+fn with_binding(path: &Path, env: Table) -> Result<Table> {
+    let mut directives = Table::new();
+    let mut out = Table::new();
+    for (key, value) in env {
+        match (key.as_str(), value) {
+            ("_", Value::Table(d)) => directives = d,
+            ("_", _) => return Err(config_unbound(path, "has an [env._] that is not a table")),
+            (_, value) => {
+                out.insert(key, value);
+            }
+        }
+    }
+    if directives.contains_key("file") {
+        return Err(config_unbound(path, "already loads another file from [env]"));
+    }
+    directives.insert("file".into(), Value::String(BINDING_FILE.into()));
+    out.insert("_".into(), Value::Table(directives));
+    Ok(out)
+}
+
+/// Refuse a request ([`config_unbound`]) unless the configuration it would load still ends its
+/// `[env]` with [`BINDING_FILE`]: checked as each request is made, after [`bind_config`].
+fn confirm_bound(root: &Path) -> Result<()> {
+    let path = output_path(root);
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(crate::error::io_error(path.display(), e)),
+        Ok(text) => match text.parse::<Table>() {
+            Ok(doc) if binds(&doc) => Ok(()),
+            Ok(_) => Err(config_unbound(&path, "does not end its [env] with Stack's binding directive")),
+            Err(_) => Err(config_unbound(&path, "is not valid TOML")),
+        },
+    }
+}
+
+/// The supervisor a request is made to: its Pitchfork state directory, and the file binding the
+/// request to it (see [`BINDING_VAR`]). Only the holder of that supervisor's lock makes one, so
+/// no start or stop is asked of a supervisor whose lock is not held, and only once the project's
+/// configuration applies the binding (see [`bind_config`]); each request confirms it still does
+/// as it is made.
+#[derive(Debug, Clone)]
+pub struct Target {
+    state_dir: PathBuf,
+    file: PathBuf,
+}
+
+impl Target {
+    /// Bind requests from the project at `root` to the supervisor of `state_dir`, an absolute
+    /// directory, through a file in `bindings` (a directory of Stack's state): `<sha256 of the
+    /// directory>.json`, whose content follows from its name, so commands writing it at once
+    /// write the same thing. The project's generated configuration is made to apply it first
+    /// (see [`bind_config`]). `supervisor_unbound` when the binding cannot be expressed or
+    /// applied: a directory Pitchfork would not read (not Unicode, or relative), a file path mise
+    /// would read as a pattern, or a configuration that cannot load it.
+    pub(crate) fn bind(root: &Path, bindings: &Path, state_dir: &Path) -> Result<Self> {
+        let unbound = |why: String| {
+            StackError::new("supervisor_unbound", format!("cannot bind requests to the Pitchfork supervisor in {}: {why}, so nothing was asked of it", state_dir.display()))
+        };
+        let dir = state_dir.to_str().filter(|_| state_dir.is_absolute()).ok_or_else(|| unbound("its path is not absolute Unicode".into()))?;
+        std::fs::create_dir_all(bindings).map_err(|e| crate::error::io_error(bindings.display(), e))?;
+        let bindings = bindings.canonicalize().map_err(|e| crate::error::io_error(bindings.display(), e))?;
+        let file = bindings.join(format!("{}.json", crate::hash::sha256_hex(dir.as_bytes())));
+        // mise reads the path as a glob pattern; one that does not name itself loads nothing.
+        if file.to_str().map_or(true, |f| f.contains(['*', '?', '[', ']'])) {
+            return Err(unbound(format!("Stack's state directory {} is not Unicode or contains one of * ? [ ]", bindings.display()))
+                .hint("set STACK_STATE_DIR to a directory whose path has none of * ? [ ]"));
+        }
+        let content = serde_json::json!({ "PITCHFORK_STATE_DIR": dir }).to_string();
+        if std::fs::read_to_string(&file).ok().as_deref() != Some(content.as_str()) {
+            let mut new = tempfile::NamedTempFile::new_in(&bindings).map_err(|e| crate::error::io_error(bindings.display(), e))?;
+            std::io::Write::write_all(&mut new, content.as_bytes()).map_err(|e| crate::error::io_error(file.display(), e))?;
+            new.persist(&file).map_err(|e| crate::error::io_error(file.display(), e.error))?;
+        }
+        bind_config(root)?;
+        Ok(Self { state_dir: state_dir.to_path_buf(), file })
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// The environment that makes a request reach this supervisor, with `owner`'s mark.
+    fn env(&self, owner: Option<&str>) -> Vec<(String, String)> {
+        let mut env = vec![
+            (BINDING_VAR.to_string(), self.file.to_string_lossy().into_owned()),
+            ("PITCHFORK_STATE_DIR".to_string(), self.state_dir.to_string_lossy().into_owned()),
+        ];
+        env.extend(owner.map(|o| (OWNER_VAR.to_string(), o.to_string())));
+        env
+    }
 }
 
 /// A mise command, bounded by the caller's deadline (see `process::output`).
@@ -613,7 +870,7 @@ fn mise_with(root: &Path, args: &[&str], overrides: &[(String, String)]) -> Resu
 /// Without either, Pitchfork only looks in a few fixed places, and when mise is installed
 /// elsewhere it runs every project's daemons without mise, with the tools on its own PATH:
 /// the tools of whichever project started it.
-fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
+fn detach_supervisor(root: &Path, code: &'static str, owner: Option<&str>, target: &Target) -> Result<()> {
     const START: &str = "mise x -- pitchfork supervisor start";
     let Some(wait) = crate::process::remaining() else { return Ok(()) };
     if wait.is_zero() {
@@ -625,13 +882,15 @@ fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
         StackError::new("provider_unavailable", "cannot find mise on PATH to start the service supervisor")
             .hint(crate::setup::MISE_INSTALL_HINT)
     })?;
+    confirm_bound(root)?;
     let mut command = Command::new(&mise_bin);
     configure_command(&mut command, root);
     command.args(["x", "--", "pitchfork", "supervisor", "start"])
         .current_dir(root)
         .env("PITCHFORK_MISE_BIN", &mise_bin)
         .env("MISE_YES", "1")
-        .env("NO_COLOR", "1");
+        .env("NO_COLOR", "1")
+        .envs(target.env(owner));
     let status = crate::process::run_detached(&mut command, wait).map_err(|e| {
         StackError::new("provider_unavailable", format!("cannot run {}: {e}", mise_bin.display()))
             .hint(crate::setup::MISE_INSTALL_HINT)
@@ -645,7 +904,18 @@ fn detach_supervisor(root: &Path, code: &'static str) -> Result<()> {
 }
 
 fn checked(root: &Path, args: &[&str], code: &'static str) -> Result<Output> {
-    let out = mise(root, args)?;
+    checked_with(root, args, code, &[])
+}
+
+/// [`checked`] for a request that may start or stop a daemon or the supervisor: bound to
+/// `target` and marked with `owner` (see [`BINDING_VAR`], [`OWNER_VAR`]).
+fn request(root: &Path, args: &[&str], code: &'static str, owner: Option<&str>, target: &Target) -> Result<Output> {
+    confirm_bound(root)?;
+    checked_with(root, args, code, &target.env(owner))
+}
+
+fn checked_with(root: &Path, args: &[&str], code: &'static str, overrides: &[(String, String)]) -> Result<Output> {
+    let out = mise_with(root, args, overrides)?;
     if out.status.success() {
         return Ok(out);
     }
@@ -1032,7 +1302,8 @@ fn pitchfork(bin: &Path, state_dir: &Path, args: &[&str]) -> std::result::Result
     command
         .args(args)
         .env("PITCHFORK_STATE_DIR", state_dir)
-        .env("NO_COLOR", "1");
+        .env("NO_COLOR", "1")
+        .env_remove(OWNER_VAR);
     let out = crate::process::capture(&mut command, SUPERVISOR_TIMEOUT, 64 * 1024)
         .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
     if out.timed_out {
@@ -1041,12 +1312,75 @@ fn pitchfork(bin: &Path, state_dir: &Path, args: &[&str]) -> std::result::Result
     Ok(out)
 }
 
+/// One daemon the supervisor tracks: its qualified id, status and process, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tracked {
+    pub id: String,
+    pub status: String,
+    pub pid: Option<u32>,
+}
+
+/// Daemons the supervisor of `state_dir` tracks (`pitchfork list --json`). Pitchfork 2.29.0
+/// starts a supervisor for this when none answers, in the command's process group, which
+/// stack ends when the command does: ask only once [`supervisor_running`] says one runs.
+pub fn supervisor_daemons(bin: &Path, state_dir: &Path) -> std::result::Result<Vec<Tracked>, String> {
+    let out = pitchfork(bin, state_dir, &["list", "--json"])?;
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+        return Err(format!("pitchfork list: {err}"));
+    }
+    let list: Vec<serde_json::Value> = serde_json::from_str(&out.stdout).map_err(|e| format!("unexpected `pitchfork list --json` output: {e}"))?;
+    Ok(list
+        .iter()
+        .map(|d| Tracked {
+            id: d["id"].as_str().unwrap_or_default().to_string(),
+            status: d["status"].as_str().unwrap_or_default().to_string(),
+            pid: d["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+        })
+        .collect())
+}
+
+/// Whether the supervisor of `state_dir` answers (`pitchfork supervisor status`, which never
+/// starts one).
+pub fn supervisor_running(bin: &Path, state_dir: &Path) -> std::result::Result<bool, String> {
+    Ok(pitchfork(bin, state_dir, &["supervisor", "status"])?.exit_code == Some(0))
+}
+
+/// `pitchfork supervisor stop` for `state_dir`, then wait (up to 10 seconds) until it no longer
+/// answers. Whether it stopped.
+pub fn stop_supervisor(bin: &Path, state_dir: &Path) -> std::result::Result<bool, String> {
+    let out = pitchfork(bin, state_dir, &["supervisor", "stop"])?;
+    if out.exit_code != Some(0) {
+        let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+        return Err(format!("pitchfork supervisor stop: {err}"));
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until {
+        if !supervisor_running(bin, state_dir)? {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Ok(false)
+}
+
 /// `pitchfork status --json <id>` against the recorded supervisor state directory.
 pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Supervised, String> {
+    let Some(v) = status_json(bin, state_dir, id)? else { return Ok(Supervised::NotFound) };
+    Ok(Supervised::Found {
+        status: v["status"].as_str().unwrap_or_default().to_string(),
+        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+        port: v["active_port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+    })
+}
+
+/// `pitchfork status --json <id>`, which reads the supervisor's state and starts none: what it
+/// says about `id`, or `None` when it knows no such daemon.
+fn status_json(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Option<serde_json::Value>, String> {
     let out = pitchfork(bin, state_dir, &["status", "--json", id])?;
     if out.exit_code != Some(0) {
         if out.stderr.contains("not found") {
-            return Ok(Supervised::NotFound);
+            return Ok(None);
         }
         let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
         return Err(format!("pitchfork status {id}: {err}"));
@@ -1056,11 +1390,23 @@ pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result
     if v["id"].as_str() != Some(id) {
         return Err(format!("pitchfork status {id} described '{}'", v["id"]));
     }
-    Ok(Supervised::Found {
-        status: v["status"].as_str().unwrap_or_default().to_string(),
-        pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
-        port: v["active_port"].as_u64().and_then(|p| u16::try_from(p).ok()),
-    })
+    Ok(Some(v))
+}
+
+/// The schedule on which the supervisor of `state_dir` starts daemon `id` (the `cron_schedule`
+/// `pitchfork status --json` reports, which Pitchfork 2.29.0 keeps between runs and omits for a
+/// daemon without one), if it has one. A daemon Pitchfork no longer knows, or an answer that
+/// does not read as Pitchfork's, is an error: Stack cannot tell.
+pub fn schedule(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Option<String>, String> {
+    let v = status_json(bin, state_dir, id)?.ok_or_else(|| format!("pitchfork status {id}: not found"))?;
+    if !v["status"].is_string() {
+        return Err(format!("pitchfork status {id} reported no status"));
+    }
+    match v.get("cron_schedule") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(cron)) if !cron.trim().is_empty() => Ok(Some(cron.clone())),
+        Some(other) => Err(format!("pitchfork status {id} reported the schedule {other}")),
+    }
 }
 
 const LOGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1145,28 +1491,35 @@ fn local_datetime(_: u64) -> Option<String> {
     None
 }
 
-pub fn stop(root: &Path) -> Result<()> {
-    detach_supervisor(root, "stop_failed")?;
-    checked(root, &["daemons", "stop"], "stop_failed").map(|_| ())
+/// Set, to the Stack state's owner mark, on every request of Stack's that may start Pitchfork's
+/// supervisor (the start below, and `mise daemons start` and `stop`, whose client starts one
+/// when none answers). The supervisor inherits it, as do its `log-sink` helpers, so its own
+/// environment shows which Stack state started it; a supervisor already running when Stack
+/// first used it, or started by anything else, lacks it. `None` sets nothing.
+pub const OWNER_VAR: &str = "STACK_SUPERVISOR_OWNER";
+
+pub fn stop(root: &Path, owner: Option<&str>, target: &Target) -> Result<()> {
+    detach_supervisor(root, "stop_failed", owner, target)?;
+    request(root, &["daemons", "stop"], "stop_failed", owner, target).map(|_| ())
 }
 
 /// Make sure the supervisor runs before start requests are made under a deadline (see
 /// [`detach_supervisor`]).
-pub fn prepare_start(root: &Path) -> Result<()> {
-    detach_supervisor(root, "start_failed")
+pub fn prepare_start(root: &Path, owner: Option<&str>, target: &Target) -> Result<()> {
+    detach_supervisor(root, "start_failed", owner, target)
 }
 
 /// Ask the supervisor to start one daemon of this project; returns once it is ready.
-pub fn start_daemon(root: &Path, name: &str) -> Result<()> {
-    checked(root, &["daemons", "start", "--", name], "start_failed").map(|_| ())
+pub fn start_daemon(root: &Path, name: &str, owner: Option<&str>, target: &Target) -> Result<()> {
+    request(root, &["daemons", "start", "--", name], "start_failed", owner, target).map(|_| ())
 }
 
 /// Stop only the named daemons of this project.
-pub fn stop_daemons(root: &Path, names: &[String]) -> Result<()> {
+pub fn stop_daemons(root: &Path, names: &[String], owner: Option<&str>, target: &Target) -> Result<()> {
     let mut args = vec!["daemons", "stop", "--"];
     args.extend(names.iter().map(String::as_str));
-    detach_supervisor(root, "stop_failed")?;
-    checked(root, &args, "stop_failed").map(|_| ())
+    detach_supervisor(root, "stop_failed", owner, target)?;
+    request(root, &args, "stop_failed", owner, target).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1181,9 +1534,123 @@ mod tests {
     fn a_deadline_already_past_starts_no_supervisor_and_makes_no_request() {
         let root = tempfile::tempdir().unwrap();
         let _expired = crate::process::deadline_scope(Some(std::time::Instant::now()));
-        let e = prepare_start(root.path()).unwrap_err();
+        let target = Target::bind(root.path(), &root.path().join("bindings"), &root.path().join("pf")).unwrap();
+        let e = prepare_start(root.path(), None, &target).unwrap_err();
         assert_eq!(e.code, "timed_out", "{e:?}");
         assert!(e.message.contains("before `mise x -- pitchfork supervisor start`"), "{e:?}");
+    }
+
+    #[test]
+    fn a_binding_names_the_chosen_directory_in_a_file_mise_reads_literally() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("pf $HOME {{ x }}/state");
+        let target = Target::bind(root.path(), &root.path().join("bindings"), &state).unwrap();
+        assert_eq!(target.state_dir(), state.as_path());
+        let env: IndexMap<String, String> = target.env(Some("mark")).into_iter().collect();
+        let file = PathBuf::from(&env[BINDING_VAR]);
+        assert!(file.is_absolute() && file.starts_with(root.path().join("bindings").canonicalize().unwrap()), "{file:?}");
+        assert_eq!((env["PITCHFORK_STATE_DIR"].as_str(), env[OWNER_VAR].as_str()), (state.to_str().unwrap(), "mark"));
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({ "PITCHFORK_STATE_DIR": state }));
+        // The same directory binds through the same file; another through its own.
+        let again = Target::bind(root.path(), &root.path().join("bindings"), &state).unwrap();
+        assert_eq!(again.file, file);
+        let other = Target::bind(root.path(), &root.path().join("bindings"), &root.path().join("pf2")).unwrap();
+        assert_ne!(other.file, file);
+        assert_eq!(target.env(None).len(), 2, "no owner, no mark");
+    }
+
+    #[test]
+    fn a_binding_mise_could_not_read_as_written_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let e = Target::bind(root.path(), &root.path().join("bindings"), Path::new("relative/state")).unwrap_err();
+        assert_eq!(e.code, "supervisor_unbound", "{e:?}");
+        for odd in ["a*b", "a?b", "a[b]"] {
+            let e = Target::bind(root.path(), &root.path().join(odd), &root.path().join("pf")).unwrap_err();
+            assert_eq!(e.code, "supervisor_unbound", "{odd}: {e:?}");
+            assert!(e.hint.as_deref().unwrap_or_default().contains("STACK_STATE_DIR"), "{e:?}");
+        }
+    }
+
+    /// A configuration as a Stack from before the binding wrote it: a bundle's `_.path` too.
+    const LEGACY: &str = "# Generated by `stack compile` from stack.toml + stack.lock. Do not edit.
+[settings]
+experimental = true
+
+[tools]
+pitchfork = \"2.29.0\"
+
+[env]
+PITCHFORK_STATE_DIR = \"{{ exec(command='cat provider-target') | trim }}\"
+WEB_URL = \"http://127.0.0.1:20754\"
+
+[env._]
+path = [\"/b/bin\"]
+
+[daemons.web]
+run = \"true\"
+port = 20754
+";
+
+    #[test]
+    fn a_configuration_written_before_the_binding_gains_it_last_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let path = output_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, LEGACY).unwrap();
+        let target = Target::bind(root.path(), &root.path().join("bindings"), &root.path().join("pf")).unwrap();
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        let expected = LEGACY.replacen("path = [\"/b/bin\"]\n", &format!("path = [\"/b/bin\"]\nfile = \"{BINDING_FILE}\"\n"), 1);
+        assert_eq!(migrated, expected);
+        assert!(binds(&migrated.parse().unwrap()));
+        // Already bound, it is not written again; a request confirms it as it is made.
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        Target::bind(root.path(), &root.path().join("bindings"), &root.path().join("pf")).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), written);
+        confirm_bound(root.path()).unwrap();
+        // Changed after the Target was made, the next request is refused before it runs.
+        std::fs::write(&path, LEGACY).unwrap();
+        let e = stop(root.path(), None, &target).unwrap_err();
+        assert_eq!(e.code, "supervisor_unbound", "{e:?}");
+        // Without `_` or `[env]` at all, the directive is added as `render` writes it.
+        let bare = "# Generated by `stack compile` from stack.toml + stack.lock. Do not edit.\n[daemons.web]\nrun = \"true\"\n";
+        std::fs::write(&path, bare).unwrap();
+        bind_config(root.path()).unwrap();
+        let doc: Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(binds(&doc) && doc["daemons"]["web"]["run"].as_str() == Some("true"), "{doc}");
+    }
+
+    #[test]
+    fn a_configuration_stack_cannot_make_bind_a_request_is_refused_and_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let path = output_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let other = LEGACY.replacen("path = [\"/b/bin\"]\n", "path = [\"/b/bin\"]\nfile = \"elsewhere.json\"\n", 1);
+        let after = format!("{}\n[env.LATE]\nvalue = \"1\"\n", LEGACY.replacen("path", &format!("file = \"{BINDING_FILE}\"\npath"), 1));
+        for text in [
+            LEGACY.replacen("# Generated by `stack compile`", "# Mine", 1),
+            other,
+            "not = [toml".to_string(),
+            LEGACY.replacen("[env._]\npath", "[env]\n_ = 1\npath", 1).replacen("[env]\nPITCHFORK", "[env2]\nPITCHFORK", 1),
+        ] {
+            std::fs::write(&path, &text).unwrap();
+            let e = Target::bind(root.path(), &root.path().join("bindings"), &root.path().join("pf")).unwrap_err();
+            assert_eq!(e.code, "supervisor_unbound", "{text}: {e:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        // The directive must decide last: one followed by another directive does not bind.
+        let late = LEGACY.replacen("path = [\"/b/bin\"]\n", &format!("file = \"{BINDING_FILE}\"\npath = [\"/b/bin\"]\n"), 1);
+        assert!(!binds(&late.parse().unwrap()));
+        assert!(!binds(&after.parse().unwrap()));
+    }
+
+    #[test]
+    fn an_inherited_binding_or_owner_mark_reaches_no_provider_command() {
+        let mut command = Command::new("mise");
+        command.env(BINDING_VAR, "/elsewhere.json").env(OWNER_VAR, "someone");
+        configure_command(&mut command, Path::new("/p/app"));
+        let removed: Vec<_> = command.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        assert!(removed.contains(&BINDING_VAR.to_string()) && removed.contains(&OWNER_VAR.to_string()), "{removed:?}");
     }
 
     #[test]

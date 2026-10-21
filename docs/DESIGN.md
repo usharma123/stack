@@ -83,7 +83,8 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Ports.** Assigned per checkout from 20000-29999 via a locked machine-wide registry; reused
   across restarts; never inside the system's ephemeral range, where an outgoing connection can
   hold a stopped service's port (a reservation made there earlier is replaced); pruned when a
-  project directory disappears; `--reassign-ports` after a foreign program takes one. Projects
+  project directory disappears (by the next compile anywhere, and by `gc` once no session of
+  it is left); `--reassign-ports` after a foreign program takes one. Projects
   may pin ports in `[override.services]`; pins are checked against other projects'
   reservations. Service defaults (5432, 6379) are never used. Before starting,
   `up` checks every assigned port: one that accepts connections without a running or starting
@@ -91,8 +92,10 @@ output (mise's answer when no release matches) is an error, not a version.
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
   assigned ports and the override for pinned ones. Stack never reassigns on its own: `down`
   removes the session while reservations persist, so "no session" does not mean "never used".
-- **Generations.** A session fingerprints the complete composed configuration, bundle lock and
-  assigned ports. `status` reports a change as stale; `exec` withholds service endpoints until
+- **Generations.** A session fingerprints the composed configuration except its tasks, the
+  bundle lock and the assigned ports. Tasks change what `run` runs, never a service, so editing
+  one keeps the session; a fingerprint recorded before tasks were left out, which still matches
+  the configuration with its tasks, is accepted too. `status` reports a change as stale; `exec` withholds service endpoints until
   `up` stops the previous owned instance and verifies the new configuration. Provider data-version checks
   remain in force: incompatible version changes fail explicitly and preserve the data, rather
   than silently reusing the old process or resetting the database.
@@ -143,7 +146,29 @@ output (mise's answer when no release matches) is an error, not a version.
   marked for another checkout is moved, with its marker, to `<data dir>.replaced-<unix time>`
   (never deleted) and named in `warnings`; the new checkout starts empty. Unmarked data, from
   before markers or with an unreadable marker, is adopted. A running service's data is not
-  touched.
+  touched. `up` also records each data directory, with the token and the service's supervisor
+  identity, in the machine state (`data.json`). Once a checkout is deleted and no session of
+  it is left, `gc` reports that data and `gc --reclaim-data` removes it, only while its marker
+  still names that checkout, the recorded supervisor confirms the service is not running, and
+  no process carrying the token runs. A path names whatever is there when it is looked up, so
+  `up` also records where the directory resolved and, once a verified service uses it, its
+  device and inode. `gc` reaches it from `/` down that resolved path with `O_NOFOLLOW` at each
+  step, requires the same device and inode, reads the marker and removes the tree through the
+  descriptors it opened (`openat`/`unlinkat`), and removes the directory's own name only if it
+  is still that directory: a replaced ancestor, a link, a copy in its place or a swap after
+  the check never redirects the removal. Quarantined `.replaced-` data and data Stack never
+  recorded are never removed.
+- **Dependencies.** `depends_on` orders starts in waves: a service is requested only once the
+  services it depends on verified and passed their declared readiness. `restart` adds every
+  service that depends on one it restarts, and `up` stops a running dependent of a service it
+  must start again before starting both, so no dependent keeps a connection to a dead
+  instance. A dependency outside what `restart` starts is never started by it: it must
+  verify and pass its readiness before anything is stopped, and again before each wave's
+  setups, or the restart fails `dependency_not_ready` without side effects of its own. A
+  `ready_cmd` passes only when it ran and exited 0 in time; one Stack could not run or read
+  answered nothing and fails, with the reason in the error. Identity stays per service: a dependent is verified on its own. A service's
+  `setup` runs just before it is requested (never for one left running), with the environment
+  `exec` would get, so migrations and seeding need not be chained into `run`.
 - **Starting.** Each service gets its own `mise daemons start -- <name>` request, in order,
   and the next is made only once the supervisor has recorded the previous service's process.
   mise holds its project lock until a request's service is ready, so a request whose service
@@ -170,6 +195,75 @@ output (mise's answer when no release matches) is an error, not a version.
   `pitchfork status --json` for its active port; if that cannot be established the recorded
   (else configured) port is waited for. A foreign listener on a reserved port is reported in
   `conflicts`, not stopped and not a failure.
+- **Supervisor lifetime.** Once its services are confirmed gone, `down` stops the Pitchfork
+  supervisor that ran them when Stack can show it started it and nothing else uses it
+  (`--keep-supervisor` opts out). Ownership: every Stack request that may start a supervisor
+  (`mise x -- pitchfork supervisor start`, `mise daemons start` and `stop`) sets
+  `STACK_SUPERVISOR_OWNER` to a random mark of the Stack state, written once to
+  `<state>/supervisor-owner` and never rewritten; the supervisor and its `log-sink` helpers
+  inherit it. At `down` the process `pitchfork status --json global/pitchfork` names must carry
+  the mark, observed before and after its environment is read and still the same process
+  before the stop. Usage: no other session records the supervisor (state directories compared
+  resolved) or records services without a supervisor, every session record is readable, and
+  no tracked daemon is in any state but stopped, failed or errored, has a live process, or has
+  a schedule. A scheduled daemon is stopped or failed between runs, yet only a running
+  supervisor starts it again, so the `cron_schedule` `pitchfork status --json` reports for each
+  daemon (omitted when it has none) keeps it, disabled or not: Pitchfork 2.29.0 runs a disabled
+  daemon on its schedule too. An answer Stack cannot read keeps it as well.
+  `pitchfork list` starts a supervisor when none answers, so it is asked only after
+  `pitchfork supervisor status` (which never starts one) says one runs. Coordination: each
+  command holds a shared lock on `stack-supervisor.lock` in the resolved supervisor state
+  directory while it asks that supervisor to start or stop something, after recording its
+  session; `down` takes it alone, waiting at most 5 seconds, for the whole check and stop.
+  The lock is that of the supervisor the request reaches: the state directory Pitchfork gets
+  from the command's environment and provider configuration, as `up` predicts its socket, never
+  one a session recorded earlier (a reused session may have run under another one, or recorded
+  none). `up` and `restart` record it in the session before starting anything there. A command
+  that cannot predict it asks nothing and fails with `supervisor_unknown`. mise renders
+  `PITCHFORK_STATE_DIR` again for every request, and a project `[env]` template may depend on
+  anything (a file a service's `setup` writes, a command's output); its value wins over any the
+  request inherits. Each request is therefore bound to the chosen supervisor inside the
+  project's own `[env]`: the generated configuration ends it with `_.file = "{{
+  get_env(name='STACK_SUPERVISOR_BINDING', default=<never written>) }}"`. Only Stack's start and
+  stop requests (the supervisor's own detached start, `mise daemons start` and `stop`) carry
+  `STACK_SUPERVISOR_BINDING`, and only from the holder of the supervisor's lock
+  (`mise::Target`); it names `$STACK_STATE_DIR/supervisor-bindings/<sha256 of the directory>.json`,
+  `{"PITCHFORK_STATE_DIR": <chosen directory>}`, and the request also inherits that directory
+  as `PITCHFORK_STATE_DIR`. mise 2026.10.3 renders the environment once per `mise daemons`
+  command and gives it to each Pitchfork call it makes (`usage`, `config add`, `start`/`stop`);
+  a later directive decides over an earlier one and over a tool's environment, and a `.json`
+  file is read literally (no template or `$` expansion), so the request reaches the chosen
+  directory whatever the project's template renders then. Without the variable the directive
+  names a file that never exists and loads nothing, so `mise env`, tasks and `exec` render the
+  project's environment as written; the variable is removed from whatever any provider command
+  inherits. The supervisor such a request starts inherits it, so a service it runs has
+  `PITCHFORK_STATE_DIR` naming that supervisor. A binding file path mise would read as a glob
+  pattern (`*`, `?`, `[`, `]` in `STACK_STATE_DIR`) is refused with `supervisor_unbound` before
+  the request. The directive binds only where the configuration mise loads carries it, and a
+  Stack from before it wrote configurations without it, which `down` and lease expiry use as
+  they find them (`up` and `restart` write theirs again first). A `mise::Target` is therefore
+  made only once the project's generated configuration ends its `[env]` with the directive:
+  under the project's lock, one starting with the line `stack compile` writes gains it there,
+  after every other `[env]` entry, with nothing else changed (exactly what `compile` writes for
+  the same inputs), in one rename that keeps its permissions; stack.toml and stack.lock are not
+  read, so a project whose manifest changed or went since is still stopped through the
+  configuration it was started with. One that is not valid TOML, was not written by `compile`,
+  or already loads another `_.file` is left alone, and nothing is asked (`supervisor_unbound`,
+  hint `stack compile`). Each start, stop and supervisor-start request confirms the directive is
+  still last as it is made, and is refused otherwise. A project without the file has no `[env]`
+  that could name another supervisor. The supervisor is still chosen once per command, and before the supervisor's
+  own start and each start or stop request the environment is confirmed, after every install,
+  setup and earlier wave, to still name it. A change is refused with `supervisor_changed`
+  before the request: the session keeps naming the chosen supervisor, under which everything
+  the command started runs, and a retry chooses the new one from its beginning. A change made
+  after that confirmation cannot redirect the request.
+  Being the supervisor's, the lock orders every Stack state's commands that use it, though
+  sessions are read from `down`'s own Stack state only: another state's checkouts are seen
+  through their daemons, which their requests started before they let go of the lock. A lock
+  file found replaced after locking is opened and locked again, and `down` keeps the
+  supervisor if its own was replaced while it decided. Stopped means `supervisor status` no
+  longer answers and no process of the supervisor's group or child of it carries the mark.
+  Every other outcome keeps the supervisor and gives the reason.
 - **Checkout token.** Every service gets `STACK_CHECKOUT_TOKEN` in its own daemon environment
   (never in `[env]`, so no task, `exec` command or `mise x` has it): a hash of the checkout's
   path, device, inode and creation time, so stable for one directory and different for one
@@ -214,6 +308,26 @@ output (mise's answer when no release matches) is an error, not a version.
 - **MCP execution.** Unix process groups bound command descendants. Output is drained through
   nonblocking pipes with fixed-size tails; neither a full pipe nor a detached descendant can
   extend collection beyond command completion or the deadline.
+- **Cancellation.** One signal handler, installed when the first command starts, passes
+  SIGINT, SIGTERM and SIGHUP on to the process group of every command running then. For a
+  user's command (`exec`, `run`, MCP calls) Stack then goes on waiting, kills the group 10 seconds
+  after the first signal or at the second, and reports the command once it is done; the MCP
+  server then answers the call and exits with 128 + the signal. A service's `setup` is run the
+  same way, and the signal cancels the start whatever the setup's exit status: `up` and
+  `restart` run no later setup, request nothing more, and fail `cancelled`. A signal that comes
+  as the command exits, too late to reach it, is still owed. The handler only records a
+  signal; a separate thread acts on it, and may run late on a busy machine. A command's run
+  therefore returns only once every signal that arrived while it was running was acted on,
+  and no command starts while a signal that already arrived is still unhandled, so a signal is
+  never judged after the step it cancelled. A provider command gets the
+  signal and Stack ends at once, as before. A command that exits on its own leaves what it
+  started running, as under a shell, unless a signal was its, including one that arrived as it
+  exited and is acted on only after: its leader is then reaped only once that signal was
+  handled, and its group gets the signal and, for a user's command, is killed first. Groups are
+  named and unnamed under one lock with the spawn and the reap, so a signal never reaches a
+  group ID that may have been reused. A
+  command attached to a terminal stays in Stack's foreground group and is passed only SIGTERM,
+  as its own PID: the terminal's own interrupt and hangup already reach it.
 - **Projects without services** never query the supervisor: `down`, `status` and `exec` have
   nothing to reconcile, and `mise daemons` is not configured for them.
 - **Partial failure.** `up` returns completed steps, whether services may have been started

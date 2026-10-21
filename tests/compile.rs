@@ -283,6 +283,59 @@ fn custom_services_get_their_loopback_address_as_their_url() {
 }
 
 #[test]
+fn the_lock_names_the_stack_that_wrote_it_without_ever_going_stale_for_it() {
+    let sb = Sandbox::new();
+    let root = sb.project("[tools]\njq = \"1.7\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let path = root.join("stack.lock");
+    let text = fs::read_to_string(&path).unwrap();
+    let me = format!("written_by = \"stack {}\"", env!("CARGO_PKG_VERSION"));
+    assert!(text.contains(&me), "{text}");
+    // Another release wrote it: nothing it pins differs, so it is neither outdated nor rewritten,
+    // and compile says which release wrote it.
+    let other = text.replace(&me, "written_by = \"stack 0.0.1\"");
+    fs::write(&path, &other).unwrap();
+    sb.compile(&root, Mode::Frozen).unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), other, "an unchanged lock is not rewritten");
+    assert!(report.warnings.iter().any(|w| w.contains("last written by stack 0.0.1")), "{:?}", report.warnings);
+    // A lock without the field (Stack 0.1.22 and earlier) is current too.
+    fs::write(&path, text.replace(&format!("{me}\n"), "")).unwrap();
+    sb.compile(&root, Mode::Frozen).unwrap();
+}
+
+#[test]
+fn service_dependencies_must_name_services_and_never_form_a_cycle() {
+    let sb = Sandbox::new();
+    let error = |text: &str| sb.compile(&sb.project(text), Mode::UseLock).unwrap_err();
+    let e = error("[services.api]\nrun = 'x'\ndepends_on = ['db']\n");
+    assert_eq!(e.code, "unknown_service", "{e:?}");
+    assert!(e.message.contains("service 'api' (project) depends on 'db'"), "{e:?}");
+    let e = error("[services.api]\nrun = 'x'\ndepends_on = ['api']\n");
+    assert_eq!(e.code, "dependency_cycle", "{e:?}");
+    let e = error("[services.a]\nrun = 'x'\ndepends_on = ['b']\n[services.b]\nrun = 'x'\ndepends_on = ['c']\n[services.c]\nrun = 'x'\ndepends_on = ['a']\n");
+    assert_eq!((e.code, e.message.as_str()), ("dependency_cycle", "services depend on each other in a cycle: a -> b -> c -> a"), "{e:?}");
+    let root = sb.project("[services.api]\nrun = 'x'\ndepends_on = ['db']\n[services.db]\npreset = 'postgres'\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+}
+
+#[test]
+fn a_postgres_preset_initializes_with_a_fixed_utf8_locale_whatever_the_callers() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.db]\npreset = \"postgres\"\n[services.cache]\npreset = \"redis\"\n[services.web]\nrun = \"serve\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let rendered: toml::Table = fs::read_to_string(mise::output_path(&root)).unwrap().parse().unwrap();
+    let daemons = rendered["daemons"].as_table().unwrap();
+    // The daemon's own environment, which its one-time `initdb` runs with, replaces the
+    // caller's locale; it is not in `[env]`, so commands keep theirs.
+    assert_eq!(daemons["db"]["env"]["LC_ALL"].as_str(), Some("C.UTF-8"), "{daemons:?}");
+    // Redis starts under any caller's locale, including one the machine lacks.
+    assert_eq!(daemons["cache"]["env"]["LC_ALL"].as_str(), Some("C"), "{daemons:?}");
+    assert!(daemons["web"].get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{daemons:?}");
+    assert!(rendered.get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{rendered:?}");
+}
+
+#[test]
 fn uv_python_selection_is_left_to_the_project_when_it_sets_one() {
     let sb = Sandbox::new();
     let root = sb.project("[tools]\npython = \"3.13\"\n[env]\nUV_PYTHON_PREFERENCE = \"managed\"\n");
