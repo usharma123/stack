@@ -592,14 +592,13 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
     unsafe {
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
-    let mut child = match spawn_named(command, passing, false, spawn_piped) {
-        Ok(child) => OwnedChild::new(child),
+    let (mut child, passed) = match spawn_named(command, passing, false, spawn_piped) {
+        Ok((child, passed)) => (OwnedChild::new(child), passing.then_some(passed)),
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
         }
     };
-    let passed = passing.then(|| Passed::new(child.child.id() as i32));
     let mut retired = false;
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
         collect(&mut child, bounded(timeout), limit, redactor, passed, |child, _| {
@@ -794,6 +793,9 @@ pub fn passed_on() -> Option<i32> {
 }
 
 /// Signals passed on to the command named with `group`, and whether to stop waiting for it.
+/// Made by [`spawn_named`] as it names the command, under the registry's lock: every signal
+/// passed on to the command after that, however soon, moves [`PASSED_ON`] past `seen`, so it is
+/// noticed even when it was handled before the run began to watch.
 #[cfg(unix)]
 struct Passed {
     group: i32,
@@ -804,10 +806,6 @@ struct Passed {
 
 #[cfg(unix)]
 impl Passed {
-    fn new(group: i32) -> Self {
-        Self { group, seen: PASSED_ON.load(std::sync::atomic::Ordering::SeqCst), forwarded: 0, first: None }
-    }
-
     /// Whether a signal was passed on to the command and it must now be killed: a second one
     /// came, or [`CANCEL_GRACE`] passed since the first.
     fn expired(&mut self) -> bool {
@@ -858,25 +856,27 @@ static SETTLED: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::
 #[cfg(all(unix, test))]
 static READER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Where a command's admission is (see [`spawn_named`]), for a test that delivers a signal
-/// there: `Deciding` before it takes the registry's lock, `Admitted` holding it, its boundary
-/// checked, before the spawn.
+/// Where a command is in its admission (see [`spawn_named`]), for a test that delivers a
+/// signal there: `Deciding` before it takes the registry's lock, `Admitted` holding it, its
+/// boundary checked, before the spawn, and `Registered` once it is named and the lock released,
+/// before its run watches it.
 #[cfg(all(unix, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
+enum Stage {
     Deciding,
     Admitted,
+    Registered,
 }
 
-/// Run by a test at each [`Admission`] point, in the thread admitting the command.
+/// Run by a test at each [`Stage`], in the thread running the command.
 #[cfg(all(unix, test))]
 #[allow(clippy::type_complexity)]
-static ADMISSION_HOOK: std::sync::Mutex<Option<Box<dyn FnMut(Admission) + Send>>> = std::sync::Mutex::new(None);
+static STAGE_HOOK: std::sync::Mutex<Option<Box<dyn FnMut(Stage) + Send>>> = std::sync::Mutex::new(None);
 
 #[cfg(all(unix, test))]
-fn admission(stage: Admission) {
-    if let Some(hook) = ADMISSION_HOOK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
-        hook(stage);
+fn stage(reached: Stage) {
+    if let Some(hook) = STAGE_HOOK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        hook(reached);
     }
 }
 
@@ -1068,14 +1068,21 @@ fn decide(commands: &mut [Named], arrival: u64, signal: libc::c_int) -> (Vec<(i3
 /// A signal arriving from the moment the spawn begins is the command's too. A `leader` command
 /// stays in stack's own group; its PID names it. Nothing is spawned while a signal that
 /// already arrived is still to be handled (see [`settle`]): one that ends stack does so first.
+/// Returns the command with what watches it for the signals passed on to it, which counts
+/// from its naming, not from when its run gets to watching.
 #[cfg(unix)]
-fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<Child> {
+fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl FnOnce(&mut Command) -> io::Result<Child>) -> io::Result<(Child, Passed)> {
     let (mut registry, since) = admitted();
     #[cfg(test)]
-    admission(Admission::Admitted);
+    stage(Stage::Admitted);
     let child = spawn(command)?;
-    registry.commands.push(Named { group: child.id() as i32, passing, since, until: None, leader, forwarded: 0 });
-    Ok(child)
+    let group = child.id() as i32;
+    registry.commands.push(Named { group, passing, since, until: None, leader, forwarded: 0 });
+    let passed = Passed { group, seen: PASSED_ON.load(std::sync::atomic::Ordering::SeqCst), forwarded: 0, first: None };
+    drop(registry);
+    #[cfg(test)]
+    stage(Stage::Registered);
+    Ok((child, passed))
 }
 
 /// The registry's lock, with every signal that arrived so far handled, and that arrival
@@ -1087,7 +1094,7 @@ fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl F
 fn admitted() -> (std::sync::MutexGuard<'static, Registry>, u64) {
     loop {
         #[cfg(test)]
-        admission(Admission::Deciding);
+        stage(Stage::Deciding);
         let registry = registry();
         let arrival = ARRIVALS.load(std::sync::atomic::Ordering::SeqCst);
         if HANDLED.load(std::sync::atomic::Ordering::SeqCst) >= arrival {
@@ -1239,8 +1246,8 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         unsafe {
             command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
         }
-        let mut child = OwnedChild::new(spawn_named(command, true, false, Command::spawn)?);
-        let mut passed = Passed::new(child.child.id() as i32);
+        let (child, mut passed) = spawn_named(command, true, false, Command::spawn)?;
+        let mut child = OwnedChild::new(child);
         let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
             let start = Instant::now();
             loop {
@@ -1295,14 +1302,13 @@ pub fn run_attached(command: &mut Command) -> io::Result<std::process::ExitStatu
     unsafe {
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
-    let mut child = match spawn_named(command, true, terminal, Command::spawn) {
-        Ok(child) => OwnedChild::new(child),
+    let (mut child, mut passed) = match spawn_named(command, true, terminal, Command::spawn) {
+        Ok((child, passed)) => (OwnedChild::new(child), passed),
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
         }
     };
-    let mut passed = Passed::new(child.child.id() as i32);
     let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| loop {
         if exited(&child.child)? {
             break Ok(());
@@ -1371,7 +1377,7 @@ fn output_within(command: &mut Command, timeout: Duration) -> io::Result<Output>
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
     let mut child = match spawn_named(command, false, false, spawn_piped) {
-        Ok(child) => OwnedChild::new(child),
+        Ok((child, _)) => OwnedChild::new(child),
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
@@ -1723,10 +1729,10 @@ mod tests {
         panic!("still running after the signal was handled");
     }
 
-    /// Run `hook` in the thread admitting a command, the first time one reaches `stage`.
-    fn at_admission(stage: Admission, hook: impl FnOnce() + Send + 'static) {
+    /// Run `hook` in the thread running a command, the first time one reaches `stage`.
+    fn at_stage(stage: Stage, hook: impl FnOnce() + Send + 'static) {
         let mut hook = Some(hook);
-        *ADMISSION_HOOK.lock().unwrap() = Some(Box::new(move |reached| {
+        *STAGE_HOOK.lock().unwrap() = Some(Box::new(move |reached| {
             if reached == stage {
                 if let Some(hook) = hook.take() {
                     hook();
@@ -1787,7 +1793,7 @@ mod tests {
         // The signal is read but not handled until this is dropped, as a busy machine may delay it.
         let gate = READER_GATE.lock().unwrap();
         // It arrives after any settling an earlier admission did, before this one's decision.
-        at_admission(Admission::Deciding, || terminate_self(1));
+        at_stage(Stage::Deciding, || terminate_self(1));
         let waits = SETTLE_WAITS.load(std::sync::atomic::Ordering::SeqCst);
         let started = dir.join("started");
         let file = started.clone();
@@ -1820,7 +1826,7 @@ mod tests {
         forwarder().unwrap();
         let gate = READER_GATE.lock().unwrap();
         // Holding the registry's lock, the boundary checked: the signal is the command's.
-        at_admission(Admission::Admitted, || terminate_self(1));
+        at_stage(Stage::Admitted, || terminate_self(1));
         let started = dir.join("started");
         let file = started.clone();
         std::thread::spawn(move || capture(Command::new("sh").args(["-c", STARTS, "sh"]).arg(file), Duration::from_secs(30), 1024));
@@ -1851,7 +1857,7 @@ mod tests {
         let running = std::thread::spawn(move || capture_redacted(Command::new("sh").args(["-c", STARTS, "sh"]).arg(file), Duration::from_secs(30), 1024, None).unwrap());
         wait_for("the first command to start", || first.exists());
         let gate = READER_GATE.lock().unwrap();
-        at_admission(Admission::Deciding, || terminate_self(1));
+        at_stage(Stage::Deciding, || terminate_self(1));
         let waits = SETTLE_WAITS.load(SeqCst);
         let file = second.clone();
         let admitted = std::thread::spawn(move || capture_redacted(Command::new("sh").args(["-c", r#"echo $$ > "$1""#, "sh"]).arg(file), Duration::from_secs(30), 1024, None).unwrap());
@@ -1860,7 +1866,7 @@ mod tests {
         assert_eq!((HANDLED.load(SeqCst), passed_on()), (0, None));
         // What the admission saw once it went ahead.
         let (tx, rx) = std::sync::mpsc::channel();
-        at_admission(Admission::Admitted, move || tx.send((HANDLED.load(SeqCst), passed_on())).unwrap());
+        at_stage(Stage::Admitted, move || tx.send((HANDLED.load(SeqCst), passed_on())).unwrap());
         drop(gate);
         let running = running.join().unwrap();
         let admitted = admitted.join().unwrap();
@@ -1870,6 +1876,124 @@ mod tests {
         assert_eq!(passed_on(), Some(libc::SIGTERM));
         // Both retired once done, and forgotten: every signal they received was handled.
         assert!(registry().commands.is_empty());
+    }
+
+    /// Starts a background `sleep`, writes its PID to `$1` whole and waits for it, both ignoring
+    /// SIGTERM: a user's command that keeps working after a cancellation.
+    const IGNORES: &str = r#"trap '' TERM; sleep 60 & echo $! > "$1.tmp" && mv "$1.tmp" "$1"; wait"#;
+
+    /// An unrelated process, in a group of its own, that no signal of stack's may reach; killed
+    /// once dropped.
+    struct Sentinel(std::process::Child);
+
+    impl Sentinel {
+        fn start() -> Self {
+            use std::os::unix::process::CommandExt;
+            Self(Command::new("sleep").arg("60").process_group(0).spawn().unwrap())
+        }
+
+        fn alive(&mut self) -> bool {
+            self.0.try_wait().unwrap().is_none()
+        }
+    }
+
+    impl Drop for Sentinel {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The runs that watch a user's command for the signals passed on to it.
+    #[derive(Clone, Copy)]
+    enum Watched {
+        Captured,
+        Deadline,
+        Attached,
+    }
+
+    /// Run [`watched_after_a_signal`] for `how` in a process of its own (`name`); nothing it
+    /// started may be left.
+    fn signal_before_watching(name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let run = run_alone(name, dir.path());
+        let left = reap_left(&dir.path().join("started"));
+        let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert_eq!(left, None, "the command's group outlived its run\n{shown}");
+        assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "{shown}");
+    }
+
+    /// A user's command is passed SIGTERM, and that is fully handled, once it is named but before
+    /// its run watches it. It ignores the signal. With no second signal, its group must still be
+    /// killed once [`CANCEL_GRACE`] passes: not at the run's own deadline, and not never.
+    fn watched_after_a_signal(how: Watched) {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(dir) = std::env::var_os(ALONE).map(std::path::PathBuf::from) else { return };
+        forwarder().unwrap();
+        let mut sentinel = Sentinel::start();
+        let started = dir.join("started");
+        let file = started.clone();
+        at_stage(Stage::Registered, move || {
+            wait_for("the command to start", || file.exists());
+            terminate_self(1);
+            wait_for("the signal to be passed on", || HANDLED.load(SeqCst) >= 1);
+        });
+        let mut command = Command::new("sh");
+        command.args(["-c", IGNORES, "sh"]).arg(&started);
+        let start = Instant::now();
+        let (signal, timed_out) = match how {
+            Watched::Captured => {
+                let out = capture_redacted(&mut command, Duration::from_secs(40), 1024, None).unwrap();
+                (out.signal, out.timed_out)
+            }
+            Watched::Deadline => {
+                let (code, timed_out) = run_with_deadline(&mut command, Duration::from_secs(40)).unwrap();
+                (code.map(|c| c - 128), timed_out)
+            }
+            Watched::Attached => (run_attached(&mut command).unwrap().signal(), false),
+        };
+        let took = start.elapsed();
+        assert!(!timed_out && took < Duration::from_secs(30), "the grace never started: ended after {took:?}, timed out {timed_out}");
+        assert!(took >= CANCEL_GRACE, "killed after {took:?}, before the grace passed");
+        assert_eq!(signal, Some(libc::SIGKILL), "the command was killed with its group");
+        assert_eq!((ARRIVALS.load(SeqCst), passed_on()), (1, Some(libc::SIGTERM)), "one signal, owed");
+        let child = pid_in(&started).unwrap();
+        assert!(ends_soon(child as u32), "the group's sleep {child} survived");
+        assert!(sentinel.alive(), "an unrelated process was signalled");
+    }
+
+    #[test]
+    fn a_signal_handled_before_a_capture_watches_its_command_still_starts_the_grace() {
+        signal_before_watching("signal_before_watching_a_capture");
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_handled_before_a_capture_watches_its_command_still_starts_the_grace"]
+    fn signal_before_watching_a_capture() {
+        watched_after_a_signal(Watched::Captured);
+    }
+
+    #[test]
+    fn a_signal_handled_before_a_deadline_run_watches_its_command_still_starts_the_grace() {
+        signal_before_watching("signal_before_watching_a_deadline_run");
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_handled_before_a_deadline_run_watches_its_command_still_starts_the_grace"]
+    fn signal_before_watching_a_deadline_run() {
+        watched_after_a_signal(Watched::Deadline);
+    }
+
+    #[test]
+    fn a_signal_handled_before_an_attached_run_watches_its_command_still_starts_the_grace() {
+        signal_before_watching("signal_before_watching_an_attached_run");
+    }
+
+    #[test]
+    #[ignore = "run by a_signal_handled_before_an_attached_run_watches_its_command_still_starts_the_grace"]
+    fn signal_before_watching_an_attached_run() {
+        watched_after_a_signal(Watched::Attached);
     }
 
     #[test]
