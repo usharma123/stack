@@ -118,7 +118,10 @@ esac
             .env("REVIEW_FIXTURE", self.dir.path())
             .env("REVIEW_PYTHON", python::python())
             .env("STACK_STATE_DIR", self.dir.path().join("state"))
-            .env("STACK_CACHE_DIR", self.dir.path().join("cache"));
+            .env("STACK_CACHE_DIR", self.dir.path().join("cache"))
+            // The supervisor's state directory is the test's own unless a test names one: Stack
+            // writes its supervisor lock there, never in the caller's Pitchfork state.
+            .env("PITCHFORK_STATE_DIR", self.dir.path().join("pfs"));
         command
     }
 
