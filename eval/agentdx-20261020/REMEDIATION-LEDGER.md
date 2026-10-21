@@ -15,7 +15,9 @@ The second independent review, of `f58c09f`, found one boundary case of each of 
 and F3 fixes still wrong; they are in
 [round 3](#corrections-after-the-second-independent-review-round-3). The third, of `b1bcd9e`,
 found one command-admission case next to round 3's signal fix; it is in
-[round 4](#corrections-after-the-third-independent-review-round-4). Every row names its proof; "remaining limit" is what the fix
+[round 4](#corrections-after-the-third-independent-review-round-4). The fourth, of `e34817c`,
+found two cancellation cases in the callers of the shared process helpers; they are in
+[round 5](#corrections-after-the-fourth-independent-review-round-5). Every row names its proof; "remaining limit" is what the fix
 does not do.
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
@@ -188,6 +190,33 @@ at the admission points. "After" paths are under
   between the two was neither handled first nor the new command's (R4-F1). That round-3 row and
   section are kept as written.
 
+## Corrections after the fourth independent review (round 5)
+
+The independent AI review of `e34817c` (Astra) found R4-F1's admission correction sound, and F1,
+F4 and typed readiness still passing, but requested changes for two cancellation cases in the
+callers of the shared process helpers. As in round 4, the reviewer derived both from the source
+and did not run them, and neither was observed in a real Stack run here before the fix. Both were
+reproduced deterministically by unit tests against the unfixed code, with test-only hooks; the
+same tests pass after. "After" paths are under
+`eval/results/agentdx-product-corrections-r5-20261020/`.
+
+| # | Finding | Severity | Kind | Before | Fix | Proof after | Remaining limit |
+|---|---|---|---|---|---|---|---|
+| R5-F1 | A user's command was named under the registry lock and the lock released before its run made the monitor watching it for passed-on signals. The monitor took the global count of passed-on signals as seen and the command's own count as zero, so a SIGTERM passed on to the command in between was never noticed: with no second signal the cancellation grace never started. An attached `exec`/`run` without `--timeout` could wait indefinitely for a command ignoring SIGTERM; a captured one (`--json`, MCP, setup) or `--timeout` run waited for its own deadline instead of the 10 s grace | P1 | defect in R2's signal forwarding (`c6c54aa`) | review of `e34817c` (source schedule); `before/r5-f1-unit.log`, the final tests and hooks on the unfixed code (`before/r5-f1-tests-on-unfixed.diff`, built by `scripts/unfix_f1.py`): signal passed on and handled after the naming, before the run watches: the captured and deadline runs time out after 40 s, the attached run does not return within the 60 s bound | `c0e6238` | `spawn_named` makes the monitor under the same lock as the naming, so every later forward moves the global count past what it saw and its own count is read. One test per caller (capture, `run_with_deadline`, `run_attached`), each in a process of its own, with a test-only hook once the command is named and the lock released: the command ignores SIGTERM, one signal is sent and handled before the run watches, and the group is killed after the grace (≥ 10 s, < 30 s) with no second signal, the signal owed, an unrelated process alive (`after/r5-unit.log`, 20 of 20 repeats in `after/r5-repeat20.txt`) | The grace is timed from when the run first sees the signal, at most one poll interval after the forward once the run watches. The first-signal/second-signal policy and the 10 s grace are unchanged |
+| R5-F2 | `run_attached` (`exec`/`run` without `--json` or `--timeout`) decided whether to kill what an exited command left in its group from the signals its monitor had seen handled, before retirement took the lock and counted the signals that were the command's. A SIGTERM counted while the command ran but still queued for the signal thread, or one passed on between that check and retirement, was missed: the leader was reaped with its group kept, the signal thread then found the command retired and signalled nothing, and a descendant ignoring SIGTERM outlived Stack. Provider commands run by `output` had the same order: a signal queued as one exited never reached its group before it ended Stack | P1 | defect in R2's signal forwarding (`c6c54aa`), not fixed by R3-F2's retirement settlement | review of `e34817c` (source schedule); `before/r5-f2-unit.log`, the final tests and hook on `c0e6238` (`before/r5-f2-tests-on-unfixed.diff`, `scripts/unfix_f2.py`): queued attached signal and a signal handled as the attached command is retired both leave its SIGTERM-ignoring sleep running; a provider command's queued signal never reaches the sleep it started; the unsignalled control passes before and after. Real binary, timing-assisted: `after/probes/attached-r4/`, the round-4 binary with the reviewer's delayed signal thread: attached `exec` exits 0 and its SIGTERM-ignoring sleep is still running (the probe then killed it) | `34369ef` | `retire` decides at its own boundary. Cut short: killed with its group at once, as before. Exited: the leader stays unreaped and the command `held`; retirement waits without the lock until every signal that arrived by then is handled, the signal thread still signals a held group (its ID kept by the unreaped leader), then under the lock the group is killed before the reap if a signal was the command's, else only the leader is reaped. Nothing signals a group after its leader is reaped. Tests in a process of their own: queued attached signal; signal handled at retirement (test-only hook); queued provider signal; unsignalled control keeps its sleep; plus the decide unit test for held entries (`after/r5-unit.log`, 20 of 20 repeats). Real binary, timing-assisted: `after/probes/attached-r5/`, the same probe on the round-5 binary: the sleep is gone, the unsignalled control keeps its sleep on both binaries, sentinel alive | A signal the kernel has not delivered to Stack's handler by the time the command is retired belongs to what follows, as before. Attached `exec` still reports the command's own exit status (0 for a command that exits 0 after SIGTERM), as documented; only its group is now cleaned up. On a terminal the command stays in Stack's group, so only its leader is ever signalled |
+
+### Statements the findings made wrong
+
+- **R2** (`c6c54aa`). The `run_attached` doc said whatever is still in an attached command's group
+  "is killed once the command is done after a signal was passed on". That held only for signals
+  its monitor had seen handled before the command exited (R5-F2). DESIGN.md said Stack "kills the
+  group 10 seconds after the first signal or at the second". A first signal handled before the
+  run first looked never started that grace (R5-F1).
+- **R3-F2** (round 3) said "a command's run returns only once every signal that arrived while it
+  was running was acted on". The run did wait for them, but for an attached command the decision
+  to clean its group up was taken before that wait (R5-F2). The round-3 and round-4 rows are kept
+  as written.
+
 ## Commits
 
 | Commit | Subject |
@@ -230,3 +259,5 @@ at the admission points. "After" paths are under
 | `dbb5085` | fix(process): act on every signal a command got before judging it (R3-F2) |
 | `ba5360f` | fix(restart): never take a ready_cmd that could not run as passing (R3-F3) |
 | `f6a87b6` | fix(process): admit a command only past a boundary every signal before was handled at (R4-F1) |
+| `c0e6238` | fix(process): watch a command for signals from its naming, not its run's first look (R5-F1) |
+| `34369ef` | fix(process): decide what an exited command keeps only once its signals are handled (R5-F2) |

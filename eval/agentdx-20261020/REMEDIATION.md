@@ -20,9 +20,122 @@ of each of F2 and F3; they are dealt with in
 [round 3](#round-3-corrections-after-the-second-independent-review). The third (Astra, of
 `b1bcd9e`) found round 3's corrections in place and requested changes for one command-admission
 case next to them, derived from the source; it is dealt with in
-[round 4](#round-4-correction-after-the-third-independent-review). A new independent review of
-the round-4 head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
+[round 4](#round-4-correction-after-the-third-independent-review). The fourth (Astra, of
+`e34817c`) found round 4's correction sound and requested changes for two cancellation cases in
+the callers of the shared process helpers, derived from the source; they are dealt with in
+[round 5](#round-5-corrections-after-the-fourth-independent-review). A new independent review of
+the round-5 head is pending. Nothing here was pushed, released or published, and 0.1.22 is still
 not on npm. Every binary below is a source build.
+
+## Round 5: corrections after the fourth independent review
+
+| | |
+|---|---|
+| Tested head | `34369efb10cece72432843235fa8fd2ba4d55c3c`, clean tree: round 4's head `e34817c` plus two commits, R5-F1 `c0e6238` and R5-F2 `34369ef`. The documentation commit after them changes no code |
+| Binary | `cargo build --locked` (cargo 1.93.1, debug), `stack 0.1.22`, sha256 `84f3c9064f5e7f17e2d0e3e754a8bb223d5b673225bcc10117aed43678973287`, frozen in `gates/bin/stack`. `cargo test` rebuilt the same hash |
+| Evidence | `eval/results/agentdx-product-corrections-r5-20261020/` (git-ignored; paths in this section are relative to it). Earlier rounds' directories are untouched |
+
+What each finding was, its fix, proof and remaining limit are in the
+[ledger](REMEDIATION-LEDGER.md#corrections-after-the-fourth-independent-review-round-5). In short:
+
+- **R5-F1** A user's command was named for signal forwarding, and the registry lock released,
+  before its run made the monitor that watches it. A signal passed on to the command in
+  between was taken as already seen, so the 10 s cancellation grace never started. An attached
+  `exec` without `--timeout` could then wait for a command ignoring SIGTERM indefinitely; a
+  captured or `--timeout` run waited for its own deadline. The monitor is now made under the
+  naming lock, for all three runs that watch a user's command.
+- **R5-F2** An attached run (`exec`/`run` without `--json` or `--timeout`) decided whether to kill
+  what an exited command left in its group before the signals that were the command's had all
+  been handled. A SIGTERM still queued for the signal thread as the command exited 0 left a
+  descendant ignoring SIGTERM running after Stack. Retirement now makes that decision itself:
+  an exited command's leader stays unreaped, and its group still signalled, until every signal
+  that arrived by then is handled, and the group is killed before the reap if one was the
+  command's. Provider commands run by `output` follow the same order, so a signal queued as one
+  exited now reaches its group before it ends Stack. A command that ends unsignalled still keeps
+  what it started.
+
+Both findings are source-derived: the reviewer gave the schedules from the code and did not run
+them, and no real Stack run here showed either before the fix. Each was reproduced
+deterministically by unit tests on the unfixed code. The final tests, with their test-only
+hooks (compiled into test builds only, like the earlier reader gate), were applied to the code
+before each fix by `scripts/unfix_f1.py` and `scripts/unfix_f2.py` in scratch exports
+(`before/r5-f*-tests-on-unfixed.diff`; `scripts/before.sh`).
+
+- `before/r5-f1-unit.log`: a SIGTERM is passed on and handled once the command is named, before
+  the run watches. The command ignores it. The captured and deadline runs time out after 40 s, and
+  the attached run does not return within the 60 s bound. After the fix, each run kills the group
+  once the 10 s grace passes, with no second signal.
+- `before/r5-f2-unit.log`: three schedules leave the command's SIGTERM-ignoring sleep running. In
+  the first, an attached command's SIGTERM is held back while it exits 0. In the second, a signal
+  is passed on as the attached command is retired. In the third, a provider command's queued
+  signal never reaches the sleep it started. The unsignalled control keeps its sleep both before
+  and after.
+
+After the fix all 41 process tests pass (`after/r5-unit.log`). Twenty repeats of every signal
+schedule test pass (`after/r5-repeat20.txt`: round 3's two, round 4's three and round 5's
+seven, with nothing left running). `INVARIANTS.md` in the evidence directory states, for each
+caller, what holds at admission, monitor initialization and refresh, grace, normal completion,
+received-but-unhandled cancellation, retirement and reaping, and which test covers each.
+
+### Gates at the round-5 head (`gates/`)
+
+| Gate | Result |
+|---|---|
+| `cargo clippy --locked --all-targets -- -D warnings` (1.93.1) | exit 0 |
+| `cargo test --locked --all-targets` | exit 0: 530 passed, 0 failed, 13 ignored, across 15 test binaries (round 4's 523 plus round 5's seven; the seven new ignored tests are their inner halves, each run in its own process by its passing outer test) |
+| `node --test tests/*.test.mjs` | exit 0: 41 pass, 1 skipped |
+| Provider boundary against the real mise (`/opt/homebrew/bin/mise` 2026.10.3) | exit 0: 2 passed |
+| `tests/e2e/native.sh`, macOS 15.7.2 arm64 | exit 0: 12 of 12, including `5-oci` against a run-owned `registry:2` container removed afterwards |
+| `bench/regressions.py`, cold | exit 0: all six `FIXED`, controls passed, cleanup clean, `globals_changed: []` |
+| Eight validation cells, cold | all valid: no-op rejected, reference passing, task loop passing before and after, cleanup clean, `globals_changed: []` in every cell |
+| Bench unit tests | 124 pass in the checkout and in a clean `git archive HEAD` export |
+| Linux, local Docker LinuxKit arm64 (`linux/`, `linux-e2e/`), not a hosted runner | Debian, `rust:1.93`, built from `34369ef` as an unprivileged user (binary `600247d2…`). Unit tests 239 passed, 13 ignored (the twelve inner halves, each run by its outer test, and `procinfo`'s sleeper helper), including round 5's seven, round 4's three and round 3's two schedule tests. The runtime tests that the signal, exec-termination and setup fixes touch: 27 passed. The six regressions run cold: all `FIXED`, `globals_changed: []`. The native e2e suite passed all 11 scenarios it ran; OCI was skipped for want of a registry. Both containers were run-owned and removed |
+
+The global Stack/mise/Pitchfork hash receipt before (`globals-before.json`) equals round 4's
+final one; the receipt after (`globals-after.json`) equals it too.
+
+### Probes, on the frozen binary (`after/probes/`)
+
+- `scripts/attached_probe.py` (new): attached `stack exec`, with no terminal, against real mise
+  2026.10.3. The command starts a sleep ignoring SIGTERM and checks that its parent is the binary
+  under test. It then sends that parent SIGTERM and exits 0. It runs once under the reviewer's
+  delayed signal thread (`delay_forwarder_v2.dylib`, hash unchanged), once without it, and once
+  as an unsignalled control. On the round-4 binary (`attached-r4/`) the delayed case exits 0 with
+  the sleep still running; the probe then killed it. On the round-5 binary (`attached-r5/`) the
+  sleep is gone. Both binaries clean up the case without the delay, both keep the control's
+  sleep, and the sentinel and unsaved file survive. This probe is timing-assisted (a 500 ms
+  pause), not a deterministic schedule. Its first version was invalid and is kept in
+  `drafts/attached-probe-v1-invalid/` with the reason: the sleep held Stack's output pipes, so
+  the harness waited for it to end before checking.
+- `scripts/probes.sh` reruns round 3's cancellation probes (`r3/`), as round 4 did. The
+  reviewer's `late_signal_v2.py` and its control give exit 143, `cancelled`, the later setup not
+  run, the sentinel alive and unsaved work kept. Round 3's `late_signal_r3.py` covers CLI
+  graceful, CLI ignoring SIGTERM, MCP and a partial wave, all `cancelled` with exit 143. Every
+  field matches round 4's receipt except ports, PIDs, paths and the binary hash.
+- R5-F1 has no real-binary probe. Its window lies between two statements in Stack's own thread,
+  which no external delay can hold open; only the unit tests control it.
+
+### What was not rerun
+
+- No agent trial. The six-trial pilot describes round 1's binary only. Its report still hashes
+  `60aa3b11…`, and no human has reviewed it.
+- The F1/F4 and readiness probes were not rerun. This round touches only signal monitoring and
+  retirement in `src/process.rs`, and the unit and runtime tests for those paths pass at this
+  head.
+- No hosted runner, Linux x64 or Intel macOS.
+
+### Remaining limits of round 5
+
+- A signal the kernel has not yet delivered to Stack's handler when a command is retired still
+  belongs to what follows, as in rounds 3 and 4. Waits for the signal thread are still unbounded.
+- The grace is timed from when the run first sees a forwarded signal, not from the forward
+  itself. Once the run is watching, that is at most one poll interval.
+- Attached `exec` still exits with the command's own status after a passed-on signal, as
+  documented ("reports the command once it is done"). A command that exits 0 on SIGTERM gives
+  exit 0. Only its group is now cleaned up.
+- On a terminal the command stays in Stack's process group, so only its leader is ever
+  signalled or killed. That path has no end-to-end test here, because none of the tests run on
+  a terminal.
 
 ## Round 4: correction after the third independent review
 
@@ -128,6 +241,9 @@ What each finding was, its fix, proof and remaining limit are in the
   took the registry lock. One arriving in between was neither handled first nor the new
   command's: R4-F1, [round 4](#round-4-correction-after-the-third-independent-review). The
   text above is kept as written.)*
+  *(Note added in round 5: the run did wait for those signals, but an attached run decided
+  whether to clean up its command's group before that wait: R5-F2,
+  [round 5](#round-5-corrections-after-the-fourth-independent-review).)*
 - **R3-F3** The restart prerequisite gate took a `ready_cmd` that could not be spawned or read
   as passing, and stopped the dependent. A `ready_cmd` now passes only when it ran and exited 0
   in time; one that could not run is `dependency_not_ready` with the reason, before anything is
