@@ -23,7 +23,9 @@ does not do.
 After round 5, the owner decided O1: plain `down` now stops the supervisor Stack started when
 nothing else uses it. That dated change is in
 [Follow-up 2026-10-21](#follow-up-2026-10-21-plain-down-stops-the-supervisor-stack-started-owner-decision-on-o1);
-the O1 and L6 rows below still describe the opt-in behaviour they were recorded with.
+the O1 and L6 rows below still describe the opt-in behaviour they were recorded with. Its
+review found two cases where it stopped a supervisor still in use; they are corrected in
+[Correction 2026-10-21](#correction-2026-10-21-review-of-the-follow-up-sc2-f1-sc2-f2).
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
 agents need that Stack did not have), **docs** (behaviour was right or deliberate but undocumented
@@ -281,6 +283,34 @@ Remaining limits:
   them.
 - `gc`, lease expiry, disposal, snapshots and H1 are unchanged.
 
+## Correction 2026-10-21: review of the follow-up (SC2-F1, SC2-F2)
+
+A fresh independent review (Astra) of the follow-up at `fd76459` requested changes for two
+counterexamples to "stop only after the last use", both reproduced with the frozen `b80318c`
+binary and real Pitchfork 2.29.0. Both are corrected below. The follow-up entry above stays as
+written; the claims this correction supersedes are listed after the table.
+
+| # | Problem | Kind | Before | Fix | Proof | Remaining limit |
+|---|---|---|---|---|---|---|
+| SC2-F1 | A checkout using another Stack state but the same Pitchfork state directory could start a healthy service between `down`'s daemon list and its supervisor stop; `down` then stopped the supervisor and the service with it | defect | The coordination lock lived in the caller's Stack state, so two states took different locks. The review's transparent wrapper held the real `pitchfork list` answer: B's `up` returned healthy in about 4 s, then A stopped the supervisor and B's service died (`confirmed: true`, `supervisor.stopped: true`). The new runtime test fails on the `fd76459` source at "state-b: B's `up` finished while A was deciding" | `9946319` | The lock is now `stack-supervisor.lock` in the resolved Pitchfork state directory, so every Stack state and every name for that directory opens one file. A lock file found replaced after locking is opened and locked again, and `down` keeps the supervisor if its own was replaced while it decided. Runtime test `an_up_through_the_same_supervisor_waits_for_a_down_deciding_to_stop_it_whatever_its_stack_state` (other state and same-state control); unit test `a_lock_file_replaced_while_it_is_locked_is_locked_anew_and_its_holder_can_tell`. The review's own race scripts, with only their output path and binary changed, now give the same outcome for a separate state as for the same-state control: B waits for A (16.0 s and 15.9 s), A stops the then-unused supervisor, and B starts afresh and stays healthy with the same PID and open port | `down` still reads sessions from its own Stack state only. Another state's checkout is seen through its daemons, which its requests started before letting go of the lock. Removing the Pitchfork state directory while commands use it is outside what the lock covers. A forced interleaving is proven, not a natural frequency |
+| SC2-F2 | `down` stopped a supervisor whose external daemon had an enabled schedule, so the schedule stopped firing | defect | A scheduled daemon is `stopped` (or `failed`/`errored`) between runs, and `down` counted that as over. The review's `scheduled.sh` showed no runs in the 23 s after `down`, and three once that supervisor was restarted | `4ae0435` | For every daemon that is otherwise over, `down` reads its `cron_schedule` from `pitchfork status --json <id>` (which reads the state file and starts no supervisor) and keeps the supervisor while one exists. A disabled daemon counts too: Pitchfork 2.29.0 ran a disabled cron daemon four times in 35 s, although its scheduling guide says `disable` prevents scheduled starts. An answer Stack cannot read, or a daemon Pitchfork no longer knows, also keeps it. Runtime cases: between runs, after a failed run, disabled, a non-string schedule, a missing status, a mismatched id and a missing daemon all keep it; no schedule (omitted, as Pitchfork omits it, or null) stops it. Real probes: the review's `scheduled.sh` (paths only changed) now keeps the supervisor, naming `external/timer`, with ticks 2 to 4 in the 23 s after `down`. A wider probe kept it between runs and after an errored run (ticks and failures went on), kept it while both daemons were disabled (ticks 4 to 7), and stopped it once the schedules were removed from configuration, after which nothing ran | A schedule removed from configuration counts until the supervisor's next check (about 10 s) has written it out. A schedule only in a configuration the supervisor has not yet registered is seen once it does (list reports such daemons as `available`, which already keeps it). Stack adds no scheduling feature |
+
+Superseded claims of the follow-up entry above:
+
+- "A command holds a shared lock per resolved supervisor state directory
+  (`<state>/supervisors/<hash>.lock`)": the lock is now in that directory itself and shared by
+  every Stack state.
+- "The lock orders this Stack state's commands only": it now orders every Stack state's
+  commands that use the supervisor; only session records stay per state.
+- "A stopped daemon that has a schedule counts as stopped": it now keeps the supervisor,
+  disabled or not.
+
+Unchanged: ownership marks, the other usage checks, the never-start-to-check rule, the CLI and
+MCP defaults and opt-outs, `gc`, leases, disposal, snapshots and H1. The review's 19 ordinary
+assertions (its `positive.py`, paths only changed) all pass with the corrected binary. Evidence
+is in `eval/results/agentdx-supervisor-corrections-r2-20261021/` (git-ignored). The pilot report
+is unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
+
 ## Commits
 
 | Commit | Subject |
@@ -326,3 +356,5 @@ Remaining limits:
 | `c0e6238` | fix(process): watch a command for signals from its naming, not its run's first look (R5-F1) |
 | `34369ef` | fix(process): decide what an exited command keeps only once its signals are handled (R5-F2) |
 | `b80318c` | feat(down): stop the supervisor Stack started once nothing else uses it (follow-up 2026-10-21, O1 decision) |
+| `9946319` | fix(down): coordinate with every Stack state that uses the same supervisor (SC2-F1) |
+| `4ae0435` | fix(down): keep the supervisor while a daemon it runs has a schedule (SC2-F2) |

@@ -333,3 +333,9 @@ than the "state directory under a Stack-owned per-root path" option above, and i
 any state directory. It is recorded in the
 [ledger follow-up](REMEDIATION-LEDGER.md#follow-up-2026-10-21-plain-down-stops-the-supervisor-stack-started-owner-decision-on-o1).
 The other questions, and the disposal and lease items of the roadmap, are still open.
+
+Its review found two cases where that stopped a supervisor still in use: a checkout of another
+Stack state starting through it, and an external daemon's schedule. Since `9946319` and
+`4ae0435`, every Stack state using a supervisor shares one coordination lock, and a scheduled
+daemon keeps the supervisor running. See the
+[ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-review-of-the-follow-up-sc2-f1-sc2-f2).

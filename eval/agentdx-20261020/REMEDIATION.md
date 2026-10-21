@@ -111,7 +111,71 @@ Not done:
   by a person, and `complete` and `publishable` remain false;
 - a hosted Linux run.
 
-Next: a new independent review of the follow-up.
+Next: a new independent review of the follow-up. It requested changes, which the
+[correction below](#correction-2026-10-21-the-follow-ups-review-sc2-f1-sc2-f2) deals with.
+
+## Correction 2026-10-21: the follow-up's review (SC2-F1, SC2-F2)
+
+| | |
+|---|---|
+| Review | Astra, fresh and independent, of `fd76459` (code `b80318c`): request changes, two P1 counterexamples reproduced with the frozen binary and real Pitchfork 2.29.0 (SC2-F1 cross-Stack-state race, SC2-F2 enabled external schedule). Its sources were read and left unchanged; their hashes are in `review-sources.sha256` |
+| Start | Clean `fd764596a825473bb7f5f4f8b29793049d40767b`; `b80318c` and `fd76459` kept as they are |
+| Tested head | `4ae04358591e8e80d54e80c6a7a5bd6b5e157ef5`, clean tree: `9946319` (SC2-F1) and `4ae0435` (SC2-F2), each with its code, tests and user and design docs. The documentation commit after them changes only `eval/agentdx-20261020/` |
+| Binary | `cargo build --locked` (cargo 1.93.1, debug, macOS 15.7.2 arm64), sha256 `c4f04430031a55e2ee6d532416687304f40254399120ba13fdf5c24a175b3255`, frozen in `gates/bin/stack`; `cargo test` rebuilt the same hash. `git archive 4ae0435 src` sha256 `c51df1fc307f621256fa2288680bf838fa8d54c142ffe642a22962e2dd3abc79` |
+| Evidence | `eval/results/agentdx-supervisor-corrections-r2-20261021/` (git-ignored; paths below are relative to it) |
+
+What changed and why is in the
+[ledger](REMEDIATION-LEDGER.md#correction-2026-10-21-review-of-the-follow-up-sc2-f1-sc2-f2). In short:
+
+- **SC2-F1.** The coordination lock moved from each Stack state into the supervisor's own state
+  directory (`stack-supervisor.lock`, resolved), so commands of every Stack state that use one
+  supervisor share it. A lock file replaced while being locked is locked anew, and `down`
+  keeps the supervisor if its own was replaced while it decided.
+- **SC2-F2.** A daemon with a `cron_schedule` (from `pitchfork status --json`) keeps the
+  supervisor between runs, after a failed run and while disabled. Pitchfork 2.29.0 still runs
+  a disabled daemon on its schedule (`probes/explore-disabled/`). A schedule Stack cannot read
+  keeps it too.
+
+Before and after:
+
+- **Before** (`before/runtime-new-tests-on-fd76459.log`): the new `tests/runtime.rs` on the
+  `fd76459` source fails at both findings. A scheduled daemon's supervisor was reported stopped,
+  and "state-b: B's `up` finished while A was deciding".
+- **Review scripts**, with only their output path and binary changed (`probes/reviewer-*`, each
+  with `adaptation.diff` and `hashes.sha256`):
+  - Cross-state race: B's `up` now waits for A (16.0 s, versus about 4 s before). A stops the
+    then-unused supervisor, and B starts afresh and stays healthy with the same PID and open
+    port. The same-state control gives the same result (15.9 s).
+  - `scheduled.sh`: `down` keeps the supervisor ("daemon external/timer runs on the schedule
+    `*/10 * * * * *`…"), and ticks go 2 to 4 in the next 23 s; the review saw 2 to 2.
+  - `positive.py`: 19 of 19 ordinary assertions pass.
+- **Wider schedule probe** (`probes/scheduled/`, `scripts/scheduled-r2.sh`, no wrapper): the
+  supervisor was kept between runs and with an errored scheduled daemon, and ticks and failures
+  went on. It was kept while both daemons were disabled, and ticks went 4 to 7. Once the
+  schedules were removed from configuration, `down` stopped it and nothing ran after.
+- **Provider study** (`probes/explore-schedule/`, `probes/explore-disabled/`): `status` starts
+  no supervisor, it omits `cron_schedule` for an unscheduled daemon, a person's `pitchfork stop`
+  leaves the schedule live, and `disable` does not stop scheduled runs in 2.29.0.
+
+Gates, all with the frozen binary at the tested head (`gates/summary.txt`, `gates/gates-summary.txt`):
+
+| Gate | Result |
+|---|---|
+| clippy `--all-targets -D warnings` | 0 findings |
+| `cargo test --locked --all-targets` | 536 passed, 0 failed, 13 ignored (lib 244, runtime 174: one more each than the follow-up's 534) |
+| node tests | 41 passed, 1 skipped |
+| real-mise provider boundary | passed |
+| macOS native e2e, with a run-owned local registry | 12/12, including 5-oci; registry container removed |
+| six regressions, cold | 6 FIXED |
+| eight validation cells, cold | 8/8 valid, `globals_changed` [] |
+| bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export; `bench/` unchanged since `fd76459` |
+| LinuxKit (local Docker arm64, rust:1.93, unprivileged user; not a hosted runner) | built from `git archive 4ae0435` (binary `6d419ea3…71b4`); lib 243 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp` 75 passed, including both changed supervisor tests and the new cross-state one; six regressions 6 FIXED; the schedule probe (`linux/scheduled/`, Linux spellings in `linux/scheduled-r2-linux.diff`) gave the same outcome at every step; container removed. The first launch failed in my wrapper before any container started (`drafts/linux-launch-failure.txt`) |
+
+Not done: push, PR, merge or release; any agent trial (the pilot report stays at
+`60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
+by a person, with `complete` and `publishable` false); a hosted Linux run.
+
+Next: a new independent review of `4ae0435` and the notes commit after it.
 
 ## Round 5: corrections after the fourth independent review
 
