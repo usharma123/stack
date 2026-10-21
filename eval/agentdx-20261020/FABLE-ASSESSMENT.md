@@ -346,3 +346,13 @@ the supervisor another checkout was stopping. Since `3e0cd74`, every start and s
 locks the supervisor it actually reaches, and a command that cannot tell which one that is asks
 nothing. See the
 [ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-3-review-of-a09676d-sc3-f1).
+
+Addendum 2026-10-21 (round 4): the lock each request took was that of the supervisor predicted
+when the command began, and a service's `setup` could change what a `PITCHFORK_STATE_DIR`
+template renders before the request, sending it to a supervisor another checkout was stopping.
+Since `ea8cbd9`, the prediction is confirmed under the lock before every start and stop request,
+and a command whose environment now names another supervisor stops there with
+`supervisor_changed` instead of asking it; a change made by another program at the moment of a
+request is found once it returns and fails the command rather than being reported as success.
+See the
+[ledger correction](REMEDIATION-LEDGER.md#correction-2026-10-21-round-4-review-of-a49f271-sc4-f1).

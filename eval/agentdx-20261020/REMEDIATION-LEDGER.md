@@ -28,6 +28,9 @@ review found two cases where it stopped a supervisor still in use; they are corr
 [Correction 2026-10-21](#correction-2026-10-21-review-of-the-follow-up-sc2-f1-sc2-f2).
 The next review found that the SC2-F1 lock did not cover a reused session; that is corrected in
 [Correction 2026-10-21, round 3](#correction-2026-10-21-round-3-review-of-a09676d-sc3-f1).
+The review after that found that a service's `setup` could still send a request to another
+supervisor than the one locked; that is corrected in
+[Correction 2026-10-21, round 4](#correction-2026-10-21-round-4-review-of-a49f271-sc4-f1).
 
 Kinds: **defect** (Stack does something wrong or contrary to its docs), **missing** (a capability
 agents need that Stack did not have), **docs** (behaviour was right or deliberate but undocumented
@@ -346,6 +349,41 @@ since `restart` reads it before stopping. Evidence is in
 `eval/results/agentdx-supervisor-corrections-r3-20261021/` (git-ignored). The pilot report is
 unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 
+## Correction 2026-10-21, round 4: review of `a49f271` (SC4-F1)
+
+A fresh independent review (Astra) of `a49f271` (code `3e0cd74`) confirmed the SC3-F1 cases for a
+stable provider environment, SC2-F2 and the earlier controls, and requested changes for one P1,
+reproduced twice with the frozen `de8b4536…f7e6` binary and real Pitchfork 2.29.0. It is
+corrected below. The entries above stay as written; the claims this correction supersedes are
+listed after the table.
+
+| # | Problem | Kind | Before | Fix | Proof | Remaining limit |
+|---|---|---|---|---|---|---|
+| SC4-F1 | `up` chose the supervisor (and its lock) from the project environment before installing and running setups, while every later request rendered that environment again. A supervisor-changing `setup` (it rewrote the file a `PITCHFORK_STATE_DIR` `[env]` template reads) sent B's start to a supervisor whose lock B did not hold, while A's `down` was deciding to stop it; the session kept naming the first one | defect | The review: B's `up` predicted O, its setup made the template name S, B locked O and started through S in 1.62 s (repeat 1.58 s) while A held S's lock; A then stopped S and B's service died; B's record still named O. Reproduced here with the same binary and the review's script, adapted only to record either outcome (`probes/sc4/old-changed`: 1.63 s, then killed, record O). On the old binary `restart` also reported success with the record naming O while its service ran under S, and a later dependency wave left db under O and api under S (`probes/sc4/paths-old`). The four new runtime tests fail on the `a49f271` source at the intended assertions; the stable-template control passes there | `ea8cbd9` | mise's `[env]` wins over any value Stack could pass, so a request cannot be pinned to the chosen supervisor. The supervisor is chosen once per command; with its lock held, the environment is confirmed to still name it before the supervisor's own start and before every start or stop request (`up`, `restart`, every dependency wave, `stop_previous`, `stop_dependents`, `down`, lease GC). A change is refused with `supervisor_changed` before the request: nothing more is started or stopped through either supervisor, the session keeps naming the chosen one (which runs everything the command started), and a retry chooses the new one from its beginning. After the requests, still under the lock, the environment is read once more: a change found then (another program, at the moment of a request) fails the command with `supervisor_changed` and `asked: true` instead of reporting the start or stop as done. Runtime tests: `a_setup_that_changes_the_supervisor_the_environment_names_starts_nothing_through_either` (changed: refused while A decides, no request from B, record O; then a retry starts under `pf`; stable control: waits for A), `a_restart_whose_setup_changes_the_supervisor_starts_nothing_through_the_new_one`, `a_later_wave_whose_setup_changes_the_supervisor_is_refused_before_its_request`, `a_supervisor_change_made_as_a_start_is_requested_is_reported_not_claimed_as_a_start`; the fake mise renders `PITCHFORK_STATE_DIR` from the project's file and records the directory each actual request reached. Real Pitchfork (`probes/sc4`): B refused in 0.63 s (repeat 0.45 s) while A decided, nothing listening; once A finished, B run again started under S, healthy with the same PID, record naming S; stable control waits 16.29 s and stays healthy; restart and a later wave refused before their start, with no supervisor ever answering in S | Prevention covers every change Stack's own steps can make (installs, setups, earlier waves) and any made before the confirmation. A change another program makes between the confirmation and mise's own rendering, milliseconds later, cannot be prevented: it is found afterwards, if it persists until the requests return, and the command fails rather than claiming success; one changed and changed back within that window is not seen. A refused command leaves what it already started (earlier waves, a restart's stop) recorded under the chosen supervisor; `down` from an environment that now names another one stops those processes by their recorded identity, not through mise (unchanged). `mise daemons` listings, which may start a supervisor, stay outside the lock as before. Each locked section now renders the environment once after taking the lock and once after its requests, and once more before each start request. Forced interleavings, not natural frequencies |
+
+Superseded claims of the round-3 correction above:
+
+- "Every start and stop request locks the supervisor it actually reaches": it locked the
+  supervisor predicted when the command began, which a setup could change before the request.
+  Since `ea8cbd9` the prediction is confirmed under the lock before each request, and a change is
+  refused.
+- "A reused session's record names that supervisor before anything starts there": true of the
+  supervisor predicted at the start; a request that then went elsewhere was not recorded.
+
+Unchanged: the SC3-F1 and SC2-F1 lock choice for a stable environment, SC2-F2 and its schedule
+rules, ownership marks, the other usage checks, the lock's location and replacement handling,
+the never-start-to-check rule, the CLI and MCP defaults and opt-outs, `gc`'s handling of deleted
+checkouts, leases, disposal, snapshots and H1. One runtime fixture changed: the slow-environment
+test now skips one lookup (`slow-env-skip`), the start's own look after its request, so its slow
+lookup still falls in verification, as its unchanged assertions require. Evidence is in
+`eval/results/agentdx-supervisor-corrections-r4-20261021/` (git-ignored). The pilot report is
+unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
+
+The review's own launch incident (a schedule launcher that continued after its isolation failed
+and ran Pitchfork against the default location) is separate from SC4-F1 and is recorded with
+this round's evidence (`review-incident/INCIDENT.md`). Possible residue in the default Pitchfork
+state remains unverified; nothing there was inspected or cleaned.
+
 ## Commits
 
 | Commit | Subject |
@@ -395,3 +433,4 @@ unchanged (`60aa3b11…5f84`), and no agent trial was rerun.
 | `4ae0435` | fix(down): keep the supervisor while a daemon it runs has a schedule (SC2-F2) |
 | `8205aa9` | test(runtime): give every fixture its own Pitchfork state directory (after SC2-F1) |
 | `3e0cd74` | fix(supervisor): lock the supervisor each request reaches, not the recorded one (SC3-F1) |
+| `ea8cbd9` | fix(supervisor): refuse a request once the environment names another supervisor (SC4-F1) |

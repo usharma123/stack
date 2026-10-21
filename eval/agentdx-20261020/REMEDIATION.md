@@ -250,7 +250,99 @@ Not done: push, PR, merge or release; any agent trial (the pilot report stays at
 `60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
 by a person, with `complete` and `publishable` false); a hosted Linux run.
 
-Next: a new independent review of `3e0cd74` and the notes commit after it.
+Next: a new independent review of `3e0cd74` and the notes commit after it. It requested changes
+(SC4-F1), which the [correction below](#correction-2026-10-21-round-4-the-review-of-a49f271-sc4-f1)
+deals with.
+
+## Correction 2026-10-21, round 4: the review of `a49f271` (SC4-F1)
+
+| | |
+|---|---|
+| Review | Astra, fresh and independent, of `a49f271` (code `3e0cd74`): request changes, one P1 (SC4-F1) reproduced twice with the frozen `de8b4536…f7e6` binary, real mise and Pitchfork 2.29.0, with an unchanged-template control. The SC3-F1 cases for a stable environment, SC2-F2 and the earlier controls confirmed. Its sources were read and left unchanged; their hashes are in `review-sources.sha256`. Its own excluded schedule launch is recorded separately (below) |
+| Start | Clean `a49f2713acc870d6975bdf3448a7755d0383ddf3`; every earlier commit kept as it is |
+| Tested head | `ea8cbd9eb3f74cc71f388fac928133bacfab1206`, clean tree: code, tests and user and design docs. The documentation commit after it changes only `eval/agentdx-20261020/` |
+| Binary | `cargo build --locked` (debug, macOS arm64), sha256 `44cf6f67637d995347d320432684b45d6a054283e9bf0902fc217055a69f424f`, frozen in `gates/bin/stack`; the gate's `cargo test` rebuilt the same hash. `git archive ea8cbd9 src` sha256 `2c007a60bb4a311fb29a18e9f2c3d540ebe08fc51522011b01fb9990c9a2cb2f` |
+| Evidence | `eval/results/agentdx-supervisor-corrections-r4-20261021/` (git-ignored; paths below are relative to it) |
+
+What changed and why is in the
+[ledger](REMEDIATION-LEDGER.md#correction-2026-10-21-round-4-review-of-a49f271-sc4-f1). In
+short: mise renders `PITCHFORK_STATE_DIR` again for every request and its `[env]` wins over
+anything Stack could pass, so the request cannot be pinned. The supervisor is chosen once per
+command, and under its lock the environment is confirmed to still name it before the
+supervisor's own start and every start or stop request; a change is refused
+(`supervisor_changed`) before the request, and a change found once the requests return fails
+the command (`asked: true`) instead of reporting success.
+
+Before and after:
+
+- **Before** (`before/`, `scripts/before.sh`): `git archive a49f271` (production source
+  identical to `3e0cd74`, `before/source-*.sha256`) with only the new `tests/runtime.rs` and
+  `tests/fakes/mise.sh`. The setup-changed `up` race fails (B's `up` succeeded while A was
+  deciding); its stable-template control, run alone (`before/case-up-*.diff` shows the only
+  edit), passes. The restart, later-wave and at-request tests fail (each command reported
+  success). The other 33 `supervisor` runtime tests pass there with the new fake; so does the
+  adapted slow-environment test.
+- **Review script** (`probes/sc4/`, the review's repeat `race.py` adapted only to record a
+  refusal and then run B again, `race.py.adaptation.diff`; launched by `scripts/sc4-probes.sh`
+  through the fail-fast `scripts/probe-launch.sh`):
+  - old binary, changed: B healthy under S in 1.63 s while A decided, then killed by A's stop;
+    B's record still named `pf-old` (the review's 1.62 s and 1.58 s).
+  - new binary, changed: B refused in 0.63 s with `supervisor_changed` (chosen `pf-old`, now
+    `pf`, `asked: false`; steps end at `start`) while A still decided, nothing listening. Once A
+    finished, B run again started under `pf`, healthy with the same PID and an open port, record
+    naming `pf/state`. Repeat: refused in 0.45 s, same outcome.
+  - stable-template control: B waits for A, 16.29 s new / 16.45 s old, healthy after with the
+    same PID; record `pf/state`.
+- **Restart and a later wave** (`probes/sc4/paths.py`, real Pitchfork, no wrapper, per-case
+  supervisor directories): with the old binary `restart` reported success while its service ran
+  under S and its record named O, and the wave left db under O and api under S (`not_ready`).
+  With the new binary both are refused with `supervisor_changed`: restart's service is stopped
+  and not started again, the wave's db stays under O and api never starts, no supervisor answers
+  in S, and records name O; run again, both start under S. A first run that shared one S between
+  the two cases is kept as `paths-*-shared-dirs` with a note (the restart case's retry left S
+  running for the wave's check).
+- **The review's other probes** (`probes/reviewer-*`, `scripts/reviewer-probes.sh`: each
+  `race.py`/`positive.py` with only its output path changed, launched through
+  `probe-launch.sh`; `probes/summary.json`): moved-registered 16.00 s, legacy 16.21 s,
+  current-record control 16.39 s, the original new-session race 16.40 s, same-state control
+  16.11 s, configured relative path control 16.26 s: B waits for A each time and stays healthy
+  with the same PID and open port. `positive.py` 19 of 19; lock refusal 4 of 4.
+- **Schedule probe** (`probes/scheduled/`, `scripts/scheduled-r4.sh`, fail-fast, no wrapper):
+  kept between runs (ticks and failures 2 to 4 in 23 s), kept while disabled (4 to 7), stopped
+  once the schedules were removed, after which ticks stayed at 7.
+
+Gates, all with the frozen binary at the tested head (`gates/summary.txt`, `gates/gates-summary.txt`,
+`scripts/gates-r4.sh`; clippy, cargo, node and the real-mise test ran under an isolated root):
+
+| Gate | Result |
+|---|---|
+| clippy `--all-targets -D warnings` | 0 findings |
+| `cargo test --locked --all-targets` | 542 passed, 0 failed, 13 ignored (lib 244, runtime 180: the four new tests) |
+| node tests | 41 passed, 1 skipped |
+| real-mise provider boundary | 2 passed |
+| macOS native e2e, with a run-owned local registry | 12/12, including 5-oci; registry container removed |
+| six regressions, cold | 6 FIXED |
+| eight validation cells, cold | 8/8 valid, `globals_changed` [] |
+| bench unit tests | 124 OK in the checkout and 124 OK in a `git archive` export; `bench/` unchanged since `4f7201c` |
+| LinuxKit | local Docker arm64, rust:1.93, unprivileged user; not a hosted runner. Built from `git archive ea8cbd9` (binary `2c7ad48b…6cc8`); lib 243 passed / 13 ignored; runtime `down supervisor gc restart up_ mcp` 81 passed, including the four new tests; six regressions 6 FIXED. SC4-F1 probes with real mise and Pitchfork 2.29.0 (installed by a warm-up `stack install` in its own root; Linux spellings in `linux/probe-launch-linux.diff`): changed `up` refused in 0.24 s while A decided, then healthy under `pf` once run again; stable control waited 14.85 s and stayed healthy with the same PID; restart and a later wave refused, no supervisor answering in S, both starting under S when run again. Container `sc4-linux-43be4cd8` removed |
+
+Review launch incident, separate from SC4-F1 (`review-incident/INCIDENT.md`): the review's
+first schedule launcher continued after its isolation failed and ran Pitchfork, including
+starting its `timer` and `failer` daemons, against the default provider location; the review
+stopped its own supervisor and excluded the run. At this round's start, three default
+Pitchfork state files hashed differently from r3's final receipt (`state.toml`,
+`pitchfork.log`, `logs.db-shm`; `globals-before-vs-r3-final.txt`), which is consistent with
+that launch but not proven to come from it. Their contents were not read and nothing was
+cleaned; a registration of those daemons may remain there, unverified. This round's own
+before/after comparison covers only its own interval. Every launcher this round is fail-fast:
+absolute paths, isolation sourcing checked, and every Stack, mise, Pitchfork and XDG directory
+asserted under its own root before any provider command.
+
+Not done: push, PR, merge or release; any agent trial (the pilot report stays at
+`60aa3b115ce727e354a209f7ab2bf83eb184d2d070da48e63b83cced19365f84`, verified but not reviewed
+by a person, with `complete` and `publishable` false); a hosted Linux run.
+
+Next: a new independent review of `ea8cbd9` and the notes commit after it.
 
 ## Round 5: corrections after the fourth independent review
 
