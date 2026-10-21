@@ -27,8 +27,11 @@ stdout; see [reading results](agents.md#reading-results)).
 
 Writes `stack.toml` in the project directory with the tools and preset services you name, and
 commented examples of a service of your own and a task. It never replaces an existing file
-(`project_exists`) and writes nothing else: run `stack compile` next. A tool without a version
-is `latest`, pinned to an exact release at the first compile.
+(`project_exists`) and writes nothing else: run `stack compile` next. A `stack.toml` link, even
+one pointing nowhere, counts as an existing file and is never followed. The file appears whole
+or not at all, and of several `init`s at once exactly one writes it; the others get
+`project_exists`. A tool without a version is `latest`, pinned to an exact release at the first
+compile.
 
 ```sh
 stack init --tool python=3.13 --tool uv --service postgres@17 --service cache=redis
