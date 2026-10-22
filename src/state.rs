@@ -239,8 +239,33 @@ pub fn pid_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// Set in the process [`passes_alone`] starts.
+    const ALONE: &str = "STACK_STATE_TEST_ALONE";
+
+    /// Run ignored test `name` of this module in a process of its own, expecting it to pass.
+    /// A process spawned while a lock's file is open shares that open file, and so the lock,
+    /// until it execs; there, no other test's spawn can hold a lock a test just let go of.
+    fn passes_alone(name: &str) {
+        let name = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([name.as_str(), "--exact", "--ignored", "--test-threads=1"]).env(ALONE, "1");
+        let run = crate::process::capture(&mut command, std::time::Duration::from_secs(60), 1 << 20).unwrap();
+        let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        assert!(!run.timed_out, "{name} did not finish within 60s\n{shown}");
+        assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "{shown}");
+    }
+
     #[test]
     fn a_shared_lock_shuts_out_an_exclusive_holder_and_waits_for_one() {
+        passes_alone("shared_lock_shuts_out_an_exclusive_holder");
+    }
+
+    #[test]
+    #[ignore = "run by a_shared_lock_shuts_out_an_exclusive_holder_and_waits_for_one"]
+    fn shared_lock_shuts_out_an_exclusive_holder() {
+        if std::env::var_os(ALONE).is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("supervisors/x.lock");
         let first = SharedLock::shared(&path).unwrap();

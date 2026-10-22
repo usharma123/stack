@@ -1492,9 +1492,10 @@ pub fn capture_redacted(_: &mut Command, _: Duration, _: usize, _: Option<&Redac
 mod tests {
     use super::*;
 
+    /// Whether `pid` still runs, as [`ends_soon`] judges it: a process that exited but is not yet
+    /// reaped (a zombie, which `kill(pid, 0)` still finds) runs no more, so it does not count.
     fn alive(pid: i32) -> bool {
-        // SAFETY: signal 0 only checks that the process exists.
-        unsafe { libc::kill(pid, 0) == 0 }
+        u32::try_from(pid).is_ok_and(crate::state::pid_alive)
     }
 
     /// Whether `pid` ends within a second. A killed process finishes exiting after the signal is
@@ -1794,12 +1795,30 @@ mod tests {
         std::fs::read_to_string(file).ok()?.trim().parse().ok()
     }
 
-    /// End a test's own command left running, so a failing schedule leaves nothing behind.
+    /// End a test's own command left running, so a failing schedule leaves nothing behind. One
+    /// that ended but whose new parent has yet to reap it is not left (see [`alive`]).
     fn reap_left(file: &std::path::Path) -> Option<i32> {
         let pid = pid_in(file).filter(|pid| alive(*pid))?;
         // SAFETY: the PID of the test's own `sleep`, just checked to be running.
         unsafe { libc::kill(pid, libc::SIGKILL) };
         Some(pid)
+    }
+
+    /// As a command that was passed a signal and orphaned is, until its new parent reaps it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_that_ended_but_is_not_yet_reaped_is_not_left_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let mut child = Command::new("sh").args(["-c", STARTS, "sh"]).arg(&started).spawn().unwrap();
+        wait_for("the command to start", || pid_in(&started).is_some());
+        let pid = pid_in(&started).unwrap();
+        assert!(alive(pid) && reap_left(&started).is_some_and(|left| left == pid), "a running command is left");
+        wait_for("the killed command to end", || !alive(pid));
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "{pid} is unreaped, so still found");
+        assert_eq!(reap_left(&started), None, "a zombie runs no more");
+        child.wait().unwrap();
     }
 
     #[test]
@@ -1843,7 +1862,7 @@ mod tests {
         let ended = pid.is_some_and(|pid| ends_soon(pid as u32));
         let left = reap_left(&started);
         let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
-        assert!(pid.is_some() && ended && left.is_none(), "the admitted command {pid:?} was not passed the signal\n{shown}");
+        assert!(pid.is_some() && ended && left.is_none(), "the admitted command {pid:?} was not passed the signal (ended within 1s: {ended}, still running: {left:?})\n{shown}");
         // A provider command's signal is passed on, then ends stack.
         assert_eq!((run.exit_code, run.signal), (None, Some(libc::SIGTERM)), "{shown}");
     }
@@ -2145,7 +2164,7 @@ mod tests {
         let ended = pid.is_some_and(|pid| ends_soon(pid as u32));
         let left = reap_left(&started);
         let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
-        assert!(pid.is_some() && ended && left.is_none(), "the signal never reached {pid:?}, which the command started\n{shown}");
+        assert!(pid.is_some() && ended && left.is_none(), "the signal never reached {pid:?}, which the command started (ended within 1s: {ended}, still running: {left:?})\n{shown}");
         // A provider command's signal is passed on, then ends stack.
         assert_eq!((run.exit_code, run.signal), (None, Some(libc::SIGTERM)), "{shown}");
         assert!(sentinel.alive(), "an unrelated process was signalled");
