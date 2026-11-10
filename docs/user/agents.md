@@ -11,8 +11,16 @@ claude mcp add stack -- stack mcp     # Claude Code
 codex mcp add stack -- stack mcp      # Codex
 ```
 
-Any other MCP client: launch the command `stack` with the argument `mcp`. Every tool takes a
-`dir` argument naming the checkout.
+Any other MCP client: launch the command `stack` with the argument `mcp`.
+
+**Pass `dir` on every call.** One registered server is shared by every agent on the machine,
+whatever checkout it works in, so the server never acts on its own working directory. Each tool
+takes `dir`, the absolute path of the checkout. It may be left out only when the client
+supports MCP roots and exposes exactly one: the server asks for `roots/list` after
+`initialize` (and again on `notifications/roots/list_changed`) and uses that root. Otherwise a
+call without `dir`, or with a relative one, fails with a `usage` error. Every result carries
+the checkout it acted on as `project`, an absolute path. `stack_gc`, `stack_ps` and `stack_mv`
+act machine-wide and need no `dir`.
 
 | Tool | Does |
 |---|---|
@@ -124,9 +132,9 @@ missing required argument or a conflicting pair is a `usage` error, and the hint
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 
-`stack_down` takes `purge: true`, like the CLI's `--purge`. `stack_ps` ignores `dir` and takes
-`no_size`, like the CLI's `--no-size`. `stack_mv` takes
-`from` and `to`; relative paths resolve against `dir`.
+`stack_down` takes `purge: true`, like the CLI's `--purge`. `stack_ps` takes `no_size`, like
+the CLI's `--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
+`dir` when it is given.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that
 is not an upper-case variable name is `invalid_secret`, as `--secret` reports it on the CLI. `stack_run`

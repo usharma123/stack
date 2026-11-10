@@ -40,7 +40,7 @@ url=$(stack exec --require api -- sh -c 'curl -fsS "$API_URL/" >/dev/null && pri
 echo 'Tasks see the same loopback URL as exec, through the CLI and MCP'
 [[ "$(stack run url)" == "$url" ]] || fail "stack run url: $(stack run url 2>&1)"
 [[ "$(stack run url_listing_service)" == "$url" ]] || fail "a task listing the service: $(stack run url_listing_service 2>&1)"
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":{"task":"url"}}}' | stack mcp >"$T/mcp-run-url.out"
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_run","arguments":{"dir":"'"$PWD"'","task":"url"}}}' | stack mcp >"$T/mcp-run-url.out"
 jq -se --arg url "$url" 'length == 1 and (.[0].result.structuredContent.data | .exit_code == 0 and .stdout == $url)' "$T/mcp-run-url.out" >/dev/null \
   || fail "MCP stack_run: $(cat "$T/mcp-run-url.out")"
 

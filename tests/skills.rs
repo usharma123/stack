@@ -359,6 +359,8 @@ struct Mcp {
     child: std::process::Child,
     stdout: BufReader<std::process::ChildStdout>,
     id: u64,
+    /// The checkout every call names: the server never acts on its own working directory.
+    dir: PathBuf,
 }
 
 impl Mcp {
@@ -367,7 +369,7 @@ impl Mcp {
         command.current_dir(f.path("app")).stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command.spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self { child, stdout, id: 0 }
+        Self { child, stdout, id: 0, dir: f.path("app").canonicalize().unwrap() }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -379,7 +381,8 @@ impl Mcp {
         serde_json::from_str(&reply).unwrap()
     }
 
-    fn call(&mut self, tool: &str, args: Value) -> Value {
+    fn call(&mut self, tool: &str, mut args: Value) -> Value {
+        args["dir"] = json!(self.dir);
         self.request("tools/call", json!({ "name": tool, "arguments": args }))["result"]["structuredContent"].clone()
     }
 }

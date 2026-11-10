@@ -9,11 +9,11 @@ cd "$W/appA" || exit 1
   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
   echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["bash","-c","echo $DATABASE_URL"]}}}'
-  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["true"],"require":["postgres"]}}}'
-  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stack_up","arguments":{"ttl":"10m"}}}'
-  echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["bash","-c","set -euo pipefail; uv run pytest -q"],"require_all":true}}}'
-  echo '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"stack_down","arguments":{}}}'
+  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["bash","-c","echo $DATABASE_URL"]}}}'
+  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["true"],"require":["postgres"]}}}'
+  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stack_up","arguments":{"dir":"'"$PWD"'","ttl":"10m"}}}'
+  echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["bash","-c","set -euo pipefail; uv run pytest -q"],"require_all":true}}}'
+  echo '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"stack_down","arguments":{"dir":"'"$PWD"'"}}}'
   echo '{"jsonrpc":"2.0","id":8,"method":"nope"}'
 } | stack mcp >"$T/mcp.out"
 jq -se '
@@ -31,7 +31,7 @@ jq -se '
 echo 'MCP timeout kills descendants and permits the next request'
 start=$(date +%s)
 {
-  echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["sh","-c","sleep 20 & wait"],"timeout_secs":1}}}'
+  echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["sh","-c","sleep 20 & wait"],"timeout_secs":1}}}'
   echo '{"jsonrpc":"2.0","id":2,"method":"ping"}'
 } | stack mcp >"$T/mcp-timeout.out"
 (( $(date +%s) - start < 6 )) || fail 'MCP response exceeded the timeout'

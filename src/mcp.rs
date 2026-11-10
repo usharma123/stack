@@ -8,69 +8,28 @@ use crate::source::Mode;
 use crate::state::default_state_dir;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+mod server;
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
 /// What the server tells a client about using its tools, once, at initialization.
-const INSTRUCTIONS: &str = "Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
+const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root). Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
 
 fn startup_timeout_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
 }
 
+/// Serve the tools over stdio until the client closes stdin (see [`server`]); every response
+/// is written as one line.
 pub fn serve() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                send(
-                    &mut stdout,
-                    json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } }),
-                )?;
-                continue;
-            }
-        };
-        // Notifications (no id) need no response.
-        let Some(id) = msg.get("id").cloned() else {
-            continue;
-        };
-        let method = msg["method"].as_str().unwrap_or_default();
-        let reply = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": negotiate(msg["params"]["protocolVersion"].as_str()),
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "stack", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": INSTRUCTIONS,
-            })),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools() })),
-            "tools/call" => Ok(call(&msg["params"])),
-            _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
-        };
-        let response = match reply {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
-        };
-        send(&mut stdout, response)?;
-        // A signal that would have ended the server was passed on to the command a tool call
-        // ran instead; now that it was answered, the server ends as the signal asked.
-        if crate::process::passed_on().is_some() {
-            break;
-        }
-    }
-    Ok(())
+    server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
 }
 
 fn send(out: &mut impl Write, v: Value) -> std::io::Result<()> {
@@ -86,11 +45,27 @@ fn negotiate(requested: Option<&str>) -> &'static str {
         .unwrap_or(PROTOCOL_VERSIONS[0])
 }
 
+/// `dir` of a tool that acts on one checkout.
+const DIR_DESCRIPTION: &str = "Absolute path of the checkout (the directory with stack.toml). Pass it on every call: it may be omitted only when the client exposes exactly one MCP root, which is then used. The server's own working directory is never used";
+
 fn schema(props: Value, required: &[&str]) -> Value {
     let mut p = props;
-    p["dir"] = json!({ "type": "string", "description": "Project directory containing stack.toml (default: server cwd)" });
+    p["dir"] = json!({ "type": "string", "description": DIR_DESCRIPTION });
     json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false })
 }
+
+/// The schema of a machine-wide tool, whose `dir` is optional and says only what `dir` does.
+fn machine_wide_schema(props: Value, required: &[&str], dir: &str) -> Value {
+    let mut schema = schema(props, required);
+    schema["properties"]["dir"]["description"] = json!(dir);
+    schema
+}
+
+/// Tools that act machine-wide: they need no checkout.
+const MACHINE_WIDE: &[&str] = &["stack_gc", "stack_ps", "stack_mv"];
+
+/// `dir` of a machine-wide tool that only reports it.
+const REPORTED_DIR: &str = "Optional absolute path of a checkout, reported back as `project`; this tool acts machine-wide either way";
 
 /// The one `pattern` the tool schemas use: a fnox secret name.
 const SECRET_NAME_PATTERN: &str = "^[A-Z_][A-Z0-9_]*$";
@@ -312,27 +287,34 @@ fn tool_definitions() -> Value {
               "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
               "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" },
           }), &[]) },
-        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": schema(json!({
+        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": machine_wide_schema(json!({
               "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
-          }), &[]) },
-        { "name": "stack_ps", "description": "Read-only list of every checkout stack has records for on this machine: path, whether its directory still exists, session and lease, and per service the port, pid, a liveness check (pid alive, port accepting; not identity verification, use stack_status for that) and data directory with its size, with totals. reclaimable marks a checkout stack_gc would reclaim (directory gone, no session left). Takes no project lock and needs no stack.toml; dir is ignored. no_size skips measuring data directories.", "inputSchema": schema(json!({ "no_size": { "type": "boolean" } }), &[]) },
-        { "name": "stack_mv", "description": "After a checkout was moved or renamed on disk, carry its session record, port reservations, identity tokens and the service data directories stack recorded for it from the old path to the new one, so it keeps its ports and data. Refuses (mv_services_running) while anything recorded for the old path may run, when the new path has a session (mv_target_has_state), and when recorded data cannot be confirmed to be the checkout's or placed at the new path (mv_data_unmovable, mv_data_unplaced); it then changes nothing. Relative paths resolve against dir.", "inputSchema": schema(json!({ "from": { "type": "string", "description": "Where the checkout was" }, "to": { "type": "string", "description": "Where it is now" } }), &["from", "to"]) },
+          }), &[], REPORTED_DIR) },
+        { "name": "stack_ps", "description": "Read-only list of every checkout stack has records for on this machine: path, whether its directory still exists, session and lease, and per service the port, pid, a liveness check (pid alive, port accepting; not identity verification, use stack_status for that) and data directory with its size, with totals. reclaimable marks a checkout stack_gc would reclaim (directory gone, no session left). Takes no project lock and needs no stack.toml or dir. no_size skips measuring data directories.", "inputSchema": machine_wide_schema(json!({ "no_size": { "type": "boolean" } }), &[], REPORTED_DIR) },
+        { "name": "stack_mv", "description": "After a checkout was moved or renamed on disk, carry its session record, port reservations, identity tokens and the service data directories stack recorded for it from the old path to the new one, so it keeps its ports and data. Refuses (mv_services_running) while anything recorded for the old path may run, when the new path has a session (mv_target_has_state), and when recorded data cannot be confirmed to be the checkout's or placed at the new path (mv_data_unmovable, mv_data_unplaced); it then changes nothing. Relative paths resolve against dir, and need it.", "inputSchema": machine_wide_schema(json!({ "from": { "type": "string", "description": "Where the checkout was: an absolute path, or relative to `dir`" }, "to": { "type": "string", "description": "Where it is now: an absolute path, or relative to `dir`" } }), &["from", "to"], "Optional absolute path that relative `from` and `to` resolve against") },
         { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
 
-fn call(params: &Value) -> Value {
+/// Run one `tools/call`. `roots` are the client's MCP roots: `None` when it offers none.
+fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
+    let mut resolved = None;
     let outcome = validate(name, &params["arguments"])
         .and_then(|args| {
             let args = Value::Object(args);
-            ctx(&args).and_then(|ctx| dispatch(name, &args, &ctx))
+            resolved = project(name, &args, roots)?;
+            dispatch(name, &args, &ctx(resolved.as_deref()))
         })
         .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
-    let envelope = match outcome {
+    let mut envelope = match outcome {
         Ok(data) => json!({ "ok": true, "data": data }),
         Err(e) => json!({ "ok": false, "error": e }),
     };
+    // Which checkout the call acted on, so a wrong one shows in every result.
+    if let Some(project) = &resolved {
+        envelope["project"] = json!(project);
+    }
     let is_error = envelope["ok"] == false;
     json!({
         "content": [{ "type": "text", "text": envelope.to_string() }],
@@ -341,19 +323,55 @@ fn call(params: &Value) -> Value {
     })
 }
 
-fn ctx(args: &Value) -> Result<Ctx> {
-    let dir = args["dir"]
-        .as_str()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+/// The checkout a call acts on: its `dir`, which must be absolute, else the client's only root.
+/// Never the server's working directory: one server is shared by agents in many checkouts, so
+/// that directory says nothing about which one a call means. `None` for a machine-wide tool
+/// given neither.
+fn project(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option<PathBuf>> {
+    let dir = match args["dir"].as_str() {
+        Some(dir) => {
+            let dir = Path::new(dir);
+            if !dir.is_absolute() {
+                return Err(StackError::new("usage", format!("{name}: `dir` must be an absolute path, not {:?}", dir.display().to_string()))
+                    .hint("pass `dir` as the absolute path of your checkout, e.g. the output of `pwd` there"));
+            }
+            dir.to_path_buf()
+        }
+        None => match roots {
+            Some([only]) => only.clone(),
+            _ if MACHINE_WIDE.contains(&name) => return Ok(None),
+            Some(several) if several.len() > 1 => {
+                let shown: Vec<String> = several.iter().map(|r| r.display().to_string()).collect();
+                return Err(StackError::new("usage", format!("{name}: `dir` is required: the client exposes {} roots, so none can be chosen", several.len()))
+                    .hint("pass `dir` as the absolute path of the checkout to act on")
+                    .with_detail(json!({ "roots": shown })));
+            }
+            _ => {
+                return Err(StackError::new("usage", format!("{name}: `dir` is required"))
+                    .hint("pass `dir` as the absolute path of your checkout; this server is shared and never acts on its own working directory"))
+            }
+        },
+    };
     let root = dir
         .canonicalize()
-        .map_err(|e| StackError::new("dir_not_found", format!("{}: {e}", dir.display())))?;
-    Ok(Ctx {
-        root,
+        .map_err(|e| StackError::new("dir_not_found", format!("{}: {e}", dir.display())).hint("pass `dir` as the absolute path of an existing checkout"))?;
+    Ok(Some(root))
+}
+
+/// Whether a call needs the client's roots to find its checkout: it names no `dir` and acts
+/// on one checkout. Arguments that fail validation need nothing; the call reports them.
+fn needs_roots(params: &Value) -> bool {
+    let name = params["name"].as_str().unwrap_or_default();
+    validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").map_or(true, Value::is_null) && !MACHINE_WIDE.contains(&name))
+}
+
+fn ctx(project: Option<&Path>) -> Ctx {
+    // A machine-wide tool given no checkout reads only the state directory.
+    Ctx {
+        root: project.map(Path::to_path_buf).unwrap_or_default(),
         cache: default_cache_dir(),
         state: default_state_dir(),
-    })
+    }
 }
 
 fn to_value<T: Serialize>(v: T) -> Value {
@@ -448,7 +466,14 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
         "stack_mv" => {
-            let path = |key: &str| args[key].as_str().map(std::path::Path::new).ok_or_else(|| StackError::new("usage", format!("{key} is required")));
+            // Never resolved against the server's working directory, like `dir`.
+            let path = |key: &str| {
+                args[key]
+                    .as_str()
+                    .map(Path::new)
+                    .filter(|p| p.is_absolute() || !ctx.root.as_os_str().is_empty())
+                    .ok_or_else(|| StackError::new("usage", format!("stack_mv: `{key}` must be an absolute path unless `dir` is given")))
+            };
             crate::fleet::mv(&ctx.state, &ctx.root, path("from")?, path("to")?).map(to_value)
         }
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
@@ -701,15 +726,15 @@ mod tests {
             assert_eq!(tool["outputSchema"], output_schema(), "{}", tool["name"]);
         }
         // An error result and a success result both fit it.
-        let failed = call(&json!({ "name": "stack_nope", "arguments": {} }));
+        let failed = call(&json!({ "name": "stack_nope", "arguments": {} }), None);
         assert_eq!(failed["isError"], true);
         assert!(fits(&failed["structuredContent"], &output_schema()), "{failed}");
-        let usage = call(&json!({ "name": "stack_exec", "arguments": { "command": "echo hi" } }));
+        let usage = call(&json!({ "name": "stack_exec", "arguments": { "command": "echo hi" } }), None);
         assert!(fits(&usage["structuredContent"], &output_schema()) && usage["structuredContent"]["error"]["hint"].is_string(), "{usage}");
         // Read-only: inspect writes nothing and asks no provider for an `[env]`-only project.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
-        let fine = call(&json!({ "name": "stack_inspect", "arguments": { "dir": dir.path() } }));
+        let fine = call(&json!({ "name": "stack_inspect", "arguments": { "dir": dir.path() } }), None);
         assert_eq!(fine["structuredContent"]["ok"], true, "{fine}");
         assert!(fits(&fine["structuredContent"], &output_schema()), "{fine}");
         assert!(!dir.path().join(".stack").exists() && !dir.path().join("stack.lock").exists());
@@ -744,9 +769,9 @@ mod tests {
         let e = validate("stack_status", &json!({ "dir": 5 })).unwrap_err();
         assert!(e.message.contains("`dir` must be a string"), "{}", e.message);
         // An unknown tool is named as such, whatever its arguments, before any directory is read.
-        let called = call(&json!({ "name": "stack_nope", "arguments": { "dir": "/does/not/exist" } }));
+        let called = call(&json!({ "name": "stack_nope", "arguments": { "dir": "/does/not/exist" } }), None);
         assert_eq!(called["structuredContent"]["error"]["code"], "unknown_tool");
-        let called = call(&json!({ "name": "stack_status", "arguments": { "dir": "/does/not/exist", "extra": 1 } }));
+        let called = call(&json!({ "name": "stack_status", "arguments": { "dir": "/does/not/exist", "extra": 1 } }), None);
         assert_eq!(called["structuredContent"]["error"]["code"], "usage");
     }
 
@@ -758,6 +783,45 @@ mod tests {
         assert_eq!(closest("Command", &known), Some("command"));
         assert_eq!(closest("requir_all", &known), Some("require_all"));
         assert_eq!(closest("environment", &known), None);
+    }
+
+    #[test]
+    fn the_project_is_an_absolute_dir_or_the_only_root_never_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(project("stack_status", &json!({ "dir": dir.path() }), None).unwrap(), Some(root.clone()));
+        let only = [dir.path().to_path_buf()];
+        assert_eq!(project("stack_status", &json!({}), Some(&only)).unwrap(), Some(root.clone()));
+        // An explicit dir wins over roots.
+        assert_eq!(project("stack_status", &json!({ "dir": dir.path() }), Some(&[PathBuf::from("/a"), PathBuf::from("/b")])).unwrap(), Some(root.clone()));
+        for roots in [None, Some(&[][..]), Some(&[PathBuf::from("/a"), PathBuf::from("/b")][..])] {
+            let e = project("stack_down", &json!({}), roots).unwrap_err();
+            assert_eq!(e.code, "usage", "{roots:?}");
+            assert!(e.hint.unwrap().contains("absolute path"));
+        }
+        let e = project("stack_down", &json!({ "dir": "." }), None).unwrap_err();
+        assert!(e.message.contains("absolute"), "{}", e.message);
+        assert_eq!(project("stack_down", &json!({ "dir": "/does/not/exist" }), None).unwrap_err().code, "dir_not_found");
+        // Machine-wide tools need none, and take the only root when there is one.
+        assert_eq!(project("stack_gc", &json!({}), None).unwrap(), None);
+        assert_eq!(project("stack_ps", &json!({}), Some(&only)).unwrap(), Some(root.clone()));
+        let called = call(&json!({ "name": "stack_status", "arguments": { "dir": "/does/not/exist" } }), None);
+        assert!(called["structuredContent"].get("project").is_none(), "an unresolved dir is not reported as the project");
+        // Whatever the server's working directory, a call without `dir` names none.
+        let called = call(&json!({ "name": "stack_down", "arguments": {} }), None);
+        assert_eq!(called["structuredContent"]["error"]["code"], "usage", "{called}");
+        // A machine-wide mv given relative paths and no `dir` has nothing to resolve them against.
+        let called = call(&json!({ "name": "stack_mv", "arguments": { "from": "a", "to": "b" } }), None);
+        assert!(called["structuredContent"]["error"]["message"].as_str().unwrap().contains("must be an absolute path"), "{called}");
+        // Every result names the checkout it acted on.
+        std::fs::write(dir.path().join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        let called = call(&json!({ "name": "stack_inspect", "arguments": { "dir": dir.path() } }), None);
+        assert_eq!(called["structuredContent"]["project"], json!(root), "{called}");
+        // `dir` is optional in the schema (roots may supply it) but never defaults to the cwd.
+        for tool in tools().as_array().unwrap() {
+            let dir = tool["inputSchema"]["properties"]["dir"]["description"].as_str().unwrap();
+            assert!(!dir.contains("cwd") && !dir.contains("default"), "{}: {dir}", tool["name"]);
+        }
     }
 
     #[test]
