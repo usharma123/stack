@@ -314,6 +314,7 @@ fn tool_definitions() -> Value {
         { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": schema(json!({
               "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
           }), &[]) },
+        { "name": "stack_ps", "description": "Read-only list of every checkout stack has records for on this machine: path, whether its directory still exists, session and lease, and per service the port, pid, a liveness check (pid alive, port accepting; not identity verification, use stack_status for that) and data directory with its size, with totals. reclaimable marks a checkout stack_gc would reclaim (directory gone, no session left). Takes no project lock and needs no stack.toml; dir is ignored. no_size skips measuring data directories.", "inputSchema": schema(json!({ "no_size": { "type": "boolean" } }), &[]) },
         { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
@@ -443,6 +444,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_renew" => session::renew(ctx).map(to_value),
         "stack_down" => session::down_with(ctx, args["stop_supervisor"] != false).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
+        "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_exec" => exec(args, ctx),
         "stack_run" => run(args, ctx),

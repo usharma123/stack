@@ -15,6 +15,7 @@
 | `stack down [--keep-supervisor]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it |
 | `stack renew` | Renew this session's lease |
 | `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
+| `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
@@ -271,6 +272,26 @@ When it cannot confirm that a deleted checkout's service stopped, `gc` fails wit
 command that shows the recorded process, and sometimes `recovery.stop`. Run inspect first,
 stop only if the PID still matches, then run `gc` again. The two steps are not atomic, which
 is why Stack does not do this for you.
+
+## ps
+
+Lists every checkout this machine's Stack state has records of: a session, port reservations,
+identity tokens or a data directory `up` recorded. For each: its path, whether the directory
+still exists (`dir` is `present`, `missing` or `replaced`), the session id and `state`, the
+lease (`kind`, `ttl_secs`, `expires_at`, `expired`), and for each service its port, pid and
+data directory, with the directory's size on disk. `state` is `running` (every service live),
+`partial`, `stopped`, `launching`, `recorded` (a session without services) or `reserved`
+(records but no session). `reclaimable` marks a checkout [`gc`](#gc) reclaims: its directory is
+gone and no session of it is left, so gc releases its ports and reports its data, which
+`--reclaim-data` removes where it is safe. `totals` adds it all up, with the data of reclaimable
+checkouts in `reclaimable_bytes`.
+
+The checks are liveness only, and the field names say so: `pid_alive` (a process with the
+recorded pid exists) and `port_accepting` (something accepts connections on the port, which may
+be another program). `ps` never checks identity; `stack status` in the checkout does. It takes
+no lock, so it never waits behind a running `up`, and it needs no `stack.toml`. Measuring data
+directories walks them, which can be slow for large databases: `--no-size` skips it
+(`data_bytes` is then `null`).
 
 ## doctor and setup
 

@@ -7472,3 +7472,82 @@ fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so
     let e = json_result(&fixture.command(&["compile", "--locked", "--json"]).output().unwrap())["error"].clone();
     assert_eq!(e["code"], "provider_outdated");
 }
+
+// ---- machine-wide commands -------------------------------------------------------------------
+
+/// `web` started under the fake supervisor with a data directory of `bytes` bytes, as mise
+/// reports one for a preset service; `up` records it (marker, machine data record).
+fn up_with_data(fixture: &Fixture, up_args: &[&str], bytes: usize) -> (u16, std::path::PathBuf) {
+    let dir = fixture.dir.path();
+    let port = assigned_port(fixture, "web");
+    supervise_listener(fixture, port);
+    let data = dir.join("mise-state/daemons/0123/data/web");
+    let daemon = |status: &str| json!([{ "id": "app-test/web", "name": "web", "status": status, "port": port, "data_dir": data }]).to_string();
+    fs::write(dir.join("daemons-started.json"), daemon("running")).unwrap();
+    fs::write(dir.join("daemons.json"), daemon("stopped")).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("rows"), vec![b'x'; bytes]).unwrap();
+    fixture.ok(&[&["up"], up_args].concat());
+    (port, data)
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let app = dir.join("app").canonicalize().unwrap();
+    let (port, data) = up_with_data(&fixture, &["--ttl", "30m"], 8192);
+    // Another checkout, deleted while its session is still recorded.
+    let gone = dir.canonicalize().unwrap().join("deleted");
+    let record = json!({ "id": "gone12345678", "project": gone, "lock_digest": "", "started_at": 1, "services": { "web": { "port": 1, "identity": "liveness", "verified_at": 1 } } });
+    fs::write(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&gone))), record.to_string()).unwrap();
+
+    let ps = |args: &[&str]| -> Value {
+        let out = fixture.command_at(dir, &[&["ps", "--json"], args].concat()).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{result}");
+        result["data"].clone()
+    };
+    let row = |report: &Value, path: &Path| -> Value {
+        report["checkouts"].as_array().unwrap().iter().find(|c| Path::new(c["path"].as_str().unwrap()) == path).cloned().unwrap_or_else(|| panic!("{path:?} in {report}"))
+    };
+    // From a directory without stack.toml, while `up` would hold the project's lock.
+    let held = stack::state::project_lock(&dir.join("state"), &app).unwrap();
+    let started = Instant::now();
+    let report = ps(&[]);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(held);
+    assert!(report["checks"].as_str().unwrap().starts_with("liveness only"), "{report}");
+    let a = row(&report, &app);
+    assert_eq!((a["dir"].as_str(), a["state"].as_str(), a["reclaimable"].as_bool()), (Some("present"), Some("running"), Some(false)), "{a}");
+    assert_eq!(a["lease"]["kind"], "ttl", "{a}");
+    assert_eq!(a["lease"]["expired"], false, "{a}");
+    let web = &a["services"][0];
+    assert_eq!((web["name"].as_str(), web["port"].as_u64()), (Some("web"), Some(u64::from(port))), "{web}");
+    assert_eq!(web["port_accepting"], true, "{web}");
+    assert_eq!(web["data_dir"].as_str(), Some(data.to_str().unwrap()), "{web}");
+    assert!(web["data_bytes"].as_u64().unwrap() >= 8192, "{web}");
+    let g = row(&report, &gone);
+    assert_eq!((g["dir"].as_str(), g["state"].as_str(), g["reclaimable"].as_bool()), (Some("missing"), Some("stopped"), Some(false)), "{g}");
+    assert_eq!(g["lease"]["kind"], "none");
+    assert_eq!(report["totals"]["checkouts"], 2, "{report}");
+    assert_eq!(report["totals"]["running"], 1, "{report}");
+    assert_eq!(report["totals"]["reclaimable_bytes"], 0, "{report}");
+    assert_eq!(row(&ps(&["--no-size"]), &app)["services"][0]["data_bytes"], Value::Null);
+    let human = String::from_utf8_lossy(&fixture.command_at(dir, &["ps"]).output().unwrap().stdout).into_owned();
+    assert!(human.contains("running  session") && human.contains("directory missing") && human.contains("liveness only"), "{human}");
+    let mcp = fixture.mcp(&[("stack_ps", json!({ "no_size": true }))], &[]);
+    assert_eq!(mcp[0]["structuredContent"]["data"]["totals"]["checkouts"], 2, "{}", mcp[0]);
+
+    // Stopped and removed: what `gc` would reclaim, its data included.
+    fixture.ok(&["down"]);
+    fs::remove_dir_all(dir.join("app")).unwrap();
+    let report = ps(&[]);
+    let a = row(&report, &app);
+    assert_eq!((a["dir"].as_str(), a["state"].as_str(), a["reclaimable"].as_bool()), (Some("missing"), Some("reserved"), Some(true)), "{a}");
+    assert_eq!(a["services"][0]["data_dir"].as_str(), Some(data.to_str().unwrap()), "from the data record: {a}");
+    assert!(report["totals"]["reclaimable_bytes"].as_u64().unwrap() >= 8192, "{report}");
+    let human = String::from_utf8_lossy(&fixture.command_at(dir, &["ps"]).output().unwrap().stdout).into_owned();
+    assert!(human.contains("reclaimable by `stack gc`"), "{human}");
+}

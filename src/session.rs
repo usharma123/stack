@@ -4169,6 +4169,11 @@ fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) 
     }
 }
 
+/// [`project_gone`], for the machine-wide commands (see [`crate::fleet`]).
+pub fn checkout_gone(session: &Session) -> Option<&'static str> {
+    project_gone(session)
+}
+
 /// Why a session's project no longer exists: deleted, or replaced by another directory at the
 /// same path (which must never inherit the authority to stop this session's services).
 fn project_gone(session: &Session) -> Option<&'static str> {

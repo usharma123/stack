@@ -6,6 +6,7 @@ pub mod compose;
 pub mod datadirs;
 pub mod doctor;
 pub mod error;
+pub mod fleet;
 pub mod git;
 pub mod hash;
 pub mod identity;

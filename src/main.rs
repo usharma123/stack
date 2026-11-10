@@ -161,6 +161,12 @@ enum Cmd {
         #[arg(long)]
         reclaim_data: bool,
     },
+    /// List every checkout Stack has records for on this machine (read-only, liveness checks only)
+    Ps {
+        /// Skip measuring data directories on disk, which can be slow
+        #[arg(long)]
+        no_size: bool,
+    },
     /// Publish a bundle directory to an OCI registry
     Publish {
         /// Directory containing bundle.toml
@@ -348,6 +354,7 @@ fn main() -> ExitCode {
         Cmd::Gc { reclaim_data, .. } => session::gc_checked(&ctx.state, *reclaim_data).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
+        Cmd::Ps { no_size } => stack::fleet::ps(&ctx.state, !*no_size).map(|r| emit(cli.json, &r, || stack::fleet::print_ps(&r))),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
         }),

@@ -296,6 +296,10 @@ output (mise's answer when no release matches) is an error, not a version.
   Use `stack down` before deleting a checkout; otherwise identify and stop the intended
   supervisor daemon explicitly before retrying GC. Nothing is recreated, and data is kept.
   While ownership remains unresolved, a new directory at the old path gets `session_conflict`.
+- **Machine-wide view.** `ps` reads the session index, `ports.json`, `identities.json` and the
+  data record (`data.json`) without locks (each is replaced atomically) and checks liveness
+  only: pid existence and TCP accept. It never runs identity verification. Sizes count the
+  blocks of what is inside each data directory without following links.
 - **Supervisor socket.** Pitchfork's socket is `<state dir>/sock/main.sock`, where the state
   directory is `PITCHFORK_STATE_DIR` (from the provider config's env, which mise passes to
   Pitchfork, else stack's own), else an absolute `XDG_STATE_HOME/pitchfork` on Linux only, else

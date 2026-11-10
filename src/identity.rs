@@ -69,6 +69,13 @@ pub fn lookup(state: &Path, project: &Path) -> Result<IndexMap<String, String>> 
         .collect())
 }
 
+/// The checkout and service of every token on the machine (never the token), read without the
+/// registry lock. For reports only.
+pub fn holders(state: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let reg: Registry = read_json(&paths(state).0)?;
+    Ok(reg.tokens.into_iter().map(|t| (t.project, t.service)).collect())
+}
+
 pub(crate) fn random_token() -> Result<String> {
     let mut seed = Vec::with_capacity(64);
     #[cfg(unix)]

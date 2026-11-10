@@ -227,6 +227,12 @@ pub fn lookup(state: &Path, project: &Path) -> Result<IndexMap<String, u16>> {
         .collect())
 }
 
+/// Every reservation on the machine, read without taking the registry lock (writes replace the
+/// file atomically). For reports only: nothing is pruned.
+pub fn all(state: &Path) -> Result<Vec<Reservation>> {
+    Ok(read_json::<Registry>(&paths(state).0)?.reservations)
+}
+
 fn find_free(reg: &Registry, project: &Path, service: &str, ephemeral: &RangeInclusive<u16>) -> Result<u16> {
     let span = u32::from(RANGE_END - RANGE_START) + 1;
     // Spread projects across the range so concurrent first runs rarely race for the same port.
