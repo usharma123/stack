@@ -112,8 +112,8 @@ minutes. When a deadline passes, Stack kills the command's process group and ret
 A runner that cancels Stack with SIGTERM (or SIGINT, SIGHUP) cancels the command: Stack passes
 the signal on to the command's process group, waits up to 10 seconds, then kills the group; a
 second signal kills it at once. With `--json` the result is still printed (`exit_code: null`
-and `signal` for a command the signal ended). `stack mcp` does the same for the command a call is running,
-answers that call, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
+and `signal` for a command the signal ended). `stack mcp` does the same for the commands its calls are running,
+answers those calls, starts nothing more, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
 A signal that comes while `up` or `restart` runs a service's `setup` cancels the start, even
 when the setup handles it and exits 0: no further setup runs and nothing more is started. The
 result is `cancelled` (CLI exit 128 plus the signal), and anything launched before stays
@@ -123,6 +123,22 @@ signal ends Stack at once, as before; that launch record is kept too.
 If `up` times out, services may still be starting. Check `stack status`. Retrying `up` lets
 a slow service finish; a service that will never become ready needs `stack down` before you
 try again.
+
+## Long calls over MCP
+
+The server reads requests while a call runs, so `ping`, `tools/list` and calls on other
+checkouts are answered meanwhile. Calls on the same checkout run one at a time, in the order
+they arrived.
+
+- **Cancelling.** `notifications/cancelled` for a running call stops it the way its timeout
+  would: its commands are killed with their process groups and no response is sent. A
+  cancelled `stack_up` or `stack_restart` leaves what a timed-out one leaves: anything it
+  launched stays recorded, so `stack_status` shows it, `stack_down` stops it and a retried
+  `stack_up` keeps waiting for it. A call cancelled while it waits for its turn never runs.
+- **Progress.** A call whose request carries `_meta.progressToken` gets
+  `notifications/progress` as each lifecycle step starts and ends (`compile`, `install`,
+  `start`, `verify` and the rest of `steps`), and a heartbeat every 10 seconds while a step
+  such as an install or a readiness wait takes long.
 
 ## MCP arguments
 

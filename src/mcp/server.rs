@@ -1,58 +1,84 @@
-//! The MCP server loop: JSON-RPC over stdio.
+//! The MCP server loop: JSON-RPC over stdio, with calls running concurrently.
 //!
-//! Stdin is read on its own thread, so the loop can wait for an answer from the client with a
-//! bound. When a call names no `dir`, its checkout is the client's single MCP root: the server
-//! asks for `roots/list` once the client is initialized (and again on
+//! Stdin is read on its own thread, so cheap requests (`ping`, `tools/list`, ...) are answered
+//! at once, also while a long `tools/call` runs. Each `tools/call` runs on a worker thread.
+//! Calls on the same checkout run one at a time, in the order they arrived; calls on different
+//! checkouts run concurrently. `notifications/cancelled` stops an in-flight call through its
+//! [`Cancel`], which ends it exactly as its deadline would (subprocesses killed with their
+//! process groups, launched services recorded), and no response is sent for it. A call that
+//! carries `_meta.progressToken` gets `notifications/progress` for each lifecycle step and a
+//! heartbeat while it runs. Every message is written whole, one per line, under one lock.
+//!
+//! When a call names no `dir`, its checkout is the client's single MCP root: the server asks
+//! for `roots/list` once the client is initialized (and again on
 //! `notifications/roots/list_changed`) and holds calls that need the answer until it arrives,
 //! or [`ROOTS_WAIT`] passes. It never falls back to its own working directory.
 
-use super::{call, needs_roots, negotiate, tools, INSTRUCTIONS};
+use super::{call, needs_roots, negotiate, project_key, tools, INSTRUCTIONS};
+use crate::process::Cancel;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long calls that need the client's roots wait for its `roots/list` answer.
 const ROOTS_WAIT: Duration = Duration::from_secs(5);
 
+/// Time between heartbeat progress notifications of a call that asked for progress.
+const HEARTBEAT: Duration = Duration::from_secs(10);
+
 /// Runs one `tools/call`: its params and the client's roots (`None` when it offers none).
 pub(super) type Caller = Arc<dyn Fn(&Value, Option<&[PathBuf]>) -> Value + Send + Sync>;
 
-/// Serve until `input` ends, then answer the calls still held.
+/// What the loop waits for.
+enum Event {
+    Line(std::io::Result<String>),
+    /// Input ended.
+    End,
+    /// A call was answered after a signal was passed on to a command (see below).
+    Stop,
+}
+
+/// Serve until `input` ends, then let calls in flight finish and answer them.
 pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static) -> std::io::Result<()> {
     serve_with(input, output, Arc::new(call))
 }
 
 pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, caller: Caller) -> std::io::Result<()> {
-    let (lines, received) = mpsc::channel();
+    let (events, received) = mpsc::channel();
+    let lines = events.clone();
     std::thread::spawn(move || {
         for line in input.lines() {
             let end = line.is_err();
-            if lines.send(line).is_err() || end {
-                break;
+            if lines.send(Event::Line(line)).is_err() || end {
+                return;
             }
         }
+        let _ = lines.send(Event::End);
     });
-    let mut server = Server::new(Arc::new(Out(Mutex::new(Box::new(output)))), caller);
+    let mut server = Server::new(Arc::new(Out(Mutex::new(Box::new(output)))), caller, events);
     let result = loop {
+        // A signal that would have ended the server was passed on to the command a call ran
+        // instead: nothing more starts, and the server ends as the signal asked once the calls
+        // in flight are answered.
+        if crate::process::passed_on().is_some() {
+            server.deferred.clear();
+            break Ok(());
+        }
         let next = match server.roots_deadline() {
             Some(at) => received.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => received.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match next {
-            Ok(Ok(line)) => server.line(&line),
-            Ok(Err(e)) => break Err(e),
+            Ok(Event::Line(Ok(line))) => server.line(&line),
+            Ok(Event::Line(Err(e))) => break Err(e),
+            Ok(Event::Stop) => {}
             Err(RecvTimeoutError::Timeout) => server.roots_failed(),
-            Err(RecvTimeoutError::Disconnected) => break Ok(()),
-        }
-        // A signal that would have ended the server was passed on to the command a call ran
-        // instead; now that it was answered, the server ends as the signal asked.
-        if crate::process::passed_on().is_some() {
-            server.deferred.clear();
-            break Ok(());
+            Ok(Event::End) | Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
     };
     server.finish();
@@ -89,16 +115,32 @@ enum Roots {
 struct Server {
     out: Arc<Out>,
     caller: Caller,
+    events: mpsc::Sender<Event>,
     client_roots: bool,
     roots: Roots,
     requests_sent: u64,
     /// Calls waiting for the client's roots, in arrival order.
     deferred: VecDeque<Value>,
+    /// The [`Cancel`] of each call in flight, by its request id.
+    inflight: Arc<Mutex<HashMap<String, Cancel>>>,
+    queues: Arc<Queues>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl Server {
-    fn new(out: Arc<Out>, caller: Caller) -> Self {
-        Server { out, caller, client_roots: false, roots: Roots::Unsupported, requests_sent: 0, deferred: VecDeque::new() }
+    fn new(out: Arc<Out>, caller: Caller, events: mpsc::Sender<Event>) -> Self {
+        Server {
+            out,
+            caller,
+            events,
+            client_roots: false,
+            roots: Roots::Unsupported,
+            requests_sent: 0,
+            deferred: VecDeque::new(),
+            inflight: Arc::default(),
+            queues: Arc::default(),
+            workers: Vec::new(),
+        }
     }
 
     fn line(&mut self, line: &str) {
@@ -116,7 +158,7 @@ impl Server {
         match (message.get("method").and_then(Value::as_str).map(String::from), id) {
             (None, Some(id)) if message.get("result").is_some() || message.get("error").is_some() => self.response(&id, &message),
             (method, Some(id)) => self.request(method.as_deref().unwrap_or_default(), id, message),
-            (Some(method), None) => self.notification(&method),
+            (Some(method), None) => self.notification(&method, &message["params"]),
             // Neither a request nor a notification: nothing to answer.
             (None, None) => {}
         }
@@ -140,19 +182,19 @@ impl Server {
             "ping" => self.out.ok(&id, json!({})),
             "tools/list" => self.out.ok(&id, json!({ "tools": tools() })),
             "tools/call" => {
-                // Calls after a held one are held too, so calls keep their order.
+                // Calls after a held one are held too, so calls on one checkout keep their order.
                 if matches!(self.roots, Roots::Pending { .. }) && (needs_roots(params) || !self.deferred.is_empty()) {
                     self.ask_roots_once();
                     self.deferred.push_back(message);
                 } else {
-                    self.run_call(&message);
+                    self.spawn_call(message);
                 }
             }
             _ => self.out.error(&id, -32601, format!("method not found: {method}")),
         }
     }
 
-    fn notification(&mut self, method: &str) {
+    fn notification(&mut self, method: &str, params: &Value) {
         match method {
             "notifications/initialized" => {
                 if self.client_roots {
@@ -164,6 +206,7 @@ impl Server {
                 self.roots = Roots::Pending { since: Instant::now(), asked: None };
                 self.ask_roots_once();
             }
+            "notifications/cancelled" => self.cancel(&params["requestId"]),
             _ => {}
         }
     }
@@ -215,7 +258,7 @@ impl Server {
 
     fn run_deferred(&mut self) {
         while let Some(message) = self.deferred.pop_front() {
-            self.run_call(&message);
+            self.spawn_call(message);
         }
     }
 
@@ -226,16 +269,210 @@ impl Server {
         }
     }
 
-    fn run_call(&mut self, message: &Value) {
-        let roots = self.roots_snapshot();
-        let result = (self.caller)(&message["params"], roots.as_deref());
-        self.out.ok(&message["id"], result);
+    /// Stop the call `request` names: one in flight ends as at its deadline, one still held
+    /// for roots is dropped. Neither is answered.
+    fn cancel(&mut self, request: &Value) {
+        if request.is_null() {
+            return;
+        }
+        if let Some(cancel) = self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&request.to_string()) {
+            cancel.cancel();
+            return;
+        }
+        self.deferred.retain(|m| m["id"] != *request);
     }
 
-    /// Calls still held for roots run without them.
+    fn spawn_call(&mut self, message: Value) {
+        let id = message["id"].clone();
+        let key = id.to_string();
+        let cancel = Cancel::new();
+        self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone(), cancel.clone());
+        let roots = self.roots_snapshot();
+        let params = message["params"].clone();
+        // Taken here, on the reading thread, so calls on one checkout keep their arrival order.
+        let ticket = project_key(&params, roots.as_deref()).map(|project| self.queues.take(project));
+        let (out, caller, inflight, queues, events) = (self.out.clone(), self.caller.clone(), self.inflight.clone(), self.queues.clone(), self.events.clone());
+        self.workers.retain(|w| !w.is_finished());
+        self.workers.push(std::thread::spawn(move || {
+            let turn = Turn { queues: &queues, ticket };
+            let outcome = turn.wait(&cancel).then(|| {
+                let token = &params["_meta"]["progressToken"];
+                let progress = (token.is_string() || token.is_i64() || token.is_u64())
+                    .then(|| Progress::start(out.clone(), token.clone(), params["name"].as_str().unwrap_or_default()));
+                let outcome = {
+                    let _cancel = crate::process::cancellation_scope(Some(cancel.clone()));
+                    let _progress = crate::progress::scope(progress.as_ref().map(Progress::sink));
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caller(&params, roots.as_deref())))
+                };
+                // The heartbeat stops before the response: no progress follows it.
+                drop(progress);
+                outcome
+            });
+            drop(turn);
+            inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
+            match outcome {
+                // Cancelled: the client expects no response.
+                _ if cancel.is_cancelled() => {}
+                Some(Ok(result)) => out.ok(&id, result),
+                Some(Err(_)) => out.error(&id, -32603, "internal error: the call panicked"),
+                None => {}
+            }
+            if crate::process::passed_on().is_some() {
+                let _ = events.send(Event::Stop);
+            }
+        }));
+    }
+
+    /// Calls still held for roots run without them; then every call in flight is answered.
     fn finish(&mut self) {
         if matches!(self.roots, Roots::Pending { .. }) {
             self.roots_failed();
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Per-checkout lines of calls: each is served in the order its ticket was taken.
+#[derive(Default)]
+struct Queues {
+    lines: Mutex<HashMap<PathBuf, Line>>,
+    turn: Condvar,
+}
+
+#[derive(Default)]
+struct Line {
+    next: u64,
+    serving: u64,
+    /// Tickets given up before their turn.
+    abandoned: BTreeSet<u64>,
+}
+
+struct Ticket {
+    project: PathBuf,
+    number: u64,
+}
+
+impl Queues {
+    fn take(&self, project: PathBuf) -> Ticket {
+        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let line = lines.entry(project.clone()).or_default();
+        line.next += 1;
+        Ticket { project, number: line.next - 1 }
+    }
+
+    /// Wait for the ticket's turn; `false` if cancelled first.
+    fn wait(&self, ticket: &Ticket, cancel: &Cancel) -> bool {
+        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if lines.get(&ticket.project).is_some_and(|l| l.serving == ticket.number) {
+                return true;
+            }
+            if cancel.is_cancelled() {
+                return false;
+            }
+            lines = self.turn.wait_timeout(lines, Duration::from_millis(50)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+    }
+
+    /// The ticket is done with, served or not: the next one in line may go.
+    fn leave(&self, ticket: &Ticket) {
+        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(line) = lines.get_mut(&ticket.project) else { return };
+        if line.serving == ticket.number {
+            line.serving += 1;
+            while line.abandoned.remove(&line.serving) {
+                line.serving += 1;
+            }
+        } else {
+            line.abandoned.insert(ticket.number);
+        }
+        if line.serving == line.next {
+            lines.remove(&ticket.project);
+        }
+        self.turn.notify_all();
+    }
+}
+
+/// A call's place in its checkout's line, given up when dropped (also on a panic).
+struct Turn<'a> {
+    queues: &'a Queues,
+    ticket: Option<Ticket>,
+}
+
+impl Turn<'_> {
+    fn wait(&self, cancel: &Cancel) -> bool {
+        self.ticket.as_ref().map_or(!cancel.is_cancelled(), |t| self.queues.wait(t, cancel))
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = &self.ticket {
+            self.queues.leave(ticket);
+        }
+    }
+}
+
+/// `notifications/progress` for one call: each lifecycle step, and a heartbeat until dropped.
+struct Progress {
+    shared: Arc<ProgressState>,
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<JoinHandle<()>>,
+}
+
+struct ProgressState {
+    out: Arc<Out>,
+    token: Value,
+    tool: String,
+    started: Instant,
+    /// Notifications sent (each one's `progress`), and the last step reported.
+    state: Mutex<(u64, String)>,
+}
+
+impl ProgressState {
+    fn notify(&self, step: Option<String>) {
+        // Held while sending, so `progress` only ever increases on the wire.
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.0 += 1;
+        let message = match step {
+            Some(step) => {
+                state.1 = step.clone();
+                format!("{}: {step}", self.tool)
+            }
+            None => format!("{}: still working ({}s; last: {})", self.tool, self.started.elapsed().as_secs(), state.1),
+        };
+        self.out.send(&json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+            "params": { "progressToken": self.token, "progress": state.0, "message": message } }));
+    }
+}
+
+impl Progress {
+    fn start(out: Arc<Out>, token: Value, tool: &str) -> Self {
+        let shared = Arc::new(ProgressState { out, token, tool: tool.to_string(), started: Instant::now(), state: Mutex::new((0, String::new())) });
+        shared.notify(Some("started".into()));
+        let (stop, stopped) = mpsc::channel::<()>();
+        let beat = shared.clone();
+        let heartbeat = std::thread::spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(HEARTBEAT) {
+                beat.notify(None);
+            }
+        });
+        Progress { shared, stop: Some(stop), heartbeat: Some(heartbeat) }
+    }
+
+    fn sink(&self) -> crate::progress::Sink {
+        let shared = self.shared.clone();
+        Arc::new(move |step: &str, status: &str| shared.notify(Some(format!("{step} {status}"))))
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
         }
     }
 }
@@ -344,6 +581,19 @@ mod tests {
             self.output.recv_timeout(Duration::from_secs(20)).expect("the server answers")
         }
 
+        /// Messages up to and including the response to `id`.
+        pub(super) fn until(&self, id: Value) -> Vec<Value> {
+            let mut seen = Vec::new();
+            loop {
+                let message = self.recv();
+                let done = message["id"] == id && message.get("method").is_none();
+                seen.push(message);
+                if done {
+                    return seen;
+                }
+            }
+        }
+
         /// Close input and collect what the server still writes before it exits.
         pub(super) fn close(mut self) -> Vec<Value> {
             drop(self.input.take());
@@ -358,6 +608,112 @@ mod tests {
 
     fn initialize(version: &str, capabilities: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": { "protocolVersion": version, "capabilities": capabilities, "clientInfo": { "name": "test", "version": "0" } } })
+    }
+
+    /// A caller that sleeps for `ms` (beside the arguments), or until cancelled, recording when it ran.
+    fn sleeper(log: Arc<Mutex<Vec<(String, Instant, Instant)>>>) -> Caller {
+        Arc::new(move |params: &Value, _: Option<&[PathBuf]>| {
+            let start = Instant::now();
+            // Outside `arguments`, which are checked against the tool's schema.
+            let ms = params["ms"].as_u64().unwrap_or(0);
+            while start.elapsed() < Duration::from_millis(ms) && !crate::process::cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let dir = params["arguments"]["dir"].as_str().unwrap_or_default().to_string();
+            log.lock().unwrap().push((dir, start, Instant::now()));
+            json!({ "slept": ms })
+        })
+    }
+
+    #[test]
+    fn ping_is_answered_while_a_call_runs() {
+        let log = Arc::default();
+        let session = Session::start(sleeper(Arc::clone(&log)));
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": "/" }, "ms": 1500 } }));
+        session.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }));
+        let first = session.recv();
+        assert_eq!((first["id"].clone(), first["result"].clone()), (json!(2), json!({})), "ping waited for the call: {first}");
+        assert_eq!(session.recv()["result"]["slept"], 1500);
+        session.close();
+    }
+
+    #[test]
+    fn calls_on_one_checkout_take_turns_and_others_run_alongside() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        let log: Arc<Mutex<Vec<(String, Instant, Instant)>>> = Arc::default();
+        let session = Session::start(sleeper(Arc::clone(&log)));
+        for (id, dir) in [(1, &a), (2, &a), (3, &b)] {
+            session.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": dir }, "ms": 400 } }));
+        }
+        let answered: BTreeSet<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        assert_eq!(answered, [1, 2, 3].into());
+        let log = log.lock().unwrap();
+        let runs = |dir: &PathBuf| log.iter().filter(|(d, _, _)| d == dir.to_str().unwrap()).collect::<Vec<_>>();
+        let (in_a, in_b) = (runs(&a), runs(&b));
+        assert_eq!((in_a.len(), in_b.len()), (2, 1));
+        assert!(in_a[1].1 >= in_a[0].2, "two calls on one checkout overlapped");
+        assert!(in_b[0].1 < in_a[0].2, "a call on another checkout waited for the first");
+    }
+
+    #[test]
+    fn a_cancelled_call_stops_its_command_and_gets_no_response() {
+        // The caller runs a command that would sleep for a minute, through the same deadline
+        // machinery the lifecycle uses.
+        let caller: Caller = Arc::new(|_: &Value, _: Option<&[PathBuf]>| {
+            let start = Instant::now();
+            let ran = crate::process::output(std::process::Command::new("sleep").arg("60"));
+            json!({ "elapsed_ms": start.elapsed().as_millis() as u64, "success": ran.is_ok_and(|o| o.status.success()) })
+        });
+        let session = Session::start(caller);
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": "/" }, "_meta": { "progressToken": "p1" } } }));
+        let started = session.recv();
+        assert_eq!(started["method"], "notifications/progress", "{started}");
+        let cancelled_at = Instant::now();
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1, "reason": "test" } }));
+        session.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }));
+        assert_eq!(session.until(json!(2)).last().unwrap()["result"], json!({}));
+        let rest = session.close();
+        assert!(cancelled_at.elapsed() < Duration::from_secs(10), "the command was not stopped");
+        assert!(rest.iter().all(|m| m["id"] != 1), "a cancelled call was answered: {rest:?}");
+    }
+
+    #[test]
+    fn a_call_cancelled_while_waiting_its_turn_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log: Arc<Mutex<Vec<(String, Instant, Instant)>>> = Arc::default();
+        let session = Session::start(sleeper(Arc::clone(&log)));
+        for (id, ms) in [(1, 600), (2, 0), (3, 0)] {
+            session.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": dir.path() }, "ms": ms } }));
+        }
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 2 } }));
+        let answered: Vec<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        assert_eq!(answered, [1, 3], "the call after the cancelled one still got its turn");
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn progress_reports_each_step_before_the_response() {
+        let caller: Caller = Arc::new(|_: &Value, _: Option<&[PathBuf]>| {
+            crate::progress::notify(crate::progress::Event { step: "gc", phase: crate::progress::Phase::Ok, code: None, detail: None });
+            crate::progress::started("install");
+            crate::progress::notify(crate::progress::Event { step: "install", phase: crate::progress::Phase::Ok, code: None, detail: None });
+            json!({ "done": true })
+        });
+        let session = Session::start(caller);
+        session.send(json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "stack_up", "arguments": { "dir": "/" }, "_meta": { "progressToken": 42 } } }));
+        let seen = session.until(json!(7));
+        let progress: Vec<&Value> = seen.iter().filter(|m| m["method"] == "notifications/progress").collect();
+        let messages: Vec<&str> = progress.iter().map(|m| m["params"]["message"].as_str().unwrap()).collect();
+        assert_eq!(messages, ["stack_up: started", "stack_up: gc ok", "stack_up: install started", "stack_up: install ok"]);
+        assert!(progress.iter().all(|m| m["params"]["progressToken"] == 42));
+        let counts: Vec<u64> = progress.iter().map(|m| m["params"]["progress"].as_u64().unwrap()).collect();
+        assert!(counts.windows(2).all(|w| w[0] < w[1]), "{counts:?}");
+        assert_eq!(seen.last().unwrap()["result"]["done"], true);
+        // Without a token, nothing but the response.
+        session.send(tool_call(8, "stack_up", json!({ "dir": "/" })));
+        assert_eq!(session.until(json!(8)).len(), 1);
+        session.close();
     }
 
     #[test]

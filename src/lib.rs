@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod oci;
 pub mod ports;
 pub mod process;
+pub mod progress;
 pub mod procinfo;
 pub mod project;
 pub mod provider;

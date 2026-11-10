@@ -337,9 +337,9 @@ impl Answer {
 fn query(cache: &Path, pins: &[Pin]) -> std::result::Result<Answer, String> {
     let root = ScratchRoot::create(cache, "skills").map_err(|e| format!("cannot create a scratch provider root: {}", e.message))?;
     root.write_tools(pins).map_err(|e| format!("cannot write the scratch provider config: {}", e.message))?;
-    let deadline = crate::process::deadline();
+    let bound = crate::process::inherit();
     let run = |args: &[&str], what: &str| -> std::result::Result<String, String> {
-        let _deadline = crate::process::deadline_scope(deadline);
+        let _deadline = bound.enter();
         let mut command = root.command(args);
         let out = crate::process::capture(&mut command, QUERY_TIMEOUT, LIST_LIMIT).map_err(|e| format!("cannot run mise: {e}"))?;
         if out.timed_out {

@@ -26,8 +26,8 @@ fn startup_timeout_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
 }
 
-/// Serve the tools over stdio until the client closes stdin (see [`server`]); every response
-/// is written as one line.
+/// Serve the tools over stdio until the client closes stdin. Requests run concurrently (see
+/// [`server`]); every response and notification is written as one line.
 pub fn serve() -> std::io::Result<()> {
     server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
 }
@@ -363,6 +363,14 @@ fn project(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option
 fn needs_roots(params: &Value) -> bool {
     let name = params["name"].as_str().unwrap_or_default();
     validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").map_or(true, Value::is_null) && !MACHINE_WIDE.contains(&name))
+}
+
+/// The checkout a call will act on, for running calls on one checkout one at a time; `None`
+/// when it acts on none or will fail before acting.
+fn project_key(params: &Value, roots: Option<&[PathBuf]>) -> Option<PathBuf> {
+    let name = params["name"].as_str().unwrap_or_default();
+    let args = Value::Object(validate(name, &params["arguments"]).ok()?);
+    project(name, &args, roots).ok().flatten()
 }
 
 fn ctx(project: Option<&Path>) -> Ctx {

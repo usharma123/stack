@@ -54,11 +54,12 @@ impl FileLock {
             .truncate(false)
             .open(path)
             .map_err(|e| io_error(path.display(), e))?;
-        if crate::process::deadline().is_none() {
+        if !crate::process::interruptible() {
             file.lock_exclusive().map_err(|e| io_error(path.display(), e))?;
             return Ok(Self { _file: file });
         }
-        // Under a deadline, wait for another holder only as long as it allows.
+        // Under a deadline (or in a call that may be cancelled), wait for another holder only as
+        // long as it allows.
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { _file: file }),
@@ -103,7 +104,7 @@ impl SharedLock {
     pub fn shared(path: &Path) -> Result<Self> {
         let mut file = open_lock(path)?;
         loop {
-            let locked = if crate::process::deadline().is_none() {
+            let locked = if !crate::process::interruptible() {
                 FileExt::lock_shared(&file).map(|()| true)
             } else {
                 FileExt::try_lock_shared(&file).map(|()| true).or_else(|e| match e.raw_os_error() {

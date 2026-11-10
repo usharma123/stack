@@ -289,12 +289,12 @@ fn concurrently<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> R
         return items.iter().map(f).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let deadline = crate::process::deadline();
+    let bound = crate::process::inherit();
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
-                    let _deadline = crate::process::deadline_scope(deadline);
+                    let _deadline = bound.enter();
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -552,14 +552,21 @@ struct Steps(Vec<Value>);
 
 impl Steps {
     fn ok(&mut self, step: &str, detail: Value) {
+        crate::progress::notify(crate::progress::Event { step, phase: crate::progress::Phase::Ok, code: None, detail: Some(&detail) });
         self.0
             .push(json!({ "step": step, "status": "ok", "detail": detail }));
     }
 
     /// A step that completed with warnings: the command still succeeds.
     fn warn(&mut self, step: &str, detail: Value) {
+        crate::progress::notify(crate::progress::Event { step, phase: crate::progress::Phase::Warning, code: None, detail: Some(&detail) });
         self.0
             .push(json!({ "step": step, "status": "warning", "detail": detail }));
+    }
+
+    /// A step is starting: only observers hear of it (see `progress`); the record is unchanged.
+    fn begin(&self, step: &str) {
+        crate::progress::started(step);
     }
 
     /// `[skills] dir`: link the stack's skills after install. Every outcome is a warning at
@@ -582,6 +589,7 @@ impl Steps {
 
     /// Attach the steps that already ran, and whether repeating the command is safe.
     fn fail(mut self, step: &str, err: StackError, changed: bool) -> StackError {
+        crate::progress::notify(crate::progress::Event { step, phase: crate::progress::Phase::Failed, code: Some(err.code), detail: None });
         self.0
             .push(json!({ "step": step, "status": "failed", "code": err.code }));
         let mut err =
@@ -737,6 +745,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     // A mise too old for what the configuration asks would silently ignore it: checked before
     // the compile writes anything. The artifact policy is checked, and the provider's lock
     // rendered from stack.lock, before any install.
+    steps.begin("compile");
     let report = match ctx.compile_to_install() {
         Ok(r) => r,
         Err((step, e)) => return Err(steps.fail(step, e, false)),
@@ -771,6 +780,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
+    steps.begin("install");
     match install_partitioned(ctx, &plan) {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
@@ -899,6 +909,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                 Err(e) => return Err(steps.fail("stop_dependents", e, true)),
             }
         }
+        steps.begin("start");
         if let Err(start_error) = start_in_order(ctx, &report, &names, supervisor) {
             let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
@@ -908,6 +919,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         }
         steps.ok("start", json!(null));
 
+        steps.begin("verify");
         checks = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
         steps.ok(
             "verify",
@@ -1361,10 +1373,10 @@ fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[St
         .collect();
     let owner = supervisor_owner(&ctx.state, true).ok();
     let starter = {
-        let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
+        let (root, names, cancel, bound) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::inherit());
         let (checkable, completed, supervisor) = (checkable.clone(), completed.clone(), supervisor.clone());
         std::thread::spawn(move || {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             let _cancel = crate::process::cancel_scope(cancel.clone());
             let _ = done.send(request_starts((&root, &supervisor), &names, &checkable, &cancel, &completed, owner.as_deref()));
         })
@@ -1581,11 +1593,11 @@ fn request_each(
     for (i, name) in names.iter().enumerate() {
         confirm_addressed(root, supervisor.state_dir())?;
         let end = Arc::new(AtomicBool::new(false));
-        let (dir, service, sent, deadline, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::deadline(), end.clone());
+        let (dir, service, sent, bound, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::inherit(), end.clone());
         let target = supervisor.clone();
         let owner = owner.map(str::to_string);
         threads.push(std::thread::spawn(move || {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             let _cancel = crate::process::cancel_scope(flag);
             let _ = sent.send((i, mise::start_daemon(&dir, &service, owner.as_deref(), &target)));
         }));
@@ -1957,6 +1969,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         Err(e) => return Err(steps.fail("preflight", e, false)),
     };
     // Confirm the old processes are gone before starting new ones on the same ports.
+    steps.begin("stop");
     if let Err(e) = stop_and_wait(ctx, &names, Some(&session), &supervisor) {
         return Err(steps.fail("stop", e, true));
     }
@@ -1985,6 +1998,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         session.provider = mise::which_pitchfork(&ctx.root).map(|pitchfork| ProviderRecord { pitchfork, state_dir: supervisor.clone() });
     }
     save(ctx, &session).map_err(|e| steps.clone().fail("record_launch", e, true))?;
+    steps.begin("start");
     if let Err(start_error) = start_in_order(ctx, &report, &names, &supervisor) {
         let observed = record_after_failed_start(ctx);
         if let Err(error) = observed {
@@ -1993,6 +2007,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         return Err(steps.fail("start", with_readiness_unless_cancelled(ctx, &report, &names, start_error), true));
     }
     steps.ok("start", json!(names));
+    steps.begin("verify");
     let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
     steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
     bind_data(ctx, &checks);
@@ -2029,6 +2044,7 @@ pub struct InstallReport {
 pub fn install(ctx: &Ctx) -> Result<InstallReport> {
     let mut steps = Steps::default();
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    steps.begin("compile");
     let report = match ctx.compile_to_install() {
         Ok(r) => r,
         Err((step, e)) => return Err(steps.fail(step, e, false)),
@@ -2050,6 +2066,7 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
+    steps.begin("install");
     match install_partitioned(ctx, &plan) {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
@@ -3657,9 +3674,9 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     // from its configuration copy below, before it starts.
     let installed = {
         let (cache, pins) = (ctx.cache.clone(), report.lock.as_ref().map(scratch::pins).unwrap_or_default());
-        let deadline = crate::process::deadline();
+        let bound = crate::process::inherit();
         std::thread::spawn(move || {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             scratch::not_installed(&cache, &pins)
         })
     };
