@@ -451,6 +451,27 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     assert_eq!(r["error"]["code"], "skill_not_found", "an entrypoint gone before discovery: {r}");
 }
 
+#[test]
+fn the_cli_prints_the_same_skill_stack_skill_returns() {
+    let f = Fixture::new(PROJECT);
+    let out = f.ok(&["skill", "mbx", "--name", "mbx-advanced"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "# mbx-advanced 1.22.0\nDocumentation only. SENTINEL-DOC\n");
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("# mbx 1.22.0 skill mbx-advanced ("), "{}", String::from_utf8_lossy(&out.stderr));
+    let cli = f.json(&["skill", "fnox"]);
+    let mut mcp = Mcp::start(&f);
+    mcp.request("initialize", json!({ "protocolVersion": "2025-06-18" }));
+    let mut over_mcp = mcp.call("stack_skill", json!({ "tool": "fnox" }));
+    over_mcp.as_object_mut().unwrap().remove("project");
+    assert_eq!(cli, over_mcp);
+    // The same refusals, with the CLI's exit codes.
+    let several = f.json(&["skill", "mbx"]);
+    assert_eq!(several["error"]["code"], "usage", "{several}");
+    assert_eq!(several["error"]["details"][0]["names"], json!(["mbx", "mbx-advanced"]), "{several}");
+    assert_eq!(f.json(&["skill", "pitchfork"])["error"]["code"], "skill_not_found");
+    let out = f.command(&["skill", "fnox", "--name", ""]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "an empty name is a usage error");
+}
+
 const SYNC_PROJECT: &str = "[tools]\nfnox = \"1.39\"\nmbx = \"1.22.0\"\n\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n\n[skills]\ndir = \".claude/skills\"\n";
 
 fn step<'a>(report: &'a Value, name: &str) -> &'a Value {

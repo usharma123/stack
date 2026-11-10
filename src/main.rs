@@ -58,6 +58,15 @@ enum Cmd {
         #[arg(long)]
         all_skills: bool,
     },
+    /// Print the SKILL.md of a pinned tool's agent skill (as listed by `inspect`)
+    Skill {
+        /// Tool name as `inspect` lists it under skills, e.g. fnox
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        tool: String,
+        /// Skill name, needed only when the tool ships several
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: Option<String>,
+    },
     /// Install the locked tools and service binaries without starting anything
     Install,
     /// Show the last lines a service wrote, as kept by the supervisor
@@ -246,6 +255,12 @@ fn main() -> ExitCode {
             r.warnings.extend(session::stale_session(&ctx, &r));
             r.attach_skills(&ctx.cache, *all_skills);
             report(cli.json, &r)
+        }),
+        Cmd::Skill { tool, name } => stack::skills::pinned(&root, &ctx.cache, &ctx.state, tool, name.as_deref()).map(|skill| {
+            emit(cli.json, &skill, || {
+                eprintln!("# {} {} skill {} ({})", skill.tool, skill.version, skill.name, skill.entrypoint.display());
+                print!("{}", skill.text);
+            })
         }),
         Cmd::Up { ttl, owner_pid, timeout } => ttl
             .as_deref()

@@ -286,7 +286,7 @@ fn tool_definitions() -> Value {
             "Show the composed stack without changing anything: bundles, tools, env, services, tasks, ports and where each value came from. Use it to learn what a checkout provides. Returns the report, including `skills`: the agent skills of the releases stack.lock pins, each available, no_skill, not_installed or unavailable (read one with stack_skill).",
             schema(json!({ "all_skills": { "type": "boolean", "description": "Also list the skills of tools Stack adds for its own supervisor, under provider_skills. For people; an agent should not drive the supervisor" } }), &[])),
         tool("stack_skill", "Read a tool's skill", annotations("Read a tool's skill", true, None, true, false),
-            "Return the SKILL.md text of a pinned tool's agent skill, one that stack_inspect lists under `skills` as available. Use it to learn how to use that tool at the pinned release; read it, do not run it. Returns {tool, version, name, entrypoint, bytes, text}, text at most 64 KiB. Fails with skill_not_found, or usage listing the names when the tool ships several and name is omitted.",
+            "Return the SKILL.md text of a pinned tool's agent skill (CLI: stack skill), one that stack_inspect lists under `skills` as available. Use it to learn how to use that tool at the pinned release; read it, do not run it. Returns {tool, version, name, entrypoint, bytes, text}, text at most 64 KiB. Fails with skill_not_found, or usage listing the names when the tool ships several and name is omitted.",
             schema(json!({ "tool": { "type": "string", "description": "Tool name as listed under `skills`, e.g. \"fnox\"" }, "name": { "type": "string", "description": "Skill name, needed only when the tool ships several" } }), &["tool"])),
         tool("stack_compile", "Compile stack.lock", annotations("Compile stack.lock", false, Some(false), true, true),
             "Resolve bundles and exact tool and service versions, then write stack.lock and the generated provider config. Use it after editing stack.toml, or when another tool fails with lock_outdated. Pins are kept unless their request changed; update re-resolves everything; locked only checks; reassign_ports gives fresh ports after port_conflict. Returns versions, ports and warnings.",
@@ -576,18 +576,7 @@ fn skill(args: &Value, ctx: &Ctx) -> Result<crate::skills::SkillText> {
         Value::Null => None,
         v => Some(v.as_str().filter(|s| !s.is_empty()).ok_or_else(|| StackError::new("usage", "name must not be empty"))?),
     };
-    let report = project::compile(&Options {
-        root: ctx.root.clone(),
-        mode: project::inspect_mode(&ctx.root),
-        write: false,
-        cache: ctx.cache.clone(),
-        state: ctx.state.clone(),
-        reassign_ports: false,
-        resolver: None,
-        locker: None,
-    })?;
-    let found = report.discover_skills(&ctx.cache);
-    crate::skills::read(&found, tool, name)
+    crate::skills::pinned(&ctx.root, &ctx.cache, &ctx.state, tool, name)
 }
 
 /// `timeout_secs` (whole seconds, at least 1) or `timeout` (a duration string, at least 1s) of

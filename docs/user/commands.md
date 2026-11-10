@@ -5,6 +5,7 @@
 | `stack init [--tool NAME[=VERSION]]... [--service NAME[=PRESET][@VERSION]]...` | Write a starting `stack.toml` (never replaces one) |
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve bundles and versions, write `stack.lock`, assign ports, write mise config |
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
+| `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
 | `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) |
@@ -60,6 +61,12 @@ nothing if resolution fails (`resolve_failed`).
 Shows the composed stack: tools, services, ports, tasks, where each value came from, and the
 [agent skills](skills.md) of the pinned releases. Before the first `compile` it previews what
 would be locked; afterwards it fails if `stack.toml` has drifted from `stack.lock`.
+
+## skill
+
+`stack skill <tool> [--name N]` prints the `SKILL.md` of one `available` skill that `inspect`
+lists under `skills`, at the release `stack.lock` pins; `--json` returns the same object as MCP
+`stack_skill`. See [reading a skill](skills.md#reading-a-skill).
 
 ## install
 

@@ -377,6 +377,23 @@ pub struct SkillText {
     pub text: String,
 }
 
+/// The `SKILL.md` of one available skill of the project at `root`, at the release stack.lock
+/// pins, from the same discovery `inspect` runs (never a provider's skill): what `stack skill`
+/// and MCP `stack_skill` return. `name` may be omitted when the tool has exactly one.
+pub fn pinned(root: &Path, cache: &Path, state: &Path, tool: &str, name: Option<&str>) -> Result<SkillText> {
+    let report = crate::project::compile(&crate::project::Options {
+        root: root.to_path_buf(),
+        mode: crate::project::inspect_mode(root),
+        write: false,
+        cache: cache.to_path_buf(),
+        state: state.to_path_buf(),
+        reassign_ports: false,
+        resolver: None,
+        locker: None,
+    })?;
+    read(&report.discover_skills(cache), tool, name)
+}
+
 /// The `SKILL.md` of an available, non-provider skill that discovery enumerated.
 pub fn read(discovery: &Discovery, tool: &str, name: Option<&str>) -> Result<SkillText> {
     let name = match name {
@@ -385,7 +402,7 @@ pub fn read(discovery: &Discovery, tool: &str, name: Option<&str>) -> Result<Ski
     };
     let not_found = |why: String| {
         StackError::new("skill_not_found", format!("no skill {name:?} of tool {tool:?}: {why}"))
-            .hint("`stack_inspect` lists the stack's skills under `skills`; only `available` ones can be read")
+            .hint("`stack inspect` (MCP `stack_inspect`) lists the stack's skills under `skills`; only `available` ones can be read")
             .with_detail(json!({ "tool": tool, "name": name }))
     };
     if discovery.provider_skills.iter().any(|s| s.tool == tool) {
@@ -456,7 +473,7 @@ fn only_skill<'a>(discovery: &'a Discovery, tool: &str) -> Result<&'a str> {
     match names.as_slice() {
         [one] => Ok(one),
         [] => Err(StackError::new("skill_not_found", format!("tool {tool:?} has no available skill"))
-            .hint("`stack_inspect` lists the stack's skills under `skills`; only `available` ones can be read")
+            .hint("`stack inspect` (MCP `stack_inspect`) lists the stack's skills under `skills`; only `available` ones can be read")
             .with_detail(json!({ "tool": tool }))),
         several => Err(StackError::new("usage", format!("tool {tool:?} has {} available skills; name one", several.len()))
             .hint(format!("give name, one of: {}", several.join(", ")))
