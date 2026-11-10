@@ -1560,7 +1560,8 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
     // (tool, arguments, what the message names, what the hint says)
     let cases: Vec<(&str, Value, &str, &str)> = vec![
         ("stack_exec", json!({ "command": ran, "secret": ["DEPLOY_KEY"] }), "unknown argument `secret`", "did you mean `secrets`?"),
-        ("stack_exec", json!({ "command": ran, "timeout": "1s" }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_exec", json!({ "command": ran, "timeout": "1s", "timeout_secs": 1 }), "`timeout` and `timeout_secs` cannot be given together", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_sec": 1 }), "unknown argument `timeout_sec`", "did you mean `timeout_secs`?"),
         ("stack_exec", json!({ "command": "echo hi" }), "`command` must be an array", r#"["sh", "-c", "echo hi"]"#),
         ("stack_exec", json!({ "command": ["echo", 1] }), "`command` item 1: must be a string", ""),
         ("stack_exec", json!({ "command": [] }), "`command` must not be empty", ""),
@@ -1578,7 +1579,7 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
         ("stack_run", json!({ "task": "t", "args": "a b" }), "`args` must be an array", ""),
         ("stack_run", json!({ "task": "t", "args": ["a", false] }), "`args` item false", ""),
         ("stack_run", json!({ "task": 5 }), "`task` must be a string", ""),
-        ("stack_run", json!({ "task": "t", "timeout": 5 }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_run", json!({ "task": "t", "timeout": 5 }), "`timeout` must be a string", ""),
         ("stack_compile", json!({ "update": true, "locked": true }), "`update` and `locked` cannot be given together", ""),
         ("stack_compile", json!({ "update": "yes" }), "`update` must be true or false", ""),
         ("stack_up", json!({ "ttl": 30 }), "`ttl` must be a string", ""),

@@ -110,9 +110,11 @@ def succeeded(operation, envelope):
 
 ## Timeouts
 
-`exec` and `run` take `--timeout` (MCP `timeout_secs`), counted from the call, so time spent
-compiling or installing comes out of the command's share. `up` and `restart` default to 10
-minutes. When a deadline passes, Stack kills the command's process group and returns
+`exec` and `run` take `--timeout`, counted from the call, so time spent compiling or
+installing comes out of the command's share. On the CLI they have no default; over MCP they
+default to 10 minutes, so an unattended call is always bounded. `up` and `restart` default to
+10 minutes everywhere. Over MCP, give either `timeout`, a duration like the CLI's (`"90s"`,
+`"5m"`), or `timeout_secs`, a whole number of seconds, but not both. When a deadline passes, Stack kills the command's process group and returns
 `timed_out` (CLI exit 124), with the output so far in `error.details`.
 
 A runner that cancels Stack with SIGTERM (or SIGINT, SIGHUP) cancels the command: Stack passes
@@ -149,8 +151,8 @@ they arrived.
 ## MCP arguments
 
 Each call is checked against the tool's `inputSchema` before anything runs. An unknown
-argument (`secret` instead of `secrets`, `timeout` instead of `timeout_secs`), a wrong type, a
-missing required argument or a conflicting pair is a `usage` error, and the hint lists the
+argument (`secret` instead of `secrets`, `required` instead of `require`), a wrong type, a
+missing required argument or a conflicting pair (`timeout` with `timeout_secs`) is a `usage` error, and the hint lists the
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 

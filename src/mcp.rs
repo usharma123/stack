@@ -23,7 +23,12 @@ const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root). Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
 
 fn startup_timeout_schema() -> Value {
-    json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600)" })
+    json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600); or give `timeout`" })
+}
+
+/// `timeout`: the same bound as `timeout_secs`, as a duration string like the CLI's `--timeout`.
+fn duration_schema(what: &str) -> Value {
+    json!({ "type": "string", "description": format!("{what}, as a duration such as \"90s\", \"5m\" or \"1h\" (default 10m). Same as timeout_secs; give one or neither") })
 }
 
 /// Serve the tools over stdio until the client closes stdin. Requests run concurrently (see
@@ -76,7 +81,15 @@ fn secret_name(s: &str) -> bool {
 }
 
 /// Arguments of one tool that cannot be given together, as on the command line.
-const CONFLICTS: &[(&str, &str, &str)] = &[("stack_compile", "update", "locked"), ("stack_exec", "require", "require_all"), ("stack_restart", "services", "changed")];
+const CONFLICTS: &[(&str, &str, &str)] = &[
+    ("stack_compile", "update", "locked"),
+    ("stack_exec", "require", "require_all"),
+    ("stack_restart", "services", "changed"),
+    ("stack_up", "timeout", "timeout_secs"),
+    ("stack_restart", "timeout", "timeout_secs"),
+    ("stack_exec", "timeout", "timeout_secs"),
+    ("stack_run", "timeout", "timeout_secs"),
+];
 
 /// Check a call's arguments against the tool's advertised `inputSchema` before anything else
 /// happens: no project is opened, no provider asked, nothing written. Unknown names, wrong
@@ -287,7 +300,8 @@ fn tool_definitions() -> Value {
             schema(json!({
                 "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_exec, stack_run and stack_renew extend it)" },
                 "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
-                "timeout_secs": startup_timeout_schema()
+                "timeout_secs": startup_timeout_schema(),
+                "timeout": duration_schema("Time the whole startup may take")
             }), &[])),
         tool("stack_install", "Install pinned tools", annotations("Install pinned tools", false, Some(false), true, true),
             "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed). A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
@@ -297,7 +311,8 @@ fn tool_definitions() -> Value {
             schema(json!({
                 "services": { "type": "array", "items": { "type": "string" }, "description": "Service names to restart; omitted or empty restarts every service. The others keep running and the session keeps its id" },
                 "changed": { "type": "boolean", "description": "Restart only the services whose watched files changed since they started (changed_since_start), and nothing when none did" },
-                "timeout_secs": startup_timeout_schema()
+                "timeout_secs": startup_timeout_schema(),
+                "timeout": duration_schema("Time the whole restart may take")
             }), &[])),
         tool("stack_logs", "Show service logs", annotations("Show service logs", true, None, true, false),
             "Return the last lines a service wrote, as the supervisor kept them; it never follows. Use it when a check fails or a service misbehaves. The supervisor keeps output across restarts; since_start returns only the current process's lines. Returns {service, lines, truncated, started_at, since_start}.",
@@ -316,14 +331,16 @@ fn tool_definitions() -> Value {
                 "require": { "type": "array", "items": { "type": "string" }, "description": "Services that must verify, or the command does not run (service_unavailable)" },
                 "require_all": { "type": "boolean", "description": "Every service must verify, or the command does not run" },
                 "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command only, resolved through the stack's pinned fnox. No granted value appears literally in the parsed stdout or stderr strings (timed_out details included): it is replaced by [redacted:KEY], or [redacted] where naming the key could spell out a value. Key names are not secret and are listed under secrets. Values shorter than 8 bytes, or ones a marker could spell out, are refused (secret_unsupported). Values the command transforms (encoded, split, or matching only after JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read ungranted secrets, which are not redacted" },
-                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs" }
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs; or give `timeout`" },
+                "timeout": duration_schema("Time the whole call may take, planning included, before the command is killed")
             }), &["command"])),
         tool("stack_run", "Run a task", annotations("Run a task", false, None, false, true),
             "Run a task declared in stack.toml ([tasks.<name>]) through mise once every service verifies, capturing output like stack_exec. Use it for the project's own tasks, such as tests; use stack_exec for commands that should run with services down. The task gets exactly the secrets it declares, redacted from its output. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
             schema(json!({
                 "task": { "type": "string", "description": "Task name from [tasks.<name>]; unknown_task lists them" },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
-                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before the task is killed and the call fails with timed_out (default 600)" }
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before the task is killed and the call fails with timed_out (default 600); or give `timeout`" },
+                "timeout": duration_schema("Time the whole call may take, planning included, before the task is killed")
             }), &["task"])),
         tool("stack_renew", "Renew the lease", annotations("Renew the lease", false, Some(false), true, false),
             "Renew this checkout's session lease so stack_gc does not reclaim it. Use it during long work under a ttl lease with no other stack calls (stack_exec and stack_run also renew). Returns the session.",
@@ -573,16 +590,29 @@ fn skill(args: &Value, ctx: &Ctx) -> Result<crate::skills::SkillText> {
     crate::skills::read(&found, tool, name)
 }
 
-/// `timeout_secs` of `stack_up` and `stack_restart`: a whole number of seconds, at least 1.
-/// Omitted (or null) means the default. Checked before any lifecycle work.
+/// `timeout_secs` (whole seconds, at least 1) or `timeout` (a duration string, at least 1s) of
+/// `stack_up` and `stack_restart`. Omitted (or null) means the default. Checked before any
+/// lifecycle work.
 fn startup_timeout(args: &Value) -> Result<Duration> {
-    match &args["timeout_secs"] {
-        Value::Null => Ok(session::DEFAULT_STARTUP_TIMEOUT),
-        v => v
+    timeout_arg(args, session::DEFAULT_STARTUP_TIMEOUT)
+}
+
+/// The call's bound from `timeout_secs` or `timeout`, which [`validate`] refuses together;
+/// `default` when neither is given.
+fn timeout_arg(args: &Value, default: Duration) -> Result<Duration> {
+    match (&args["timeout_secs"], &args["timeout"]) {
+        (Value::Null, Value::Null) => Ok(default),
+        (Value::Null, Value::String(text)) => match parse_duration(text)? {
+            0 => Err(StackError::new("usage", format!("timeout {text:?} must be at least 1s"))),
+            secs => Ok(Duration::from_secs(secs)),
+        },
+        (Value::Null, v) => Err(StackError::new("usage", format!("timeout {v} must be a duration string such as \"90s\" or \"5m\""))),
+        (v, Value::Null) => v
             .as_u64()
             .filter(|secs| *secs >= 1)
             .map(Duration::from_secs)
             .ok_or_else(|| StackError::new("usage", format!("timeout_secs {v} must be a whole number of seconds, at least 1"))),
+        _ => Err(StackError::new("usage", "`timeout` and `timeout_secs` cannot be given together")),
     }
 }
 
@@ -612,14 +642,10 @@ fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
     captured(args, ctx, || session::plan_task(ctx, task, &extra, true))
 }
 
-/// Plan and run within `timeout_secs`, which counts from the call: planning (including a
+/// Plan and run within `timeout_secs` (or `timeout`), which counts from the call: planning (including a
 /// task's install of missing pins) and the command share it.
 fn captured(args: &Value, ctx: &Ctx, plan: impl FnOnce() -> Result<session::ExecPlan>) -> Result<Value> {
-    let timeout = Duration::from_secs(
-        args["timeout_secs"]
-            .as_u64()
-            .unwrap_or(DEFAULT_EXEC_TIMEOUT),
-    );
+    let timeout = timeout_arg(args, Duration::from_secs(DEFAULT_EXEC_TIMEOUT))?;
     let (plan, _deadline) = session::plan_within(Some(timeout), "raise timeout_secs", plan)?;
     let mut plan = plan;
     let result = run_and_finish(ctx, &mut plan, timeout)?;
@@ -887,6 +913,33 @@ mod tests {
         for tool in tools().as_array().unwrap() {
             let dir = tool["inputSchema"]["properties"]["dir"]["description"].as_str().unwrap();
             assert!(!dir.contains("cwd") && !dir.contains("default"), "{}: {dir}", tool["name"]);
+        }
+    }
+
+    #[test]
+    fn timeouts_take_seconds_or_a_duration_but_not_both() {
+        let default = Duration::from_secs(600);
+        assert_eq!(timeout_arg(&json!({ "timeout": "90s" }), default).unwrap(), Duration::from_secs(90));
+        assert_eq!(timeout_arg(&json!({ "timeout": "5m" }), default).unwrap(), Duration::from_secs(300));
+        assert_eq!(timeout_arg(&json!({ "timeout": "45" }), default).unwrap(), Duration::from_secs(45));
+        assert_eq!(timeout_arg(&json!({ "timeout_secs": 7 }), default).unwrap(), Duration::from_secs(7));
+        assert_eq!(timeout_arg(&json!({ "timeout": null, "timeout_secs": null }), default).unwrap(), default);
+        assert_eq!(timeout_arg(&json!({}), default).unwrap(), default);
+        for bad in [json!({ "timeout": "0s" }), json!({ "timeout": "soon" }), json!({ "timeout": "5x" }), json!({ "timeout": 5 })] {
+            assert_eq!(timeout_arg(&bad, default).unwrap_err().code, "usage", "{bad}");
+        }
+        for tool in ["stack_up", "stack_restart", "stack_exec", "stack_run"] {
+            let mut args = json!({ "timeout": "5m", "timeout_secs": 300 });
+            if tool == "stack_exec" {
+                args["command"] = json!(["true"]);
+            }
+            if tool == "stack_run" {
+                args["task"] = json!("test");
+            }
+            let e = validate(tool, &args).unwrap_err();
+            assert!(e.message.contains("cannot be given together"), "{tool}: {}", e.message);
+            args.as_object_mut().unwrap().remove("timeout_secs");
+            assert!(validate(tool, &args).is_ok(), "{tool}");
         }
     }
 
