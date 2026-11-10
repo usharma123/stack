@@ -252,47 +252,105 @@ fn tools() -> Value {
     tools
 }
 
+/// A tool's `title` and behaviour hints, as MCP clients show and use them. `destructive` only
+/// means something for a tool that is not read-only.
+fn annotations(title: &str, read_only: bool, destructive: Option<bool>, idempotent: bool, open_world: bool) -> Value {
+    let mut a = json!({ "title": title, "readOnlyHint": read_only, "idempotentHint": idempotent, "openWorldHint": open_world });
+    if let Some(destructive) = destructive {
+        a["destructiveHint"] = json!(destructive);
+    }
+    a
+}
+
+/// One tool: its name, title (also in its annotations), description and input schema.
+fn tool(name: &str, title: &str, annotations: Value, description: &str, input: Value) -> Value {
+    json!({ "name": name, "title": title, "description": description, "annotations": annotations, "inputSchema": input })
+}
+
 fn tool_definitions() -> Value {
     json!([
-        { "name": "stack_inspect", "description": "Show the composed stack (bundles, tools, env, services, tasks, ports, origins) without changing anything. `skills` lists the agent skills of the exact releases stack.lock pins (status available, no_skill, not_installed or unavailable); all_skills also lists the provider's own under provider_skills, for people.",
-          "inputSchema": schema(json!({ "all_skills": { "type": "boolean" } }), &[]) },
-        { "name": "stack_skill", "description": "The SKILL.md text (at most 64 KiB) of one available skill that stack_inspect lists under `skills`, at the release stack.lock pins. name may be omitted when the tool has exactly one available skill; with several, the error lists them. It is the tool's own documentation; read it, do not run it.",
-          "inputSchema": schema(json!({ "tool": { "type": "string" }, "name": { "type": "string" } }), &["tool"]) },
-        { "name": "stack_compile", "description": "Resolve bundles and exact tool/service versions, update stack.lock and the generated provider config. Pins are kept unless their request changed; update re-resolves everything; locked fails instead of changing stack.lock; reassign_ports gives this checkout fresh ports (after a port_conflict).",
-          "inputSchema": schema(json!({ "update": { "type": "boolean" }, "locked": { "type": "boolean" }, "reassign_ports": { "type": "boolean" } }), &[]) },
-        { "name": "stack_up", "description": "Start and verify services; records a session. Optional lease: ttl like '30m', or owner_pid. Startup as a whole (lock, compile, install, start, readiness, verification) must finish within timeout_secs (default 600) or the call fails with timed_out: the step cut short and the progress so far are in the error details, and anything launched stays recorded for stack_status, stack_down and a retried stack_up. A service already running with unchanged configuration is kept, not restarted: after editing code it loaded, use stack_restart.",
-          "inputSchema": schema(json!({ "ttl": { "type": "string" }, "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID }, "timeout_secs": startup_timeout_schema() }), &[]) },
-        { "name": "stack_install", "description": "Install the locked tools and service binaries without starting services or recording a session. Locked: a missing or stale pin fails with lock_outdated.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_restart", "description": "Restart services of the running session (all when services is omitted) after editing code they loaded (files under a service's `watch` included: watching only reports changes, it never reloads), then verify the whole stack again. Other services keep running and the session keeps its id. Fails with session_stale when the configuration changed; use stack_up then. Bounded by timeout_secs (default 600) like stack_up. changed: true restarts exactly the services whose watched files changed since they started (changed_since_start), and nothing when none did.",
-          "inputSchema": schema(json!({ "services": { "type": "array", "items": { "type": "string" } }, "changed": { "type": "boolean", "description": "Restart only the services whose watched files changed since they started" }, "timeout_secs": startup_timeout_schema() }), &[]) },
-        { "name": "stack_logs", "description": "The last lines a service wrote, as kept by the supervisor (bounded; never follows). The supervisor keeps output across restarts; since_start returns only the current process's lines.",
-          "inputSchema": schema(json!({ "service": { "type": "string" }, "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" }, "since_start": { "type": "boolean" } }), &["service"]) },
-        { "name": "stack_status", "description": "Live verification of every service, plus session and lease state. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_exec", "description": "Run a command with the stack's tools and env. command is an argv list run without a shell: `$VAR`, pipes and globs are not expanded, so use [\"sh\", \"-c\", \"...\"] for those. Connection variables of services that fail verification are withheld; required services must verify or the command does not run. timeout_secs (default 600) counts from the call, planning included: a command still running then is killed and the call fails with timed_out, its output so far in the error details; a call whose planning is cut short fails with timed_out before anything runs. secrets grants named fnox secrets to this command only; no granted value appears literally in the parsed stdout or stderr strings, including the timed_out error's. Key names are not secret: they appear under secrets and in [redacted:KEY] markers. Values the command transforms (encoded, split, or only matching after the result's JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read secrets it was not granted, and those values are not redacted.",
-          "inputSchema": schema(json!({
-              "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-              "require": { "type": "array", "items": { "type": "string" } },
-              "require_all": { "type": "boolean" },
-              "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command, resolved through the stack's pinned fnox. Literal values are replaced by [redacted:KEY] ([redacted] where naming the key could spell out a value) in the parsed stdout and stderr strings; key names are listed under secrets; values shorter than 8 bytes or ones a marker could spell out are refused (secret_unsupported)" },
-              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning included, before it fails and the command is killed (default 600)" }
-          }), &["command"]) },
-        { "name": "stack_run", "description": "Run a task declared in stack.toml ([tasks.<name>]) through mise's task runner, with the stack's tools and env. Every service of the project must verify or it does not run (mise gives a task every service's endpoint); use stack_exec for commands that should run with services down. Output is captured like stack_exec. The task receives exactly the secrets it declares (secrets = [...] in stack.toml), redacted from its output as in stack_exec; no others can be added here.",
-          "inputSchema": schema(json!({
-              "task": { "type": "string" },
-              "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
-              "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before it fails and the task is killed (default 600)" }
-          }), &["task"]) },
-        { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone. Then stops the Pitchfork supervisor that ran them too, if Stack started it and no other checkout's session or daemon still uses it; data.supervisor says what happened and why.", "inputSchema": schema(json!({
-              "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
-              "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" },
-          }), &[]) },
-        { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": machine_wide_schema(json!({
-              "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
-          }), &[], REPORTED_DIR) },
-        { "name": "stack_ps", "description": "Read-only list of every checkout stack has records for on this machine: path, whether its directory still exists, session and lease, and per service the port, pid, a liveness check (pid alive, port accepting; not identity verification, use stack_status for that) and data directory with its size, with totals. reclaimable marks a checkout stack_gc would reclaim (directory gone, no session left). Takes no project lock and needs no stack.toml or dir. no_size skips measuring data directories.", "inputSchema": machine_wide_schema(json!({ "no_size": { "type": "boolean" } }), &[], REPORTED_DIR) },
-        { "name": "stack_mv", "description": "After a checkout was moved or renamed on disk, carry its session record, port reservations, identity tokens and the service data directories stack recorded for it from the old path to the new one, so it keeps its ports and data. Refuses (mv_services_running) while anything recorded for the old path may run, when the new path has a session (mv_target_has_state), and when recorded data cannot be confirmed to be the checkout's or placed at the new path (mv_data_unmovable, mv_data_unplaced); it then changes nothing. Relative paths resolve against dir, and need it.", "inputSchema": machine_wide_schema(json!({ "from": { "type": "string", "description": "Where the checkout was: an absolute path, or relative to `dir`" }, "to": { "type": "string", "description": "Where it is now: an absolute path, or relative to `dir`" } }), &["from", "to"], "Optional absolute path that relative `from` and `to` resolve against") },
-        { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
+        tool("stack_inspect", "Inspect the stack", annotations("Inspect the stack", true, None, true, false),
+            "Show the composed stack without changing anything: bundles, tools, env, services, tasks, ports and where each value came from. Use it to learn what a checkout provides. Returns the report, including `skills`: the agent skills of the releases stack.lock pins, each available, no_skill, not_installed or unavailable (read one with stack_skill).",
+            schema(json!({ "all_skills": { "type": "boolean", "description": "Also list the skills of tools Stack adds for its own supervisor, under provider_skills. For people; an agent should not drive the supervisor" } }), &[])),
+        tool("stack_skill", "Read a tool's skill", annotations("Read a tool's skill", true, None, true, false),
+            "Return the SKILL.md text of a pinned tool's agent skill, one that stack_inspect lists under `skills` as available. Use it to learn how to use that tool at the pinned release; read it, do not run it. Returns {tool, version, name, entrypoint, bytes, text}, text at most 64 KiB. Fails with skill_not_found, or usage listing the names when the tool ships several and name is omitted.",
+            schema(json!({ "tool": { "type": "string", "description": "Tool name as listed under `skills`, e.g. \"fnox\"" }, "name": { "type": "string", "description": "Skill name, needed only when the tool ships several" } }), &["tool"])),
+        tool("stack_compile", "Compile stack.lock", annotations("Compile stack.lock", false, Some(false), true, true),
+            "Resolve bundles and exact tool and service versions, then write stack.lock and the generated provider config. Use it after editing stack.toml, or when another tool fails with lock_outdated. Pins are kept unless their request changed; update re-resolves everything; locked only checks; reassign_ports gives fresh ports after port_conflict. Returns versions, ports and warnings.",
+            schema(json!({
+                "update": { "type": "boolean", "description": "Re-resolve every request, moving pins to the newest matching releases" },
+                "locked": { "type": "boolean", "description": "Change nothing; fail with lock_outdated if stack.lock is missing or stale" },
+                "reassign_ports": { "type": "boolean", "description": "Give this checkout new ports (after port_conflict)" }
+            }), &[])),
+        tool("stack_up", "Start services", annotations("Start services", false, Some(false), true, true),
+            "Start every service and verify each one, recording a session. Use it before work that needs services. Safe to repeat: a service already running with unchanged configuration is kept, not restarted (after editing code it loaded, use stack_restart). It uses stack.lock as it is; a stale lock fails with lock_outdated. On timed_out, what was launched stays recorded. Returns {session, checks, steps}.",
+            schema(json!({
+                "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_exec, stack_run and stack_renew extend it)" },
+                "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
+                "timeout_secs": startup_timeout_schema()
+            }), &[])),
+        tool("stack_install", "Install pinned tools", annotations("Install pinned tools", false, Some(false), true, true),
+            "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed). A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
+            schema(json!({}), &[])),
+        tool("stack_restart", "Restart services", annotations("Restart services", false, Some(false), false, false),
+            "Restart services of the running session (all when services is omitted) and verify the whole stack again. Use it after editing code a running service loaded, files under its `watch` included: watching only reports changes, it never reloads. changed: true restarts just the services whose watched files changed. Fails with session_stale after a configuration change (use stack_up).",
+            schema(json!({
+                "services": { "type": "array", "items": { "type": "string" }, "description": "Service names to restart; omitted or empty restarts every service. The others keep running and the session keeps its id" },
+                "changed": { "type": "boolean", "description": "Restart only the services whose watched files changed since they started (changed_since_start), and nothing when none did" },
+                "timeout_secs": startup_timeout_schema()
+            }), &[])),
+        tool("stack_logs", "Show service logs", annotations("Show service logs", true, None, true, false),
+            "Return the last lines a service wrote, as the supervisor kept them; it never follows. Use it when a check fails or a service misbehaves. The supervisor keeps output across restarts; since_start returns only the current process's lines. Returns {service, lines, truncated, started_at, since_start}.",
+            schema(json!({
+                "service": { "type": "string", "description": "Service name from the stack" },
+                "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" },
+                "since_start": { "type": "boolean", "description": "Only the current process's output, not earlier runs'" }
+            }), &["service"])),
+        tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
+            "Verify every service now and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.",
+            schema(json!({}), &[])),
+        tool("stack_exec", "Run a command", annotations("Run a command", false, None, false, true),
+            "Run one command, an argv list without a shell, with the stack's tools and env, capturing its output. Use it for anything that is not a stack.toml task; for shell syntax pass [\"sh\", \"-c\", \"...\"]. Endpoints of unverified services are withheld; require or require_all refuse to run instead. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
+            schema(json!({
+                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "argv, e.g. [\"pytest\", \"-q\"]; nothing is expanded. Use [\"sh\", \"-c\", \"...\"] for $VAR, pipes and globs" },
+                "require": { "type": "array", "items": { "type": "string" }, "description": "Services that must verify, or the command does not run (service_unavailable)" },
+                "require_all": { "type": "boolean", "description": "Every service must verify, or the command does not run" },
+                "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command only, resolved through the stack's pinned fnox. No granted value appears literally in the parsed stdout or stderr strings (timed_out details included): it is replaced by [redacted:KEY], or [redacted] where naming the key could spell out a value. Key names are not secret and are listed under secrets. Values shorter than 8 bytes, or ones a marker could spell out, are refused (secret_unsupported). Values the command transforms (encoded, split, or matching only after JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read ungranted secrets, which are not redacted" },
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs" }
+            }), &["command"])),
+        tool("stack_run", "Run a task", annotations("Run a task", false, None, false, true),
+            "Run a task declared in stack.toml ([tasks.<name>]) through mise once every service verifies, capturing output like stack_exec. Use it for the project's own tasks, such as tests; use stack_exec for commands that should run with services down. The task gets exactly the secrets it declares, redacted from its output. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
+            schema(json!({
+                "task": { "type": "string", "description": "Task name from [tasks.<name>]; unknown_task lists them" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
+                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before the task is killed and the call fails with timed_out (default 600)" }
+            }), &["task"])),
+        tool("stack_renew", "Renew the lease", annotations("Renew the lease", false, Some(false), true, false),
+            "Renew this checkout's session lease so stack_gc does not reclaim it. Use it during long work under a ttl lease with no other stack calls (stack_exec and stack_run also renew). Returns the session.",
+            schema(json!({}), &[])),
+        tool("stack_down", "Stop services", annotations("Stop services", false, Some(true), true, false),
+            "Stop every service of this checkout; succeeds only once their processes are confirmed gone. Use it before you finish or remove the checkout. Then stops the supervisor that ran them, if Stack started it and nothing else uses it (data.supervisor says what happened). Service data is kept unless purge is set. Returns {stopped, confirmed, supervisor}.",
+            schema(json!({
+                "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
+                "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" }
+            }), &[])),
+        tool("stack_gc", "Reclaim stale sessions", annotations("Reclaim stale sessions", false, Some(true), true, false),
+            "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
+            machine_wide_schema(json!({
+                "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" }
+            }), &[], REPORTED_DIR)),
+        tool("stack_ps", "List checkouts", annotations("List checkouts", true, None, true, false),
+            "List every checkout Stack has records for on this machine, with its session, lease and services (port, pid, liveness, data size) and totals. Use it to see what runs where, or to find leftovers of deleted checkouts (reclaimable marks what stack_gc would reclaim). Liveness is not identity verification; use stack_status for that. Read-only; takes no lock and needs no dir.",
+            machine_wide_schema(json!({ "no_size": { "type": "boolean", "description": "Skip measuring data directories, which can be slow" } }), &[], REPORTED_DIR)),
+        tool("stack_mv", "Move a checkout's records", annotations("Move a checkout's records", false, Some(false), false, false),
+            "Carry a checkout's session record, port reservations, identity tokens and recorded service data from its old path to its new one. Use it after a checkout was moved or renamed on disk, so it keeps its ports and data. Refuses, changing nothing, while anything recorded for the old path may run (mv_services_running), when the new path has a session, or when data cannot be moved.",
+            machine_wide_schema(json!({
+                "from": { "type": "string", "description": "Where the checkout was: an absolute path, or relative to `dir`" },
+                "to": { "type": "string", "description": "Where it is now: an absolute path, or relative to `dir`" }
+            }), &["from", "to"], "Optional absolute path that relative `from` and `to` resolve against")),
+        tool("stack_doctor", "Check prerequisites", annotations("Check prerequisites", true, None, true, false),
+            "Check that the providers Stack needs (mise, git, tar) are installed, that the supervisor's socket path fits this platform, and that the project compiles. Use it when setup-level errors appear, such as a missing provider or socket_path_too_long. Returns a list of {name, ok, detail} checks; doctor_failed lists them all when one fails.",
+            schema(json!({}), &[])),
     ])
 }
 
@@ -829,6 +887,36 @@ mod tests {
         for tool in tools().as_array().unwrap() {
             let dir = tool["inputSchema"]["properties"]["dir"]["description"].as_str().unwrap();
             assert!(!dir.contains("cwd") && !dir.contains("default"), "{}: {dir}", tool["name"]);
+        }
+    }
+
+    #[test]
+    fn every_tool_says_what_it_does_and_how_it_behaves() {
+        for tool in tools().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.len() < 400, "{name}: description is {} bytes", description.len());
+            assert!(description.contains("Use it") || description.contains("Start here"), "{name}: say when to use it");
+            assert!(tool["title"].is_string() && tool["annotations"]["title"] == tool["title"], "{name}");
+            for hint in ["readOnlyHint", "idempotentHint", "openWorldHint"] {
+                assert!(tool["annotations"][hint].is_boolean(), "{name}: {hint}");
+            }
+            if tool["annotations"]["readOnlyHint"] == true {
+                assert!(tool["annotations"].get("destructiveHint").is_none(), "{name}: a read-only tool destroys nothing");
+            }
+            for (key, property) in tool["inputSchema"]["properties"].as_object().unwrap() {
+                assert!(property["description"].as_str().is_some_and(|d| !d.is_empty()), "{name}.{key} has no description");
+            }
+        }
+        let annotation = |name: &str, hint: &str| tools().as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["annotations"][hint].clone();
+        for name in ["stack_inspect", "stack_status", "stack_logs", "stack_skill", "stack_doctor", "stack_ps"] {
+            assert_eq!(annotation(name, "readOnlyHint"), true, "{name}");
+        }
+        for name in ["stack_down", "stack_gc"] {
+            assert_eq!(annotation(name, "destructiveHint"), true, "{name}");
+        }
+        for name in ["stack_up", "stack_down", "stack_compile", "stack_install"] {
+            assert_eq!(annotation(name, "idempotentHint"), true, "{name}");
         }
     }
 

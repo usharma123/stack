@@ -36,6 +36,12 @@ act machine-wide and need no `dir`.
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships |
 
+Each tool has a `title`, a short description that says when to use it, a description for
+every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
+`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor` and `stack_ps`,
+`destructiveHint` for `stack_down` and `stack_gc`, and `idempotentHint` for those that are
+safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
+
 ## The loop
 
 ```sh
