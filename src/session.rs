@@ -2286,6 +2286,30 @@ pub struct DownReport {
     /// services.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<Value>,
+    /// What `down --purge` removed and released (see [`purge_locked`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purge: Option<PurgeReport>,
+}
+
+/// What `down --purge` did with this checkout's recorded data, ports and identity tokens.
+#[derive(Debug, Serialize)]
+pub struct PurgeReport {
+    /// Each data directory `up` recorded for this checkout, and what became of it.
+    pub data: Vec<PurgedData>,
+    /// Every recorded data directory was removed, or found no longer to be this checkout's.
+    /// When false, `data` says what was kept and why.
+    pub complete: bool,
+    pub released_ports: Vec<Value>,
+    pub released_identities: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgedData {
+    pub service: String,
+    pub dir: PathBuf,
+    pub outcome: String,
+    /// Kept because Stack could not confirm it is safe to remove; `outcome` says why.
+    pub kept: bool,
 }
 
 /// A port reserved for one of this checkout's services that a foreign program holds.
@@ -2308,6 +2332,13 @@ pub fn down(ctx: &Ctx) -> Result<DownReport> {
 
 /// [`down`]; with `stop_supervisor` false the supervisor is kept whoever started it.
 pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
+    down_purging(ctx, stop_supervisor, false)
+}
+
+/// [`down_with`]; with `purge`, once every service is confirmed stopped, also remove the data
+/// directories `up` recorded for this checkout and release its ports and identity tokens (see
+/// [`purge_locked`]), under the same project lock.
+pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     restore_provider_config(ctx)?;
     let session = load(ctx)?;
@@ -2315,6 +2346,10 @@ pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
     let owns_services = !ports::lookup(&ctx.state, &ctx.root)?.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
     let recorded = session.and_then(|s| s.provider);
     let mut report = down_locked(ctx, None, None)?;
+    // Before the supervisor may stop: it confirms each service is not running.
+    if purge {
+        report.purge = Some(purge_locked(ctx)?);
+    }
     if owns_services || recorded.is_some() {
         report.supervisor = Some(if stop_supervisor {
             stop_owned_supervisor(ctx, recorded)
@@ -2751,6 +2786,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>, addressed: Option<&
         confirmed: true,
         conflicts,
         supervisor: None,
+        purge: None,
     })
 }
 
@@ -4120,6 +4156,40 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         .into_iter()
         .map(|(project, services)| GcEntry { project, reason: "project directory deleted".into(), stopped: true, error: None, services })
         .collect())
+}
+
+/// `down --purge`, once `down` confirmed every service of this checkout stopped: remove each
+/// data directory `up` recorded for this very directory (by its checkout token; data of an
+/// earlier directory at the path is not its own), each only as `gc --reclaim-data` removes a
+/// deleted checkout's (see [`reclaim_data`]: the recorded directory, reached with no link
+/// followed, its marker naming the checkout, the recorded supervisor confirming the service is
+/// not running and no process carrying the token), then release its port reservations and
+/// identity tokens. Data Stack never recorded is not touched.
+fn purge_locked(ctx: &Ctx) -> Result<PurgeReport> {
+    let token = crate::checkout::token(&ctx.root);
+    let mut data = Vec::new();
+    let mut settled = Vec::new();
+    for entry in crate::datadirs::entries(&ctx.state)? {
+        if entry.project != ctx.root || token.as_deref() != Some(entry.checkout.as_str()) {
+            continue;
+        }
+        let (outcome, done) = reclaim_data(&entry, true);
+        data.push(PurgedData { service: entry.service.clone(), dir: entry.dir.clone(), outcome, kept: !done });
+        if done {
+            settled.push(entry);
+        }
+    }
+    crate::datadirs::forget(&ctx.state, |e| settled.contains(e))?;
+    let released_ports = ports::release(&ctx.state, &ctx.root)?
+        .into_iter()
+        .map(|r| json!({ "service": r.service, "port": r.port }))
+        .collect();
+    Ok(PurgeReport {
+        complete: data.iter().all(|d| !d.kept),
+        data,
+        released_ports,
+        released_identities: crate::identity::release(&ctx.state, &ctx.root)?,
+    })
 }
 
 /// One deleted checkout's recorded data directory: what happened to it, and whether its record

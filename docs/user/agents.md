@@ -124,7 +124,8 @@ missing required argument or a conflicting pair is a `usage` error, and the hint
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 
-`stack_ps` ignores `dir` and takes `no_size`, like the CLI's `--no-size`. `stack_mv` takes
+`stack_down` takes `purge: true`, like the CLI's `--purge`. `stack_ps` ignores `dir` and takes
+`no_size`, like the CLI's `--no-size`. `stack_mv` takes
 `from` and `to`; relative paths resolve against `dir`.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that

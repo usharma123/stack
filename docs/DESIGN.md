@@ -312,6 +312,12 @@ output (mise's answer when no release matches) is an error, not a version.
   ls` names for the new path, writes the new token into its marker and the data record, and
   moves the session (re-stamped with the directory) and completion records. Data moves and
   registry changes are undone if a later step fails.
+- **Purging.** `down --purge` removes an existing checkout's own data after `down` confirmed
+  the stop, under the same project lock and before the supervisor may stop: each data-record
+  entry of this path whose token is the directory's own goes through the same reclaim as `gc
+  --reclaim-data` (resolved location, `O_NOFOLLOW`, device and inode, marker, supervisor
+  status, token carriers, removal through the held descriptors). Settled entries leave the
+  record; the rest are kept and reported. It then releases the path's reservations and tokens.
 - **Supervisor socket.** Pitchfork's socket is `<state dir>/sock/main.sock`, where the state
   directory is `PITCHFORK_STATE_DIR` (from the provider config's env, which mise passes to
   Pitchfork, else stack's own), else an absolute `XDG_STATE_HOME/pitchfork` on Linux only, else

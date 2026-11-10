@@ -142,6 +142,10 @@ enum Cmd {
         /// scripts written when this was not the default)
         #[arg(long)]
         stop_supervisor: bool,
+        /// Then remove the service data `up` recorded for this checkout, where it is safe to,
+        /// and release its ports and identity tokens
+        #[arg(long)]
+        purge: bool,
     },
     /// Renew this project's session lease
     Renew,
@@ -339,9 +343,24 @@ fn main() -> ExitCode {
         Cmd::Run { task, timeout, args } => {
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
         }
-        Cmd::Down { keep_supervisor, stop_supervisor: _ } => session::down_with(&ctx, !*keep_supervisor).map(|r| {
+        Cmd::Down { keep_supervisor, stop_supervisor: _, purge } => session::down_purging(&ctx, !*keep_supervisor, *purge).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                if let Some(p) = &r.purge {
+                    for d in &p.data {
+                        println!("{} {}: {}", if d.kept { "kept" } else { "data" }, d.service, d.outcome);
+                    }
+                    if p.data.is_empty() {
+                        println!("no service data recorded for this checkout");
+                    }
+                    let ports: Vec<String> = p.released_ports.iter().map(|r| format!("{} {}", r["service"].as_str().unwrap_or_default(), r["port"])).collect();
+                    if !ports.is_empty() {
+                        println!("released ports: {}", ports.join(", "));
+                    }
+                    if p.released_identities > 0 {
+                        println!("released {} identity token(s)", p.released_identities);
+                    }
+                }
                 if let Some(supervisor) = &r.supervisor {
                     match (supervisor["stopped"].as_bool(), supervisor["reason"].as_str()) {
                         (Some(true), Some(_)) => println!("supervisor not running"),

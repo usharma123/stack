@@ -7668,3 +7668,47 @@ fn mv_refuses_what_it_cannot_do_safely_and_changes_nothing() {
     assert!(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&moved))).exists());
     assert!(ports().contains(moved.to_str().unwrap()) && !ports().contains(&format!("{}\"", app.display())), "{}", ports());
 }
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_purge_removes_the_data_up_recorded_only_where_gc_would_and_releases_ports() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let (port, data) = up_with_data(&fixture, &[], 8192);
+    let marker = data.with_file_name("web.stack-checkout");
+    fs::write(data.with_file_name("unsaved.txt"), "keep me").unwrap();
+    let purge = |args: &[&str]| -> Value {
+        let out = fixture.command(&[&["down", "--purge", "--json"], args].concat()).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{result}");
+        assert_eq!(result["data"]["confirmed"], true, "{result}");
+        result["data"]["purge"].clone()
+    };
+
+    // The supervisor the record names does not report the service stopped: the data is kept.
+    fs::create_dir_all(dir.join("pf-status/app-test")).unwrap();
+    fs::write(dir.join("pf-status/app-test/web.json"), json!({ "id": "app-test/web", "status": "running" }).to_string()).unwrap();
+    let p = purge(&[]);
+    assert_eq!(p["complete"], false, "{p}");
+    assert_eq!(p["data"][0]["kept"], true, "{p}");
+    assert!(p["data"][0]["outcome"].as_str().unwrap().contains("the supervisor reports app-test/web as \"running\""), "{p}");
+    assert!(data.join("rows").exists() && marker.exists());
+    assert_eq!(p["released_ports"], json!([{ "service": "web", "port": port }]), "{p}");
+    fs::remove_dir_all(dir.join("pf-status")).unwrap();
+
+    // Confirmed: removed with its marker, and nothing beside it; the record is settled.
+    let p = purge(&[]);
+    assert_eq!(p["complete"], true, "{p}");
+    assert_eq!(p["data"][0]["kept"], false, "{p}");
+    assert!(p["data"][0]["outcome"].as_str().unwrap().starts_with(&format!("data in {} removed", data.display())), "{p}");
+    assert!(!data.exists() && !marker.exists());
+    assert_eq!(fs::read_to_string(data.with_file_name("unsaved.txt")).unwrap(), "keep me");
+    let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
+    assert_eq!(ledger["entries"], json!([]), "{ledger}");
+    assert!(!fs::read_to_string(dir.join("state/ports.json")).unwrap().contains("\"web\""));
+
+    // Nothing left: purging again is safe, over MCP too.
+    let mcp = fixture.mcp(&[("stack_down", json!({ "purge": true }))], &[]);
+    let p = &mcp[0]["structuredContent"]["data"]["purge"];
+    assert_eq!((p["complete"].clone(), p["data"].clone()), (json!(true), json!([])), "{}", mcp[0]);
+}

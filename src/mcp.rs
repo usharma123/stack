@@ -310,6 +310,7 @@ fn tool_definitions() -> Value {
         { "name": "stack_renew", "description": "Renew this project's session lease.", "inputSchema": schema(json!({}), &[]) },
         { "name": "stack_down", "description": "Stop services; succeeds only once their processes are confirmed gone. Then stops the Pitchfork supervisor that ran them too, if Stack started it and no other checkout's session or daemon still uses it; data.supervisor says what happened and why.", "inputSchema": schema(json!({
               "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
+              "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" },
           }), &[]) },
         { "name": "stack_gc", "description": "Reclaim sessions with expired leases, and services of deleted projects, machine-wide. Fails (gc_incomplete) if any could not be confirmed stopped; ownership records are then kept. A deleted checkout with no record left gets its port reservations released and its service data reported; reclaim_data removes that data.", "inputSchema": schema(json!({
               "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
@@ -443,7 +444,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         }
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
-        "stack_down" => session::down_with(ctx, args["stop_supervisor"] != false).map(to_value),
+        "stack_down" => session::down_purging(ctx, args["stop_supervisor"] != false, args["purge"] == true).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
         "stack_mv" => {

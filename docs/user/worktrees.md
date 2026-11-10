@@ -16,6 +16,9 @@ Stopping first matters. Stack will not stop a deleted checkout's services by nam
 checkout removed while its services run leaves them running until you stop them yourself
 (see [`gc`](commands.md#gc)).
 
+`stack down` keeps the checkout's service data, in case the checkout comes back. To remove it
+in the same step, use `stack down --purge` in the remove hook (see [`down`](commands.md#down)).
+
 ## Moving a checkout
 
 A moved or renamed worktree keeps its ports and data once you run `stack mv <old> <new>` with

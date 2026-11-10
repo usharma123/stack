@@ -76,6 +76,20 @@ pub fn holders(state: &Path) -> Result<Vec<(PathBuf, String)>> {
     Ok(reg.tokens.into_iter().map(|t| (t.project, t.service)).collect())
 }
 
+/// Drop every token recorded for `project` (`down --purge`); returns how many.
+pub fn release(state: &Path, project: &Path) -> Result<usize> {
+    let (file, lock) = paths(state);
+    let _guard = FileLock::acquire(&lock)?;
+    let mut reg: Registry = read_json(&file)?;
+    let before = reg.tokens.len();
+    reg.tokens.retain(|t| t.project != project);
+    let released = before - reg.tokens.len();
+    if released > 0 {
+        write_json(&file, &reg)?;
+    }
+    Ok(released)
+}
+
 /// Move `old`'s tokens to `new`, for a checkout moved from `old` to `new`, as
 /// [`crate::ports::rekey`] moves its reservations. Returns how many moved and how many of
 /// `new`'s were replaced.

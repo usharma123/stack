@@ -233,6 +233,19 @@ pub fn all(state: &Path) -> Result<Vec<Reservation>> {
     Ok(read_json::<Registry>(&paths(state).0)?.reservations)
 }
 
+/// Drop every reservation recorded for `project` (`down --purge`), returning them.
+pub fn release(state: &Path, project: &Path) -> Result<Vec<Reservation>> {
+    let (file, lock) = paths(state);
+    let _guard = FileLock::acquire(&lock)?;
+    let mut reg: Registry = read_json(&file)?;
+    let (released, kept): (Vec<Reservation>, Vec<Reservation>) = reg.reservations.into_iter().partition(|r| r.project == project);
+    reg.reservations = kept;
+    if !released.is_empty() {
+        write_json(&file, &reg)?;
+    }
+    Ok(released)
+}
+
 /// Move `old`'s reservations to `new`, for a checkout moved from `old` to `new`. When `old` has
 /// any, they replace whatever `new` holds (only what a compile there assigned: `stack mv`
 /// refuses a `new` with a session); otherwise `new` keeps its own. Returns how many moved and

@@ -12,7 +12,7 @@
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
-| `stack down [--keep-supervisor]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it |
+| `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew` | Renew this session's lease |
 | `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
@@ -239,6 +239,17 @@ supervisor that is not running is not started: `supervisor` is then `{"stopped":
 `up`. A checkout without services gets no `supervisor` field. `--keep-supervisor` (MCP:
 `"stop_supervisor": false`) keeps it in every case. `--stop-supervisor`, which turned this on
 before it was the default, is still accepted and changes nothing.
+
+Service data is kept, so the next `up` finds the same databases. `down --purge` (MCP:
+`"purge": true`) also removes it once every service is confirmed stopped, and releases the
+checkout's port reservations and identity tokens (the next `up` assigns new ones). It removes
+only the data directories `up` recorded for this very checkout, and only as [`gc
+--reclaim-data`](#gc) removes a deleted checkout's: the directory `up` saw, reached with no
+link on the way, its `.stack-checkout` marker naming this checkout, the recorded supervisor
+confirming the service is not running and no process carrying the checkout's token. Anything
+else is kept, `purge.data[].kept` is true with the reason in `outcome`, and `purge.complete` is
+false; `down` itself still succeeds. Data Stack never recorded, and data of an earlier
+directory at the same path (moved aside by `up` as `.replaced-<time>`), is never removed.
 
 ## gc
 
