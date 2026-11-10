@@ -167,6 +167,13 @@ enum Cmd {
         #[arg(long)]
         no_size: bool,
     },
+    /// After a checkout was moved or renamed, carry its records and service data to the new path
+    Mv {
+        /// Where the checkout was
+        old: PathBuf,
+        /// Where it is now
+        new: PathBuf,
+    },
     /// Publish a bundle directory to an OCI registry
     Publish {
         /// Directory containing bundle.toml
@@ -355,6 +362,10 @@ fn main() -> ExitCode {
             emit(cli.json, &r, || print_gc(&r))
         }),
         Cmd::Ps { no_size } => stack::fleet::ps(&ctx.state, !*no_size).map(|r| emit(cli.json, &r, || stack::fleet::print_ps(&r))),
+        Cmd::Mv { old, new } => std::env::current_dir()
+            .map_err(|e| StackError::new("io", format!("current directory: {e}")))
+            .and_then(|cwd| stack::fleet::mv(&ctx.state, &cwd, old, new))
+            .map(|r| emit(cli.json, &r, || stack::fleet::print_mv(&r))),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
         }),

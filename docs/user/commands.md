@@ -16,6 +16,7 @@
 | `stack renew` | Renew this session's lease |
 | `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
+| `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
@@ -292,6 +293,42 @@ be another program). `ps` never checks identity; `stack status` in the checkout 
 no lock, so it never waits behind a running `up`, and it needs no `stack.toml`. Measuring data
 directories walks them, which can be slow for large databases: `--no-size` skips it
 (`data_bytes` is then `null`).
+
+## mv
+
+When a checkout was moved or renamed (`git worktree move`, `mv`), its records still name the
+old path, and Stack reports `session_conflict` in it. `stack mv <old> <new>` carries them over:
+the session record, port reservations and identity tokens, so the checkout keeps its ports.
+Relative paths resolve against the working directory. mise keeps service data per project
+path, so `mv` also moves each data directory `up` recorded for the checkout to where mise will
+look for it at the new path (asked with `mise daemons ls`, which starts nothing). The
+[checkout token](../DESIGN.md#runtime-contract) follows from the path, so each moved directory
+gets the new token in its `.stack-checkout` marker and in Stack's data record, as `up` would
+write them. The rest of mise's state for the old path stays; `mise daemons prune` removes it.
+
+Data is checked as [`gc --reclaim-data`](#gc) checks it before removing anything: it must be
+the very directory `up` recorded (where it resolved, no link on the way, the same device and
+inode) and its marker must name the checkout. It is moved by renaming that directory, never
+copied, so a new path on another file system is refused. Data recorded for an earlier
+directory at the old path, or whose marker names another checkout, is left where it is (`gc`
+reports it); data that is already gone is dropped from the record.
+
+`mv` changes nothing unless everything checks out:
+
+| Code | When |
+|---|---|
+| `mv_services_running` | Something recorded for the old path may still run: a live pid, an open port, a supervisor that does not report a service stopped, an interrupted start, or a process carrying the checkout's token. Running services were started with the old path in their configuration, so only that path can stop them: move the directory back, run `stack -C <old> down`, move it again and rerun `stack mv` |
+| `mv_target_has_state` | The new path has a session of its own: run `stack -C <new> down`, or move elsewhere |
+| `mv_source_exists` | The old path still exists, so nothing was moved. A copy needs no `mv`; it gets its own ports on `up` |
+| `mv_nothing_recorded` | Nothing is recorded for the old path; `stack ps` lists what is |
+| `mv_target_missing` | The new path is not an existing directory; move the checkout first |
+| `mv_data_unmovable` | A recorded data directory cannot be confirmed to be the checkout's (replaced, linked, never seen by `up`, or named only by a session older than the data record), or its place at the new path already holds data |
+| `mv_data_unplaced` | mise names no data directory for a service at the new path: run `stack -C <new> compile` and retry |
+
+Ports and tokens that a compile at the new path assigned (a worktree hook usually compiles
+first) are replaced by the old ones, and the result's `notes` say so. A compile anywhere
+releases the reservations of a path that no longer exists, so run `stack mv` before other
+Stack commands to keep the old ports; the data moves either way.
 
 ## doctor and setup
 

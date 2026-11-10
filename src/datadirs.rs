@@ -344,6 +344,46 @@ mod imp {
         }
     }
 
+    impl Held {
+        /// Rename the held directory to `to`, an absolute path where nothing is (or an empty
+        /// directory), and remove the `suffix` file beside its old name, provided the name in
+        /// the held parent still is this directory; it is then confirmed to be the directory
+        /// now at `to`, and renamed back otherwise. Its contents are never copied: a `to` on
+        /// another file system fails, and nothing moves.
+        pub fn move_to(self, to: &Path, suffix: &str) -> io::Result<()> {
+            let now = stat_at(&self.parent, &self.name)?;
+            if id(&now) != self.identity {
+                return Err(io::Error::other("the directory was replaced since it was checked; what replaced it is left alone"));
+            }
+            let target = cstring(to.as_os_str())?;
+            // SAFETY: renameat with the held parent, NUL-terminated names and AT_FDCWD for an
+            // absolute target.
+            if unsafe { libc::renameat(self.parent.as_raw_fd(), self.name.as_ptr(), libc::AT_FDCWD, target.as_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let moved = std::fs::symlink_metadata(to).ok().map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                [m.dev(), m.ino()]
+            });
+            if moved != Some(self.identity) {
+                // SAFETY: as above, the other way.
+                unsafe { libc::renameat(libc::AT_FDCWD, target.as_ptr(), self.parent.as_raw_fd(), self.name.as_ptr()) };
+                return Err(io::Error::other(format!("{} changed while the data was moved there; the data was moved back", to.display())));
+            }
+            let mut marker = self.name.as_bytes().to_vec();
+            marker.extend_from_slice(suffix.as_bytes());
+            let marker = CString::new(marker).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))?;
+            // SAFETY: unlinkat with the held parent and a NUL-terminated name.
+            if unsafe { libc::unlinkat(self.parent.as_raw_fd(), marker.as_ptr(), 0) } != 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::NotFound {
+                    return Err(e);
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// The names in `dir`, without `.` and `..`.
     fn names(dir: &OwnedFd) -> io::Result<Vec<CString>> {
         // SAFETY: dup of a valid descriptor; fdopendir takes the copy, closedir closes it.
@@ -427,6 +467,9 @@ impl Held {
         0
     }
     pub fn remove(self, _: &str) -> std::io::Result<u64> {
+        Err(std::io::Error::other("not supported"))
+    }
+    pub fn move_to(self, _: &Path, _: &str) -> std::io::Result<()> {
         Err(std::io::Error::other("not supported"))
     }
 }
@@ -587,6 +630,30 @@ mod tests {
         copy(&root.path().join("checked"), &parent.join("data"));
         assert!(found.remove(".stack-checkout").unwrap_err().to_string().contains("replaced"));
         assert!(parent.join("data/rows").exists() && parent.join("data.stack-checkout").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_checked_directory_is_moved_whole_and_a_replaced_one_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let (parent, entry) = recorded(root.path());
+        let to = root.path().join("elsewhere/data");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        held(hold(&entry)).move_to(&to, ".stack-checkout").unwrap();
+        assert_eq!(std::fs::read(to.join("rows")).unwrap(), b"123");
+        assert_eq!(locate(&to).1, entry.identity, "the same directory, not a copy");
+        assert!(!parent.join("data").exists() && !parent.join("data.stack-checkout").exists());
+        assert!(parent.join("unsaved.txt").exists());
+
+        // Swapped for a copy after the check: the copy stays, and nothing moves.
+        let root = tempfile::tempdir().unwrap();
+        let (parent, entry) = recorded(root.path());
+        let found = held(hold(&entry));
+        std::fs::rename(parent.join("data"), root.path().join("checked")).unwrap();
+        copy(&root.path().join("checked"), &parent.join("data"));
+        let to = root.path().join("target");
+        assert!(found.move_to(&to, ".stack-checkout").unwrap_err().to_string().contains("replaced"));
+        assert!(!to.exists() && parent.join("data/rows").exists() && parent.join("data.stack-checkout").exists());
     }
 
     #[cfg(unix)]

@@ -76,6 +76,28 @@ pub fn holders(state: &Path) -> Result<Vec<(PathBuf, String)>> {
     Ok(reg.tokens.into_iter().map(|t| (t.project, t.service)).collect())
 }
 
+/// Move `old`'s tokens to `new`, for a checkout moved from `old` to `new`, as
+/// [`crate::ports::rekey`] moves its reservations. Returns how many moved and how many of
+/// `new`'s were replaced.
+pub fn rekey(state: &Path, old: &Path, new: &Path) -> Result<(usize, usize)> {
+    let (file, lock) = paths(state);
+    let _guard = FileLock::acquire(&lock)?;
+    let mut reg: Registry = read_json(&file)?;
+    if !reg.tokens.iter().any(|t| t.project == old) {
+        return Ok((0, 0));
+    }
+    let before = reg.tokens.len();
+    reg.tokens.retain(|t| t.project != new);
+    let replaced = before - reg.tokens.len();
+    let mut moved = 0;
+    for t in reg.tokens.iter_mut().filter(|t| t.project == old) {
+        t.project = new.to_path_buf();
+        moved += 1;
+    }
+    write_json(&file, &reg)?;
+    Ok((moved, replaced))
+}
+
 pub(crate) fn random_token() -> Result<String> {
     let mut seed = Vec::with_capacity(64);
     #[cfg(unix)]

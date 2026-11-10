@@ -300,6 +300,18 @@ output (mise's answer when no release matches) is an error, not a version.
   data record (`data.json`) without locks (each is replaced atomically) and checks liveness
   only: pid existence and TCP accept. It never runs identity verification. Sizes count the
   blocks of what is inside each data directory without following links.
+- **Moving.** mise derives each project's daemon namespace and data directory from the project
+  path, the checkout token includes the path, and running services carry both. So `mv`
+  refuses while anything recorded for the old path may run (live pid, open port, supervisor not
+  reporting stopped, launch in progress, a process carrying the token the directory had at the
+  old path, which a move keeps computable since device, inode and creation time stay). It holds
+  both paths' project locks, checks each data directory recorded under that token as `gc`
+  does (`hold`: resolved location, `O_NOFOLLOW`, same device and inode, marker), and only then
+  rekeys reservations and tokens, renames each held directory (`renameat` from the held
+  parent, then confirmed by device and inode, renamed back otherwise) to what `mise daemons
+  ls` names for the new path, writes the new token into its marker and the data record, and
+  moves the session (re-stamped with the directory) and completion records. Data moves and
+  registry changes are undone if a later step fails.
 - **Supervisor socket.** Pitchfork's socket is `<state dir>/sock/main.sock`, where the state
   directory is `PITCHFORK_STATE_DIR` (from the provider config's env, which mise passes to
   Pitchfork, else stack's own), else an absolute `XDG_STATE_HOME/pitchfork` on Linux only, else

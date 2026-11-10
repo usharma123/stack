@@ -154,6 +154,9 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     else
       cat "$REVIEW_FIXTURE/env.json"
     fi ;;
+  'daemons ls')
+    # What each daemon would use at this root, without starting anything: `daemons-ls.json`.
+    if test -f "$REVIEW_FIXTURE/daemons-ls.json"; then cat "$REVIEW_FIXTURE/daemons-ls.json"; else cat "$REVIEW_FIXTURE/daemons.json"; fi ;;
   'daemons --json')
     # Like mise, without the generated configuration (which enables experimental features)
     # there are no daemons to ask about.

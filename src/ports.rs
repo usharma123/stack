@@ -233,6 +233,29 @@ pub fn all(state: &Path) -> Result<Vec<Reservation>> {
     Ok(read_json::<Registry>(&paths(state).0)?.reservations)
 }
 
+/// Move `old`'s reservations to `new`, for a checkout moved from `old` to `new`. When `old` has
+/// any, they replace whatever `new` holds (only what a compile there assigned: `stack mv`
+/// refuses a `new` with a session); otherwise `new` keeps its own. Returns how many moved and
+/// how many of `new`'s were replaced.
+pub fn rekey(state: &Path, old: &Path, new: &Path) -> Result<(usize, usize)> {
+    let (file, lock) = paths(state);
+    let _guard = FileLock::acquire(&lock)?;
+    let mut reg: Registry = read_json(&file)?;
+    if !reg.reservations.iter().any(|r| r.project == old) {
+        return Ok((0, 0));
+    }
+    let before = reg.reservations.len();
+    reg.reservations.retain(|r| r.project != new);
+    let replaced = before - reg.reservations.len();
+    let mut moved = 0;
+    for r in reg.reservations.iter_mut().filter(|r| r.project == old) {
+        r.project = new.to_path_buf();
+        moved += 1;
+    }
+    write_json(&file, &reg)?;
+    Ok((moved, replaced))
+}
+
 fn find_free(reg: &Registry, project: &Path, service: &str, ephemeral: &RangeInclusive<u16>) -> Result<u16> {
     let span = u32::from(RANGE_END - RANGE_START) + 1;
     // Spread projects across the range so concurrent first runs rarely race for the same port.

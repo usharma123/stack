@@ -16,6 +16,19 @@ Stopping first matters. Stack will not stop a deleted checkout's services by nam
 checkout removed while its services run leaves them running until you stop them yourself
 (see [`gc`](commands.md#gc)).
 
+## Moving a checkout
+
+A moved or renamed worktree keeps its ports and data once you run `stack mv <old> <new>` with
+its services stopped (see [`mv`](commands.md#mv)). Stop them first, then move:
+
+```sh
+stack -C ../feature down
+git worktree move ../feature ../feature-2
+stack mv ../feature ../feature-2
+```
+
+`stack ps` lists every checkout Stack has records for, and how much data each holds.
+
 ## Worktrunk
 
 For [Worktrunk](https://github.com/max-sixty/worktrunk) (`wt`, tested with 0.80.0), add both

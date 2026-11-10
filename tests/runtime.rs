@@ -7551,3 +7551,120 @@ fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
     let human = String::from_utf8_lossy(&fixture.command_at(dir, &["ps"]).output().unwrap().stdout).into_owned();
     assert!(human.contains("reclaimable by `stack gc`"), "{human}");
 }
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn mv_carries_a_moved_checkouts_ports_tokens_and_data_to_its_new_path() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let (port, data) = up_with_data(&fixture, &[], 8192);
+    fixture.ok(&["down"]);
+    let app = dir.join("app").canonicalize().unwrap();
+    // An identity token, as a compile gives a service with an identity probe.
+    let token = "stack-0123456789abcdef0123456789abcdef";
+    fs::write(dir.join("state/identities.json"), json!({ "tokens": [{ "project": app, "service": "web", "token": token }] }).to_string()).unwrap();
+    let tokens = || -> Value { serde_json::from_slice(&fs::read(dir.join("state/identities.json")).unwrap()).unwrap() };
+    let moved = dir.canonicalize().unwrap().join("moved");
+    fs::rename(&app, &moved).unwrap();
+    let new_data = dir.join("mise-state/daemons/4567/data/web");
+    fs::write(dir.join("daemons-ls.json"), json!([{ "name": "web", "status": "available", "data_dir": new_data }]).to_string()).unwrap();
+
+    // Relative paths, from the parent directory.
+    let out = fixture.command_at(dir, &["mv", "app", "moved", "--json"]).current_dir(dir).output().unwrap();
+    let result = json_result(&out);
+    assert!(out.status.success(), "{result}");
+    let m = &result["data"];
+    assert_eq!((m["from"].as_str(), m["to"].as_str()), (app.to_str(), moved.to_str()), "{result}");
+    assert_eq!((m["ports"].as_u64(), m["identity_tokens"].as_u64()), (Some(1), Some(1)), "{result}");
+    assert_eq!(m["data"][0]["to"].as_str(), new_data.to_str(), "{result}");
+    assert_eq!(fs::read(new_data.join("rows")).unwrap().len(), 8192);
+    assert!(!data.exists() && !data.with_file_name("web.stack-checkout").exists(), "the old directory and marker are gone");
+    // Marked and recorded as the checkout's under the token its new path gives it.
+    let new_token = stack::checkout::token(&moved).unwrap();
+    let marker: Value = serde_json::from_slice(&fs::read(new_data.with_file_name("web.stack-checkout")).unwrap()).unwrap();
+    assert_eq!(marker["checkout"], new_token.as_str());
+    let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
+    let entries = ledger["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{ledger}");
+    assert_eq!(entries[0]["project"].as_str(), moved.to_str(), "{ledger}");
+    assert_eq!(entries[0]["checkout"], new_token.as_str(), "{ledger}");
+    assert_eq!(entries[0]["location"], json!(new_data.canonicalize().unwrap()), "{ledger}");
+    assert!(entries[0]["identity"].is_array(), "{ledger}");
+    assert_eq!(tokens()["tokens"][0]["token"], token);
+    assert_eq!(tokens()["tokens"][0]["project"].as_str(), moved.to_str());
+    // The checkout compiles at its new path with its old port, and gc leaves it alone.
+    let inspect = json_result(&fixture.command_at(&moved, &["inspect", "--json"]).output().unwrap());
+    assert_eq!(inspect["data"]["ports"]["web"].as_u64(), Some(u64::from(port)), "{inspect}");
+    let gc = json_result(&fixture.command_at(dir, &["gc", "--reclaim-data", "--json"]).output().unwrap());
+    assert_eq!(gc["data"], json!([]), "{gc}");
+    assert!(new_data.join("rows").exists());
+}
+
+#[test]
+fn mv_refuses_what_it_cannot_do_safely_and_changes_nothing() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let app = dir.join("app").canonicalize().unwrap();
+    let port = assigned_port(&fixture, "web");
+    let ports = || fs::read_to_string(dir.join("state/ports.json")).unwrap();
+    let mv = |args: &[&str]| json_result(&fixture.command_at(dir, &[&["mv"], args, &["--json"]].concat()).current_dir(dir).output().unwrap());
+
+    // The old path still exists: a copy, not a move.
+    fs::create_dir(dir.join("copy")).unwrap();
+    assert_eq!(mv(&["app", "copy"])["error"]["code"], "mv_source_exists");
+    let r = mv(&["never-there", "copy"]);
+    assert_eq!(r["error"]["code"], "mv_nothing_recorded", "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains("stack ps"), "{r}");
+    assert_eq!(mv(&["app", "nowhere"])["error"]["code"], "mv_target_missing");
+    // Over MCP; a missing argument is a usage error.
+    let copy = dir.canonicalize().unwrap().join("copy");
+    let mcp = fixture.mcp(&[("stack_mv", json!({ "from": app, "to": copy })), ("stack_mv", json!({ "from": app }))], &[]);
+    assert_eq!(mcp[0]["structuredContent"]["error"]["code"], "mv_source_exists", "{}", mcp[0]);
+    assert_eq!(mcp[1]["structuredContent"]["error"]["code"], "usage", "{}", mcp[1]);
+
+    // Services may still run: a live recorded pid.
+    let mut live = Command::new("sleep").arg("60").spawn().unwrap();
+    let index = dir.join(format!("state/sessions/{}.json", stack::state::project_key(&app)));
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    let record = json!({ "id": "sess12345678", "project": app, "lock_digest": "", "started_at": 1, "services": { "web": { "port": port, "pid": live.id(), "identity": "liveness", "verified_at": 1 } } });
+    fs::write(&index, record.to_string()).unwrap();
+    let moved = dir.canonicalize().unwrap().join("moved");
+    fs::rename(&app, &moved).unwrap();
+    let r = mv(&["app", "moved"]);
+    assert_eq!(r["error"]["code"], "mv_services_running", "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains("down"), "{r}");
+    assert!(ports().contains(app.to_str().unwrap()) && index.exists(), "nothing changed");
+
+    // The moved checkout points at `stack mv` when the record that came with it is in the way.
+    fs::create_dir_all(moved.join(".stack")).unwrap();
+    fs::rename(&index, moved.join(".stack/session.json")).unwrap();
+    let r = json_result(&fixture.command_at(&moved, &["status", "--json"]).output().unwrap());
+    assert_eq!(r["error"]["code"], "session_conflict", "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains(&format!("stack mv {} {}", app.display(), moved.display())), "{r}");
+    let _ = live.kill();
+    let _ = live.wait();
+
+    // The new path has a session of its own.
+    let other = dir.canonicalize().unwrap().join("other");
+    fs::create_dir(&other).unwrap();
+    let theirs = dir.join(format!("state/sessions/{}.json", stack::state::project_key(&other)));
+    fs::write(&theirs, json!({ "id": "other1234567", "project": other, "lock_digest": "", "started_at": 1, "services": {} }).to_string()).unwrap();
+    assert_eq!(mv(&["app", "other"])["error"]["code"], "mv_target_has_state");
+
+    // Data recorded for the checkout that cannot be confirmed to be its own refuses the move.
+    let data = dir.join("mise-state/daemons/0123/data/web");
+    fs::create_dir_all(&data).unwrap();
+    let token = stack::checkout::token_as(&app, &moved).unwrap();
+    let entry = json!({ "project": app, "service": "web", "dir": data, "checkout": token });
+    fs::write(dir.join("state/data.json"), json!({ "entries": [entry] }).to_string()).unwrap();
+    let r = mv(&["app", "moved"]);
+    assert_eq!(r["error"]["code"], "mv_data_unmovable", "{r}");
+    assert!(ports().contains(app.to_str().unwrap()), "nothing changed");
+    fs::remove_file(dir.join("state/data.json")).unwrap();
+
+    // With the service stopped, the record that came with the directory is enough to move it.
+    let r = mv(&["app", "moved"]);
+    assert_eq!(r["data"]["session"], "sess12345678", "{r}");
+    assert!(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&moved))).exists());
+    assert!(ports().contains(moved.to_str().unwrap()) && !ports().contains(&format!("{}\"", app.display())), "{}", ports());
+}

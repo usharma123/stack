@@ -315,6 +315,7 @@ fn tool_definitions() -> Value {
               "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
           }), &[]) },
         { "name": "stack_ps", "description": "Read-only list of every checkout stack has records for on this machine: path, whether its directory still exists, session and lease, and per service the port, pid, a liveness check (pid alive, port accepting; not identity verification, use stack_status for that) and data directory with its size, with totals. reclaimable marks a checkout stack_gc would reclaim (directory gone, no session left). Takes no project lock and needs no stack.toml; dir is ignored. no_size skips measuring data directories.", "inputSchema": schema(json!({ "no_size": { "type": "boolean" } }), &[]) },
+        { "name": "stack_mv", "description": "After a checkout was moved or renamed on disk, carry its session record, port reservations, identity tokens and the service data directories stack recorded for it from the old path to the new one, so it keeps its ports and data. Refuses (mv_services_running) while anything recorded for the old path may run, when the new path has a session (mv_target_has_state), and when recorded data cannot be confirmed to be the checkout's or placed at the new path (mv_data_unmovable, mv_data_unplaced); it then changes nothing. Relative paths resolve against dir.", "inputSchema": schema(json!({ "from": { "type": "string", "description": "Where the checkout was" }, "to": { "type": "string", "description": "Where it is now" } }), &["from", "to"]) },
         { "name": "stack_doctor", "description": "Check that the providers stack needs (mise, git, tar) are installed, that Pitchfork's socket path fits this platform, and that the project compiles.", "inputSchema": schema(json!({}), &[]) },
     ])
 }
@@ -445,6 +446,10 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_down" => session::down_with(ctx, args["stop_supervisor"] != false).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
+        "stack_mv" => {
+            let path = |key: &str| args[key].as_str().map(std::path::Path::new).ok_or_else(|| StackError::new("usage", format!("{key} is required")));
+            crate::fleet::mv(&ctx.state, &ctx.root, path("from")?, path("to")?).map(to_value)
+        }
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_exec" => exec(args, ctx),
         "stack_run" => run(args, ctx),

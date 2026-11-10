@@ -1262,6 +1262,14 @@ pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
         .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons --json` output: {e}")))
 }
 
+/// The configured daemons as `mise daemons ls --json` lists them: what each would use (port,
+/// data directory) at this root, without starting a supervisor or registering configuration.
+pub fn daemons_listed(root: &Path) -> Result<Vec<DaemonStatus>> {
+    let out = checked(root, &["daemons", "ls", "--json"], "provider_failed")?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons ls --json` output: {e}")))
+}
+
 /// `env` and `daemons` at once. Both only read provider state for the same configuration, so
 /// they run concurrently, both within the caller's deadline; errors are reported in the order
 /// the two used to run.

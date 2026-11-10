@@ -24,6 +24,7 @@ Any other MCP client: launch the command `stack` with the argument `mcp`. Every 
 | `stack_logs` | Shows a service's recent output |
 | `stack_down` | Stops everything and confirms it is gone |
 | `stack_ps` | Lists every checkout on the machine, its services and data size (liveness only) |
+| `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships |
 
@@ -123,7 +124,8 @@ missing required argument or a conflicting pair is a `usage` error, and the hint
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 
-`stack_ps` ignores `dir` and takes `no_size`, like the CLI's `--no-size`.
+`stack_ps` ignores `dir` and takes `no_size`, like the CLI's `--no-size`. `stack_mv` takes
+`from` and `to`; relative paths resolve against `dir`.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that
 is not an upper-case variable name is `invalid_secret`, as `--secret` reports it on the CLI. `stack_run`

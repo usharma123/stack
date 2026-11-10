@@ -88,7 +88,7 @@ impl Ctx {
     }
 }
 
-fn index_path(state: &Path, root: &Path) -> PathBuf {
+pub(crate) fn index_path(state: &Path, root: &Path) -> PathBuf {
     state
         .join("sessions")
         .join(format!("{}.json", project_key(root)))
@@ -1001,11 +1001,11 @@ fn encoding_warning(env: &IndexMap<String, String>, check: &Check) -> Option<Str
 }
 
 /// What [`data_marker`] adds to the data directory's name.
-const MARKER_SUFFIX: &str = ".stack-checkout";
+pub(crate) const MARKER_SUFFIX: &str = ".stack-checkout";
 
 /// The file beside a service's data directory naming the checkout (by token, see
 /// [`crate::checkout`]) whose data it is.
-fn data_marker(dir: &Path) -> PathBuf {
+pub(crate) fn data_marker(dir: &Path) -> PathBuf {
     let mut name = dir.file_name().unwrap_or_default().to_os_string();
     name.push(MARKER_SUFFIX);
     dir.with_file_name(name)
@@ -1072,7 +1072,7 @@ fn data_owner(dir: &Path) -> Option<String> {
     fs::read(data_marker(dir)).ok().and_then(|bytes| marker_owner(&bytes))
 }
 
-fn marker_owner(bytes: &[u8]) -> Option<String> {
+pub(crate) fn marker_owner(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes).ok().and_then(|v| v["checkout"].as_str().map(String::from))
 }
 
@@ -2230,7 +2230,7 @@ pub fn dir_id(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
+pub(crate) fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.created().ok()
 }
 
@@ -4388,9 +4388,12 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
             ),
         )
         .hint(format!(
-            "move the directory back to {} and run `stack down` there; if this file was only \
-             copied from that checkout, delete it",
-            session.project.display()
+            "if this directory was moved from there, run `stack mv {} {}` to carry its records \
+             here (it refuses while services may still run: then move the directory back, run \
+             `stack down` there, and move it again); if this file was only copied from that \
+             checkout, delete it",
+            session.project.display(),
+            ctx.root.display()
         )));
     }
     // A different directory now at this path must not adopt (or stop) the old one's services.
@@ -4424,6 +4427,12 @@ fn owned_elsewhere(ctx: &Ctx, session: &Session) -> bool {
 fn confirmed_gone(session: &Session) -> bool {
     !session.launching
         && session.services.values().all(|r| reconcile_gone(session.provider.as_ref(), r, false).is_ok())
+}
+
+/// Record `session` for the checkout at `root`, in the machine index and the checkout's own
+/// copy, as every lifecycle command does: for `stack mv` (see [`crate::fleet`]).
+pub(crate) fn save_at(state: &Path, root: &Path, session: &Session) -> Result<()> {
+    save(&Ctx { root: root.to_path_buf(), cache: PathBuf::new(), state: state.to_path_buf() }, session)
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
@@ -4464,7 +4473,7 @@ struct Completion {
 }
 
 /// Where a project's completion records are: `<state>/completed/<project key>/<token>.json`.
-fn completions_dir(state: &Path, root: &Path) -> PathBuf {
+pub(crate) fn completions_dir(state: &Path, root: &Path) -> PathBuf {
     state.join("completed").join(project_key(root))
 }
 
