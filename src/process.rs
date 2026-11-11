@@ -170,6 +170,11 @@ pub struct Captured {
     pub stderr: String,
     /// More than `limit` bytes were written; `stdout` holds only the tail.
     pub stdout_truncated: bool,
+    /// Likewise for `stderr`.
+    pub stderr_truncated: bool,
+    /// Bytes written to each stream in all (after redaction), before any were dropped.
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
 }
 
 // ---- redaction -----------------------------------------------------------------------------
@@ -444,6 +449,8 @@ struct Tail {
     bytes: VecDeque<u8>,
     limit: usize,
     truncated: bool,
+    /// Every byte appended, kept or not.
+    total: u64,
 }
 
 impl Tail {
@@ -452,10 +459,12 @@ impl Tail {
             bytes: VecDeque::new(),
             limit,
             truncated: false,
+            total: 0,
         }
     }
 
     fn append(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
         for &byte in bytes {
             if self.bytes.len() == self.limit {
                 self.bytes.pop_front();
@@ -693,6 +702,9 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
         signal: if piped.timed_out { None } else { child.status.and_then(|s| s.signal()) },
         timed_out: piped.timed_out,
         stdout_truncated: piped.stdout.truncated,
+        stderr_truncated: piped.stderr.truncated,
+        stdout_bytes: piped.stdout.total,
+        stderr_bytes: piped.stderr.total,
         stdout: piped.stdout.text(),
         stderr: piped.stderr.text(),
     })
@@ -2403,6 +2415,17 @@ mod tests {
         assert!(out.stdout.ends_with("stdout-end"));
         assert!(out.stderr.ends_with("stderr-end"));
         assert!(out.stdout.len() < 4200 && out.stderr.len() < 4200);
+    }
+
+    #[test]
+    fn truncation_of_each_stream_and_its_full_size_are_reported() {
+        let out = capture(Command::new("sh").args(["-c", "head -c 5000 /dev/zero; printf short >&2"]), Duration::from_secs(5), 4096).unwrap();
+        assert!(out.stdout_truncated && !out.stderr_truncated);
+        assert_eq!((out.stdout_bytes, out.stderr_bytes), (5000, 5));
+        let out = capture(Command::new("sh").args(["-c", "head -c 5000 /dev/zero >&2"]), Duration::from_secs(5), 4096).unwrap();
+        assert!(!out.stdout_truncated && out.stderr_truncated);
+        assert_eq!(out.stderr_bytes, 5000);
+        assert!(out.stderr.starts_with(TRUNCATED));
     }
 
     #[test]

@@ -802,6 +802,10 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         "timed_out": output.timed_out,
         "stdout": output.stdout,
         "stderr": output.stderr,
+        "stdout_truncated": output.stdout_truncated,
+        "stderr_truncated": output.stderr_truncated,
+        "stdout_bytes": output.stdout_bytes,
+        "stderr_bytes": output.stderr_bytes,
         "unverified": plan.checks.iter().filter(|c| !c.ready).map(|c| &c.service).collect::<Vec<_>>(),
         "checks": plan.checks,
     });

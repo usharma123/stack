@@ -7713,3 +7713,17 @@ fn down_purge_removes_the_data_up_recorded_only_where_gc_would_and_releases_port
     let p = &mcp[0]["structuredContent"]["data"]["purge"];
     assert_eq!((p["complete"].clone(), p["data"].clone()), (json!(true), json!([])), "{}", mcp[0]);
 }
+
+#[test]
+fn exec_reports_truncation_and_full_size_of_each_stream() {
+    let fixture = Fixture::new();
+    let script = "head -c 70000 /dev/zero | tr '\\0' a; printf 0123456789 >&2";
+    let result = json_result(&fixture.ok(&["--json", "exec", "--", "sh", "-c", script]));
+    let data = &result["data"];
+    assert_eq!((data["stdout_truncated"].as_bool(), data["stderr_truncated"].as_bool()), (Some(true), Some(false)), "{data}");
+    assert_eq!((data["stdout_bytes"].as_u64(), data["stderr_bytes"].as_u64()), (Some(70000), Some(10)));
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", "head -c 70000 /dev/zero >&2"] }))], &[]);
+    let data = &results[0]["structuredContent"]["data"];
+    assert_eq!((data["stdout_truncated"].as_bool(), data["stderr_truncated"].as_bool()), (Some(false), Some(true)), "{data}");
+    assert_eq!(data["stderr_bytes"], 70000);
+}

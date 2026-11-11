@@ -133,7 +133,9 @@ def succeeded(operation, envelope):
   `error.hint`. `error.details` carries the specifics.
 - A bad argument is `usage` with a hint, whether the parser or Stack itself rejected it (an
   unknown flag, `--ttl banana`, `--timeout 1ms`), and the CLI exits 2 for it.
-- `exec` and `run` capture at most 64 KiB of each output stream.
+- `exec` and `run` capture at most 64 KiB of each output stream and keep the end.
+  `stdout_truncated` and `stderr_truncated` say whether anything was dropped, and
+  `stdout_bytes` and `stderr_bytes` give each stream's full size.
 
 ## Timeouts
 
