@@ -78,6 +78,7 @@ Full docs live in [docs/](https://github.com/usharma123/stack/tree/main/docs).
 - [Bundles and `stack.toml`](https://github.com/usharma123/stack/blob/main/docs/user/bundles.md)
 - [Command reference](https://github.com/usharma123/stack/blob/main/docs/user/commands.md)
 - [Worktrees and sandboxes](https://github.com/usharma123/stack/blob/main/docs/user/worktrees.md)
+- [Service data: init tasks](https://github.com/usharma123/stack/blob/main/docs/user/data.md)
 - [Secrets](https://github.com/usharma123/stack/blob/main/docs/user/secrets.md)
 - [What Stack guarantees](https://github.com/usharma123/stack/blob/main/docs/user/guarantees.md)
 

@@ -13,6 +13,7 @@ pub mod git;
 pub mod hash;
 pub mod identity;
 pub mod init;
+pub mod init_tasks;
 pub mod ignore;
 pub mod lease;
 pub mod lock;

@@ -550,6 +550,10 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
     if old_completed.exists() && !new_completed.exists() {
         let _ = fs::rename(&old_completed, &new_completed);
     }
+    // Init markers follow the checkout, and name moved data directories where they are now.
+    let moved: Vec<(PathBuf, PathBuf)> =
+        done.iter().flat_map(|(e, to)| e.location.iter().chain([&e.dir]).map(move |from| (from.clone(), to.clone()))).collect();
+    crate::init_tasks::rekey(state, &old, &new, &moved);
     if !done.is_empty() {
         notes.push(format!(
             "the provider's other state for {} stays behind; `mise daemons prune` removes state of paths that no longer exist",

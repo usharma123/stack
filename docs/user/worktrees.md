@@ -13,6 +13,10 @@ should call it from their hooks. Ready-made recipes follow for [Worktrunk](#work
   `stack gc` does that too) and removes its databases. Without the flag the data is kept and
   reported, so a checkout removed by mistake loses nothing until you ask.
 
+To give a new checkout a ready database instead of an empty one, declare init tasks
+(`init = ["migrate", "seed"]`), which `up` runs once per new database. See
+[service data](data.md).
+
 Stopping first matters. Stack will not stop a deleted checkout's services by name, so a
 checkout removed while its services run leaves them running until you stop them yourself, or
 until `stack gc --stop-orphans` confirms each one is still the recorded process and stops it

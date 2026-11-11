@@ -79,6 +79,9 @@ pub struct VersionReport {
 pub struct Report {
     pub bundles: Vec<BundleReport>,
     pub stack: Composed,
+    /// Init tasks of each service that declares them, and the layer each list came from.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub init: IndexMap<String, crate::compose::Entry<Vec<String>>>,
     /// Ports assigned to this checkout. Machine-specific; never written to bundles or stack.lock.
     pub ports: IndexMap<String, u16>,
     /// Requested and exact versions of every tool and resolvable preset service.
@@ -437,6 +440,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         artifact_policy: policy,
         bundles: reports,
         warnings,
+        init: stack.init.iter().filter(|(_, e)| !e.value.is_empty()).map(|(k, e)| (k.clone(), e.clone())).collect(),
         stack,
         ports,
         versions,

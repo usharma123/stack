@@ -7,7 +7,7 @@
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
-| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports]` | Start services, verify them, record a session |
+| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S]` | Start services, verify them, run pending [init tasks](data.md), record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
@@ -159,6 +159,11 @@ load code you edited use `restart`.
 - **Failures** after the steps begin end with a progress record, `{steps, retry_safe,
   changed}`, saying what was done and whether a retry is safe. Service output in an error is
   cut to each service's last lines; `stack logs <service>` has the rest.
+- **Init tasks.** Once every service verifies, `up` runs the `init` tasks of each service whose
+  data directory has not completed them, and reports them in its steps and under `init`. A
+  failing one is `init_failed`, with services left running; the next `up` resumes from it.
+  `--no-init` skips them; `--reinit <service>` runs a service's list again. See
+  [service data](data.md).
 - `up` marks the generated mise config as trusted, so commands from the bundles you use run
   without mise's trust prompt. Review bundles like any dependency.
 
@@ -169,7 +174,9 @@ and, for Postgres, Redis and services with an [identity probe](identity-probes.m
 this checkout's instance. `ok` stays true; `healthy` says whether everything passed, and the
 exit code is 1 when it did not. A session whose lease expired is not healthy either, though
 its services still answer: `lease_expired` says why, and that the next `gc` or `up` stops them
-(`stack renew` or any `exec` renews a TTL lease).
+(`stack renew` or any `exec` renews a TTL lease). When a service declares init tasks, `init`
+gives each service's state (`done`, `pending`, `failed`, `stale` or `none`; see
+[service data](data.md)).
 
 Checking counts as using the session: `status` renews a lease that has not expired yet, like
 `exec`. An expired lease is reported, not revived, and so is the lease of a session that is

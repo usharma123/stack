@@ -14,11 +14,15 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 /// Options of `up` that are not about the lease.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UpOptions {
     /// On `port_conflict` with a program Stack does not own, move this checkout's conflicting
     /// (unpinned) ports and continue.
     pub reassign_ports: bool,
+    /// `--no-init`: run no init task (see [`crate::init_tasks`]).
+    pub no_init: bool,
+    /// `--reinit <service>`: run these services' init tasks again from the first.
+    pub reinit: Vec<String>,
 }
 
 /// A port `up --reassign-ports` moved.
@@ -38,7 +42,7 @@ pub fn up_with(ctx: &Ctx, lease: LeaseOptions, timeout: Duration, opts: UpOption
 /// `up`, and with `reassign_ports`, after a `port_conflict` at the `ports` step that names no
 /// pinned port, new reservations for the conflicting services and `up` once more.
 fn up_reassigning(ctx: &Ctx, lease: LeaseOptions, opts: UpOptions) -> Result<UpReport> {
-    let first = up_within(ctx, lease.clone());
+    let first = up_within(ctx, lease.clone(), &opts);
     let error = match first {
         Err(e) if opts.reassign_ports && e.code == "port_conflict" && failed_step(&e) == Some("ports") => e,
         other => return other,
@@ -50,7 +54,7 @@ fn up_reassigning(ctx: &Ctx, lease: LeaseOptions, opts: UpOptions) -> Result<UpR
     }
     let services: Vec<String> = conflicts.iter().filter_map(|c| c["service"].as_str().map(String::from)).collect();
     let moved = ports::reassign(&ctx.state, &ctx.root, &services)?;
-    let mut report = up_within(ctx, lease)?;
+    let mut report = up_within(ctx, lease, &opts)?;
     report.reassigned_ports = moved.into_iter().map(|(service, old, new)| ReassignedPort { service, old, new }).collect();
     Ok(report)
 }

@@ -181,8 +181,10 @@ missing required argument or a conflicting pair (`timeout` with `timeout_secs`) 
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 
-`stack_down` takes `purge: true`, like the CLI's `--purge`. `stack_ps` takes `no_size`, like
-the CLI's `--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
+`stack_up` takes `no_init` and `reinit` (a list of services), like the CLI's `--no-init` and
+`--reinit` (see [service data](data.md)); they cannot be given together. `stack_down` takes
+`purge: true`, like the CLI's `--purge`. `stack_ps` takes `no_size`, like the CLI's
+`--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
 `dir` when it is given.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that

@@ -379,6 +379,15 @@ output (mise's answer when no release matches) is an error, not a version.
   as its own PID: the terminal's own interrupt and hangup already reach it.
 - **Projects without services** never query the supervisor: `down`, `status` and `exec` have
   nothing to reconcile, and `mise daemons` is not configured for them.
+- **Service data.** mise's presets own data directories
+  (`$MISE_STATE_DIR/daemons/<checkout hash>/data/<service>`, created by `mise daemons __init`
+  on first start); `mise daemons --json` reports the path even before then. Init tasks run
+  after verification, through the same planning as `stack run`, once per data directory; a
+  service's `setup` is the hook that runs before every start. A marker in Stack's state records
+  the directory as the data record does (resolved location, device and inode) and a digest of
+  the init list and task definitions, so a recreated directory re-runs init and a changed list
+  is reported `stale`, never re-run silently. `init` is composed apart from the service
+  definition and excluded from the session fingerprint. See [service data](user/data.md).
 - **Partial failure.** `up` returns completed steps, whether services may have been started
   (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
 

@@ -115,6 +115,12 @@ enum Cmd {
         /// `status` and `down`. Covers the whole startup. Default 10m
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Run no init task (`init = [...]` of a service), even pending ones
+        #[arg(long)]
+        no_init: bool,
+        /// Run this service's init tasks again from the first, whatever was recorded (repeatable)
+        #[arg(long, value_name = "SERVICE", conflicts_with = "no_init")]
+        reinit: Vec<String>,
     },
     /// Restart services of the running session (all when none are named), then verify again
     Restart {
@@ -370,7 +376,7 @@ fn main() -> ExitCode {
                 print!("{}", skill.text);
             })
         }),
-        Cmd::Up { ttl, owner_pid, timeout, reassign_ports } => ttl
+        Cmd::Up { ttl, owner_pid, timeout, reassign_ports, no_init, reinit } => ttl
             .as_deref()
             .map(parse_duration)
             .transpose()
@@ -379,7 +385,8 @@ fn main() -> ExitCode {
                 Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout))
             })
             .and_then(|(ttl_secs, owner_pid, timeout)| {
-                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, session::UpOptions { reassign_ports: *reassign_ports })
+                let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone() };
+                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, opts)
             })
             .map(|r| {
                 emit(cli.json, &r, || {
@@ -388,6 +395,10 @@ fn main() -> ExitCode {
                     }
                     for c in &r.checks {
                         println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                    }
+                    for (service, o) in &r.init {
+                        let ran = if o.ran.is_empty() { String::new() } else { format!(" (ran {})", o.ran.join(", ")) };
+                        println!("{service:<12} init {}{ran}", o.status);
                     }
                     println!("session {}", r.session.id);
                     for w in &r.warnings {
@@ -458,6 +469,9 @@ fn main() -> ExitCode {
                         None => println!("{:<12} ready  port {}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity)),
                         Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
                     }
+                }
+                for (service, state) in r.init.iter().filter(|(_, s)| **s != stack::init_tasks::InitState::None) {
+                    println!("{service:<12} init {state}");
                 }
                 warn_changed(&r.checks);
             });
@@ -824,6 +838,9 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
         }
         for (name, port) in &r.ports {
             println!("port {name} = {port}");
+        }
+        for (name, e) in &r.init {
+            println!("init {name} = [{}] ({})", e.value.join(", "), e.origin);
         }
         for o in &s.overrides {
             let replaced = if o.replaced.is_empty() { "nothing".into() } else { o.replaced.join(", ") };

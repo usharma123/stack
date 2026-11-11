@@ -92,6 +92,7 @@ const CONFLICTS: &[(&str, &str, &str)] = &[
     ("stack_exec", "timeout", "timeout_secs"),
     ("stack_run", "timeout", "timeout_secs"),
     ("stack_gc", "dry_run", "stop_orphans"),
+    ("stack_up", "no_init", "reinit"),
 ];
 
 /// Arguments of one tool that mean something only with another, as on the command line.
@@ -320,7 +321,9 @@ fn tool_definitions() -> Value {
                 "owner_ancestor": { "type": "string", "description": "Lease: tie the session to the nearest ancestor of this stack server with this command name, e.g. \"claude\" (CLI: --owner-pid ancestor:<name>); owner_not_found lists the ancestors when none matches" },
                 "reassign_ports": { "type": "boolean", "description": "On port_conflict with another program, give this checkout's conflicting ports new numbers and continue; data.reassigned_ports lists old and new. A pinned port is never moved" },
                 "timeout_secs": startup_timeout_schema(),
-                "timeout": duration_schema("Time the whole startup may take")
+                "timeout": duration_schema("Time the whole startup may take"),
+                "no_init": { "type": "boolean", "description": "Run no init task (a service's init = [...], run once per data directory after services verify), even pending ones" },
+                "reinit": { "type": "array", "items": { "type": "string" }, "description": "Services whose init tasks run again from the first, whatever was recorded" }
             }), &[])),
         tool("stack_install", "Install pinned tools", annotations("Install pinned tools", false, Some(false), true, true),
             "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed) unless given install. A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
@@ -556,7 +559,11 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                     owner_pid,
                 },
                 timeout,
-                session::UpOptions { reassign_ports: args["reassign_ports"] == true },
+                session::UpOptions {
+                    reassign_ports: args["reassign_ports"] == true,
+                    no_init: args["no_init"] == true,
+                    reinit: strings(args, "reinit")?,
+                },
             )
             .map(to_value)
         }

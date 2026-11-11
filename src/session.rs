@@ -646,6 +646,8 @@ pub struct UpReport {
     pub warnings: Vec<String>,
     /// Ports `--reassign-ports` moved after a port conflict.
     pub reassigned_ports: Vec<ReassignedPort>,
+    /// What happened to each service's init tasks (see `init_tasks`).
+    pub init: IndexMap<String, crate::init_tasks::Outcome>,
 }
 
 impl Serialize for UpReport {
@@ -659,6 +661,7 @@ impl Serialize for UpReport {
             reaped: &self.reaped,
             warnings: &self.warnings,
             reassigned_ports: &self.reassigned_ports,
+            init: Some(&self.init).filter(|i| !i.is_empty()),
         }
         .serialize(s)
     }
@@ -685,6 +688,9 @@ struct StartedView<'a> {
     warnings: &'a [String],
     #[serde(skip_serializing_if = "<[ReassignedPort]>::is_empty")]
     reassigned_ports: &'a [ReassignedPort],
+    /// What happened to each service's init tasks (`up` only; see `init_tasks`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    init: Option<&'a IndexMap<String, crate::init_tasks::Outcome>>,
 }
 
 #[derive(Serialize)]
@@ -741,7 +747,7 @@ pub fn up(ctx: &Ctx, lease: LeaseOptions, timeout: Duration) -> Result<UpReport>
     up_with(ctx, lease, timeout, UpOptions::default())
 }
 
-fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
+fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpReport> {
     if let Some(pid) = lease.owner_pid {
         owner_pid(pid.into())?;
     }
@@ -768,6 +774,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     steps.ok("compile", json!({ "ports": report.ports }));
     if let Err(e) = check_services_host(&report).and_then(|()| refuse_root(&report)) {
         return Err(steps.fail("install", e, false));
+    }
+    if let Err(e) = crate::init_tasks::check_options(&report.stack, opts) {
+        return Err(steps.fail("compile", e, false));
     }
 
     let plan = match prepare_install(ctx, &report) {
@@ -982,14 +991,19 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         project_dir_created,
     };
     save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
-    Ok(UpReport {
+    let mut up = UpReport {
         session,
         checks,
         steps: steps.0,
         reaped,
         warnings: gc_warnings.into_iter().chain(warnings).collect(),
         reassigned_ports: Vec::new(),
-    })
+        init: IndexMap::new(),
+    };
+    // Init tasks run like `stack run`, which takes the project lock itself.
+    drop(_guard);
+    crate::init_tasks::run(ctx, &mut up, &report.stack, opts)?;
+    Ok(up)
 }
 
 /// A warning for each verified Postgres preset whose cluster is not `UTF8`: one created under
@@ -1885,6 +1899,7 @@ impl Serialize for RestartReport {
             reaped: &[],
             warnings: &[],
             reassigned_ports: &[],
+            init: None,
         }
         .serialize(s)
     }
@@ -3175,6 +3190,9 @@ pub struct StatusReport {
     /// stack.lock; nothing is fetched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<artifacts::PlatformSummary>,
+    /// Init state of each service, when any declares init tasks (see `init_tasks`).
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub init: IndexMap<String, crate::init_tasks::InitState>,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
@@ -3214,7 +3232,10 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     if let Some(session) = session.as_mut().filter(|s| !s.launching && !stale && lease_expired.is_none()) {
         renew_in_status(ctx, session)?;
     }
+    let data_dirs = checks.iter().map(|c| (c.service.clone(), c.data_dir.clone())).collect();
+    let init = crate::init_tasks::statuses(&ctx.state, &ctx.root, &report.stack, &data_dirs);
     Ok(StatusReport {
+        init,
         artifacts,
         healthy: !stale && lease_expired.is_none() && checks.iter().all(|c| c.ready),
         stale,
@@ -4232,6 +4253,16 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         note(&entry.project, &entry.service, outcome);
     }
     crate::datadirs::forget(state, |e| settled.contains(e))?;
+    // A deleted checkout's init markers go with its data; those of data still recorded stay.
+    if !settled.is_empty() {
+        let left = crate::datadirs::entries(state)?;
+        let mut projects: Vec<&Path> = settled.iter().map(|e| e.project.as_path()).collect();
+        projects.dedup();
+        for project in projects {
+            let kept: Vec<String> = left.iter().filter(|e| e.project == project).map(|e| e.service.clone()).collect();
+            let _ = crate::init_tasks::forget(state, project, &kept);
+        }
+    }
     Ok(found
         .into_iter()
         .map(|(project, services)| GcEntry { project, reason: "project directory deleted".into(), stopped: true, error: None, services })
@@ -4260,6 +4291,9 @@ fn purge_locked(ctx: &Ctx) -> Result<PurgeReport> {
         }
     }
     crate::datadirs::forget(&ctx.state, |e| settled.contains(e))?;
+    // Data removed was never initialised as far as the next `up` is concerned; kept data was.
+    let kept: Vec<String> = data.iter().filter(|d| d.kept).map(|d| d.service.clone()).collect();
+    crate::init_tasks::forget(&ctx.state, &ctx.root, &kept)?;
     let released_ports = ports::release(&ctx.state, &ctx.root)?
         .into_iter()
         .map(|r| json!({ "service": r.service, "port": r.port }))
@@ -5539,6 +5573,7 @@ mod tests {
             watch: Vec::new(),
             depends_on: Vec::new(),
             setup: None,
+            init: None,
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [
