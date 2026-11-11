@@ -89,6 +89,9 @@ A few things that are easy to get wrong:
   `stack.lock` records. Report it, and run `stack compile --update` only if the change is
   expected upstream.
 - **`stack logs <service> --since-start`** shows only the current process's output.
+- **The CLI finds the project from a subdirectory**, up to the Git worktree root. `exec` runs
+  your command in the directory you called it from. Pass `-C` to be explicit. MCP `dir` is
+  never searched upward: it must be the directory that holds `stack.toml`.
 
 ## Reading results
 

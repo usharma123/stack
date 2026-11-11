@@ -26,6 +26,13 @@
 Every command accepts `-C <dir>` (the project directory) and `--json` (one result object on
 stdout; see [reading results](agents.md#reading-results)).
 
+**Finding the project.** Without `-C`, Stack uses the nearest `stack.toml` at or above the
+working directory. It searches no higher than the Git worktree root (the directory holding
+`.git`), or `$HOME` and then the filesystem root outside Git, so a parent checkout's
+`stack.toml` is never picked up by mistake. If none is found, `manifest_missing` says where it
+looked and suggests `stack init`, which then writes one in the working directory. With `-C`,
+Stack uses exactly that directory and searches nothing.
+
 ## init
 
 Writes `stack.toml` in the project directory with the tools and preset services you name, and
@@ -166,7 +173,9 @@ files changed (none, when nothing did), so an agent need not pick the names out 
 
 ## exec
 
-Runs a command with the stack's tools and environment, in the project directory.
+Runs a command with the stack's tools and environment. It runs in the directory you called
+Stack from when the project was found by searching upward, and in the project directory when
+you pass `-C`. `STACK_PROJECT` always names the project directory.
 
 - Services that do not verify keep their variables, but with the host replaced by
   `unverified.stack.invalid`, so an app that falls back to `localhost` fails loudly instead of

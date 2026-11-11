@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod checkout;
 pub mod compose;
 pub mod datadirs;
+pub mod discover;
 pub mod doctor;
 pub mod error;
 pub mod fleet;

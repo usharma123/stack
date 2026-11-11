@@ -18,9 +18,10 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "stack", version, about = "Reusable, agent-safe development stacks")]
 struct Cli {
-    /// Project directory containing stack.toml
-    #[arg(short = 'C', long = "dir", global = true, default_value = ".")]
-    dir: PathBuf,
+    /// Project directory containing stack.toml (default: the nearest one at or above the
+    /// working directory, searching up to the Git worktree root)
+    #[arg(short = 'C', long = "dir", global = true)]
+    dir: Option<PathBuf>,
     /// Machine-readable output: a single JSON object on stdout
     #[arg(long, global = true)]
     json: bool,
@@ -253,10 +254,20 @@ fn main() -> ExitCode {
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
     }
-    let root = match cli.dir.canonicalize() {
-        Ok(root) => root,
-        Err(e) => return fail(cli.json, StackError::new("dir_not_found", format!("{}: {e}", cli.dir.display()))),
+    // Without -C, the nearest stack.toml at or above the working directory. Commands then run
+    // in the caller's directory, as they did before when it held stack.toml.
+    let (root, discovery) = match &cli.dir {
+        Some(dir) => match dir.canonicalize() {
+            Ok(root) => (root, None),
+            Err(e) => return fail(cli.json, StackError::new("dir_not_found", format!("{}: {e}", dir.display()))),
+        },
+        None => match stack::discover::from_cwd() {
+            Ok(d) => (d.root.clone(), Some(d)),
+            Err(e) => return fail(cli.json, StackError::new("dir_not_found", format!("working directory: {e}"))),
+        },
     };
+    // `exec` runs its command where it was called from when the project was found above it.
+    let child_dir = discovery.as_ref().map(|d| d.from.clone()).filter(|from| *from != root);
     let ctx = Ctx { root: root.clone(), cache: default_cache_dir(), state: default_state_dir() };
     let opts = |mode, write, reassign_ports| Options {
         root: root.clone(),
@@ -395,7 +406,12 @@ fn main() -> ExitCode {
             };
             prepare(*up, ttl.as_deref(), *install).and_then(|prepare| {
                 run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
-                    session::plan_prepared(&ctx, prepare, || session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured }))
+                    session::plan_prepared(&ctx, prepare, || {
+                        session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured }).map(|mut plan| {
+                            plan.dir = child_dir.clone();
+                            plan
+                        })
+                    })
                 })
             })
         }
@@ -473,6 +489,11 @@ fn main() -> ExitCode {
         }),
         Cmd::Mcp => unreachable!("handled above"),
     };
+    // Without -C, a missing stack.toml says where the search looked.
+    let result = result.map_err(|e| match &discovery {
+        Some(d) => d.explain(e),
+        None => e,
+    });
     match result {
         Ok(code) => code,
         // Like `timeout(1)`, and like `exec --timeout`.
@@ -757,7 +778,7 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     for var in &plan.removed {
         command.env_remove(var);
     }
-    command.args(&plan.args).envs(&plan.env).current_dir(&ctx.root);
+    command.args(&plan.args).envs(&plan.env).current_dir(plan.dir.as_deref().unwrap_or(&ctx.root));
     let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
     let code = match timeout {
         None => {

@@ -3273,6 +3273,8 @@ pub struct ExecPlan {
     /// A task's copy of the provider configuration it was planned from, which `env` points
     /// `mise run` at. Removed when the plan is dropped, after the command finishes.
     pub task_config: Option<TaskConfig>,
+    /// Where the command runs; the project root when `None`.
+    pub dir: Option<PathBuf>,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -3899,6 +3901,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         secret_warnings,
         redactor,
         task_config,
+        dir: None,
     })
 }
 

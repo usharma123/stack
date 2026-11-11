@@ -730,7 +730,7 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         command
             .args(&plan.args)
             .envs(&plan.env)
-            .current_dir(&ctx.root),
+            .current_dir(plan.dir.as_deref().unwrap_or(&ctx.root)),
         timeout,
         OUTPUT_LIMIT,
         Some(&plan.redactor),
