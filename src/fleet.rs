@@ -10,6 +10,7 @@ use crate::checkout;
 use crate::datadirs::{self, Found};
 use crate::error::{io_error, Result, StackError};
 use crate::identity;
+use crate::lease::LeaseSummary;
 use crate::ports;
 use crate::provider::mise;
 use crate::session::{self, Session};
@@ -59,23 +60,6 @@ pub struct SessionSummary {
     pub id: String,
     pub started_at: u64,
     pub launching: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LeaseSummary {
-    /// `ttl`, `owner_pid`, `ttl+owner_pid`, or `none` (lives until `stack down`).
-    pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner_pid: Option<u32>,
-    pub renewed_at: u64,
-    /// When the TTL runs out unless renewed; absent without a TTL.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
-    pub expired: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expired_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +194,7 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
             dir,
             state: state_name,
             session: session.map(|s| SessionSummary { id: s.id.clone(), started_at: s.started_at, launching: s.launching }),
-            lease: session.map(|s| lease_summary(s.lease.as_ref())),
+            lease: session.map(|s| LeaseSummary::of(s.lease.as_ref())),
             services,
             identity_tokens: tokens.iter().filter(|(p, _)| *p == path).count(),
             reclaimable,
@@ -223,28 +207,6 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
 impl ServiceRow {
     fn empty(name: &str, port: Option<u16>) -> Self {
         Self { name: name.to_string(), port, reserved_port: None, pid: None, pid_alive: None, port_accepting: false, data_dir: None, data_bytes: None }
-    }
-}
-
-fn lease_summary(lease: Option<&session::Lease>) -> LeaseSummary {
-    let Some(lease) = lease else {
-        return LeaseSummary { kind: "none", ttl_secs: None, owner_pid: None, renewed_at: 0, expires_at: None, expired: false, expired_reason: None };
-    };
-    let kind = match (lease.ttl_secs, lease.owner_pid) {
-        (Some(_), Some(_)) => "ttl+owner_pid",
-        (Some(_), None) => "ttl",
-        (None, Some(_)) => "owner_pid",
-        (None, None) => "none",
-    };
-    let reason = lease.expired(now());
-    LeaseSummary {
-        kind,
-        ttl_secs: lease.ttl_secs,
-        owner_pid: lease.owner_pid,
-        renewed_at: lease.renewed_at,
-        expires_at: lease.ttl_secs.map(|ttl| lease.renewed_at.saturating_add(ttl)),
-        expired: reason.is_some(),
-        expired_reason: reason,
     }
 }
 

@@ -128,9 +128,12 @@ output (mise's answer when no release matches) is an error, not a version.
   pinned `fnox` twice (`--describe`, then `--keys`), bounded in time and output, validates the
   whole answer before applying it, and never forwards what fnox printed. Captured output passes
   through a streaming matcher before it is bounded. See [secret grants](user/secrets.md).
-- **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
+- **Leases.** `--ttl` (renewed by `exec`/`run`/`renew`, and by `status` while not yet
+  expired) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
   `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.
+  `status`, `up` and `ps` report the lease as one structured `lease` object (`kind`,
+  `ttl_secs`, `renewed_at`, `expires_at`, `owner_alive`, `expired`).
   Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.

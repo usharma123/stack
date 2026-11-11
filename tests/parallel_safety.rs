@@ -443,3 +443,53 @@ fn stop_orphans_never_stops_a_service_whose_supervisor_reports_another_pid() {
     let results = fixture.mcp(&[("stack_gc", json!({ "dry_run": true, "stop_orphans": true, "dir": null }))]);
     assert_eq!(results[0]["error"]["code"], "usage", "{}", results[0]);
 }
+
+// ---- leases ------------------------------------------------------------------------------
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+#[test]
+fn status_renews_a_lease_and_status_and_up_report_it_structured() {
+    let fixture = Fixture::new();
+    let up = fixture.json(&["up", "--json", "--ttl", "30m"]);
+    let lease = &up["data"]["lease"];
+    assert_eq!((lease["kind"].as_str(), lease["ttl_secs"].as_u64(), lease["expired"].as_bool()), (Some("ttl"), Some(1800), Some(false)), "{up}");
+    assert_eq!(lease["expires_at"].as_u64(), Some(lease["renewed_at"].as_u64().unwrap() + 1800), "{up}");
+
+    // Make the lease look idle for ten minutes, then check: status counts as activity.
+    let idle_since = unix_now() - 600;
+    fixture.edit_session(|s| s["lease"]["renewed_at"] = json!(idle_since));
+    let status = fixture.json(&["status", "--json"]);
+    assert_eq!(status["data"]["lease"]["kind"], "ttl", "{status}");
+    let renewed = status["data"]["lease"]["renewed_at"].as_u64().unwrap();
+    assert!(renewed >= idle_since + 600, "status did not renew: {status}");
+    assert_eq!(status["data"]["session"]["lease"]["renewed_at"], renewed);
+    let saved: Value = serde_json::from_slice(&fs::read(fixture.path("app/.stack/session.json")).unwrap()).unwrap();
+    assert_eq!(saved["lease"]["renewed_at"], renewed);
+    let human = String::from_utf8_lossy(&fixture.command(&["status"]).output().unwrap().stdout).into_owned();
+    assert!(human.contains("lease: ttl 1800s, "), "{human}");
+
+    // An expired lease is reported, not revived.
+    fixture.edit_session(|s| {
+        s["lease"]["ttl_secs"] = json!(1);
+        s["lease"]["renewed_at"] = json!(1_000);
+    });
+    let status = fixture.json(&["status", "--json"]);
+    assert_eq!(status["data"]["lease"]["expired"], true, "{status}");
+    assert_eq!(status["data"]["lease"]["expires_at"], 1_001);
+    assert!(status["data"]["lease"]["expired_reason"].as_str().unwrap().contains("lease expired"), "{status}");
+    assert!(status["data"]["lease_expired"].is_string());
+    assert_eq!(status["data"]["session"]["lease"]["renewed_at"], 1_000);
+    let human = String::from_utf8_lossy(&fixture.command(&["status"]).output().unwrap().stdout).into_owned();
+    assert!(human.contains("lease: lease expired"), "{human}");
+
+    // No lease: kind none.
+    fixture.ok(&["down"]);
+    fixture.ok(&["up"]);
+    let status = fixture.json(&["status", "--json"]);
+    assert_eq!(status["data"]["lease"], json!({ "kind": "none", "renewed_at": 0, "expired": false }), "{status}");
+    let results = fixture.mcp(&[("stack_status", json!({}))]);
+    assert_eq!(results[0]["data"]["lease"]["kind"], "none", "{}", results[0]);
+}

@@ -340,6 +340,8 @@ fn main() -> ExitCode {
                 }
                 if let Some(why) = &r.lease_expired {
                     println!("lease: {why}");
+                } else if let Some(line) = r.lease.line() {
+                    println!("lease: {line}");
                 }
                 for c in &r.checks {
                     match &c.reason {

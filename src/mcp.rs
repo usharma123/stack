@@ -300,7 +300,7 @@ fn tool_definitions() -> Value {
         tool("stack_up", "Start services", annotations("Start services", false, Some(false), true, true),
             "Start every service and verify each one, recording a session. Use it before work that needs services. Safe to repeat: a service already running with unchanged configuration is kept, not restarted (after editing code it loaded, use stack_restart). It uses stack.lock as it is; a stale lock fails with lock_outdated. On timed_out, what was launched stays recorded. Returns {session, checks, steps}.",
             schema(json!({
-                "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_exec, stack_run and stack_renew extend it)" },
+                "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_status, stack_exec, stack_run and stack_renew extend it)" },
                 "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
                 "timeout_secs": startup_timeout_schema(),
                 "timeout": duration_schema("Time the whole startup may take")
@@ -324,7 +324,7 @@ fn tool_definitions() -> Value {
                 "since_start": { "type": "boolean", "description": "Only the current process's output, not earlier runs'" }
             }), &["service"])),
         tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
-            "Verify every service now and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.",
+            "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.",
             schema(json!({}), &[])),
         tool("stack_exec", "Run a command", annotations("Run a command", false, None, false, true),
             "Run one command, an argv list without a shell, with the stack's tools and env, capturing its output. Use it for anything that is not a stack.toml task; for shell syntax pass [\"sh\", \"-c\", \"...\"]. Endpoints of unverified services are withheld; require or require_all refuse to run instead. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",

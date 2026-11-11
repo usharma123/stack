@@ -19,6 +19,7 @@ use crate::secrets::{self, Grant};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json, SharedLock};
 use crate::timing::Timings;
+use crate::lease::LeaseSummary;
 
 mod gc_pass;
 pub use gc_pass::{gc_plan, gc_with, DeletedPlan, GcDryRun, GcOptions, GcPass, GcPlanned, GcSkipped, PlannedData, PlannedPort, PlannedService};
@@ -647,6 +648,7 @@ impl Serialize for UpReport {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         StartedView {
             session: SessionView::of(&self.session),
+            lease: Some(LeaseSummary::of(self.session.lease.as_ref())),
             restarted: None,
             checks: &self.checks,
             steps: compact_steps(&self.steps),
@@ -665,6 +667,9 @@ impl Serialize for UpReport {
 #[derive(Serialize)]
 struct StartedView<'a> {
     session: SessionView<'a>,
+    /// The session's lease, structured (`up` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease: Option<LeaseSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     restarted: Option<&'a [String]>,
     checks: &'a [Check],
@@ -1866,6 +1871,7 @@ impl Serialize for RestartReport {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         StartedView {
             session: SessionView::of(&self.session),
+            lease: None,
             restarted: Some(&self.restarted),
             checks: &self.checks,
             steps: compact_steps(&self.steps),
@@ -3141,6 +3147,8 @@ pub struct StatusReport {
     pub checks: Vec<Check>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expired: Option<String>,
+    /// The session's lease, structured (kind `none` without a session or lease).
+    pub lease: LeaseSummary,
     /// The complete compiled configuration changed since the session started.
     pub stale: bool,
     /// Every service verified and the session is current; `stack status` exits 1 otherwise.
@@ -3154,7 +3162,7 @@ pub struct StatusReport {
 /// Always answers, even for a broken session: diagnosing that state is the point.
 pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    let session = load(ctx)?;
+    let mut session = load(ctx)?;
     let report = ctx.compile(false)?;
     let checks = if report.stack.services.is_empty() {
         Vec::new()
@@ -3182,10 +3190,17 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
         .and_then(|s| s.lease.as_ref())
         .and_then(|l| l.expired(now()))
         .map(|why| format!("{why}; the next `stack gc` or `stack up` stops these services; `stack renew` (or any `stack exec`) renews a TTL lease"));
+    // Checking on a session is using it, as `exec` is: a lease that has not run out is
+    // renewed. An expired one is left for GC rather than revived, and a session that is stale
+    // or did not finish starting is not one to keep alive.
+    if let Some(session) = session.as_mut().filter(|s| !s.launching && !stale && lease_expired.is_none()) {
+        renew_in_status(ctx, session)?;
+    }
     Ok(StatusReport {
         artifacts,
         healthy: !stale && lease_expired.is_none() && checks.iter().all(|c| c.ready),
         stale,
+        lease: LeaseSummary::of(session.as_ref().and_then(|s| s.lease.as_ref())),
         lease_expired,
         session,
         checks,
@@ -4024,6 +4039,21 @@ pub fn renew(ctx: &Ctx) -> Result<Session> {
     lease.renewed_at = now();
     save(ctx, &session)?;
     Ok(session)
+}
+
+/// `status`'s renewal, under its lock: completion records are applied first, as `exec` applies
+/// them, so the renewal is never older than one they hold.
+fn renew_in_status(ctx: &Ctx, session: &mut Session) -> Result<()> {
+    if session.lease.is_none() {
+        return Ok(());
+    }
+    let consumed = reconcile_executions(&ctx.state, &ctx.root, session);
+    if let Some(lease) = session.lease.as_mut() {
+        lease.renewed_at = lease.renewed_at.max(now());
+    }
+    save(ctx, session)?;
+    forget_completions(&consumed);
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]

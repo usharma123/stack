@@ -12,6 +12,7 @@ pub mod hash;
 pub mod identity;
 pub mod init;
 pub mod ignore;
+pub mod lease;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;

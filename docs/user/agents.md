@@ -24,7 +24,7 @@ act machine-wide and need no `dir`.
 
 | Tool | Does |
 |---|---|
-| `stack_status` | Checks every service now. Start here |
+| `stack_status` | Checks every service now and renews the lease. Start here |
 | `stack_up` | Compiles if needed, installs, starts and verifies services |
 | `stack_run` | Runs a `[tasks.<name>]` once every service checks out |
 | `stack_exec` | Runs any other command (an argv list) with the stack's tools and env |
@@ -72,6 +72,9 @@ A few things that are easy to get wrong:
   with unchanged configuration running, so it will not pick up your edit either.
 - **Prefer `--ttl` to `--owner-pid`.** A lease tied to the shell that ran `stack up` ends as
   soon as that shell exits.
+- **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
+  `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
+  `renew` count as activity.
 - **Do not work around `artifact_mismatch`.** It means a download differs from what
   `stack.lock` records. Report it, and run `stack compile --update` only if the change is
   expected upstream.

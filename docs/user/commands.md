@@ -8,7 +8,7 @@
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
 | `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
-| `stack status` | Verify every service now (exit 1 if any fails) |
+| `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
@@ -81,8 +81,9 @@ Installs what is missing, starts every service, checks each one and records a se
 Running it again is safe: a service whose configuration has not changed keeps running, so to
 load code you edited use `restart`.
 
-- **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec` and `renew`
-  extend it). `--owner-pid N` ties it to a process that lives as long as your work.
+- **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec`, `run`,
+  `status` and `renew` extend it). `--owner-pid N` ties it to a process that lives as long as
+  your work. See [leases](#leases).
 - **Timeout.** The default is 10 minutes, covering downloads, installs and readiness. On
   expiry you get `timed_out` (exit 124). Services may still be starting: check `status`, retry
   `up`, or run `down` before fixing a service that will never become ready. A service whose
@@ -128,6 +129,10 @@ this checkout's instance. `ok` stays true; `healthy` says whether everything pas
 exit code is 1 when it did not. A session whose lease expired is not healthy either, though
 its services still answer: `lease_expired` says why, and that the next `gc` or `up` stops them
 (`stack renew` or any `exec` renews a TTL lease).
+
+Checking counts as using the session: `status` renews a lease that has not expired yet, like
+`exec`. An expired lease is reported, not revived, and so is the lease of a session that is
+stale or did not finish starting. The result carries a [`lease`](#leases) object.
 
 ## restart
 
@@ -263,6 +268,21 @@ else is kept, `purge.data[].kept` is true with the reason in `outcome`, and `pur
 false; `down` itself still succeeds. Data Stack never recorded, and data of an earlier
 directory at the same path (moved aside by `up` as `.replaced-<time>`), is never removed.
 
+## Leases
+
+`status` and `up` report the lease as a `lease` object, the same one `ps` lists per checkout:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `ttl`, `owner_pid`, `ttl+owner_pid`, or `none` (no lease, or no session) |
+| `ttl_secs` | The TTL, when there is one |
+| `renewed_at` | When it was last renewed (Unix seconds; 0 without a lease) |
+| `expires_at` | When a TTL lease runs out unless something renews it first (Unix seconds) |
+| `owner_pid`, `owner_alive` | The owner process, and whether it is alive now |
+| `expired`, `expired_reason` | The lease ran out, and why; `gc` or the next `up` anywhere reclaims the session |
+
+`status` keeps `lease_expired`, the reason with what to do about it, beside it.
+
 ## gc
 
 Stops sessions whose lease expired. For a checkout that was deleted, it drops the session
@@ -340,7 +360,7 @@ while something may be starting services at a deleted checkout's path.
 Lists every checkout this machine's Stack state has records of: a session, port reservations,
 identity tokens or a data directory `up` recorded. For each: its path, whether the directory
 still exists (`dir` is `present`, `missing` or `replaced`), the session id and `state`, the
-lease (`kind`, `ttl_secs`, `expires_at`, `expired`), and for each service its port, pid and
+lease (see [leases](#leases)), and for each service its port, pid and
 data directory, with the directory's size on disk. `state` is `running` (every service live),
 `partial`, `stopped`, `launching`, `recorded` (a session without services) or `reserved`
 (records but no session). `reclaimable` marks a checkout [`gc`](#gc) reclaims: its directory is
