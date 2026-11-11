@@ -19,7 +19,7 @@ cd "$W/appA" || exit 1
 jq -se '
   length == 8 and
   (map(select(.id == 1)) | length == 1 and .[0].result.protocolVersion == "2025-06-18") and
-  (map(select(.id == 2)) | length == 1 and (.[0].result.tools | map(.name) | sort) == (["stack_inspect", "stack_skill", "stack_compile", "stack_install", "stack_up", "stack_status", "stack_run", "stack_restart", "stack_exec", "stack_logs", "stack_renew", "stack_down", "stack_gc", "stack_doctor"] | sort)) and
+  (map(select(.id == 2)) | length == 1 and (.[0].result.tools | map(.name) | sort) == (["stack_inspect", "stack_skill", "stack_init", "stack_compile", "stack_up", "stack_snapshot_save", "stack_snapshot_restore", "stack_snapshot_list", "stack_snapshot_rm", "stack_install", "stack_restart", "stack_logs", "stack_env", "stack_status", "stack_exec", "stack_run", "stack_renew", "stack_down", "stack_gc", "stack_ps", "stack_mv", "stack_doctor", "stack_errors"] | sort)) and
   (map(select(.id == 3)) | .[0].result.structuredContent.data | .exit_code == 0 and (.stdout | contains("unverified.stack.invalid"))) and
   (map(select(.id == 4)) | .[0].result | .isError and .structuredContent.error.code == "service_unavailable") and
   (map(select(.id == 5)) | .[0].result.structuredContent | .ok and all(.data.checks[]; .ready and .identity == "instance")) and
