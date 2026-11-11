@@ -252,6 +252,18 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Print the environment `stack exec` would give a command, for `eval "$(stack env)"`;
+    /// unverified services' addresses are withheld as exec withholds them
+    Env {
+        /// Shell syntax (default: from $SHELL, else bash)
+        #[arg(long, value_enum)]
+        shell: Option<stack::shell::Shell>,
+    },
+    /// Print a snippet that loads the stack's environment from another tool (direnv's .envrc)
+    Hook {
+        #[arg(value_enum)]
+        tool: stack::shell::Hook,
+    },
     /// Check that mise, git and tar are usable and the project compiles
     Doctor,
     /// Serve the stack tools over MCP (stdio)
@@ -269,6 +281,10 @@ fn main() -> ExitCode {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
+    }
+    if let Cmd::Hook { tool } = &cli.cmd {
+        print!("{}", stack::shell::hook(*tool));
+        return ExitCode::SUCCESS;
     }
     // Without -C, the nearest stack.toml at or above the working directory. Commands then run
     // in the caller's directory, as they did before when it held stack.toml.
@@ -508,6 +524,17 @@ fn main() -> ExitCode {
                 println!("ready; run `stack doctor` to check the rest");
             })
         }),
+        Cmd::Env { shell } if cli.json && shell.is_some() => Err(stack::shell::json_conflict()),
+        Cmd::Env { shell } => stack::shell::plan(&ctx).map(|r| {
+            emit(cli.json, &r, || {
+                for w in &r.withheld {
+                    eprintln!("stack: not verified: {} ({}); withheld: {}", w.service, w.reason.as_deref().unwrap_or("unknown"),
+                        if w.vars.is_empty() { "nothing".to_string() } else { w.vars.join(", ") });
+                }
+                print!("{}", stack::shell::render(&r, shell.unwrap_or_else(stack::shell::default_shell)));
+            })
+        }),
+        Cmd::Hook { .. } => unreachable!("handled above"),
         Cmd::Doctor => stack::doctor::run(&root, &ctx.cache, &ctx.state).map(|checks| {
             emit(cli.json, &checks, || {
                 for c in &checks {

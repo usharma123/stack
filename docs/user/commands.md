@@ -13,6 +13,8 @@
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow]` | Show services' recent output (default 100 lines each) |
+| `stack env [--shell bash\|zsh\|fish]` | Print the environment `exec` would give a command, for `eval` |
+| `stack hook direnv` | Print an `.envrc` snippet that loads `stack env` |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
@@ -237,6 +239,26 @@ single-service result.
 
 `unknown_service` lists the project's services; `logs_failed` means the supervisor could not
 return them.
+
+## env
+
+Prints the environment `stack exec` would give a command right now, as `export` lines for
+`eval "$(stack env)"` (`--shell fish` for fish; the default follows `$SHELL`). It is planned
+exactly like `exec`: pinned tools must be installed, every service is checked, and an
+unverified service's connection variables are poisoned or unset just as `exec` does. A
+comment, and a line on stderr, names each unverified service and what was withheld.
+`--json` returns `{env, unset, withheld, skipped}`.
+
+Stack's own mise selection variables (`MISE_*`) are left out (`skipped`), so the mise in your
+shell keeps reading its usual configuration.
+
+The output is a snapshot. Unlike `exec`, which checks services every time, a shell keeps these
+values after a service stops or another checkout takes its port. Re-run `stack env` after
+`up`, `restart` or `down`. See [worktrees](worktrees.md#your-shell-and-direnv) for shell and
+direnv setups.
+
+`stack hook direnv` prints an `.envrc` snippet that runs `stack env` and reloads when
+`stack.toml`, `stack.lock` or the session changes.
 
 ## down
 

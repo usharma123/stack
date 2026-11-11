@@ -337,6 +337,9 @@ fn tool_definitions() -> Value {
                 "grep": { "type": "string", "description": "Only lines containing this text (a plain substring, not a regex)" },
                 "ignore_case": { "type": "boolean", "description": "Match grep ignoring case" }
             }), &[])),
+        tool("stack_env", "Show the command environment", annotations("Show the command environment", true, None, true, false),
+            "Return the environment stack_exec would give a command now. Use it to see which variables a command gets, or to hand them to a tool Stack cannot wrap; prefer stack_exec, which verifies on every call. Returns {env, unset, withheld, skipped}: withheld lists each unverified service and the variables removed for it; MISE_* variables are skipped.",
+            schema(json!({}), &[])),
         tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
             "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.",
             schema(json!({}), &[])),
@@ -581,6 +584,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             }
         }
         "stack_status" => session::status(ctx).map(to_value),
+        "stack_env" => crate::shell::plan(ctx).map(to_value),
         "stack_renew" => {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
             session::renew_with(ctx, ttl_secs).map(to_value)
@@ -1004,7 +1008,7 @@ mod tests {
             }
         }
         let annotation = |name: &str, hint: &str| tools().as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["annotations"][hint].clone();
-        for name in ["stack_inspect", "stack_status", "stack_logs", "stack_skill", "stack_doctor", "stack_ps"] {
+        for name in ["stack_inspect", "stack_status", "stack_logs", "stack_skill", "stack_doctor", "stack_ps", "stack_env"] {
             assert_eq!(annotation(name, "readOnlyHint"), true, "{name}");
         }
         for name in ["stack_down", "stack_gc"] {

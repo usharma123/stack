@@ -64,7 +64,8 @@ Bundles are code you run: review them like any other dependency. Sessions with a
 cleaned up by `stack gc` or the next `stack up`. Nothing runs in the background unless you run
 `stack gc --watch` under a supervisor.
 
-Run Stack from anywhere inside a checkout; it finds the nearest `stack.toml`.
+Run Stack from anywhere inside a checkout; it finds the nearest `stack.toml`. `stack env`
+loads the stack's environment into your shell or direnv.
 
 ## Documentation
 

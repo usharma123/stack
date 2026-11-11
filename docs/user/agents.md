@@ -35,10 +35,11 @@ act machine-wide and need no `dir`.
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
+| `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
 
 Each tool has a `title`, a short description that says when to use it, a description for
 every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
-`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor` and `stack_ps`,
+`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps` and `stack_env`,
 `destructiveHint` for `stack_down` and `stack_gc`, and `idempotentHint` for those that are
 safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
 

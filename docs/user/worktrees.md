@@ -63,6 +63,37 @@ stack = "stack down"
 The same two commands fit any tool with blocking create and remove hooks. Run `stack down`
 from a hook that can still stop the removal. A hook that runs after deletion is too late.
 
+## Your shell and direnv
+
+`stack exec -- <cmd>` checks every service each time it runs. To get the same environment in
+an interactive shell instead, load it once:
+
+```sh
+eval "$(stack env)"                 # bash or zsh
+stack env --shell fish | source     # fish
+```
+
+With [direnv](https://direnv.net), put the snippet `stack hook direnv` prints in `.envrc`:
+
+```sh
+stack hook direnv > .envrc
+direnv allow
+```
+
+It loads `stack env` on entering the checkout, and reloads when `stack.toml`, `stack.lock` or
+the session changes.
+
+Both are snapshots. Services that do not verify when the environment is loaded have their
+addresses withheld, as `exec` withholds them, and a comment names them. But a shell keeps the
+values it loaded: if a service stops later, or another checkout takes its port, the shell
+still points at that address. Re-run `stack env` (or `direnv reload`) after `up`, `restart`
+or `down`, and use `stack exec` when you need the check every time.
+
+mise's own shell activation (`mise activate`, or running `mise` in the checkout) also reads
+the configuration Stack generates, so it sets the same `DATABASE_URL` and `<NAME>_PORT`
+values. It does no verification: you get those addresses whether or not the service runs, or
+is this checkout's.
+
 ## Isolated runs
 
 To run Stack without touching your own installation (an evaluation, a sandboxed agent, a

@@ -25,6 +25,8 @@
   probe](identity-probes.md); without one they are checked for liveness only, and labelled
   that way. The address of a service that fails is replaced with `unverified.stack.invalid`, so
   an app that falls back to `localhost` fails loudly. `--require` refuses to run instead.
+  `stack env` applies the same rules, but only when it runs: a shell or direnv that loaded it
+  keeps those values afterwards. mise's own activation does no verification at all.
 - **Configuration changes need a fresh start.** A session records a fingerprint of the
   compiled configuration services see (everything but `[tasks]`) and ports. After a change,
   services count as unverified until `stack up` restarts them. Adding or editing a task needs

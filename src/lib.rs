@@ -28,6 +28,7 @@ pub mod provider;
 pub mod secrets;
 pub mod session;
 pub mod setup;
+pub mod shell;
 pub mod skills;
 pub mod source;
 pub mod state;

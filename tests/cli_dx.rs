@@ -229,3 +229,54 @@ fn follow_prints_new_lines_until_interrupted() {
     let out = fixture.command_in(&fixture.app(), &["logs", "--follow", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "usage");
 }
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn env_withholds_exactly_what_exec_withholds() {
+    let fixture = Fixture::new(TWO);
+    let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+    let path = format!("{}:{}", fixture.dir.path().join("bin").display(), std::env::var("PATH").unwrap());
+    fs::write(
+        fixture.dir.path().join("env.json"),
+        json!({ "PATH": path, "WEB_URL": format!("http://127.0.0.1:{port}/"), "WEB_PORT": port.to_string(), "PLAIN": "it's" }).to_string(),
+    )
+    .unwrap();
+    fixture.ok(&["install"]);
+    let exec = stdout(&fixture.ok(&["exec", "--", "sh", "-c", "echo \"$WEB_URL|${WEB_PORT-ABSENT}|$STACK_UNVERIFIED\""]));
+    let env = json_result(&fixture.ok(&["env", "--json"]));
+    let data = &env["data"];
+    assert_eq!(exec, format!("{}|ABSENT|{}\n", data["env"]["WEB_URL"].as_str().unwrap(), data["env"]["STACK_UNVERIFIED"].as_str().unwrap()), "{env}");
+    assert!(data["env"]["WEB_URL"].as_str().unwrap().contains("unverified.stack.invalid"), "{env}");
+    assert!(data["unset"].as_array().unwrap().contains(&json!("WEB_PORT")), "{env}");
+    let withheld: Vec<&str> = data["withheld"].as_array().unwrap().iter().map(|w| w["service"].as_str().unwrap()).collect();
+    assert_eq!(withheld, ["web", "worker"], "{env}");
+    assert!(data["env"].as_object().unwrap().keys().all(|k| !k.starts_with("MISE_")), "{env}");
+
+    // Shell output says so in a comment and evaluates to the same values.
+    let out = fixture.ok(&["env", "--shell", "bash"]);
+    let text = stdout(&out);
+    assert!(text.contains("# stack: web not verified ("), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not verified: web"));
+    let script = format!("{text}\necho \"$WEB_URL|${{WEB_PORT-ABSENT}}|$PLAIN\"");
+    let evaluated = Command::new("bash").args(["-c", &script]).env("WEB_PORT", "1").output().unwrap();
+    assert_eq!(stdout(&evaluated), format!("{}|ABSENT|it's\n", data["env"]["WEB_URL"].as_str().unwrap()));
+    let fish = stdout(&fixture.ok(&["env", "--shell", "fish"]));
+    assert!(fish.contains("set -e WEB_PORT") && fish.contains("set -gx PATH (string split : -- "), "{fish}");
+    let out = fixture.command_in(&fixture.app(), &["env", "--json", "--shell", "zsh"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "usage");
+    assert_eq!(out.status.code(), Some(2));
+
+    let app = fixture.app();
+    let replies = fixture.mcp(&app, &[("stack_env", json!({ "dir": app }))]);
+    assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
+    assert_eq!(replies[0]["data"]["env"]["WEB_URL"], data["env"]["WEB_URL"], "{}", replies[0]);
+}
+
+#[test]
+fn the_direnv_hook_prints_without_a_project() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    let elsewhere = fixture.dir.path().join("bin");
+    let hook = stdout(&fixture.ok_in(&elsewhere, &["hook", "direnv"]));
+    assert!(hook.contains("eval \"$(stack env --shell bash)\"") && hook.contains("watch_file stack.toml stack.lock .stack/session.json"), "{hook}");
+}
