@@ -7,7 +7,7 @@
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
-| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S]` | Start services, verify them, run pending [init tasks](data.md), record a session |
+| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME]` | Start services, verify them, run pending [init tasks](data.md), record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
@@ -17,6 +17,7 @@
 | `stack hook direnv` | Print an `.envrc` snippet that loads `stack env` |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
+| `stack snapshot save\|restore\|list\|rm [NAME]` | Save and restore service data, shared by every checkout of the project ([data](data.md)) |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
@@ -164,6 +165,8 @@ load code you edited use `restart`.
   failing one is `init_failed`, with services left running; the next `up` resumes from it.
   `--no-init` skips them; `--reinit <service>` runs a service's list again. See
   [service data](data.md).
+- **Snapshots.** `--from-snapshot <name>` fills each data directory that does not exist yet from
+  a snapshot before the first start. See [service data](data.md#snapshots).
 - `up` marks the generated mise config as trusted, so commands from the bundles you use run
   without mise's trust prompt. Review bundles like any dependency.
 
@@ -181,6 +184,14 @@ gives each service's state (`done`, `pending`, `failed`, `stale` or `none`; see
 Checking counts as using the session: `status` renews a lease that has not expired yet, like
 `exec`. An expired lease is reported, not revived, and so is the lease of a session that is
 stale or did not finish starting. The result carries a [`lease`](#leases) object.
+
+## snapshot
+
+`save <name>` copies this checkout's postgres and redis data, `restore <name>` replaces it,
+`list` and `rm <name>` manage them. Only the data directory `up` recorded for this checkout is
+copied or replaced. Running services, and those that depend on them, are stopped for the copy,
+then started and verified again. Snapshots are shared by every checkout of the same
+repository. See [service data](data.md#snapshots).
 
 ## restart
 

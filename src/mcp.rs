@@ -323,8 +323,25 @@ fn tool_definitions() -> Value {
                 "timeout_secs": startup_timeout_schema(),
                 "timeout": duration_schema("Time the whole startup may take"),
                 "no_init": { "type": "boolean", "description": "Run no init task (a service's init = [...], run once per data directory after services verify), even pending ones" },
-                "reinit": { "type": "array", "items": { "type": "string" }, "description": "Services whose init tasks run again from the first, whatever was recorded" }
+                "reinit": { "type": "array", "items": { "type": "string" }, "description": "Services whose init tasks run again from the first, whatever was recorded" },
+                "from_snapshot": { "type": "string", "description": "Before the first start, fill each data directory that does not exist yet from this snapshot (stack_snapshot_save); its init counts as done" }
             }), &[])),
+        tool("stack_snapshot_save", "Save a data snapshot", annotations("Save a data snapshot", false, Some(false), false, false),
+            "Save this checkout's postgres and redis data as a named snapshot that every checkout (worktree) of the project can restore. Use it after migrating and seeding, so new worktrees can start from it. Running services are stopped for the copy, then started and verified again. Returns {name, services, restarted, steps}.",
+            schema(json!({
+                "name": { "type": "string", "description": "Snapshot name: letters, digits, '.', '_' or '-'" },
+                "services": { "type": "array", "items": { "type": "string" }, "description": "Only these services (default: every postgres and redis service)" },
+                "force": { "type": "boolean", "description": "Replace a snapshot of the same name" }
+            }), &["name"])),
+        tool("stack_snapshot_restore", "Restore a data snapshot", annotations("Restore a data snapshot", false, Some(true), true, false),
+            "Replace this checkout's service data with a snapshot of the same service kind and major version. Use it to reset a database to a saved state; it discards the current data. Running services are stopped, the data swapped in one step, then started and verified again. Init counts as done for the init tasks the snapshot satisfied.",
+            schema(json!({ "name": { "type": "string", "description": "Snapshot name, as stack_snapshot_list shows it" } }), &["name"])),
+        tool("stack_snapshot_list", "List data snapshots", annotations("List data snapshots", true, None, true, false),
+            "List this project's snapshots. Use it to find a name for stack_snapshot_restore or stack_up's from_snapshot. Returns each snapshot's services with their kind, version and init state when saved, and the checkout it came from.",
+            schema(json!({}), &[])),
+        tool("stack_snapshot_rm", "Remove a data snapshot", annotations("Remove a data snapshot", false, Some(true), true, false),
+            "Remove one of this project's snapshots. Use it to free disk once a snapshot is no longer needed; every checkout of the project loses it. Fails with snapshot_not_found for an unknown name.",
+            schema(json!({ "name": { "type": "string", "description": "Snapshot name" } }), &["name"])),
         tool("stack_install", "Install pinned tools", annotations("Install pinned tools", false, Some(false), true, true),
             "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed) unless given install. A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
             schema(json!({}), &[])),
@@ -563,11 +580,19 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                     reassign_ports: args["reassign_ports"] == true,
                     no_init: args["no_init"] == true,
                     reinit: strings(args, "reinit")?,
+                    from_snapshot: args["from_snapshot"].as_str().map(String::from),
                 },
             )
             .map(to_value)
         }
         "stack_install" => session::install(ctx).map(to_value),
+        "stack_snapshot_save" => {
+            let name = args["name"].as_str().unwrap_or_default();
+            crate::snapshot::save(ctx, name, &strings(args, "services")?, args["force"] == true).map(to_value)
+        }
+        "stack_snapshot_restore" => crate::snapshot::restore(ctx, args["name"].as_str().unwrap_or_default()).map(to_value),
+        "stack_snapshot_list" => crate::snapshot::list(ctx).map(to_value),
+        "stack_snapshot_rm" => crate::snapshot::rm(ctx, args["name"].as_str().unwrap_or_default()),
         "stack_logs" => {
             let tail = match &args["tail"] {
                 Value::Null => 100,

@@ -7,7 +7,7 @@
 - [Bundles and `stack.toml`](user/bundles.md)
 - [Command reference](user/commands.md)
 - [Worktrees and sandboxes](user/worktrees.md)
-- [Service data: init tasks](user/data.md)
+- [Service data: init tasks and snapshots](user/data.md)
 - [Secrets](user/secrets.md)
 - [Agent skills](user/skills.md)
 - [Service identity probes](user/identity-probes.md)

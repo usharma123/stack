@@ -36,12 +36,14 @@ act machine-wide and need no `dir`.
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
 | `stack_init` | Writes a starting `stack.toml` (`tools`, `services`), like `stack init` |
+| `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapshot_list`, `stack_snapshot_rm` | Save a checkout's Postgres and Redis data and restore it in any checkout of the project, like `stack snapshot` ([service data](data.md)) |
 | `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
 
 Each tool has a `title`, a short description that says when to use it, a description for
 every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
-`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps` and `stack_env`,
-`destructiveHint` for `stack_down` and `stack_gc`, and `idempotentHint` for those that are
+`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps`, `stack_env` and
+`stack_snapshot_list`, `destructiveHint` for `stack_down`, `stack_gc`, `stack_snapshot_restore`
+and `stack_snapshot_rm`, and `idempotentHint` for those that are
 safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
 
 The server also offers this page as the resource `stack://guide`, takes `logging/setLevel`
@@ -181,10 +183,10 @@ missing required argument or a conflicting pair (`timeout` with `timeout_secs`) 
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
 
-`stack_up` takes `no_init` and `reinit` (a list of services), like the CLI's `--no-init` and
-`--reinit` (see [service data](data.md)); they cannot be given together. `stack_down` takes
-`purge: true`, like the CLI's `--purge`. `stack_ps` takes `no_size`, like the CLI's
-`--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
+`stack_up` takes `no_init`, `reinit` (a list of services) and `from_snapshot`, like the CLI's
+`--no-init`, `--reinit` and `--from-snapshot` (see [service data](data.md)); `no_init` and
+`reinit` cannot be given together. `stack_down` takes `purge: true`, like the CLI's
+`--purge`. `stack_ps` takes `no_size`, like the CLI's `--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
 `dir` when it is given.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that

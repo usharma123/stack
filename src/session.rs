@@ -775,7 +775,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     if let Err(e) = check_services_host(&report).and_then(|()| refuse_root(&report)) {
         return Err(steps.fail("install", e, false));
     }
-    if let Err(e) = crate::init_tasks::check_options(&report.stack, opts) {
+    if let Err(e) = crate::init_tasks::check_options(&report.stack, opts).and_then(|()| crate::snapshot::check_up(ctx, &report, opts)) {
         return Err(steps.fail("compile", e, false));
     }
 
@@ -865,6 +865,13 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         match claim_data(ctx, &report, &statuses, provider.as_ref()) {
             Ok(moved) => warnings.extend(moved),
             Err(e) => return Err(steps.fail("data", e, false)),
+        }
+        // After the claim: each data directory is recorded for this checkout and marked as its.
+        if let Some(name) = opts.from_snapshot.as_deref() {
+            match crate::snapshot::restore_before_start(ctx, &report, &statuses, name) {
+                Ok(detail) => steps.ok("restore_snapshot", detail),
+                Err(e) => return Err(steps.fail("restore_snapshot", e, false)),
+            }
         }
     }
 
@@ -2059,6 +2066,161 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     }
     save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
     Ok(RestartReport { session, restarted: names, checks, steps: steps.0 })
+}
+
+/// What [`with_stopped`] did around its operation.
+#[derive(Debug, Serialize)]
+pub struct StoppedReport {
+    pub steps: Vec<Value>,
+    /// Services that were running, stopped for the operation (with those that depend on them)
+    /// and started and verified again.
+    pub restarted: Vec<String>,
+    pub checks: Vec<Check>,
+    /// What the operation returned.
+    pub result: Value,
+}
+
+/// Run `operation` with the named services confirmed stopped, under the project lock, then
+/// start and verify again those that were running (for snapshots, which copy data
+/// directories). Stopping and starting are `restart`'s: services that depend on a stopped one
+/// are stopped first and started after it, each service's `setup` runs before it starts, and
+/// the supervisor this environment names is the one addressed. `operation` gets the compiled
+/// report and the supervisor listing taken once they stopped. Services that run must belong to
+/// the current, verified session; a stale or incomplete one is refused (`session_stale`). If
+/// the operation fails after stopping, the services are started again before the error is
+/// returned.
+pub fn with_stopped(
+    ctx: &Ctx,
+    names: &[String],
+    operation: impl FnOnce(&Report, &[DaemonStatus]) -> Result<Value>,
+) -> Result<StoppedReport> {
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(DEFAULT_STARTUP_TIMEOUT)?));
+    let mut steps = Steps::default();
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let mut session = load(ctx)?;
+    if let Some(s) = session.as_mut() {
+        settle_executions(ctx, s)?;
+        if has_active_executions(s) {
+            return Err(busy(s, "snapshot"));
+        }
+    }
+    let report = ctx.compile(true)?;
+    for name in names {
+        if !report.stack.services.contains_key(name) {
+            return Err(unknown_service(&report, name));
+        }
+    }
+    check_services_host(&report)?;
+    refuse_root(&report)?;
+    mise::trust(&ctx.root)?;
+    let statuses = mise::daemons(&ctx.root)?;
+    let live = |n: &String| {
+        statuses.iter().any(|d| d.name == *n && matches!(d.status.as_str(), "running" | "starting" | "waiting"))
+            || session.as_ref().and_then(|s| s.services.get(n)).is_some_and(|r| r.pid.is_some_and(pid_alive))
+    };
+    let mut stopping: Vec<String> = names.iter().filter(|n| live(n)).cloned().collect();
+    let mut supervisor = None;
+    if !stopping.is_empty() {
+        let current = session.as_ref().is_some_and(|s| !s.launching && same_config(s, ctx, &report));
+        if !current {
+            return Err(StackError::new(
+                "session_stale",
+                format!("{} running from a configuration or launch this checkout has not verified", stopping.join(", ")),
+            )
+            .hint("run `stack up` (or `stack down`) first, then retry"));
+        }
+        // What holds connections to a stopped service is stopped with it and started after it.
+        let dependents: Vec<String> = dependents_of(&report.stack.services, &stopping).into_iter().filter(|n| live(n)).collect();
+        stopping.extend(dependents);
+        let dir = match addressed_supervisor(ctx) {
+            Ok(dir) => dir,
+            Err(e) => return Err(steps.fail("preflight", e, false)),
+        };
+        steps.begin("stop");
+        if let Err(e) = stop_and_wait(ctx, &stopping, session.as_ref(), &dir) {
+            return Err(steps.fail("stop", e, true));
+        }
+        steps.ok("stop", json!(stopping));
+        supervisor = Some(dir);
+    }
+    // The supervisor must agree that nothing named still runs before any data is touched.
+    let stopped = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("confirm_stopped", e, !stopping.is_empty()))?;
+    let still: Vec<&str> = names
+        .iter()
+        .filter(|n| stopped.iter().any(|d| d.name == **n && matches!(d.status.as_str(), "running" | "starting" | "waiting")))
+        .map(String::as_str)
+        .collect();
+    if !still.is_empty() {
+        let err = StackError::new("stop_unconfirmed", format!("the supervisor still reports {} running; no data was touched", still.join(", ")))
+            .hint("run `stack down`, then retry");
+        return Err(steps.fail("confirm_stopped", err, !stopping.is_empty()));
+    }
+    let outcome = operation(&report, &stopped);
+    let result = match &outcome {
+        Ok(v) => {
+            steps.ok("copy", v.clone());
+            v.clone()
+        }
+        Err(e) => {
+            steps.0.push(json!({ "step": "copy", "status": "failed", "code": e.code }));
+            Value::Null
+        }
+    };
+    let mut checks = Vec::new();
+    if let (Some(mut session), Some(supervisor)) = (session.filter(|_| !stopping.is_empty()), supervisor) {
+        let started_at = now_ms();
+        for name in &stopping {
+            if let Some(record) = session.services.get_mut(name) {
+                record.pid = None;
+                record.started_at_ms = None;
+            }
+        }
+        session.launching = true;
+        if session.provider.as_ref().map_or(true, |p| resolved(&p.state_dir) != resolved(&supervisor)) {
+            session.provider = mise::which_pitchfork(&ctx.root).map(|pitchfork| ProviderRecord { pitchfork, state_dir: supervisor.clone() });
+        }
+        let restarted = save(ctx, &session)
+            .map_err(|e| ("record_launch", e))
+            .and_then(|()| {
+                start_in_order(ctx, &report, &stopping, &supervisor).map_err(|e| {
+                    let _ = record_after_failed_start(ctx);
+                    ("start", with_readiness_unless_cancelled(ctx, &report, &stopping, e))
+                })
+            })
+            .and_then(|()| verify_launch(ctx, &report, "snapshot_verify"));
+        match restarted {
+            Ok(verified) => {
+                steps.ok("start", json!(stopping));
+                steps.ok("verify", json!(verified.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
+                bind_data(ctx, &verified);
+                for check in &verified {
+                    let started = match session.services.get(&check.service) {
+                        Some(r) if !stopping.contains(&check.service) && r.pid.is_some() && r.pid == check.pid => r.started_at_ms,
+                        _ => Some(started_at),
+                    };
+                    session.services.insert(check.service.clone(), record_of(check, started));
+                }
+                session.launching = false;
+                save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
+                checks = verified;
+            }
+            Err((step, e)) => {
+                let e = match outcome {
+                    Err(first) => first.with_detail(json!({ "restart_error": e })),
+                    Ok(_) => e,
+                };
+                return Err(steps.fail(step, e, true));
+            }
+        }
+    }
+    match outcome {
+        Ok(_) => Ok(StoppedReport { steps: steps.0, restarted: stopping, checks, result }),
+        Err(e) => {
+            let changed = !stopping.is_empty();
+            // The failed copy step is already recorded; attach the progress record.
+            Err(e.with_detail(json!({ "steps": steps.0, "retry_safe": true, "changed": changed })))
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -1,4 +1,4 @@
-//! Init tasks, against the fake mise (tests/fakes/mise.sh) with a thin wrapper
+//! Init tasks and snapshots, against the fake mise (tests/fakes/mise.sh) with a thin wrapper
 //! that runs task bodies and initialises preset data directories the way mise does, and a
 //! fake `psql` that reports the data directory the supervisor started the server with (as
 //! Postgres reports `-D`).
@@ -243,6 +243,126 @@ fn init_runs_once_per_data_directory_and_resumes_after_a_failure() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn snapshots_seed_a_worktree_without_running_init() {
+    let f = Fixture::new(STACK);
+    let a = f.repo();
+    f.ok(&a, &["compile"]);
+    f.env_for(&a, Some("A"));
+    assert_eq!(f.ok(&a, &["up"])["init"]["db"]["ran"], json!(["migrate", "seed"]));
+
+    // Save the migrated, seeded state; the running service is stopped for the copy and
+    // started and verified again.
+    let saved = f.ok(&a, &["snapshot", "save", "base"]);
+    assert_eq!(saved["restarted"], json!(["db"]), "{saved}");
+    assert_eq!(saved["checks"][0]["identity"], "instance", "{saved}");
+    assert_eq!(saved["meta"]["services"]["db"]["init"], "done");
+    assert_eq!(saved["meta"]["services"]["db"]["version"], "17.11");
+    let steps: Vec<&str> = saved["steps"].as_array().unwrap().iter().map(|s| s["step"].as_str().unwrap()).collect();
+    assert_eq!(steps, ["stop", "copy", "start", "verify"]);
+    assert_eq!(f.json(&a, &["snapshot", "save", "base"])["error"]["code"], "snapshot_exists");
+    f.ok(&a, &["down"]);
+
+    // A new worktree of the same repository starts from it instead of running init.
+    let b = f.dir.path().join("wt");
+    git(&a, &["worktree", "add", "-q", b.to_str().unwrap()]);
+    f.ok(&b, &["compile"]);
+    let list = f.ok(&b, &["snapshot", "list"]);
+    assert_eq!(list["snapshots"][0]["name"], "base", "worktrees share snapshots: {list}");
+    f.env_for(&b, Some("B"));
+    let missing = f.json(&b, &["up", "--from-snapshot", "nope"]);
+    assert_eq!(missing["error"]["code"], "snapshot_not_found", "{missing}");
+    assert!(!f.data_dir("B").exists(), "nothing started before the snapshot was checked");
+    let log = f.tasks_log();
+    let up = f.ok(&b, &["up", "--from-snapshot", "base"]);
+    let restore = up["steps"].as_array().unwrap().iter().find(|s| s["step"] == "restore_snapshot").unwrap();
+    assert_eq!(restore["detail"]["restored"][0]["service"], "db", "{up}");
+    assert_eq!(up["init"]["db"]["status"], "done", "{up}");
+    assert_eq!(f.tasks_log(), log, "no init task ran in the restored worktree");
+    assert_eq!(f.applied("B"), "migrate\nseed\n");
+
+    // The restored data verifies as B's own instance, and carries nothing naming A's.
+    let status = f.ok(&b, &["status"]);
+    assert_eq!(status["checks"][0]["identity"], "instance", "{status}");
+    assert_eq!(status["session"]["services"]["db"]["data_dir"], json!(f.data_dir("B")));
+    assert_eq!(status["init"]["db"], "done");
+    let a_path = f.data_dir("A").to_string_lossy().into_owned();
+    for entry in walk(&f.data_dir("B")) {
+        let text = fs::read(&entry).unwrap();
+        assert!(!String::from_utf8_lossy(&text).contains(&a_path), "{} names A's data directory", entry.display());
+    }
+
+    // Running it again on existing data keeps that data.
+    let again = f.ok(&b, &["up", "--from-snapshot", "base"]);
+    let restore = again["steps"].as_array().unwrap().iter().find(|s| s["step"] == "restore_snapshot").unwrap();
+    assert_eq!(restore["detail"]["skipped"][0]["reason"], "data directory exists", "{again}");
+
+    // Restoring explicitly replaces the data of a running checkout and restarts it.
+    f.ok(&b, &["up", "--reinit", "db"]);
+    assert_eq!(f.applied("B"), "migrate\nseed\nmigrate\nseed\n");
+    let restored = f.ok(&b, &["snapshot", "restore", "base"]);
+    assert_eq!(restored["restarted"], json!(["db"]), "{restored}");
+    assert_eq!(f.applied("B"), "migrate\nseed\n");
+    assert_eq!(f.ok(&b, &["status"])["init"]["db"], "done");
+    // Its init digest is the one the snapshot satisfied: an edited task makes it stale.
+    fs::write(b.join("stack.toml"), STACK.replace("echo seed >>", "echo seed2 >>")).unwrap();
+    f.ok(&b, &["compile"]);
+    assert_eq!(f.ok(&b, &["status"])["init"]["db"], "stale");
+    // The record names the restored directory, so a purge removes it, and with it its init.
+    let down = f.ok(&b, &["down", "--purge"]);
+    assert_eq!(down["purge"]["complete"], true, "{down}");
+    assert!(!f.data_dir("B").exists());
+    assert_eq!(f.ok(&b, &["status"])["init"]["db"], "pending");
+    f.ok(&b, &["snapshot", "rm", "base"]);
+    assert_eq!(f.ok(&a, &["snapshot", "list"])["snapshots"], json!([]));
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn snapshots_refuse_another_major_version_and_unsupported_services() {
+    let f = Fixture::new(STACK);
+    let a = f.repo();
+    f.ok(&a, &["compile"]);
+    f.env_for(&a, Some("A"));
+    // Data Stack never recorded for this checkout is never copied.
+    fs::create_dir_all(f.data_dir("A")).unwrap();
+    let unrecorded = f.json(&a, &["snapshot", "save", "early", "--service", "db"]);
+    assert_eq!(unrecorded["error"]["code"], "snapshot_failed", "{unrecorded}");
+    fs::remove_dir_all(f.data_dir("A")).unwrap();
+    // `up` records it; once stopped, the data is copied without starting anything.
+    f.ok(&a, &["up", "--no-init"]);
+    f.ok(&a, &["down"]);
+    fs::write(a.join("stack.toml"), format!("{STACK}\n[services.web]\nrun = 'true'\n")).unwrap();
+    f.ok(&a, &["compile"]);
+    let saved = f.ok(&a, &["snapshot", "save", "v17", "--service", "db"]);
+    assert_eq!(saved["restarted"], json!([]), "{saved}");
+    assert_eq!(saved["meta"]["services"]["db"]["init"], "pending");
+    assert_eq!(f.json(&a, &["snapshot", "save", "w", "--service", "web"])["error"]["code"], "snapshot_unsupported");
+    assert_eq!(f.json(&a, &["snapshot", "save", "../x"])["error"]["code"], "usage");
+
+    fs::write(a.join("stack.toml"), STACK.replace("version = \"17\"", "version = \"18.1\"")).unwrap();
+    f.ok(&a, &["compile"]);
+    let refused = f.json(&a, &["snapshot", "restore", "v17"]);
+    assert_eq!(refused["error"]["code"], "snapshot_incompatible", "{refused}");
+    assert_eq!(fs::read_to_string(f.data_dir("A").join("PG_VERSION")).unwrap(), "17\n", "nothing was replaced");
+    let up = f.json(&a, &["up", "--from-snapshot", "v17"]);
+    assert_eq!(up["error"]["code"], "snapshot_incompatible", "{up}");
+}
+
+#[test]
 fn init_lists_are_validated_composed_and_shown_with_their_origin() {
     let f = Fixture::new("[services.db]\npreset = 'postgres'\ninit = ['nope']\n");
     let e = f.json(&f.repo(), &["inspect"]);
@@ -307,12 +427,15 @@ fn a_service_without_a_data_directory_runs_init_once_per_checkout() {
 }
 
 #[test]
-fn mcp_up_takes_init_options() {
+fn mcp_exposes_snapshots_and_init_options() {
     let f = Fixture::new(STACK);
     let repo = f.repo();
     let calls = [
         json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}),
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_up","arguments":{"dir":repo,"no_init":true,"reinit":["db"]}}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stack_snapshot_list","arguments":{"dir":repo}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stack_up","arguments":{"dir":repo,"no_init":true,"reinit":["db"]}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"stack_snapshot_restore","arguments":{"dir":repo,"name":"none"}}}),
     ];
     let input: String = calls.iter().map(|c| format!("{c}\n")).collect();
     let mut child = f.command(&repo, &["mcp"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
@@ -321,5 +444,12 @@ fn mcp_up_takes_init_options() {
     let out = child.wait_with_output().unwrap();
     let replies: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let by_id = |id: u64| replies.iter().find(|r| r["id"] == id).unwrap()["result"].clone();
-    assert_eq!(by_id(1)["structuredContent"]["error"]["code"], "usage");
+    let names: Vec<String> = by_id(1)["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    for tool in ["stack_snapshot_save", "stack_snapshot_restore", "stack_snapshot_list", "stack_snapshot_rm"] {
+        assert!(names.iter().any(|n| n == tool), "{tool}: {names:?}");
+    }
+    assert_eq!(by_id(2)["structuredContent"]["data"]["snapshots"], json!([]));
+    assert_eq!(by_id(2)["structuredContent"]["data"]["project"]["kind"], "git");
+    assert_eq!(by_id(3)["structuredContent"]["error"]["code"], "usage");
+    assert_eq!(by_id(4)["structuredContent"]["error"]["code"], "snapshot_not_found");
 }

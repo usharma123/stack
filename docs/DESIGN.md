@@ -387,7 +387,13 @@ output (mise's answer when no release matches) is an error, not a version.
   the directory as the data record does (resolved location, device and inode) and a digest of
   the init list and task definitions, so a recreated directory re-runs init and a changed list
   is reported `stale`, never re-run silently. `init` is composed apart from the service
-  definition and excluded from the session fingerprint. See [service data](user/data.md).
+  definition and excluded from the session fingerprint. Snapshots (postgres and redis only)
+  copy and replace only the data directory recorded for the checkout (held as `gc
+  --reclaim-data` holds it), only while its service and its dependents are confirmed stopped,
+  keyed by the Git common directory, and restore by exchanging a complete sibling copy into
+  place, then bind the record to the new directory. The instance check compares the server's
+  reported directory (from `-D`/`--dir`, not stored in the data) with the supervisor's, so
+  restored data verifies as the restoring checkout's. See [service data](user/data.md).
 - **Partial failure.** `up` returns completed steps, whether services may have been started
   (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
 

@@ -159,7 +159,7 @@ pub struct Marker {
     pub completed: Vec<CompletedTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_task: Option<String>,
-    /// What wrote it: `up`.
+    /// `up`, or `snapshot:<name>` for data restored from a snapshot.
     pub source: String,
     pub at: u64,
 }
@@ -179,7 +179,7 @@ fn markers_lock(state: &Path, root: &Path) -> Result<FileLock> {
     FileLock::acquire(&state.join("init").join(format!("{}.markers.lock", project_key(root))))
 }
 
-/// Serializes init runs of one checkout. Taken before the project
+/// Serializes init runs (and snapshot operations) of one checkout. Taken before the project
 /// lock, never while holding it.
 pub fn run_lock(state: &Path, root: &Path) -> Result<FileLock> {
     FileLock::acquire(&state.join("init").join(format!("{}.lock", project_key(root))))

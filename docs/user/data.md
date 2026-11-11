@@ -1,7 +1,10 @@
-# Service data: init tasks
+# Service data: init tasks and snapshots
 
-A new checkout starts with empty databases. **Init tasks** get it to a usable one: they run
-your migrations and seeds, once for each new database, as part of `stack up`.
+A new checkout starts with empty databases. Two things get it to a usable one:
+
+- **Init tasks** run your migrations and seeds, once for each new database, as part of `stack up`.
+- **Snapshots** copy a migrated, seeded database from one checkout so other checkouts of the
+  same project can start from it instead of running init again.
 
 ## Worked example
 
@@ -27,11 +30,20 @@ On `main`:
 stack compile
 stack up                       # starts postgres, verifies it, then runs migrate and seed
 stack up                       # init is done for this database: nothing runs
-stack status                   # postgres: ready, verified instance; init done
+stack snapshot save seeded     # stops postgres, copies its data, starts and verifies it again
 ```
 
-A new worktree gets its own database, on its own port, and its first `stack up` runs init
-there. Changes there never reach `main`'s database.
+In a new worktree:
+
+```sh
+git worktree add ../feature && cd ../feature
+stack compile --locked
+stack up --from-snapshot seeded   # copies the snapshot in before the first start; no init runs
+stack status                      # postgres: ready, verified instance; init done
+```
+
+The worktree has its own copy of the data, on its own port, verified as its own instance.
+Changes there never reach `main`'s database.
 
 ## Init tasks
 
@@ -107,6 +119,77 @@ restarts a running service:
 
 `stack inspect` lists each init list under `init`, with the layer it came from.
 
+## Snapshots
+
+```sh
+stack snapshot save <name> [--service S]... [--force]
+stack snapshot restore <name>
+stack snapshot list
+stack snapshot rm <name>
+```
+
+The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapshot_list` and
+`stack_snapshot_rm`, and `stack_up` takes `from_snapshot`, `no_init` and `reinit`.
+
+- **What is copied.** The data directories of the project's `postgres` and `redis` preset
+  services (`--service` narrows it). Other services cannot be snapshotted
+  (`snapshot_unsupported`), and neither can a data directory holding a symbolic link, such as a
+  Postgres tablespace outside it.
+- **Only the recorded directory.** The data directory is the one `up` recorded for this
+  checkout (the record `stack gc --reclaim-data` and `stack mv` use): the supervisor must name
+  it, it must still be the same directory, reached with no link followed, and carry this
+  checkout's marker. Anything else fails with `snapshot_failed` or `snapshot_unsupported`, and
+  nothing is copied or replaced. After a restore the record names the new directory.
+- **Only while stopped.** `save` and `restore` take the project lock, stop the affected
+  services if they run, and the services that `depends_on` them, and confirm they are gone, as
+  `stack restart` does. They check that the supervisor agrees, copy, then start them again (each
+  service's `setup` first, dependencies before dependents) and verify each one, reporting every
+  step. Services that were not running are left stopped. A stale or half-finished session is refused with
+  `session_stale` (run `stack up` first), and running commands with `session_busy`.
+- **Copy-on-write** where the filesystem supports it: `clonefile` on APFS, and reflinks through
+  `copy_file_range` on Btrfs and XFS. Elsewhere it is a plain copy, so expect the time and space
+  of the data's size. Files describing one run of a server (`postmaster.pid`,
+  `postmaster.opts`) are left out.
+- **Restoring replaces atomically.** The snapshot is copied to a sibling of the data directory,
+  then exchanged with it in one step (`renamex_np`/`renameat2`; two renames where the platform
+  has no exchange). An interrupted restore leaves the old data or the new, never a mix.
+- **Compatibility.** A snapshot records each service's preset and the exact release
+  `stack.lock` pinned. Restoring into a different preset or major version fails with
+  `snapshot_incompatible` before anything stops.
+- **Init.** A snapshot records whether init had completed and against which init list and task
+  definitions. Restored data counts as initialised for that digest: `done` if it matches the
+  checkout's current one, `stale` otherwise (never run again silently). Data saved before init
+  completed is `pending` after a restore.
+
+### `up --from-snapshot`
+
+`stack up --from-snapshot <name>` restores each snapshotted service whose data directory does
+not exist yet, before the service first starts, and then starts and verifies as usual. A
+service that already has data keeps it (the `restore_snapshot` step lists it under `skipped`),
+so the same command can run every time a checkout is created. A missing or incompatible
+snapshot fails before anything starts (`snapshot_not_found`, `snapshot_incompatible`).
+
+### Which checkouts share snapshots
+
+Snapshots live in Stack's machine state (`$STACK_STATE_DIR/snapshots/<project id>/`), keyed by
+project rather than by checkout path:
+
+- In Git, the project is the repository's common directory (shared by a clone and all its
+  worktrees) plus the path of `stack.toml` inside the checkout, so two Stack projects in one
+  repository keep separate snapshots. Separate clones of the same remote are separate projects.
+- Outside Git, the project is the checkout directory itself.
+
+`stack snapshot list` shows the project identity it used.
+
+### Identity after a restore
+
+Stack verifies Postgres and Redis by asking the server for its data directory and comparing it
+with the one the supervisor reports for this checkout. Neither server stores that path in its
+data: Postgres takes it from `-D` and Redis from `--dir` when they start. Restored data lives
+at the restoring checkout's own path, so the server reports that path and verifies as this
+checkout's instance, not the one that saved it. Identity tokens of probed services are kept in
+Stack's machine state per checkout, never in a data directory.
+
 ## Where data directories live
 
 mise's presets own the data. Each checkout's data directory is
@@ -114,8 +197,9 @@ mise's presets own the data. Each checkout's data directory is
 `~/.local/state/mise`), keyed by the checkout's path. mise creates it on the service's first
 start (`initdb` for Postgres) and reuses it afterwards as long as the major version matches.
 Stack reads the path from `mise daemons --json`, which reports it before the first start, and
-records it for the checkout when `up` claims it. `stack down` and `stack gc` keep data
-directories unless asked to remove them (`down --purge`, `gc --reclaim-data`).
+records it for the checkout when `up` claims it. Snapshots copy and replace only that recorded
+directory. `stack down` and `stack gc` keep data directories unless asked to remove them
+(`down --purge`, `gc --reclaim-data`).
 
 ## Errors
 
@@ -123,5 +207,11 @@ directories unless asked to remove them (`down --purge`, `gc --reclaim-data`).
 |---|---|
 | `init_invalid` | An init list names an unknown task, repeats one, or names a task whose `services` exclude the service; or `--reinit` names a service without init tasks |
 | `init_failed` | An init task exited non-zero or could not start. Services stay running; fix it and run `stack up` |
+| `snapshot_not_found` | No snapshot of that name for this project; the hint lists the ones there are |
+| `snapshot_exists` | `save` to a name in use; pick another, `rm` it, or `--force` |
+| `snapshot_incompatible` | The snapshot's preset or major version differs from this checkout's |
+| `snapshot_unsupported` | A service that is not a postgres or redis preset, or data holding links or special files |
+| `snapshot_failed` | The supervisor reports no data directory, Stack has no record of it for this checkout, it is not the recorded directory or lacks this checkout's marker, or a service has no data yet (run `stack up`) |
+| `stop_unconfirmed` | A service could not be confirmed stopped; nothing was copied |
 
 [All docs](../README.md)

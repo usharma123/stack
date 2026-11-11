@@ -14,8 +14,9 @@ should call it from their hooks. Ready-made recipes follow for [Worktrunk](#work
   reported, so a checkout removed by mistake loses nothing until you ask.
 
 To give a new checkout a ready database instead of an empty one, declare init tasks
-(`init = ["migrate", "seed"]`), which `up` runs once per new database. See
-[service data](data.md).
+(`init = ["migrate", "seed"]`), which `up` runs once per new database, or save a snapshot in
+one checkout and start the others from it: `stack compile --locked && stack up --from-snapshot
+seeded`. See [service data](data.md).
 
 Stopping first matters. Stack will not stop a deleted checkout's services by name, so a
 checkout removed while its services run leaves them running until you stop them yourself, or
@@ -51,6 +52,8 @@ hooks to `.config/wt.toml`. Both block, and a failing hook aborts the operation:
 # .config/wt.toml
 [pre-start]
 stack = "stack compile --locked && stack up"
+# or, from a snapshot saved on main (see data.md):
+# stack = "stack compile --locked && stack up --from-snapshot seeded"
 
 [pre-remove]
 stack = "stack down"

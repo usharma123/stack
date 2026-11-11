@@ -23,6 +23,9 @@ pub struct UpOptions {
     pub no_init: bool,
     /// `--reinit <service>`: run these services' init tasks again from the first.
     pub reinit: Vec<String>,
+    /// `--from-snapshot <name>`: fill data directories that do not exist yet from this
+    /// snapshot before the first start (see [`crate::snapshot`]).
+    pub from_snapshot: Option<String>,
 }
 
 /// A port `up --reassign-ports` moved.

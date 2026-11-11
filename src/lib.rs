@@ -32,6 +32,7 @@ pub mod session;
 pub mod setup;
 pub mod shell;
 pub mod skills;
+pub mod snapshot;
 pub mod source;
 pub mod state;
 pub mod timing;

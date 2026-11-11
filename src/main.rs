@@ -121,6 +121,10 @@ enum Cmd {
         /// Run this service's init tasks again from the first, whatever was recorded (repeatable)
         #[arg(long, value_name = "SERVICE", conflicts_with = "no_init")]
         reinit: Vec<String>,
+        /// Before the first start, fill each data directory that does not exist yet from this
+        /// snapshot (see `stack snapshot`); its init counts as done
+        #[arg(long, value_name = "NAME")]
+        from_snapshot: Option<String>,
     },
     /// Restart services of the running session (all when none are named), then verify again
     Restart {
@@ -292,6 +296,32 @@ enum Cmd {
     Doctor,
     /// Serve the stack tools over MCP (stdio)
     Mcp,
+    /// Save, restore, list or remove snapshots of service data, shared by every checkout of
+    /// the project
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Copy this checkout's postgres and redis data (stopping and restarting them if running)
+    Save {
+        name: String,
+        /// Only this service (repeatable); default every postgres and redis service
+        #[arg(long = "service", value_name = "SERVICE")]
+        services: Vec<String>,
+        /// Replace a snapshot of the same name
+        #[arg(long)]
+        force: bool,
+    },
+    /// Replace this checkout's data with a snapshot (stopping and restarting services if running)
+    Restore { name: String },
+    /// List this project's snapshots
+    List,
+    /// Remove a snapshot
+    Rm { name: String },
 }
 
 fn main() -> ExitCode {
@@ -376,7 +406,7 @@ fn main() -> ExitCode {
                 print!("{}", skill.text);
             })
         }),
-        Cmd::Up { ttl, owner_pid, timeout, reassign_ports, no_init, reinit } => ttl
+        Cmd::Up { ttl, owner_pid, timeout, reassign_ports, no_init, reinit, from_snapshot } => ttl
             .as_deref()
             .map(parse_duration)
             .transpose()
@@ -385,7 +415,7 @@ fn main() -> ExitCode {
                 Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout))
             })
             .and_then(|(ttl_secs, owner_pid, timeout)| {
-                let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone() };
+                let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone(), from_snapshot: from_snapshot.clone() };
                 session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, opts)
             })
             .map(|r| {
@@ -581,6 +611,7 @@ fn main() -> ExitCode {
             })
         }),
         Cmd::Mcp => unreachable!("handled above"),
+        Cmd::Snapshot { action } => snapshot(&ctx, cli.json, action),
     };
     // Without -C, a missing stack.toml says where the search looked.
     let result = result.map_err(|e| match &discovery {
@@ -691,6 +722,34 @@ fn gc_agent(as_json: bool, print: bool, remove: bool, enable: bool) -> Result<Ex
             }
         }
     }))
+}
+
+fn snapshot(ctx: &Ctx, as_json: bool, action: &SnapshotCmd) -> Result<ExitCode> {
+    use stack::snapshot;
+    let steps = |r: &snapshot::SnapshotReport, verb: &str| {
+        println!("{verb} snapshot {} ({})", r.name, r.services.join(", "));
+        if !r.restarted.is_empty() {
+            println!("restarted and verified {}", r.restarted.join(", "));
+        }
+    };
+    match action {
+        SnapshotCmd::Save { name, services, force } => {
+            snapshot::save(ctx, name, services, *force).map(|r| emit(as_json, &r, || steps(&r, "saved")))
+        }
+        SnapshotCmd::Restore { name } => snapshot::restore(ctx, name).map(|r| emit(as_json, &r, || steps(&r, "restored"))),
+        SnapshotCmd::List => snapshot::list(ctx).map(|r| {
+            emit(as_json, &r, || {
+                for m in &r.snapshots {
+                    let services: Vec<String> = m.services.iter().map(|(n, s)| format!("{n} {} {} init {}", s.preset, s.version, s.init)).collect();
+                    println!("{:<20} {}  from {}", m.name, services.join("; "), m.source.display());
+                }
+                if r.snapshots.is_empty() {
+                    println!("no snapshots for this project");
+                }
+            })
+        }),
+        SnapshotCmd::Rm { name } => snapshot::rm(ctx, name).map(|r| emit(as_json, &r, || println!("removed snapshot {name}"))),
+    }
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.
