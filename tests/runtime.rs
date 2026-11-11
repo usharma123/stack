@@ -4072,6 +4072,7 @@ fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one
     let passes: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(passes.len(), 4, "one JSON object per pass");
     assert!(passes.iter().all(|p| p["ok"] == true && p["data"]["reclaimed"] == json!([])), "{passes:?}");
+    assert!(passes.iter().all(|p| p["command"] == "gc" && p["passed"] == true && p["data"]["pass"].is_u64()), "{passes:?}");
     assert_eq!(fixture.index_files(), 1);
 
     // Left idle, it expires and is collected by the next pass, with no `stack up`.
@@ -7738,4 +7739,46 @@ fn a_service_that_does_not_verify_has_a_stable_reason_code() {
     assert!(web["reason"].is_string(), "{status}");
     let results = fixture.mcp(&[("stack_status", json!({}))], &[]);
     assert_eq!(results[0]["structuredContent"]["data"]["checks"][0]["reason_code"], "not_launched", "{}", results[0]);
+}
+
+/// Every envelope says what ran, with which Stack, in which schema, and how long it took.
+fn assert_self_described(envelope: &Value, command: &str) {
+    assert_eq!(envelope["command"], command, "{envelope}");
+    assert_eq!(envelope["schema"], 1, "{envelope}");
+    assert_eq!(envelope["stack_version"], env!("CARGO_PKG_VERSION"), "{envelope}");
+    assert!(envelope["duration_ms"].is_u64(), "{envelope}");
+    assert!(envelope["passed"].is_boolean(), "{envelope}");
+}
+
+#[test]
+fn every_envelope_describes_itself_and_says_whether_it_passed() {
+    let fixture = Fixture::new();
+    let out = fixture.command(&["--json", "exec", "--", "sh", "-c", "exit 7"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    let result = json_result(&out);
+    assert_self_described(&result, "exec");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(false)), "{result}");
+    let result = json_result(&fixture.ok(&["--json", "exec", "--", "true"]));
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(true)), "{result}");
+
+    // Stack's own failure, and an argument clap refused, name the command too.
+    let result = json_result(&fixture.command(&["--json", "restart"]).output().unwrap());
+    assert_self_described(&result, "restart");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(false), Some(false)), "{result}");
+    let out = fixture.command(&["--json", "logs", "--tail", "many"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let result = json_result(&out);
+    assert_self_described(&result, "logs");
+    assert_eq!(result["error"]["code"], "usage", "{result}");
+
+    // An unhealthy status succeeded but did not pass.
+    let fixture = Fixture::with_bundle(WEB);
+    let result = json_result(&fixture.command(&["--json", "status"]).output().unwrap());
+    assert_self_described(&result, "status");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(false)), "{result}");
+    let results = fixture.mcp(&[("stack_status", json!({})), ("stack_inspect", json!({}))], &[]);
+    assert_self_described(&results[0]["structuredContent"], "status");
+    assert_eq!(results[0]["structuredContent"]["passed"], false);
+    assert_self_described(&results[1]["structuredContent"], "inspect");
+    assert_eq!(results[1]["structuredContent"]["passed"], true);
 }

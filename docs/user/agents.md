@@ -124,6 +124,18 @@ def succeeded(operation, envelope):
     return True
 ```
 
+Every envelope also answers that check itself: **`passed`** is false when `ok` is false, when
+`exec` or `run` exited non-zero or by a signal, and when `status` finds a service unhealthy,
+so `envelope["passed"]` is the same test without the table. Beside it, `command` names the
+operation (MCP tool names without `stack_`), `stack_version` the Stack release that answered,
+`schema` the version of these shapes (currently `1`, raised only on an incompatible change)
+and `duration_ms` how long the call took:
+
+```json
+{"ok": true, "passed": false, "command": "exec", "stack_version": "0.1.22", "schema": 1,
+ "duration_ms": 412, "data": {"exit_code": 3, "signal": null, "stdout": "...", "stderr": "..."}}
+```
+
 - A command that exits 7 gives `ok: true` and `data.exit_code: 7`, and the CLI exits 7 too.
   `exit_code` is `null` when a signal ended the command; `data.signal` then names it, and the
   CLI exits 128 plus the signal (137 for SIGKILL), as a shell does.

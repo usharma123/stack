@@ -457,11 +457,14 @@ fn the_cli_prints_the_same_skill_stack_skill_returns() {
     let out = f.ok(&["skill", "mbx", "--name", "mbx-advanced"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "# mbx-advanced 1.22.0\nDocumentation only. SENTINEL-DOC\n");
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("# mbx 1.22.0 skill mbx-advanced ("), "{}", String::from_utf8_lossy(&out.stderr));
-    let cli = f.json(&["skill", "fnox"]);
+    let mut cli = f.json(&["skill", "fnox"]);
     let mut mcp = Mcp::start(&f);
     mcp.request("initialize", json!({ "protocolVersion": "2025-06-18" }));
     let mut over_mcp = mcp.call("stack_skill", json!({ "tool": "fnox" }));
     over_mcp.as_object_mut().unwrap().remove("project");
+    // How long each call took is the one field that may differ.
+    assert!(cli.as_object_mut().unwrap().remove("duration_ms").is_some_and(|d| d.is_u64()), "{cli}");
+    assert!(over_mcp.as_object_mut().unwrap().remove("duration_ms").is_some_and(|d| d.is_u64()), "{over_mcp}");
     assert_eq!(cli, over_mcp);
     // The same refusals, with the CLI's exit codes.
     let several = f.json(&["skill", "mbx"]);

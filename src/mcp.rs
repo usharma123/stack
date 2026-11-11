@@ -251,6 +251,11 @@ fn output_schema() -> Value {
         "type": "object",
         "properties": {
             "ok": { "type": "boolean", "description": "Whether Stack did what was asked (for stack_exec and stack_run, check data.exit_code too; for stack_status, data.healthy)" },
+            "passed": { "type": "boolean", "description": "Whether what was asked for is in the wanted state: false when ok is false, when stack_exec or stack_run exited non-zero or by a signal, and when stack_status finds a service unhealthy" },
+            "command": { "type": "string", "description": "The operation that answered: the tool's name without stack_" },
+            "stack_version": { "type": "string", "description": "The Stack release that answered" },
+            "schema": { "type": "integer", "description": "Version of the envelope and result shapes; raised only on an incompatible change" },
+            "duration_ms": { "type": "integer", "description": "How long the call took, in milliseconds" },
             "data": { "description": "The operation's result, when ok is true" },
             "error": {
                 "type": "object",
@@ -264,7 +269,7 @@ fn output_schema() -> Value {
                 "required": ["code", "message"],
             },
         },
-        "required": ["ok"],
+        "required": ["ok", "passed", "command", "stack_version", "schema", "duration_ms"],
     })
 }
 
@@ -428,6 +433,7 @@ fn tool_definitions() -> Value {
 /// Run one `tools/call`. `roots` are the client's MCP roots: `None` when it offers none.
 fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
+    let call = crate::contract::Call::new(name.strip_prefix("stack_").unwrap_or(name));
     let mut resolved = None;
     let outcome = validate(name, &params["arguments"])
         .and_then(|args| {
@@ -436,10 +442,7 @@ fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
             dispatch(name, &args, &ctx(resolved.as_deref()))
         })
         .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
-    let mut envelope = match outcome {
-        Ok(data) => json!({ "ok": true, "data": data }),
-        Err(e) => json!({ "ok": false, "error": e }),
-    };
+    let mut envelope = call.outcome(&outcome);
     // Which checkout the call acted on, so a wrong one shows in every result.
     if let Some(project) = &resolved {
         envelope["project"] = json!(project);
@@ -896,6 +899,7 @@ mod tests {
             Some("boolean") => value.is_boolean(),
             Some("string") => value.is_string(),
             Some("array") => value.is_array(),
+            Some("integer") => value.is_u64() || value.is_i64(),
             Some(_) => false,
             None => true,
         };

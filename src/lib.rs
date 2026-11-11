@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod checkout;
 pub mod compose;
+pub mod contract;
 pub mod datadirs;
 pub mod discover;
 pub mod doctor;

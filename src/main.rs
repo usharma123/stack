@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use stack::error::{Result, StackError};
@@ -7,6 +7,7 @@ use stack::mcp::{self, parse_duration};
 use stack::oci::{self, Reference};
 use stack::project::{self, default_cache_dir, Options, Report};
 use stack::compose::LoadedBundle;
+use stack::contract::Call;
 use stack::secrets::Grant;
 use stack::session::{self, Ctx, LeaseOptions, Require};
 use stack::source::Mode;
@@ -324,12 +325,43 @@ enum SnapshotCmd {
     Rm { name: String },
 }
 
+/// The call this process is answering, for the envelope `emit` and `fail` print.
+static CALL: std::sync::Mutex<Option<Call>> = std::sync::Mutex::new(None);
+
+fn call() -> Call {
+    CALL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Call::new(command_from_args()))
+}
+
+fn update_call(f: impl FnOnce(&mut Call)) {
+    let mut guard = CALL.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(|| Call::new(command_from_args())));
+}
+
+/// The subcommand named on the command line, for envelopes of calls clap refused: the first
+/// argument (before `--`) that names one. Empty when none does.
+fn command_from_args() -> String {
+    let cmd = Cli::command();
+    let names: Vec<String> = cmd.get_subcommands().map(|s| s.get_name().to_string()).collect();
+    std::env::args_os()
+        .skip(1)
+        .take_while(|a| a != "--")
+        .filter_map(|a| a.into_string().ok())
+        .find(|a| names.contains(a))
+        .unwrap_or_default()
+}
+
 fn main() -> ExitCode {
     stack::setup::use_managed_tools();
-    let cli = match Cli::try_parse() {
+    update_call(|_| {});
+    let matches = match Cli::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(e) => return usage_error(e),
+    };
+    let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => return usage_error(e),
     };
+    update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
@@ -337,7 +369,6 @@ fn main() -> ExitCode {
         };
     }
     if let Cmd::Completions { shell } = &cli.cmd {
-        use clap::CommandFactory;
         clap_complete::generate(*shell, &mut Cli::command(), "stack", &mut std::io::stdout());
         return ExitCode::SUCCESS;
     }
@@ -643,12 +674,7 @@ fn main() -> ExitCode {
 
 /// The subcommand's name, as clap parsed the arguments it already accepted.
 fn subcommand() -> String {
-    use clap::CommandFactory;
-    Cli::command()
-        .try_get_matches_from(std::env::args_os())
-        .ok()
-        .and_then(|m| m.subcommand_name().map(String::from))
-        .unwrap_or_default()
+    call().command
 }
 
 /// `--up`, `--ttl` and `--install` of `exec` and `run`, checked before anything runs.
@@ -817,12 +843,19 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
     let mut pass = 0u64;
     loop {
         pass += 1;
+        let mut this = call();
+        this.started = std::time::Instant::now();
         let result = session::gc_checked(state, reclaim_data, stop_orphans);
         let ok = result.is_ok();
         if as_json {
             let line = match &result {
-                Ok(entries) => json!({ "ok": true, "data": { "pass": pass, "at": stack::state::now(), "reclaimed": entries } }),
-                Err(e) => json!({ "ok": false, "error": e, "pass": pass, "at": stack::state::now() }),
+                Ok(entries) => this.success(json!({ "pass": pass, "at": stack::state::now(), "reclaimed": entries })),
+                Err(e) => {
+                    let mut line = this.failure(e);
+                    line["pass"] = json!(pass);
+                    line["at"] = json!(stack::state::now());
+                    line
+                }
             };
             println!("{line}");
         } else {
@@ -843,7 +876,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
 
 fn emit<T: Serialize>(as_json: bool, value: &T, human: impl FnOnce()) -> ExitCode {
     if as_json {
-        println!("{}", json!({ "ok": true, "data": value }));
+        println!("{}", call().success(serde_json::to_value(value).expect("results serialize")));
     } else {
         human();
     }
@@ -1024,12 +1057,12 @@ fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) 
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
     let result = mcp::run_and_finish(ctx, &mut plan, timeout)?;
     if result["timed_out"] == true {
-        println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
+        println!("{}", call().failure(&mcp::timed_out(timeout, result, "raise --timeout")));
         return Ok(ExitCode::from(124));
     }
     // Like a shell: a command ended by a signal reports 128 + its number.
     let code = result["exit_code"].as_i64().or_else(|| result["signal"].as_i64().map(|s| 128 + s)).unwrap_or(1).clamp(0, 255) as u8;
-    println!("{}", json!({ "ok": true, "data": result }));
+    println!("{}", call().success(result));
     Ok(ExitCode::from(code))
 }
 
@@ -1098,7 +1131,7 @@ fn usage_text(rendered: &str) -> (String, String) {
 
 fn fail(as_json: bool, e: StackError) -> ExitCode {
     if as_json {
-        println!("{}", json!({ "ok": false, "error": e }));
+        println!("{}", call().failure(&e));
     } else {
         print_error(&e);
     }
