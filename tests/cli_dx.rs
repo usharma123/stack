@@ -326,3 +326,22 @@ fn the_gc_agent_is_written_printed_and_removed_under_home_without_loading_anythi
     let error = run(&["setup", "--print", "--json"]);
     assert_eq!(error["error"]["code"], "usage", "--print needs --gc-agent: {error}");
 }
+
+#[test]
+fn mcp_init_writes_a_project_in_dir_and_never_replaces_one() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    fs::create_dir(fixture.dir.path().join("fresh")).unwrap();
+    let fresh = fixture.dir.path().join("fresh").canonicalize().unwrap();
+    let calls = [
+        ("stack_init", json!({ "dir": fresh, "tools": ["python=3.13"], "services": ["redis@8"] })),
+        ("stack_init", json!({ "dir": fresh })),
+        ("stack_init", json!({ "dir": fixture.app(), "tools": [3] })),
+    ];
+    let replies = fixture.mcp(&fixture.app(), &calls);
+    assert_eq!(replies[0]["data"]["services"], json!(["redis"]), "{}", replies[0]);
+    assert_eq!(replies[0]["project"], fresh.to_str().unwrap());
+    let written = fs::read_to_string(fresh.join("stack.toml")).unwrap();
+    assert!(written.contains("python = \"3.13\""), "{written}");
+    assert_eq!(replies[1]["error"]["code"], "project_exists", "{}", replies[1]);
+    assert_eq!(replies[2]["error"]["code"], "usage", "{}", replies[2]);
+}

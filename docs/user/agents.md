@@ -35,6 +35,7 @@ act machine-wide and need no `dir`.
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
+| `stack_init` | Writes a starting `stack.toml` (`tools`, `services`), like `stack init` |
 | `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
 
 Each tool has a `title`, a short description that says when to use it, a description for

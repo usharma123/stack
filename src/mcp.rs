@@ -299,6 +299,12 @@ fn tool_definitions() -> Value {
         tool("stack_skill", "Read a tool's skill", annotations("Read a tool's skill", true, None, true, false),
             "Return the SKILL.md text of a pinned tool's agent skill (CLI: stack skill), one that stack_inspect lists under `skills` as available. Use it to learn how to use that tool at the pinned release; read it, do not run it. Returns {tool, version, name, entrypoint, bytes, text}, text at most 64 KiB. Fails with skill_not_found, or usage listing the names when the tool ships several and name is omitted.",
             schema(json!({ "tool": { "type": "string", "description": "Tool name as listed under `skills`, e.g. \"fnox\"" }, "name": { "type": "string", "description": "Skill name, needed only when the tool ships several" } }), &["tool"])),
+        tool("stack_init", "Write a starting stack.toml", annotations("Write a starting stack.toml", false, Some(false), false, false),
+            "Write a starting stack.toml in dir with the tools and preset services named (CLI: stack init). Use it when a checkout has none (manifest_missing), then call stack_compile. It never replaces an existing file (project_exists). Returns {path, tools, services, next}.",
+            schema(json!({
+                "tools": { "type": "array", "items": { "type": "string" }, "description": "Tools as NAME or NAME=VERSION, e.g. \"python=3.13\" (no version: latest, pinned at the first compile)" },
+                "services": { "type": "array", "items": { "type": "string" }, "description": "Preset services as NAME, NAME=PRESET, either with @VERSION, e.g. \"postgres@17\" or \"cache=redis\"" }
+            }), &[])),
         tool("stack_compile", "Compile stack.lock", annotations("Compile stack.lock", false, Some(false), true, true),
             "Resolve bundles and exact tool and service versions, then write stack.lock and the generated provider config. Use it after editing stack.toml, or when another tool fails with lock_outdated. Pins are kept unless their request changed; update re-resolves everything; locked only checks; reassign_ports gives fresh ports after port_conflict. Returns versions, ports and warnings.",
             schema(json!({
@@ -508,6 +514,10 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             to_value(r)
         }),
         "stack_skill" => skill(args, ctx).map(to_value),
+        "stack_init" => {
+            let strings = |key: &str| -> Vec<String> { args[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect() };
+            crate::init::init(&ctx.root, &strings("tools"), &strings("services")).map(to_value)
+        }
         "stack_compile" => {
             let mode = if args["update"] == true {
                 Mode::Update
