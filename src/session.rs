@@ -19,6 +19,9 @@ use crate::secrets::{self, Grant};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json, SharedLock};
 use crate::timing::Timings;
+
+mod gc_pass;
+pub use gc_pass::{gc_with, GcOptions, GcPass, GcSkipped};
 use crate::tool::ToolSpec;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -636,7 +639,7 @@ pub struct UpReport {
     pub checks: Vec<Check>,
     pub steps: Vec<Value>,
     pub reaped: Vec<GcEntry>,
-    /// Problems that did not stop startup (the `skills` step).
+    /// Problems that did not stop startup (the `gc` and `skills` steps).
     pub warnings: Vec<String>,
 }
 
@@ -688,13 +691,15 @@ impl<'a> SessionView<'a> {
 
 /// Successful steps without details the result already carries elsewhere (ports and identities
 /// are in the checks) or that only matter when something fails (the socket, install coverage:
-/// `stack install` reports it). What `stop_previous` and `ports` stopped without a record is kept.
+/// `stack install` reports it). What `stop_previous` and `ports` stopped without a record is kept,
+/// and so are the other checkouts' sessions `gc` skipped because they were busy.
 fn compact_steps(steps: &[Value]) -> Vec<Value> {
     const REDUNDANT: [&str; 7] = ["gc", "compile", "preflight", "install", "stop", "start", "verify"];
+    let redundant = |step: &Value| REDUNDANT.contains(&step["step"].as_str().unwrap_or_default()) && step["detail"].get("skipped").is_none();
     steps
         .iter()
         .map(|step| match step.as_object() {
-            Some(fields) if step["status"] == "ok" && (REDUNDANT.contains(&step["step"].as_str().unwrap_or_default()) || step["detail"].is_null()) => {
+            Some(fields) if step["status"] == "ok" && (redundant(step) || step["detail"].is_null()) => {
                 Value::Object(fields.iter().filter(|(k, _)| *k != "detail").map(|(k, v)| (k.clone(), v.clone())).collect())
             }
             _ => step.clone(),
@@ -730,8 +735,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         owner_pid(pid.into())?;
     }
     let mut steps = Steps::default();
-    let reaped = gc(&ctx.state)?;
-    steps.ok("gc", json!({ "reaped": reaped.len() }));
+    let (reaped, gc_warnings) = gc_pass::before_up(&ctx.state, &mut steps);
 
     let _guard = project_lock(&ctx.state, &ctx.root).map_err(|e| steps.clone().fail("lock", e, false))?;
     let mut previous = load(ctx)?;
@@ -972,7 +976,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         checks,
         steps: steps.0,
         reaped,
-        warnings,
+        warnings: gc_warnings.into_iter().chain(warnings).collect(),
     })
 }
 
@@ -4075,65 +4079,57 @@ impl From<String> for Unconfirmed {
 
 /// Reclaim sessions whose lease expired or whose project directory is gone.
 pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
-    let dir = state.join("sessions");
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let indexed: Session = read_json(&path)?;
-        let ctx = Ctx {
-            root: indexed.project.clone(),
-            cache: PathBuf::new(),
-            state: state.to_path_buf(),
-        };
-        let _guard = project_lock(state, &ctx.root)?;
-        // Re-read after locking: another command may have renewed or replaced this generation.
-        if !path.exists() {
-            continue;
-        }
-        let mut session: Session = read_json(&path)?;
-        let consumed = reconcile_executions(state, &ctx.root, &mut session);
-        // Saved only for a project still there: a save would recreate a deleted checkout's
-        // `.stack/`. A gone project's completion records go with its index.
-        if !consumed.is_empty() && project_gone(&session).is_none() {
-            save(&ctx, &session)?;
-            forget_completions(&consumed);
-        }
-        // TTL describes idle time; an executing command is not idle. Owner death still
-        // follows the explicit runner policy even if one of its commands has survived.
-        let owner_dead = session
-            .lease
-            .as_ref()
-            .and_then(|l| l.owner_pid)
-            .is_some_and(|p| !pid_alive(p));
-        let busy = !owner_dead && has_active_executions(&session);
-        if let Some(reason) = project_gone(&session) {
-            if !busy {
-                out.push(reclaim_gone(state, &path, session, reason));
-            }
-            continue;
-        }
-        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
-            continue;
-        };
-        if busy {
-            continue;
-        }
-        let result = down_locked(&ctx, None, None);
-        out.push(GcEntry {
-            project: session.project,
-            reason,
-            stopped: result.is_ok(),
-            error: result.err().map(|e| e.to_string()),
-            services: Vec::new(),
-        });
+    gc_pass::gc_with(state, &GcOptions::default()).map(|pass| pass.reclaimed)
+}
+
+/// The locked part of GC for one indexed session at `path`: re-read it, settle executions,
+/// and reclaim it if it is still expired or its project gone. The caller holds the lock.
+fn gc_locked(state: &Path, path: &Path) -> Result<Option<GcEntry>> {
+    // Re-read after locking: another command may have renewed or replaced this generation.
+    if !path.exists() {
+        return Ok(None);
     }
-    Ok(out)
+    let mut session: Session = read_json(path)?;
+    let ctx = Ctx {
+        root: session.project.clone(),
+        cache: PathBuf::new(),
+        state: state.to_path_buf(),
+    };
+    let consumed = reconcile_executions(state, &ctx.root, &mut session);
+    // Saved only for a project still there: a save would recreate a deleted checkout's
+    // `.stack/`. A gone project's completion records go with its index.
+    if !consumed.is_empty() && project_gone(&session).is_none() {
+        save(&ctx, &session)?;
+        forget_completions(&consumed);
+    }
+    // TTL describes idle time; an executing command is not idle. Owner death still
+    // follows the explicit runner policy even if one of its commands has survived.
+    let owner_dead = session
+        .lease
+        .as_ref()
+        .and_then(|l| l.owner_pid)
+        .is_some_and(|p| !pid_alive(p));
+    let busy = !owner_dead && has_active_executions(&session);
+    if let Some(reason) = project_gone(&session) {
+        if busy {
+            return Ok(None);
+        }
+        return Ok(Some(reclaim_gone(state, path, session, reason)));
+    }
+    let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
+        return Ok(None);
+    };
+    if busy {
+        return Ok(None);
+    }
+    let result = down_locked(&ctx, None, None);
+    Ok(Some(GcEntry {
+        project: session.project,
+        reason,
+        stopped: result.is_ok(),
+        error: result.err().map(|e| e.to_string()),
+        services: Vec::new(),
+    }))
 }
 
 /// What a deleted checkout leaves once no session record of it is left (after `down`, or once

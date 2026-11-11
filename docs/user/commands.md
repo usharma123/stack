@@ -93,6 +93,11 @@ load code you edited use `restart`.
   fails with `port_conflict`, naming the port and, where it can, the program. Run
   `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never
   reassigns ports on its own.
+- **Other checkouts.** `up` first reclaims expired sessions and those of deleted checkouts,
+  machine-wide, but never waits for another checkout: a session another command holds locked
+  (a long `up` in another worktree, say) is skipped and listed under the `gc` step's
+  `skipped`. A problem reclaiming someone else's session never fails `up`: the `gc` step
+  becomes a `warning` and the message is added to `warnings`.
 - **Postgres encoding.** A new Postgres cluster is created `UTF8` with locale `C.UTF-8`
   (code-point collation), whatever locale the shell running `up` has, so CI, `env -i` and
   containers get the same database as a laptop. A locale set in the project's `[env]` reaches
@@ -264,6 +269,9 @@ Stops sessions whose lease expired. For a checkout that was deleted, it drops th
 once its services are confirmed stopped. `--watch` repeats every `--interval` until stopped (with `--json`, one object per
 pass). Stack installs no background service, so run `gc --watch` under systemd, launchd or
 your agent runner if you want unattended cleanup.
+
+`gc` decides from each session's record which ones look expired or belong to a deleted
+checkout, and locks only those. If another command holds one of them, `gc` waits for it.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once. Its services'

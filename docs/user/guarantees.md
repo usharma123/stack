@@ -32,7 +32,8 @@
   needs one restart after its first task edit.
 - **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
-  them. For a deleted checkout, `gc` never stops anything itself, because Pitchfork cannot
+  them. The pass in `up` never waits for, or fails because of, another checkout. For a deleted
+  checkout, `gc` never stops anything itself, because Pitchfork cannot
   check and stop a process in one step. It drops the record once the services are confirmed
   stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop them.
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was

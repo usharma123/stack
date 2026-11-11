@@ -16,6 +16,9 @@ Stopping first matters. Stack will not stop a deleted checkout's services by nam
 checkout removed while its services run leaves them running until you stop them yourself
 (see [`gc`](commands.md#gc)).
 
+Checkouts do not wait on each other: the cleanup pass at the start of `stack up` skips any
+other checkout's session that another command holds, and never fails because of one.
+
 `stack down` keeps the checkout's service data, in case the checkout comes back. To remove it
 in the same step, use `stack down --purge` in the remove hook (see [`down`](commands.md#down)).
 

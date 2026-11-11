@@ -74,6 +74,16 @@ impl FileLock {
             }
         }
     }
+
+    /// Take the lock only if nobody holds it: `None` while another process does.
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = open_lock(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+            Err(e) => Err(io_error(path.display(), e)),
+        }
+    }
 }
 
 /// A lock that many holders may share, and one holder may take alone (see [`SharedLock`]).
@@ -168,11 +178,16 @@ fn still_at(file: &File, path: &Path) -> bool {
 
 /// Serialize compile and lifecycle changes for this project, outside its mutable directory.
 pub fn project_lock(state: &Path, root: &Path) -> Result<FileLock> {
-    FileLock::acquire(
-        &state
-            .join("projects")
-            .join(format!("{}.lock", project_key(root))),
-    )
+    FileLock::acquire(&project_lock_path(state, root))
+}
+
+/// [`project_lock`] without waiting: `None` while another command holds it.
+pub fn project_try_lock(state: &Path, root: &Path) -> Result<Option<FileLock>> {
+    FileLock::try_acquire(&project_lock_path(state, root))
+}
+
+fn project_lock_path(state: &Path, root: &Path) -> PathBuf {
+    state.join("projects").join(format!("{}.lock", project_key(root)))
 }
 
 pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
@@ -254,6 +269,25 @@ mod tests {
         let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
         assert!(!run.timed_out, "{name} did not finish within 60s\n{shown}");
         assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "{shown}");
+    }
+
+    #[test]
+    fn a_held_lock_is_not_taken_by_try_acquire() {
+        passes_alone("try_acquire_never_takes_a_held_lock");
+    }
+
+    #[test]
+    #[ignore = "run by a_held_lock_is_not_taken_by_try_acquire"]
+    fn try_acquire_never_takes_a_held_lock() {
+        if std::env::var_os(ALONE).is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects/x.lock");
+        let held = FileLock::acquire(&path).unwrap();
+        assert!(FileLock::try_acquire(&path).unwrap().is_none());
+        drop(held);
+        assert!(FileLock::try_acquire(&path).unwrap().is_some());
     }
 
     #[test]

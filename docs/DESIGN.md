@@ -134,6 +134,11 @@ output (mise's answer when no release matches) is an error, not a version.
   Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.
+- **GC passes.** A pass reads each machine index entry without its lock and locks only
+  candidates (an expired lease, or a gone project); everything is checked again under the
+  lock. The pass at the start of `up` try-locks: a busy candidate is skipped and reported, and
+  any failure becomes a warning of the `gc` step, so one checkout's `up` never waits on or
+  fails because of another's. Standalone `gc` waits for busy candidates.
   Commands register active executions under the lifecycle lock and renew on completion. A
   command that cannot retake the lock within a second leaves an atomic completion record
   (session, token, PID) instead; the next lifecycle operation applies it, but only once it has
