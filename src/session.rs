@@ -878,6 +878,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     // Nothing can start on a port a foreign program holds, and the supervisor's own error
     // would come after the attempt. Stack's own daemons still running (an unchanged
     // generation) are not conflicts.
+    // The supervisor's listing, asked once for the port check and the launch record: nothing
+    // between them starts or stops a daemon it tracks.
+    let mut listed = None;
     if !report.stack.services.is_empty() {
         let statuses = match mise::daemons(&ctx.root) {
             Ok(s) => s,
@@ -917,6 +920,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 Ok(detail) => steps.ok("restore_snapshot", detail),
                 Err(e) => return Err(steps.fail("restore_snapshot", e, false)),
             }
+        }
+        // Stopping this checkout's untracked processes can change what the supervisor says
+        // about the daemons they belonged to: asked again then.
+        if mine.is_empty() {
+            listed = Some(statuses);
         }
     }
 
@@ -971,7 +979,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         }
         let supervisor = addressed.as_deref().expect("services have a known supervisor (preflight)");
         // Capture qualified IDs before launch when available, including interrupted starts.
-        let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        let before = match listed.take() {
+            Some(statuses) => statuses,
+            None => mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?,
+        };
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         let names: Vec<String> = report.stack.services.keys().cloned().collect();
         // A service still running whose dependency is about to start again (it died, or never
