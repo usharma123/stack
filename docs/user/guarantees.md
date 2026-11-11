@@ -33,9 +33,12 @@
 - **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
   them. The pass in `up` never waits for, or fails because of, another checkout. For a deleted
-  checkout, `gc` never stops anything itself, because Pitchfork cannot
+  checkout, `gc` by default never stops anything itself, because Pitchfork cannot
   check and stop a process in one step. It drops the record once the services are confirmed
-  stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop them.
+  stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop them. With
+  `--stop-orphans` it stops a service only when its supervisor id, pid, port and process start
+  time all still match the record; the race that leaves is documented under
+  [stopping orphans](commands.md#stopping-orphans).
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was
   granted. Values never enter `stack.lock`, generated config, session records or logs, and
   are redacted from output captured with `--json` or MCP. Terminal output is not redacted, and

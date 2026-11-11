@@ -296,8 +296,13 @@ output (mise's answer when no release matches) is an error, not a version.
   reuse after deletion; older records and filesystems without creation times retain device/inode
   checks. When the directory is gone, or a different directory now has its path, GC asks Pitchfork
   (`pitchfork status --json <id>`, which reads its state without starting a supervisor).
-  Pitchfork does not provide atomic compare-and-stop, so GC never issues a separate stop by
-  daemon name for a gone project, even when PID and port match. Live, unknown, transitional,
+  Pitchfork does not provide atomic compare-and-stop, so by default GC never issues a separate
+  stop by daemon name for a gone project, even when PID and port match. `gc --stop-orphans` is
+  the explicit opt-in: where PID and port match it also requires the live process's start time
+  to fall within [recorded start − 2 s, recorded start + 10 min] (unreadable or unrecorded is a
+  refusal), queries the supervisor again, then stops the id and waits for the PID to exit and
+  the port to close. The window between that last query and the stop remains: a daemon
+  restarted under the same id in it (a new checkout at the same path) is the one stopped. Live, unknown, transitional,
   retrying and incomplete-launch states retain the record and return `gc_incomplete`.
   A confirmed stopped daemon with no live recorded PID, or a missing daemon after a completed
   launch and dead recorded PID, permits release. Unrelated listeners remain untouched.

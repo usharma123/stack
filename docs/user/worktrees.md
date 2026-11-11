@@ -13,8 +13,9 @@ should call it from their hooks:
   reported, so a checkout removed by mistake loses nothing until you ask.
 
 Stopping first matters. Stack will not stop a deleted checkout's services by name, so a
-checkout removed while its services run leaves them running until you stop them yourself
-(see [`gc`](commands.md#gc)).
+checkout removed while its services run leaves them running until you stop them yourself, or
+until `stack gc --stop-orphans` confirms each one is still the recorded process and stops it
+(see [`gc`](commands.md#gc) and [stopping orphans](commands.md#stopping-orphans)).
 
 Checkouts do not wait on each other: the cleanup pass at the start of `stack up` skips any
 other checkout's session that another command holds, and never fails because of one. Run

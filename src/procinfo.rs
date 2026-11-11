@@ -22,6 +22,12 @@ impl Process {
     pub fn current(&self) -> Option<Process> {
         process(self.pid).filter(|now| now.same(self))
     }
+
+    /// When it started, in Unix milliseconds: exact on macOS; on Linux derived from the boot
+    /// time, which the kernel reports in whole seconds, so up to a second early.
+    pub fn started_unix_ms(&self) -> Option<u64> {
+        imp::started_unix_ms(self.started)
+    }
 }
 
 /// The process `pid` now. A zombie (exited, not yet reaped) is no process.
@@ -94,6 +100,11 @@ mod imp {
             group: info.pbi_pgid,
             started: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
         })
+    }
+
+    /// `started` is microseconds since the epoch.
+    pub fn started_unix_ms(started: u64) -> Option<u64> {
+        Some(started / 1000)
     }
 
     /// `KERN_PROCARGS2`: argc, the executable path, padding, the arguments, then the environment,
@@ -169,6 +180,14 @@ mod imp {
         let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
         Some(bytes.split(|b| *b == 0).filter(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
     }
+
+    /// `started` is clock ticks after boot; the boot time (`btime`) is whole seconds.
+    pub fn started_unix_ms(started: u64) -> Option<u64> {
+        let boot: u64 = std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
+        // SAFETY: sysconf has no preconditions.
+        let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|h| *h > 0)?;
+        Some(boot * 1000 + started * 1000 / hz)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -184,6 +203,10 @@ mod imp {
     }
 
     pub fn environ(_: u32) -> Option<Vec<Vec<u8>>> {
+        None
+    }
+
+    pub fn started_unix_ms(_: u64) -> Option<u64> {
         None
     }
 }
@@ -230,6 +253,19 @@ mod tests {
         let mut odd = 1i32.to_ne_bytes().to_vec();
         odd.extend_from_slice(b"/bin/x\0zx\0A=1\0\0");
         assert_eq!(imp::parse_procargs(&odd), None);
+    }
+
+    #[test]
+    fn a_child_started_now_has_a_start_time_now() {
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let before = now();
+        let mut child = child();
+        let started = process(child.id()).and_then(|p| p.started_unix_ms());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let started = started.expect("start time readable");
+        // Linux rounds the boot time down to the second.
+        assert!(started + 1500 >= before && started <= now(), "{started} vs {before}");
     }
 
     #[test]

@@ -1,12 +1,15 @@
 //! How a GC pass chooses what to lock, so that one checkout's `up` never waits on, or fails
-//! because of, another checkout, and what `gc --dry-run` reports.
+//! because of, another checkout, what `gc --dry-run` reports, and the opt-in stop of a deleted
+//! checkout's services (`gc --stop-orphans`).
 
-use super::{gc_locked, index_path, project_gone, GcEntry, Session, Steps};
+use super::{accepting, gc_locked, index_path, project_gone, GcEntry, ProviderRecord, ServiceRecord, Session, Steps, Unconfirmed, STOP_TIMEOUT};
 use crate::error::Result;
-use crate::state::{now, pid_alive, project_lock, project_try_lock, read_json};
+use crate::provider::mise;
+use crate::state::{now, pid_alive, project_lock, project_try_lock, read_json, rfc3339};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// How a GC pass treats other projects.
 #[derive(Debug, Clone, Copy, Default)]
@@ -14,6 +17,8 @@ pub struct GcOptions {
     /// The pass `up` runs first: never wait for another project's lock (a busy candidate is
     /// skipped and reported), and never fail (problems become warnings).
     pub background: bool,
+    /// Stop a deleted checkout's service when every recorded fact still matches it.
+    pub stop_orphans: bool,
 }
 
 /// What one pass did.
@@ -78,7 +83,7 @@ pub fn gc_with(state: &Path, opts: &GcOptions) -> Result<GcPass> {
             } else {
                 project_lock(state, &indexed.project)?
             };
-            if let Some(entry) = gc_locked(state, &path)? {
+            if let Some(entry) = gc_locked(state, &path, opts.stop_orphans)? {
                 if opts.background && !entry.stopped {
                     pass.warnings.push(format!(
                         "{}: {} but not confirmed stopped ({}); run `stack gc` for details",
@@ -105,7 +110,7 @@ pub fn gc_with(state: &Path, opts: &GcOptions) -> Result<GcPass> {
 /// what it skipped when anything was busy); returns what it reclaimed and the warnings for
 /// the result.
 pub(super) fn before_up(state: &Path, steps: &mut Steps) -> (Vec<GcEntry>, Vec<String>) {
-    let pass = gc_with(state, &GcOptions { background: true }).unwrap_or_else(|e| GcPass {
+    let pass = gc_with(state, &GcOptions { background: true, stop_orphans: false }).unwrap_or_else(|e| GcPass {
         warnings: vec![e.to_string()],
         ..GcPass::default()
     });
@@ -262,4 +267,96 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
         deleted[i].data.extend(data);
     }
     Ok(GcDryRun { dry_run: true, would_reclaim: planned, deleted_checkouts: deleted, warnings })
+}
+
+/// How long before the recorded start a process may appear to have started: the recorded
+/// time is taken just before the supervisor's start call, and Linux reports boot time in
+/// whole seconds.
+const START_SLACK_BEFORE: Duration = Duration::from_secs(2);
+/// How long after the recorded start the process may have started: the supervisor's start
+/// call, which spawns it, runs within the default startup timeout.
+const START_SLACK_AFTER: Duration = super::DEFAULT_STARTUP_TIMEOUT;
+
+/// Whether a process that started at `actual` (Unix ms) can be the one recorded as started
+/// at `recorded`.
+fn start_matches(recorded: u64, actual: u64) -> bool {
+    actual.saturating_add(START_SLACK_BEFORE.as_millis() as u64) >= recorded
+        && actual <= recorded.saturating_add(START_SLACK_AFTER.as_millis() as u64)
+}
+
+/// `gc --stop-orphans` for a deleted checkout's service whose supervisor still reports the
+/// recorded id, pid and port (`refused` says so, with its recovery commands). Stops it only
+/// when the live process's start time also matches the recorded one and a second supervisor
+/// query, just before the stop, still reports the same id, pid and port. Then waits until the
+/// pid is gone and the port closed. Anything else keeps the record, as without the flag.
+pub(super) fn stop_orphan(provider: Option<&ProviderRecord>, record: &ServiceRecord, refused: Unconfirmed) -> std::result::Result<String, Unconfirmed> {
+    let Unconfirmed { recovery, .. } = refused;
+    let keep = |why: String| Unconfirmed { why: format!("--stop-orphans: {why}; not signalled"), recovery: recovery.clone() };
+    let (Some(provider), Some(id), Some(pid)) = (provider, record.provider_id.as_deref(), record.pid) else {
+        return Err(keep("the record names no supervisor, id or pid".into()));
+    };
+    let Some(recorded) = record.started_at_ms else {
+        return Err(keep(format!("no start time was recorded for pid {pid} (a record from before Stack 0.1.18)")));
+    };
+    let Some(actual) = crate::procinfo::process(pid).and_then(|p| p.started_unix_ms()) else {
+        return Err(keep(format!("the start time of pid {pid} cannot be read")));
+    };
+    if !start_matches(recorded, actual) {
+        return Err(keep(format!(
+            "pid {pid} started at {}, not when the record says ({}): the pid may have been reused",
+            rfc3339(actual / 1000),
+            rfc3339(recorded / 1000)
+        )));
+    }
+    match mise::supervised(&provider.pitchfork, &provider.state_dir, id) {
+        Ok(mise::Supervised::Found { status, pid: Some(now), port: Some(port) }) if status == "running" && now == pid && port == record.port => {}
+        Ok(other) => return Err(keep(format!("{id} changed before the stop ({other:?})"))),
+        Err(e) => return Err(keep(e)),
+    }
+    if let Err(e) = mise::stop_supervised(&provider.pitchfork, &provider.state_dir, id) {
+        return Err(Unconfirmed { why: format!("--stop-orphans: {e}"), recovery });
+    }
+    let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
+    loop {
+        let alive = pid_alive(pid);
+        let listening = record.port != 0 && accepting(record.port);
+        if !alive && !listening {
+            return Ok(format!(
+                "stopped by --stop-orphans: supervisor id {id}, pid {pid}, port {} and start time matched the record",
+                record.port
+            ));
+        }
+        if Instant::now() >= deadline {
+            let what = if alive { format!("pid {pid} is still alive") } else { format!("port {} still accepts connections", record.port) };
+            return Err(Unconfirmed { why: format!("--stop-orphans asked the supervisor to stop {id}, but {what}"), recovery });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// What the `gc_incomplete` hint adds when some service could be stopped with `--stop-orphans`.
+pub(super) fn stop_orphans_hint(entries: &[GcEntry]) -> Option<&'static str> {
+    entries
+        .iter()
+        .flat_map(|e| e.services.iter())
+        .any(|s| s.recovery.as_ref().is_some_and(|r| r.stop.is_some()))
+        .then_some(
+            "or run `stack gc --stop-orphans`, which stops such a service itself only while its supervisor id, pid, \
+             port and process start time all still match the record",
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_time_matches_only_near_the_recorded_launch() {
+        let at = 1_000_000_000u64;
+        assert!(start_matches(at, at));
+        assert!(start_matches(at, at - 1500), "boot-time rounding");
+        assert!(start_matches(at, at + 60_000), "spawned during the start call");
+        assert!(!start_matches(at, at - 5000), "started before the launch: a reused pid");
+        assert!(!start_matches(at, at + 3_600_000), "started an hour later: a restart");
+    }
 }

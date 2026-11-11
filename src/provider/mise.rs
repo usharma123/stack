@@ -1382,6 +1382,17 @@ pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result
     })
 }
 
+/// `pitchfork stop -- <id>` against the recorded supervisor state directory. Pitchfork stops
+/// whatever runs under the id when it receives the request; the caller checks first.
+pub fn stop_supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<(), String> {
+    let out = pitchfork(bin, state_dir, &["stop", "--", id])?;
+    if out.exit_code == Some(0) {
+        return Ok(());
+    }
+    let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+    Err(format!("pitchfork stop {id}: {err}"))
+}
+
 /// `pitchfork status --json <id>`, which reads the supervisor's state and starts none: what it
 /// says about `id`, or `None` when it knows no such daemon.
 fn status_json(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<Option<serde_json::Value>, String> {

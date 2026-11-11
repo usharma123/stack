@@ -312,3 +312,134 @@ fn gc_dry_run_reports_what_would_be_reclaimed_and_changes_nothing() {
     assert_eq!(results[0]["data"]["would_reclaim"][0]["action"], "stop", "{}", results[0]);
     assert_eq!(before, state_files(), "a dry run over MCP changed a record");
 }
+
+// ---- gc --stop-orphans -------------------------------------------------------------------
+
+const WEB: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\n";
+const WEB_ID: &str = "app-0123456789abcdef/web";
+
+/// A detached process standing in for a supervised service, killed when dropped.
+struct Detached(u32);
+
+impl Detached {
+    fn spawn() -> Self {
+        let out = Command::new("sh").args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"]).output().unwrap();
+        Self(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap())
+    }
+
+    fn alive(&self) -> bool {
+        Command::new("kill").args(["-0", &self.0.to_string()]).stderr(Stdio::null()).status().unwrap().success()
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").arg(self.0.to_string()).stderr(Stdio::null()).status();
+    }
+}
+
+struct Running {
+    service: Detached,
+    port: u16,
+    listener: Option<std::net::TcpListener>,
+}
+
+impl Fixture {
+    /// `stack up` of one supervised service that is really running and listening.
+    fn start_web(&self) -> Running {
+        let inspect = json_result(&self.ok(&["inspect", "--json"]));
+        let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+        let service = Detached::spawn();
+        fs::write(
+            self.path("daemons-started.json"),
+            json!([{ "id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
+        )
+        .unwrap();
+        let up = self.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.path("started").exists() {
+            assert!(Instant::now() < deadline, "provider start never ran");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let out = up.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        Running { service, port, listener: Some(listener) }
+    }
+
+    /// What the supervisor says it tracks under the recorded id, and what `stop` kills.
+    fn supervisor_tracks(&self, pid: u32, port: u16) {
+        fs::write(self.path("pf-status.json"), json!({ "id": WEB_ID, "status": "running", "pid": pid, "active_port": port }).to_string()).unwrap();
+        fs::write(self.path("pf-tracked-pid"), pid.to_string()).unwrap();
+    }
+
+    fn pitchfork_log(&self) -> String {
+        fs::read_to_string(self.path("pitchfork.log")).unwrap_or_default()
+    }
+
+    /// Rewrite the index record of a checkout whose directory is gone.
+    fn edit_index(&self, edit: impl Fn(&mut Value)) {
+        for path in self.index_files() {
+            let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            edit(&mut session);
+            fs::write(&path, session.to_string()).unwrap();
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn stop_orphans_stops_a_deleted_checkouts_service_only_when_every_recorded_fact_matches() {
+    let fixture = Fixture::with_bundle(WEB);
+    let mut running = fixture.start_web();
+    let pid = running.service.0;
+    let started = stack::procinfo::process(pid).and_then(|p| p.started_unix_ms()).expect("start time readable");
+    fixture.supervisor_tracks(pid, running.port);
+    fs::remove_dir_all(fixture.path("app")).unwrap();
+
+    // Without the flag nothing changes, and the hint names it.
+    let (ok, result) = fixture.gc(&[]);
+    assert!(!ok && result["error"]["code"] == "gc_incomplete", "{result}");
+    assert!(result["error"]["hint"].as_str().unwrap().contains("stack gc --stop-orphans"), "{result}");
+    assert!(running.service.alive());
+
+    for (case, recorded) in [("an hour later", Some(started + 3_600_000)), ("an hour earlier", Some(started - 3_600_000)), ("unrecorded", None)] {
+        fixture.edit_index(|s| s["services"]["web"]["started_at_ms"] = json!(recorded));
+        let (ok, result) = fixture.gc(&["--stop-orphans"]);
+        assert!(!ok && result["error"]["code"] == "gc_incomplete", "{case}: {result}");
+        let error = result["error"]["details"][0]["services"][0]["error"].as_str().unwrap();
+        assert!(error.contains("--stop-orphans") && error.contains("not signalled"), "{case}: {error}");
+        assert!(result["error"]["details"][0]["services"][0]["recovery"]["stop"].is_string(), "{case}: {result}");
+        assert!(running.service.alive(), "{case}: signalled");
+        assert!(!fixture.pitchfork_log().contains(" stop "), "{case}");
+    }
+
+    fixture.edit_index(|s| s["services"]["web"]["started_at_ms"] = json!(started));
+    // The service's port closes with it.
+    drop(running.listener.take());
+    let (ok, result) = fixture.gc(&["--stop-orphans"]);
+    assert!(ok, "{result}");
+    let outcome = result["data"][0]["services"][0]["outcome"].as_str().unwrap();
+    assert!(outcome.contains("stopped by --stop-orphans"), "{outcome}");
+    assert!(!running.service.alive(), "the matching service was not stopped");
+    assert!(fixture.index_files().is_empty(), "record kept after a confirmed stop");
+    assert!(fixture.pitchfork_log().lines().any(|l| l.ends_with(&format!("stop -- {WEB_ID}"))), "{}", fixture.pitchfork_log());
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn stop_orphans_never_stops_a_service_whose_supervisor_reports_another_pid() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web();
+    let other = Detached::spawn();
+    fixture.supervisor_tracks(other.0, running.port);
+    fs::remove_dir_all(fixture.path("app")).unwrap();
+    let (ok, result) = fixture.gc(&["--stop-orphans"]);
+    assert!(!ok && result["error"]["code"] == "gc_incomplete", "{result}");
+    assert!(running.service.alive() && other.alive());
+    assert!(!fixture.pitchfork_log().contains(" stop "));
+    let (ok, result) = fixture.gc(&["--dry-run", "--stop-orphans"]);
+    assert!(!ok && result["error"]["code"] == "usage", "{result}");
+    let results = fixture.mcp(&[("stack_gc", json!({ "dry_run": true, "stop_orphans": true, "dir": null }))]);
+    assert_eq!(results[0]["error"]["code"], "usage", "{}", results[0]);
+}

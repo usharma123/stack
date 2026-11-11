@@ -175,8 +175,12 @@ enum Cmd {
         reclaim_data: bool,
         /// Show what would be reclaimed (sessions, and the ports and data of deleted checkouts)
         /// and change nothing
-        #[arg(long, conflicts_with = "watch")]
+        #[arg(long, conflicts_with_all = ["watch", "stop_orphans"])]
         dry_run: bool,
+        /// Also stop a deleted checkout's service when its supervisor id, pid, port and process
+        /// start time all still match the record (see `stack gc` in the docs for the remaining race)
+        #[arg(long)]
+        stop_orphans: bool,
     },
     /// List every checkout Stack has records for on this machine (read-only, liveness checks only)
     Ps {
@@ -395,9 +399,11 @@ fn main() -> ExitCode {
             })
         }),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc { watch: true, interval, max_passes, reclaim_data, .. } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data),
+        Cmd::Gc { watch: true, interval, max_passes, reclaim_data, stop_orphans, .. } => {
+            gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data, *stop_orphans)
+        }
         Cmd::Gc { dry_run: true, reclaim_data, .. } => session::gc_plan(&ctx.state, *reclaim_data).map(|r| emit(cli.json, &r, || print_gc_plan(&r))),
-        Cmd::Gc { reclaim_data, .. } => session::gc_checked(&ctx.state, *reclaim_data).map(|r| {
+        Cmd::Gc { reclaim_data, stop_orphans, .. } => session::gc_checked(&ctx.state, *reclaim_data, *stop_orphans).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
         Cmd::Ps { no_size } => stack::fleet::ps(&ctx.state, !*no_size).map(|r| emit(cli.json, &r, || stack::fleet::print_ps(&r))),
@@ -514,7 +520,7 @@ fn print_gc(entries: &[session::GcEntry]) {
 /// Foreground periodic collection. Each pass is reported as it completes (one JSON object per
 /// line with --json). A failing pass is reported and retried at the next interval; the exit
 /// code after --max-passes reflects the last pass.
-fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>, reclaim_data: bool) -> Result<ExitCode> {
+fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>, reclaim_data: bool, stop_orphans: bool) -> Result<ExitCode> {
     let interval = interval.map(parse_duration).transpose()?.unwrap_or(60);
     if interval == 0 {
         return Err(StackError::new("usage", "--interval must be at least 1s"));
@@ -522,7 +528,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
     let mut pass = 0u64;
     loop {
         pass += 1;
-        let result = session::gc_checked(state, reclaim_data);
+        let result = session::gc_checked(state, reclaim_data, stop_orphans);
         let ok = result.is_ok();
         if as_json {
             let line = match &result {

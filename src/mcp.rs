@@ -90,6 +90,7 @@ const CONFLICTS: &[(&str, &str, &str)] = &[
     ("stack_restart", "timeout", "timeout_secs"),
     ("stack_exec", "timeout", "timeout_secs"),
     ("stack_run", "timeout", "timeout_secs"),
+    ("stack_gc", "dry_run", "stop_orphans"),
 ];
 
 /// Check a call's arguments against the tool's advertised `inputSchema` before anything else
@@ -356,6 +357,7 @@ fn tool_definitions() -> Value {
             "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. dry_run only reports. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
             machine_wide_schema(json!({
                 "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
+                "stop_orphans": { "type": "boolean", "description": "Also stop a deleted checkout's service where gc would offer recovery.stop, only when its supervisor id, pid, port and process start time all still match the record (Pitchfork cannot compare and stop in one step: a daemon restarted under the same id at that moment would be stopped)" },
                 "dry_run": { "type": "boolean", "description": "Change nothing and take no lock: report what would be reclaimed (would_reclaim: session, project, reason, action, services) and what deleted checkouts would release (deleted_checkouts: ports, and data with action remove_if_safe under reclaim_data, else report)" }
             }), &[], REPORTED_DIR)),
         tool("stack_ps", "List checkouts", annotations("List checkouts", true, None, true, false),
@@ -549,7 +551,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_renew" => session::renew(ctx).map(to_value),
         "stack_down" => session::down_purging(ctx, args["stop_supervisor"] != false, args["purge"] == true).map(to_value),
         "stack_gc" if args["dry_run"] == true => session::gc_plan(&ctx.state, args["reclaim_data"] == true).map(to_value),
-        "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
+        "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true, args["stop_orphans"] == true).map(to_value),
         "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
         "stack_mv" => {
             // Never resolved against the server's working directory, like `dir`.

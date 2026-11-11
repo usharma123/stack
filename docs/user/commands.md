@@ -15,7 +15,7 @@
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew` | Renew this session's lease |
-| `stack gc [--reclaim-data] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
+| `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
@@ -309,7 +309,31 @@ When it cannot confirm that a deleted checkout's service stopped, `gc` fails wit
 `gc_incomplete` and keeps the record. Each such service comes with `recovery.inspect`, a
 command that shows the recorded process, and sometimes `recovery.stop`. Run inspect first,
 stop only if the PID still matches, then run `gc` again. The two steps are not atomic, which
-is why Stack does not do this for you.
+is why Stack does not do this for you by default.
+
+### Stopping orphans
+
+`gc --stop-orphans` opts in to stopping such a service itself. It acts only where `gc` would
+offer `recovery.stop`, and only when every recorded fact still matches:
+
+1. the supervisor (asked by its recorded binary and state directory) reports the recorded
+   daemon id as `running`, with the recorded pid and port;
+2. the live process with that pid started when the record says: no earlier than 2 seconds
+   before the recorded start (`started_at_ms`, taken just before the supervisor's start call)
+   and no later than 10 minutes after it. Records without a start time (from before Stack
+   0.1.18), and processes whose start time cannot be read, are refused;
+3. a second supervisor query, made after the start-time check, still reports the same id,
+   pid and port.
+
+Then it asks the supervisor to stop that id and waits until the pid is gone and the port
+closed. Anything else keeps the record and reports why, as without the flag. It cannot be
+combined with `--dry-run`.
+
+The remaining race: Pitchfork cannot compare and stop in one step, so it stops whatever runs
+under the id when the stop arrives. If, in the moment between the last check and the stop,
+the daemon is restarted under the same id (for example by a new checkout created at the same
+path running `stack up`), that new process is the one stopped. Do not use `--stop-orphans`
+while something may be starting services at a deleted checkout's path.
 
 ## ps
 

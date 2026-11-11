@@ -30,6 +30,23 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Unix seconds as an RFC 3339 UTC timestamp, such as `2026-11-10T14:03:00Z`.
+pub fn rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
 /// Short stable key for a project directory.
 pub fn project_key(root: &Path) -> String {
     sha256_hex(root.to_string_lossy().as_bytes())[..16].to_string()
@@ -269,6 +286,14 @@ mod tests {
         let shown = format!("stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
         assert!(!run.timed_out, "{name} did not finish within 60s\n{shown}");
         assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "{shown}");
+    }
+
+    #[test]
+    fn timestamps_are_rfc3339_utc() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339(1_794_405_780), "2026-11-11T14:03:00Z");
+        assert_eq!(rfc3339(4_102_444_799), "2099-12-31T23:59:59Z");
     }
 
     #[test]

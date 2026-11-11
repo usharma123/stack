@@ -4051,7 +4051,7 @@ pub struct GcService {
 
 /// Commands a person runs to finish what GC refused to do itself. They are POSIX shell
 /// commands with every recorded value quoted, so they can be copied as they are.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Recovery {
     /// Shows what runs now: under the recorded supervisor id, or as the recorded pid.
     pub inspect: String,
@@ -4084,7 +4084,7 @@ pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
 
 /// The locked part of GC for one indexed session at `path`: re-read it, settle executions,
 /// and reclaim it if it is still expired or its project gone. The caller holds the lock.
-fn gc_locked(state: &Path, path: &Path) -> Result<Option<GcEntry>> {
+fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcEntry>> {
     // Re-read after locking: another command may have renewed or replaced this generation.
     if !path.exists() {
         return Ok(None);
@@ -4114,7 +4114,7 @@ fn gc_locked(state: &Path, path: &Path) -> Result<Option<GcEntry>> {
         if busy {
             return Ok(None);
         }
-        return Ok(Some(reclaim_gone(state, path, session, reason)));
+        return Ok(Some(reclaim_gone(state, path, session, reason, stop_orphans)));
     }
     let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
         return Ok(None);
@@ -4269,12 +4269,20 @@ fn project_gone(session: &Session) -> Option<&'static str> {
 /// Reconcile a gone project without signalling a daemon whose identity can be replaced.
 /// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
 /// their ownership record. Only confirmed terminal state permits releasing the record.
-fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str) -> GcEntry {
+/// `stop_orphans` (`gc --stop-orphans`) stops a service only where a person would be offered
+/// `recovery.stop`, and only once its start time also matches (see [`gc_pass::stop_orphan`]).
+fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str, stop_orphans: bool) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
         let service = name.clone();
-        match reconcile_gone(session.provider.as_ref(), record, session.launching) {
+        let reconciled = match reconcile_gone(session.provider.as_ref(), record, session.launching) {
+            Err(refused) if stop_orphans && refused.recovery.as_ref().is_some_and(|r| r.stop.is_some()) => {
+                gc_pass::stop_orphan(session.provider.as_ref(), record, refused)
+            }
+            other => other,
+        };
+        match reconciled {
             Ok(outcome) => services.push(GcService { service, outcome: Some(outcome), error: None, recovery: None }),
             Err(Unconfirmed { why, recovery }) => {
                 problems.push(format!("{name}: {why}"));
@@ -4412,8 +4420,10 @@ fn recovery_steps(entries: &[GcEntry]) -> Vec<String> {
 /// be confirmed stopped. Ownership records are kept for a retry. Then what deleted checkouts
 /// with no session record left behind (see [`reclaim_deleted`]): their port reservations are
 /// released, and their data reported, or removed with `remove_data`.
-pub fn gc_checked(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
-    let mut entries = gc(state)?;
+/// With `stop_orphans`, a deleted checkout's service is stopped when every recorded fact still
+/// matches it (see [`gc_pass::stop_orphan`]).
+pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result<Vec<GcEntry>> {
+    let mut entries = gc_with(state, &GcOptions { stop_orphans, ..GcOptions::default() })?.reclaimed;
     entries.extend(reclaim_deleted(state, remove_data)?);
     let failed = entries.iter().filter(|e| !e.stopped).count();
     if failed == 0 {
@@ -4432,10 +4442,11 @@ fn gc_hint(entries: &[GcEntry]) -> String {
     if steps.is_empty() {
         return "retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed".into();
     }
+    let orphans = gc_pass::stop_orphans_hint(entries).map(|h| format!("; {h}")).unwrap_or_default();
     format!(
         "services of a deleted or replaced checkout are never stopped by name. For each service below, run \
          the inspect command; run the stop command, where offered, only if inspect shows the recorded pid. \
-         Then retry `stack gc`. Records are kept until cleanup is confirmed\n{}",
+         Then retry `stack gc`{orphans}. Records are kept until cleanup is confirmed\n{}",
         steps.join("\n")
     )
 }
