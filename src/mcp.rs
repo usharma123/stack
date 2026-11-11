@@ -15,12 +15,13 @@ use std::time::Duration;
 
 mod server;
 
-const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// Newest first; the first is offered when the client asks for one not listed.
+const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
 /// What the server tells a client about using its tools, once, at initialization.
-const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root). Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one.";
+const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root). Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one. The resource stack://guide is the full agent guide.";
 
 fn startup_timeout_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600); or give `timeout`" })

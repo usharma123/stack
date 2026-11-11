@@ -31,6 +31,19 @@ const ROOTS_WAIT: Duration = Duration::from_secs(5);
 /// Time between heartbeat progress notifications of a call that asked for progress.
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// The only protocol revision that allows JSON-RPC batches.
+const BATCH_VERSION: &str = "2025-03-26";
+
+/// The agent guide, served as the `stack://guide` resource.
+const GUIDE: &str = include_str!("../../docs/user/agents.md");
+const GUIDE_URI: &str = "stack://guide";
+
+/// MCP log levels, least severe first.
+const LEVELS: [&str; 8] = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"];
+
+/// The level `notifications/message` starts at, until the client sets one: `warning`.
+const DEFAULT_LOG_LEVEL: usize = 3;
+
 /// Runs one `tools/call`: its params and the client's roots (`None` when it offers none).
 pub(super) type Caller = Arc<dyn Fn(&Value, Option<&[PathBuf]>) -> Value + Send + Sync>;
 
@@ -77,7 +90,7 @@ pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Writ
             Ok(Event::Line(Ok(line))) => server.line(&line),
             Ok(Event::Line(Err(e))) => break Err(e),
             Ok(Event::Stop) => {}
-            Err(RecvTimeoutError::Timeout) => server.roots_failed(),
+            Err(RecvTimeoutError::Timeout) => server.roots_failed("the client did not answer roots/list in time"),
             Ok(Event::End) | Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
     };
@@ -94,13 +107,61 @@ impl Out {
         // A client that went away cannot be told; the calls still finish.
         let _ = super::send(&mut *out, message.clone());
     }
+}
 
+/// Where a request's response goes: straight out, or into the batch it arrived in.
+#[derive(Clone)]
+enum Reply {
+    Direct(Arc<Out>),
+    Batch(Arc<Batch>),
+}
+
+impl Reply {
     fn ok(&self, id: &Value, result: Value) {
-        self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
     }
 
     fn error(&self, id: &Value, code: i64, message: impl Into<String>) {
-        self.send(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message.into() } }));
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message.into() } }));
+    }
+
+    fn send(&self, response: Value) {
+        match self {
+            Reply::Direct(out) => out.send(&response),
+            Reply::Batch(batch) => batch.add(Some(response)),
+        }
+    }
+
+    /// No response will come (a cancelled request).
+    fn skip(&self) {
+        if let Reply::Batch(batch) = self {
+            batch.add(None);
+        }
+    }
+
+    /// A response is still owed.
+    fn expect(&self) {
+        if let Reply::Batch(batch) = self {
+            batch.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 += 1;
+        }
+    }
+}
+
+/// The responses of one batch, sent together once the last owed one is in.
+struct Batch {
+    out: Arc<Out>,
+    /// Responses still owed, and those collected.
+    state: Mutex<(usize, Vec<Value>)>,
+}
+
+impl Batch {
+    fn add(&self, response: Option<Value>) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1.extend(response);
+        state.0 -= 1;
+        if state.0 == 0 && !state.1.is_empty() {
+            self.out.send(&Value::Array(std::mem::take(&mut state.1)));
+        }
     }
 }
 
@@ -116,15 +177,19 @@ struct Server {
     out: Arc<Out>,
     caller: Caller,
     events: mpsc::Sender<Event>,
+    /// The protocol revision `initialize` settled on.
+    version: &'static str,
     client_roots: bool,
     roots: Roots,
     requests_sent: u64,
     /// Calls waiting for the client's roots, in arrival order.
-    deferred: VecDeque<Value>,
+    deferred: VecDeque<(Value, Reply)>,
     /// The [`Cancel`] of each call in flight, by its request id.
     inflight: Arc<Mutex<HashMap<String, Cancel>>>,
     queues: Arc<Queues>,
     workers: Vec<JoinHandle<()>>,
+    /// The least severe of [`LEVELS`] sent as `notifications/message`.
+    log_level: usize,
 }
 
 impl Server {
@@ -133,6 +198,7 @@ impl Server {
             out,
             caller,
             events,
+            version: super::PROTOCOL_VERSIONS[0],
             client_roots: false,
             roots: Roots::Unsupported,
             requests_sent: 0,
@@ -140,6 +206,7 @@ impl Server {
             inflight: Arc::default(),
             queues: Arc::default(),
             workers: Vec::new(),
+            log_level: DEFAULT_LOG_LEVEL,
         }
     }
 
@@ -147,50 +214,92 @@ impl Server {
         if line.trim().is_empty() {
             return;
         }
+        let direct = Reply::Direct(self.out.clone());
         match serde_json::from_str::<Value>(line) {
-            Err(e) => self.out.error(&Value::Null, -32700, e.to_string()),
-            Ok(message) => self.message(message),
+            Err(e) => direct.error(&Value::Null, -32700, format!("parse error: {e}")),
+            Ok(Value::Array(items)) => self.batch(items),
+            Ok(message) => self.message(message, direct),
         }
     }
 
-    fn message(&mut self, message: Value) {
+    fn batch(&mut self, items: Vec<Value>) {
+        let direct = Reply::Direct(self.out.clone());
+        if self.version != BATCH_VERSION {
+            return direct.error(&Value::Null, -32600, format!("JSON-RPC batches are not supported in protocol version {}; send one message per line", self.version));
+        }
+        if items.is_empty() {
+            return direct.error(&Value::Null, -32600, "invalid request: empty batch");
+        }
+        // One owed response holds the batch open until every item is dispatched.
+        let batch = Reply::Batch(Arc::new(Batch { out: self.out.clone(), state: Mutex::new((1, Vec::new())) }));
+        for item in items {
+            self.message(item, batch.clone());
+        }
+        batch.skip();
+    }
+
+    fn message(&mut self, message: Value, reply: Reply) {
         let id = message.get("id").cloned();
         match (message.get("method").and_then(Value::as_str).map(String::from), id) {
             (None, Some(id)) if message.get("result").is_some() || message.get("error").is_some() => self.response(&id, &message),
-            (method, Some(id)) => self.request(method.as_deref().unwrap_or_default(), id, message),
+            (Some(method), Some(id)) => {
+                reply.expect();
+                self.request(&method, id, message, reply);
+            }
             (Some(method), None) => self.notification(&method, &message["params"]),
-            // Neither a request nor a notification: nothing to answer.
-            (None, None) => {}
+            (None, id) => {
+                reply.expect();
+                reply.error(&id.unwrap_or(Value::Null), -32600, "invalid request: no method");
+            }
         }
     }
 
-    fn request(&mut self, method: &str, id: Value, message: Value) {
+    fn request(&mut self, method: &str, id: Value, message: Value, reply: Reply) {
         let params = &message["params"];
         match method {
             "initialize" => {
+                self.version = negotiate(params["protocolVersion"].as_str());
                 self.client_roots = params["capabilities"]["roots"].is_object();
                 if self.client_roots {
                     self.roots = Roots::Pending { since: Instant::now(), asked: None };
                 }
-                self.out.ok(&id, json!({
-                    "protocolVersion": negotiate(params["protocolVersion"].as_str()),
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "stack", "version": env!("CARGO_PKG_VERSION") },
+                reply.ok(&id, json!({
+                    "protocolVersion": self.version,
+                    "capabilities": { "tools": { "listChanged": false }, "resources": { "listChanged": false }, "logging": {} },
+                    "serverInfo": { "name": "stack", "title": "Stack", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": INSTRUCTIONS,
                 }));
             }
-            "ping" => self.out.ok(&id, json!({})),
-            "tools/list" => self.out.ok(&id, json!({ "tools": tools() })),
+            "ping" => reply.ok(&id, json!({})),
+            "tools/list" => reply.ok(&id, json!({ "tools": tools() })),
+            "resources/list" => reply.ok(&id, json!({ "resources": [{
+                "uri": GUIDE_URI, "name": "guide", "title": "Stack agent guide", "mimeType": "text/markdown",
+                "description": "How a coding agent uses Stack: the tools, the loop, reading results, timeouts and arguments",
+                "size": GUIDE.len(),
+            }] })),
+            "resources/templates/list" => reply.ok(&id, json!({ "resourceTemplates": [] })),
+            "resources/read" => match params["uri"].as_str() {
+                Some(GUIDE_URI) => reply.ok(&id, json!({ "contents": [{ "uri": GUIDE_URI, "mimeType": "text/markdown", "text": GUIDE }] })),
+                uri => reply.send(json!({ "jsonrpc": "2.0", "id": id, "error": {
+                    "code": -32002, "message": format!("resource not found: {}", uri.unwrap_or("(no uri)")), "data": { "uri": params["uri"] } } })),
+            },
+            "logging/setLevel" => match LEVELS.iter().position(|l| Some(*l) == params["level"].as_str()) {
+                Some(level) => {
+                    self.log_level = level;
+                    reply.ok(&id, json!({}));
+                }
+                None => reply.error(&id, -32602, format!("invalid params: level must be one of {}", LEVELS.join(", "))),
+            },
             "tools/call" => {
                 // Calls after a held one are held too, so calls on one checkout keep their order.
                 if matches!(self.roots, Roots::Pending { .. }) && (needs_roots(params) || !self.deferred.is_empty()) {
                     self.ask_roots_once();
-                    self.deferred.push_back(message);
+                    self.deferred.push_back((message, reply));
                 } else {
-                    self.spawn_call(message);
+                    self.spawn_call(message, reply);
                 }
             }
-            _ => self.out.error(&id, -32601, format!("method not found: {method}")),
+            _ => reply.error(&id, -32601, format!("method not found: {method}")),
         }
     }
 
@@ -217,12 +326,15 @@ impl Server {
         if id.as_str() != Some(asked.as_str()) {
             return;
         }
-        if message.get("error").is_some() {
-            return self.roots_failed();
+        if let Some(error) = message.get("error") {
+            return self.roots_failed(&format!("the client answered roots/list with an error: {error}"));
         }
         let roots = message["result"]["roots"].as_array().cloned().unwrap_or_default();
         // A root that is not a local directory names no checkout.
         let paths: Vec<PathBuf> = roots.iter().filter_map(|r| r["uri"].as_str().and_then(file_uri_path)).collect();
+        if paths.len() < roots.len() {
+            self.log(3, json!({ "message": "ignored client roots that are not file:// URIs", "roots": roots }));
+        }
         self.roots = Roots::Known(paths);
         self.run_deferred();
     }
@@ -247,18 +359,26 @@ impl Server {
         }
     }
 
-    /// Carry on without roots (the client did not answer `roots/list` in time, answered it with
-    /// an error, or closed the connection): calls that name no `dir` then fail with a usage error.
-    fn roots_failed(&mut self) {
+    /// Carry on without roots (`why` says why, in a warning to the client): calls that name no
+    /// `dir` then fail with a usage error.
+    fn roots_failed(&mut self, why: &str) {
         if matches!(self.roots, Roots::Pending { .. }) {
+            self.log(3, json!({ "message": format!("{why}; calls must pass `dir`") }));
             self.roots = Roots::Known(Vec::new());
         }
         self.run_deferred();
     }
 
     fn run_deferred(&mut self) {
-        while let Some(message) = self.deferred.pop_front() {
-            self.spawn_call(message);
+        while let Some((message, reply)) = self.deferred.pop_front() {
+            self.spawn_call(message, reply);
+        }
+    }
+
+    /// `notifications/message` at `level` (an index into [`LEVELS`]), if the client wants it.
+    fn log(&self, level: usize, data: Value) {
+        if level >= self.log_level {
+            self.out.send(&json!({ "jsonrpc": "2.0", "method": "notifications/message", "params": { "level": LEVELS[level], "logger": "stack", "data": data } }));
         }
     }
 
@@ -279,10 +399,14 @@ impl Server {
             cancel.cancel();
             return;
         }
-        self.deferred.retain(|m| m["id"] != *request);
+        if let Some(at) = self.deferred.iter().position(|(m, _)| m["id"] == *request) {
+            if let Some((_, reply)) = self.deferred.remove(at) {
+                reply.skip();
+            }
+        }
     }
 
-    fn spawn_call(&mut self, message: Value) {
+    fn spawn_call(&mut self, message: Value, reply: Reply) {
         let id = message["id"].clone();
         let key = id.to_string();
         let cancel = Cancel::new();
@@ -312,10 +436,10 @@ impl Server {
             inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
             match outcome {
                 // Cancelled: the client expects no response.
-                _ if cancel.is_cancelled() => {}
-                Some(Ok(result)) => out.ok(&id, result),
-                Some(Err(_)) => out.error(&id, -32603, "internal error: the call panicked"),
-                None => {}
+                _ if cancel.is_cancelled() => reply.skip(),
+                Some(Ok(result)) => reply.ok(&id, result),
+                Some(Err(_)) => reply.error(&id, -32603, "internal error: the call panicked"),
+                None => reply.skip(),
             }
             if crate::process::passed_on().is_some() {
                 let _ = events.send(Event::Stop);
@@ -326,7 +450,7 @@ impl Server {
     /// Calls still held for roots run without them; then every call in flight is answered.
     fn finish(&mut self) {
         if matches!(self.roots, Roots::Pending { .. }) {
-            self.roots_failed();
+            self.roots_failed("the client closed the connection before answering roots/list");
         }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -626,6 +750,88 @@ mod tests {
     }
 
     #[test]
+    fn initialize_offers_the_requested_revision_or_the_newest() {
+        let session = Session::start(Arc::new(call));
+        for (asked, offered) in [("2025-11-25", "2025-11-25"), ("2025-06-18", "2025-06-18"), ("2024-11-05", "2024-11-05"), ("2099-01-01", "2025-11-25")] {
+            session.send(initialize(asked, json!({})));
+            let result = &session.recv()["result"];
+            assert_eq!(result["protocolVersion"], offered, "{result}");
+            assert!(result["capabilities"]["tools"].is_object() && result["capabilities"]["resources"].is_object() && result["capabilities"]["logging"].is_object());
+            assert_eq!(result["serverInfo"]["name"], "stack");
+        }
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "nope" }));
+        let reply = session.recv();
+        assert_eq!((reply["id"].clone(), reply["error"]["code"].clone()), (json!(1), json!(-32601)), "the notification got no reply: {reply}");
+        session.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "logging/setLevel", "params": { "level": "debug" } }));
+        assert_eq!(session.recv()["result"], json!({}));
+        session.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "logging/setLevel", "params": { "level": "loud" } }));
+        assert_eq!(session.recv()["error"]["code"], -32602);
+        session.send(json!({ "jsonrpc": "2.0", "id": 4 }));
+        assert_eq!(session.recv()["error"]["code"], -32600);
+        session.send(json!(5));
+        assert_eq!(session.recv()["error"]["code"], -32600);
+        session.input.as_ref().unwrap().send("{not json".into()).unwrap();
+        let reply = session.recv();
+        assert_eq!((reply["id"].clone(), reply["error"]["code"].clone()), (Value::Null, json!(-32700)));
+        assert!(session.close().is_empty());
+    }
+
+    #[test]
+    fn the_guide_is_a_resource() {
+        let session = Session::start(Arc::new(call));
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }));
+        let listed = session.recv();
+        assert_eq!(listed["result"]["resources"][0]["uri"], GUIDE_URI, "{listed}");
+        session.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": { "uri": GUIDE_URI } }));
+        let text = session.recv()["result"]["contents"][0]["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("# Coding agents"), "{text}");
+        assert!(text.contains("stack://guide"), "the guide names itself");
+        session.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": { "uri": "stack://nope" } }));
+        assert_eq!(session.recv()["error"]["code"], -32002);
+        session.close();
+    }
+
+    #[test]
+    fn batches_are_answered_together_only_in_the_revision_that_has_them() {
+        let session = Session::start(Arc::new(call));
+        session.send(initialize("2025-06-18", json!({})));
+        session.recv();
+        session.send(json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]));
+        assert_eq!(session.recv()["error"]["code"], -32600);
+        session.send(initialize("2025-03-26", json!({})));
+        session.recv();
+        session.send(json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "ping" },
+            { "jsonrpc": "2.0", "method": "notifications/initialized" },
+            { "jsonrpc": "2.0", "id": 2, "method": "tools/list" },
+            { "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "stack_down", "arguments": {} } },
+        ]));
+        let batch = session.recv();
+        let ids: BTreeSet<u64> = batch.as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, [1, 2, 3].into());
+        session.send(json!([]));
+        assert_eq!(session.recv()["error"]["code"], -32600);
+        session.close();
+    }
+
+    #[test]
+    fn a_client_whose_roots_fail_is_warned_that_calls_must_pass_dir() {
+        let session = Session::start(Arc::new(call));
+        session.send(initialize("2025-06-18", json!({ "roots": {} })));
+        session.recv();
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        let ask = session.recv();
+        session.send(json!({ "jsonrpc": "2.0", "id": ask["id"], "error": { "code": -32601, "message": "no roots here" } }));
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }));
+        let seen = session.until(json!(1));
+        let warning = seen.iter().find(|m| m["method"] == "notifications/message").expect("a warning about roots");
+        assert_eq!(warning["params"]["level"], "warning");
+        assert!(warning["params"]["data"]["message"].as_str().unwrap().contains("calls must pass `dir`"), "{warning}");
+        session.close();
+    }
+
+    #[test]
     fn ping_is_answered_while_a_call_runs() {
         let log = Arc::default();
         let session = Session::start(sleeper(Arc::clone(&log)));
@@ -754,7 +960,7 @@ mod tests {
         assert_eq!(session.recv()["method"], "roots/list");
         let asked = Instant::now();
         session.send(tool_call(1, "stack_down", json!({})));
-        let reply = session.recv();
+        let reply = session.until(json!(1)).pop().unwrap();
         assert!(asked.elapsed() >= ROOTS_WAIT - Duration::from_millis(500), "answered before the wait for roots ended: {reply}");
         assert_eq!(reply["result"]["structuredContent"]["error"]["code"], "usage", "{reply}");
         session.close();

@@ -42,6 +42,12 @@ every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
 `destructiveHint` for `stack_down` and `stack_gc`, and `idempotentHint` for those that are
 safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
 
+The server also offers this page as the resource `stack://guide`, takes `logging/setLevel`
+(it warns, for example, when a client's roots cannot be used), negotiates the protocol revision
+the client asks for (2025-11-25, 2025-06-18, 2025-03-26 or 2024-11-05, else the newest), and
+answers a malformed message or an unknown method with the standard JSON-RPC error. Batches are
+accepted only in 2025-03-26, the one revision that has them.
+
 ## The loop
 
 ```sh
