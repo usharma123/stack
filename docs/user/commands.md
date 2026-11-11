@@ -10,8 +10,8 @@
 | `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
-| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
-| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
+| `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
+| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
@@ -184,6 +184,12 @@ Runs a command with the stack's tools and environment, in the project directory.
   directly), and a SIGTERM sent to Stack alone is passed on to the command itself. `run` behaves
   the same. A SIGKILL cannot be passed on.
 - `--secret KEY` (repeatable) grants a named fnox secret. See [secrets](secrets.md).
+- `--up` runs `stack up` first when there is no session, or it is stale (the configuration
+  changed), expired, incomplete or has a service that does not verify. Otherwise it does
+  nothing. The session keeps its lease (a TTL, or an owner still alive) unless `--ttl` gives
+  it a new one. `up` gets what is left of `--timeout`, at most its usual 10 minutes. What it
+  did is listed under `prepared` in the `--json` result (`step` `up`, with the `reason`), and
+  on stderr otherwise; nothing appears when it did not run.
 
 ## run
 
@@ -191,7 +197,7 @@ Runs a `[tasks.<name>]` through `mise run`, so mise's task rules apply (template
 arguments after `--`). Every service must verify first, whatever the task's `services` list
 says; for a command that should run with services down, use `exec`. A task gets the secrets it
 declares, and installs any missing pinned tool before it starts. `unknown_task` lists the
-tasks the project defines.
+tasks the project defines. `--up` and `--ttl` work as for [`exec`](#exec).
 
 ## logs
 

@@ -127,6 +127,12 @@ enum Cmd {
         /// fnox itself to read ungranted secrets, which are not redacted
         #[arg(long = "secret", value_name = "KEY")]
         secret: Vec<String>,
+        /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
+        #[arg(long)]
+        up: bool,
+        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        #[arg(long, value_name = "DURATION", requires = "up")]
+        ttl: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
@@ -138,6 +144,12 @@ enum Cmd {
         /// call: planning, including installing missing pins, is included. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
+        #[arg(long)]
+        up: bool,
+        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        #[arg(long, value_name = "DURATION", requires = "up")]
+        ttl: Option<String>,
         /// Extra arguments, appended to the task's command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -361,7 +373,7 @@ fn main() -> ExitCode {
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
-        Cmd::Exec { require, require_all, timeout, secret, cmd } => {
+        Cmd::Exec { require, require_all, timeout, secret, up, ttl, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -369,13 +381,17 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
-                session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured })
+            prepare(*up, ttl.as_deref()).and_then(|prepare| {
+                run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
+                    session::plan_prepared(&ctx, prepare, || session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured }))
+                })
             })
         }
-        Cmd::Run { task, timeout, args } => {
-            run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
-        }
+        Cmd::Run { task, timeout, up, ttl, args } => prepare(*up, ttl.as_deref()).and_then(|prepare| {
+            run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
+                session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
+            })
+        }),
         Cmd::Down { keep_supervisor, stop_supervisor: _, purge } => session::down_purging(&ctx, !*keep_supervisor, *purge).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
@@ -476,6 +492,12 @@ fn subcommand() -> String {
         .ok()
         .and_then(|m| m.subcommand_name().map(String::from))
         .unwrap_or_default()
+}
+
+/// `--up` and `--ttl` of `exec` and `run`, checked before anything runs.
+fn prepare(up: bool, ttl: Option<&str>) -> Result<session::Prepare> {
+    let ttl_secs = ttl.map(parse_duration).transpose()?;
+    Ok(session::Prepare { up, ttl_secs })
 }
 
 /// `--owner-pid`: a process ID or `ancestor:<name>`, checked as an argument (exit 2).
@@ -707,6 +729,11 @@ fn warn_changed(checks: &[session::Check]) {
 }
 
 fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
+    for step in &plan.prepared {
+        if step["step"] == "up" {
+            eprintln!("stack: ran `stack up` first ({})", step["reason"].as_str().unwrap_or("unknown"));
+        }
+    }
     warn_unverified(&plan.checks);
     warn_changed(&plan.checks);
     for warning in &plan.secret_warnings {

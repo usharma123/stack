@@ -94,6 +94,9 @@ const CONFLICTS: &[(&str, &str, &str)] = &[
     ("stack_gc", "dry_run", "stop_orphans"),
 ];
 
+/// Arguments of one tool that mean something only with another, as on the command line.
+const REQUIRES: &[(&str, &str, &str)] = &[("stack_exec", "ttl", "up"), ("stack_run", "ttl", "up")];
+
 /// Check a call's arguments against the tool's advertised `inputSchema` before anything else
 /// happens: no project is opened, no provider asked, nothing written. Unknown names, wrong
 /// types and out-of-range numbers are `usage` errors; an argument given as `null` counts as
@@ -156,6 +159,11 @@ fn validate(name: &str, args: &Value) -> Result<serde_json::Map<String, Value>> 
     for (_, a, b) in CONFLICTS.iter().filter(|(tool, _, _)| *tool == name) {
         if given(a) && given(b) {
             return Err(usage(format!("`{a}` and `{b}` cannot be given together")));
+        }
+    }
+    for (_, a, b) in REQUIRES.iter().filter(|(tool, _, _)| *tool == name) {
+        if given(a) && !given(b) {
+            return Err(usage(format!("`{a}` needs `{b}: true`")));
         }
     }
     Ok(args)
@@ -336,7 +344,9 @@ fn tool_definitions() -> Value {
                 "require_all": { "type": "boolean", "description": "Every service must verify, or the command does not run" },
                 "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command only, resolved through the stack's pinned fnox. No granted value appears literally in the parsed stdout or stderr strings (timed_out details included): it is replaced by [redacted:KEY], or [redacted] where naming the key could spell out a value. Key names are not secret and are listed under secrets. Values shorter than 8 bytes, or ones a marker could spell out, are refused (secret_unsupported). Values the command transforms (encoded, split, or matching only after JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read ungranted secrets, which are not redacted" },
                 "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs; or give `timeout`" },
-                "timeout": duration_schema("Time the whole call may take, planning included, before the command is killed")
+                "timeout": duration_schema("Time the whole call may take, planning included, before the command is killed"),
+                "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
+                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease)" }
             }), &["command"])),
         tool("stack_run", "Run a task", annotations("Run a task", false, None, false, true),
             "Run a task declared in stack.toml ([tasks.<name>]) through mise once every service verifies, capturing output like stack_exec. Use it for the project's own tasks, such as tests; use stack_exec for commands that should run with services down. The task gets exactly the secrets it declares, redacted from its output. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
@@ -344,7 +354,9 @@ fn tool_definitions() -> Value {
                 "task": { "type": "string", "description": "Task name from [tasks.<name>]; unknown_task lists them" },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
                 "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before the task is killed and the call fails with timed_out (default 600); or give `timeout`" },
-                "timeout": duration_schema("Time the whole call may take, planning included, before the task is killed")
+                "timeout": duration_schema("Time the whole call may take, planning included, before the task is killed"),
+                "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
+                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease)" }
             }), &["task"])),
         tool("stack_renew", "Renew the lease", annotations("Renew the lease", false, Some(false), true, false),
             "Renew this checkout's session lease so stack_gc does not reclaim it. Use it during long work under a ttl lease with no other stack calls (stack_exec and stack_run also renew). Returns the session.",
@@ -625,7 +637,14 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
     let command = strings(args, "command")?;
     let secrets = strings(args, "secrets")?;
     let require = if args["require_all"] == true { Require::All } else { Require::Only(strings(args, "require")?) };
-    captured(args, ctx, || session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true }))
+    let prepare = prepare(args)?;
+    captured(args, ctx, || session::plan_prepared(ctx, prepare, || session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true })))
+}
+
+/// `up` and `ttl` of `stack_exec` and `stack_run`, checked before anything runs.
+fn prepare(args: &Value) -> Result<session::Prepare> {
+    let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
+    Ok(session::Prepare { up: args["up"] == true, ttl_secs })
 }
 
 /// An array-of-strings argument: omitted (or `null`) is empty, and anything else is refused
@@ -644,7 +663,8 @@ fn strings(args: &Value, key: &str) -> Result<Vec<String>> {
 fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
     let task = args["task"].as_str().ok_or_else(|| StackError::new("usage", "task is required"))?;
     let extra = strings(args, "args")?;
-    captured(args, ctx, || session::plan_task(ctx, task, &extra, true))
+    let prepare = prepare(args)?;
+    captured(args, ctx, || session::plan_prepared(ctx, prepare, || session::plan_task(ctx, task, &extra, true)))
 }
 
 /// Plan and run within `timeout_secs` (or `timeout`), which counts from the call: planning (including a
@@ -726,6 +746,10 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         "unverified": plan.checks.iter().filter(|c| !c.ready).map(|c| &c.service).collect::<Vec<_>>(),
         "checks": plan.checks,
     });
+    // Only when `up` (or `install`) ran first, so other results keep their shape.
+    if !plan.prepared.is_empty() {
+        result["prepared"] = json!(plan.prepared);
+    }
     // Only for a command a signal ended, so other results keep their shape.
     if let Some(signal) = output.signal {
         result["signal"] = json!(signal);

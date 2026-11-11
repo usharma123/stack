@@ -548,3 +548,58 @@ fn owner_pid_can_name_the_nearest_ancestor_by_command_name() {
     assert_eq!(results[1]["error"]["code"], "usage", "{}", results[1]);
     fixture.ok(&["down"]);
 }
+
+// ---- fewer round-trips -------------------------------------------------------------------
+
+fn saved_session(fixture: &Fixture) -> Value {
+    serde_json::from_slice(&fs::read(fixture.path("app/.stack/session.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn exec_up_starts_the_stack_only_when_needed_and_keeps_the_lease() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.t]\nrun='true'\n");
+    let result = json_result(&fixture.ok(&["--json", "exec", "--up", "--ttl", "5m", "--", "true"]));
+    assert_eq!(result["data"]["exit_code"], 0);
+    assert_eq!(result["data"]["prepared"][0]["step"], "up", "{result}");
+    assert!(result["data"]["prepared"][0]["reason"].as_str().unwrap().contains("no session"), "{result}");
+    assert_eq!(result["data"]["prepared"][0]["lease"]["ttl_secs"], 300, "{result}");
+    let session = saved_session(&fixture);
+    assert_eq!(session["lease"]["ttl_secs"], 300);
+    let id = session["id"].clone();
+
+    // A healthy session: nothing more runs.
+    let result = json_result(&fixture.ok(&["--json", "exec", "--up", "--", "true"]));
+    assert!(result["data"].get("prepared").is_none(), "{result}");
+
+    // A configuration change makes the session stale: up runs again, keeping the TTL.
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
+    let result = json_result(&fixture.ok(&["--json", "run", "--up", "t"]));
+    assert_eq!(result["data"]["prepared"][0]["step"], "up", "{result}");
+    assert!(result["data"]["prepared"][0]["reason"].as_str().unwrap().contains("configuration changed"), "{result}");
+    let session = saved_session(&fixture);
+    assert_ne!(session["id"], id);
+    assert_eq!(session["lease"]["ttl_secs"], 300, "{session}");
+    let out = fixture.command(&["exec", "--up", "--", "true"]).output().unwrap();
+    assert!(out.status.success() && out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // --ttl alone is refused, on both surfaces.
+    let out = fixture.command(&["--json", "exec", "--ttl", "5m", "--", "true"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "usage");
+    let results = fixture.mcp(&[
+        ("stack_exec", json!({ "command": ["true"], "ttl": "5m" })),
+        ("stack_run", json!({ "task": "t", "ttl": "5m" })),
+        ("stack_exec", json!({ "command": ["true"], "up": true })),
+    ]);
+    assert_eq!(results[0]["error"]["code"], "usage", "{}", results[0]);
+    assert!(results[0]["error"]["message"].as_str().unwrap().contains("`ttl` needs `up: true`"), "{}", results[0]);
+    assert_eq!(results[1]["error"]["code"], "usage", "{}", results[1]);
+    assert_eq!(results[2]["data"]["exit_code"], 0, "{}", results[2]);
+    assert!(results[2]["data"].get("prepared").is_none(), "{}", results[2]);
+
+    // Stopped: up runs again over MCP too.
+    fixture.ok(&["down"]);
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "t", "up": true, "ttl": "1h" }))]);
+    assert_eq!(results[0]["data"]["prepared"][0]["step"], "up", "{}", results[0]);
+    assert_eq!(saved_session(&fixture)["lease"]["ttl_secs"], 3600);
+    fixture.ok(&["down"]);
+}

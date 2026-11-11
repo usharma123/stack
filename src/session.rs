@@ -22,6 +22,8 @@ use crate::timing::Timings;
 use crate::lease::LeaseSummary;
 
 mod gc_pass;
+mod prepare;
+pub use prepare::{needs_up, plan_prepared, Prepare};
 pub use gc_pass::{gc_plan, gc_with, DeletedPlan, GcDryRun, GcOptions, GcPass, GcPlanned, GcSkipped, PlannedData, PlannedPort, PlannedService};
 use crate::tool::ToolSpec;
 use indexmap::IndexMap;
@@ -3245,6 +3247,8 @@ fn not_launched(report: &Report) -> Vec<Check> {
 }
 
 pub struct ExecPlan {
+    /// What `--up` (and `--install`) did before planning, reported with the result.
+    pub prepared: Vec<Value>,
     pub program: PathBuf,
     pub args: Vec<String>,
     /// Complete environment for the command, including poisoned endpoints.
@@ -3878,6 +3882,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         None => Default::default(),
     };
     Ok(ExecPlan {
+        prepared: Vec::new(),
         program,
         args: args.to_vec(),
         env,
