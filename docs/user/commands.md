@@ -42,6 +42,25 @@ as it starts and ends (`stack: install ...`, `stack: install ok (41.2s)`). Nothi
 with `--json`, `--quiet`, or when stderr is not a terminal. `NO_COLOR` turns off the coloured
 `ok`/`FAIL` markers.
 
+## Which command does what
+
+`compile`, `install` and `up` overlap: each does everything the one before it does, then more.
+
+| Command | Resolves versions | Installs | Starts | Verifies | Needs first |
+|---|---|---|---|---|---|
+| `compile` | New or changed requests (`--update`: all; `--locked`: none). Writes `stack.lock`, ports and the mise config | No | No | No | `stack.toml` |
+| `install` | No: uses `stack.lock` (`lock_outdated` if stale) | Pinned tools and service binaries | No | No | Current `stack.lock` |
+| `up` | No, like `install` | Whatever is missing | Every service (keeps unchanged ones running) | Every service, waiting until ready | Current `stack.lock` |
+| `restart` | No | No | Named services (all when none named) | Every service | A session from `up` with unchanged configuration |
+| `run` | No | The task's missing pins | Only with `--up` | Every service; all must pass | Current `stack.lock` |
+| `exec` | No | Only with `--install` (else `tools_not_installed`) | Only with `--up` | Every service; unverified ones withheld, required ones refused | `install` or `up`, or `--install`/`--up` |
+| `env` | No | No | No | Like `exec` | `install` or `up` |
+| `status` | No | No | No | Every service, now | Nothing (reports `no session`) |
+| `down` | No | No | Stops every service | Confirms they are gone | Nothing |
+
+In practice: `compile` after editing `stack.toml`, `up` to work, `install` to warm a cache or CI
+image without starting anything.
+
 ## init
 
 Writes `stack.toml` in the project directory with the tools and preset services you name, and

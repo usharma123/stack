@@ -4,7 +4,8 @@ Each Git worktree is its own checkout to Stack, with its own ports, data, identi
 session. A shared `stack.lock` keeps every worktree on the same exact versions.
 
 Stack never creates or deletes checkouts. Tools that do (worktree managers, agent sandboxes)
-should call it from their hooks:
+should call it from their hooks. Ready-made recipes follow for [Worktrunk](#worktrunk),
+[Claude Code](#claude-code) and [plain `git worktree`](#plain-git-worktree):
 
 - when a checkout appears: `stack compile --locked && stack up`
 - before it is removed: `stack down`
@@ -57,6 +58,70 @@ stack = "stack down"
   `stack down` before abandoning the worktree.
 - A failing `stack down` aborts `wt remove`, so services are never orphaned. `--no-hooks`
   skips both hooks, so stop services yourself first.
+
+## Claude Code
+
+Start the stack when a session starts, with a lease so it stops on its own later. In
+`.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "stack -C \"$CLAUDE_PROJECT_DIR\" up --ttl 2h --quiet" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- Claude Code adds a `SessionStart` hook's stdout to the session's context, so Claude sees each
+  service's port and the session id. Errors go to stderr; a failing hook does not stop the
+  session, so Claude can still run `stack status`.
+- `up` is safe to repeat. Add a second entry with `"matcher": "resume"` to check the stack
+  again when a session is resumed.
+- `stack exec` and `stack run` renew the lease. If the agent mostly runs commands without
+  Stack, use a longer `--ttl` or have it run `stack renew`.
+- A session started with `claude --worktree` starts in the new worktree, so the same hook
+  starts that worktree's own services. No worktree hook is needed for that.
+- Stopping: `SessionEnd` hooks share a 1.5-second budget, too short for `stack down`, so rely
+  on the lease (and [`setup --gc-agent`](commands.md#doctor-and-setup) to collect it).
+- `WorktreeCreate` hooks replace Claude Code's own `git worktree add`: the hook must create
+  the worktree itself and print only its path on stdout. Add one only if you need custom
+  creation anyway, and send Stack's output to stderr (`stack -C "$path" up --ttl 2h >&2`).
+  `WorktreeRemove` runs only for worktrees such a hook created. Run `stack -C "$path" down`
+  there: a non-zero exit stops the removal while the directory still exists, so services are
+  not orphaned. Check the [hooks reference](https://code.claude.com/docs/en/hooks) for the
+  JSON each hook receives.
+
+## Plain `git worktree`
+
+Git runs `post-checkout` in a new worktree after `git worktree add`, with an all-zero previous
+HEAD. Hooks live in the shared `.git/hooks`, so one hook covers every worktree:
+
+```sh
+#!/bin/sh
+# .git/hooks/post-checkout (make it executable)
+[ "$1" = 0000000000000000000000000000000000000000 ] || exit 0   # only new checkouts
+[ -f stack.toml ] || exit 0
+stack compile --locked && stack up --ttl 4h
+```
+
+A failing `post-checkout` does not undo the checkout; the worktree exists either way.
+
+Git has no hook that runs before a worktree is removed, so nothing can stop its services for
+you. Stop them first, for example with a shell function:
+
+```sh
+wt-rm() { stack -C "$1" down && git worktree remove "$1"; }
+```
+
+A worktree removed with services running keeps them running until you stop them, or until
+`stack gc --stop-orphans` does (see [stopping orphans](commands.md#stopping-orphans)).
 
 ## Other tools
 
