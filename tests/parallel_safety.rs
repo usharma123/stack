@@ -705,6 +705,77 @@ fn a_repeated_up_skips_the_install_only_while_every_pin_is_installed() {
 }
 
 #[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn commands_in_one_checkout_plan_side_by_side_and_every_one_is_recorded_then_released() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let index = fixture.index_files().pop().unwrap();
+    let active = || serde_json::from_str::<Value>(&fs::read_to_string(&index).unwrap()).unwrap()["active_executions"].as_object().map_or(0, |a| a.len());
+
+    // Eight commands at once, each alive long enough for all of them to be recorded together.
+    let children: Vec<_> = (0..8).map(|_| fixture.command(&["exec", "--", "sleep", "2"]).stdout(Stdio::null()).spawn().unwrap()).collect();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut most = 0;
+    while most < 8 && Instant::now() < deadline {
+        most = most.max(active());
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(most, 8, "every running command is recorded in the session, none overwrote another");
+
+    // While they run, a lifecycle command still sees the session as busy.
+    let busy = fixture.json(&["up", "--json", "--timeout", "30s"]);
+    assert_eq!(busy["error"]["code"], "session_busy", "{busy}");
+
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+    assert_eq!(active(), 0, "each command removed its own record");
+    // And nothing is left that would keep the next lifecycle command out.
+    let up = fixture.json(&["up", "--json"]);
+    assert_eq!(up["ok"], true, "{up}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_command_waits_while_a_lifecycle_command_holds_the_project_and_plans_beside_others() {
+    let fixture = Fixture::new();
+    let (state, root) = (fixture.path("state"), fixture.path("app").canonicalize().unwrap());
+    fixture.ok(&["exec", "--", "true"]);
+    let exec = || fixture.command(&["exec", "--", "true"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+
+    // Held alone, as `up`, `down` or `compile` hold it: a command waits until it is let go.
+    let alone = stack::state::project_lock(&state, &root).unwrap();
+    let mut waiting = exec();
+    thread::sleep(Duration::from_millis(700));
+    assert!(waiting.try_wait().unwrap().is_none(), "exec plans only once the lifecycle command is done");
+    drop(alone);
+    assert!(waiting.wait().unwrap().success());
+
+    // Shared, as another command planning holds it: a command plans beside it.
+    let planning = stack::state::project_lock_shared(&state, &root, true).unwrap();
+    let mut beside = exec();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while beside.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(beside.try_wait().unwrap().is_some_and(|s| s.success()), "exec planned beside another planner");
+    // A lifecycle command still waits for it.
+    let (sent, got) = std::sync::mpsc::channel();
+    let waiter = thread::spawn({
+        let (state, root) = (state.clone(), root.clone());
+        move || {
+            let lock = stack::state::project_lock(&state, &root).unwrap();
+            sent.send(()).unwrap();
+            drop(lock);
+        }
+    });
+    assert!(got.recv_timeout(Duration::from_millis(300)).is_err(), "the lifecycle lock waits for planners");
+    drop(planning);
+    got.recv_timeout(Duration::from_secs(10)).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
 fn exec_asks_mise_to_trust_a_generated_configuration_once_until_it_changes() {
     let fixture = Fixture::new();
     let trusts = || fs::read_to_string(fixture.path("mise.log")).unwrap_or_default().lines().filter(|l| l.starts_with("trust ")).count();

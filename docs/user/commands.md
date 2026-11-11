@@ -270,6 +270,10 @@ you pass `-C`. `STACK_PROJECT` always names the project directory.
   --require redis`); `--require postgres,redis` names one service called `postgres,redis`.
 - `--timeout` counts from the call. When it expires the command's process group is killed and
   Stack exits 124 (`timed_out`).
+- Several `exec` calls in one checkout plan at the same time, so a test runner that fans out
+  does not queue behind itself. `up`, `restart`, `down`, `compile` and `gc` still run alone:
+  they wait for commands that are being planned, and new ones wait for them. `run`, and `exec`
+  with `--up` or `--install` while it starts or installs, run alone too.
 - With `--json`, at most 64 KiB of each output stream is captured into the result (the end is
   kept; `stdout_truncated`, `stderr_truncated`, `stdout_bytes` and `stderr_bytes` say what was
   dropped), and Stack exits with the command's exit code. A command a signal ended has `exit_code: null` and

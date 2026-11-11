@@ -55,6 +55,8 @@ pub fn project_key(root: &Path) -> String {
 /// Cross-process exclusive lock held for the lifetime of the guard.
 pub struct FileLock {
     _file: File,
+    /// The project's gate, held with the project lock (see [`project_lock`]).
+    _gate: Option<Box<FileLock>>,
 }
 
 impl FileLock {
@@ -73,13 +75,13 @@ impl FileLock {
             .map_err(|e| io_error(path.display(), e))?;
         if !crate::process::interruptible() {
             file.lock_exclusive().map_err(|e| io_error(path.display(), e))?;
-            return Ok(Self { _file: file });
+            return Ok(Self { _file: file, _gate: None });
         }
         // Under a deadline (or in a call that may be cancelled), wait for another holder only as
         // long as it allows.
         loop {
             match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { _file: file }),
+                Ok(()) => return Ok(Self { _file: file, _gate: None }),
                 Err(e) if e.raw_os_error() != fs2::lock_contended_error().raw_os_error() => {
                     return Err(io_error(path.display(), e))
                 }
@@ -96,7 +98,7 @@ impl FileLock {
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let file = open_lock(path)?;
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { _file: file, _gate: None })),
             Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
             Err(e) => Err(io_error(path.display(), e)),
         }
@@ -194,8 +196,45 @@ fn still_at(file: &File, path: &Path) -> bool {
 }
 
 /// Serialize compile and lifecycle changes for this project, outside its mutable directory.
+///
+/// Planning a command shares the lock instead ([`project_lock_shared`]), so commands in one
+/// checkout plan side by side while nothing that holds it alone runs. A holder that changes
+/// the project takes the project's gate first, which new sharers pass through: a steady stream
+/// of them cannot keep it waiting, since those already planning finish and the rest wait.
 pub fn project_lock(state: &Path, root: &Path) -> Result<FileLock> {
-    FileLock::acquire(&project_lock_path(state, root))
+    let gate = FileLock::acquire(&project_file(state, root, "gate"))?;
+    let mut lock = FileLock::acquire(&project_lock_path(state, root))?;
+    lock._gate = Some(Box::new(gate));
+    Ok(lock)
+}
+
+/// The project lock shared with other holders that only plan a command, or record that one
+/// finished: nothing that holds [`project_lock`] runs meanwhile. Whatever a sharer writes, it
+/// writes holding [`project_write_lock`]. A planner passes through the gate first (and waits
+/// there behind a command waiting to change the project); a finishing command does not, so it
+/// is never held up by one that is only waiting.
+pub fn project_lock_shared(state: &Path, root: &Path, through_gate: bool) -> Result<SharedLock> {
+    let busy = |e: StackError| {
+        if e.code != "lock_busy" {
+            return e;
+        }
+        StackError::new("lock_busy", e.message).hint("another `stack up`, `restart` or `down` may be running for this project; retry when it finishes")
+    };
+    if through_gate {
+        drop(SharedLock::shared(&project_file(state, root, "gate")).map_err(busy)?);
+    }
+    SharedLock::shared(&project_lock_path(state, root)).map_err(busy)
+}
+
+/// Held briefly by a sharer of the project lock around each of its writes (the compiled
+/// configuration, the session record), so two never write at once. A holder of
+/// [`project_lock`] needs no other.
+pub fn project_write_lock(state: &Path, root: &Path) -> Result<FileLock> {
+    FileLock::acquire(&project_file(state, root, "write"))
+}
+
+fn project_file(state: &Path, root: &Path, suffix: &str) -> PathBuf {
+    state.join("projects").join(format!("{}.{suffix}.lock", project_key(root)))
 }
 
 /// [`project_lock`] without waiting: `None` while another command holds it.

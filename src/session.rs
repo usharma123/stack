@@ -3935,7 +3935,20 @@ fn declared_task<'a>(stack: &'a Composed, name: &str) -> Result<&'a Entry<Task>>
 
 fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");
-    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    // Planning a command writes only what it writes holding the project's write lock (the
+    // compiled configuration and its trust, then the session's record of this execution), so
+    // commands in one checkout plan side by side while nothing that changes the project runs.
+    // A task also writes its configuration copy and may install its tools: it plans alone.
+    let shared = matches!(target, Target::Command { .. });
+    let (_alone, _sharing) = if shared {
+        (None, Some(crate::state::project_lock_shared(&ctx.state, &ctx.root, true)?))
+    } else {
+        (Some(project_lock(&ctx.state, &ctx.root)?), None)
+    };
+    let write_lock = || -> Result<Option<crate::state::FileLock>> {
+        if shared { crate::state::project_write_lock(&ctx.state, &ctx.root).map(Some) } else { Ok(None) }
+    };
+    let mut writing = write_lock()?;
     timings.mark("lock");
     let mut session = load(ctx)?;
     let report = match target {
@@ -3990,6 +4003,9 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         })
     };
     let trusted = mise::trust_once(&ctx.state, &ctx.root);
+    // Written and trusted: from here the provider only reads the configuration, as other
+    // planners do.
+    drop(writing.take());
     timings.mark("trust");
     let provide = || {
         if report.stack.services.is_empty() {
@@ -4002,8 +4018,10 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         // mise may have dropped its own record of a configuration Stack remembers trusting (its
         // state was cleared, or `mise trust --untrust` ran): trusted again, and asked once more.
         Err(_) if skipped => {
+            let _writing = write_lock()?;
             mise::forget_trust(&ctx.state, &ctx.root);
             mise::trust_once(&ctx.state, &ctx.root)?;
+            drop(_writing);
             provide()
         }
         other => other,
@@ -4139,6 +4157,13 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     // Reserve execution before releasing the same lock used by GC. This closes the
     // verify/start race without holding an exclusive lock throughout a long command.
     let mut execution = None;
+    let _writing = write_lock()?;
+    if shared {
+        // Other commands may have planned meanwhile: this one is recorded in the session as it
+        // is now. The shared lock kept it the generation verified above; nothing else is.
+        let verified = session.as_ref().map(|s| s.id.clone());
+        session = load(ctx)?.filter(|fresh| verified.as_ref() == Some(&fresh.id));
+    }
     if let Some(session) = session
         .as_mut()
         .filter(|s| !s.launching && same_config(s, ctx, &report))
@@ -5239,9 +5264,12 @@ impl ExecutionGuard {
         let completed_at = now();
         // The lock is waited for briefly whatever the call's deadline: an expired one still
         // gets the chance, and none (a CLI `exec` without `--timeout`) never waits unbounded.
+        // Shared, without passing the gate, and with the write lock: other commands may be
+        // planning or finishing too, and one waiting to change the project waits for this.
         let locked = {
             let _bound = crate::process::deadline_scope(Some(Instant::now() + RELEASE_GRACE));
-            project_lock(&ctx.state, &ctx.root)
+            crate::state::project_lock_shared(&ctx.state, &ctx.root, false)
+                .and_then(|project| crate::state::project_write_lock(&ctx.state, &ctx.root).map(|write| (project, write)))
         };
         let _guard = match locked {
             Ok(guard) => guard,

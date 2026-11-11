@@ -680,7 +680,19 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
     }
-    fs::write(path, contents).map_err(|e| io_error(path.display(), e))
+    // Replaced in one step: a command planning under the shared project lock may be reading it.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(parent.display(), e))?;
+    // The mode a plain write would have given it (the temporary file is private).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o644);
+        temp.as_file().set_permissions(fs::Permissions::from_mode(mode)).map_err(|e| io_error(temp.path().display(), e))?;
+    }
+    std::io::Write::write_all(&mut temp, contents.as_bytes()).map_err(|e| io_error(temp.path().display(), e))?;
+    temp.persist(path).map_err(|e| io_error(path.display(), e.error))?;
+    Ok(())
 }
 
 /// What locking artifacts produced for one compile.
