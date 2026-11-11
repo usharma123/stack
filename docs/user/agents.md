@@ -83,6 +83,8 @@ A few things that are easy to get wrong:
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
   `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
   `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
+- **Port conflicts.** `stack up --reassign-ports` (MCP `reassign_ports`) moves this checkout's
+  conflicting ports and continues; the other program is left alone.
 - **Do not work around `artifact_mismatch`.** It means a download differs from what
   `stack.lock` records. Report it, and run `stack compile --update` only if the change is
   expected upstream.

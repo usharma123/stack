@@ -7,7 +7,7 @@
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
-| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D]` | Start services, verify them, record a session |
+| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
@@ -94,9 +94,12 @@ load code you edited use `restart`.
   (curl: (7) Failed to connect …)`), and `details` keep its exit status and last output lines
   under `readiness`; the same goes for a failed `restart`.
 - **Port conflicts.** If another program is listening on one of this checkout's ports, `up`
-  fails with `port_conflict`, naming the port and, where it can, the program. Run
-  `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never
-  reassigns ports on its own.
+  fails with `port_conflict`, naming the port and, where it can, the program. Pass
+  `up --reassign-ports`, which gives only the conflicting services new ports and carries on;
+  the result lists each move under `reassigned_ports` (`service`, `old`, `new`). Or run
+  `stack compile --reassign-ports` (new ports for every service) and `up` again. A port the
+  project pins in `[override.services]` is never moved. Stack never kills the other program,
+  and without the flag never reassigns ports on its own.
 - **Other checkouts.** `up` first reclaims expired sessions and those of deleted checkouts,
   machine-wide, but never waits for another checkout: a session another command holds locked
   (a long `up` in another worktree, say) is skipped and listed under the `gc` step's

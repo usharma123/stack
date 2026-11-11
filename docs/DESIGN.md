@@ -92,6 +92,9 @@ output (mise's answer when no release matches) is an error, not a version.
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
   assigned ports and the override for pinned ones. Stack never reassigns on its own: `down`
   removes the session while reservations persist, so "no session" does not mean "never used".
+  `up --reassign-ports` is the explicit opt-in: on a `port_conflict` at the `ports` step with no
+  pinned port involved, only the conflicting services get new reservations (the old port stays
+  excluded while choosing) and `up` runs again once, reporting `reassigned_ports`.
 - **Fewer round-trips.** `exec`/`run --up` run a live `status` first and `up` only when it finds
   no session, a launching, stale or expired one, or a service that does not verify; the lease is
   carried over unless `--ttl` is given. `exec --install` runs `install` when a pin is missing.

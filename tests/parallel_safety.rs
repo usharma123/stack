@@ -623,3 +623,57 @@ fn exec_install_installs_missing_pins_instead_of_failing() {
     assert_eq!(results[0]["data"]["exit_code"], 0, "{}", results[0]);
     assert_eq!(results[1]["error"]["code"], "usage", "stack_run installs a task's pins itself: {}", results[1]);
 }
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn up_reassign_ports_moves_a_port_another_program_holds_and_leaves_the_program_alone() {
+    let fixture = Fixture::with_bundle(WEB);
+    // A provider that starts a supervised listener on whatever port web is assigned when it
+    // starts, as a real daemon would.
+    let real = fixture.path("bin/mise-fake");
+    fs::rename(fixture.path("bin/mise"), &real).unwrap();
+    write_exe(
+        &fixture.path("bin/mise"),
+        &format!(
+            r#"#!/bin/sh
+if test "$1 $2" = "daemons start"; then
+  "$REVIEW_PYTHON" -c '
+import json, os, sys
+f = sys.argv[1]
+r = json.load(open(os.path.join(os.environ["STACK_STATE_DIR"], "ports.json")))
+p = [x["port"] for x in r["reservations"] if x["service"] == "web"][0]
+open(os.path.join(f, "listen-port"), "w").write(str(p))
+json.dump([{{"id": "{WEB_ID}", "name": "web", "status": "running", "port": p}}], open(os.path.join(f, "daemons-started.json"), "w"))
+' "$REVIEW_FIXTURE"
+fi
+exec "{}" "$@"
+"#,
+            real.display()
+        ),
+    );
+    let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+
+    // Without the flag: the conflict, whose hint names it.
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "port_conflict", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("stack up --reassign-ports"), "{error}");
+
+    let up = json_result(&fixture.ok(&["up", "--json", "--reassign-ports"]));
+    let moved = &up["data"]["reassigned_ports"][0];
+    assert_eq!((moved["service"].as_str(), moved["old"].as_u64()), (Some("web"), Some(u64::from(port))), "{up}");
+    let new = moved["new"].as_u64().unwrap();
+    assert_ne!(new, u64::from(port));
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    assert_eq!(up["data"]["checks"][0]["port"], new);
+    // The other program still has its port.
+    assert!(squatter.local_addr().is_ok());
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+    assert_eq!(json_result(&fixture.ok(&["inspect", "--json"]))["data"]["ports"]["web"], new);
+    // Nothing to move: the flag changes nothing.
+    let results = fixture.mcp(&[("stack_up", json!({ "reassign_ports": true }))]);
+    assert!(results[0]["data"].get("reassigned_ports").is_none(), "{}", results[0]);
+    fixture.ok(&["down"]);
+}

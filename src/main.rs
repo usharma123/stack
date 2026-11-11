@@ -90,6 +90,10 @@ enum Cmd {
         /// picks the nearest ancestor of this command with that command name (e.g. ancestor:claude)
         #[arg(long, value_name = "PID|ancestor:NAME", value_parser = owner_arg)]
         owner_pid: Option<stack::lease::Owner>,
+        /// On a port conflict with another program, give this checkout's conflicting ports new
+        /// numbers and continue (the result lists old and new). The other program is left alone
+        #[arg(long)]
+        reassign_ports: bool,
         /// Give up after this long (e.g. 5m), exit 124 and keep what was launched recorded for
         /// `status` and `down`. Covers the whole startup. Default 10m
         #[arg(long, value_name = "DURATION")]
@@ -290,7 +294,7 @@ fn main() -> ExitCode {
                 print!("{}", skill.text);
             })
         }),
-        Cmd::Up { ttl, owner_pid, timeout } => ttl
+        Cmd::Up { ttl, owner_pid, timeout, reassign_ports } => ttl
             .as_deref()
             .map(parse_duration)
             .transpose()
@@ -298,9 +302,14 @@ fn main() -> ExitCode {
                 let timeout = startup_timeout(timeout.as_deref())?;
                 Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout))
             })
-            .and_then(|(ttl_secs, owner_pid, timeout)| session::up(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout))
+            .and_then(|(ttl_secs, owner_pid, timeout)| {
+                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, session::UpOptions { reassign_ports: *reassign_ports })
+            })
             .map(|r| {
                 emit(cli.json, &r, || {
+                    for p in &r.reassigned_ports {
+                        println!("{:<12} port {} -> {} (reassigned: another program held {})", p.service, p.old, p.new, p.old);
+                    }
                     for c in &r.checks {
                         println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
                     }

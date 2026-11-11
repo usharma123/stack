@@ -312,6 +312,7 @@ fn tool_definitions() -> Value {
                 "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_status, stack_exec, stack_run and stack_renew extend it)" },
                 "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
                 "owner_ancestor": { "type": "string", "description": "Lease: tie the session to the nearest ancestor of this stack server with this command name, e.g. \"claude\" (CLI: --owner-pid ancestor:<name>); owner_not_found lists the ancestors when none matches" },
+                "reassign_ports": { "type": "boolean", "description": "On port_conflict with another program, give this checkout's conflicting ports new numbers and continue; data.reassigned_ports lists old and new. A pinned port is never moved" },
                 "timeout_secs": startup_timeout_schema(),
                 "timeout": duration_schema("Time the whole startup may take")
             }), &[])),
@@ -532,13 +533,14 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 None => owner_pid,
             };
             let timeout = startup_timeout(args)?;
-            session::up(
+            session::up_with(
                 ctx,
                 LeaseOptions {
                     ttl_secs,
                     owner_pid,
                 },
                 timeout,
+                session::UpOptions { reassign_ports: args["reassign_ports"] == true },
             )
             .map(to_value)
         }

@@ -1,11 +1,69 @@
-//! Fewer round-trips: what `exec` and `run` do before planning (`--up`, `--install`), which
-//! the caller would otherwise run and retry after an error.
+//! Fewer round-trips: `up --reassign-ports`, and what `exec` and `run` do before planning
+//! (`--up`, `--install`), which the caller would otherwise run and retry after an error.
 
-use super::{install, status, up, Ctx, ExecPlan, LeaseOptions, StatusReport, DEFAULT_STARTUP_TIMEOUT};
+use super::{
+    install, startup_deadline, startup_timed_out, status, up, up_within, Ctx, ExecPlan, LeaseOptions, StatusReport, UpReport,
+    DEFAULT_STARTUP_TIMEOUT,
+};
 use crate::error::{Result, StackError};
+use crate::ports;
 use crate::provider::scratch;
 use crate::state::pid_alive;
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Options of `up` that are not about the lease.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpOptions {
+    /// On `port_conflict` with a program Stack does not own, move this checkout's conflicting
+    /// (unpinned) ports and continue.
+    pub reassign_ports: bool,
+}
+
+/// A port `up --reassign-ports` moved.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReassignedPort {
+    pub service: String,
+    pub old: u16,
+    pub new: u16,
+}
+
+/// [`super::up`] with [`UpOptions`]: all within `timeout`.
+pub fn up_with(ctx: &Ctx, lease: LeaseOptions, timeout: Duration, opts: UpOptions) -> Result<UpReport> {
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
+    up_reassigning(ctx, lease, opts).map_err(|e| startup_timed_out(e, "up", timeout))
+}
+
+/// `up`, and with `reassign_ports`, after a `port_conflict` at the `ports` step that names no
+/// pinned port, new reservations for the conflicting services and `up` once more.
+fn up_reassigning(ctx: &Ctx, lease: LeaseOptions, opts: UpOptions) -> Result<UpReport> {
+    let first = up_within(ctx, lease.clone());
+    let error = match first {
+        Err(e) if opts.reassign_ports && e.code == "port_conflict" && failed_step(&e) == Some("ports") => e,
+        other => return other,
+    };
+    // Only ports Stack assigned can move; a pinned one keeps the error and its hint.
+    let conflicts: Vec<&Value> = error.details.iter().filter(|d| d.get("service").is_some() && d.get("port").is_some()).collect();
+    if conflicts.is_empty() || conflicts.iter().any(|c| c["pinned"] == true) {
+        return Err(error);
+    }
+    let services: Vec<String> = conflicts.iter().filter_map(|c| c["service"].as_str().map(String::from)).collect();
+    let moved = ports::reassign(&ctx.state, &ctx.root, &services)?;
+    let mut report = up_within(ctx, lease)?;
+    report.reassigned_ports = moved.into_iter().map(|(service, old, new)| ReassignedPort { service, old, new }).collect();
+    Ok(report)
+}
+
+/// The step an `up` failure's progress record names as failed.
+fn failed_step(error: &StackError) -> Option<&str> {
+    error
+        .details
+        .iter()
+        .rev()
+        .find_map(|d| d.get("steps"))
+        .and_then(|steps| steps.as_array()?.last()?.get("step")?.as_str())
+}
 
 /// What `exec` and `run` do before planning the command.
 #[derive(Debug, Clone, Copy, Default)]

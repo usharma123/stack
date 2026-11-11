@@ -196,6 +196,27 @@ fn assign_outside(
     Ok(out)
 }
 
+/// Give `services` of `project` new ports (after another program took theirs), keeping its
+/// other reservations. The old port stays reserved while the new one is chosen, so it is never
+/// picked again. Returns `(service, old, new)` for each service that had a reservation.
+pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec<(String, u16, u16)>> {
+    let (file, lock) = paths(state);
+    let _guard = FileLock::acquire(&lock)?;
+    let mut reg: Registry = read_json(&file)?;
+    let ephemeral = ephemeral();
+    let mut moved = Vec::new();
+    for service in services {
+        let mine = |r: &Reservation| r.project == project && &r.service == service;
+        let Some(old) = reg.reservations.iter().find(|r| mine(r)).map(|r| r.port) else { continue };
+        let new = find_free(&reg, project, service, &ephemeral)?;
+        reg.reservations.retain(|r| !mine(r));
+        reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone() });
+        moved.push((service.clone(), old, new));
+    }
+    write_json(&file, &reg)?;
+    Ok(moved)
+}
+
 /// Release the reservations of projects whose directory is gone, except those `keep` holds
 /// on to (a project whose session record is still kept: its services may still listen there).
 /// Returns what was released. `assign` prunes gone projects too, but only when some project
@@ -292,6 +313,19 @@ mod tests {
 
     fn requests(services: &[(&str, Option<u16>)]) -> Vec<Request> {
         services.iter().map(|(s, fixed)| Request { service: s.to_string(), fixed: *fixed }).collect()
+    }
+
+    #[test]
+    fn reassign_moves_only_the_named_services_and_never_back_to_the_old_port() {
+        let (state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ports = assign(state.path(), project.path(), &requests(&[("web", None), ("db", None)]), false).unwrap();
+        let moved = reassign(state.path(), project.path(), &["web".to_string(), "missing".to_string()]).unwrap();
+        assert_eq!(moved.len(), 1);
+        let (service, old, new) = &moved[0];
+        assert_eq!((service.as_str(), *old), ("web", ports["web"]));
+        assert_ne!(*new, ports["web"]);
+        let now = lookup(state.path(), project.path()).unwrap();
+        assert_eq!((now["web"], now["db"]), (*new, ports["db"]));
     }
 
     #[test]

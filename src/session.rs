@@ -23,7 +23,7 @@ use crate::lease::LeaseSummary;
 
 mod gc_pass;
 mod prepare;
-pub use prepare::{needs_up, plan_prepared, Prepare};
+pub use prepare::{needs_up, plan_prepared, up_with, Prepare, ReassignedPort, UpOptions};
 pub use gc_pass::{gc_plan, gc_with, DeletedPlan, GcDryRun, GcOptions, GcPass, GcPlanned, GcSkipped, PlannedData, PlannedPort, PlannedService};
 use crate::tool::ToolSpec;
 use indexmap::IndexMap;
@@ -610,7 +610,7 @@ impl Steps {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LeaseOptions {
     pub ttl_secs: Option<u64>,
     pub owner_pid: Option<u32>,
@@ -644,6 +644,8 @@ pub struct UpReport {
     pub reaped: Vec<GcEntry>,
     /// Problems that did not stop startup (the `gc` and `skills` steps).
     pub warnings: Vec<String>,
+    /// Ports `--reassign-ports` moved after a port conflict.
+    pub reassigned_ports: Vec<ReassignedPort>,
 }
 
 impl Serialize for UpReport {
@@ -656,6 +658,7 @@ impl Serialize for UpReport {
             steps: compact_steps(&self.steps),
             reaped: &self.reaped,
             warnings: &self.warnings,
+            reassigned_ports: &self.reassigned_ports,
         }
         .serialize(s)
     }
@@ -680,6 +683,8 @@ struct StartedView<'a> {
     reaped: &'a [GcEntry],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     warnings: &'a [String],
+    #[serde(skip_serializing_if = "<[ReassignedPort]>::is_empty")]
+    reassigned_ports: &'a [ReassignedPort],
 }
 
 #[derive(Serialize)]
@@ -733,8 +738,7 @@ fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()
 /// short (its subprocesses killed with their process groups) and the result is `timed_out`;
 /// ownership of anything launched stays recorded, as for any failed launch.
 pub fn up(ctx: &Ctx, lease: LeaseOptions, timeout: Duration) -> Result<UpReport> {
-    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
-    up_within(ctx, lease).map_err(|e| startup_timed_out(e, "up", timeout))
+    up_with(ctx, lease, timeout, UpOptions::default())
 }
 
 fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
@@ -984,6 +988,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         steps: steps.0,
         reaped,
         warnings: gc_warnings.into_iter().chain(warnings).collect(),
+        reassigned_ports: Vec::new(),
     })
 }
 
@@ -1879,6 +1884,7 @@ impl Serialize for RestartReport {
             steps: compact_steps(&self.steps),
             reaped: &[],
             warnings: &[],
+            reassigned_ports: &[],
         }
         .serialize(s)
     }
@@ -2983,7 +2989,7 @@ fn port_conflict_error(conflicts: Vec<PortConflict>) -> StackError {
     let (pinned, assigned): (Vec<&PortConflict>, Vec<&PortConflict>) = conflicts.iter().partition(|c| c.pinned);
     let mut hints = Vec::new();
     if !assigned.is_empty() {
-        hints.push("run `stack compile --reassign-ports` to give this checkout other ports, then `stack up`".to_string());
+        hints.push("run `stack up --reassign-ports` to give the conflicting services other ports and carry on (or `stack compile --reassign-ports` to give this checkout all new ports, then `stack up`)".to_string());
     }
     for c in pinned {
         hints.push(format!(
