@@ -7727,3 +7727,15 @@ fn exec_reports_truncation_and_full_size_of_each_stream() {
     assert_eq!((data["stdout_truncated"].as_bool(), data["stderr_truncated"].as_bool()), (Some(false), Some(true)), "{data}");
     assert_eq!(data["stderr_bytes"], 70000);
 }
+
+#[test]
+fn a_service_that_does_not_verify_has_a_stable_reason_code() {
+    let fixture = Fixture::with_bundle(WEB);
+    let status = json_result(&fixture.command(&["--json", "status"]).output().unwrap());
+    let web = &status["data"]["checks"][0];
+    assert_eq!((web["service"].as_str(), web["ready"].as_bool()), (Some("web"), Some(false)), "{status}");
+    assert_eq!(web["reason_code"], "not_launched", "{status}");
+    assert!(web["reason"].is_string(), "{status}");
+    let results = fixture.mcp(&[("stack_status", json!({}))], &[]);
+    assert_eq!(results[0]["structuredContent"]["data"]["checks"][0]["reason_code"], "not_launched", "{}", results[0]);
+}

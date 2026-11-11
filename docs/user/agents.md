@@ -128,7 +128,8 @@ def succeeded(operation, envelope):
   `exit_code` is `null` when a signal ended the command; `data.signal` then names it, and the
   CLI exits 128 plus the signal (137 for SIGKILL), as a shell does.
 - A `status` that finds a service down still gives `ok: true`, with `data.healthy: false` and
-  `data.checks` saying which service and why. The CLI exits 1.
+  `data.checks` saying which service and why: a sentence in `reason` and a stable
+  [`reason_code`](commands.md#reason-codes) to branch on. The CLI exits 1.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
   `error.hint`. `error.details` carries the specifics.
 - A bad argument is `usage` with a hint, whether the parser or Stack itself rejected it (an

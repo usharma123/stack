@@ -185,6 +185,27 @@ Checking counts as using the session: `status` renews a lease that has not expir
 `exec`. An expired lease is reported, not revived, and so is the lease of a session that is
 stale or did not finish starting. The result carries a [`lease`](#leases) object.
 
+### Reason codes
+
+A service that is not ready has a `reason` for people and a `reason_code` to branch on:
+
+| `reason_code` | Means | Do |
+|---|---|---|
+| `not_launched` | Nothing in this checkout started it | `up` |
+| `launch_incomplete` | The last `up` did not finish verifying it | `up` |
+| `config_changed` | The compiled configuration changed since `up` | `up` |
+| `process_changed` | Its process differs from the one `up` verified | `up` |
+| `no_port` | No port assigned | `compile`, then `up` |
+| `no_token` | No instance token assigned for its identity probe | `compile`, then `up` |
+| `not_started` | The supervisor does not know it | `up` |
+| `not_running` | The supervisor reports it stopped, failed or still starting | `logs`, then `restart` |
+| `process_dead` | Its process is gone | `restart` |
+| `wrong_port` | It runs on a port other than this checkout's | `down`, then `up` |
+| `port_closed` | Its port does not accept connections | `logs`, then `restart` |
+| `env_missing` | A connection variable it needs is not set | `compile`, then `up` |
+| `probe_failed` | The identity check could not run or gave no answer | `logs`; fix the probe or the service |
+| `wrong_instance` | The app's settings reach a different instance | `down`, then `up` |
+
 ## snapshot
 
 `save <name>` copies this checkout's postgres and redis data, `restore <name>` replaces it,

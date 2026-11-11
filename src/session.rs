@@ -210,6 +210,9 @@ pub struct Check {
     pub identity: Option<Identity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `reason` as a stable code an agent can branch on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<ReasonCode>,
     /// Connection variables poisoned or removed for commands because the service is not verified.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<String>,
@@ -225,6 +228,41 @@ pub struct Check {
     data_dir: Option<String>,
     #[serde(skip)]
     provider_id: Option<String>,
+}
+
+/// Why a service check failed, as a stable code beside the free-text `reason`. The values and
+/// the action each calls for are listed in docs/user/commands.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    /// Nothing in this checkout launched it (`up`).
+    NotLaunched,
+    /// The last `up` did not finish verifying this launch (`up`).
+    LaunchIncomplete,
+    /// The compiled configuration changed since `up` (`up`).
+    ConfigChanged,
+    /// The process differs from the one `up` verified, or is gone (`up`).
+    ProcessChanged,
+    /// No port assigned (`compile`).
+    NoPort,
+    /// No instance token assigned for its identity probe (`compile`).
+    NoToken,
+    /// The supervisor does not know it (`up`).
+    NotStarted,
+    /// The supervisor reports it stopped, failed or still starting (`logs`, then `restart`).
+    NotRunning,
+    /// Its process is gone (`restart`).
+    ProcessDead,
+    /// It runs on a port other than this checkout's (`down`, then `up`).
+    WrongPort,
+    /// Its port does not accept connections (`logs`, then `restart`).
+    PortClosed,
+    /// A connection variable it needs is not set (`compile`, then `up`).
+    EnvMissing,
+    /// The identity check could not run or gave no answer (`logs`).
+    ProbeFailed,
+    /// The app's settings reach a different instance (`down`, then `up`).
+    WrongInstance,
 }
 
 // ---- verification --------------------------------------------------------------------------
@@ -253,6 +291,7 @@ fn verify_all(
             pid: status.and_then(|s| s.pid),
             identity: None,
             reason: None,
+            reason_code: None,
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
@@ -271,8 +310,9 @@ fn verify_all(
                 check.ready = true;
                 check.identity = Some(identity);
             }
-            Err(reason) => {
+            Err((code, reason)) => {
                 check.reason = Some(reason);
+                check.reason_code = Some(code);
                 check.withheld = binding_vars(name, service, port, env, &inherited);
             }
         }
@@ -329,25 +369,26 @@ fn verify_one(
     status: Option<&DaemonStatus>,
     env: &IndexMap<String, String>,
     token: Option<&str>,
-) -> std::result::Result<Identity, String> {
-    let port = port.ok_or("no port assigned; run `stack compile`")?;
-    let status = status.ok_or("not started")?;
+) -> std::result::Result<Identity, (ReasonCode, String)> {
+    use ReasonCode as R;
+    let port = port.ok_or((R::NoPort, "no port assigned; run `stack compile`".to_string()))?;
+    let status = status.ok_or((R::NotStarted, "not started".to_string()))?;
     if status.status != "running" {
-        return Err(format!("supervisor reports '{}'", status.status));
+        return Err((R::NotRunning, format!("supervisor reports '{}'", status.status)));
     }
     if let Some(pid) = status.pid {
         if !pid_alive(pid) {
-            return Err(format!("process {pid} is not alive"));
+            return Err((R::ProcessDead, format!("process {pid} is not alive")));
         }
     }
     if let Some(actual) = status.port {
         if actual != port {
-            return Err(format!("running on port {actual}, but this checkout is assigned {port}; run `stack down && stack up`"));
+            return Err((R::WrongPort, format!("running on port {actual}, but this checkout is assigned {port}; run `stack down && stack up`")));
         }
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500))
-        .map_err(|_| format!("port {port} is not accepting connections"))?;
+        .map_err(|_| (R::PortClosed, format!("port {port} is not accepting connections")))?;
 
     let (var, bin) = match service.preset.as_deref() {
         Some("postgres") => ("DATABASE_URL", "psql"),
@@ -355,23 +396,27 @@ fn verify_one(
         _ => {
             return match &service.identity {
                 Some(probe) => {
-                    let token = token.ok_or("no instance token assigned; run `stack compile`")?;
-                    run_identity_probe(root, probe, env, token).map(|()| Identity::Instance)
+                    let token = token.ok_or((R::NoToken, "no instance token assigned; run `stack compile`".to_string()))?;
+                    run_identity_probe(root, probe, env, token).map(|()| Identity::Instance).map_err(|why| {
+                        // The one answer that is not a failure to probe.
+                        let code = if why.starts_with("identity probe reached a different instance") { R::WrongInstance } else { R::ProbeFailed };
+                        (code, why)
+                    })
                 }
                 None => Ok(Identity::Liveness),
             }
         }
     };
-    let url = env.get(var).ok_or_else(|| format!("{var} is not set"))?;
+    let url = env.get(var).ok_or_else(|| (R::EnvMissing, format!("{var} is not set")))?;
     let expected = status
         .data_dir
         .as_deref()
-        .ok_or("supervisor did not report a data directory")?;
+        .ok_or((R::ProbeFailed, "supervisor did not report a data directory".to_string()))?;
     let args: Vec<&str> = match bin {
         "psql" => vec![url, "-Atc", "select current_setting('data_directory')"],
         _ => vec!["-u", url, "--no-auth-warning", "config", "get", "dir"],
     };
-    let out = run_probe(env, bin, &args)?;
+    let out = run_probe(env, bin, &args).map_err(|why| (R::ProbeFailed, why))?;
     let reported = out
         .lines()
         .map(str::trim)
@@ -380,9 +425,9 @@ fn verify_one(
     if same_path(reported, expected) {
         Ok(Identity::Instance)
     } else {
-        Err(format!(
+        Err((R::WrongInstance, format!(
             "{var} reaches a different server (data dir '{reported}', expected '{expected}')"
-        ))
+        )))
     }
 }
 
@@ -1339,7 +1384,7 @@ fn prerequisites_ready(ctx: &Ctx, report: &Report, starting: &[String], names: &
         let status = statuses.iter().find(|d| d.name == *name);
         let token = report.identities.get(name).map(String::as_str);
         let reason = match (verify_one(&ctx.root, &entry.value, report.ports.get(name).copied(), status, &env, token), &entry.value.ready_cmd) {
-            (Err(reason), _) => Some((reason, None)),
+            (Err((_, reason)), _) => Some((reason, None)),
             // A declared ready_cmd runs once, kept with what it answered when it fails. One that
             // cannot be run says nothing of readiness, so it does not pass either.
             (Ok(_), Some(command)) => match check_ready_cmd(ctx, report, &env, name, command) {
@@ -3435,6 +3480,7 @@ fn not_launched(report: &Report) -> Vec<Check> {
             pid: None,
             identity: None,
             reason: Some("no launch record in this checkout; run `stack up`".into()),
+            reason_code: Some(ReasonCode::NotLaunched),
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
@@ -5009,10 +5055,13 @@ fn verify_session(
 ) -> Vec<Check> {
     let mut checks = verify_all(&ctx.root, report, env, statuses, timings);
     let reason = match session {
-        None => Some("no launch record; run `stack up`"),
-        Some(s) if s.launching => Some("`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`"),
+        None => Some((ReasonCode::NotLaunched, "no launch record; run `stack up`")),
+        Some(s) if s.launching => Some((
+            ReasonCode::LaunchIncomplete,
+            "`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`",
+        )),
         Some(s) if !same_config(s, ctx, report) => {
-            Some("session configuration changed; run `stack up` to restart and verify it")
+            Some((ReasonCode::ConfigChanged, "session configuration changed; run `stack up` to restart and verify it"))
         }
         _ => None,
     };
@@ -5024,14 +5073,18 @@ fn verify_session(
         // that the launched process is no longer there only adds to it. One that passed with a
         // process other than the launched one is the changed process.
         let process = match (&check.reason, changed_process) {
-            (Some(own), true) => Some(format!("{own}; the process `stack up` started is gone; run `stack up` to start it again")),
-            (None, true) => Some("service process changed since launch; run `stack up`".into()),
+            (Some(own), true) => Some((
+                check.reason_code.unwrap_or(ReasonCode::ProcessChanged),
+                format!("{own}; the process `stack up` started is gone; run `stack up` to start it again"),
+            )),
+            (None, true) => Some((ReasonCode::ProcessChanged, "service process changed since launch; run `stack up`".into())),
             _ => None,
         };
-        if let Some(reason) = reason.map(String::from).or(process) {
+        if let Some((code, reason)) = reason.map(|(code, why)| (code, String::from(why))).or(process) {
             check.ready = false;
             check.identity = None;
             check.reason = Some(reason);
+            check.reason_code = Some(code);
             check.withheld = binding_vars(
                 &check.service,
                 &report.stack.services[&check.service].value,
@@ -5856,6 +5909,7 @@ mod tests {
             pid: None,
             identity: Some(Identity::Instance),
             reason: None,
+            reason_code: None,
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
