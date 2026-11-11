@@ -73,16 +73,26 @@ enum Cmd {
     },
     /// Install the locked tools and service binaries without starting anything
     Install,
-    /// Show the last lines a service wrote, as kept by the supervisor
+    /// Show the last lines services wrote, as kept by the supervisor
     Logs {
-        /// Service name from the composed stack
-        service: String,
+        /// Services from the composed stack (default: every service, each line prefixed)
+        services: Vec<String>,
         /// Number of lines from the end (default 100)
         #[arg(long, value_name = "N", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=10_000))]
         tail: u64,
         /// Only output of the current process, not of earlier runs the supervisor kept
         #[arg(long)]
         since_start: bool,
+        /// Only output written in the last DURATION (e.g. 10m, 2h)
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+        /// Only lines containing this text (a plain substring, not a regex); --tail counts
+        /// matching lines
+        #[arg(long, value_name = "TEXT")]
+        grep: Option<String>,
+        /// Match --grep ignoring case
+        #[arg(short = 'i', long, requires = "grep")]
+        ignore_case: bool,
     },
     /// Start services, verify each one, and record a session
     Up {
@@ -364,18 +374,19 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Logs { service, tail, since_start } => session::logs(&ctx, service, *tail as usize, *since_start).map(|r| {
-            emit(cli.json, &r, || {
-                // On stderr, so the lines themselves stay pipeable.
-                if let (Some(at), false) = (r.started_at, r.since_start) {
-                    eprintln!("# current {} process started {}s ago; --since-start shows only its output",
-                        r.service, stack::state::now().saturating_sub(at));
-                }
-                for line in &r.lines {
-                    println!("{line}");
-                }
-            })
-        }),
+        Cmd::Logs { services, tail, since_start, since, grep, ignore_case } => logs(
+            &ctx,
+            cli.json,
+            stack::logs::Query {
+                services: services.clone(),
+                tail: *tail as usize,
+                since_start: *since_start,
+                since_secs: None,
+                grep: grep.clone(),
+                ignore_case: *ignore_case,
+            },
+            since.as_deref(),
+        ),
         Cmd::Restart { services, changed, timeout } => startup_timeout(timeout.as_deref())
             .and_then(|timeout| if *changed { session::restart_changed(&ctx, timeout) } else { session::restart(&ctx, services, timeout) })
             .map(|r| {
@@ -549,6 +560,31 @@ fn prepare(up: bool, ttl: Option<&str>, install: bool) -> Result<session::Prepar
 /// `--owner-pid`: a process ID or `ancestor:<name>`, checked as an argument (exit 2).
 fn owner_arg(value: &str) -> std::result::Result<stack::lease::Owner, String> {
     stack::lease::Owner::parse(value).map_err(|e| e.message)
+}
+
+/// `stack logs`: one service as before, or several (every one when none is named) with each
+/// line prefixed by its service.
+fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>) -> Result<ExitCode> {
+    q.since_secs = since.map(parse_duration).transpose()?;
+    Ok(match stack::logs::fetch(ctx, &q)? {
+        stack::logs::Logs::One(r) => emit(as_json, &r, || {
+            // On stderr, so the lines themselves stay pipeable.
+            if let (Some(at), false) = (r.started_at, r.since_start) {
+                eprintln!("# current {} process started {}s ago; --since-start shows only its output",
+                    r.service, stack::state::now().saturating_sub(at));
+            }
+            stack::logs::print_lines(&r.service, None, &r.lines);
+        }),
+        stack::logs::Logs::Many(m) => emit(as_json, &m, || {
+            let width = m.services.keys().chain(m.errors.keys()).map(String::len).max().unwrap_or(0);
+            for (name, e) in &m.errors {
+                eprintln!("# {name}: error[{}]: {}", e.code, e.message);
+            }
+            for (name, r) in &m.services {
+                stack::logs::print_lines(name, Some(width), &r.lines);
+            }
+        }),
+    })
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.

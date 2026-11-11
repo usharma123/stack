@@ -328,12 +328,15 @@ fn tool_definitions() -> Value {
                 "timeout": duration_schema("Time the whole restart may take")
             }), &[])),
         tool("stack_logs", "Show service logs", annotations("Show service logs", true, None, true, false),
-            "Return the last lines a service wrote, as the supervisor kept them; it never follows. Use it when a check fails or a service misbehaves. The supervisor keeps output across restarts; since_start returns only the current process's lines. Returns {service, lines, truncated, started_at, since_start}.",
+            "Return the last lines services wrote, as the supervisor kept them; it never follows. Use it when a check fails or a service misbehaves. since_start, since and grep narrow the lines. With service, returns {service, lines, truncated, started_at, since_start}; without, every service's: {services: {<name>: {lines, ...}}, errors}, errors naming services whose output could not be read.",
             schema(json!({
-                "service": { "type": "string", "description": "Service name from the stack" },
-                "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100)" },
-                "since_start": { "type": "boolean", "description": "Only the current process's output, not earlier runs'" }
-            }), &["service"])),
+                "service": { "type": "string", "description": "Service name from the stack; omitted means every service" },
+                "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100); with grep, matching lines" },
+                "since_start": { "type": "boolean", "description": "Only the current process's output, not earlier runs'" },
+                "since": { "type": "string", "description": "Only output written in this last span, e.g. \"10m\"" },
+                "grep": { "type": "string", "description": "Only lines containing this text (a plain substring, not a regex)" },
+                "ignore_case": { "type": "boolean", "description": "Match grep ignoring case" }
+            }), &[])),
         tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
             "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.",
             schema(json!({}), &[])),
@@ -546,12 +549,19 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         }
         "stack_install" => session::install(ctx).map(to_value),
         "stack_logs" => {
-            let service = args["service"].as_str().ok_or_else(|| StackError::new("usage", "service is required"))?;
             let tail = match &args["tail"] {
                 Value::Null => 100,
                 v => v.as_u64().filter(|n| (1..=10_000).contains(n)).ok_or_else(|| StackError::new("usage", format!("tail {v} must be 1 to 10000")))? as usize,
             };
-            session::logs(ctx, service, tail, args["since_start"] == true).map(to_value)
+            let q = crate::logs::Query {
+                services: args["service"].as_str().map(String::from).into_iter().collect(),
+                tail,
+                since_start: args["since_start"] == true,
+                since_secs: args["since"].as_str().map(parse_duration).transpose()?,
+                grep: args["grep"].as_str().map(String::from),
+                ignore_case: args["ignore_case"] == true,
+            };
+            crate::logs::fetch(ctx, &q).map(to_value)
         }
         "stack_restart" => {
             // Omitted or empty means every service; anything malformed must not widen to that.

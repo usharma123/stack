@@ -15,6 +15,7 @@ pub mod init;
 pub mod ignore;
 pub mod lease;
 pub mod lock;
+pub mod logs;
 pub mod manifest;
 pub mod mcp;
 pub mod oci;

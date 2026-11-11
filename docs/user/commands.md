@@ -12,7 +12,7 @@
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
-| `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
+| `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]]` | Show services' recent output (default 100 lines each) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
@@ -221,10 +221,19 @@ tasks the project defines. `--up` and `--ttl` work as for [`exec`](#exec).
 
 ## logs
 
-Prints up to `--tail` lines (default 100, at most 10000) that the supervisor kept for one
-service. It never follows. `--since-start` keeps only the current process's output, which
-helps after a restart. `unknown_service` lists the project's services; `logs_failed` means the
-supervisor could not return them.
+Prints up to `--tail` lines (default 100, at most 10000) that the supervisor kept for a
+service. With no service named, or several, it shows each one with lines prefixed
+`<service> | `; with `--json` the result is `{services: {<name>: {lines, ...}}, errors}`, where
+`errors` lists services whose output could not be read. One named service keeps the
+single-service result. It never follows.
+
+- `--since-start` keeps only the current process's output, which helps after a restart.
+- `--since 10m` keeps only output from the last 10 minutes. The supervisor applies the window.
+- `--grep TEXT` keeps lines containing `TEXT` (a plain substring, not a regex); `-i` ignores
+  case. `--tail` then counts matching lines, out of the last 10000.
+
+`unknown_service` lists the project's services; `logs_failed` means the supervisor could not
+return them.
 
 ## down
 

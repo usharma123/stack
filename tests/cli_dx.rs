@@ -166,3 +166,44 @@ fn lifecycle_progress_stays_off_pipes() {
         assert!(!stderr.contains("stack: install") && !stderr.contains("stack: compile"), "{args:?}: {stderr}");
     }
 }
+
+const TWO: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.worker]\nrun='true'\n";
+
+#[test]
+fn logs_of_every_service_are_prefixed_filtered_and_split_per_service() {
+    let fixture = Fixture::new(TWO);
+    fs::write(fixture.dir.path().join("logs-web.txt"), "web up\nGET / 200\nGET /x 500 Error\n").unwrap();
+    fs::write(fixture.dir.path().join("logs-worker.txt"), "worker up\nerror: retrying\n").unwrap();
+    let out = fixture.ok(&["logs"]);
+    assert_eq!(stdout(&out), "web    | web up\nweb    | GET / 200\nweb    | GET /x 500 Error\nworker | worker up\nworker | error: retrying\n");
+    let result = json_result(&fixture.ok(&["logs", "--json", "--grep", "error", "-i"]));
+    assert_eq!(result["data"]["services"]["web"]["lines"], json!(["GET /x 500 Error"]), "{result}");
+    assert_eq!(result["data"]["services"]["worker"]["lines"], json!(["error: retrying"]));
+    // One named service keeps the single-service shape; --tail counts matching lines.
+    let result = json_result(&fixture.ok(&["logs", "web", "--json", "--grep", "GET", "--tail", "1"]));
+    assert_eq!(result["data"]["lines"], json!(["GET /x 500 Error"]), "{result}");
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.contains("daemons logs -- web -n 10000 --raw --no-pager"), "{log}");
+    // --since asks the supervisor for that window.
+    fixture.ok(&["logs", "web", "--since", "10m"]);
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(log.lines().any(|l| l.starts_with("daemons logs -- web") && l.contains("--since")), "{log}");
+
+    let out = fixture.command_in(&fixture.app(), &["logs", "nope", "worker", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
+    let out = fixture.command_in(&fixture.app(), &["logs", "--ignore-case"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "-i needs --grep");
+}
+
+#[test]
+fn mcp_logs_of_every_service_filtered() {
+    let fixture = Fixture::new(TWO);
+    fixture.ok(&["install"]);
+    fs::write(fixture.dir.path().join("logs-web.txt"), "a\nboom\n").unwrap();
+    fs::write(fixture.dir.path().join("logs-worker.txt"), "b\n").unwrap();
+    let app = fixture.app();
+    let replies = fixture.mcp(&app, &[("stack_logs", json!({ "dir": app, "grep": "BOOM", "ignore_case": true })), ("stack_logs", json!({ "dir": app, "service": "worker" }))]);
+    assert_eq!(replies[0]["data"]["services"]["web"]["lines"], json!(["boom"]), "{}", replies[0]);
+    assert_eq!(replies[0]["data"]["services"]["worker"]["lines"], json!([]));
+    assert_eq!(replies[1]["data"]["lines"], json!(["b"]), "{}", replies[1]);
+}

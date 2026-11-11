@@ -1586,7 +1586,7 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
         ("stack_up", json!({ "owner": 1 }), "unknown argument `owner`", "did you mean `owner_pid`?"),
         ("stack_restart", json!({ "services": "web" }), "`services` must be an array", ""),
         ("stack_logs", json!({ "service": "web", "tail": 0 }), "`tail` must be from 1 to 10000", ""),
-        ("stack_logs", json!({ "tail": 5 }), "`service` is required", ""),
+        ("stack_logs", json!({ "grep": 5 }), "`grep` must be a string", ""),
         ("stack_inspect", json!({ "all_skills": 1 }), "`all_skills` must be true or false", ""),
         ("stack_skill", json!({ "tool": "jq", "name": 3 }), "`name` must be a string", ""),
         ("stack_status", json!({ "verbose": true }), "unknown argument `verbose`", "stack_status accepts: dir"),
@@ -3309,10 +3309,10 @@ fn argument_errors_honour_json() {
         assert!(result["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()), "{args:?}: {result}");
     }
     // The missing argument is named, not cut off after "were not provided:".
-    let out = fixture.command(&["--json", "logs"]).output().unwrap();
+    let out = fixture.command(&["--json", "mv"]).output().unwrap();
     let error = &json_result(&out)["error"];
-    assert_eq!(error["message"], "the following required arguments were not provided: <SERVICE>", "{error}");
-    assert!(error["hint"].as_str().unwrap().contains("usage: stack logs <SERVICE>"), "{error}");
+    assert_eq!(error["message"], "the following required arguments were not provided: <OLD> <NEW>", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("usage: stack mv <OLD> <NEW>"), "{error}");
     let mcp = fixture.mcp(&[("stack_up", json!({ "ttl": "banana" })), ("stack_exec", json!({ "command": ["true"], "timeout_secs": 0, "require": ["nope"], "require_all": true }))], &[]);
     for result in &mcp {
         let error = &result["structuredContent"]["error"];

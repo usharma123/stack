@@ -29,7 +29,7 @@ act machine-wide and need no `dir`.
 | `stack_run` | Runs a `[tasks.<name>]` once every service checks out |
 | `stack_exec` | Runs any other command (an argv list) with the stack's tools and env |
 | `stack_restart` | Restarts services after you edit code they loaded |
-| `stack_logs` | Shows a service's recent output |
+| `stack_logs` | Shows recent output of one service, or of every service; `grep`, `ignore_case` and `since` filter it |
 | `stack_down` | Stops everything and confirms it is gone |
 | `stack_ps` | Lists every checkout on the machine, its services and data size (liveness only) |
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
@@ -89,6 +89,7 @@ A few things that are easy to get wrong:
   `stack.lock` records. Report it, and run `stack compile --update` only if the change is
   expected upstream.
 - **`stack logs <service> --since-start`** shows only the current process's output.
+  `stack logs --grep error -i` searches every service's output at once.
 - **The CLI finds the project from a subdirectory**, up to the Git worktree root. `exec` runs
   your command in the directory you called it from. Pass `-C` to be explicit. MCP `dir` is
   never searched upward: it must be the directory that holds `stack.toml`.

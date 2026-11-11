@@ -264,7 +264,8 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     if test -f "$REVIEW_FIXTURE/x-fail"; then echo 'cannot start the supervisor' >&2; exit 1; fi
     supervise detached ;;
   'daemons logs')
-    if test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
+    if test -f "$REVIEW_FIXTURE/logs-$4.txt"; then cat "$REVIEW_FIXTURE/logs-$4.txt"
+    elif test -f "$REVIEW_FIXTURE/logs.txt"; then cat "$REVIEW_FIXTURE/logs.txt"; else echo "Error: Daemon $4 not found" >&2; exit 1; fi ;;
   'daemons stop')
     if test -f "$REVIEW_FIXTURE/fail-stop"; then echo 'cannot stop' >&2; exit 1; fi
     # With `listen-service`, `daemons stop -- NAME...` stops only those services, as mise does.

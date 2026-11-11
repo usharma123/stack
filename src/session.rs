@@ -2179,6 +2179,16 @@ pub struct LogsReport {
 /// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
 /// time and size; never follows. With `since_start`, only output of the current process.
 pub fn logs(ctx: &Ctx, service: &str, tail: usize, since_start: bool) -> Result<LogsReport> {
+    logs_since(ctx, service, tail, since_start, None)
+}
+
+/// Every service the project defines, in order.
+pub fn service_names(ctx: &Ctx) -> Result<Vec<String>> {
+    Ok(ctx.compile(false)?.stack.services.keys().cloned().collect())
+}
+
+/// [`logs`], also keeping only output written at or after `since` (Unix seconds) when given.
+pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, since: Option<u64>) -> Result<LogsReport> {
     let report = ctx.compile(false)?;
     if !report.stack.services.contains_key(service) {
         return Err(unknown_service(&report, service));
@@ -2198,8 +2208,8 @@ pub fn logs(ctx: &Ctx, service: &str, tail: usize, since_start: bool) -> Result<
             .hint("run `stack up` first"));
     }
     let since = match (since_start, started_at) {
-        (false, _) => None,
-        (true, Some(at)) => Some(at),
+        (false, _) => since,
+        (true, Some(at)) => Some(since.map_or(at, |s| s.max(at))),
         (true, None) => {
             return Err(StackError::new("logs_failed", format!("no recorded start time for {service}"))
                 .hint("sessions started before stack 0.1.18 lack one; `stack restart` records it"))
