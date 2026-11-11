@@ -35,6 +35,63 @@ pub fn process(pid: u32) -> Option<Process> {
     imp::process(pid)
 }
 
+/// A process with the names it can be known by, as `--owner-pid ancestor:<name>` matches them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Named {
+    pub pid: u32,
+    pub parent: u32,
+    /// The kernel's command name, which it truncates (15 bytes on Linux, 16 on macOS).
+    pub comm: String,
+    /// The basename of `argv[0]`, which a program may have rewritten (a process title), when it
+    /// could be read and differs from `comm`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv0: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+const COMM_LIMIT: usize = 15;
+#[cfg(not(target_os = "linux"))]
+const COMM_LIMIT: usize = 16;
+
+impl Named {
+    /// Whether `name` is this process's command name or the basename of its `argv[0]`. The
+    /// kernel truncates `comm`, so a longer name also matches a `comm` it starts with when that
+    /// `comm` is as long as the kernel keeps.
+    pub fn named(&self, name: &str) -> bool {
+        let truncated = self.comm.len() >= COMM_LIMIT && name.starts_with(self.comm.as_str());
+        self.comm == name || truncated || self.argv0.as_deref() == Some(name)
+    }
+}
+
+/// `pid` with its names, or `None` when it is not running or cannot be read.
+pub fn named(pid: u32) -> Option<Named> {
+    let process = process(pid)?;
+    let comm = imp::comm(pid)?;
+    let argv0 = imp::argv0(pid)
+        .map(|a| {
+            let a = String::from_utf8_lossy(&a).into_owned();
+            a.rsplit('/').next().unwrap_or(&a).to_string()
+        })
+        .filter(|a| !a.is_empty() && *a != comm);
+    Some(Named { pid, parent: process.parent, comm, argv0 })
+}
+
+/// Most ancestors [`ancestors`] walks, so a corrupt or cyclic answer cannot loop forever.
+const ANCESTOR_LIMIT: usize = 64;
+
+/// The parents of this process, nearest first, up to the first one whose parent is 0 or that
+/// cannot be read.
+pub fn ancestors() -> Vec<Named> {
+    let mut chain: Vec<Named> = Vec::new();
+    let mut pid = std::os::unix::process::parent_id();
+    while pid > 0 && chain.len() < ANCESTOR_LIMIT && !chain.iter().any(|p| p.pid == pid) {
+        let Some(found) = named(pid) else { break };
+        pid = found.parent;
+        chain.push(found);
+    }
+    chain
+}
+
 /// Whether `pid`'s environment, as it was when it started, sets `key` to exactly `value`.
 /// macOS shows no environment for its own platform binaries (`/bin/sh`, say), even to their
 /// owner, and an environment that cannot be told from the arguments is unknown too: only
@@ -79,7 +136,7 @@ mod imp {
         }
     }
 
-    pub fn process(pid: u32) -> Option<Process> {
+    fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
         let pid = libc::c_int::try_from(pid).ok()?;
         // SAFETY: proc_pidinfo writes at most `size` bytes into the zeroed struct.
         let info = unsafe {
@@ -91,9 +148,11 @@ mod imp {
             }
             info
         };
-        if info.pbi_status == libc::SZOMB {
-            return None;
-        }
+        (info.pbi_status != libc::SZOMB).then_some(info)
+    }
+
+    pub fn process(pid: u32) -> Option<Process> {
+        let info = bsdinfo(pid)?;
         Some(Process {
             pid: info.pbi_pid,
             parent: info.pbi_ppid,
@@ -107,9 +166,24 @@ mod imp {
         Some(started / 1000)
     }
 
+    /// The kernel's command name (`p_comm`, at most 16 bytes).
+    pub fn comm(pid: u32) -> Option<String> {
+        let info = bsdinfo(pid)?;
+        let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn environ(pid: u32) -> Option<Vec<Vec<u8>>> {
+        parse_procargs(&procargs(pid)?)
+    }
+
+    pub fn argv0(pid: u32) -> Option<Vec<u8>> {
+        parse_argv0(&procargs(pid)?)
+    }
+
     /// `KERN_PROCARGS2`: argc, the executable path, padding, the arguments, then the environment,
     /// each NUL-terminated.
-    pub fn environ(pid: u32) -> Option<Vec<Vec<u8>>> {
+    fn procargs(pid: u32) -> Option<Vec<u8>> {
         let pid = libc::c_int::try_from(pid).ok()?;
         let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
         let mut max: libc::c_int = 0;
@@ -129,7 +203,30 @@ mod imp {
                 return None;
             }
         }
-        parse_procargs(buf.get(..size)?)
+        buf.truncate(size);
+        Some(buf)
+    }
+
+    /// Where the arguments start in a `KERN_PROCARGS2` buffer (see [`parse_procargs`]), with argc.
+    fn arguments(buf: &[u8]) -> Option<(usize, &[u8], usize)> {
+        let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
+        let rest = buf.get(4..)?;
+        let path_end = rest.iter().position(|b| *b == 0)?;
+        let at = (path_end + 1).div_ceil(std::mem::size_of::<usize>()) * std::mem::size_of::<usize>();
+        if !rest.get(path_end..at)?.iter().all(|b| *b == 0) {
+            return None;
+        }
+        Some((argc, rest, at))
+    }
+
+    /// The first argument in a `KERN_PROCARGS2` buffer, as the process holds it now.
+    pub(super) fn parse_argv0(buf: &[u8]) -> Option<Vec<u8>> {
+        let (argc, rest, at) = arguments(buf)?;
+        if argc == 0 {
+            return None;
+        }
+        let arg = rest.get(at..)?;
+        Some(arg[..arg.iter().position(|b| *b == 0)?].to_vec())
     }
 
     /// The environment in a `KERN_PROCARGS2` buffer: argc, the executable path padded with
@@ -137,13 +234,7 @@ mod imp {
     /// `round_up(len + 1, 8)` after argc, whatever they are), exactly argc arguments, then the
     /// environment up to an empty entry. A layout that does not match is unknown.
     pub(super) fn parse_procargs(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
-        let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
-        let rest = buf.get(4..)?;
-        let path_end = rest.iter().position(|b| *b == 0)?;
-        let mut at = (path_end + 1).div_ceil(std::mem::size_of::<usize>()) * std::mem::size_of::<usize>();
-        if !rest.get(path_end..at)?.iter().all(|b| *b == 0) {
-            return None;
-        }
+        let (argc, rest, mut at) = arguments(buf)?;
         for _ in 0..argc {
             at += rest.get(at..)?.iter().position(|b| *b == 0)? + 1;
         }
@@ -181,6 +272,16 @@ mod imp {
         Some(bytes.split(|b| *b == 0).filter(|f| !f.is_empty()).map(<[u8]>::to_vec).collect())
     }
 
+    /// The kernel's command name (at most 15 bytes).
+    pub fn comm(pid: u32) -> Option<String> {
+        Some(std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim_end_matches('\n').to_string())
+    }
+
+    pub fn argv0(pid: u32) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        bytes.split(|b| *b == 0).next().map(<[u8]>::to_vec)
+    }
+
     /// `started` is clock ticks after boot; the boot time (`btime`) is whole seconds.
     pub fn started_unix_ms(started: u64) -> Option<u64> {
         let boot: u64 = std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
@@ -207,6 +308,14 @@ mod imp {
     }
 
     pub fn started_unix_ms(_: u64) -> Option<u64> {
+        None
+    }
+
+    pub fn comm(_: u32) -> Option<String> {
+        None
+    }
+
+    pub fn argv0(_: u32) -> Option<Vec<u8>> {
         None
     }
 }
@@ -266,6 +375,31 @@ mod tests {
         let started = started.expect("start time readable");
         // Linux rounds the boot time down to the second.
         assert!(started + 1500 >= before && started <= now(), "{started} vs {before}");
+    }
+
+    #[test]
+    fn the_ancestor_chain_starts_at_the_parent_and_names_match_comm_or_argv0() {
+        let chain = ancestors();
+        let parent = chain.first().expect("the parent is readable");
+        assert_eq!(parent.pid, std::os::unix::process::parent_id());
+        assert!(!parent.comm.is_empty() && parent.named(&parent.comm));
+        let me = named(std::process::id()).unwrap();
+        assert_eq!(me.parent, parent.pid);
+        let p = Named { pid: 2, parent: 1, comm: "node".into(), argv0: Some("claude".into()) };
+        assert!(p.named("claude") && p.named("node") && !p.named("clau"));
+        let long = Named { comm: "a".repeat(COMM_LIMIT), argv0: None, ..p };
+        assert!(long.named(&format!("{}-server", "a".repeat(COMM_LIMIT))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn argv0_is_the_first_argument() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/x\0\0claude\0y\0A=1\0\0");
+        assert_eq!(imp::parse_argv0(&buf), Some(b"claude".to_vec()));
+        let mut none = 0i32.to_ne_bytes().to_vec();
+        none.extend_from_slice(b"/bin/x\0\0A=1\0\0");
+        assert_eq!(imp::parse_argv0(&none), None);
     }
 
     #[test]

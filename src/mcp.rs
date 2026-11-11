@@ -87,6 +87,7 @@ const CONFLICTS: &[(&str, &str, &str)] = &[
     ("stack_exec", "require", "require_all"),
     ("stack_restart", "services", "changed"),
     ("stack_up", "timeout", "timeout_secs"),
+    ("stack_up", "owner_pid", "owner_ancestor"),
     ("stack_restart", "timeout", "timeout_secs"),
     ("stack_exec", "timeout", "timeout_secs"),
     ("stack_run", "timeout", "timeout_secs"),
@@ -302,6 +303,7 @@ fn tool_definitions() -> Value {
             schema(json!({
                 "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_status, stack_exec, stack_run and stack_renew extend it)" },
                 "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
+                "owner_ancestor": { "type": "string", "description": "Lease: tie the session to the nearest ancestor of this stack server with this command name, e.g. \"claude\" (CLI: --owner-pid ancestor:<name>); owner_not_found lists the ancestors when none matches" },
                 "timeout_secs": startup_timeout_schema(),
                 "timeout": duration_schema("Time the whole startup may take")
             }), &[])),
@@ -511,6 +513,10 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                         })
                         .and_then(session::owner_pid)?,
                 ),
+            };
+            let owner_pid = match args["owner_ancestor"].as_str() {
+                Some(name) => Some(crate::lease::Owner::ancestor(name)?.resolve()?),
+                None => owner_pid,
             };
             let timeout = startup_timeout(args)?;
             session::up(

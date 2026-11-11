@@ -86,9 +86,10 @@ enum Cmd {
         #[arg(long)]
         ttl: Option<String>,
         /// Reclaim the session when this process exits. Pass a long-lived process such as the
-        /// agent runner or CI job, not a shell that exits after this command
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
-        owner_pid: Option<u32>,
+        /// agent runner or CI job, not a shell that exits after this command. `ancestor:<name>`
+        /// picks the nearest ancestor of this command with that command name (e.g. ancestor:claude)
+        #[arg(long, value_name = "PID|ancestor:NAME", value_parser = owner_arg)]
+        owner_pid: Option<stack::lease::Owner>,
         /// Give up after this long (e.g. 5m), exit 124 and keep what was launched recorded for
         /// `status` and `down`. Covers the whole startup. Default 10m
         #[arg(long, value_name = "DURATION")]
@@ -278,8 +279,11 @@ fn main() -> ExitCode {
             .as_deref()
             .map(parse_duration)
             .transpose()
-            .and_then(|ttl_secs| Ok((ttl_secs, startup_timeout(timeout.as_deref())?)))
-            .and_then(|(ttl_secs, timeout)| session::up(&ctx, LeaseOptions { ttl_secs, owner_pid: *owner_pid }, timeout))
+            .and_then(|ttl_secs| {
+                let timeout = startup_timeout(timeout.as_deref())?;
+                Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout))
+            })
+            .and_then(|(ttl_secs, owner_pid, timeout)| session::up(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout))
             .map(|r| {
                 emit(cli.json, &r, || {
                     for c in &r.checks {
@@ -472,6 +476,11 @@ fn subcommand() -> String {
         .ok()
         .and_then(|m| m.subcommand_name().map(String::from))
         .unwrap_or_default()
+}
+
+/// `--owner-pid`: a process ID or `ancestor:<name>`, checked as an argument (exit 2).
+fn owner_arg(value: &str) -> std::result::Result<stack::lease::Owner, String> {
+    stack::lease::Owner::parse(value).map_err(|e| e.message)
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.

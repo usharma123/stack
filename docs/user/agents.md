@@ -70,8 +70,10 @@ A few things that are easy to get wrong:
 - **`watch` does not reload anything.** When a file listed in a service's `watch` changes,
   `status`, `exec` and `run` tell you to run `stack restart <service>`. `up` leaves a service
   with unchanged configuration running, so it will not pick up your edit either.
-- **Prefer `--ttl` to `--owner-pid`.** A lease tied to the shell that ran `stack up` ends as
-  soon as that shell exits.
+- **Prefer `--ttl` to `--owner-pid N`.** A lease tied to the shell that ran `stack up` ends as
+  soon as that shell exits. To tie it to the agent itself, use `--owner-pid ancestor:claude`
+  (MCP `owner_ancestor: "claude"`): Stack uses its nearest ancestor process with that command
+  name, and fails with `owner_not_found`, listing the ancestors, if there is none.
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
   `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
   `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.

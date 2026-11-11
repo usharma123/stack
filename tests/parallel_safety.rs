@@ -513,3 +513,38 @@ fn renew_sets_the_ttl_and_a_session_without_a_lease_says_how_to_give_it_one() {
     let results = fixture.mcp(&[("stack_renew", json!({ "ttl": "soon" }))]);
     assert_eq!(results[0]["error"]["code"], "usage", "{}", results[0]);
 }
+
+#[test]
+fn owner_pid_can_name_the_nearest_ancestor_by_command_name() {
+    let fixture = Fixture::new();
+    // This test process is the parent of the stack command it runs.
+    let me = stack::procinfo::named(std::process::id()).unwrap();
+    let up = fixture.json(&["up", "--json", "--owner-pid", &format!("ancestor:{}", me.comm)]);
+    assert_eq!(up["data"]["session"]["lease"]["owner_pid"], std::process::id(), "{up}");
+    assert_eq!(up["data"]["lease"]["kind"], "owner_pid");
+    assert_eq!(up["data"]["lease"]["owner_alive"], true);
+    fixture.ok(&["down"]);
+
+    let log = fixture.path("mise.log");
+    let calls = fs::read_to_string(&log).unwrap_or_default().lines().count();
+    let out = fixture.command(&["up", "--json", "--owner-pid", "ancestor:no-such-runner"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "owner_not_found", "{error}");
+    assert!(error["message"].as_str().unwrap().contains(&format!("{} {}", std::process::id(), me.comm)), "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("--ttl"), "{error}");
+    assert_eq!(fs::read_to_string(&log).unwrap_or_default().lines().count(), calls, "lifecycle work ran");
+    assert!(!fixture.path("app/.stack/session.json").exists());
+
+    let out = fixture.command(&["up", "--json", "--owner-pid", "abc"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_result(&out)["error"]["code"], "usage");
+
+    // Over MCP the server itself is the stack process; its parent is this test.
+    let results = fixture.mcp(&[
+        ("stack_up", json!({ "owner_ancestor": me.comm })),
+        ("stack_up", json!({ "owner_ancestor": "x", "owner_pid": 5 })),
+    ]);
+    assert_eq!(results[0]["data"]["session"]["lease"]["owner_pid"], std::process::id(), "{}", results[0]);
+    assert_eq!(results[1]["error"]["code"], "usage", "{}", results[1]);
+    fixture.ok(&["down"]);
+}

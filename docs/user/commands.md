@@ -7,7 +7,7 @@
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
-| `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
+| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D]` | Start services, verify them, record a session |
 | `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
@@ -83,7 +83,10 @@ load code you edited use `restart`.
 
 - **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec`, `run`,
   `status` and `renew` extend it). `--owner-pid N` ties it to a process that lives as long as
-  your work. See [leases](#leases).
+  your work. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
+  own parent and uses the nearest ancestor whose command name (or `argv[0]`) is `<name>`, for
+  example `ancestor:claude` from a hook Claude Code runs. With no match it fails with
+  `owner_not_found`, listing the ancestors it saw, and starts nothing. See [leases](#leases).
 - **Timeout.** The default is 10 minutes, covering downloads, installs and readiness. On
   expiry you get `timed_out` (exit 124). Services may still be starting: check `status`, retry
   `up`, or run `down` before fixing a service that will never become ready. A service whose
