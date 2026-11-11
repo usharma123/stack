@@ -26,6 +26,7 @@
 | `stack setup --gc-agent [--print \| --remove] [--enable]` | Write a launchd agent or systemd user unit that runs `gc --watch` |
 | `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
+| `stack errors [--markdown]` | List every [error code](errors.md) with its meaning, default hint and whether a retry can succeed |
 | `stack mcp` | Serve these operations over MCP (stdio); see [coding agents](agents.md) |
 
 Every command accepts `-C <dir>` (the project directory), `--json` (one result object on
@@ -603,7 +604,8 @@ gui/$(id -u)/dev.stack.gc`, or `systemctl --user disable --now stack-gc.service`
 
 ## Errors
 
-Malformed `stack.toml` and `bundle.toml` errors name the file, line and column, and show the
+Every code, with its meaning, default hint and whether a retry can succeed, is in [error
+codes](errors.md); `stack errors` prints the same list. Malformed `stack.toml` and `bundle.toml` errors name the file, line and column, and show the
 line with a caret. Errors from mise keep its last diagnostic lines. A `stack.lock` written by a
 newer Stack fails with `lock_invalid`; upgrade Stack.
 

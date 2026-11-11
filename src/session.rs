@@ -5434,7 +5434,12 @@ mod tests {
         let busy = startup_timed_out(StackError::new("lock_busy", "held"), "restart", Duration::from_secs(1));
         assert_eq!(busy.code, "timed_out");
         assert!(busy.hint.as_deref().unwrap().starts_with("nothing was started"), "{busy}");
-        assert_eq!(busy.details, vec![json!({ "cause": { "code": "lock_busy", "message": "held" } })]);
+        assert_eq!(busy.details.len(), 1);
+        let cause = &busy.details[0]["cause"];
+        assert_eq!((cause["code"].as_str(), cause["message"].as_str()), (Some("lock_busy"), Some("held")));
+        // The cause is a full error: its registry hint and whether retrying can help.
+        assert_eq!(cause["retryable"], true);
+        assert!(cause["hint"].is_string(), "{cause}");
     }
 
     #[test]

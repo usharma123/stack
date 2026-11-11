@@ -6,6 +6,7 @@
 - [Coding agents: JSON output and MCP](user/agents.md)
 - [Bundles and `stack.toml`](user/bundles.md)
 - [Command reference](user/commands.md)
+- [Error codes](user/errors.md)
 - [Worktrees and sandboxes](user/worktrees.md)
 - [Service data: init tasks and snapshots](user/data.md)
 - [Secrets](user/secrets.md)

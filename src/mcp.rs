@@ -68,7 +68,7 @@ fn machine_wide_schema(props: Value, required: &[&str], dir: &str) -> Value {
 }
 
 /// Tools that act machine-wide: they need no checkout.
-const MACHINE_WIDE: &[&str] = &["stack_gc", "stack_ps", "stack_mv"];
+const MACHINE_WIDE: &[&str] = &["stack_gc", "stack_ps", "stack_mv", "stack_errors"];
 
 /// `dir` of a machine-wide tool that only reports it.
 const REPORTED_DIR: &str = "Optional absolute path of a checkout, reported back as `project`; this tool acts machine-wide either way";
@@ -263,7 +263,9 @@ fn output_schema() -> Value {
                 "properties": {
                     "code": { "type": "string", "description": "Stable error code, such as usage, service_unavailable or timed_out" },
                     "message": { "type": "string" },
-                    "hint": { "type": "string", "description": "What to do next, where Stack knows" },
+                    "hint": { "type": "string", "description": "What to do next: the site's own hint, or the code's default from stack_errors" },
+                    "retryable": { "type": "boolean", "description": "Whether repeating the same call unchanged can succeed" },
+                    "next": { "type": "array", "description": "Where the fix is unambiguous, the operations to run, in order: {command (CLI argv), tool (MCP tool name, or null), args (its arguments)}" },
                     "details": { "type": "array", "description": "Specifics: affected services, captured output, progress records" },
                 },
                 "required": ["code", "message"],
@@ -427,13 +429,16 @@ fn tool_definitions() -> Value {
         tool("stack_doctor", "Check prerequisites", annotations("Check prerequisites", true, None, true, false),
             "Check that the providers Stack needs (mise, git, tar) are installed, that the supervisor's socket path fits this platform, and that the project compiles. Use it when setup-level errors appear, such as a missing provider or socket_path_too_long. Returns a list of {name, ok, detail} checks; doctor_failed lists them all when one fails.",
             schema(json!({}), &[])),
+        tool("stack_errors", "List error codes", annotations("List error codes", true, None, true, false),
+            "List every error code Stack can return. Use it to learn what a code means and what fixes it without the docs. Returns each code's meaning, default hint, whether retrying the same call unchanged can succeed (retryable), and the operations that fix it (next).",
+            machine_wide_schema(json!({}), &[], REPORTED_DIR)),
     ])
 }
 
 /// Run one `tools/call`. `roots` are the client's MCP roots: `None` when it offers none.
 fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
-    let call = crate::contract::Call::new(name.strip_prefix("stack_").unwrap_or(name));
+    let mut call = crate::contract::Call::new(name.strip_prefix("stack_").unwrap_or(name));
     let mut resolved = None;
     let outcome = validate(name, &params["arguments"])
         .and_then(|args| {
@@ -442,6 +447,7 @@ fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
             dispatch(name, &args, &ctx(resolved.as_deref()))
         })
         .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
+    call.dir = resolved.clone();
     let mut envelope = call.outcome(&outcome);
     // Which checkout the call acted on, so a wrong one shows in every result.
     if let Some(project) = &resolved {
@@ -650,6 +656,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             crate::fleet::mv(&ctx.state, &ctx.root, path("from")?, path("to")?).map(to_value)
         }
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
+        "stack_errors" => Ok(crate::error::registry_json()),
         "stack_exec" => exec(args, ctx),
         "stack_run" => run(args, ctx),
         _ => Err(StackError::new(

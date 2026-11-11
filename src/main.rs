@@ -295,6 +295,12 @@ enum Cmd {
     },
     /// Check that mise, git and tar are usable and the project compiles
     Doctor,
+    /// List every error code with its meaning, default hint and whether a retry can succeed
+    Errors {
+        /// Print docs/user/errors.md instead
+        #[arg(long)]
+        markdown: bool,
+    },
     /// Serve the stack tools over MCP (stdio)
     Mcp,
     /// Save, restore, list or remove snapshots of service data, shared by every checkout of
@@ -376,6 +382,18 @@ fn main() -> ExitCode {
         print!("{}", stack::shell::hook(*tool));
         return ExitCode::SUCCESS;
     }
+    if let Cmd::Errors { markdown } = cli.cmd {
+        if markdown {
+            print!("{}", stack::error::registry_markdown());
+            return ExitCode::SUCCESS;
+        }
+        return emit(cli.json, &stack::error::registry_json(), || {
+            for i in stack::error::REGISTRY {
+                println!("{:<22} {}{}", i.code, i.meaning, if i.retryable { " (retryable)" } else { "" });
+                println!("{:<22} hint: {}", "", i.hint);
+            }
+        });
+    }
     // Without -C, the nearest stack.toml at or above the working directory. Commands then run
     // in the caller's directory, as they did before when it held stack.toml.
     let (root, discovery) = match &cli.dir {
@@ -392,6 +410,7 @@ fn main() -> ExitCode {
     let child_dir = discovery.as_ref().map(|d| d.from.clone()).filter(|from| *from != root);
     // Steps as they start and end, for people at a terminal only.
     let _progress = (!cli.json && !cli.quiet).then(stack::progress::Terminal::if_tty).flatten().map(stack::progress::observe);
+    update_call(|c| c.dir = Some(root.clone()));
     let ctx = Ctx { root: root.clone(), cache: default_cache_dir(), state: default_state_dir() };
     let opts = |mode, write, reassign_ports| Options {
         root: root.clone(),
@@ -641,7 +660,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Mcp => unreachable!("handled above"),
+        Cmd::Mcp | Cmd::Errors { .. } => unreachable!("handled above"),
         Cmd::Snapshot { action } => snapshot(&ctx, cli.json, action),
     };
     // Without -C, a missing stack.toml says where the search looked.
@@ -1136,7 +1155,7 @@ fn fail(as_json: bool, e: StackError) -> ExitCode {
 /// An error for people, on stderr: the message, then the hint and details that say what to do.
 fn print_error(e: &StackError) {
     eprintln!("error[{}]: {}", e.code, e.message);
-    if let Some(hint) = &e.hint {
+    if let Some(hint) = e.effective_hint() {
         eprintln!("  hint: {hint}");
     }
     for d in &e.details {

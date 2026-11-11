@@ -20,7 +20,7 @@ supports MCP roots and exposes exactly one: the server asks for `roots/list` aft
 `initialize` (and again on `notifications/roots/list_changed`) and uses that root. Otherwise a
 call without `dir`, or with a relative one, fails with a `usage` error. Every result carries
 the checkout it acted on as `project`, an absolute path. `stack_gc`, `stack_ps` and `stack_mv`
-act machine-wide and need no `dir`.
+act machine-wide and need no `dir`, as does `stack_errors`.
 
 | Tool | Does |
 |---|---|
@@ -37,12 +37,13 @@ act machine-wide and need no `dir`.
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
 | `stack_init` | Writes a starting `stack.toml` (`tools`, `services`), like `stack init` |
 | `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapshot_list`, `stack_snapshot_rm` | Save a checkout's Postgres and Redis data and restore it in any checkout of the project, like `stack snapshot` ([service data](data.md)) |
+| `stack_errors` | Lists every [error code](errors.md): its meaning, default hint, `retryable` and `next` (CLI: `stack errors`) |
 | `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
 
 Each tool has a `title`, a short description that says when to use it, a description for
 every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
-`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps`, `stack_env` and
-`stack_snapshot_list`, `destructiveHint` for `stack_down`, `stack_gc`, `stack_snapshot_restore`
+`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps`, `stack_env`,
+`stack_errors` and `stack_snapshot_list`, `destructiveHint` for `stack_down`, `stack_gc`, `stack_snapshot_restore`
 and `stack_snapshot_rm`, and `idempotentHint` for those that are
 safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
 
@@ -145,6 +146,15 @@ and `duration_ms` how long the call took:
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
   `error.hint`. `error.details` carries the specifics. The CLI exits 70 (124 for
   `timed_out`); see [exit codes](commands.md#exit-codes).
+- Every `error.code` is listed in [error codes](errors.md); `stack errors --json` (MCP
+  `stack_errors`) returns the list. `error.retryable` says whether repeating the same call
+  unchanged can succeed (`lock_busy`, `timed_out`) or something must change first
+  (`no_session`, `lock_outdated`). An error raised without a hint of its own carries the
+  code's default.
+- Where the fix is unambiguous, `error.next` lists it as data, with this checkout's directory
+  filled in: `{"command": ["stack", "-C", "/abs/app", "up"], "tool": "stack_up", "args":
+  {"dir": "/abs/app"}}`. Run `command` from a shell, or call `tool` with `args` over MCP.
+  `tool` is `null` for operations MCP does not serve (`setup`).
 - A bad argument is `usage` with a hint, whether the parser or Stack itself rejected it (an
   unknown flag, `--ttl banana`, `--timeout 1ms`), and the CLI exits 2 for it.
 - `exec` and `run` capture at most 64 KiB of each output stream and keep the end.

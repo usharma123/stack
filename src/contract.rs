@@ -2,6 +2,7 @@
 
 use crate::error::StackError;
 use serde_json::{Map, Value};
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// Version of the envelope and result shapes. Raised on an incompatible change.
@@ -41,17 +42,19 @@ pub fn child_exit(code: Option<i64>, signal: Option<i64>) -> u8 {
     }
 }
 
-/// One call being answered: what it was and since when.
+/// One call being answered: what it was, where, and since when.
 #[derive(Debug, Clone)]
 pub struct Call {
     /// The operation: a CLI subcommand, or an MCP tool's name without `stack_`.
     pub command: String,
+    /// The canonical project directory, once known. Fills in `error.next`.
+    pub dir: Option<PathBuf>,
     pub started: Instant,
 }
 
 impl Call {
     pub fn new(command: impl Into<String>) -> Self {
-        Self { command: command.into(), started: Instant::now() }
+        Self { command: command.into(), dir: None, started: Instant::now() }
     }
 
     fn head(&self, ok: bool, passed: bool) -> Map<String, Value> {
@@ -72,10 +75,16 @@ impl Call {
         Value::Object(envelope)
     }
 
-    /// `{ok: false, passed: false, command, stack_version, schema, duration_ms, error}`.
+    /// `{ok: false, passed: false, command, stack_version, schema, duration_ms, error}`, with
+    /// `error.next` filled in from the registry for this project directory.
     pub fn failure(&self, e: &StackError) -> Value {
+        let mut error = serde_json::to_value(e).expect("errors serialize");
+        let next = e.next(self.dir.as_deref());
+        if !next.is_empty() {
+            error["next"] = Value::Array(next);
+        }
         let mut envelope = self.head(false, false);
-        envelope.insert("error".into(), serde_json::to_value(e).expect("errors serialize"));
+        envelope.insert("error".into(), error);
         Value::Object(envelope)
     }
 
@@ -123,13 +132,16 @@ mod tests {
         assert_eq!(ok["stack_version"], env!("CARGO_PKG_VERSION"));
         assert!(ok["duration_ms"].is_u64());
         assert_eq!(ok["data"]["checks"], json!([]), "the result is kept whole");
-        let call = Call::new("exec");
+        let mut call = Call::new("exec");
         assert_eq!(call.success(json!({ "exit_code": 0 }))["passed"], true);
         assert_eq!(call.success(json!({ "exit_code": 7 }))["passed"], false);
         assert_eq!(call.success(json!({ "exit_code": null, "signal": 9 }))["passed"], false);
+        call.dir = Some(PathBuf::from("/p"));
         let failed = call.failure(&StackError::new("no_session", "none"));
         assert_eq!((failed["ok"].as_bool(), failed["passed"].as_bool()), (Some(false), Some(false)));
         assert_eq!(failed["error"]["code"], "no_session");
+        assert_eq!(failed["error"]["next"][0]["command"], json!(["stack", "-C", "/p", "up"]));
+        assert_eq!(failed["error"]["retryable"], false);
         assert_eq!(Call::new("down").success(json!({}))["passed"], true);
     }
 }

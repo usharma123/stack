@@ -7784,3 +7784,24 @@ fn every_envelope_describes_itself_and_says_whether_it_passed() {
     assert_self_described(&results[1]["structuredContent"], "inspect");
     assert_eq!(results[1]["structuredContent"]["passed"], true);
 }
+
+#[test]
+fn every_error_code_is_registered_with_a_hint_a_retry_flag_and_next_steps() {
+    let fixture = Fixture::new();
+    let listed = json_result(&fixture.ok(&["--json", "errors"]));
+    let codes = listed["data"].as_array().unwrap();
+    let no_session = codes.iter().find(|i| i["code"] == "no_session").unwrap();
+    assert_eq!(no_session["retryable"], false, "{no_session}");
+    assert!(no_session["hint"].as_str().is_some_and(|h| h.contains("stack up")), "{no_session}");
+    assert_eq!(fixture.ok(&["errors", "--markdown"]).stdout, fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/user/errors.md")).unwrap());
+
+    // A failure names the operation that fixes it, in this checkout, for the CLI and for MCP.
+    let failed = json_result(&fixture.command(&["--json", "restart"]).output().unwrap());
+    let app = fixture.dir.path().join("app").canonicalize().unwrap().display().to_string();
+    assert_eq!(failed["error"]["code"], "no_session", "{failed}");
+    assert_eq!(failed["error"]["retryable"], false, "{failed}");
+    assert_eq!(failed["error"]["next"], json!([{ "command": ["stack", "-C", app, "up"], "tool": "stack_up", "args": { "dir": app } }]), "{failed}");
+    let results = fixture.mcp(&[("stack_restart", json!({})), ("stack_errors", json!({}))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["next"], failed["error"]["next"], "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["data"], listed["data"], "{}", results[1]);
+}
