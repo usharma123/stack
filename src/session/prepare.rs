@@ -1,8 +1,9 @@
-//! Fewer round-trips: what `exec` and `run` do before planning, which the caller would
-//! otherwise run and retry after an error.
+//! Fewer round-trips: what `exec` and `run` do before planning (`--up`, `--install`), which
+//! the caller would otherwise run and retry after an error.
 
-use super::{status, up, Ctx, ExecPlan, LeaseOptions, StatusReport, DEFAULT_STARTUP_TIMEOUT};
+use super::{install, status, up, Ctx, ExecPlan, LeaseOptions, StatusReport, DEFAULT_STARTUP_TIMEOUT};
 use crate::error::{Result, StackError};
+use crate::provider::scratch;
 use crate::state::pid_alive;
 use serde_json::{json, Value};
 
@@ -14,6 +15,8 @@ pub struct Prepare {
     pub up: bool,
     /// `--ttl` with `--up`: the lease of a session `up` records.
     pub ttl_secs: Option<u64>,
+    /// `--install`: install pinned tools that are missing instead of failing.
+    pub install: bool,
 }
 
 /// Run what `prepare` asks, then `plan`. What ran is attached to the plan as `prepared`.
@@ -21,6 +24,9 @@ pub fn plan_prepared(ctx: &Ctx, prepare: Prepare, plan: impl FnOnce() -> Result<
     let mut prepared = Vec::new();
     if prepare.up {
         prepared.extend(up_if_needed(ctx, prepare.ttl_secs)?);
+    }
+    if prepare.install {
+        prepared.extend(install_if_missing(ctx)?);
     }
     let mut plan = plan()?;
     plan.prepared = prepared;
@@ -72,4 +78,17 @@ fn up_if_needed(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Option<Value>> {
         "lease": crate::lease::LeaseSummary::of(started.session.lease.as_ref()),
         "warnings": started.warnings,
     })))
+}
+
+/// `--install`: `stack install` when a pinned release is not installed, else nothing.
+fn install_if_missing(ctx: &Ctx) -> Result<Option<Value>> {
+    let report = ctx.compile(false)?;
+    let pins = report.lock.as_ref().map(scratch::pins).unwrap_or_default();
+    let missing = scratch::not_installed(&ctx.cache, &pins)?;
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let names: Vec<String> = missing.iter().map(|p| format!("{}@{}", p.tool, p.spec.version)).collect();
+    let installed = install(ctx)?;
+    Ok(Some(json!({ "step": "install", "missing": names, "warnings": installed.warnings })))
 }

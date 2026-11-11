@@ -133,6 +133,9 @@ enum Cmd {
         /// With --up: the lease of a session `up` records (default: keep the current lease)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
+        /// Install pinned tools that are missing instead of failing with tools_not_installed
+        #[arg(long)]
+        install: bool,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
@@ -373,7 +376,7 @@ fn main() -> ExitCode {
             });
             if healthy { code } else { ExitCode::FAILURE }
         }),
-        Cmd::Exec { require, require_all, timeout, secret, up, ttl, cmd } => {
+        Cmd::Exec { require, require_all, timeout, secret, up, ttl, install, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -381,13 +384,13 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            prepare(*up, ttl.as_deref()).and_then(|prepare| {
+            prepare(*up, ttl.as_deref(), *install).and_then(|prepare| {
                 run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
                     session::plan_prepared(&ctx, prepare, || session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured }))
                 })
             })
         }
-        Cmd::Run { task, timeout, up, ttl, args } => prepare(*up, ttl.as_deref()).and_then(|prepare| {
+        Cmd::Run { task, timeout, up, ttl, args } => prepare(*up, ttl.as_deref(), false).and_then(|prepare| {
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
                 session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
             })
@@ -494,10 +497,10 @@ fn subcommand() -> String {
         .unwrap_or_default()
 }
 
-/// `--up` and `--ttl` of `exec` and `run`, checked before anything runs.
-fn prepare(up: bool, ttl: Option<&str>) -> Result<session::Prepare> {
+/// `--up`, `--ttl` and `--install` of `exec` and `run`, checked before anything runs.
+fn prepare(up: bool, ttl: Option<&str>, install: bool) -> Result<session::Prepare> {
     let ttl_secs = ttl.map(parse_duration).transpose()?;
-    Ok(session::Prepare { up, ttl_secs })
+    Ok(session::Prepare { up, ttl_secs, install })
 }
 
 /// `--owner-pid`: a process ID or `ancestor:<name>`, checked as an argument (exit 2).
@@ -730,8 +733,10 @@ fn warn_changed(checks: &[session::Check]) {
 
 fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
     for step in &plan.prepared {
-        if step["step"] == "up" {
-            eprintln!("stack: ran `stack up` first ({})", step["reason"].as_str().unwrap_or("unknown"));
+        match step["step"].as_str() {
+            Some("up") => eprintln!("stack: ran `stack up` first ({})", step["reason"].as_str().unwrap_or("unknown")),
+            Some("install") => eprintln!("stack: installed missing pins first: {}", step["missing"]),
+            _ => {}
         }
     }
     warn_unverified(&plan.checks);

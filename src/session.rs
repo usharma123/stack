@@ -3994,7 +3994,7 @@ fn require_installed(missing: &[scratch::Pin]) -> Result<()> {
         "tools_not_installed",
         format!("pinned release(s) not installed: {}", names.join(", ")),
     )
-    .hint("run `stack install`; exec does not fall back to another release on PATH")
+    .hint("run `stack install`, or repeat with `stack exec --install` (MCP `install: true`); exec does not fall back to another release on PATH")
     .details(missing.iter().map(|p| json!({ "tool": p.tool, "version": p.spec.version })).collect()))
 }
 

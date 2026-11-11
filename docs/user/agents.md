@@ -61,8 +61,9 @@ stack down                               # before you finish or remove the check
 
 To save a round-trip, `stack exec --up -- <command>` and `stack run --up <task>` start the
 stack first when it needs it (no session, a stale or expired one, or a service that does not
-verify). Over MCP these are `up` and `ttl` on `stack_exec` and `stack_run`; what ran is listed
-under `prepared`.
+verify), and `stack exec --install` installs missing pinned tools instead of failing with
+`tools_not_installed`. Over MCP these are `up`, `ttl` and `install` on `stack_exec` and
+`stack_run`; what ran is listed under `prepared`.
 
 A few things that are easy to get wrong:
 

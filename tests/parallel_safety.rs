@@ -603,3 +603,23 @@ fn exec_up_starts_the_stack_only_when_needed_and_keeps_the_lease() {
     assert_eq!(saved_session(&fixture)["lease"]["ttl_secs"], 3600);
     fixture.ok(&["down"]);
 }
+
+#[test]
+fn exec_install_installs_missing_pins_instead_of_failing() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.8.2'\n");
+    let out = fixture.command(&["--json", "exec", "--", "true"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "tools_not_installed");
+    assert!(error["hint"].as_str().unwrap().contains("--install"), "{error}");
+
+    let result = json_result(&fixture.ok(&["--json", "exec", "--install", "--", "true"]));
+    assert_eq!(result["data"]["exit_code"], 0, "{result}");
+    assert_eq!(result["data"]["prepared"][0]["step"], "install", "{result}");
+    assert_eq!(result["data"]["prepared"][0]["missing"], json!(["jq@1.8.2"]));
+    // Installed now: the flag does nothing more.
+    let result = json_result(&fixture.ok(&["--json", "exec", "--install", "--", "true"]));
+    assert!(result["data"].get("prepared").is_none(), "{result}");
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["true"], "install": true })), ("stack_run", json!({ "task": "t", "install": true }))]);
+    assert_eq!(results[0]["data"]["exit_code"], 0, "{}", results[0]);
+    assert_eq!(results[1]["error"]["code"], "usage", "stack_run installs a task's pins itself: {}", results[1]);
+}

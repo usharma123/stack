@@ -11,7 +11,7 @@
 | `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
-| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] -- <cmd>` | Run a command with the stack's tools and env |
+| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
@@ -190,6 +190,9 @@ Runs a command with the stack's tools and environment, in the project directory.
   it a new one. `up` gets what is left of `--timeout`, at most its usual 10 minutes. What it
   did is listed under `prepared` in the `--json` result (`step` `up`, with the `reason`), and
   on stderr otherwise; nothing appears when it did not run.
+- `--install` installs pinned tools that are missing, as `stack install` would, instead of
+  failing with `tools_not_installed`. It is listed under `prepared` too (`step` `install`,
+  with the `missing` pins), only when it ran.
 
 ## run
 

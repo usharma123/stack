@@ -316,7 +316,7 @@ fn tool_definitions() -> Value {
                 "timeout": duration_schema("Time the whole startup may take")
             }), &[])),
         tool("stack_install", "Install pinned tools", annotations("Install pinned tools", false, Some(false), true, true),
-            "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed). A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
+            "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed) unless given install. A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
             schema(json!({}), &[])),
         tool("stack_restart", "Restart services", annotations("Restart services", false, Some(false), false, false),
             "Restart services of the running session (all when services is omitted) and verify the whole stack again. Use it after editing code a running service loaded, files under its `watch` included: watching only reports changes, it never reloads. changed: true restarts just the services whose watched files changed. Fails with session_stale after a configuration change (use stack_up).",
@@ -346,7 +346,8 @@ fn tool_definitions() -> Value {
                 "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs; or give `timeout`" },
                 "timeout": duration_schema("Time the whole call may take, planning included, before the command is killed"),
                 "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
-                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease)" }
+                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease)" },
+                "install": { "type": "boolean", "description": "Install pinned tools that are missing (as stack_install would) instead of failing with tools_not_installed; data.prepared lists them" }
             }), &["command"])),
         tool("stack_run", "Run a task", annotations("Run a task", false, None, false, true),
             "Run a task declared in stack.toml ([tasks.<name>]) through mise once every service verifies, capturing output like stack_exec. Use it for the project's own tasks, such as tests; use stack_exec for commands that should run with services down. The task gets exactly the secrets it declares, redacted from its output. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
@@ -637,14 +638,14 @@ fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
     let command = strings(args, "command")?;
     let secrets = strings(args, "secrets")?;
     let require = if args["require_all"] == true { Require::All } else { Require::Only(strings(args, "require")?) };
-    let prepare = prepare(args)?;
+    let prepare = prepare(args, args["install"] == true)?;
     captured(args, ctx, || session::plan_prepared(ctx, prepare, || session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true })))
 }
 
-/// `up` and `ttl` of `stack_exec` and `stack_run`, checked before anything runs.
-fn prepare(args: &Value) -> Result<session::Prepare> {
+/// `up`, `ttl` and (`stack_exec` only) `install`, checked before anything runs.
+fn prepare(args: &Value, install: bool) -> Result<session::Prepare> {
     let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
-    Ok(session::Prepare { up: args["up"] == true, ttl_secs })
+    Ok(session::Prepare { up: args["up"] == true, ttl_secs, install })
 }
 
 /// An array-of-strings argument: omitted (or `null`) is empty, and anything else is refused
@@ -663,7 +664,7 @@ fn strings(args: &Value, key: &str) -> Result<Vec<String>> {
 fn run(args: &Value, ctx: &Ctx) -> Result<Value> {
     let task = args["task"].as_str().ok_or_else(|| StackError::new("usage", "task is required"))?;
     let extra = strings(args, "args")?;
-    let prepare = prepare(args)?;
+    let prepare = prepare(args, false)?;
     captured(args, ctx, || session::plan_prepared(ctx, prepare, || session::plan_task(ctx, task, &extra, true)))
 }
 

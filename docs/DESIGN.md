@@ -94,7 +94,8 @@ output (mise's answer when no release matches) is an error, not a version.
   removes the session while reservations persist, so "no session" does not mean "never used".
 - **Fewer round-trips.** `exec`/`run --up` run a live `status` first and `up` only when it finds
   no session, a launching, stale or expired one, or a service that does not verify; the lease is
-  carried over unless `--ttl` is given. This happens before planning, outside the plan's lock,
+  carried over unless `--ttl` is given. `exec --install` runs `install` when a pin is missing.
+  Both happen before planning, outside the plan's lock,
   within the call's deadline.
 - **Generations.** A session fingerprints the composed configuration except its tasks, the
   bundle lock and the assigned ports. Tasks change what `run` runs, never a service, so editing
