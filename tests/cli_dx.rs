@@ -156,3 +156,13 @@ fn mcp_dir_means_exactly_that_directory_and_never_the_servers_own() {
     assert_eq!(replies[1]["project"], deep.to_str().unwrap());
     assert_eq!(replies[2]["error"]["code"], "usage", "{}", replies[2]);
 }
+
+#[test]
+fn lifecycle_progress_stays_off_pipes() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    for args in [&["install"][..], &["compile"], &["--quiet", "install"], &["-q", "compile"]] {
+        let out = fixture.ok(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("stack: install") && !stderr.contains("stack: compile"), "{args:?}: {stderr}");
+    }
+}

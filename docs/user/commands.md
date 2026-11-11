@@ -23,8 +23,8 @@
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
 | `stack mcp` | Serve these operations over MCP (stdio); see [coding agents](agents.md) |
 
-Every command accepts `-C <dir>` (the project directory) and `--json` (one result object on
-stdout; see [reading results](agents.md#reading-results)).
+Every command accepts `-C <dir>` (the project directory), `--json` (one result object on
+stdout; see [reading results](agents.md#reading-results)) and `--quiet` (`-q`).
 
 **Finding the project.** Without `-C`, Stack uses the nearest `stack.toml` at or above the
 working directory. It searches no higher than the Git worktree root (the directory holding
@@ -32,6 +32,11 @@ working directory. It searches no higher than the Git worktree root (the directo
 `stack.toml` is never picked up by mistake. If none is found, `manifest_missing` says where it
 looked and suggests `stack init`, which then writes one in the working directory. With `-C`,
 Stack uses exactly that directory and searches nothing.
+
+**Progress.** On a terminal, `compile`, `install`, `up` and `restart` print each step to stderr
+as it starts and ends (`stack: install ...`, `stack: install ok (41.2s)`). Nothing is printed
+with `--json`, `--quiet`, or when stderr is not a terminal. `NO_COLOR` turns off the coloured
+`ok`/`FAIL` markers.
 
 ## init
 

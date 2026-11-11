@@ -1,11 +1,14 @@
 //! Lifecycle progress as it happens. The lifecycle (`up`, `install`, `restart`) reports each
-//! step to whatever observer the calling thread installed, if any: anything that implements
-//! [`Observer`], such as the MCP server's progress notifier (through a [`Sink`]). Without an
-//! observer nothing is reported, and results are unchanged either way.
+//! step to whatever observer the calling thread installed, if any: the [`Terminal`] printer
+//! for people, or anything else that implements [`Observer`], such as the MCP server's progress
+//! notifier (through a [`Sink`]). Without an observer nothing is reported, and results are
+//! unchanged either way.
 
 use serde_json::Value;
 use std::cell::RefCell;
+use std::io::{IsTerminal, Write};
 use std::rc::Rc;
+use std::time::Instant;
 
 /// Where a step is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +101,58 @@ pub fn scope(sink: Option<Sink>) -> Scope {
     Scope { previous: CURRENT.with(|c| c.replace(observer)) }
 }
 
+/// Progress for people on stderr: one line when a step starts, one when it ends.
+pub struct Terminal {
+    color: bool,
+    started: RefCell<Vec<(String, Instant)>>,
+}
+
+impl Terminal {
+    /// A printer when stderr is a terminal; `None` otherwise (pipes and files stay clean).
+    pub fn if_tty() -> Option<Self> {
+        std::io::stderr().is_terminal().then(|| Self::new(color_allowed()))
+    }
+
+    pub fn new(color: bool) -> Self {
+        Self { color, started: RefCell::new(Vec::new()) }
+    }
+
+    fn render(&self, event: &Event<'_>) -> String {
+        let elapsed = {
+            let mut started = self.started.borrow_mut();
+            match event.phase {
+                Phase::Started => {
+                    started.push((event.step.to_string(), Instant::now()));
+                    None
+                }
+                _ => started.iter().rposition(|(s, _)| s == event.step).map(|i| started.remove(i).1.elapsed()),
+            }
+        };
+        let paint = |text: &str, code: &str| if self.color { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_string() };
+        let took = elapsed.map(|d| format!(" ({:.1}s)", d.as_secs_f64())).unwrap_or_default();
+        match event.phase {
+            Phase::Started => format!("stack: {} ...", event.step),
+            Phase::Ok => format!("stack: {} {}{took}", event.step, paint("ok", "32")),
+            Phase::Warning => format!("stack: {} {}{took}", event.step, paint("warning", "33")),
+            Phase::Failed => {
+                format!("stack: {} {}{took}{}", event.step, paint("FAIL", "31"), event.code.map(|c| format!(" [{c}]")).unwrap_or_default())
+            }
+        }
+    }
+}
+
+impl Observer for Terminal {
+    fn step(&self, event: &Event<'_>) {
+        let line = self.render(event);
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+/// Colour only on a terminal, and never when `NO_COLOR` is set to anything non-empty.
+pub fn color_allowed() -> bool {
+    std::env::var_os("NO_COLOR").map_or(true, |v| v.is_empty()) && std::io::stderr().is_terminal()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +189,18 @@ mod tests {
         }
         started("verify");
         assert_eq!(*seen.lock().unwrap(), ["install started", "install failed"]);
+    }
+
+    #[test]
+    fn the_terminal_printer_marks_outcomes_without_colour_when_asked() {
+        let t = Terminal::new(false);
+        assert_eq!(t.render(&Event { step: "compile", phase: Phase::Started, code: None, detail: None }), "stack: compile ...");
+        let done = t.render(&Event { step: "compile", phase: Phase::Ok, code: None, detail: None });
+        assert!(done.starts_with("stack: compile ok ("), "{done}");
+        let failed = t.render(&Event { step: "start", phase: Phase::Failed, code: Some("start_failed"), detail: None });
+        assert_eq!(failed, "stack: start FAIL [start_failed]");
+        assert!(!failed.contains('\x1b'));
+        let coloured = Terminal::new(true).render(&Event { step: "x", phase: Phase::Ok, code: None, detail: None });
+        assert!(coloured.contains("\x1b[32mok\x1b[0m"), "{coloured}");
     }
 }

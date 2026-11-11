@@ -25,6 +25,9 @@ struct Cli {
     /// Machine-readable output: a single JSON object on stdout
     #[arg(long, global = true)]
     json: bool,
+    /// No progress lines on stderr while lifecycle commands run
+    #[arg(short, long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -268,6 +271,8 @@ fn main() -> ExitCode {
     };
     // `exec` runs its command where it was called from when the project was found above it.
     let child_dir = discovery.as_ref().map(|d| d.from.clone()).filter(|from| *from != root);
+    // Steps as they start and end, for people at a terminal only.
+    let _progress = (!cli.json && !cli.quiet).then(stack::progress::Terminal::if_tty).flatten().map(stack::progress::observe);
     let ctx = Ctx { root: root.clone(), cache: default_cache_dir(), state: default_state_dir() };
     let opts = |mode, write, reassign_ports| Options {
         root: root.clone(),
@@ -289,7 +294,15 @@ fn main() -> ExitCode {
         }),
         Cmd::Compile { update, locked, reassign_ports } => {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
-            project::compile(&opts(mode, true, *reassign_ports)).map(|mut r| {
+            stack::progress::started("compile");
+            let compiled = project::compile(&opts(mode, true, *reassign_ports));
+            stack::progress::notify(stack::progress::Event {
+                step: "compile",
+                phase: if compiled.is_ok() { stack::progress::Phase::Ok } else { stack::progress::Phase::Failed },
+                code: compiled.as_ref().err().map(|e| e.code),
+                detail: None,
+            });
+            compiled.map(|mut r| {
                 r.attach_skills(&ctx.cache, false);
                 report(cli.json, &r)
             })
