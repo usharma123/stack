@@ -7,7 +7,7 @@ use stack::mcp::{self, parse_duration};
 use stack::oci::{self, Reference};
 use stack::project::{self, default_cache_dir, Options, Report};
 use stack::compose::LoadedBundle;
-use stack::contract::Call;
+use stack::contract::{self, Call};
 use stack::secrets::Grant;
 use stack::session::{self, Ctx, LeaseOptions, Require};
 use stack::source::Mode;
@@ -364,7 +364,7 @@ fn main() -> ExitCode {
     update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
-            Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
+            Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from(contract::child_exit(None, Some(signal.into())))),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
     }
@@ -536,7 +536,7 @@ fn main() -> ExitCode {
                 }
                 warn_changed(&r.checks);
             });
-            if healthy { code } else { ExitCode::FAILURE }
+            if healthy { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
         }),
         Cmd::Exec { require, require_all, timeout, secret, up, ttl, install, cmd } => {
             let req = if *require_all {
@@ -651,22 +651,17 @@ fn main() -> ExitCode {
     });
     match result {
         Ok(code) => code,
-        // Like `timeout(1)`, and like `exec --timeout`.
-        Err(e) if e.code == "timed_out" => {
-            fail(cli.json, e);
-            ExitCode::from(124)
-        }
+        // `fail` gives `timed_out` 124, like `timeout(1)` and `exec --timeout`.
         // A start the caller's signal cancelled ends as that signal would have ended it.
         Err(e) if e.code == "cancelled" => {
             let signal = stack::process::passed_on().unwrap_or(15);
             fail(cli.json, e);
-            ExitCode::from((128 + signal) as u8)
+            ExitCode::from(contract::child_exit(None, Some(signal.into())))
         }
         // Like an argument error clap rejects: the same code, a hint, and exit 2.
         Err(e) if e.code == "usage" => {
             let help = format!("run `stack {} --help` for usage", subcommand());
-            fail(cli.json, mcp::with_usage_hint(e, &help));
-            ExitCode::from(2)
+            fail(cli.json, mcp::with_usage_hint(e, &help))
         }
         Err(e) => fail(cli.json, e),
     }
@@ -868,7 +863,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
         use std::io::Write;
         let _ = std::io::stdout().flush();
         if max_passes.is_some_and(|max| pass >= max) {
-            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(contract::exit::ERROR) });
         }
         std::thread::sleep(Duration::from_secs(interval));
     }
@@ -1042,12 +1037,12 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
             let (code, timed_out) = stack::process::run_with_deadline(&mut command, stack::process::bounded(timeout)).map_err(start_error)?;
             if timed_out {
                 eprintln!("stack: command did not finish within {}s and was killed", timeout.as_secs());
-                return Ok(ExitCode::from(124));
+                return Ok(ExitCode::from(contract::exit::TIMED_OUT));
             }
             code
         }
     };
-    Ok(ExitCode::from(code.unwrap_or(1).clamp(0, 255) as u8))
+    Ok(ExitCode::from(contract::child_exit(code.map(i64::from), None)))
 }
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
@@ -1058,10 +1053,10 @@ fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) 
     let result = mcp::run_and_finish(ctx, &mut plan, timeout)?;
     if result["timed_out"] == true {
         println!("{}", call().failure(&mcp::timed_out(timeout, result, "raise --timeout")));
-        return Ok(ExitCode::from(124));
+        return Ok(ExitCode::from(contract::exit::TIMED_OUT));
     }
     // Like a shell: a command ended by a signal reports 128 + its number.
-    let code = result["exit_code"].as_i64().or_else(|| result["signal"].as_i64().map(|s| 128 + s)).unwrap_or(1).clamp(0, 255) as u8;
+    let code = contract::child_exit(result["exit_code"].as_i64(), result["signal"].as_i64());
     println!("{}", call().success(result));
     Ok(ExitCode::from(code))
 }
@@ -1099,8 +1094,7 @@ fn usage_error(e: clap::Error) -> ExitCode {
         e.exit();
     }
     let (message, hint) = usage_text(&e.render().to_string());
-    fail(true, StackError::new("usage", message).hint(hint));
-    ExitCode::from(2)
+    fail(true, StackError::new("usage", message).hint(hint))
 }
 
 /// clap's rendered error as one message and a hint: the error with the lines that continue it
@@ -1129,13 +1123,14 @@ fn usage_text(rendered: &str) -> (String, String) {
     (message, hint.join("; "))
 }
 
+/// Report `e` and return its exit code: 2 for `usage`, 124 for `timed_out`, 70 otherwise.
 fn fail(as_json: bool, e: StackError) -> ExitCode {
     if as_json {
         println!("{}", call().failure(&e));
     } else {
         print_error(&e);
     }
-    ExitCode::FAILURE
+    ExitCode::from(contract::error_exit(&e))
 }
 
 /// An error for people, on stderr: the message, then the hint and details that say what to do.

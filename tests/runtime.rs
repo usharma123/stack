@@ -3848,7 +3848,7 @@ fn every_gc_mode_shows_the_recovery_commands() {
     let commands = [recovery["inspect"].as_str().unwrap(), recovery["stop"].as_str().unwrap()];
     for args in [&["gc"][..], &["gc", "--watch", "--max-passes", "1"], &["gc", "--watch", "--max-passes", "1", "--json"]] {
         let out = fixture.command_at(fixture.dir.path(), args).output().unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(out.status.code(), Some(70), "{args:?}: a Stack error exits 70");
         // People read stderr; with --json, each pass is one object on stdout.
         let shown = match args.contains(&"--json") {
             true => serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["hint"].as_str().unwrap().to_string(),
@@ -7762,7 +7762,9 @@ fn every_envelope_describes_itself_and_says_whether_it_passed() {
     assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(true)), "{result}");
 
     // Stack's own failure, and an argument clap refused, name the command too.
-    let result = json_result(&fixture.command(&["--json", "restart"]).output().unwrap());
+    let out = fixture.command(&["--json", "restart"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(70), "a Stack error exits 70");
+    let result = json_result(&out);
     assert_self_described(&result, "restart");
     assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(false), Some(false)), "{result}");
     let out = fixture.command(&["--json", "logs", "--tail", "many"]).output().unwrap();

@@ -143,7 +143,8 @@ and `duration_ms` how long the call took:
   `data.checks` saying which service and why: a sentence in `reason` and a stable
   [`reason_code`](commands.md#reason-codes) to branch on. The CLI exits 1.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
-  `error.hint`. `error.details` carries the specifics.
+  `error.hint`. `error.details` carries the specifics. The CLI exits 70 (124 for
+  `timed_out`); see [exit codes](commands.md#exit-codes).
 - A bad argument is `usage` with a hint, whether the parser or Stack itself rejected it (an
   unknown flag, `--ttl banana`, `--timeout 1ms`), and the CLI exits 2 for it.
 - `exec` and `run` capture at most 64 KiB of each output stream and keep the end.

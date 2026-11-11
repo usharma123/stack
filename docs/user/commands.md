@@ -43,6 +43,22 @@ as it starts and ends (`stack: install ...`, `stack: install ok (41.2s)`). Nothi
 with `--json`, `--quiet`, or when stderr is not a terminal. `NO_COLOR` turns off the coloured
 `ok`/`FAIL` markers.
 
+## Exit codes
+
+| Code | Means |
+|---|---|
+| 0 | Success |
+| 1 | `status` found a service unhealthy (`ok: true, passed: false`) |
+| 2 | Usage error: bad arguments or flag values (`usage`) |
+| 70 | Any other Stack error (`ok: false`); `error.code` says which |
+| 124 | Stack's own deadline passed (`timed_out`) |
+| 128 + N | Signal N cancelled Stack, or ended the command `exec` or `run` ran |
+| any | `exec` and `run` exit with the command's own code |
+
+A command run by `exec` or `run` can itself exit 1, 2, 70 or 124, so the exit code alone
+cannot say who failed. With `--json`, `ok` and `passed` can: `ok: true, passed: false` is the
+command's failure, `ok: false` is Stack's. Through 0.1.22, Stack's own errors exited 1.
+
 ## Which command does what
 
 `compile`, `install` and `up` overlap: each does everything the one before it does, then more.
@@ -417,7 +433,7 @@ with `no_lease`, whose hint says how to give it one.
 
 Stops sessions whose lease expired. For a checkout that was deleted, it drops the session
 once its services are confirmed stopped. `--watch` repeats every `--interval` until stopped (with `--json`, one object per
-pass). Stack runs nothing in the background on its own. For unattended cleanup, run
+pass; after `--max-passes`, the exit code is 70 if the last pass failed). Stack runs nothing in the background on its own. For unattended cleanup, run
 [`stack setup --gc-agent`](#doctor-and-setup), or run `gc --watch` under your own supervisor or
 agent runner.
 

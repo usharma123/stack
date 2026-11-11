@@ -7,6 +7,40 @@ use std::time::Instant;
 /// Version of the envelope and result shapes. Raised on an incompatible change.
 pub const SCHEMA: u32 = 1;
 
+/// Exit codes of the CLI. A command run by `exec`/`run` can exit with any of these numbers
+/// too, so with `--json` the envelope is the unambiguous channel.
+pub mod exit {
+    pub const SUCCESS: u8 = 0;
+    /// The call worked but what it checked is not in the wanted state (`status`).
+    pub const UNHEALTHY: u8 = 1;
+    /// Argument errors (clap's convention).
+    pub const USAGE: u8 = 2;
+    /// Any other Stack error (`ok: false`), like sysexits' EX_SOFTWARE.
+    pub const ERROR: u8 = 70;
+    /// Stack's own deadline passed (`timed_out`), like `timeout(1)`.
+    pub const TIMED_OUT: u8 = 124;
+    /// Added to the number of the signal that ended a command, or that cancelled Stack.
+    pub const SIGNAL_BASE: u8 = 128;
+}
+
+/// The exit code a CLI error gets: 2 for `usage`, 124 for `timed_out`, 70 otherwise.
+pub fn error_exit(e: &StackError) -> u8 {
+    match e.code {
+        "timed_out" => exit::TIMED_OUT,
+        "usage" => exit::USAGE,
+        _ => exit::ERROR,
+    }
+}
+
+/// A command's own exit code, or 128 + the signal that ended it, as a shell reports it.
+pub fn child_exit(code: Option<i64>, signal: Option<i64>) -> u8 {
+    match (code, signal) {
+        (Some(code), _) => code.clamp(0, 255) as u8,
+        (None, Some(signal)) => (i64::from(exit::SIGNAL_BASE) + signal).clamp(0, 255) as u8,
+        (None, None) => exit::ERROR,
+    }
+}
+
 /// One call being answered: what it was and since when.
 #[derive(Debug, Clone)]
 pub struct Call {
@@ -67,6 +101,17 @@ pub fn passed(command: &str, data: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exit_codes_keep_stacks_own_outcomes_apart() {
+        assert_eq!(child_exit(Some(7), None), 7);
+        assert_eq!(child_exit(None, Some(9)), 137);
+        assert_eq!(child_exit(None, Some(15)), 143);
+        assert_eq!(child_exit(Some(300), None), 255);
+        assert_eq!(error_exit(&StackError::new("timed_out", "")), 124);
+        assert_eq!(error_exit(&StackError::new("usage", "")), 2);
+        assert_eq!(error_exit(&StackError::new("no_session", "")), 70);
+    }
 
     #[test]
     fn every_envelope_describes_itself_and_says_whether_it_passed() {
