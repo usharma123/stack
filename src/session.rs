@@ -850,7 +850,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         }
     }
     steps.begin("install");
-    match install_partitioned(ctx, &plan) {
+    match install_partitioned(ctx, &plan, &report) {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
     }
@@ -2307,7 +2307,7 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
         }
     }
     steps.begin("install");
-    match install_partitioned(ctx, &plan) {
+    match install_partitioned(ctx, &plan, &report) {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
     }
@@ -2363,9 +2363,37 @@ fn install_plan(report: &Report) -> Result<InstallPlan> {
     Ok(InstallPlan { artifacts: artifacts::summary(lock, &pins, &platform), partition, everything })
 }
 
+/// Whether every tool the install would name is an exact pin of stack.lock that mise lists as
+/// installed, asked now with one `mise ls --json` naming exactly those pins and their options.
+/// `mise install` checks nothing more of a release already installed (see
+/// [`INSTALL_BOUNDARY`]), so a repeated `up` skips it and saves a provider start per partition.
+/// Anything else, including a question mise could not answer, installs as before, so nothing a
+/// download goes through (checksum, signer, platform variant) is skipped for a missing release.
+fn already_installed(ctx: &Ctx, plan: &InstallPlan, report: &Report) -> bool {
+    let named = || plan.partition.locked.iter().chain(&plan.partition.plain);
+    // A request that names no release (`system`, `path:`, `ref:`) is not a pin: mise decides.
+    let unpinned = report.stack.tools.values().any(|e| mise::unversioned(&e.value.version));
+    if plan.everything || unpinned || named().next().is_none() {
+        return false;
+    }
+    let pins = report.lock.as_ref().map(scratch::pins).unwrap_or_default();
+    named().all(|tool| pins.iter().any(|pin| &pin.tool == tool))
+        && scratch::not_installed(&ctx.cache, &pins).is_ok_and(|missing| missing.is_empty())
+}
+
 /// `mise install --locked` for pins whose coverage here is verified or exempt, then plain
-/// `mise install` for the rest; an empty partition is skipped.
-fn install_partitioned(ctx: &Ctx, plan: &InstallPlan) -> Result<Value> {
+/// `mise install` for the rest; an empty partition is skipped, and so is the whole install
+/// when every pin is already installed (see [`already_installed`]).
+fn install_partitioned(ctx: &Ctx, plan: &InstallPlan, report: &Report) -> Result<Value> {
+    if already_installed(ctx, plan, report) {
+        return Ok(json!({
+            "artifacts": plan.artifacts,
+            "locked": plan.partition.locked,
+            "plain": plan.partition.plain,
+            "boundary": INSTALL_BOUNDARY,
+            "skipped": "every pinned release is already installed",
+        }));
+    }
     if !plan.partition.locked.is_empty() {
         mise::install_tools(&ctx.root, &plan.partition.locked, true)?;
     }

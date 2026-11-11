@@ -132,7 +132,9 @@ whatever release `PATH` holds.
 
 Installs what is missing, starts every service, checks each one and records a session.
 Running it again is safe: a service whose configuration has not changed keeps running, so to
-load code you edited use `restart`.
+load code you edited use `restart`. When every pinned release is already installed, the
+install step is skipped and says so (`skipped` in its detail); a pin that is missing installs
+as usual.
 
 - **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec`, `run`,
   `status` and `renew` extend it). `--owner-pid N` ties it to a process that lives as long as

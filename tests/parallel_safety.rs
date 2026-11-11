@@ -677,3 +677,29 @@ exec "{}" "$@"
     assert!(results[0]["data"].get("reassigned_ports").is_none(), "{}", results[0]);
     fixture.ok(&["down"]);
 }
+
+#[test]
+fn a_repeated_up_skips_the_install_only_while_every_pin_is_installed() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.8.2'\n");
+    let step = |up: &Value| up["data"]["steps"].as_array().unwrap().iter().find(|s| s["step"] == "install").cloned().unwrap();
+    let installs = || fs::read_to_string(fixture.path("install.log")).unwrap_or_default().lines().count();
+    let first = fixture.json(&["up", "--json"]);
+    assert_eq!(first["ok"], true, "{first}");
+    let after_first = installs();
+    assert!(after_first > 0, "the first up installs");
+    let second = fixture.json(&["up", "--json"]);
+    assert_eq!(second["ok"], true, "{second}");
+    let (first, second) = (step(&first), step(&second));
+    assert!(first["detail"]["skipped"].is_null(), "the first up installs: {first}");
+    assert_eq!(second["detail"]["skipped"], "every pinned release is already installed", "{second}");
+    let named = [&second["detail"]["locked"], &second["detail"]["plain"]];
+    assert!(named.iter().any(|n| n.as_array().is_some_and(|a| a.contains(&json!("jq")))), "the step still names what it covers: {second}");
+    assert_eq!(installs(), after_first, "mise install was not run again");
+
+    // The release removed behind stack's back: the next up installs it again.
+    fs::write(fixture.path("installed"), "").unwrap();
+    let third = fixture.json(&["up", "--json"]);
+    assert_eq!(third["ok"], true, "{third}");
+    assert!(step(&third)["detail"]["skipped"].is_null(), "{third}");
+    assert!(installs() > after_first, "a missing pin installs");
+}
