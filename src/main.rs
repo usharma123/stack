@@ -173,6 +173,10 @@ enum Cmd {
         /// Also remove the service data of deleted checkouts (otherwise only reported)
         #[arg(long)]
         reclaim_data: bool,
+        /// Show what would be reclaimed (sessions, and the ports and data of deleted checkouts)
+        /// and change nothing
+        #[arg(long, conflicts_with = "watch")]
+        dry_run: bool,
     },
     /// List every checkout Stack has records for on this machine (read-only, liveness checks only)
     Ps {
@@ -391,7 +395,8 @@ fn main() -> ExitCode {
             })
         }),
         Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc { watch: true, interval, max_passes, reclaim_data } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data),
+        Cmd::Gc { watch: true, interval, max_passes, reclaim_data, .. } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data),
+        Cmd::Gc { dry_run: true, reclaim_data, .. } => session::gc_plan(&ctx.state, *reclaim_data).map(|r| emit(cli.json, &r, || print_gc_plan(&r))),
         Cmd::Gc { reclaim_data, .. } => session::gc_checked(&ctx.state, *reclaim_data).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
@@ -458,6 +463,34 @@ fn startup_timeout(timeout: Option<&str>) -> Result<Duration> {
         None => Ok(session::DEFAULT_STARTUP_TIMEOUT),
         Some(0) => Err(StackError::new("usage", "--timeout must be at least 1s")),
         Some(secs) => Ok(Duration::from_secs(secs)),
+    }
+}
+
+fn print_gc_plan(plan: &session::GcDryRun) {
+    for p in &plan.would_reclaim {
+        let busy = if p.busy { ", busy: a command is running" } else { "" };
+        println!("{}: {} (would {}{busy})", p.project.display(), p.reason, p.action.replace('_', " "));
+        for s in &p.services {
+            let pid = s.pid.map(|pid| format!(" pid {pid}{}", if s.pid_alive == Some(true) { " (alive)" } else { "" })).unwrap_or_default();
+            println!("  {} port {}{pid}", s.service, s.port);
+        }
+    }
+    for d in &plan.deleted_checkouts {
+        let after = if d.after_session { " (once its session is reclaimed)" } else { "" };
+        println!("{}: deleted checkout{after}", d.project.display());
+        for p in &d.ports {
+            println!("  {} port {} would be released", p.service, p.port);
+        }
+        for data in &d.data {
+            let what = if data.action == "remove_if_safe" { "would be removed if safe" } else { "would be reported and kept" };
+            println!("  {} data {} {what}", data.service, data.dir.display());
+        }
+    }
+    for w in &plan.warnings {
+        eprintln!("warning: {w}");
+    }
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() {
+        println!("nothing to reclaim");
     }
 }
 

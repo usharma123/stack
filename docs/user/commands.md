@@ -15,7 +15,7 @@
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew` | Renew this session's lease |
-| `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
+| `stack gc [--reclaim-data] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
@@ -272,6 +272,17 @@ your agent runner if you want unattended cleanup.
 
 `gc` decides from each session's record which ones look expired or belong to a deleted
 checkout, and locks only those. If another command holds one of them, `gc` waits for it.
+
+`--dry-run` reports what `gc` would do and changes nothing: no lock, no supervisor query, no
+record touched, no data directory opened. Each entry under `would_reclaim` has the
+`session`, `project`, `reason`, `action` (`stop` for an expired lease, `release_if_stopped`
+for a deleted checkout) and the recorded `services` (`port`, `pid`, whether that pid is alive,
+supervisor id). `busy` means a command was running in it, so `gc` would leave it alone.
+`deleted_checkouts` lists what deleted checkouts left: the `ports` that would be released and
+the recorded `data` directories, each with `action` `report` (kept and reported), or
+`remove_if_safe` with `--reclaim-data` (removed only if the checks below pass).
+`after_session` marks a checkout whose session record is still kept: the rest goes only once
+its services are confirmed stopped.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once. Its services'

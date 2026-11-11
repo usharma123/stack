@@ -138,7 +138,10 @@ output (mise's answer when no release matches) is an error, not a version.
   candidates (an expired lease, or a gone project); everything is checked again under the
   lock. The pass at the start of `up` try-locks: a busy candidate is skipped and reported, and
   any failure becomes a warning of the `gc` step, so one checkout's `up` never waits on or
-  fails because of another's. Standalone `gc` waits for busy candidates.
+  fails because of another's. Standalone `gc` waits for busy candidates. `gc --dry-run`
+  reads without locks and writes nothing; it lists the sessions a pass would reclaim and the
+  ports and data a deleted checkout would release (or, with `--reclaim-data`, have removed
+  where the checks pass).
   Commands register active executions under the lifecycle lock and renew on completion. A
   command that cannot retake the lock within a second leaves an atomic completion record
   (session, token, PID) instead; the next lifecycle operation applies it, but only once it has

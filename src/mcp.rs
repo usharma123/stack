@@ -353,9 +353,10 @@ fn tool_definitions() -> Value {
                 "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" }
             }), &[])),
         tool("stack_gc", "Reclaim stale sessions", annotations("Reclaim stale sessions", false, Some(true), true, false),
-            "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
+            "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. dry_run only reports. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
             machine_wide_schema(json!({
-                "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" }
+                "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
+                "dry_run": { "type": "boolean", "description": "Change nothing and take no lock: report what would be reclaimed (would_reclaim: session, project, reason, action, services) and what deleted checkouts would release (deleted_checkouts: ports, and data with action remove_if_safe under reclaim_data, else report)" }
             }), &[], REPORTED_DIR)),
         tool("stack_ps", "List checkouts", annotations("List checkouts", true, None, true, false),
             "List every checkout Stack has records for on this machine, with its session, lease and services (port, pid, liveness, data size) and totals. Use it to see what runs where, or to find leftovers of deleted checkouts (reclaimable marks what stack_gc would reclaim). Liveness is not identity verification; use stack_status for that. Read-only; takes no lock and needs no dir.",
@@ -547,6 +548,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_status" => session::status(ctx).map(to_value),
         "stack_renew" => session::renew(ctx).map(to_value),
         "stack_down" => session::down_purging(ctx, args["stop_supervisor"] != false, args["purge"] == true).map(to_value),
+        "stack_gc" if args["dry_run"] == true => session::gc_plan(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
         "stack_mv" => {

@@ -21,7 +21,7 @@ use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_j
 use crate::timing::Timings;
 
 mod gc_pass;
-pub use gc_pass::{gc_with, GcOptions, GcPass, GcSkipped};
+pub use gc_pass::{gc_plan, gc_with, DeletedPlan, GcDryRun, GcOptions, GcPass, GcPlanned, GcSkipped, PlannedData, PlannedPort, PlannedService};
 use crate::tool::ToolSpec;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
