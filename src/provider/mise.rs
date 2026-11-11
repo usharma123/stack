@@ -1082,6 +1082,34 @@ fn strip_escapes(text: &str) -> String {
     clean
 }
 
+/// Where the digest of the generated configuration `mise trust` last accepted is kept.
+fn trusted_marker(state: &Path, root: &Path) -> PathBuf {
+    state.join("projects").join(format!("{}.trusted", crate::state::project_key(root)))
+}
+
+/// [`trust`], skipped when mise already trusted exactly this generated configuration, as
+/// recorded the last time. Returns whether it was skipped: a caller whose next provider call
+/// then fails should [`forget_trust`] and trust again, in case mise's own record was removed.
+pub fn trust_once(state: &Path, root: &Path) -> Result<bool> {
+    let digest = std::fs::read(output_path(root)).ok().map(|bytes| crate::hash::sha256_hex(&bytes));
+    let marker = trusted_marker(state, root);
+    if digest.is_some() && std::fs::read_to_string(&marker).ok() == digest {
+        return Ok(true);
+    }
+    trust(root)?;
+    if let Some(digest) = digest {
+        // Best effort: without the marker the next call only trusts again.
+        let _ = marker.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(&marker, digest);
+    }
+    Ok(false)
+}
+
+/// Forget what [`trust_once`] recorded, so the next call asks mise again.
+pub fn forget_trust(state: &Path, root: &Path) {
+    let _ = std::fs::remove_file(trusted_marker(state, root));
+}
+
 pub fn trust(root: &Path) -> Result<()> {
     checked(root, &["trust", "--quiet", &output_path(root).to_string_lossy()], "provider_failed").map(|_| ())
 }

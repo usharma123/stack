@@ -3989,13 +3989,24 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
             scratch::not_installed(&cache, &pins)
         })
     };
-    let provided = mise::trust(&ctx.root).and_then(|()| {
-        timings.mark("trust");
+    let trusted = mise::trust_once(&ctx.state, &ctx.root);
+    timings.mark("trust");
+    let provide = || {
         if report.stack.services.is_empty() {
             mise::env(&ctx.root).map(|env| (env, None))
         } else {
             mise::env_and_daemons(&ctx.root).map(|(env, statuses)| (env, Some(statuses)))
         }
+    };
+    let provided = trusted.and_then(|skipped| match provide() {
+        // mise may have dropped its own record of a configuration Stack remembers trusting (its
+        // state was cleared, or `mise trust --untrust` ran): trusted again, and asked once more.
+        Err(_) if skipped => {
+            mise::forget_trust(&ctx.state, &ctx.root);
+            mise::trust_once(&ctx.state, &ctx.root)?;
+            provide()
+        }
+        other => other,
     });
     let missing = installed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
     if let Target::Command { .. } = target {

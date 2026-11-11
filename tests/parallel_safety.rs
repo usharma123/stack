@@ -703,3 +703,23 @@ fn a_repeated_up_skips_the_install_only_while_every_pin_is_installed() {
     assert!(step(&third)["detail"]["skipped"].is_null(), "{third}");
     assert!(installs() > after_first, "a missing pin installs");
 }
+
+#[test]
+fn exec_asks_mise_to_trust_a_generated_configuration_once_until_it_changes() {
+    let fixture = Fixture::new();
+    let trusts = || fs::read_to_string(fixture.path("mise.log")).unwrap_or_default().lines().filter(|l| l.starts_with("trust ")).count();
+    fixture.ok(&["exec", "--", "true"]);
+    let after_first = trusts();
+    assert!(after_first >= 1);
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.ok(&["exec", "--", "true"]);
+    assert_eq!(trusts(), after_first, "an unchanged configuration is not trusted again");
+
+    // A changed configuration is new to mise: it is trusted again, once.
+    fs::write(fixture.path("bundle/bundle.toml"), "[bundle]\nname='test'\n[env]\nCHANGED='1'\n").unwrap();
+    fixture.ok(&["compile"]);
+    let before = trusts();
+    fixture.ok(&["exec", "--", "true"]);
+    fixture.ok(&["exec", "--", "true"]);
+    assert_eq!(trusts(), before + 1);
+}
