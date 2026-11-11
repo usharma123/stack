@@ -207,3 +207,25 @@ fn mcp_logs_of_every_service_filtered() {
     assert_eq!(replies[0]["data"]["services"]["worker"]["lines"], json!([]));
     assert_eq!(replies[1]["data"]["lines"], json!(["b"]), "{}", replies[1]);
 }
+
+#[test]
+fn follow_prints_new_lines_until_interrupted() {
+    let fixture = Fixture::new(TWO);
+    let logs = fixture.dir.path().join("logs-web.txt");
+    fs::write(&logs, "one\n").unwrap();
+    fs::write(fixture.dir.path().join("logs-worker.txt"), "").unwrap();
+    let child = fixture.command_in(&fixture.app(), &["logs", "web", "--follow"]).stdout(Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    fs::write(&logs, "one\ntwo\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    // SAFETY: signals a child this test started and has not reaped.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let out = child.wait_with_output().unwrap();
+    // Like `tail -f`: the interrupt ends it, after every line read so far was written.
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(out.status.signal(), Some(libc::SIGINT), "{:?}", out.status);
+    assert_eq!(stdout(&out), "one\ntwo\n");
+
+    let out = fixture.command_in(&fixture.app(), &["logs", "--follow", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "usage");
+}

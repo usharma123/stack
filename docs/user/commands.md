@@ -12,7 +12,7 @@
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
-| `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]]` | Show services' recent output (default 100 lines each) |
+| `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow]` | Show services' recent output (default 100 lines each) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
@@ -225,12 +225,15 @@ Prints up to `--tail` lines (default 100, at most 10000) that the supervisor kep
 service. With no service named, or several, it shows each one with lines prefixed
 `<service> | `; with `--json` the result is `{services: {<name>: {lines, ...}}, errors}`, where
 `errors` lists services whose output could not be read. One named service keeps the
-single-service result. It never follows.
+single-service result.
 
 - `--since-start` keeps only the current process's output, which helps after a restart.
 - `--since 10m` keeps only output from the last 10 minutes. The supervisor applies the window.
 - `--grep TEXT` keeps lines containing `TEXT` (a plain substring, not a regex); `-i` ignores
   case. `--tail` then counts matching lines, out of the last 10000.
+- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. The supervisor
+  offers no stream, so Stack asks it again every second. Without timestamps, identical lines
+  written within one poll may be shown once. Not with `--json`, and not over MCP.
 
 `unknown_service` lists the project's services; `logs_failed` means the supervisor could not
 return them.

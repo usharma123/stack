@@ -1,11 +1,13 @@
-//! `stack logs` across services: every service when none is named, a substring filter and a
-//! time window. Built on [`session::logs_since`], which asks the supervisor for one service's
-//! kept output.
+//! `stack logs` across services: every service when none is named, a substring filter, a time
+//! window, and `--follow` for people. Built on [`session::logs_since`], which asks the
+//! supervisor for one service's kept output; following polls it, because the supervisor offers
+//! no stream through mise.
 
 use crate::error::{Result, StackError};
 use crate::session::{self, Ctx, LogsReport};
 use indexmap::IndexMap;
 use serde::Serialize;
+use std::time::Duration;
 
 /// Most lines one request asks the supervisor for, as `--tail` allows.
 pub const MAX_LINES: usize = 10_000;
@@ -113,22 +115,102 @@ pub fn fetch(ctx: &Ctx, q: &Query) -> Result<Logs> {
     Ok(Logs::Many(many))
 }
 
-/// Lines for people, prefixed with the service when several are shown.
-pub fn print_lines(service: &str, width: Option<usize>, lines: &[String]) {
+/// Lines for people, prefixed with the service when several are shown. Fails when stdout
+/// does, such as a pipe whose reader is gone.
+pub fn print_lines(service: &str, width: Option<usize>, lines: &[String]) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     for line in lines {
-        let _ = match width {
-            Some(w) => writeln!(out, "{service:<w$} | {line}"),
-            None => writeln!(out, "{line}"),
-        };
+        match width {
+            Some(w) => writeln!(out, "{service:<w$} | {line}")?,
+            None => writeln!(out, "{line}")?,
+        }
     }
-    let _ = out.flush();
+    out.flush()
+}
+
+/// Lines of `cur` written after the ones `prev` ended with. Both are windows of one output, and
+/// `cur` was read later: the new lines start after the longest suffix of `prev` that `cur`
+/// holds. Without timestamps, identical lines can make this undercount; with no overlap at all
+/// (the window moved past `prev`), every line of `cur` is new.
+pub fn new_lines<'a>(prev: &[String], cur: &'a [String]) -> &'a [String] {
+    if prev.is_empty() {
+        return cur;
+    }
+    for end in (1..=cur.len()).rev() {
+        let m = end.min(prev.len());
+        if cur[end - m..end] == prev[prev.len() - m..] {
+            return &cur[end..];
+        }
+    }
+    cur
+}
+
+/// Print what `q` selects, then keep printing new lines every `interval` until stdout is
+/// gone (a closed pipe), or an error. Ctrl-C ends it as it ends `tail -f`: Stack installs no
+/// handler for it, and each batch of lines is flushed as it is printed.
+pub fn follow(ctx: &Ctx, q: &Query, interval: Duration) -> Result<()> {
+    let names = selected(ctx, q)?;
+    let width = (names.len() > 1).then(|| names.iter().map(String::len).max().unwrap_or(0));
+    // The raw window last read for each service.
+    let mut seen: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut from = crate::state::now();
+    for name in &names {
+        let raw = match session::logs_since(ctx, name, MAX_LINES, q.since_start, q.since()) {
+            Ok(r) => r.lines,
+            Err(e) if e.code == "logs_failed" && names.len() > 1 => {
+                eprintln!("# {name}: {}", e.message);
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+        let shown: Vec<String> = raw.iter().filter(|l| q.matches(l)).cloned().collect();
+        if print_lines(name, width, &shown[shown.len().saturating_sub(q.tail)..]).is_err() {
+            return Ok(());
+        }
+        seen.insert(name.clone(), raw);
+    }
+    loop {
+        std::thread::sleep(interval);
+        let at = crate::state::now();
+        for name in &names {
+            // Only output since the last read: a short window keeps polls cheap.
+            let cur = match session::logs_since(ctx, name, MAX_LINES, q.since_start, Some(from)) {
+                Ok(r) => r.lines,
+                // A service not started yet, or restarting: try again next time.
+                Err(e) if e.code == "logs_failed" => continue,
+                Err(e) => return Err(e),
+            };
+            let prev = seen.get(name).map(Vec::as_slice).unwrap_or_default();
+            let fresh: Vec<String> = new_lines(prev, &cur).iter().filter(|l| q.matches(l)).cloned().collect();
+            if print_lines(name, width, &fresh).is_err() {
+                return Ok(());
+            }
+            seen.insert(name.clone(), cur);
+        }
+        from = at;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn new_lines_follow_the_overlap_of_successive_windows() {
+        assert_eq!(new_lines(&v(&["a", "b", "c"]), &v(&["b", "c", "d", "e"])), v(&["d", "e"]));
+        assert_eq!(new_lines(&v(&["a", "b"]), &v(&["a", "b"])), Vec::<String>::new());
+        assert_eq!(new_lines(&[], &v(&["x"])), v(&["x"]));
+        // A window that starts earlier than the last one still lines up.
+        assert_eq!(new_lines(&v(&["c", "d"]), &v(&["a", "b", "c", "d", "e"])), v(&["e"]));
+        // No overlap: the window moved past everything seen.
+        assert_eq!(new_lines(&v(&["a"]), &v(&["y", "z"])), v(&["y", "z"]));
+        assert_eq!(new_lines(&v(&["a"]), &[]), Vec::<String>::new());
+    }
 
     #[test]
     fn the_filter_is_a_substring_optionally_ignoring_case() {

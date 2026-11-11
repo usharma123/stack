@@ -93,6 +93,9 @@ enum Cmd {
         /// Match --grep ignoring case
         #[arg(short = 'i', long, requires = "grep")]
         ignore_case: bool,
+        /// Keep printing new lines until interrupted (polls the supervisor every second; not with --json)
+        #[arg(short, long)]
+        follow: bool,
     },
     /// Start services, verify each one, and record a session
     Up {
@@ -374,7 +377,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Logs { services, tail, since_start, since, grep, ignore_case } => logs(
+        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow } => logs(
             &ctx,
             cli.json,
             stack::logs::Query {
@@ -386,6 +389,7 @@ fn main() -> ExitCode {
                 ignore_case: *ignore_case,
             },
             since.as_deref(),
+            *follow,
         ),
         Cmd::Restart { services, changed, timeout } => startup_timeout(timeout.as_deref())
             .and_then(|timeout| if *changed { session::restart_changed(&ctx, timeout) } else { session::restart(&ctx, services, timeout) })
@@ -562,10 +566,17 @@ fn owner_arg(value: &str) -> std::result::Result<stack::lease::Owner, String> {
     stack::lease::Owner::parse(value).map_err(|e| e.message)
 }
 
-/// `stack logs`: one service as before, or several (every one when none is named) with each
-/// line prefixed by its service.
-fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>) -> Result<ExitCode> {
+/// `stack logs`: one service as before, several (every one when none is named) with each line
+/// prefixed by its service, or following until interrupted.
+fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>, follow: bool) -> Result<ExitCode> {
     q.since_secs = since.map(parse_duration).transpose()?;
+    if follow {
+        if as_json {
+            return Err(StackError::new("usage", "--follow cannot be combined with --json")
+                .hint("run `stack logs --json` repeatedly, or `stack logs --follow` without --json"));
+        }
+        return stack::logs::follow(ctx, &q, Duration::from_secs(1)).map(|()| ExitCode::SUCCESS);
+    }
     Ok(match stack::logs::fetch(ctx, &q)? {
         stack::logs::Logs::One(r) => emit(as_json, &r, || {
             // On stderr, so the lines themselves stay pipeable.
@@ -573,7 +584,7 @@ fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>
                 eprintln!("# current {} process started {}s ago; --since-start shows only its output",
                     r.service, stack::state::now().saturating_sub(at));
             }
-            stack::logs::print_lines(&r.service, None, &r.lines);
+            let _ = stack::logs::print_lines(&r.service, None, &r.lines);
         }),
         stack::logs::Logs::Many(m) => emit(as_json, &m, || {
             let width = m.services.keys().chain(m.errors.keys()).map(String::len).max().unwrap_or(0);
@@ -581,7 +592,7 @@ fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>
                 eprintln!("# {name}: error[{}]: {}", e.code, e.message);
             }
             for (name, r) in &m.services {
-                stack::logs::print_lines(name, Some(width), &r.lines);
+                let _ = stack::logs::print_lines(name, Some(width), &r.lines);
             }
         }),
     })
