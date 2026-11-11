@@ -249,8 +249,21 @@ enum Cmd {
     /// Download mise into stack's data directory unless one is already on PATH
     Setup {
         /// Install stack's pinned mise even when another mise is on PATH
-        #[arg(long)]
+        #[arg(long, conflicts_with = "gc_agent")]
         force: bool,
+        /// Instead of mise: write a launchd agent (macOS) or systemd user unit (Linux) running
+        /// `stack gc --watch`, and print the command that loads it. Loads nothing unless --enable
+        #[arg(long)]
+        gc_agent: bool,
+        /// With --gc-agent: print the file instead of writing it
+        #[arg(long, requires = "gc_agent", conflicts_with_all = ["remove", "enable"])]
+        print: bool,
+        /// With --gc-agent: delete the file (with --enable, unload the agent first)
+        #[arg(long, requires = "gc_agent")]
+        remove: bool,
+        /// With --gc-agent: also run the load (or, with --remove, unload) command
+        #[arg(long, requires = "gc_agent")]
+        enable: bool,
     },
     /// Print the environment `stack exec` would give a command, for `eval "$(stack env)"`;
     /// unverified services' addresses are withheld as exec withholds them
@@ -527,7 +540,8 @@ fn main() -> ExitCode {
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
         }),
-        Cmd::Setup { force } => stack::setup::run(*force).map(|r| {
+        Cmd::Setup { gc_agent: true, print, remove, enable, .. } => gc_agent(cli.json, *print, *remove, *enable),
+        Cmd::Setup { force, .. } => stack::setup::run(*force).map(|r| {
             emit(cli.json, &r, || {
                 let how = if r.installed { "installed" } else { "already available" };
                 println!("mise {} {how} at {}", r.version, r.mise.display());
@@ -633,6 +647,36 @@ fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>
             }
         }),
     })
+}
+
+/// `stack setup --gc-agent`: print, write or remove the agent under `$HOME`.
+fn gc_agent(as_json: bool, print: bool, remove: bool, enable: bool) -> Result<ExitCode> {
+    use stack::gc_agent::Action;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .ok_or_else(|| StackError::new("usage", "HOME is not set to an absolute path").hint("set HOME, then run `stack setup --gc-agent` again"))?;
+    let action = if print { Action::Print } else if remove { Action::Remove } else { Action::Write };
+    let r = stack::gc_agent::run(action, enable, &home)?;
+    Ok(emit(as_json, &r, || match action {
+        Action::Print => print!("{}", r.content.as_deref().unwrap_or_default()),
+        Action::Remove => {
+            println!("{} {}", if r.removed { "removed" } else { "nothing to remove at" }, r.path.display());
+            if r.ran {
+                println!("unloaded with: {}", r.command);
+            } else {
+                println!("if it was loaded, unload it with:\n  {}", r.command);
+            }
+        }
+        Action::Write => {
+            println!("wrote {}", r.path.display());
+            if r.ran {
+                println!("loaded with: {}", r.command);
+            } else {
+                println!("load it with:\n  {}", r.command);
+            }
+        }
+    }))
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.

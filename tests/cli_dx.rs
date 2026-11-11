@@ -290,3 +290,39 @@ fn completions_print_without_a_project() {
         assert!(script.contains("stack") && script.contains("logs") && script.contains("completions"), "{shell}: {script}");
     }
 }
+
+#[test]
+fn the_gc_agent_is_written_printed_and_removed_under_home_without_loading_anything() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    // A HOME of the test's own: nothing is written to, or loaded into, this machine's.
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = fixture.command_in(fixture.dir.path(), args).env("HOME", home.path()).env_remove("XDG_CONFIG_HOME").output().unwrap();
+        json_result(&out)
+    };
+    let expected = if cfg!(target_os = "macos") {
+        home.path().join("Library/LaunchAgents/dev.stack.gc.plist")
+    } else {
+        home.path().join(".config/systemd/user/stack-gc.service")
+    };
+    let printed = run(&["setup", "--gc-agent", "--print", "--json"]);
+    assert_eq!(printed["data"]["written"], false, "{printed}");
+    assert!(printed["data"]["content"].as_str().unwrap().contains("--watch"));
+    assert!(!expected.exists());
+
+    let written = run(&["setup", "--gc-agent", "--json"]);
+    assert_eq!(written["data"]["path"], expected.to_str().unwrap(), "{written}");
+    assert_eq!(written["data"]["ran"], false);
+    let content = fs::read_to_string(&expected).unwrap();
+    assert!(content.contains("gc") && content.contains("--watch"), "{content}");
+    // The store it collects is the one the caller uses.
+    assert!(content.contains(&fixture.dir.path().join("state").display().to_string()), "{content}");
+    let command = written["data"]["command"].as_str().unwrap();
+    assert!(command.contains(if cfg!(target_os = "macos") { "launchctl bootstrap" } else { "systemctl --user" }), "{command}");
+
+    let removed = run(&["setup", "--gc-agent", "--remove", "--json"]);
+    assert_eq!(removed["data"]["removed"], true, "{removed}");
+    assert!(!expected.exists());
+    let error = run(&["setup", "--print", "--json"]);
+    assert_eq!(error["error"]["code"], "usage", "--print needs --gc-agent: {error}");
+}

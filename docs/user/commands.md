@@ -22,6 +22,7 @@
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
+| `stack setup --gc-agent [--print \| --remove] [--enable]` | Write a launchd agent or systemd user unit that runs `gc --watch` |
 | `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
 | `stack mcp` | Serve these operations over MCP (stdio); see [coding agents](agents.md) |
@@ -357,8 +358,9 @@ with `no_lease`, whose hint says how to give it one.
 
 Stops sessions whose lease expired. For a checkout that was deleted, it drops the session
 once its services are confirmed stopped. `--watch` repeats every `--interval` until stopped (with `--json`, one object per
-pass). Stack installs no background service, so run `gc --watch` under systemd, launchd or
-your agent runner if you want unattended cleanup.
+pass). Stack runs nothing in the background on its own. For unattended cleanup, run
+[`stack setup --gc-agent`](#doctor-and-setup), or run `gc --watch` under your own supervisor or
+agent runner.
 
 `gc` decides from each session's record which ones look expired or belong to a deleted
 checkout, and locks only those. If another command holds one of them, `gc` waits for it.
@@ -508,6 +510,21 @@ Pitchfork's socket lives under its state directory. On macOS, if `up` reports
 
 `setup` downloads the mise release Stack is tested against, unless one is on `PATH`.
 `--force` installs it anyway.
+
+`setup --gc-agent` writes a per-user service that runs `stack gc --watch`, and prints the
+command that loads it. It loads nothing unless you add `--enable`.
+
+| Platform | File | Load it with |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/dev.stack.gc.plist` (log: `~/Library/Logs/stack-gc.log`) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.stack.gc.plist` |
+| Linux | `~/.config/systemd/user/stack-gc.service` (`$XDG_CONFIG_HOME` if set; log: the journal) | `systemctl --user daemon-reload && systemctl --user enable --now stack-gc.service` |
+
+The service runs the `stack` on your `PATH` (else this executable) with your current `PATH`
+and any `STACK_*`, `PITCHFORK_STATE_DIR`, `MISE_*_DIR` and `XDG_*` store variables, so it sees
+the same sessions you do. Run it again after changing those. `--print` shows the file without
+writing it. `--remove` deletes it and prints the unload command (`launchctl bootout
+gui/$(id -u)/dev.stack.gc`, or `systemctl --user disable --now stack-gc.service`); with
+`--enable` it runs that command first.
 
 ## Errors
 

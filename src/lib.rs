@@ -8,6 +8,7 @@ pub mod discover;
 pub mod doctor;
 pub mod error;
 pub mod fleet;
+pub mod gc_agent;
 pub mod git;
 pub mod hash;
 pub mod identity;

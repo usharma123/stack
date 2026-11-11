@@ -61,8 +61,9 @@ run) rather than let the command reach the wrong server. See the [agent guide](h
 Stack is early. Expect rough edges, and pin a version in CI.
 
 Bundles are code you run: review them like any other dependency. Sessions with a `--ttl` are
-cleaned up by `stack gc` or the next `stack up`. Nothing runs in the background unless you run
-`stack gc --watch` under a supervisor.
+cleaned up by `stack gc` or the next `stack up`. Nothing runs in the background unless you ask:
+`stack setup --gc-agent` writes a launchd agent or systemd user unit that runs `stack gc --watch`,
+and prints the command to load it.
 
 Run Stack from anywhere inside a checkout; it finds the nearest `stack.toml`. `stack env`
 loads the stack's environment into your shell or direnv, and `stack completions <shell>` prints
