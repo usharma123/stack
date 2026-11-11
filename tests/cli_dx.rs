@@ -280,3 +280,13 @@ fn the_direnv_hook_prints_without_a_project() {
     let hook = stdout(&fixture.ok_in(&elsewhere, &["hook", "direnv"]));
     assert!(hook.contains("eval \"$(stack env --shell bash)\"") && hook.contains("watch_file stack.toml stack.lock .stack/session.json"), "{hook}");
 }
+
+#[test]
+fn completions_print_without_a_project() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    let elsewhere = fixture.dir.path().join("bin");
+    for shell in ["bash", "zsh", "fish"] {
+        let script = stdout(&fixture.ok_in(&elsewhere, &["completions", shell]));
+        assert!(script.contains("stack") && script.contains("logs") && script.contains("completions"), "{shell}: {script}");
+    }
+}

@@ -22,6 +22,7 @@
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
+| `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
 | `stack mcp` | Serve these operations over MCP (stdio); see [coding agents](agents.md) |
 
@@ -479,6 +480,17 @@ Ports and tokens that a compile at the new path assigned (a worktree hook usuall
 first) are replaced by the old ones, and the result's `notes` say so. A compile anywhere
 releases the reservations of a path that no longer exists, so run `stack mv` before other
 Stack commands to keep the old ports; the data moves either way.
+
+## completions
+
+`stack completions <shell>` prints a completion script for bash, zsh, fish, elvish or
+PowerShell. For example:
+
+```sh
+stack completions zsh > "${fpath[1]}/_stack"
+stack completions bash > ~/.local/share/bash-completion/completions/stack
+stack completions fish > ~/.config/fish/completions/stack.fish
+```
 
 ## doctor and setup
 

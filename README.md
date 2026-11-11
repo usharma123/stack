@@ -65,7 +65,8 @@ cleaned up by `stack gc` or the next `stack up`. Nothing runs in the background 
 `stack gc --watch` under a supervisor.
 
 Run Stack from anywhere inside a checkout; it finds the nearest `stack.toml`. `stack env`
-loads the stack's environment into your shell or direnv.
+loads the stack's environment into your shell or direnv, and `stack completions <shell>` prints
+shell completions.
 
 ## Documentation
 

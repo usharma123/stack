@@ -264,6 +264,11 @@ enum Cmd {
         #[arg(value_enum)]
         tool: stack::shell::Hook,
     },
+    /// Print a shell completion script
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Check that mise, git and tar are usable and the project compiles
     Doctor,
     /// Serve the stack tools over MCP (stdio)
@@ -281,6 +286,11 @@ fn main() -> ExitCode {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
+    }
+    if let Cmd::Completions { shell } = &cli.cmd {
+        use clap::CommandFactory;
+        clap_complete::generate(*shell, &mut Cli::command(), "stack", &mut std::io::stdout());
+        return ExitCode::SUCCESS;
     }
     if let Cmd::Hook { tool } = &cli.cmd {
         print!("{}", stack::shell::hook(*tool));
@@ -534,7 +544,7 @@ fn main() -> ExitCode {
                 print!("{}", stack::shell::render(&r, shell.unwrap_or_else(stack::shell::default_shell)));
             })
         }),
-        Cmd::Hook { .. } => unreachable!("handled above"),
+        Cmd::Hook { .. } | Cmd::Completions { .. } => unreachable!("handled above"),
         Cmd::Doctor => stack::doctor::run(&root, &ctx.cache, &ctx.state).map(|checks| {
             emit(cli.json, &checks, || {
                 for c in &checks {
