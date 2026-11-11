@@ -129,7 +129,7 @@ output (mise's answer when no release matches) is an error, not a version.
   whole answer before applying it, and never forwards what fnox printed. Captured output passes
   through a streaming matcher before it is bounded. See [secret grants](user/secrets.md).
 - **Leases.** `--ttl` (renewed by `exec`/`run`/`renew`, and by `status` while not yet
-  expired) or `--owner-pid` (a long-lived runner, not the
+  expired; `renew --ttl` changes it) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
   `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.
   `status`, `up` and `ps` report the lease as one structured `lease` object (`kind`,

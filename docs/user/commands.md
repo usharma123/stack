@@ -14,7 +14,7 @@
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
 | `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
-| `stack renew` | Renew this session's lease |
+| `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
 | `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
@@ -267,6 +267,12 @@ confirming the service is not running and no process carrying the checkout's tok
 else is kept, `purge.data[].kept` is true with the reason in `outcome`, and `purge.complete` is
 false; `down` itself still succeeds. Data Stack never recorded, and data of an earlier
 directory at the same path (moved aside by `up` as `.replaced-<time>`), is never removed.
+
+## renew
+
+Renews the session's lease. `--ttl 30m` sets its TTL (giving a session without a lease one,
+and keeping an owner process if it has one); without it, a session that has no lease fails
+with `no_lease`, whose hint says how to give it one.
 
 ## Leases
 

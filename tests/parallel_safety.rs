@@ -493,3 +493,23 @@ fn status_renews_a_lease_and_status_and_up_report_it_structured() {
     let results = fixture.mcp(&[("stack_status", json!({}))]);
     assert_eq!(results[0]["data"]["lease"]["kind"], "none", "{}", results[0]);
 }
+
+#[test]
+fn renew_sets_the_ttl_and_a_session_without_a_lease_says_how_to_give_it_one() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up"]);
+    let out = fixture.command(&["renew", "--json"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "no_lease");
+    assert!(error["hint"].as_str().unwrap().contains("stack renew --ttl"), "{error}");
+
+    let renewed = json_result(&fixture.ok(&["renew", "--json", "--ttl", "45m"]));
+    assert_eq!(renewed["data"]["lease"]["ttl_secs"], 2700, "{renewed}");
+    let renewed = json_result(&fixture.ok(&["renew", "--json", "--ttl", "10m"]));
+    assert_eq!(renewed["data"]["lease"]["ttl_secs"], 600, "{renewed}");
+    let results = fixture.mcp(&[("stack_renew", json!({ "ttl": "2h" })), ("stack_status", json!({}))]);
+    assert_eq!(results[0]["data"]["lease"]["ttl_secs"], 7200, "{}", results[0]);
+    assert_eq!(results[1]["data"]["lease"]["ttl_secs"], 7200, "{}", results[1]);
+    let results = fixture.mcp(&[("stack_renew", json!({ "ttl": "soon" }))]);
+    assert_eq!(results[0]["error"]["code"], "usage", "{}", results[0]);
+}

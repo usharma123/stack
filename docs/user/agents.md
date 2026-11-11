@@ -74,7 +74,7 @@ A few things that are easy to get wrong:
   soon as that shell exits.
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
   `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
-  `renew` count as activity.
+  `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
 - **Do not work around `artifact_mismatch`.** It means a download differs from what
   `stack.lock` records. Report it, and run `stack compile --update` only if the change is
   expected upstream.

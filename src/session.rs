@@ -4026,16 +4026,29 @@ fn resolve_secrets(
 }
 
 pub fn renew(ctx: &Ctx) -> Result<Session> {
+    renew_with(ctx, None)
+}
+
+/// [`renew`], setting the lease's TTL to `ttl_secs` when given (giving a session without a
+/// lease one; an owner process, if any, is kept).
+pub fn renew_with(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Session> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     let mut session = load(ctx)?.ok_or_else(|| {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
+    if let (None, Some(ttl)) = (&session.lease, ttl_secs) {
+        session.lease = Some(Lease { ttl_secs: Some(ttl), owner_pid: None, renewed_at: now() });
+    }
     let lease = session.lease.as_mut().ok_or_else(|| {
         StackError::new(
             "no_lease",
             "this session has no lease; it lives until `stack down`",
         )
+        .hint("run `stack renew --ttl 30m` to give it one, or `stack up --ttl 30m`")
     })?;
+    if ttl_secs.is_some() {
+        lease.ttl_secs = ttl_secs;
+    }
     lease.renewed_at = now();
     save(ctx, &session)?;
     Ok(session)

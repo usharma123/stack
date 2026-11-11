@@ -346,7 +346,9 @@ fn tool_definitions() -> Value {
             }), &["task"])),
         tool("stack_renew", "Renew the lease", annotations("Renew the lease", false, Some(false), true, false),
             "Renew this checkout's session lease so stack_gc does not reclaim it. Use it during long work under a ttl lease with no other stack calls (stack_exec and stack_run also renew). Returns the session.",
-            schema(json!({}), &[])),
+            schema(json!({
+                "ttl": { "type": "string", "description": "Set the lease's TTL, e.g. \"30m\"; gives a session without a lease one" }
+            }), &[])),
         tool("stack_down", "Stop services", annotations("Stop services", false, Some(true), true, false),
             "Stop every service of this checkout; succeeds only once their processes are confirmed gone. Use it before you finish or remove the checkout. Then stops the supervisor that ran them, if Stack started it and nothing else uses it (data.supervisor says what happened). Service data is kept unless purge is set. Returns {stopped, confirmed, supervisor}.",
             schema(json!({
@@ -548,7 +550,10 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             }
         }
         "stack_status" => session::status(ctx).map(to_value),
-        "stack_renew" => session::renew(ctx).map(to_value),
+        "stack_renew" => {
+            let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
+            session::renew_with(ctx, ttl_secs).map(to_value)
+        }
         "stack_down" => session::down_purging(ctx, args["stop_supervisor"] != false, args["purge"] == true).map(to_value),
         "stack_gc" if args["dry_run"] == true => session::gc_plan(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true, args["stop_orphans"] == true).map(to_value),

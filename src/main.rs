@@ -157,7 +157,11 @@ enum Cmd {
         purge: bool,
     },
     /// Renew this project's session lease
-    Renew,
+    Renew {
+        /// Set the lease's TTL (e.g. 30m), giving a session without a lease one
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
+    },
     /// Reclaim sessions with expired leases or deleted projects (machine-wide)
     Gc {
         /// Keep running in the foreground and collect every --interval (for a supervisor such as
@@ -400,7 +404,12 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
+        Cmd::Renew { ttl } => ttl
+            .as_deref()
+            .map(parse_duration)
+            .transpose()
+            .and_then(|ttl_secs| session::renew_with(&ctx, ttl_secs))
+            .map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
         Cmd::Gc { watch: true, interval, max_passes, reclaim_data, stop_orphans, .. } => {
             gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data, *stop_orphans)
         }
