@@ -34,6 +34,13 @@ for operation, envelope, expected in json.loads(sys.argv[1]):
 `, JSON.stringify(cases)]);
 });
 
+test('errors.md lists the codes the agent docs mention', () => {
+  const errors = readFileSync('docs/user/errors.md', 'utf8');
+  for (const code of ['no_session', 'session_stale', 'lock_outdated', 'tools_not_installed', 'port_conflict', 'timed_out', 'usage']) {
+    assert.match(errors, new RegExp('\\| `' + code + '` \\|'), code);
+  }
+});
+
 // Runs examples/isolated-stack.sh under a temporary HOME, with stand-ins for npm and stack. The
 // stand-in stack logs each call, fails a call that starts with an entry in `fail`, hangs on one
 // in `hang` and reports `supervisor` as the supervisor's status. A call in `resist` ignores

@@ -36,6 +36,11 @@ pub struct Composed {
     pub tasks: IndexMap<String, Entry<Task>>,
     pub bin_paths: Vec<PathBuf>,
     pub overrides: Vec<OverrideRecord>,
+    /// `services.<name>.init` of every layer, composed as its own key (see `init_tasks`).
+    /// Not serialized with the stack, so the session fingerprint does not depend on it;
+    /// reports show it beside the stack.
+    #[serde(skip)]
+    pub init: IndexMap<String, Entry<Vec<String>>>,
 }
 
 #[derive(Debug)]
@@ -99,7 +104,9 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
         let tools = tool_specs(&b.manifest.tools, &origin)?;
         merge("tools", &mut out.tools, &tools, &origin, &mut conflicts);
         merge("env", &mut out.env, &b.manifest.env, &origin, &mut conflicts);
-        merge("services", &mut out.services, &b.manifest.services, &origin, &mut conflicts);
+        let (services, init) = crate::init_tasks::split(&b.manifest.services);
+        merge("services", &mut out.services, &services, &origin, &mut conflicts);
+        merge("init", &mut out.init, &init, &origin, &mut conflicts);
         merge("tasks", &mut out.tasks, &b.manifest.tasks, &origin, &mut conflicts);
         out.bin_paths
             .extend(b.manifest.paths.bin.iter().map(|p| b.dir.join(p)));
@@ -111,7 +118,9 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
     let tools = tool_specs(&project.tools, "project")?;
     merge("tools", &mut out.tools, &tools, "project", &mut conflicts);
     merge("env", &mut out.env, &project.env, "project", &mut conflicts);
-    merge("services", &mut out.services, &project.services, "project", &mut conflicts);
+    let (services, init) = crate::init_tasks::split(&project.services);
+    merge("services", &mut out.services, &services, "project", &mut conflicts);
+    merge("init", &mut out.init, &init, "project", &mut conflicts);
     merge("tasks", &mut out.tasks, &project.tasks, "project", &mut conflicts);
 
     apply_overrides(&mut out, &project.overrides, &mut conflicts)?;
@@ -132,15 +141,17 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
                 first.origins.join(" and ")
             ),
         )
-        .hint(format!(
-            "resolve explicitly in stack.toml, e.g. [override.{}] {} = ...",
-            first.kind, first.key
-        ))
+        .hint(if first.kind == "init" {
+            format!("resolve explicitly in stack.toml, e.g. [override.services.{}] init = [...]", first.key)
+        } else {
+            format!("resolve explicitly in stack.toml, e.g. [override.{}] {} = ...", first.kind, first.key)
+        })
         .details(details));
     }
 
     validate_task_services(&out)?;
     validate_service_dependencies(&out)?;
+    crate::init_tasks::validate(&out)?;
     validate_tool_options(&out)?;
     crate::secrets::validate_tasks(&out)?;
     Ok(out)
@@ -204,7 +215,9 @@ fn apply_overrides(out: &mut Composed, o: &Overrides, conflicts: &mut Vec<Confli
     let tools = tool_specs(&o.tools, "[override.tools]")?;
     override_kind("tools", &mut out.tools, &tools, conflicts, &mut out.overrides);
     override_kind("env", &mut out.env, &o.env, conflicts, &mut out.overrides);
-    override_kind("services", &mut out.services, &o.services, conflicts, &mut out.overrides);
+    let (services, init) = crate::init_tasks::split(&o.services);
+    override_kind("services", &mut out.services, &services, conflicts, &mut out.overrides);
+    override_kind("init", &mut out.init, &init, conflicts, &mut out.overrides);
     override_kind("tasks", &mut out.tasks, &o.tasks, conflicts, &mut out.overrides);
     Ok(())
 }

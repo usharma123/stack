@@ -19,6 +19,12 @@ use crate::secrets::{self, Grant};
 use crate::source::Mode;
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json, SharedLock};
 use crate::timing::Timings;
+use crate::lease::LeaseSummary;
+
+mod gc_pass;
+mod prepare;
+pub use prepare::{needs_up, plan_prepared, up_with, Prepare, ReassignedPort, UpOptions};
+pub use gc_pass::{gc_plan, gc_with, DeletedPlan, GcDryRun, GcOptions, GcPass, GcPlanned, GcSkipped, PlannedData, PlannedPort, PlannedService};
 use crate::tool::ToolSpec;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -88,7 +94,7 @@ impl Ctx {
     }
 }
 
-fn index_path(state: &Path, root: &Path) -> PathBuf {
+pub(crate) fn index_path(state: &Path, root: &Path) -> PathBuf {
     state
         .join("sessions")
         .join(format!("{}.json", project_key(root)))
@@ -204,6 +210,9 @@ pub struct Check {
     pub identity: Option<Identity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `reason` as a stable code an agent can branch on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<ReasonCode>,
     /// Connection variables poisoned or removed for commands because the service is not verified.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<String>,
@@ -219,6 +228,41 @@ pub struct Check {
     data_dir: Option<String>,
     #[serde(skip)]
     provider_id: Option<String>,
+}
+
+/// Why a service check failed, as a stable code beside the free-text `reason`. The values and
+/// the action each calls for are listed in docs/user/commands.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    /// Nothing in this checkout launched it (`up`).
+    NotLaunched,
+    /// The last `up` did not finish verifying this launch (`up`).
+    LaunchIncomplete,
+    /// The compiled configuration changed since `up` (`up`).
+    ConfigChanged,
+    /// The process differs from the one `up` verified, or is gone (`up`).
+    ProcessChanged,
+    /// No port assigned (`compile`).
+    NoPort,
+    /// No instance token assigned for its identity probe (`compile`).
+    NoToken,
+    /// The supervisor does not know it (`up`).
+    NotStarted,
+    /// The supervisor reports it stopped, failed or still starting (`logs`, then `restart`).
+    NotRunning,
+    /// Its process is gone (`restart`).
+    ProcessDead,
+    /// It runs on a port other than this checkout's (`down`, then `up`).
+    WrongPort,
+    /// Its port does not accept connections (`logs`, then `restart`).
+    PortClosed,
+    /// A connection variable it needs is not set (`compile`, then `up`).
+    EnvMissing,
+    /// The identity check could not run or gave no answer (`logs`).
+    ProbeFailed,
+    /// The app's settings reach a different instance (`down`, then `up`).
+    WrongInstance,
 }
 
 // ---- verification --------------------------------------------------------------------------
@@ -247,6 +291,7 @@ fn verify_all(
             pid: status.and_then(|s| s.pid),
             identity: None,
             reason: None,
+            reason_code: None,
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
@@ -265,8 +310,9 @@ fn verify_all(
                 check.ready = true;
                 check.identity = Some(identity);
             }
-            Err(reason) => {
+            Err((code, reason)) => {
                 check.reason = Some(reason);
+                check.reason_code = Some(code);
                 check.withheld = binding_vars(name, service, port, env, &inherited);
             }
         }
@@ -289,12 +335,12 @@ fn concurrently<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> R
         return items.iter().map(f).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let deadline = crate::process::deadline();
+    let bound = crate::process::inherit();
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
-                    let _deadline = crate::process::deadline_scope(deadline);
+                    let _deadline = bound.enter();
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -323,25 +369,26 @@ fn verify_one(
     status: Option<&DaemonStatus>,
     env: &IndexMap<String, String>,
     token: Option<&str>,
-) -> std::result::Result<Identity, String> {
-    let port = port.ok_or("no port assigned; run `stack compile`")?;
-    let status = status.ok_or("not started")?;
+) -> std::result::Result<Identity, (ReasonCode, String)> {
+    use ReasonCode as R;
+    let port = port.ok_or((R::NoPort, "no port assigned; run `stack compile`".to_string()))?;
+    let status = status.ok_or((R::NotStarted, "not started".to_string()))?;
     if status.status != "running" {
-        return Err(format!("supervisor reports '{}'", status.status));
+        return Err((R::NotRunning, format!("supervisor reports '{}'", status.status)));
     }
     if let Some(pid) = status.pid {
         if !pid_alive(pid) {
-            return Err(format!("process {pid} is not alive"));
+            return Err((R::ProcessDead, format!("process {pid} is not alive")));
         }
     }
     if let Some(actual) = status.port {
         if actual != port {
-            return Err(format!("running on port {actual}, but this checkout is assigned {port}; run `stack down && stack up`"));
+            return Err((R::WrongPort, format!("running on port {actual}, but this checkout is assigned {port}; run `stack down && stack up`")));
         }
     }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500))
-        .map_err(|_| format!("port {port} is not accepting connections"))?;
+        .map_err(|_| (R::PortClosed, format!("port {port} is not accepting connections")))?;
 
     let (var, bin) = match service.preset.as_deref() {
         Some("postgres") => ("DATABASE_URL", "psql"),
@@ -349,23 +396,27 @@ fn verify_one(
         _ => {
             return match &service.identity {
                 Some(probe) => {
-                    let token = token.ok_or("no instance token assigned; run `stack compile`")?;
-                    run_identity_probe(root, probe, env, token).map(|()| Identity::Instance)
+                    let token = token.ok_or((R::NoToken, "no instance token assigned; run `stack compile`".to_string()))?;
+                    run_identity_probe(root, probe, env, token).map(|()| Identity::Instance).map_err(|why| {
+                        // The one answer that is not a failure to probe.
+                        let code = if why.starts_with("identity probe reached a different instance") { R::WrongInstance } else { R::ProbeFailed };
+                        (code, why)
+                    })
                 }
                 None => Ok(Identity::Liveness),
             }
         }
     };
-    let url = env.get(var).ok_or_else(|| format!("{var} is not set"))?;
+    let url = env.get(var).ok_or_else(|| (R::EnvMissing, format!("{var} is not set")))?;
     let expected = status
         .data_dir
         .as_deref()
-        .ok_or("supervisor did not report a data directory")?;
+        .ok_or((R::ProbeFailed, "supervisor did not report a data directory".to_string()))?;
     let args: Vec<&str> = match bin {
         "psql" => vec![url, "-Atc", "select current_setting('data_directory')"],
         _ => vec!["-u", url, "--no-auth-warning", "config", "get", "dir"],
     };
-    let out = run_probe(env, bin, &args)?;
+    let out = run_probe(env, bin, &args).map_err(|why| (R::ProbeFailed, why))?;
     let reported = out
         .lines()
         .map(str::trim)
@@ -374,9 +425,9 @@ fn verify_one(
     if same_path(reported, expected) {
         Ok(Identity::Instance)
     } else {
-        Err(format!(
+        Err((R::WrongInstance, format!(
             "{var} reaches a different server (data dir '{reported}', expected '{expected}')"
-        ))
+        )))
     }
 }
 
@@ -552,14 +603,21 @@ struct Steps(Vec<Value>);
 
 impl Steps {
     fn ok(&mut self, step: &str, detail: Value) {
+        crate::progress::notify(crate::progress::Event { step, phase: crate::progress::Phase::Ok, code: None, detail: Some(&detail) });
         self.0
             .push(json!({ "step": step, "status": "ok", "detail": detail }));
     }
 
     /// A step that completed with warnings: the command still succeeds.
     fn warn(&mut self, step: &str, detail: Value) {
+        crate::progress::notify(crate::progress::Event { step, phase: crate::progress::Phase::Warning, code: None, detail: Some(&detail) });
         self.0
             .push(json!({ "step": step, "status": "warning", "detail": detail }));
+    }
+
+    /// A step is starting: only observers hear of it (see `progress`); the record is unchanged.
+    fn begin(&self, step: &str) {
+        crate::progress::started(step);
     }
 
     /// `[skills] dir`: link the stack's skills after install. Every outcome is a warning at
@@ -582,6 +640,7 @@ impl Steps {
 
     /// Attach the steps that already ran, and whether repeating the command is safe.
     fn fail(mut self, step: &str, err: StackError, changed: bool) -> StackError {
+        crate::progress::notify(crate::progress::Event { step, phase: crate::progress::Phase::Failed, code: Some(err.code), detail: None });
         self.0
             .push(json!({ "step": step, "status": "failed", "code": err.code }));
         let mut err =
@@ -596,7 +655,7 @@ impl Steps {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LeaseOptions {
     pub ttl_secs: Option<u64>,
     pub owner_pid: Option<u32>,
@@ -628,19 +687,26 @@ pub struct UpReport {
     pub checks: Vec<Check>,
     pub steps: Vec<Value>,
     pub reaped: Vec<GcEntry>,
-    /// Problems that did not stop startup (the `skills` step).
+    /// Problems that did not stop startup (the `gc` and `skills` steps).
     pub warnings: Vec<String>,
+    /// Ports `--reassign-ports` moved after a port conflict.
+    pub reassigned_ports: Vec<ReassignedPort>,
+    /// What happened to each service's init tasks (see `init_tasks`).
+    pub init: IndexMap<String, crate::init_tasks::Outcome>,
 }
 
 impl Serialize for UpReport {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         StartedView {
             session: SessionView::of(&self.session),
+            lease: Some(LeaseSummary::of(self.session.lease.as_ref())),
             restarted: None,
             checks: &self.checks,
             steps: compact_steps(&self.steps),
             reaped: &self.reaped,
             warnings: &self.warnings,
+            reassigned_ports: &self.reassigned_ports,
+            init: Some(&self.init).filter(|i| !i.is_empty()),
         }
         .serialize(s)
     }
@@ -654,6 +720,9 @@ impl Serialize for UpReport {
 #[derive(Serialize)]
 struct StartedView<'a> {
     session: SessionView<'a>,
+    /// The session's lease, structured (`up` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease: Option<LeaseSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     restarted: Option<&'a [String]>,
     checks: &'a [Check],
@@ -662,6 +731,11 @@ struct StartedView<'a> {
     reaped: &'a [GcEntry],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     warnings: &'a [String],
+    #[serde(skip_serializing_if = "<[ReassignedPort]>::is_empty")]
+    reassigned_ports: &'a [ReassignedPort],
+    /// What happened to each service's init tasks (`up` only; see `init_tasks`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    init: Option<&'a IndexMap<String, crate::init_tasks::Outcome>>,
 }
 
 #[derive(Serialize)]
@@ -680,13 +754,15 @@ impl<'a> SessionView<'a> {
 
 /// Successful steps without details the result already carries elsewhere (ports and identities
 /// are in the checks) or that only matter when something fails (the socket, install coverage:
-/// `stack install` reports it). What `stop_previous` and `ports` stopped without a record is kept.
+/// `stack install` reports it). What `stop_previous` and `ports` stopped without a record is kept,
+/// and so are the other checkouts' sessions `gc` skipped because they were busy.
 fn compact_steps(steps: &[Value]) -> Vec<Value> {
     const REDUNDANT: [&str; 7] = ["gc", "compile", "preflight", "install", "stop", "start", "verify"];
+    let redundant = |step: &Value| REDUNDANT.contains(&step["step"].as_str().unwrap_or_default()) && step["detail"].get("skipped").is_none();
     steps
         .iter()
         .map(|step| match step.as_object() {
-            Some(fields) if step["status"] == "ok" && (REDUNDANT.contains(&step["step"].as_str().unwrap_or_default()) || step["detail"].is_null()) => {
+            Some(fields) if step["status"] == "ok" && (redundant(step) || step["detail"].is_null()) => {
                 Value::Object(fields.iter().filter(|(k, _)| *k != "detail").map(|(k, v)| (k.clone(), v.clone())).collect())
             }
             _ => step.clone(),
@@ -713,17 +789,15 @@ fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()
 /// short (its subprocesses killed with their process groups) and the result is `timed_out`;
 /// ownership of anything launched stays recorded, as for any failed launch.
 pub fn up(ctx: &Ctx, lease: LeaseOptions, timeout: Duration) -> Result<UpReport> {
-    let _deadline = crate::process::deadline_scope(Some(startup_deadline(timeout)?));
-    up_within(ctx, lease).map_err(|e| startup_timed_out(e, "up", timeout))
+    up_with(ctx, lease, timeout, UpOptions::default())
 }
 
-fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
+fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpReport> {
     if let Some(pid) = lease.owner_pid {
         owner_pid(pid.into())?;
     }
     let mut steps = Steps::default();
-    let reaped = gc(&ctx.state)?;
-    steps.ok("gc", json!({ "reaped": reaped.len() }));
+    let (reaped, gc_warnings) = gc_pass::before_up(&ctx.state, &mut steps);
 
     let _guard = project_lock(&ctx.state, &ctx.root).map_err(|e| steps.clone().fail("lock", e, false))?;
     let mut previous = load(ctx)?;
@@ -737,6 +811,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     // A mise too old for what the configuration asks would silently ignore it: checked before
     // the compile writes anything. The artifact policy is checked, and the provider's lock
     // rendered from stack.lock, before any install.
+    steps.begin("compile");
     let report = match ctx.compile_to_install() {
         Ok(r) => r,
         Err((step, e)) => return Err(steps.fail(step, e, false)),
@@ -744,6 +819,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     steps.ok("compile", json!({ "ports": report.ports }));
     if let Err(e) = check_services_host(&report).and_then(|()| refuse_root(&report)) {
         return Err(steps.fail("install", e, false));
+    }
+    if let Err(e) = crate::init_tasks::check_options(&report.stack, opts).and_then(|()| crate::snapshot::check_up(ctx, &report, opts)) {
+        return Err(steps.fail("compile", e, false));
     }
 
     let plan = match prepare_install(ctx, &report) {
@@ -771,7 +849,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
-    match install_partitioned(ctx, &plan) {
+    steps.begin("install");
+    match install_partitioned(ctx, &plan, &report) {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
     }
@@ -799,6 +878,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
     // Nothing can start on a port a foreign program holds, and the supervisor's own error
     // would come after the attempt. Stack's own daemons still running (an unchanged
     // generation) are not conflicts.
+    // The supervisor's listing, asked once for the port check and the launch record: nothing
+    // between them starts or stops a daemon it tracks.
+    let mut listed = None;
     if !report.stack.services.is_empty() {
         let statuses = match mise::daemons(&ctx.root) {
             Ok(s) => s,
@@ -831,6 +913,18 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         match claim_data(ctx, &report, &statuses, provider.as_ref()) {
             Ok(moved) => warnings.extend(moved),
             Err(e) => return Err(steps.fail("data", e, false)),
+        }
+        // After the claim: each data directory is recorded for this checkout and marked as its.
+        if let Some(name) = opts.from_snapshot.as_deref() {
+            match crate::snapshot::restore_before_start(ctx, &report, &statuses, name) {
+                Ok(detail) => steps.ok("restore_snapshot", detail),
+                Err(e) => return Err(steps.fail("restore_snapshot", e, false)),
+            }
+        }
+        // Stopping this checkout's untracked processes can change what the supervisor says
+        // about the daemons they belonged to: asked again then.
+        if mine.is_empty() {
+            listed = Some(statuses);
         }
     }
 
@@ -885,7 +979,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         }
         let supervisor = addressed.as_deref().expect("services have a known supervisor (preflight)");
         // Capture qualified IDs before launch when available, including interrupted starts.
-        let before = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        let before = match listed.take() {
+            Some(statuses) => statuses,
+            None => mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("record_launch", e, false))?,
+        };
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         let names: Vec<String> = report.stack.services.keys().cloned().collect();
         // A service still running whose dependency is about to start again (it died, or never
@@ -899,6 +996,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
                 Err(e) => return Err(steps.fail("stop_dependents", e, true)),
             }
         }
+        steps.begin("start");
         if let Err(start_error) = start_in_order(ctx, &report, &names, supervisor) {
             let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
@@ -908,6 +1006,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         }
         steps.ok("start", json!(null));
 
+        steps.begin("verify");
         checks = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
         steps.ok(
             "verify",
@@ -955,13 +1054,19 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions) -> Result<UpReport> {
         project_dir_created,
     };
     save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
-    Ok(UpReport {
+    let mut up = UpReport {
         session,
         checks,
         steps: steps.0,
         reaped,
-        warnings,
-    })
+        warnings: gc_warnings.into_iter().chain(warnings).collect(),
+        reassigned_ports: Vec::new(),
+        init: IndexMap::new(),
+    };
+    // Init tasks run like `stack run`, which takes the project lock itself.
+    drop(_guard);
+    crate::init_tasks::run(ctx, &mut up, &report.stack, opts)?;
+    Ok(up)
 }
 
 /// A warning for each verified Postgres preset whose cluster is not `UTF8`: one created under
@@ -1001,11 +1106,11 @@ fn encoding_warning(env: &IndexMap<String, String>, check: &Check) -> Option<Str
 }
 
 /// What [`data_marker`] adds to the data directory's name.
-const MARKER_SUFFIX: &str = ".stack-checkout";
+pub(crate) const MARKER_SUFFIX: &str = ".stack-checkout";
 
 /// The file beside a service's data directory naming the checkout (by token, see
 /// [`crate::checkout`]) whose data it is.
-fn data_marker(dir: &Path) -> PathBuf {
+pub(crate) fn data_marker(dir: &Path) -> PathBuf {
     let mut name = dir.file_name().unwrap_or_default().to_os_string();
     name.push(MARKER_SUFFIX);
     dir.with_file_name(name)
@@ -1072,7 +1177,7 @@ fn data_owner(dir: &Path) -> Option<String> {
     fs::read(data_marker(dir)).ok().and_then(|bytes| marker_owner(&bytes))
 }
 
-fn marker_owner(bytes: &[u8]) -> Option<String> {
+pub(crate) fn marker_owner(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes).ok().and_then(|v| v["checkout"].as_str().map(String::from))
 }
 
@@ -1290,7 +1395,7 @@ fn prerequisites_ready(ctx: &Ctx, report: &Report, starting: &[String], names: &
         let status = statuses.iter().find(|d| d.name == *name);
         let token = report.identities.get(name).map(String::as_str);
         let reason = match (verify_one(&ctx.root, &entry.value, report.ports.get(name).copied(), status, &env, token), &entry.value.ready_cmd) {
-            (Err(reason), _) => Some((reason, None)),
+            (Err((_, reason)), _) => Some((reason, None)),
             // A declared ready_cmd runs once, kept with what it answered when it fails. One that
             // cannot be run says nothing of readiness, so it does not pass either.
             (Ok(_), Some(command)) => match check_ready_cmd(ctx, report, &env, name, command) {
@@ -1361,10 +1466,10 @@ fn watch_starts(ctx: &Ctx, report: &Report, names: &[String], scope: Option<&[St
         .collect();
     let owner = supervisor_owner(&ctx.state, true).ok();
     let starter = {
-        let (root, names, cancel, deadline) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::deadline());
+        let (root, names, cancel, bound) = (ctx.root.clone(), names.to_vec(), cancel.clone(), crate::process::inherit());
         let (checkable, completed, supervisor) = (checkable.clone(), completed.clone(), supervisor.clone());
         std::thread::spawn(move || {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             let _cancel = crate::process::cancel_scope(cancel.clone());
             let _ = done.send(request_starts((&root, &supervisor), &names, &checkable, &cancel, &completed, owner.as_deref()));
         })
@@ -1581,11 +1686,11 @@ fn request_each(
     for (i, name) in names.iter().enumerate() {
         confirm_addressed(root, supervisor.state_dir())?;
         let end = Arc::new(AtomicBool::new(false));
-        let (dir, service, sent, deadline, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::deadline(), end.clone());
+        let (dir, service, sent, bound, flag) = (root.to_path_buf(), name.clone(), sent.clone(), crate::process::inherit(), end.clone());
         let target = supervisor.clone();
         let owner = owner.map(str::to_string);
         threads.push(std::thread::spawn(move || {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             let _cancel = crate::process::cancel_scope(flag);
             let _ = sent.send((i, mise::start_daemon(&dir, &service, owner.as_deref(), &target)));
         }));
@@ -1850,11 +1955,14 @@ impl Serialize for RestartReport {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         StartedView {
             session: SessionView::of(&self.session),
+            lease: None,
             restarted: Some(&self.restarted),
             checks: &self.checks,
             steps: compact_steps(&self.steps),
             reaped: &[],
             warnings: &[],
+            reassigned_ports: &[],
+            init: None,
         }
         .serialize(s)
     }
@@ -1957,6 +2065,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         Err(e) => return Err(steps.fail("preflight", e, false)),
     };
     // Confirm the old processes are gone before starting new ones on the same ports.
+    steps.begin("stop");
     if let Err(e) = stop_and_wait(ctx, &names, Some(&session), &supervisor) {
         return Err(steps.fail("stop", e, true));
     }
@@ -1985,6 +2094,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         session.provider = mise::which_pitchfork(&ctx.root).map(|pitchfork| ProviderRecord { pitchfork, state_dir: supervisor.clone() });
     }
     save(ctx, &session).map_err(|e| steps.clone().fail("record_launch", e, true))?;
+    steps.begin("start");
     if let Err(start_error) = start_in_order(ctx, &report, &names, &supervisor) {
         let observed = record_after_failed_start(ctx);
         if let Err(error) = observed {
@@ -1993,6 +2103,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
         return Err(steps.fail("start", with_readiness_unless_cancelled(ctx, &report, &names, start_error), true));
     }
     steps.ok("start", json!(names));
+    steps.begin("verify");
     let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
     steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
     bind_data(ctx, &checks);
@@ -2013,6 +2124,161 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     Ok(RestartReport { session, restarted: names, checks, steps: steps.0 })
 }
 
+/// What [`with_stopped`] did around its operation.
+#[derive(Debug, Serialize)]
+pub struct StoppedReport {
+    pub steps: Vec<Value>,
+    /// Services that were running, stopped for the operation (with those that depend on them)
+    /// and started and verified again.
+    pub restarted: Vec<String>,
+    pub checks: Vec<Check>,
+    /// What the operation returned.
+    pub result: Value,
+}
+
+/// Run `operation` with the named services confirmed stopped, under the project lock, then
+/// start and verify again those that were running (for snapshots, which copy data
+/// directories). Stopping and starting are `restart`'s: services that depend on a stopped one
+/// are stopped first and started after it, each service's `setup` runs before it starts, and
+/// the supervisor this environment names is the one addressed. `operation` gets the compiled
+/// report and the supervisor listing taken once they stopped. Services that run must belong to
+/// the current, verified session; a stale or incomplete one is refused (`session_stale`). If
+/// the operation fails after stopping, the services are started again before the error is
+/// returned.
+pub fn with_stopped(
+    ctx: &Ctx,
+    names: &[String],
+    operation: impl FnOnce(&Report, &[DaemonStatus]) -> Result<Value>,
+) -> Result<StoppedReport> {
+    let _deadline = crate::process::deadline_scope(Some(startup_deadline(DEFAULT_STARTUP_TIMEOUT)?));
+    let mut steps = Steps::default();
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let mut session = load(ctx)?;
+    if let Some(s) = session.as_mut() {
+        settle_executions(ctx, s)?;
+        if has_active_executions(s) {
+            return Err(busy(s, "snapshot"));
+        }
+    }
+    let report = ctx.compile(true)?;
+    for name in names {
+        if !report.stack.services.contains_key(name) {
+            return Err(unknown_service(&report, name));
+        }
+    }
+    check_services_host(&report)?;
+    refuse_root(&report)?;
+    mise::trust(&ctx.root)?;
+    let statuses = mise::daemons(&ctx.root)?;
+    let live = |n: &String| {
+        statuses.iter().any(|d| d.name == *n && matches!(d.status.as_str(), "running" | "starting" | "waiting"))
+            || session.as_ref().and_then(|s| s.services.get(n)).is_some_and(|r| r.pid.is_some_and(pid_alive))
+    };
+    let mut stopping: Vec<String> = names.iter().filter(|n| live(n)).cloned().collect();
+    let mut supervisor = None;
+    if !stopping.is_empty() {
+        let current = session.as_ref().is_some_and(|s| !s.launching && same_config(s, ctx, &report));
+        if !current {
+            return Err(StackError::new(
+                "session_stale",
+                format!("{} running from a configuration or launch this checkout has not verified", stopping.join(", ")),
+            )
+            .hint("run `stack up` (or `stack down`) first, then retry"));
+        }
+        // What holds connections to a stopped service is stopped with it and started after it.
+        let dependents: Vec<String> = dependents_of(&report.stack.services, &stopping).into_iter().filter(|n| live(n)).collect();
+        stopping.extend(dependents);
+        let dir = match addressed_supervisor(ctx) {
+            Ok(dir) => dir,
+            Err(e) => return Err(steps.fail("preflight", e, false)),
+        };
+        steps.begin("stop");
+        if let Err(e) = stop_and_wait(ctx, &stopping, session.as_ref(), &dir) {
+            return Err(steps.fail("stop", e, true));
+        }
+        steps.ok("stop", json!(stopping));
+        supervisor = Some(dir);
+    }
+    // The supervisor must agree that nothing named still runs before any data is touched.
+    let stopped = mise::daemons(&ctx.root).map_err(|e| steps.clone().fail("confirm_stopped", e, !stopping.is_empty()))?;
+    let still: Vec<&str> = names
+        .iter()
+        .filter(|n| stopped.iter().any(|d| d.name == **n && matches!(d.status.as_str(), "running" | "starting" | "waiting")))
+        .map(String::as_str)
+        .collect();
+    if !still.is_empty() {
+        let err = StackError::new("stop_unconfirmed", format!("the supervisor still reports {} running; no data was touched", still.join(", ")))
+            .hint("run `stack down`, then retry");
+        return Err(steps.fail("confirm_stopped", err, !stopping.is_empty()));
+    }
+    let outcome = operation(&report, &stopped);
+    let result = match &outcome {
+        Ok(v) => {
+            steps.ok("copy", v.clone());
+            v.clone()
+        }
+        Err(e) => {
+            steps.0.push(json!({ "step": "copy", "status": "failed", "code": e.code }));
+            Value::Null
+        }
+    };
+    let mut checks = Vec::new();
+    if let (Some(mut session), Some(supervisor)) = (session.filter(|_| !stopping.is_empty()), supervisor) {
+        let started_at = now_ms();
+        for name in &stopping {
+            if let Some(record) = session.services.get_mut(name) {
+                record.pid = None;
+                record.started_at_ms = None;
+            }
+        }
+        session.launching = true;
+        if session.provider.as_ref().map_or(true, |p| resolved(&p.state_dir) != resolved(&supervisor)) {
+            session.provider = mise::which_pitchfork(&ctx.root).map(|pitchfork| ProviderRecord { pitchfork, state_dir: supervisor.clone() });
+        }
+        let restarted = save(ctx, &session)
+            .map_err(|e| ("record_launch", e))
+            .and_then(|()| {
+                start_in_order(ctx, &report, &stopping, &supervisor).map_err(|e| {
+                    let _ = record_after_failed_start(ctx);
+                    ("start", with_readiness_unless_cancelled(ctx, &report, &stopping, e))
+                })
+            })
+            .and_then(|()| verify_launch(ctx, &report, "snapshot_verify"));
+        match restarted {
+            Ok(verified) => {
+                steps.ok("start", json!(stopping));
+                steps.ok("verify", json!(verified.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
+                bind_data(ctx, &verified);
+                for check in &verified {
+                    let started = match session.services.get(&check.service) {
+                        Some(r) if !stopping.contains(&check.service) && r.pid.is_some() && r.pid == check.pid => r.started_at_ms,
+                        _ => Some(started_at),
+                    };
+                    session.services.insert(check.service.clone(), record_of(check, started));
+                }
+                session.launching = false;
+                save(ctx, &session).map_err(|e| steps.clone().fail("record_session", e, true))?;
+                checks = verified;
+            }
+            Err((step, e)) => {
+                let e = match outcome {
+                    Err(first) => first.with_detail(json!({ "restart_error": e })),
+                    Ok(_) => e,
+                };
+                return Err(steps.fail(step, e, true));
+            }
+        }
+    }
+    match outcome {
+        Ok(_) => Ok(StoppedReport { steps: steps.0, restarted: stopping, checks, result }),
+        Err(e) => {
+            let changed = !stopping.is_empty();
+            // The failed copy step is already recorded; attach the progress record.
+            Err(e.with_detail(json!({ "steps": steps.0, "retry_safe": true, "changed": changed })))
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct InstallReport {
     pub steps: Vec<Value>,
@@ -2029,6 +2295,7 @@ pub struct InstallReport {
 pub fn install(ctx: &Ctx) -> Result<InstallReport> {
     let mut steps = Steps::default();
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    steps.begin("compile");
     let report = match ctx.compile_to_install() {
         Ok(r) => r,
         Err((step, e)) => return Err(steps.fail(step, e, false)),
@@ -2050,7 +2317,8 @@ pub fn install(ctx: &Ctx) -> Result<InstallReport> {
             Err(e) => return Err(steps.fail("preflight", e, false)),
         }
     }
-    match install_partitioned(ctx, &plan) {
+    steps.begin("install");
+    match install_partitioned(ctx, &plan, &report) {
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
     }
@@ -2106,9 +2374,37 @@ fn install_plan(report: &Report) -> Result<InstallPlan> {
     Ok(InstallPlan { artifacts: artifacts::summary(lock, &pins, &platform), partition, everything })
 }
 
+/// Whether every tool the install would name is an exact pin of stack.lock that mise lists as
+/// installed, asked now with one `mise ls --json` naming exactly those pins and their options.
+/// `mise install` checks nothing more of a release already installed (see
+/// [`INSTALL_BOUNDARY`]), so a repeated `up` skips it and saves a provider start per partition.
+/// Anything else, including a question mise could not answer, installs as before, so nothing a
+/// download goes through (checksum, signer, platform variant) is skipped for a missing release.
+fn already_installed(ctx: &Ctx, plan: &InstallPlan, report: &Report) -> bool {
+    let named = || plan.partition.locked.iter().chain(&plan.partition.plain);
+    // A request that names no release (`system`, `path:`, `ref:`) is not a pin: mise decides.
+    let unpinned = report.stack.tools.values().any(|e| mise::unversioned(&e.value.version));
+    if plan.everything || unpinned || named().next().is_none() {
+        return false;
+    }
+    let pins = report.lock.as_ref().map(scratch::pins).unwrap_or_default();
+    named().all(|tool| pins.iter().any(|pin| &pin.tool == tool))
+        && scratch::not_installed(&ctx.cache, &pins).is_ok_and(|missing| missing.is_empty())
+}
+
 /// `mise install --locked` for pins whose coverage here is verified or exempt, then plain
-/// `mise install` for the rest; an empty partition is skipped.
-fn install_partitioned(ctx: &Ctx, plan: &InstallPlan) -> Result<Value> {
+/// `mise install` for the rest; an empty partition is skipped, and so is the whole install
+/// when every pin is already installed (see [`already_installed`]).
+fn install_partitioned(ctx: &Ctx, plan: &InstallPlan, report: &Report) -> Result<Value> {
+    if already_installed(ctx, plan, report) {
+        return Ok(json!({
+            "artifacts": plan.artifacts,
+            "locked": plan.partition.locked,
+            "plain": plan.partition.plain,
+            "boundary": INSTALL_BOUNDARY,
+            "skipped": "every pinned release is already installed",
+        }));
+    }
     if !plan.partition.locked.is_empty() {
         mise::install_tools(&ctx.root, &plan.partition.locked, true)?;
     }
@@ -2144,6 +2440,16 @@ pub struct LogsReport {
 /// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
 /// time and size; never follows. With `since_start`, only output of the current process.
 pub fn logs(ctx: &Ctx, service: &str, tail: usize, since_start: bool) -> Result<LogsReport> {
+    logs_since(ctx, service, tail, since_start, None)
+}
+
+/// Every service the project defines, in order.
+pub fn service_names(ctx: &Ctx) -> Result<Vec<String>> {
+    Ok(ctx.compile(false)?.stack.services.keys().cloned().collect())
+}
+
+/// [`logs`], also keeping only output written at or after `since` (Unix seconds) when given.
+pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, since: Option<u64>) -> Result<LogsReport> {
     let report = ctx.compile(false)?;
     if !report.stack.services.contains_key(service) {
         return Err(unknown_service(&report, service));
@@ -2163,8 +2469,8 @@ pub fn logs(ctx: &Ctx, service: &str, tail: usize, since_start: bool) -> Result<
             .hint("run `stack up` first"));
     }
     let since = match (since_start, started_at) {
-        (false, _) => None,
-        (true, Some(at)) => Some(at),
+        (false, _) => since,
+        (true, Some(at)) => Some(since.map_or(at, |s| s.max(at))),
         (true, None) => {
             return Err(StackError::new("logs_failed", format!("no recorded start time for {service}"))
                 .hint("sessions started before stack 0.1.18 lack one; `stack restart` records it"))
@@ -2230,7 +2536,7 @@ pub fn dir_id(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
+pub(crate) fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.created().ok()
 }
 
@@ -2286,6 +2592,30 @@ pub struct DownReport {
     /// services.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<Value>,
+    /// What `down --purge` removed and released (see [`purge_locked`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purge: Option<PurgeReport>,
+}
+
+/// What `down --purge` did with this checkout's recorded data, ports and identity tokens.
+#[derive(Debug, Serialize)]
+pub struct PurgeReport {
+    /// Each data directory `up` recorded for this checkout, and what became of it.
+    pub data: Vec<PurgedData>,
+    /// Every recorded data directory was removed, or found no longer to be this checkout's.
+    /// When false, `data` says what was kept and why.
+    pub complete: bool,
+    pub released_ports: Vec<Value>,
+    pub released_identities: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgedData {
+    pub service: String,
+    pub dir: PathBuf,
+    pub outcome: String,
+    /// Kept because Stack could not confirm it is safe to remove; `outcome` says why.
+    pub kept: bool,
 }
 
 /// A port reserved for one of this checkout's services that a foreign program holds.
@@ -2308,6 +2638,13 @@ pub fn down(ctx: &Ctx) -> Result<DownReport> {
 
 /// [`down`]; with `stop_supervisor` false the supervisor is kept whoever started it.
 pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
+    down_purging(ctx, stop_supervisor, false)
+}
+
+/// [`down_with`]; with `purge`, once every service is confirmed stopped, also remove the data
+/// directories `up` recorded for this checkout and release its ports and identity tokens (see
+/// [`purge_locked`]), under the same project lock.
+pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     restore_provider_config(ctx)?;
     let session = load(ctx)?;
@@ -2315,6 +2652,10 @@ pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
     let owns_services = !ports::lookup(&ctx.state, &ctx.root)?.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
     let recorded = session.and_then(|s| s.provider);
     let mut report = down_locked(ctx, None, None)?;
+    // Before the supervisor may stop: it confirms each service is not running.
+    if purge {
+        report.purge = Some(purge_locked(ctx)?);
+    }
     if owns_services || recorded.is_some() {
         report.supervisor = Some(if stop_supervisor {
             stop_owned_supervisor(ctx, recorded)
@@ -2751,6 +3092,7 @@ fn down_locked(ctx: &Ctx, provider: Option<&ProviderRecord>, addressed: Option<&
         confirmed: true,
         conflicts,
         supervisor: None,
+        purge: None,
     })
 }
 
@@ -2918,7 +3260,7 @@ fn port_conflict_error(conflicts: Vec<PortConflict>) -> StackError {
     let (pinned, assigned): (Vec<&PortConflict>, Vec<&PortConflict>) = conflicts.iter().partition(|c| c.pinned);
     let mut hints = Vec::new();
     if !assigned.is_empty() {
-        hints.push("run `stack compile --reassign-ports` to give this checkout other ports, then `stack up`".to_string());
+        hints.push("run `stack up --reassign-ports` to give the conflicting services other ports and carry on (or `stack compile --reassign-ports` to give this checkout all new ports, then `stack up`)".to_string());
     }
     for c in pinned {
         hints.push(format!(
@@ -3084,6 +3426,8 @@ pub struct StatusReport {
     pub checks: Vec<Check>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expired: Option<String>,
+    /// The session's lease, structured (kind `none` without a session or lease).
+    pub lease: LeaseSummary,
     /// The complete compiled configuration changed since the session started.
     pub stale: bool,
     /// Every service verified and the session is current; `stack status` exits 1 otherwise.
@@ -3092,12 +3436,15 @@ pub struct StatusReport {
     /// stack.lock; nothing is fetched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<artifacts::PlatformSummary>,
+    /// Init state of each service, when any declares init tasks (see `init_tasks`).
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub init: IndexMap<String, crate::init_tasks::InitState>,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
 pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    let session = load(ctx)?;
+    let mut session = load(ctx)?;
     let report = ctx.compile(false)?;
     let checks = if report.stack.services.is_empty() {
         Vec::new()
@@ -3125,10 +3472,20 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
         .and_then(|s| s.lease.as_ref())
         .and_then(|l| l.expired(now()))
         .map(|why| format!("{why}; the next `stack gc` or `stack up` stops these services; `stack renew` (or any `stack exec`) renews a TTL lease"));
+    // Checking on a session is using it, as `exec` is: a lease that has not run out is
+    // renewed. An expired one is left for GC rather than revived, and a session that is stale
+    // or did not finish starting is not one to keep alive.
+    if let Some(session) = session.as_mut().filter(|s| !s.launching && !stale && lease_expired.is_none()) {
+        renew_in_status(ctx, session)?;
+    }
+    let data_dirs = checks.iter().map(|c| (c.service.clone(), c.data_dir.clone())).collect();
+    let init = crate::init_tasks::statuses(&ctx.state, &ctx.root, &report.stack, &data_dirs);
     Ok(StatusReport {
+        init,
         artifacts,
         healthy: !stale && lease_expired.is_none() && checks.iter().all(|c| c.ready),
         stale,
+        lease: LeaseSummary::of(session.as_ref().and_then(|s| s.lease.as_ref())),
         lease_expired,
         session,
         checks,
@@ -3162,6 +3519,7 @@ fn not_launched(report: &Report) -> Vec<Check> {
             pid: None,
             identity: None,
             reason: Some("no launch record in this checkout; run `stack up`".into()),
+            reason_code: Some(ReasonCode::NotLaunched),
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
@@ -3173,6 +3531,8 @@ fn not_launched(report: &Report) -> Vec<Check> {
 }
 
 pub struct ExecPlan {
+    /// What `--up` (and `--install`) did before planning, reported with the result.
+    pub prepared: Vec<Value>,
     pub program: PathBuf,
     pub args: Vec<String>,
     /// Complete environment for the command, including poisoned endpoints.
@@ -3191,6 +3551,8 @@ pub struct ExecPlan {
     /// A task's copy of the provider configuration it was planned from, which `env` points
     /// `mise run` at. Removed when the plan is dropped, after the command finishes.
     pub task_config: Option<TaskConfig>,
+    /// Where the command runs; the project root when `None`.
+    pub dir: Option<PathBuf>,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -3573,7 +3935,20 @@ fn declared_task<'a>(stack: &'a Composed, name: &str) -> Result<&'a Entry<Task>>
 
 fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     let mut timings = Timings::new("exec");
-    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    // Planning a command writes only what it writes holding the project's write lock (the
+    // compiled configuration and its trust, then the session's record of this execution), so
+    // commands in one checkout plan side by side while nothing that changes the project runs.
+    // A task also writes its configuration copy and may install its tools: it plans alone.
+    let shared = matches!(target, Target::Command { .. });
+    let (_alone, _sharing) = if shared {
+        (None, Some(crate::state::project_lock_shared(&ctx.state, &ctx.root, true)?))
+    } else {
+        (Some(project_lock(&ctx.state, &ctx.root)?), None)
+    };
+    let write_lock = || -> Result<Option<crate::state::FileLock>> {
+        if shared { crate::state::project_write_lock(&ctx.state, &ctx.root).map(Some) } else { Ok(None) }
+    };
+    let mut writing = write_lock()?;
     timings.mark("lock");
     let mut session = load(ctx)?;
     let report = match target {
@@ -3621,19 +3996,35 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     // from its configuration copy below, before it starts.
     let installed = {
         let (cache, pins) = (ctx.cache.clone(), report.lock.as_ref().map(scratch::pins).unwrap_or_default());
-        let deadline = crate::process::deadline();
+        let bound = crate::process::inherit();
         std::thread::spawn(move || {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             scratch::not_installed(&cache, &pins)
         })
     };
-    let provided = mise::trust(&ctx.root).and_then(|()| {
-        timings.mark("trust");
+    let trusted = mise::trust_once(&ctx.state, &ctx.root);
+    // Written and trusted: from here the provider only reads the configuration, as other
+    // planners do.
+    drop(writing.take());
+    timings.mark("trust");
+    let provide = || {
         if report.stack.services.is_empty() {
             mise::env(&ctx.root).map(|env| (env, None))
         } else {
             mise::env_and_daemons(&ctx.root).map(|(env, statuses)| (env, Some(statuses)))
         }
+    };
+    let provided = trusted.and_then(|skipped| match provide() {
+        // mise may have dropped its own record of a configuration Stack remembers trusting (its
+        // state was cleared, or `mise trust --untrust` ran): trusted again, and asked once more.
+        Err(_) if skipped => {
+            let _writing = write_lock()?;
+            mise::forget_trust(&ctx.state, &ctx.root);
+            mise::trust_once(&ctx.state, &ctx.root)?;
+            drop(_writing);
+            provide()
+        }
+        other => other,
     });
     let missing = installed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
     if let Target::Command { .. } = target {
@@ -3766,6 +4157,13 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
     // Reserve execution before releasing the same lock used by GC. This closes the
     // verify/start race without holding an exclusive lock throughout a long command.
     let mut execution = None;
+    let _writing = write_lock()?;
+    if shared {
+        // Other commands may have planned meanwhile: this one is recorded in the session as it
+        // is now. The shared lock kept it the generation verified above; nothing else is.
+        let verified = session.as_ref().map(|s| s.id.clone());
+        session = load(ctx)?.filter(|fresh| verified.as_ref() == Some(&fresh.id));
+    }
     if let Some(session) = session
         .as_mut()
         .filter(|s| !s.launching && same_config(s, ctx, &report))
@@ -3806,6 +4204,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         None => Default::default(),
     };
     Ok(ExecPlan {
+        prepared: Vec::new(),
         program,
         args: args.to_vec(),
         env,
@@ -3816,6 +4215,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         secret_warnings,
         redactor,
         task_config,
+        dir: None,
     })
 }
 
@@ -3917,7 +4317,7 @@ fn require_installed(missing: &[scratch::Pin]) -> Result<()> {
         "tools_not_installed",
         format!("pinned release(s) not installed: {}", names.join(", ")),
     )
-    .hint("run `stack install`; exec does not fall back to another release on PATH")
+    .hint("run `stack install`, or repeat with `stack exec --install` (MCP `install: true`); exec does not fall back to another release on PATH")
     .details(missing.iter().map(|p| json!({ "tool": p.tool, "version": p.spec.version })).collect()))
 }
 
@@ -3954,19 +4354,47 @@ fn resolve_secrets(
 }
 
 pub fn renew(ctx: &Ctx) -> Result<Session> {
+    renew_with(ctx, None)
+}
+
+/// [`renew`], setting the lease's TTL to `ttl_secs` when given (giving a session without a
+/// lease one; an owner process, if any, is kept).
+pub fn renew_with(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Session> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     let mut session = load(ctx)?.ok_or_else(|| {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
+    if let (None, Some(ttl)) = (&session.lease, ttl_secs) {
+        session.lease = Some(Lease { ttl_secs: Some(ttl), owner_pid: None, renewed_at: now() });
+    }
     let lease = session.lease.as_mut().ok_or_else(|| {
         StackError::new(
             "no_lease",
             "this session has no lease; it lives until `stack down`",
         )
+        .hint("run `stack renew --ttl 30m` to give it one, or `stack up --ttl 30m`")
     })?;
+    if ttl_secs.is_some() {
+        lease.ttl_secs = ttl_secs;
+    }
     lease.renewed_at = now();
     save(ctx, &session)?;
     Ok(session)
+}
+
+/// `status`'s renewal, under its lock: completion records are applied first, as `exec` applies
+/// them, so the renewal is never older than one they hold.
+fn renew_in_status(ctx: &Ctx, session: &mut Session) -> Result<()> {
+    if session.lease.is_none() {
+        return Ok(());
+    }
+    let consumed = reconcile_executions(&ctx.state, &ctx.root, session);
+    if let Some(lease) = session.lease.as_mut() {
+        lease.renewed_at = lease.renewed_at.max(now());
+    }
+    save(ctx, session)?;
+    forget_completions(&consumed);
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -3994,7 +4422,7 @@ pub struct GcService {
 
 /// Commands a person runs to finish what GC refused to do itself. They are POSIX shell
 /// commands with every recorded value quoted, so they can be copied as they are.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Recovery {
     /// Shows what runs now: under the recorded supervisor id, or as the recorded pid.
     pub inspect: String,
@@ -4022,65 +4450,57 @@ impl From<String> for Unconfirmed {
 
 /// Reclaim sessions whose lease expired or whose project directory is gone.
 pub fn gc(state: &Path) -> Result<Vec<GcEntry>> {
-    let dir = state.join("sessions");
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let indexed: Session = read_json(&path)?;
-        let ctx = Ctx {
-            root: indexed.project.clone(),
-            cache: PathBuf::new(),
-            state: state.to_path_buf(),
-        };
-        let _guard = project_lock(state, &ctx.root)?;
-        // Re-read after locking: another command may have renewed or replaced this generation.
-        if !path.exists() {
-            continue;
-        }
-        let mut session: Session = read_json(&path)?;
-        let consumed = reconcile_executions(state, &ctx.root, &mut session);
-        // Saved only for a project still there: a save would recreate a deleted checkout's
-        // `.stack/`. A gone project's completion records go with its index.
-        if !consumed.is_empty() && project_gone(&session).is_none() {
-            save(&ctx, &session)?;
-            forget_completions(&consumed);
-        }
-        // TTL describes idle time; an executing command is not idle. Owner death still
-        // follows the explicit runner policy even if one of its commands has survived.
-        let owner_dead = session
-            .lease
-            .as_ref()
-            .and_then(|l| l.owner_pid)
-            .is_some_and(|p| !pid_alive(p));
-        let busy = !owner_dead && has_active_executions(&session);
-        if let Some(reason) = project_gone(&session) {
-            if !busy {
-                out.push(reclaim_gone(state, &path, session, reason));
-            }
-            continue;
-        }
-        let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
-            continue;
-        };
-        if busy {
-            continue;
-        }
-        let result = down_locked(&ctx, None, None);
-        out.push(GcEntry {
-            project: session.project,
-            reason,
-            stopped: result.is_ok(),
-            error: result.err().map(|e| e.to_string()),
-            services: Vec::new(),
-        });
+    gc_pass::gc_with(state, &GcOptions::default()).map(|pass| pass.reclaimed)
+}
+
+/// The locked part of GC for one indexed session at `path`: re-read it, settle executions,
+/// and reclaim it if it is still expired or its project gone. The caller holds the lock.
+fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcEntry>> {
+    // Re-read after locking: another command may have renewed or replaced this generation.
+    if !path.exists() {
+        return Ok(None);
     }
-    Ok(out)
+    let mut session: Session = read_json(path)?;
+    let ctx = Ctx {
+        root: session.project.clone(),
+        cache: PathBuf::new(),
+        state: state.to_path_buf(),
+    };
+    let consumed = reconcile_executions(state, &ctx.root, &mut session);
+    // Saved only for a project still there: a save would recreate a deleted checkout's
+    // `.stack/`. A gone project's completion records go with its index.
+    if !consumed.is_empty() && project_gone(&session).is_none() {
+        save(&ctx, &session)?;
+        forget_completions(&consumed);
+    }
+    // TTL describes idle time; an executing command is not idle. Owner death still
+    // follows the explicit runner policy even if one of its commands has survived.
+    let owner_dead = session
+        .lease
+        .as_ref()
+        .and_then(|l| l.owner_pid)
+        .is_some_and(|p| !pid_alive(p));
+    let busy = !owner_dead && has_active_executions(&session);
+    if let Some(reason) = project_gone(&session) {
+        if busy {
+            return Ok(None);
+        }
+        return Ok(Some(reclaim_gone(state, path, session, reason, stop_orphans)));
+    }
+    let Some(reason) = session.lease.as_ref().and_then(|l| l.expired(now())) else {
+        return Ok(None);
+    };
+    if busy {
+        return Ok(None);
+    }
+    let result = down_locked(&ctx, None, None);
+    Ok(Some(GcEntry {
+        project: session.project,
+        reason,
+        stopped: result.is_ok(),
+        error: result.err().map(|e| e.to_string()),
+        services: Vec::new(),
+    }))
 }
 
 /// What a deleted checkout leaves once no session record of it is left (after `down`, or once
@@ -4116,10 +4536,57 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         note(&entry.project, &entry.service, outcome);
     }
     crate::datadirs::forget(state, |e| settled.contains(e))?;
+    // A deleted checkout's init markers go with its data; those of data still recorded stay.
+    if !settled.is_empty() {
+        let left = crate::datadirs::entries(state)?;
+        let mut projects: Vec<&Path> = settled.iter().map(|e| e.project.as_path()).collect();
+        projects.dedup();
+        for project in projects {
+            let kept: Vec<String> = left.iter().filter(|e| e.project == project).map(|e| e.service.clone()).collect();
+            let _ = crate::init_tasks::forget(state, project, &kept);
+        }
+    }
     Ok(found
         .into_iter()
         .map(|(project, services)| GcEntry { project, reason: "project directory deleted".into(), stopped: true, error: None, services })
         .collect())
+}
+
+/// `down --purge`, once `down` confirmed every service of this checkout stopped: remove each
+/// data directory `up` recorded for this very directory (by its checkout token; data of an
+/// earlier directory at the path is not its own), each only as `gc --reclaim-data` removes a
+/// deleted checkout's (see [`reclaim_data`]: the recorded directory, reached with no link
+/// followed, its marker naming the checkout, the recorded supervisor confirming the service is
+/// not running and no process carrying the token), then release its port reservations and
+/// identity tokens. Data Stack never recorded is not touched.
+fn purge_locked(ctx: &Ctx) -> Result<PurgeReport> {
+    let token = crate::checkout::token(&ctx.root);
+    let mut data = Vec::new();
+    let mut settled = Vec::new();
+    for entry in crate::datadirs::entries(&ctx.state)? {
+        if entry.project != ctx.root || token.as_deref() != Some(entry.checkout.as_str()) {
+            continue;
+        }
+        let (outcome, done) = reclaim_data(&entry, true);
+        data.push(PurgedData { service: entry.service.clone(), dir: entry.dir.clone(), outcome, kept: !done });
+        if done {
+            settled.push(entry);
+        }
+    }
+    crate::datadirs::forget(&ctx.state, |e| settled.contains(e))?;
+    // Data removed was never initialised as far as the next `up` is concerned; kept data was.
+    let kept: Vec<String> = data.iter().filter(|d| d.kept).map(|d| d.service.clone()).collect();
+    crate::init_tasks::forget(&ctx.state, &ctx.root, &kept)?;
+    let released_ports = ports::release(&ctx.state, &ctx.root)?
+        .into_iter()
+        .map(|r| json!({ "service": r.service, "port": r.port }))
+        .collect();
+    Ok(PurgeReport {
+        complete: data.iter().all(|d| !d.kept),
+        data,
+        released_ports,
+        released_identities: crate::identity::release(&ctx.state, &ctx.root)?,
+    })
 }
 
 /// One deleted checkout's recorded data directory: what happened to it, and whether its record
@@ -4169,6 +4636,11 @@ fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) 
     }
 }
 
+/// [`project_gone`], for the machine-wide commands (see [`crate::fleet`]).
+pub fn checkout_gone(session: &Session) -> Option<&'static str> {
+    project_gone(session)
+}
+
 /// Why a session's project no longer exists: deleted, or replaced by another directory at the
 /// same path (which must never inherit the authority to stop this session's services).
 fn project_gone(session: &Session) -> Option<&'static str> {
@@ -4181,12 +4653,20 @@ fn project_gone(session: &Session) -> Option<&'static str> {
 /// Reconcile a gone project without signalling a daemon whose identity can be replaced.
 /// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
 /// their ownership record. Only confirmed terminal state permits releasing the record.
-fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str) -> GcEntry {
+/// `stop_orphans` (`gc --stop-orphans`) stops a service only where a person would be offered
+/// `recovery.stop`, and only once its start time also matches (see [`gc_pass::stop_orphan`]).
+fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str, stop_orphans: bool) -> GcEntry {
     let mut services = Vec::new();
     let mut problems = Vec::new();
     for (name, record) in &session.services {
         let service = name.clone();
-        match reconcile_gone(session.provider.as_ref(), record, session.launching) {
+        let reconciled = match reconcile_gone(session.provider.as_ref(), record, session.launching) {
+            Err(refused) if stop_orphans && refused.recovery.as_ref().is_some_and(|r| r.stop.is_some()) => {
+                gc_pass::stop_orphan(session.provider.as_ref(), record, refused)
+            }
+            other => other,
+        };
+        match reconciled {
             Ok(outcome) => services.push(GcService { service, outcome: Some(outcome), error: None, recovery: None }),
             Err(Unconfirmed { why, recovery }) => {
                 problems.push(format!("{name}: {why}"));
@@ -4324,8 +4804,10 @@ fn recovery_steps(entries: &[GcEntry]) -> Vec<String> {
 /// be confirmed stopped. Ownership records are kept for a retry. Then what deleted checkouts
 /// with no session record left behind (see [`reclaim_deleted`]): their port reservations are
 /// released, and their data reported, or removed with `remove_data`.
-pub fn gc_checked(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
-    let mut entries = gc(state)?;
+/// With `stop_orphans`, a deleted checkout's service is stopped when every recorded fact still
+/// matches it (see [`gc_pass::stop_orphan`]).
+pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result<Vec<GcEntry>> {
+    let mut entries = gc_with(state, &GcOptions { stop_orphans, ..GcOptions::default() })?.reclaimed;
     entries.extend(reclaim_deleted(state, remove_data)?);
     let failed = entries.iter().filter(|e| !e.stopped).count();
     if failed == 0 {
@@ -4344,10 +4826,11 @@ fn gc_hint(entries: &[GcEntry]) -> String {
     if steps.is_empty() {
         return "retry `stack gc`; for a live project, `stack down` in it. Records are kept until cleanup is confirmed".into();
     }
+    let orphans = gc_pass::stop_orphans_hint(entries).map(|h| format!("; {h}")).unwrap_or_default();
     format!(
         "services of a deleted or replaced checkout are never stopped by name. For each service below, run \
          the inspect command; run the stop command, where offered, only if inspect shows the recorded pid. \
-         Then retry `stack gc`. Records are kept until cleanup is confirmed\n{}",
+         Then retry `stack gc`{orphans}. Records are kept until cleanup is confirmed\n{}",
         steps.join("\n")
     )
 }
@@ -4383,9 +4866,12 @@ fn load(ctx: &Ctx) -> Result<Option<Session>> {
             ),
         )
         .hint(format!(
-            "move the directory back to {} and run `stack down` there; if this file was only \
-             copied from that checkout, delete it",
-            session.project.display()
+            "if this directory was moved from there, run `stack mv {} {}` to carry its records \
+             here (it refuses while services may still run: then move the directory back, run \
+             `stack down` there, and move it again); if this file was only copied from that \
+             checkout, delete it",
+            session.project.display(),
+            ctx.root.display()
         )));
     }
     // A different directory now at this path must not adopt (or stop) the old one's services.
@@ -4419,6 +4905,12 @@ fn owned_elsewhere(ctx: &Ctx, session: &Session) -> bool {
 fn confirmed_gone(session: &Session) -> bool {
     !session.launching
         && session.services.values().all(|r| reconcile_gone(session.provider.as_ref(), r, false).is_ok())
+}
+
+/// Record `session` for the checkout at `root`, in the machine index and the checkout's own
+/// copy, as every lifecycle command does: for `stack mv` (see [`crate::fleet`]).
+pub(crate) fn save_at(state: &Path, root: &Path, session: &Session) -> Result<()> {
+    save(&Ctx { root: root.to_path_buf(), cache: PathBuf::new(), state: state.to_path_buf() }, session)
 }
 
 fn save(ctx: &Ctx, session: &Session) -> Result<()> {
@@ -4459,7 +4951,7 @@ struct Completion {
 }
 
 /// Where a project's completion records are: `<state>/completed/<project key>/<token>.json`.
-fn completions_dir(state: &Path, root: &Path) -> PathBuf {
+pub(crate) fn completions_dir(state: &Path, root: &Path) -> PathBuf {
     state.join("completed").join(project_key(root))
 }
 
@@ -4638,10 +5130,13 @@ fn verify_session(
 ) -> Vec<Check> {
     let mut checks = verify_all(&ctx.root, report, env, statuses, timings);
     let reason = match session {
-        None => Some("no launch record; run `stack up`"),
-        Some(s) if s.launching => Some("`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`"),
+        None => Some((ReasonCode::NotLaunched, "no launch record; run `stack up`")),
+        Some(s) if s.launching => Some((
+            ReasonCode::LaunchIncomplete,
+            "`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`",
+        )),
         Some(s) if !same_config(s, ctx, report) => {
-            Some("session configuration changed; run `stack up` to restart and verify it")
+            Some((ReasonCode::ConfigChanged, "session configuration changed; run `stack up` to restart and verify it"))
         }
         _ => None,
     };
@@ -4653,14 +5148,18 @@ fn verify_session(
         // that the launched process is no longer there only adds to it. One that passed with a
         // process other than the launched one is the changed process.
         let process = match (&check.reason, changed_process) {
-            (Some(own), true) => Some(format!("{own}; the process `stack up` started is gone; run `stack up` to start it again")),
-            (None, true) => Some("service process changed since launch; run `stack up`".into()),
+            (Some(own), true) => Some((
+                check.reason_code.unwrap_or(ReasonCode::ProcessChanged),
+                format!("{own}; the process `stack up` started is gone; run `stack up` to start it again"),
+            )),
+            (None, true) => Some((ReasonCode::ProcessChanged, "service process changed since launch; run `stack up`".into())),
             _ => None,
         };
-        if let Some(reason) = reason.map(String::from).or(process) {
+        if let Some((code, reason)) = reason.map(|(code, why)| (code, String::from(why))).or(process) {
             check.ready = false;
             check.identity = None;
             check.reason = Some(reason);
+            check.reason_code = Some(code);
             check.withheld = binding_vars(
                 &check.service,
                 &report.stack.services[&check.service].value,
@@ -4765,9 +5264,12 @@ impl ExecutionGuard {
         let completed_at = now();
         // The lock is waited for briefly whatever the call's deadline: an expired one still
         // gets the chance, and none (a CLI `exec` without `--timeout`) never waits unbounded.
+        // Shared, without passing the gate, and with the write lock: other commands may be
+        // planning or finishing too, and one waiting to change the project waits for this.
         let locked = {
             let _bound = crate::process::deadline_scope(Some(Instant::now() + RELEASE_GRACE));
-            project_lock(&ctx.state, &ctx.root)
+            crate::state::project_lock_shared(&ctx.state, &ctx.root, false)
+                .and_then(|project| crate::state::project_write_lock(&ctx.state, &ctx.root).map(|write| (project, write)))
         };
         let _guard = match locked {
             Ok(guard) => guard,
@@ -5010,7 +5512,12 @@ mod tests {
         let busy = startup_timed_out(StackError::new("lock_busy", "held"), "restart", Duration::from_secs(1));
         assert_eq!(busy.code, "timed_out");
         assert!(busy.hint.as_deref().unwrap().starts_with("nothing was started"), "{busy}");
-        assert_eq!(busy.details, vec![json!({ "cause": { "code": "lock_busy", "message": "held" } })]);
+        assert_eq!(busy.details.len(), 1);
+        let cause = &busy.details[0]["cause"];
+        assert_eq!((cause["code"].as_str(), cause["message"].as_str()), (Some("lock_busy"), Some("held")));
+        // The cause is a full error: its registry hint and whether retrying can help.
+        assert_eq!(cause["retryable"], true);
+        assert!(cause["hint"].is_string(), "{cause}");
     }
 
     #[test]
@@ -5364,6 +5871,7 @@ mod tests {
             watch: Vec::new(),
             depends_on: Vec::new(),
             setup: None,
+            init: None,
         };
         let vars = binding_vars("postgres", &service, Some(41234), &env, &inherited);
         for v in [
@@ -5484,6 +5992,7 @@ mod tests {
             pid: None,
             identity: Some(Identity::Instance),
             reason: None,
+            reason_code: None,
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,

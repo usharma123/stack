@@ -1082,6 +1082,34 @@ fn strip_escapes(text: &str) -> String {
     clean
 }
 
+/// Where the digest of the generated configuration `mise trust` last accepted is kept.
+fn trusted_marker(state: &Path, root: &Path) -> PathBuf {
+    state.join("projects").join(format!("{}.trusted", crate::state::project_key(root)))
+}
+
+/// [`trust`], skipped when mise already trusted exactly this generated configuration, as
+/// recorded the last time. Returns whether it was skipped: a caller whose next provider call
+/// then fails should [`forget_trust`] and trust again, in case mise's own record was removed.
+pub fn trust_once(state: &Path, root: &Path) -> Result<bool> {
+    let digest = std::fs::read(output_path(root)).ok().map(|bytes| crate::hash::sha256_hex(&bytes));
+    let marker = trusted_marker(state, root);
+    if digest.is_some() && std::fs::read_to_string(&marker).ok() == digest {
+        return Ok(true);
+    }
+    trust(root)?;
+    if let Some(digest) = digest {
+        // Best effort: without the marker the next call only trusts again.
+        let _ = marker.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(&marker, digest);
+    }
+    Ok(false)
+}
+
+/// Forget what [`trust_once`] recorded, so the next call asks mise again.
+pub fn forget_trust(state: &Path, root: &Path) {
+    let _ = std::fs::remove_file(trusted_marker(state, root));
+}
+
 pub fn trust(root: &Path) -> Result<()> {
     checked(root, &["trust", "--quiet", &output_path(root).to_string_lossy()], "provider_failed").map(|_| ())
 }
@@ -1262,14 +1290,22 @@ pub fn daemons(root: &Path) -> Result<Vec<DaemonStatus>> {
         .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons --json` output: {e}")))
 }
 
+/// The configured daemons as `mise daemons ls --json` lists them: what each would use (port,
+/// data directory) at this root, without starting a supervisor or registering configuration.
+pub fn daemons_listed(root: &Path) -> Result<Vec<DaemonStatus>> {
+    let out = checked(root, &["daemons", "ls", "--json"], "provider_failed")?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise daemons ls --json` output: {e}")))
+}
+
 /// `env` and `daemons` at once. Both only read provider state for the same configuration, so
 /// they run concurrently, both within the caller's deadline; errors are reported in the order
 /// the two used to run.
 pub fn env_and_daemons(root: &Path) -> Result<(IndexMap<String, String>, Vec<DaemonStatus>)> {
-    let deadline = crate::process::deadline();
+    let bound = crate::process::inherit();
     let (env, daemons) = std::thread::scope(|scope| {
         let statuses = scope.spawn(|| {
-            let _deadline = crate::process::deadline_scope(deadline);
+            let _deadline = bound.enter();
             daemons(root)
         });
         let env = env(root);
@@ -1372,6 +1408,17 @@ pub fn supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result
         pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
         port: v["active_port"].as_u64().and_then(|p| u16::try_from(p).ok()),
     })
+}
+
+/// `pitchfork stop -- <id>` against the recorded supervisor state directory. Pitchfork stops
+/// whatever runs under the id when it receives the request; the caller checks first.
+pub fn stop_supervised(bin: &Path, state_dir: &Path, id: &str) -> std::result::Result<(), String> {
+    let out = pitchfork(bin, state_dir, &["stop", "--", id])?;
+    if out.exit_code == Some(0) {
+        return Ok(());
+    }
+    let err = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("failed");
+    Err(format!("pitchfork stop {id}: {err}"))
 }
 
 /// `pitchfork status --json <id>`, which reads the supervisor's state and starts none: what it

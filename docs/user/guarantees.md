@@ -25,6 +25,8 @@
   probe](identity-probes.md); without one they are checked for liveness only, and labelled
   that way. The address of a service that fails is replaced with `unverified.stack.invalid`, so
   an app that falls back to `localhost` fails loudly. `--require` refuses to run instead.
+  `stack env` applies the same rules, but only when it runs: a shell or direnv that loaded it
+  keeps those values afterwards. mise's own activation does no verification at all.
 - **Configuration changes need a fresh start.** A session records a fingerprint of the
   compiled configuration services see (everything but `[tasks]`) and ports. After a change,
   services count as unverified until `stack up` restarts them. Adding or editing a task needs
@@ -32,9 +34,13 @@
   needs one restart after its first task edit.
 - **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
-  them. For a deleted checkout, `gc` never stops anything itself, because Pitchfork cannot
+  them. The pass in `up` never waits for, or fails because of, another checkout. For a deleted
+  checkout, `gc` by default never stops anything itself, because Pitchfork cannot
   check and stop a process in one step. It drops the record once the services are confirmed
-  stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop them.
+  stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop them. With
+  `--stop-orphans` it stops a service only when its supervisor id, pid, port and process start
+  time all still match the record; the race that leaves is documented under
+  [stopping orphans](commands.md#stopping-orphans).
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was
   granted. Values never enter `stack.lock`, generated config, session records or logs, and
   are redacted from output captured with `--json` or MCP. Terminal output is not redacted, and
@@ -47,8 +53,9 @@
 - **Skills match the pins.** A listed [agent skill](skills.md) belongs to the exact release
   `stack.lock` pins.
 - **Results are structured.** `--json` prints one object on stdout, even for argument errors,
-  and every error has a stable `code` and a `message`, a `hint` where there is something to
-  do (every `usage` error has one), and `details` with the specifics where there are any.
+  and every error has a stable, [registered](errors.md) `code` and a `message`, a `hint`
+  (the site's own, or the code's default), `retryable`, `details` with the specifics where
+  there are any and, where the fix is unambiguous, a machine-readable `next` step.
   Argument errors are `usage` and exit 2. `stack mcp` returns the same object. Git never prompts.
 
 ## mise configuration

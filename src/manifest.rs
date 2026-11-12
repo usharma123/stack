@@ -45,7 +45,7 @@ pub struct Paths {
 }
 
 /// A service definition. Either a provider `preset` or a custom `run` command.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +78,12 @@ pub struct Service {
     /// failure stops the start with `setup_failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<String>,
+    /// Tasks `up` runs, in order, once per data directory (see `init_tasks`). Composed as its
+    /// own key, apart from the rest of the definition, so it is never serialized with it: the
+    /// running services do not depend on it. A table that sets only `init` adds it to a
+    /// service another layer defines.
+    #[serde(default, skip_serializing)]
+    pub init: Option<Vec<String>>,
 }
 
 /// A command that asks the running service, through the app's own connection settings, which
@@ -202,7 +208,15 @@ pub struct Overrides {
 }
 
 impl Service {
+    /// A table that sets `init` and nothing else: it extends a service defined elsewhere.
+    pub fn init_only(&self) -> bool {
+        self.init.is_some() && Service { init: None, ..self.clone() } == Service::default()
+    }
+
     pub fn validate(&self, name: &str, origin: &str) -> Result<()> {
+        if self.init_only() {
+            return Ok(());
+        }
         if self.preset.is_some() == self.run.is_some() {
             return Err(StackError::new(
                 "invalid_service",

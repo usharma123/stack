@@ -10,36 +10,108 @@ use std::time::{Duration, Instant};
 
 thread_local! {
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The [`Cancel`] of the call this thread works for, if it may be cancelled.
+    static CALL: std::cell::RefCell<Option<Cancel>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Restores the enclosing deadline when dropped.
+/// A request to stop a call early, shared between the threads doing its work and whoever may
+/// cancel it (the MCP server, on `notifications/cancelled`). Once fired, work it is installed
+/// for (see [`cancellation_scope`]) behaves exactly as if its deadline had passed at that
+/// moment: subprocesses are killed with their process groups, waits on [`remaining`] end, and
+/// what was launched is still recorded within a [`grace_scope`]. Cancelling is the deadline
+/// path, not a separate one.
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(std::sync::Arc<std::sync::OnceLock<Instant>>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fire it; the first call fixes when.
+    pub fn cancel(&self) {
+        let _ = self.0.set(Instant::now());
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    fn fired_at(&self) -> Option<Instant> {
+        self.0.get().copied()
+    }
+}
+
+/// Restores the enclosing deadline (and the call's [`Cancel`], where the scope replaced it)
+/// when dropped.
 #[must_use = "the deadline applies only while the scope is alive"]
 pub struct DeadlineScope {
     previous: Option<Instant>,
+    previous_call: Option<Option<Cancel>>,
 }
 
 impl Drop for DeadlineScope {
     fn drop(&mut self) {
         DEADLINE.with(|d| d.set(self.previous));
+        if let Some(call) = self.previous_call.take() {
+            CALL.with(|c| *c.borrow_mut() = call);
+        }
     }
 }
 
 /// Bound the work this thread does until the scope is dropped. Every subprocess this module
 /// runs ([`capture`], [`output`]) and every wait that consults [`remaining`] ends by `at`.
-/// `None` lifts the bound. Threads do not inherit it; pass [`deadline`] on explicitly.
+/// `None` lifts the bound. The thread's [`Cancel`], if any, stays in force. Threads do not
+/// inherit either; carry them over with [`inherit`].
 pub fn deadline_scope(at: Option<Instant>) -> DeadlineScope {
-    DeadlineScope { previous: DEADLINE.with(|d| d.replace(at)) }
+    DeadlineScope { previous: DEADLINE.with(|d| d.replace(at)), previous_call: None }
 }
 
-/// A scope that leaves at least `grace` from now, for recording what timed-out work did.
+/// Install `cancel` on this thread until the scope is dropped: once it fires, the work ends as
+/// at its deadline. `None` makes the work not cancellable.
+pub fn cancellation_scope(cancel: Option<Cancel>) -> DeadlineScope {
+    DeadlineScope { previous: DEADLINE.with(Cell::get), previous_call: Some(CALL.with(|c| c.replace(cancel))) }
+}
+
+/// A scope that leaves at least `grace` from now, for recording what timed-out (or cancelled)
+/// work did. The call's [`Cancel`] is suspended inside it, so the record is still written.
 pub fn grace_scope(grace: Duration) -> DeadlineScope {
     let at = deadline().map(|d| d.max(Instant::now() + grace));
-    deadline_scope(at)
+    DeadlineScope { previous: DEADLINE.with(|d| d.replace(at)), previous_call: Some(CALL.with(|c| c.replace(None))) }
 }
 
-/// This thread's deadline, if any.
+/// This thread's bound (its deadline and the call's [`Cancel`]), to carry into a thread it
+/// spawns: `let bound = inherit();` before the spawn, `let _bound = bound.enter();` inside it.
+/// A cancellation that fires later reaches that thread too.
+#[derive(Clone, Debug)]
+pub struct Inherited {
+    at: Option<Instant>,
+    call: Option<Cancel>,
+}
+
+pub fn inherit() -> Inherited {
+    Inherited { at: DEADLINE.with(Cell::get), call: CALL.with(|c| c.borrow().clone()) }
+}
+
+impl Inherited {
+    pub fn enter(&self) -> DeadlineScope {
+        DeadlineScope { previous: DEADLINE.with(|d| d.replace(self.at)), previous_call: Some(CALL.with(|c| c.replace(self.call.clone()))) }
+    }
+}
+
+/// This thread's deadline, if any: the moment the call's [`Cancel`] fired, when that is earlier.
 pub fn deadline() -> Option<Instant> {
-    DEADLINE.with(Cell::get)
+    let at = DEADLINE.with(Cell::get);
+    match CALL.with(|c| c.borrow().as_ref().and_then(Cancel::fired_at)) {
+        Some(fired) => Some(at.map_or(fired, |a| a.min(fired))),
+        None => at,
+    }
+}
+
+/// Work on this thread can be ended early, by a deadline or the call's [`Cancel`]: a wait must
+/// poll rather than block indefinitely.
+pub fn interruptible() -> bool {
+    DEADLINE.with(Cell::get).is_some() || CALL.with(|c| c.borrow().is_some())
 }
 
 /// Time left before this thread's deadline; `None` when there is none.
@@ -79,12 +151,14 @@ pub fn cancel_scope(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Canc
     CancelScope
 }
 
-fn cancelled() -> bool {
+/// This thread's cancellation flag is set, or the call it works for was cancelled.
+pub fn cancelled() -> bool {
     CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)))
+        || CALL.with(|c| c.borrow().as_ref().is_some_and(Cancel::is_cancelled))
 }
 
 fn cancellable() -> bool {
-    CANCEL.with(|c| c.borrow().is_some())
+    CANCEL.with(|c| c.borrow().is_some()) || CALL.with(|c| c.borrow().is_some())
 }
 
 pub struct Captured {
@@ -96,6 +170,11 @@ pub struct Captured {
     pub stderr: String,
     /// More than `limit` bytes were written; `stdout` holds only the tail.
     pub stdout_truncated: bool,
+    /// Likewise for `stderr`.
+    pub stderr_truncated: bool,
+    /// Bytes written to each stream in all (after redaction), before any were dropped.
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
 }
 
 // ---- redaction -----------------------------------------------------------------------------
@@ -370,6 +449,8 @@ struct Tail {
     bytes: VecDeque<u8>,
     limit: usize,
     truncated: bool,
+    /// Every byte appended, kept or not.
+    total: u64,
 }
 
 impl Tail {
@@ -378,10 +459,12 @@ impl Tail {
             bytes: VecDeque::new(),
             limit,
             truncated: false,
+            total: 0,
         }
     }
 
     fn append(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
         for &byte in bytes {
             if self.bytes.len() == self.limit {
                 self.bytes.pop_front();
@@ -619,6 +702,9 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
         signal: if piped.timed_out { None } else { child.status.and_then(|s| s.signal()) },
         timed_out: piped.timed_out,
         stdout_truncated: piped.stdout.truncated,
+        stderr_truncated: piped.stderr.truncated,
+        stdout_bytes: piped.stdout.total,
+        stderr_bytes: piped.stderr.total,
         stdout: piped.stdout.text(),
         stderr: piped.stderr.text(),
     })
@@ -1545,6 +1631,68 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_acts_as_a_deadline_that_passed_when_it_fired() {
+        let cancel = Cancel::new();
+        let _scope = cancellation_scope(Some(cancel.clone()));
+        assert!(interruptible() && !expired() && deadline().is_none());
+        let inherited = inherit();
+        cancel.cancel();
+        assert!(cancelled() && expired());
+        // A thread given this one's bound before the cancel sees it too.
+        assert!(std::thread::spawn(move || {
+            let _bound = inherited.enter();
+            expired() && cancelled()
+        })
+        .join()
+        .unwrap());
+        {
+            // Recording what was launched still gets its grace period.
+            let _grace = grace_scope(Duration::from_secs(5));
+            assert!(!cancelled() && !expired());
+            assert!(remaining().unwrap() > Duration::from_secs(4));
+        }
+        assert!(expired());
+        {
+            // A later deadline does not lift the cancellation.
+            let _later = deadline_scope(Some(Instant::now() + Duration::from_secs(60)));
+            assert!(expired());
+        }
+        drop(_scope);
+        assert!(!cancelled() && !interruptible() && deadline().is_none());
+    }
+
+    #[test]
+    fn cancelling_a_call_kills_its_running_command_with_the_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let started = tmp.path().join("started");
+        let cancel = Cancel::new();
+        let worker = {
+            let (cancel, started) = (cancel.clone(), started.clone());
+            std::thread::spawn(move || {
+                // No deadline: the cancellation alone ends the command's whole group.
+                let _scope = cancellation_scope(Some(cancel));
+                let script = "sleep 30 & echo $!; touch \"$1\"; wait";
+                let out = output(Command::new("sh").args(["-c", script, "sh"]).arg(&started)).unwrap();
+                let child: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+                let captured = capture(Command::new("sleep").arg("30"), Duration::from_secs(30), 1024).unwrap();
+                (out.status.success(), child, captured.timed_out)
+            })
+        };
+        let waiting = Instant::now();
+        while !started.exists() && !worker.is_finished() {
+            assert!(waiting.elapsed() < Duration::from_secs(20), "the command never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = Instant::now();
+        cancel.cancel();
+        let (succeeded, child, later_timed_out) = worker.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10), "the command outlived its cancellation");
+        assert!(!succeeded);
+        assert!(ends_soon(child), "cancelling left {child} running");
+        assert!(later_timed_out, "an already cancelled capture runs nothing for long");
+    }
+
+    #[test]
     fn output_under_a_deadline_kills_the_whole_group_and_keeps_what_was_written() {
         use std::os::unix::process::ExitStatusExt;
         let start = Instant::now();
@@ -2267,6 +2415,17 @@ mod tests {
         assert!(out.stdout.ends_with("stdout-end"));
         assert!(out.stderr.ends_with("stderr-end"));
         assert!(out.stdout.len() < 4200 && out.stderr.len() < 4200);
+    }
+
+    #[test]
+    fn truncation_of_each_stream_and_its_full_size_are_reported() {
+        let out = capture(Command::new("sh").args(["-c", "head -c 5000 /dev/zero; printf short >&2"]), Duration::from_secs(5), 4096).unwrap();
+        assert!(out.stdout_truncated && !out.stderr_truncated);
+        assert_eq!((out.stdout_bytes, out.stderr_bytes), (5000, 5));
+        let out = capture(Command::new("sh").args(["-c", "head -c 5000 /dev/zero >&2"]), Duration::from_secs(5), 4096).unwrap();
+        assert!(!out.stdout_truncated && out.stderr_truncated);
+        assert_eq!(out.stderr_bytes, 5000);
+        assert!(out.stderr.starts_with(TRUNCATED));
     }
 
     #[test]

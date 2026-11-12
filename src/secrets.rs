@@ -651,6 +651,7 @@ mod tests {
             watch: vec![],
             depends_on: vec![],
             setup: None,
+            init: None,
         };
         stack.services.insert("db".into(), Entry { value: service(Some("postgres"), None), origin: "project".into() });
         stack.services.insert("cache".into(), Entry { value: service(Some("redis"), None), origin: "project".into() });
@@ -711,7 +712,7 @@ mod tests {
     }
 
     fn captured(stdout: &str, exit_code: Option<i32>) -> Captured {
-        Captured { exit_code, signal: None, timed_out: false, stdout: stdout.into(), stderr: "SENTINEL-STDERR quoted line".into(), stdout_truncated: false }
+        Captured { exit_code, signal: None, timed_out: false, stdout: stdout.into(), stderr: "SENTINEL-STDERR quoted line".into(), stdout_truncated: false, stderr_truncated: false, stdout_bytes: 0, stderr_bytes: 0 }
     }
 
     fn assert_clean(e: &StackError) {

@@ -9,17 +9,17 @@ cd "$W/appA" || exit 1
   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
   echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["bash","-c","echo $DATABASE_URL"]}}}'
-  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["true"],"require":["postgres"]}}}'
-  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stack_up","arguments":{"ttl":"10m"}}}'
-  echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["bash","-c","set -euo pipefail; uv run pytest -q"],"require_all":true}}}'
-  echo '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"stack_down","arguments":{}}}'
+  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["bash","-c","echo $DATABASE_URL"]}}}'
+  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["true"],"require":["postgres"]}}}'
+  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stack_up","arguments":{"dir":"'"$PWD"'","ttl":"10m"}}}'
+  echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["bash","-c","set -euo pipefail; uv run pytest -q"],"require_all":true}}}'
+  echo '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"stack_down","arguments":{"dir":"'"$PWD"'"}}}'
   echo '{"jsonrpc":"2.0","id":8,"method":"nope"}'
 } | stack mcp >"$T/mcp.out"
 jq -se '
   length == 8 and
   (map(select(.id == 1)) | length == 1 and .[0].result.protocolVersion == "2025-06-18") and
-  (map(select(.id == 2)) | length == 1 and (.[0].result.tools | map(.name) | sort) == (["stack_inspect", "stack_skill", "stack_compile", "stack_install", "stack_up", "stack_status", "stack_run", "stack_restart", "stack_exec", "stack_logs", "stack_renew", "stack_down", "stack_gc", "stack_doctor"] | sort)) and
+  (map(select(.id == 2)) | length == 1 and (.[0].result.tools | map(.name) | sort) == (["stack_inspect", "stack_skill", "stack_init", "stack_compile", "stack_up", "stack_snapshot_save", "stack_snapshot_restore", "stack_snapshot_list", "stack_snapshot_rm", "stack_install", "stack_restart", "stack_logs", "stack_env", "stack_status", "stack_exec", "stack_run", "stack_renew", "stack_down", "stack_gc", "stack_ps", "stack_mv", "stack_doctor", "stack_errors"] | sort)) and
   (map(select(.id == 3)) | .[0].result.structuredContent.data | .exit_code == 0 and (.stdout | contains("unverified.stack.invalid"))) and
   (map(select(.id == 4)) | .[0].result | .isError and .structuredContent.error.code == "service_unavailable") and
   (map(select(.id == 5)) | .[0].result.structuredContent | .ok and all(.data.checks[]; .ready and .identity == "instance")) and
@@ -31,8 +31,8 @@ jq -se '
 echo 'MCP timeout kills descendants and permits the next request'
 start=$(date +%s)
 {
-  echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_exec","arguments":{"command":["sh","-c","sleep 20 & wait"],"timeout_secs":1}}}'
+  echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stack_exec","arguments":{"dir":"'"$PWD"'","command":["sh","-c","sleep 20 & wait"],"timeout_secs":1}}}'
   echo '{"jsonrpc":"2.0","id":2,"method":"ping"}'
 } | stack mcp >"$T/mcp-timeout.out"
 (( $(date +%s) - start < 6 )) || fail 'MCP response exceeded the timeout'
-jq -se 'length == 2 and (.[0].result | (.isError and .structuredContent.error.code == "timed_out" and .structuredContent.error.details[0].timed_out)) and .[1].result == {}' "$T/mcp-timeout.out" >/dev/null
+jq -se 'length == 2 and (map(select(.id == 1))[0].result | (.isError and .structuredContent.error.code == "timed_out" and .structuredContent.error.details[0].timed_out)) and map(select(.id == 2))[0].result == {}' "$T/mcp-timeout.out" >/dev/null

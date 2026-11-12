@@ -46,9 +46,10 @@ in `skills`, never returned by `stack_skill`, and never linked. People can see i
 `stack inspect --all-skills` (MCP `stack_inspect` with `all_skills: true`), under
 `provider_skills`.
 
-## Reading a skill over MCP
+## Reading a skill
 
-`stack_skill { tool, name }` returns `{ tool, version, name, entrypoint, bytes, text }` for one
+`stack skill <tool> [--name N]` prints the skill's text (`--json` returns the object below);
+over MCP, `stack_skill { tool, name }` returns `{ tool, version, name, entrypoint, bytes, text }` for one
 `available` skill from `skills`. `name` may be left out when the tool has exactly one available
 skill; with several, the `usage` error lists their names. The MCP server's instructions
 mention it, so agents find it without being told.

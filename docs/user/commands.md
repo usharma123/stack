@@ -5,23 +5,79 @@
 | `stack init [--tool NAME[=VERSION]]... [--service NAME[=PRESET][@VERSION]]...` | Write a starting `stack.toml` (never replaces one) |
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve bundles and versions, write `stack.lock`, assign ports, write mise config |
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
+| `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
-| `stack up [--ttl 30m] [--owner-pid N] [--timeout D]` | Start services, verify them, record a session |
-| `stack status` | Verify every service now (exit 1 if any fails) |
+| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME]` | Start services, verify them, run pending [init tasks](data.md), record a session |
+| `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
-| `stack run <task> [--timeout D] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
-| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... -- <cmd>` | Run a command with the stack's tools and env |
-| `stack logs <service> [--tail N] [--since-start]` | Show a service's recent output (default 100 lines) |
-| `stack down [--keep-supervisor]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it |
-| `stack renew` | Renew this session's lease |
-| `stack gc [--reclaim-data] [--watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
+| `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
+| `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
+| `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow]` | Show services' recent output (default 100 lines each) |
+| `stack env [--shell bash\|zsh\|fish]` | Print the environment `exec` would give a command, for `eval` |
+| `stack hook direnv` | Print an `.envrc` snippet that loads `stack env` |
+| `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
+| `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
+| `stack snapshot save\|restore\|list\|rm [NAME]` | Save and restore service data, shared by every checkout of the project ([data](data.md)) |
+| `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
+| `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
+| `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
+| `stack setup --gc-agent [--print \| --remove] [--enable]` | Write a launchd agent or systemd user unit that runs `gc --watch` |
+| `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
+| `stack errors [--markdown]` | List every [error code](errors.md) with its meaning, default hint and whether a retry can succeed |
 | `stack mcp` | Serve these operations over MCP (stdio); see [coding agents](agents.md) |
 
-Every command accepts `-C <dir>` (the project directory) and `--json` (one result object on
-stdout; see [reading results](agents.md#reading-results)).
+Every command accepts `-C <dir>` (the project directory), `--json` (one result object on
+stdout; see [reading results](agents.md#reading-results)) and `--quiet` (`-q`).
+
+**Finding the project.** Without `-C`, Stack uses the nearest `stack.toml` at or above the
+working directory. It searches no higher than the Git worktree root (the directory holding
+`.git`), or `$HOME` and then the filesystem root outside Git, so a parent checkout's
+`stack.toml` is never picked up by mistake. If none is found, `manifest_missing` says where it
+looked and suggests `stack init`, which then writes one in the working directory. With `-C`,
+Stack uses exactly that directory and searches nothing.
+
+**Progress.** On a terminal, `compile`, `install`, `up` and `restart` print each step to stderr
+as it starts and ends (`stack: install ...`, `stack: install ok (41.2s)`). Nothing is printed
+with `--json`, `--quiet`, or when stderr is not a terminal. `NO_COLOR` turns off the coloured
+`ok`/`FAIL` markers.
+
+## Exit codes
+
+| Code | Means |
+|---|---|
+| 0 | Success |
+| 1 | `status` found a service unhealthy (`ok: true, passed: false`) |
+| 2 | Usage error: bad arguments or flag values (`usage`) |
+| 70 | Any other Stack error (`ok: false`); `error.code` says which |
+| 124 | Stack's own deadline passed (`timed_out`) |
+| 128 + N | Signal N cancelled Stack, or ended the command `exec` or `run` ran |
+| any | `exec` and `run` exit with the command's own code |
+
+A command run by `exec` or `run` can itself exit 1, 2, 70 or 124, so the exit code alone
+cannot say who failed. With `--json`, `ok` and `passed` can: `ok: true, passed: false` is the
+command's failure, `ok: false` is Stack's. Through 0.1.22, Stack's own errors exited 1.
+
+## Which command does what
+
+`compile`, `install` and `up` overlap: each does everything the one before it does, then more.
+
+| Command | Resolves versions | Installs | Starts | Verifies | Needs first |
+|---|---|---|---|---|---|
+| `compile` | New or changed requests (`--update`: all; `--locked`: none). Writes `stack.lock`, ports and the mise config | No | No | No | `stack.toml` |
+| `install` | No: uses `stack.lock` (`lock_outdated` if stale) | Pinned tools and service binaries | No | No | Current `stack.lock` |
+| `up` | No, like `install` | Whatever is missing | Every service (keeps unchanged ones running) | Every service, waiting until ready | Current `stack.lock` |
+| `restart` | No | No | Named services (all when none named) | Every service | A session from `up` with unchanged configuration |
+| `run` | No | The task's missing pins | Only with `--up` | Every service; all must pass | Current `stack.lock` |
+| `exec` | No | Only with `--install` (else `tools_not_installed`) | Only with `--up` | Every service; unverified ones withheld, required ones refused | `install` or `up`, or `--install`/`--up` |
+| `env` | No | No | No | Like `exec` | `install` or `up` |
+| `status` | No | No | No | Every service, now | Nothing (reports `no session`) |
+| `down` | No | No | Stops every service | Confirms they are gone | Nothing |
+
+In practice: `compile` after editing `stack.toml`, `up` to work, `install` to warm a cache or CI
+image without starting anything.
 
 ## init
 
@@ -59,6 +115,12 @@ Shows the composed stack: tools, services, ports, tasks, where each value came f
 [agent skills](skills.md) of the pinned releases. Before the first `compile` it previews what
 would be locked; afterwards it fails if `stack.toml` has drifted from `stack.lock`.
 
+## skill
+
+`stack skill <tool> [--name N]` prints the `SKILL.md` of one `available` skill that `inspect`
+lists under `skills`, at the release `stack.lock` pins; `--json` returns the same object as MCP
+`stack_skill`. See [reading a skill](skills.md#reading-a-skill).
+
 ## install
 
 `up` without starting anything: it installs every pinned tool and service binary, checking
@@ -70,10 +132,16 @@ whatever release `PATH` holds.
 
 Installs what is missing, starts every service, checks each one and records a session.
 Running it again is safe: a service whose configuration has not changed keeps running, so to
-load code you edited use `restart`.
+load code you edited use `restart`. When every pinned release is already installed, the
+install step is skipped and says so (`skipped` in its detail); a pin that is missing installs
+as usual.
 
-- **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec` and `renew`
-  extend it). `--owner-pid N` ties it to a process that lives as long as your work.
+- **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec`, `run`,
+  `status` and `renew` extend it). `--owner-pid N` ties it to a process that lives as long as
+  your work. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
+  own parent and uses the nearest ancestor whose command name (or `argv[0]`) is `<name>`, for
+  example `ancestor:claude` from a hook Claude Code runs. With no match it fails with
+  `owner_not_found`, listing the ancestors it saw, and starts nothing. See [leases](#leases).
 - **Timeout.** The default is 10 minutes, covering downloads, installs and readiness. On
   expiry you get `timed_out` (exit 124). Services may still be starting: check `status`, retry
   `up`, or run `down` before fixing a service that will never become ready. A service whose
@@ -81,9 +149,17 @@ load code you edited use `restart`.
   (curl: (7) Failed to connect …)`), and `details` keep its exit status and last output lines
   under `readiness`; the same goes for a failed `restart`.
 - **Port conflicts.** If another program is listening on one of this checkout's ports, `up`
-  fails with `port_conflict`, naming the port and, where it can, the program. Run
-  `stack compile --reassign-ports` and `up` again. Stack never kills the other program and never
-  reassigns ports on its own.
+  fails with `port_conflict`, naming the port and, where it can, the program. Pass
+  `up --reassign-ports`, which gives only the conflicting services new ports and carries on;
+  the result lists each move under `reassigned_ports` (`service`, `old`, `new`). Or run
+  `stack compile --reassign-ports` (new ports for every service) and `up` again. A port the
+  project pins in `[override.services]` is never moved. Stack never kills the other program,
+  and without the flag never reassigns ports on its own.
+- **Other checkouts.** `up` first reclaims expired sessions and those of deleted checkouts,
+  machine-wide, but never waits for another checkout: a session another command holds locked
+  (a long `up` in another worktree, say) is skipped and listed under the `gc` step's
+  `skipped`. A problem reclaiming someone else's session never fails `up`: the `gc` step
+  becomes a `warning` and the message is added to `warnings`.
 - **Postgres encoding.** A new Postgres cluster is created `UTF8` with locale `C.UTF-8`
   (code-point collation), whatever locale the shell running `up` has, so CI, `env -i` and
   containers get the same database as a laptop. A locale set in the project's `[env]` reaches
@@ -103,6 +179,13 @@ load code you edited use `restart`.
 - **Failures** after the steps begin end with a progress record, `{steps, retry_safe,
   changed}`, saying what was done and whether a retry is safe. Service output in an error is
   cut to each service's last lines; `stack logs <service>` has the rest.
+- **Init tasks.** Once every service verifies, `up` runs the `init` tasks of each service whose
+  data directory has not completed them, and reports them in its steps and under `init`. A
+  failing one is `init_failed`, with services left running; the next `up` resumes from it.
+  `--no-init` skips them; `--reinit <service>` runs a service's list again. See
+  [service data](data.md).
+- **Snapshots.** `--from-snapshot <name>` fills each data directory that does not exist yet from
+  a snapshot before the first start. See [service data](data.md#snapshots).
 - `up` marks the generated mise config as trusted, so commands from the bundles you use run
   without mise's trust prompt. Review bundles like any dependency.
 
@@ -113,7 +196,42 @@ and, for Postgres, Redis and services with an [identity probe](identity-probes.m
 this checkout's instance. `ok` stays true; `healthy` says whether everything passed, and the
 exit code is 1 when it did not. A session whose lease expired is not healthy either, though
 its services still answer: `lease_expired` says why, and that the next `gc` or `up` stops them
-(`stack renew` or any `exec` renews a TTL lease).
+(`stack renew` or any `exec` renews a TTL lease). When a service declares init tasks, `init`
+gives each service's state (`done`, `pending`, `failed`, `stale` or `none`; see
+[service data](data.md)).
+
+Checking counts as using the session: `status` renews a lease that has not expired yet, like
+`exec`. An expired lease is reported, not revived, and so is the lease of a session that is
+stale or did not finish starting. The result carries a [`lease`](#leases) object.
+
+### Reason codes
+
+A service that is not ready has a `reason` for people and a `reason_code` to branch on:
+
+| `reason_code` | Means | Do |
+|---|---|---|
+| `not_launched` | Nothing in this checkout started it | `up` |
+| `launch_incomplete` | The last `up` did not finish verifying it | `up` |
+| `config_changed` | The compiled configuration changed since `up` | `up` |
+| `process_changed` | Its process differs from the one `up` verified | `up` |
+| `no_port` | No port assigned | `compile`, then `up` |
+| `no_token` | No instance token assigned for its identity probe | `compile`, then `up` |
+| `not_started` | The supervisor does not know it | `up` |
+| `not_running` | The supervisor reports it stopped, failed or still starting | `logs`, then `restart` |
+| `process_dead` | Its process is gone | `restart` |
+| `wrong_port` | It runs on a port other than this checkout's | `down`, then `up` |
+| `port_closed` | Its port does not accept connections | `logs`, then `restart` |
+| `env_missing` | A connection variable it needs is not set | `compile`, then `up` |
+| `probe_failed` | The identity check could not run or gave no answer | `logs`; fix the probe or the service |
+| `wrong_instance` | The app's settings reach a different instance | `down`, then `up` |
+
+## snapshot
+
+`save <name>` copies this checkout's postgres and redis data, `restore <name>` replaces it,
+`list` and `rm <name>` manage them. Only the data directory `up` recorded for this checkout is
+copied or replaced. Running services, and those that depend on them, are stopped for the copy,
+then started and verified again. Snapshots are shared by every checkout of the same
+repository. See [service data](data.md#snapshots).
 
 ## restart
 
@@ -141,7 +259,9 @@ files changed (none, when nothing did), so an agent need not pick the names out 
 
 ## exec
 
-Runs a command with the stack's tools and environment, in the project directory.
+Runs a command with the stack's tools and environment. It runs in the directory you called
+Stack from when the project was found by searching upward, and in the project directory when
+you pass `-C`. `STACK_PROJECT` always names the project directory.
 
 - Services that do not verify keep their variables, but with the host replaced by
   `unverified.stack.invalid`, so an app that falls back to `localhost` fails loudly instead of
@@ -150,8 +270,13 @@ Runs a command with the stack's tools and environment, in the project directory.
   --require redis`); `--require postgres,redis` names one service called `postgres,redis`.
 - `--timeout` counts from the call. When it expires the command's process group is killed and
   Stack exits 124 (`timed_out`).
-- With `--json`, at most 64 KiB of each output stream is captured into the result, and Stack
-  exits with the command's exit code. A command a signal ended has `exit_code: null` and
+- Several `exec` calls in one checkout plan at the same time, so a test runner that fans out
+  does not queue behind itself. `up`, `restart`, `down`, `compile` and `gc` still run alone:
+  they wait for commands that are being planned, and new ones wait for them. `run`, and `exec`
+  with `--up` or `--install` while it starts or installs, run alone too.
+- With `--json`, at most 64 KiB of each output stream is captured into the result (the end is
+  kept; `stdout_truncated`, `stderr_truncated`, `stdout_bytes` and `stderr_bytes` say what was
+  dropped), and Stack exits with the command's exit code. A command a signal ended has `exit_code: null` and
   `signal: <number>`, and Stack exits 128 plus the signal, with or without `--json`.
 - **Cancelling.** SIGINT, SIGTERM or SIGHUP sent to Stack is passed on to the command, and Stack
   waits for it rather than exit and leave it running. A command still running 10 seconds later,
@@ -162,6 +287,15 @@ Runs a command with the stack's tools and environment, in the project directory.
   directly), and a SIGTERM sent to Stack alone is passed on to the command itself. `run` behaves
   the same. A SIGKILL cannot be passed on.
 - `--secret KEY` (repeatable) grants a named fnox secret. See [secrets](secrets.md).
+- `--up` runs `stack up` first when there is no session, or it is stale (the configuration
+  changed), expired, incomplete or has a service that does not verify. Otherwise it does
+  nothing. The session keeps its lease (a TTL, or an owner still alive) unless `--ttl` gives
+  it a new one. `up` gets what is left of `--timeout`, at most its usual 10 minutes. What it
+  did is listed under `prepared` in the `--json` result (`step` `up`, with the `reason`), and
+  on stderr otherwise; nothing appears when it did not run.
+- `--install` installs pinned tools that are missing, as `stack install` would, instead of
+  failing with `tools_not_installed`. It is listed under `prepared` too (`step` `install`,
+  with the `missing` pins), only when it ran.
 
 ## run
 
@@ -169,14 +303,46 @@ Runs a `[tasks.<name>]` through `mise run`, so mise's task rules apply (template
 arguments after `--`). Every service must verify first, whatever the task's `services` list
 says; for a command that should run with services down, use `exec`. A task gets the secrets it
 declares, and installs any missing pinned tool before it starts. `unknown_task` lists the
-tasks the project defines.
+tasks the project defines. `--up` and `--ttl` work as for [`exec`](#exec).
 
 ## logs
 
-Prints up to `--tail` lines (default 100, at most 10000) that the supervisor kept for one
-service. It never follows. `--since-start` keeps only the current process's output, which
-helps after a restart. `unknown_service` lists the project's services; `logs_failed` means the
-supervisor could not return them.
+Prints up to `--tail` lines (default 100, at most 10000) that the supervisor kept for a
+service. With no service named, or several, it shows each one with lines prefixed
+`<service> | `; with `--json` the result is `{services: {<name>: {lines, ...}}, errors}`, where
+`errors` lists services whose output could not be read. One named service keeps the
+single-service result.
+
+- `--since-start` keeps only the current process's output, which helps after a restart.
+- `--since 10m` keeps only output from the last 10 minutes. The supervisor applies the window.
+- `--grep TEXT` keeps lines containing `TEXT` (a plain substring, not a regex); `-i` ignores
+  case. `--tail` then counts matching lines, out of the last 10000.
+- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. The supervisor
+  offers no stream, so Stack asks it again every second. Without timestamps, identical lines
+  written within one poll may be shown once. Not with `--json`, and not over MCP.
+
+`unknown_service` lists the project's services; `logs_failed` means the supervisor could not
+return them.
+
+## env
+
+Prints the environment `stack exec` would give a command right now, as `export` lines for
+`eval "$(stack env)"` (`--shell fish` for fish; the default follows `$SHELL`). It is planned
+exactly like `exec`: pinned tools must be installed, every service is checked, and an
+unverified service's connection variables are poisoned or unset just as `exec` does. A
+comment, and a line on stderr, names each unverified service and what was withheld.
+`--json` returns `{env, unset, withheld, skipped}`.
+
+Stack's own mise selection variables (`MISE_*`) are left out (`skipped`), so the mise in your
+shell keeps reading its usual configuration.
+
+The output is a snapshot. Unlike `exec`, which checks services every time, a shell keeps these
+values after a service stops or another checkout takes its port. Re-run `stack env` after
+`up`, `restart` or `down`. See [worktrees](worktrees.md#your-shell-and-direnv) for shell and
+direnv setups.
+
+`stack hook direnv` prints an `.envrc` snippet that runs `stack env` and reloads when
+`stack.toml`, `stack.lock` or the session changes.
 
 ## down
 
@@ -238,12 +404,59 @@ supervisor that is not running is not started: `supervisor` is then `{"stopped":
 `"stop_supervisor": false`) keeps it in every case. `--stop-supervisor`, which turned this on
 before it was the default, is still accepted and changes nothing.
 
+Service data is kept, so the next `up` finds the same databases. `down --purge` (MCP:
+`"purge": true`) also removes it once every service is confirmed stopped, and releases the
+checkout's port reservations and identity tokens (the next `up` assigns new ones). It removes
+only the data directories `up` recorded for this very checkout, and only as [`gc
+--reclaim-data`](#gc) removes a deleted checkout's: the directory `up` saw, reached with no
+link on the way, its `.stack-checkout` marker naming this checkout, the recorded supervisor
+confirming the service is not running and no process carrying the checkout's token. Anything
+else is kept, `purge.data[].kept` is true with the reason in `outcome`, and `purge.complete` is
+false; `down` itself still succeeds. Data Stack never recorded, and data of an earlier
+directory at the same path (moved aside by `up` as `.replaced-<time>`), is never removed.
+
+## renew
+
+Renews the session's lease. `--ttl 30m` sets its TTL (giving a session without a lease one,
+and keeping an owner process if it has one); without it, a session that has no lease fails
+with `no_lease`, whose hint says how to give it one.
+
+## Leases
+
+`status` and `up` report the lease as a `lease` object, the same one `ps` lists per checkout:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `ttl`, `owner_pid`, `ttl+owner_pid`, or `none` (no lease, or no session) |
+| `ttl_secs` | The TTL, when there is one |
+| `renewed_at` | When it was last renewed (Unix seconds; 0 without a lease) |
+| `expires_at` | When a TTL lease runs out unless something renews it first (Unix seconds) |
+| `owner_pid`, `owner_alive` | The owner process, and whether it is alive now |
+| `expired`, `expired_reason` | The lease ran out, and why; `gc` or the next `up` anywhere reclaims the session |
+
+`status` keeps `lease_expired`, the reason with what to do about it, beside it.
+
 ## gc
 
 Stops sessions whose lease expired. For a checkout that was deleted, it drops the session
 once its services are confirmed stopped. `--watch` repeats every `--interval` until stopped (with `--json`, one object per
-pass). Stack installs no background service, so run `gc --watch` under systemd, launchd or
-your agent runner if you want unattended cleanup.
+pass; after `--max-passes`, the exit code is 70 if the last pass failed). Stack runs nothing in the background on its own. For unattended cleanup, run
+[`stack setup --gc-agent`](#doctor-and-setup), or run `gc --watch` under your own supervisor or
+agent runner.
+
+`gc` decides from each session's record which ones look expired or belong to a deleted
+checkout, and locks only those. If another command holds one of them, `gc` waits for it.
+
+`--dry-run` reports what `gc` would do and changes nothing: no lock, no supervisor query, no
+record touched, no data directory opened. Each entry under `would_reclaim` has the
+`session`, `project`, `reason`, `action` (`stop` for an expired lease, `release_if_stopped`
+for a deleted checkout) and the recorded `services` (`port`, `pid`, whether that pid is alive,
+supervisor id). `busy` means a command was running in it, so `gc` would leave it alone.
+`deleted_checkouts` lists what deleted checkouts left: the `ports` that would be released and
+the recorded `data` directories, each with `action` `report` (kept and reported), or
+`remove_if_safe` with `--reclaim-data` (removed only if the checks below pass).
+`after_session` marks a checkout whose session record is still kept: the rest goes only once
+its services are confirmed stopped.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once. Its services'
@@ -270,7 +483,98 @@ When it cannot confirm that a deleted checkout's service stopped, `gc` fails wit
 `gc_incomplete` and keeps the record. Each such service comes with `recovery.inspect`, a
 command that shows the recorded process, and sometimes `recovery.stop`. Run inspect first,
 stop only if the PID still matches, then run `gc` again. The two steps are not atomic, which
-is why Stack does not do this for you.
+is why Stack does not do this for you by default.
+
+### Stopping orphans
+
+`gc --stop-orphans` opts in to stopping such a service itself. It acts only where `gc` would
+offer `recovery.stop`, and only when every recorded fact still matches:
+
+1. the supervisor (asked by its recorded binary and state directory) reports the recorded
+   daemon id as `running`, with the recorded pid and port;
+2. the live process with that pid started when the record says: no earlier than 2 seconds
+   before the recorded start (`started_at_ms`, taken just before the supervisor's start call)
+   and no later than 10 minutes after it. Records without a start time (from before Stack
+   0.1.18), and processes whose start time cannot be read, are refused;
+3. a second supervisor query, made after the start-time check, still reports the same id,
+   pid and port.
+
+Then it asks the supervisor to stop that id and waits until the pid is gone and the port
+closed. Anything else keeps the record and reports why, as without the flag. It cannot be
+combined with `--dry-run`.
+
+The remaining race: Pitchfork cannot compare and stop in one step, so it stops whatever runs
+under the id when the stop arrives. If, in the moment between the last check and the stop,
+the daemon is restarted under the same id (for example by a new checkout created at the same
+path running `stack up`), that new process is the one stopped. Do not use `--stop-orphans`
+while something may be starting services at a deleted checkout's path.
+
+## ps
+
+Lists every checkout this machine's Stack state has records of: a session, port reservations,
+identity tokens or a data directory `up` recorded. For each: its path, whether the directory
+still exists (`dir` is `present`, `missing` or `replaced`), the session id and `state`, the
+lease (see [leases](#leases)), and for each service its port, pid and
+data directory, with the directory's size on disk. `state` is `running` (every service live),
+`partial`, `stopped`, `launching`, `recorded` (a session without services) or `reserved`
+(records but no session). `reclaimable` marks a checkout [`gc`](#gc) reclaims: its directory is
+gone and no session of it is left, so gc releases its ports and reports its data, which
+`--reclaim-data` removes where it is safe. `totals` adds it all up, with the data of reclaimable
+checkouts in `reclaimable_bytes`.
+
+The checks are liveness only, and the field names say so: `pid_alive` (a process with the
+recorded pid exists) and `port_accepting` (something accepts connections on the port, which may
+be another program). `ps` never checks identity; `stack status` in the checkout does. It takes
+no lock, so it never waits behind a running `up`, and it needs no `stack.toml`. Measuring data
+directories walks them, which can be slow for large databases: `--no-size` skips it
+(`data_bytes` is then `null`).
+
+## mv
+
+When a checkout was moved or renamed (`git worktree move`, `mv`), its records still name the
+old path, and Stack reports `session_conflict` in it. `stack mv <old> <new>` carries them over:
+the session record, port reservations and identity tokens, so the checkout keeps its ports.
+Relative paths resolve against the working directory. mise keeps service data per project
+path, so `mv` also moves each data directory `up` recorded for the checkout to where mise will
+look for it at the new path (asked with `mise daemons ls`, which starts nothing). The
+[checkout token](../DESIGN.md#runtime-contract) follows from the path, so each moved directory
+gets the new token in its `.stack-checkout` marker and in Stack's data record, as `up` would
+write them. The rest of mise's state for the old path stays; `mise daemons prune` removes it.
+
+Data is checked as [`gc --reclaim-data`](#gc) checks it before removing anything: it must be
+the very directory `up` recorded (where it resolved, no link on the way, the same device and
+inode) and its marker must name the checkout. It is moved by renaming that directory, never
+copied, so a new path on another file system is refused. Data recorded for an earlier
+directory at the old path, or whose marker names another checkout, is left where it is (`gc`
+reports it); data that is already gone is dropped from the record.
+
+`mv` changes nothing unless everything checks out:
+
+| Code | When |
+|---|---|
+| `mv_services_running` | Something recorded for the old path may still run: a live pid, an open port, a supervisor that does not report a service stopped, an interrupted start, or a process carrying the checkout's token. Running services were started with the old path in their configuration, so only that path can stop them: move the directory back, run `stack -C <old> down`, move it again and rerun `stack mv` |
+| `mv_target_has_state` | The new path has a session of its own: run `stack -C <new> down`, or move elsewhere |
+| `mv_source_exists` | The old path still exists, so nothing was moved. A copy needs no `mv`; it gets its own ports on `up` |
+| `mv_nothing_recorded` | Nothing is recorded for the old path; `stack ps` lists what is |
+| `mv_target_missing` | The new path is not an existing directory; move the checkout first |
+| `mv_data_unmovable` | A recorded data directory cannot be confirmed to be the checkout's (replaced, linked, never seen by `up`, or named only by a session older than the data record), or its place at the new path already holds data |
+| `mv_data_unplaced` | mise names no data directory for a service at the new path: run `stack -C <new> compile` and retry |
+
+Ports and tokens that a compile at the new path assigned (a worktree hook usually compiles
+first) are replaced by the old ones, and the result's `notes` say so. A compile anywhere
+releases the reservations of a path that no longer exists, so run `stack mv` before other
+Stack commands to keep the old ports; the data moves either way.
+
+## completions
+
+`stack completions <shell>` prints a completion script for bash, zsh, fish, elvish or
+PowerShell. For example:
+
+```sh
+stack completions zsh > "${fpath[1]}/_stack"
+stack completions bash > ~/.local/share/bash-completion/completions/stack
+stack completions fish > ~/.config/fish/completions/stack.fish
+```
 
 ## doctor and setup
 
@@ -289,9 +593,25 @@ Pitchfork's socket lives under its state directory. On macOS, if `up` reports
 `setup` downloads the mise release Stack is tested against, unless one is on `PATH`.
 `--force` installs it anyway.
 
+`setup --gc-agent` writes a per-user service that runs `stack gc --watch`, and prints the
+command that loads it. It loads nothing unless you add `--enable`.
+
+| Platform | File | Load it with |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/dev.stack.gc.plist` (log: `~/Library/Logs/stack-gc.log`) | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.stack.gc.plist` |
+| Linux | `~/.config/systemd/user/stack-gc.service` (`$XDG_CONFIG_HOME` if set; log: the journal) | `systemctl --user daemon-reload && systemctl --user enable --now stack-gc.service` |
+
+The service runs the `stack` on your `PATH` (else this executable) with your current `PATH`
+and any `STACK_*`, `PITCHFORK_STATE_DIR`, `MISE_*_DIR` and `XDG_*` store variables, so it sees
+the same sessions you do. Run it again after changing those. `--print` shows the file without
+writing it. `--remove` deletes it and prints the unload command (`launchctl bootout
+gui/$(id -u)/dev.stack.gc`, or `systemctl --user disable --now stack-gc.service`); with
+`--enable` it runs that command first.
+
 ## Errors
 
-Malformed `stack.toml` and `bundle.toml` errors name the file, line and column, and show the
+Every code, with its meaning, default hint and whether a retry can succeed, is in [error
+codes](errors.md); `stack errors` prints the same list. Malformed `stack.toml` and `bundle.toml` errors name the file, line and column, and show the
 line with a caret. Errors from mise keep its last diagnostic lines. A `stack.lock` written by a
 newer Stack fails with `lock_invalid`; upgrade Stack.
 

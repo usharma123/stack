@@ -1560,7 +1560,8 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
     // (tool, arguments, what the message names, what the hint says)
     let cases: Vec<(&str, Value, &str, &str)> = vec![
         ("stack_exec", json!({ "command": ran, "secret": ["DEPLOY_KEY"] }), "unknown argument `secret`", "did you mean `secrets`?"),
-        ("stack_exec", json!({ "command": ran, "timeout": "1s" }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_exec", json!({ "command": ran, "timeout": "1s", "timeout_secs": 1 }), "`timeout` and `timeout_secs` cannot be given together", ""),
+        ("stack_exec", json!({ "command": ran, "timeout_sec": 1 }), "unknown argument `timeout_sec`", "did you mean `timeout_secs`?"),
         ("stack_exec", json!({ "command": "echo hi" }), "`command` must be an array", r#"["sh", "-c", "echo hi"]"#),
         ("stack_exec", json!({ "command": ["echo", 1] }), "`command` item 1: must be a string", ""),
         ("stack_exec", json!({ "command": [] }), "`command` must not be empty", ""),
@@ -1578,14 +1579,14 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
         ("stack_run", json!({ "task": "t", "args": "a b" }), "`args` must be an array", ""),
         ("stack_run", json!({ "task": "t", "args": ["a", false] }), "`args` item false", ""),
         ("stack_run", json!({ "task": 5 }), "`task` must be a string", ""),
-        ("stack_run", json!({ "task": "t", "timeout": 5 }), "unknown argument `timeout`", "did you mean `timeout_secs`?"),
+        ("stack_run", json!({ "task": "t", "timeout": 5 }), "`timeout` must be a string", ""),
         ("stack_compile", json!({ "update": true, "locked": true }), "`update` and `locked` cannot be given together", ""),
         ("stack_compile", json!({ "update": "yes" }), "`update` must be true or false", ""),
         ("stack_up", json!({ "ttl": 30 }), "`ttl` must be a string", ""),
         ("stack_up", json!({ "owner": 1 }), "unknown argument `owner`", "did you mean `owner_pid`?"),
         ("stack_restart", json!({ "services": "web" }), "`services` must be an array", ""),
         ("stack_logs", json!({ "service": "web", "tail": 0 }), "`tail` must be from 1 to 10000", ""),
-        ("stack_logs", json!({ "tail": 5 }), "`service` is required", ""),
+        ("stack_logs", json!({ "grep": 5 }), "`grep` must be a string", ""),
         ("stack_inspect", json!({ "all_skills": 1 }), "`all_skills` must be true or false", ""),
         ("stack_skill", json!({ "tool": "jq", "name": 3 }), "`name` must be a string", ""),
         ("stack_status", json!({ "verbose": true }), "unknown argument `verbose`", "stack_status accepts: dir"),
@@ -3308,10 +3309,10 @@ fn argument_errors_honour_json() {
         assert!(result["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()), "{args:?}: {result}");
     }
     // The missing argument is named, not cut off after "were not provided:".
-    let out = fixture.command(&["--json", "logs"]).output().unwrap();
+    let out = fixture.command(&["--json", "mv"]).output().unwrap();
     let error = &json_result(&out)["error"];
-    assert_eq!(error["message"], "the following required arguments were not provided: <SERVICE>", "{error}");
-    assert!(error["hint"].as_str().unwrap().contains("usage: stack logs <SERVICE>"), "{error}");
+    assert_eq!(error["message"], "the following required arguments were not provided: <OLD> <NEW>", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("usage: stack mv <OLD> <NEW>"), "{error}");
     let mcp = fixture.mcp(&[("stack_up", json!({ "ttl": "banana" })), ("stack_exec", json!({ "command": ["true"], "timeout_secs": 0, "require": ["nope"], "require_all": true }))], &[]);
     for result in &mcp {
         let error = &result["structuredContent"]["error"];
@@ -3847,7 +3848,7 @@ fn every_gc_mode_shows_the_recovery_commands() {
     let commands = [recovery["inspect"].as_str().unwrap(), recovery["stop"].as_str().unwrap()];
     for args in [&["gc"][..], &["gc", "--watch", "--max-passes", "1"], &["gc", "--watch", "--max-passes", "1", "--json"]] {
         let out = fixture.command_at(fixture.dir.path(), args).output().unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(out.status.code(), Some(70), "{args:?}: a Stack error exits 70");
         // People read stderr; with --json, each pass is one object on stdout.
         let shown = match args.contains(&"--json") {
             true => serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["hint"].as_str().unwrap().to_string(),
@@ -4071,6 +4072,7 @@ fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one
     let passes: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(passes.len(), 4, "one JSON object per pass");
     assert!(passes.iter().all(|p| p["ok"] == true && p["data"]["reclaimed"] == json!([])), "{passes:?}");
+    assert!(passes.iter().all(|p| p["command"] == "gc" && p["passed"] == true && p["data"]["pass"].is_u64()), "{passes:?}");
     assert_eq!(fixture.index_files(), 1);
 
     // Left idle, it expires and is collected by the next pass, with no `stack up`.
@@ -7471,4 +7473,335 @@ fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so
     assert!(check["detail"].as_str().unwrap().contains("2026.9.16"), "{check}");
     let e = json_result(&fixture.command(&["compile", "--locked", "--json"]).output().unwrap())["error"].clone();
     assert_eq!(e["code"], "provider_outdated");
+}
+
+// ---- machine-wide commands -------------------------------------------------------------------
+
+/// `web` started under the fake supervisor with a data directory of `bytes` bytes, as mise
+/// reports one for a preset service; `up` records it (marker, machine data record).
+fn up_with_data(fixture: &Fixture, up_args: &[&str], bytes: usize) -> (u16, std::path::PathBuf) {
+    let dir = fixture.dir.path();
+    let port = assigned_port(fixture, "web");
+    supervise_listener(fixture, port);
+    let data = dir.join("mise-state/daemons/0123/data/web");
+    let daemon = |status: &str| json!([{ "id": "app-test/web", "name": "web", "status": status, "port": port, "data_dir": data }]).to_string();
+    fs::write(dir.join("daemons-started.json"), daemon("running")).unwrap();
+    fs::write(dir.join("daemons.json"), daemon("stopped")).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("rows"), vec![b'x'; bytes]).unwrap();
+    fixture.ok(&[&["up"], up_args].concat());
+    (port, data)
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let app = dir.join("app").canonicalize().unwrap();
+    let (port, data) = up_with_data(&fixture, &["--ttl", "30m"], 8192);
+    // Another checkout, deleted while its session is still recorded.
+    let gone = dir.canonicalize().unwrap().join("deleted");
+    let record = json!({ "id": "gone12345678", "project": gone, "lock_digest": "", "started_at": 1, "services": { "web": { "port": 1, "identity": "liveness", "verified_at": 1 } } });
+    fs::write(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&gone))), record.to_string()).unwrap();
+
+    let ps = |args: &[&str]| -> Value {
+        let out = fixture.command_at(dir, &[&["ps", "--json"], args].concat()).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{result}");
+        result["data"].clone()
+    };
+    let row = |report: &Value, path: &Path| -> Value {
+        report["checkouts"].as_array().unwrap().iter().find(|c| Path::new(c["path"].as_str().unwrap()) == path).cloned().unwrap_or_else(|| panic!("{path:?} in {report}"))
+    };
+    // From a directory without stack.toml, while `up` would hold the project's lock.
+    let held = stack::state::project_lock(&dir.join("state"), &app).unwrap();
+    let started = Instant::now();
+    let report = ps(&[]);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(held);
+    assert!(report["checks"].as_str().unwrap().starts_with("liveness only"), "{report}");
+    let a = row(&report, &app);
+    assert_eq!((a["dir"].as_str(), a["state"].as_str(), a["reclaimable"].as_bool()), (Some("present"), Some("running"), Some(false)), "{a}");
+    assert_eq!(a["lease"]["kind"], "ttl", "{a}");
+    assert_eq!(a["lease"]["expired"], false, "{a}");
+    let web = &a["services"][0];
+    assert_eq!((web["name"].as_str(), web["port"].as_u64()), (Some("web"), Some(u64::from(port))), "{web}");
+    assert_eq!(web["port_accepting"], true, "{web}");
+    assert_eq!(web["data_dir"].as_str(), Some(data.to_str().unwrap()), "{web}");
+    assert!(web["data_bytes"].as_u64().unwrap() >= 8192, "{web}");
+    let g = row(&report, &gone);
+    assert_eq!((g["dir"].as_str(), g["state"].as_str(), g["reclaimable"].as_bool()), (Some("missing"), Some("stopped"), Some(false)), "{g}");
+    assert_eq!(g["lease"]["kind"], "none");
+    assert_eq!(report["totals"]["checkouts"], 2, "{report}");
+    assert_eq!(report["totals"]["running"], 1, "{report}");
+    assert_eq!(report["totals"]["reclaimable_bytes"], 0, "{report}");
+    assert_eq!(row(&ps(&["--no-size"]), &app)["services"][0]["data_bytes"], Value::Null);
+    let human = String::from_utf8_lossy(&fixture.command_at(dir, &["ps"]).output().unwrap().stdout).into_owned();
+    assert!(human.contains("running  session") && human.contains("directory missing") && human.contains("liveness only"), "{human}");
+    let mcp = fixture.mcp(&[("stack_ps", json!({ "no_size": true }))], &[]);
+    assert_eq!(mcp[0]["structuredContent"]["data"]["totals"]["checkouts"], 2, "{}", mcp[0]);
+
+    // Stopped and removed: what `gc` would reclaim, its data included.
+    fixture.ok(&["down"]);
+    fs::remove_dir_all(dir.join("app")).unwrap();
+    let report = ps(&[]);
+    let a = row(&report, &app);
+    assert_eq!((a["dir"].as_str(), a["state"].as_str(), a["reclaimable"].as_bool()), (Some("missing"), Some("reserved"), Some(true)), "{a}");
+    assert_eq!(a["services"][0]["data_dir"].as_str(), Some(data.to_str().unwrap()), "from the data record: {a}");
+    assert!(report["totals"]["reclaimable_bytes"].as_u64().unwrap() >= 8192, "{report}");
+    let human = String::from_utf8_lossy(&fixture.command_at(dir, &["ps"]).output().unwrap().stdout).into_owned();
+    assert!(human.contains("reclaimable by `stack gc`"), "{human}");
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn mv_carries_a_moved_checkouts_ports_tokens_and_data_to_its_new_path() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let (port, data) = up_with_data(&fixture, &[], 8192);
+    fixture.ok(&["down"]);
+    let app = dir.join("app").canonicalize().unwrap();
+    // An identity token, as a compile gives a service with an identity probe.
+    let token = "stack-0123456789abcdef0123456789abcdef";
+    fs::write(dir.join("state/identities.json"), json!({ "tokens": [{ "project": app, "service": "web", "token": token }] }).to_string()).unwrap();
+    let tokens = || -> Value { serde_json::from_slice(&fs::read(dir.join("state/identities.json")).unwrap()).unwrap() };
+    let moved = dir.canonicalize().unwrap().join("moved");
+    fs::rename(&app, &moved).unwrap();
+    let new_data = dir.join("mise-state/daemons/4567/data/web");
+    fs::write(dir.join("daemons-ls.json"), json!([{ "name": "web", "status": "available", "data_dir": new_data }]).to_string()).unwrap();
+
+    // Relative paths, from the parent directory.
+    let out = fixture.command_at(dir, &["mv", "app", "moved", "--json"]).current_dir(dir).output().unwrap();
+    let result = json_result(&out);
+    assert!(out.status.success(), "{result}");
+    let m = &result["data"];
+    assert_eq!((m["from"].as_str(), m["to"].as_str()), (app.to_str(), moved.to_str()), "{result}");
+    assert_eq!((m["ports"].as_u64(), m["identity_tokens"].as_u64()), (Some(1), Some(1)), "{result}");
+    assert_eq!(m["data"][0]["to"].as_str(), new_data.to_str(), "{result}");
+    assert_eq!(fs::read(new_data.join("rows")).unwrap().len(), 8192);
+    assert!(!data.exists() && !data.with_file_name("web.stack-checkout").exists(), "the old directory and marker are gone");
+    // Marked and recorded as the checkout's under the token its new path gives it.
+    let new_token = stack::checkout::token(&moved).unwrap();
+    let marker: Value = serde_json::from_slice(&fs::read(new_data.with_file_name("web.stack-checkout")).unwrap()).unwrap();
+    assert_eq!(marker["checkout"], new_token.as_str());
+    let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
+    let entries = ledger["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{ledger}");
+    assert_eq!(entries[0]["project"].as_str(), moved.to_str(), "{ledger}");
+    assert_eq!(entries[0]["checkout"], new_token.as_str(), "{ledger}");
+    assert_eq!(entries[0]["location"], json!(new_data.canonicalize().unwrap()), "{ledger}");
+    assert!(entries[0]["identity"].is_array(), "{ledger}");
+    assert_eq!(tokens()["tokens"][0]["token"], token);
+    assert_eq!(tokens()["tokens"][0]["project"].as_str(), moved.to_str());
+    // The checkout compiles at its new path with its old port, and gc leaves it alone.
+    let inspect = json_result(&fixture.command_at(&moved, &["inspect", "--json"]).output().unwrap());
+    assert_eq!(inspect["data"]["ports"]["web"].as_u64(), Some(u64::from(port)), "{inspect}");
+    let gc = json_result(&fixture.command_at(dir, &["gc", "--reclaim-data", "--json"]).output().unwrap());
+    assert_eq!(gc["data"], json!([]), "{gc}");
+    assert!(new_data.join("rows").exists());
+}
+
+#[test]
+fn mv_refuses_what_it_cannot_do_safely_and_changes_nothing() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let app = dir.join("app").canonicalize().unwrap();
+    let port = assigned_port(&fixture, "web");
+    let ports = || fs::read_to_string(dir.join("state/ports.json")).unwrap();
+    let mv = |args: &[&str]| json_result(&fixture.command_at(dir, &[&["mv"], args, &["--json"]].concat()).current_dir(dir).output().unwrap());
+
+    // The old path still exists: a copy, not a move.
+    fs::create_dir(dir.join("copy")).unwrap();
+    assert_eq!(mv(&["app", "copy"])["error"]["code"], "mv_source_exists");
+    let r = mv(&["never-there", "copy"]);
+    assert_eq!(r["error"]["code"], "mv_nothing_recorded", "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains("stack ps"), "{r}");
+    assert_eq!(mv(&["app", "nowhere"])["error"]["code"], "mv_target_missing");
+    // Over MCP; a missing argument is a usage error.
+    let copy = dir.canonicalize().unwrap().join("copy");
+    let mcp = fixture.mcp(&[("stack_mv", json!({ "from": app, "to": copy })), ("stack_mv", json!({ "from": app }))], &[]);
+    assert_eq!(mcp[0]["structuredContent"]["error"]["code"], "mv_source_exists", "{}", mcp[0]);
+    assert_eq!(mcp[1]["structuredContent"]["error"]["code"], "usage", "{}", mcp[1]);
+
+    // Services may still run: a live recorded pid.
+    let mut live = Command::new("sleep").arg("60").spawn().unwrap();
+    let index = dir.join(format!("state/sessions/{}.json", stack::state::project_key(&app)));
+    fs::create_dir_all(index.parent().unwrap()).unwrap();
+    let record = json!({ "id": "sess12345678", "project": app, "lock_digest": "", "started_at": 1, "services": { "web": { "port": port, "pid": live.id(), "identity": "liveness", "verified_at": 1 } } });
+    fs::write(&index, record.to_string()).unwrap();
+    let moved = dir.canonicalize().unwrap().join("moved");
+    fs::rename(&app, &moved).unwrap();
+    let r = mv(&["app", "moved"]);
+    assert_eq!(r["error"]["code"], "mv_services_running", "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains("down"), "{r}");
+    assert!(ports().contains(app.to_str().unwrap()) && index.exists(), "nothing changed");
+
+    // The moved checkout points at `stack mv` when the record that came with it is in the way.
+    fs::create_dir_all(moved.join(".stack")).unwrap();
+    fs::rename(&index, moved.join(".stack/session.json")).unwrap();
+    let r = json_result(&fixture.command_at(&moved, &["status", "--json"]).output().unwrap());
+    assert_eq!(r["error"]["code"], "session_conflict", "{r}");
+    assert!(r["error"]["hint"].as_str().unwrap().contains(&format!("stack mv {} {}", app.display(), moved.display())), "{r}");
+    let _ = live.kill();
+    let _ = live.wait();
+
+    // The new path has a session of its own.
+    let other = dir.canonicalize().unwrap().join("other");
+    fs::create_dir(&other).unwrap();
+    let theirs = dir.join(format!("state/sessions/{}.json", stack::state::project_key(&other)));
+    fs::write(&theirs, json!({ "id": "other1234567", "project": other, "lock_digest": "", "started_at": 1, "services": {} }).to_string()).unwrap();
+    assert_eq!(mv(&["app", "other"])["error"]["code"], "mv_target_has_state");
+
+    // Data recorded for the checkout that cannot be confirmed to be its own refuses the move.
+    let data = dir.join("mise-state/daemons/0123/data/web");
+    fs::create_dir_all(&data).unwrap();
+    let token = stack::checkout::token_as(&app, &moved).unwrap();
+    let entry = json!({ "project": app, "service": "web", "dir": data, "checkout": token });
+    fs::write(dir.join("state/data.json"), json!({ "entries": [entry] }).to_string()).unwrap();
+    let r = mv(&["app", "moved"]);
+    assert_eq!(r["error"]["code"], "mv_data_unmovable", "{r}");
+    assert!(ports().contains(app.to_str().unwrap()), "nothing changed");
+    fs::remove_file(dir.join("state/data.json")).unwrap();
+
+    // With the service stopped, the record that came with the directory is enough to move it.
+    let r = mv(&["app", "moved"]);
+    assert_eq!(r["data"]["session"], "sess12345678", "{r}");
+    assert!(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&moved))).exists());
+    assert!(ports().contains(moved.to_str().unwrap()) && !ports().contains(&format!("{}\"", app.display())), "{}", ports());
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn down_purge_removes_the_data_up_recorded_only_where_gc_would_and_releases_ports() {
+    let fixture = Fixture::with_bundle(WEB);
+    let dir = fixture.dir.path();
+    let (port, data) = up_with_data(&fixture, &[], 8192);
+    let marker = data.with_file_name("web.stack-checkout");
+    fs::write(data.with_file_name("unsaved.txt"), "keep me").unwrap();
+    let purge = |args: &[&str]| -> Value {
+        let out = fixture.command(&[&["down", "--purge", "--json"], args].concat()).output().unwrap();
+        let result = json_result(&out);
+        assert!(out.status.success(), "{result}");
+        assert_eq!(result["data"]["confirmed"], true, "{result}");
+        result["data"]["purge"].clone()
+    };
+
+    // The supervisor the record names does not report the service stopped: the data is kept.
+    fs::create_dir_all(dir.join("pf-status/app-test")).unwrap();
+    fs::write(dir.join("pf-status/app-test/web.json"), json!({ "id": "app-test/web", "status": "running" }).to_string()).unwrap();
+    let p = purge(&[]);
+    assert_eq!(p["complete"], false, "{p}");
+    assert_eq!(p["data"][0]["kept"], true, "{p}");
+    assert!(p["data"][0]["outcome"].as_str().unwrap().contains("the supervisor reports app-test/web as \"running\""), "{p}");
+    assert!(data.join("rows").exists() && marker.exists());
+    assert_eq!(p["released_ports"], json!([{ "service": "web", "port": port }]), "{p}");
+    fs::remove_dir_all(dir.join("pf-status")).unwrap();
+
+    // Confirmed: removed with its marker, and nothing beside it; the record is settled.
+    let p = purge(&[]);
+    assert_eq!(p["complete"], true, "{p}");
+    assert_eq!(p["data"][0]["kept"], false, "{p}");
+    assert!(p["data"][0]["outcome"].as_str().unwrap().starts_with(&format!("data in {} removed", data.display())), "{p}");
+    assert!(!data.exists() && !marker.exists());
+    assert_eq!(fs::read_to_string(data.with_file_name("unsaved.txt")).unwrap(), "keep me");
+    let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
+    assert_eq!(ledger["entries"], json!([]), "{ledger}");
+    assert!(!fs::read_to_string(dir.join("state/ports.json")).unwrap().contains("\"web\""));
+
+    // Nothing left: purging again is safe, over MCP too.
+    let mcp = fixture.mcp(&[("stack_down", json!({ "purge": true }))], &[]);
+    let p = &mcp[0]["structuredContent"]["data"]["purge"];
+    assert_eq!((p["complete"].clone(), p["data"].clone()), (json!(true), json!([])), "{}", mcp[0]);
+}
+
+#[test]
+fn exec_reports_truncation_and_full_size_of_each_stream() {
+    let fixture = Fixture::new();
+    let script = "head -c 70000 /dev/zero | tr '\\0' a; printf 0123456789 >&2";
+    let result = json_result(&fixture.ok(&["--json", "exec", "--", "sh", "-c", script]));
+    let data = &result["data"];
+    assert_eq!((data["stdout_truncated"].as_bool(), data["stderr_truncated"].as_bool()), (Some(true), Some(false)), "{data}");
+    assert_eq!((data["stdout_bytes"].as_u64(), data["stderr_bytes"].as_u64()), (Some(70000), Some(10)));
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", "head -c 70000 /dev/zero >&2"] }))], &[]);
+    let data = &results[0]["structuredContent"]["data"];
+    assert_eq!((data["stdout_truncated"].as_bool(), data["stderr_truncated"].as_bool()), (Some(false), Some(true)), "{data}");
+    assert_eq!(data["stderr_bytes"], 70000);
+}
+
+#[test]
+fn a_service_that_does_not_verify_has_a_stable_reason_code() {
+    let fixture = Fixture::with_bundle(WEB);
+    let status = json_result(&fixture.command(&["--json", "status"]).output().unwrap());
+    let web = &status["data"]["checks"][0];
+    assert_eq!((web["service"].as_str(), web["ready"].as_bool()), (Some("web"), Some(false)), "{status}");
+    assert_eq!(web["reason_code"], "not_launched", "{status}");
+    assert!(web["reason"].is_string(), "{status}");
+    let results = fixture.mcp(&[("stack_status", json!({}))], &[]);
+    assert_eq!(results[0]["structuredContent"]["data"]["checks"][0]["reason_code"], "not_launched", "{}", results[0]);
+}
+
+/// Every envelope says what ran, with which Stack, in which schema, and how long it took.
+fn assert_self_described(envelope: &Value, command: &str) {
+    assert_eq!(envelope["command"], command, "{envelope}");
+    assert_eq!(envelope["schema"], 1, "{envelope}");
+    assert_eq!(envelope["stack_version"], env!("CARGO_PKG_VERSION"), "{envelope}");
+    assert!(envelope["duration_ms"].is_u64(), "{envelope}");
+    assert!(envelope["passed"].is_boolean(), "{envelope}");
+}
+
+#[test]
+fn every_envelope_describes_itself_and_says_whether_it_passed() {
+    let fixture = Fixture::new();
+    let out = fixture.command(&["--json", "exec", "--", "sh", "-c", "exit 7"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    let result = json_result(&out);
+    assert_self_described(&result, "exec");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(false)), "{result}");
+    let result = json_result(&fixture.ok(&["--json", "exec", "--", "true"]));
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(true)), "{result}");
+
+    // Stack's own failure, and an argument clap refused, name the command too.
+    let out = fixture.command(&["--json", "restart"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(70), "a Stack error exits 70");
+    let result = json_result(&out);
+    assert_self_described(&result, "restart");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(false), Some(false)), "{result}");
+    let out = fixture.command(&["--json", "logs", "--tail", "many"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let result = json_result(&out);
+    assert_self_described(&result, "logs");
+    assert_eq!(result["error"]["code"], "usage", "{result}");
+
+    // An unhealthy status succeeded but did not pass.
+    let fixture = Fixture::with_bundle(WEB);
+    let result = json_result(&fixture.command(&["--json", "status"]).output().unwrap());
+    assert_self_described(&result, "status");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(false)), "{result}");
+    let results = fixture.mcp(&[("stack_status", json!({})), ("stack_inspect", json!({}))], &[]);
+    assert_self_described(&results[0]["structuredContent"], "status");
+    assert_eq!(results[0]["structuredContent"]["passed"], false);
+    assert_self_described(&results[1]["structuredContent"], "inspect");
+    assert_eq!(results[1]["structuredContent"]["passed"], true);
+}
+
+#[test]
+fn every_error_code_is_registered_with_a_hint_a_retry_flag_and_next_steps() {
+    let fixture = Fixture::new();
+    let listed = json_result(&fixture.ok(&["--json", "errors"]));
+    let codes = listed["data"].as_array().unwrap();
+    let no_session = codes.iter().find(|i| i["code"] == "no_session").unwrap();
+    assert_eq!(no_session["retryable"], false, "{no_session}");
+    assert!(no_session["hint"].as_str().is_some_and(|h| h.contains("stack up")), "{no_session}");
+    assert_eq!(fixture.ok(&["errors", "--markdown"]).stdout, fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/user/errors.md")).unwrap());
+
+    // A failure names the operation that fixes it, in this checkout, for the CLI and for MCP.
+    let failed = json_result(&fixture.command(&["--json", "restart"]).output().unwrap());
+    let app = fixture.dir.path().join("app").canonicalize().unwrap().display().to_string();
+    assert_eq!(failed["error"]["code"], "no_session", "{failed}");
+    assert_eq!(failed["error"]["retryable"], false, "{failed}");
+    assert_eq!(failed["error"]["next"], json!([{ "command": ["stack", "-C", app, "up"], "tool": "stack_up", "args": { "dir": app } }]), "{failed}");
+    let results = fixture.mcp(&[("stack_restart", json!({})), ("stack_errors", json!({}))], &[]);
+    assert_eq!(results[0]["structuredContent"]["error"]["next"], failed["error"]["next"], "{}", results[0]);
+    assert_eq!(results[1]["structuredContent"]["data"], listed["data"], "{}", results[1]);
 }

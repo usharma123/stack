@@ -11,20 +11,47 @@ claude mcp add stack -- stack mcp     # Claude Code
 codex mcp add stack -- stack mcp      # Codex
 ```
 
-Any other MCP client: launch the command `stack` with the argument `mcp`. Every tool takes a
-`dir` argument naming the checkout.
+Any other MCP client: launch the command `stack` with the argument `mcp`.
+
+**Pass `dir` on every call.** One registered server is shared by every agent on the machine,
+whatever checkout it works in, so the server never acts on its own working directory. Each tool
+takes `dir`, the absolute path of the checkout. It may be left out only when the client
+supports MCP roots and exposes exactly one: the server asks for `roots/list` after
+`initialize` (and again on `notifications/roots/list_changed`) and uses that root. Otherwise a
+call without `dir`, or with a relative one, fails with a `usage` error. Every result carries
+the checkout it acted on as `project`, an absolute path. `stack_gc`, `stack_ps` and `stack_mv`
+act machine-wide and need no `dir`, as does `stack_errors`.
 
 | Tool | Does |
 |---|---|
-| `stack_status` | Checks every service now. Start here |
+| `stack_status` | Checks every service now and renews the lease. Start here |
 | `stack_up` | Compiles if needed, installs, starts and verifies services |
 | `stack_run` | Runs a `[tasks.<name>]` once every service checks out |
 | `stack_exec` | Runs any other command (an argv list) with the stack's tools and env |
 | `stack_restart` | Restarts services after you edit code they loaded |
-| `stack_logs` | Shows a service's recent output |
+| `stack_logs` | Shows recent output of one service, or of every service; `grep`, `ignore_case` and `since` filter it |
 | `stack_down` | Stops everything and confirms it is gone |
+| `stack_ps` | Lists every checkout on the machine, its services and data size (liveness only) |
+| `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
-| `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships |
+| `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
+| `stack_init` | Writes a starting `stack.toml` (`tools`, `services`), like `stack init` |
+| `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapshot_list`, `stack_snapshot_rm` | Save a checkout's Postgres and Redis data and restore it in any checkout of the project, like `stack snapshot` ([service data](data.md)) |
+| `stack_errors` | Lists every [error code](errors.md): its meaning, default hint, `retryable` and `next` (CLI: `stack errors`) |
+| `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
+
+Each tool has a `title`, a short description that says when to use it, a description for
+every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
+`stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps`, `stack_env`,
+`stack_errors` and `stack_snapshot_list`, `destructiveHint` for `stack_down`, `stack_gc`, `stack_snapshot_restore`
+and `stack_snapshot_rm`, and `idempotentHint` for those that are
+safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
+
+The server also offers this page as the resource `stack://guide`, takes `logging/setLevel`
+(it warns, for example, when a client's roots cannot be used), negotiates the protocol revision
+the client asks for (2025-11-25, 2025-06-18, 2025-03-26 or 2024-11-05, else the newest), and
+answers a malformed message or an unknown method with the standard JSON-RPC error. Batches are
+accepted only in 2025-03-26, the one revision that has them.
 
 ## The loop
 
@@ -37,6 +64,12 @@ stack exec --require-all -- <command>    # anything else
 stack down                               # before you finish or remove the checkout
 ```
 
+To save a round-trip, `stack exec --up -- <command>` and `stack run --up <task>` start the
+stack first when it needs it (no session, a stale or expired one, or a service that does not
+verify), and `stack exec --install` installs missing pinned tools instead of failing with
+`tools_not_installed`. Over MCP these are `up`, `ttl` and `install` on `stack_exec` and
+`stack_run`; what ran is listed under `prepared`.
+
 A few things that are easy to get wrong:
 
 - **Read connection details from the environment.** `DATABASE_URL`, `REDIS_URL`,
@@ -48,12 +81,23 @@ A few things that are easy to get wrong:
 - **`watch` does not reload anything.** When a file listed in a service's `watch` changes,
   `status`, `exec` and `run` tell you to run `stack restart <service>`. `up` leaves a service
   with unchanged configuration running, so it will not pick up your edit either.
-- **Prefer `--ttl` to `--owner-pid`.** A lease tied to the shell that ran `stack up` ends as
-  soon as that shell exits.
+- **Prefer `--ttl` to `--owner-pid N`.** A lease tied to the shell that ran `stack up` ends as
+  soon as that shell exits. To tie it to the agent itself, use `--owner-pid ancestor:claude`
+  (MCP `owner_ancestor: "claude"`): Stack uses its nearest ancestor process with that command
+  name, and fails with `owner_not_found`, listing the ancestors, if there is none.
+- **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
+  `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
+  `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
+- **Port conflicts.** `stack up --reassign-ports` (MCP `reassign_ports`) moves this checkout's
+  conflicting ports and continues; the other program is left alone.
 - **Do not work around `artifact_mismatch`.** It means a download differs from what
   `stack.lock` records. Report it, and run `stack compile --update` only if the change is
   expected upstream.
 - **`stack logs <service> --since-start`** shows only the current process's output.
+  `stack logs --grep error -i` searches every service's output at once.
+- **The CLI finds the project from a subdirectory**, up to the Git worktree root. `exec` runs
+  your command in the directory you called it from. Pass `-C` to be explicit. MCP `dir` is
+  never searched upward: it must be the directory that holds `stack.toml`.
 
 ## Reading results
 
@@ -81,29 +125,56 @@ def succeeded(operation, envelope):
     return True
 ```
 
+Every envelope also answers that check itself: **`passed`** is false when `ok` is false, when
+`exec` or `run` exited non-zero or by a signal, and when `status` finds a service unhealthy,
+so `envelope["passed"]` is the same test without the table. Beside it, `command` names the
+operation (MCP tool names without `stack_`), `stack_version` the Stack release that answered,
+`schema` the version of these shapes (currently `1`, raised only on an incompatible change)
+and `duration_ms` how long the call took:
+
+```json
+{"ok": true, "passed": false, "command": "exec", "stack_version": "0.1.22", "schema": 1,
+ "duration_ms": 412, "data": {"exit_code": 3, "signal": null, "stdout": "...", "stderr": "..."}}
+```
+
 - A command that exits 7 gives `ok: true` and `data.exit_code: 7`, and the CLI exits 7 too.
   `exit_code` is `null` when a signal ended the command; `data.signal` then names it, and the
   CLI exits 128 plus the signal (137 for SIGKILL), as a shell does.
 - A `status` that finds a service down still gives `ok: true`, with `data.healthy: false` and
-  `data.checks` saying which service and why. The CLI exits 1.
+  `data.checks` saying which service and why: a sentence in `reason` and a stable
+  [`reason_code`](commands.md#reason-codes) to branch on. The CLI exits 1.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
-  `error.hint`. `error.details` carries the specifics.
+  `error.hint`. `error.details` carries the specifics. The CLI exits 70 (124 for
+  `timed_out`); see [exit codes](commands.md#exit-codes).
+- Every `error.code` is listed in [error codes](errors.md); `stack errors --json` (MCP
+  `stack_errors`) returns the list. `error.retryable` says whether repeating the same call
+  unchanged can succeed (`lock_busy`, `timed_out`) or something must change first
+  (`no_session`, `lock_outdated`). An error raised without a hint of its own carries the
+  code's default.
+- Where the fix is unambiguous, `error.next` lists it as data, with this checkout's directory
+  filled in: `{"command": ["stack", "-C", "/abs/app", "up"], "tool": "stack_up", "args":
+  {"dir": "/abs/app"}}`. Run `command` from a shell, or call `tool` with `args` over MCP.
+  `tool` is `null` for operations MCP does not serve (`setup`).
 - A bad argument is `usage` with a hint, whether the parser or Stack itself rejected it (an
   unknown flag, `--ttl banana`, `--timeout 1ms`), and the CLI exits 2 for it.
-- `exec` and `run` capture at most 64 KiB of each output stream.
+- `exec` and `run` capture at most 64 KiB of each output stream and keep the end.
+  `stdout_truncated` and `stderr_truncated` say whether anything was dropped, and
+  `stdout_bytes` and `stderr_bytes` give each stream's full size.
 
 ## Timeouts
 
-`exec` and `run` take `--timeout` (MCP `timeout_secs`), counted from the call, so time spent
-compiling or installing comes out of the command's share. `up` and `restart` default to 10
-minutes. When a deadline passes, Stack kills the command's process group and returns
+`exec` and `run` take `--timeout`, counted from the call, so time spent compiling or
+installing comes out of the command's share. On the CLI they have no default; over MCP they
+default to 10 minutes, so an unattended call is always bounded. `up` and `restart` default to
+10 minutes everywhere. Over MCP, give either `timeout`, a duration like the CLI's (`"90s"`,
+`"5m"`), or `timeout_secs`, a whole number of seconds, but not both. When a deadline passes, Stack kills the command's process group and returns
 `timed_out` (CLI exit 124), with the output so far in `error.details`.
 
 A runner that cancels Stack with SIGTERM (or SIGINT, SIGHUP) cancels the command: Stack passes
 the signal on to the command's process group, waits up to 10 seconds, then kills the group; a
 second signal kills it at once. With `--json` the result is still printed (`exit_code: null`
-and `signal` for a command the signal ended). `stack mcp` does the same for the command a call is running,
-answers that call, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
+and `signal` for a command the signal ended). `stack mcp` does the same for the commands its calls are running,
+answers those calls, starts nothing more, then exits. Send SIGTERM, not SIGKILL: Stack cannot pass a SIGKILL on.
 A signal that comes while `up` or `restart` runs a service's `setup` cancels the start, even
 when the setup handles it and exits 0: no further setup runs and nothing more is started. The
 result is `cancelled` (CLI exit 128 plus the signal), and anything launched before stays
@@ -114,13 +185,35 @@ If `up` times out, services may still be starting. Check `stack status`. Retryin
 a slow service finish; a service that will never become ready needs `stack down` before you
 try again.
 
+## Long calls over MCP
+
+The server reads requests while a call runs, so `ping`, `tools/list` and calls on other
+checkouts are answered meanwhile. Calls on the same checkout run one at a time, in the order
+they arrived.
+
+- **Cancelling.** `notifications/cancelled` for a running call stops it the way its timeout
+  would: its commands are killed with their process groups and no response is sent. A
+  cancelled `stack_up` or `stack_restart` leaves what a timed-out one leaves: anything it
+  launched stays recorded, so `stack_status` shows it, `stack_down` stops it and a retried
+  `stack_up` keeps waiting for it. A call cancelled while it waits for its turn never runs.
+- **Progress.** A call whose request carries `_meta.progressToken` gets
+  `notifications/progress` as each lifecycle step starts and ends (`compile`, `install`,
+  `start`, `verify` and the rest of `steps`), and a heartbeat every 10 seconds while a step
+  such as an install or a readiness wait takes long.
+
 ## MCP arguments
 
 Each call is checked against the tool's `inputSchema` before anything runs. An unknown
-argument (`secret` instead of `secrets`, `timeout` instead of `timeout_secs`), a wrong type, a
-missing required argument or a conflicting pair is a `usage` error, and the hint lists the
+argument (`secret` instead of `secrets`, `required` instead of `require`), a wrong type, a
+missing required argument or a conflicting pair (`timeout` with `timeout_secs`) is a `usage` error, and the hint lists the
 accepted names. `command` must be an argv list such as `["sh", "-c", "echo hi"]`; a string is
 refused, not split. `null` counts as omitted.
+
+`stack_up` takes `no_init`, `reinit` (a list of services) and `from_snapshot`, like the CLI's
+`--no-init`, `--reinit` and `--from-snapshot` (see [service data](data.md)); `no_init` and
+`reinit` cannot be given together. `stack_down` takes `purge: true`, like the CLI's
+`--purge`. `stack_ps` takes `no_size`, like the CLI's `--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
+`dir` when it is given.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that
 is not an upper-case variable name is `invalid_secret`, as `--secret` reports it on the CLI. `stack_run`

@@ -92,6 +92,14 @@ output (mise's answer when no release matches) is an error, not a version.
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
   assigned ports and the override for pinned ones. Stack never reassigns on its own: `down`
   removes the session while reservations persist, so "no session" does not mean "never used".
+  `up --reassign-ports` is the explicit opt-in: on a `port_conflict` at the `ports` step with no
+  pinned port involved, only the conflicting services get new reservations (the old port stays
+  excluded while choosing) and `up` runs again once, reporting `reassigned_ports`.
+- **Fewer round-trips.** `exec`/`run --up` run a live `status` first and `up` only when it finds
+  no session, a launching, stale or expired one, or a service that does not verify; the lease is
+  carried over unless `--ttl` is given. `exec --install` runs `install` when a pin is missing.
+  Both happen before planning, outside the plan's lock,
+  within the call's deadline.
 - **Generations.** A session fingerprints the composed configuration except its tasks, the
   bundle lock and the assigned ports. Tasks change what `run` runs, never a service, so editing
   one keeps the session; a fingerprint recorded before tasks were left out, which still matches
@@ -128,12 +136,26 @@ output (mise's answer when no release matches) is an error, not a version.
   pinned `fnox` twice (`--describe`, then `--keys`), bounded in time and output, validates the
   whole answer before applying it, and never forwards what fnox printed. Captured output passes
   through a streaming matcher before it is bounded. See [secret grants](user/secrets.md).
-- **Leases.** `--ttl` (renewed by `exec`/`renew`) or `--owner-pid` (a long-lived runner, not the
+- **Leases.** `--ttl` (renewed by `exec`/`run`/`renew`, and by `status` while not yet
+  expired; `renew --ttl` changes it) or `--owner-pid` (a long-lived runner, not the
   short-lived shell that ran `stack up`). Owner PIDs must be 1 to 2147483647 (a positive
   `pid_t`); other values are rejected as `usage` before any lifecycle work, never truncated.
+  `--owner-pid ancestor:<name>` walks the parent chain of the stack process (kernel process
+  info through `procinfo`, no subprocess) and takes the nearest process whose `comm` or
+  `argv[0]` basename is `<name>`; none is `owner_not_found` listing the chain.
+  `status`, `up` and `ps` report the lease as one structured `lease` object (`kind`,
+  `ttl_secs`, `renewed_at`, `expires_at`, `owner_alive`, `expired`).
   Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.
+- **GC passes.** A pass reads each machine index entry without its lock and locks only
+  candidates (an expired lease, or a gone project); everything is checked again under the
+  lock. The pass at the start of `up` try-locks: a busy candidate is skipped and reported, and
+  any failure becomes a warning of the `gc` step, so one checkout's `up` never waits on or
+  fails because of another's. Standalone `gc` waits for busy candidates. `gc --dry-run`
+  reads without locks and writes nothing; it lists the sessions a pass would reclaim and the
+  ports and data a deleted checkout would release (or, with `--reclaim-data`, have removed
+  where the checks pass).
   Commands register active executions under the lifecycle lock and renew on completion. A
   command that cannot retake the lock within a second leaves an atomic completion record
   (session, token, PID) instead; the next lifecycle operation applies it, but only once it has
@@ -288,14 +310,41 @@ output (mise's answer when no release matches) is an error, not a version.
   reuse after deletion; older records and filesystems without creation times retain device/inode
   checks. When the directory is gone, or a different directory now has its path, GC asks Pitchfork
   (`pitchfork status --json <id>`, which reads its state without starting a supervisor).
-  Pitchfork does not provide atomic compare-and-stop, so GC never issues a separate stop by
-  daemon name for a gone project, even when PID and port match. Live, unknown, transitional,
+  Pitchfork does not provide atomic compare-and-stop, so by default GC never issues a separate
+  stop by daemon name for a gone project, even when PID and port match. `gc --stop-orphans` is
+  the explicit opt-in: where PID and port match it also requires the live process's start time
+  to fall within [recorded start − 2 s, recorded start + 10 min] (unreadable or unrecorded is a
+  refusal), queries the supervisor again, then stops the id and waits for the PID to exit and
+  the port to close. The window between that last query and the stop remains: a daemon
+  restarted under the same id in it (a new checkout at the same path) is the one stopped. Live, unknown, transitional,
   retrying and incomplete-launch states retain the record and return `gc_incomplete`.
   A confirmed stopped daemon with no live recorded PID, or a missing daemon after a completed
   launch and dead recorded PID, permits release. Unrelated listeners remain untouched.
   Use `stack down` before deleting a checkout; otherwise identify and stop the intended
   supervisor daemon explicitly before retrying GC. Nothing is recreated, and data is kept.
   While ownership remains unresolved, a new directory at the old path gets `session_conflict`.
+- **Machine-wide view.** `ps` reads the session index, `ports.json`, `identities.json` and the
+  data record (`data.json`) without locks (each is replaced atomically) and checks liveness
+  only: pid existence and TCP accept. It never runs identity verification. Sizes count the
+  blocks of what is inside each data directory without following links.
+- **Moving.** mise derives each project's daemon namespace and data directory from the project
+  path, the checkout token includes the path, and running services carry both. So `mv`
+  refuses while anything recorded for the old path may run (live pid, open port, supervisor not
+  reporting stopped, launch in progress, a process carrying the token the directory had at the
+  old path, which a move keeps computable since device, inode and creation time stay). It holds
+  both paths' project locks, checks each data directory recorded under that token as `gc`
+  does (`hold`: resolved location, `O_NOFOLLOW`, same device and inode, marker), and only then
+  rekeys reservations and tokens, renames each held directory (`renameat` from the held
+  parent, then confirmed by device and inode, renamed back otherwise) to what `mise daemons
+  ls` names for the new path, writes the new token into its marker and the data record, and
+  moves the session (re-stamped with the directory) and completion records. Data moves and
+  registry changes are undone if a later step fails.
+- **Purging.** `down --purge` removes an existing checkout's own data after `down` confirmed
+  the stop, under the same project lock and before the supervisor may stop: each data-record
+  entry of this path whose token is the directory's own goes through the same reclaim as `gc
+  --reclaim-data` (resolved location, `O_NOFOLLOW`, device and inode, marker, supervisor
+  status, token carriers, removal through the held descriptors). Settled entries leave the
+  record; the rest are kept and reported. It then releases the path's reservations and tokens.
 - **Supervisor socket.** Pitchfork's socket is `<state dir>/sock/main.sock`, where the state
   directory is `PITCHFORK_STATE_DIR` (from the provider config's env, which mise passes to
   Pitchfork, else stack's own), else an absolute `XDG_STATE_HOME/pitchfork` on Linux only, else
@@ -330,6 +379,21 @@ output (mise's answer when no release matches) is an error, not a version.
   as its own PID: the terminal's own interrupt and hangup already reach it.
 - **Projects without services** never query the supervisor: `down`, `status` and `exec` have
   nothing to reconcile, and `mise daemons` is not configured for them.
+- **Service data.** mise's presets own data directories
+  (`$MISE_STATE_DIR/daemons/<checkout hash>/data/<service>`, created by `mise daemons __init`
+  on first start); `mise daemons --json` reports the path even before then. Init tasks run
+  after verification, through the same planning as `stack run`, once per data directory; a
+  service's `setup` is the hook that runs before every start. A marker in Stack's state records
+  the directory as the data record does (resolved location, device and inode) and a digest of
+  the init list and task definitions, so a recreated directory re-runs init and a changed list
+  is reported `stale`, never re-run silently. `init` is composed apart from the service
+  definition and excluded from the session fingerprint. Snapshots (postgres and redis only)
+  copy and replace only the data directory recorded for the checkout (held as `gc
+  --reclaim-data` holds it), only while its service and its dependents are confirmed stopped,
+  keyed by the Git common directory, and restore by exchanging a complete sibling copy into
+  place, then bind the record to the new directory. The instance check compares the server's
+  reported directory (from `-D`/`--dir`, not stored in the data) with the supervisor's, so
+  restored data verifies as the restoring checkout's. See [service data](user/data.md).
 - **Partial failure.** `up` returns completed steps, whether services may have been started
   (`changed`), and `retry_safe`. Arbitrary setup is not rolled back.
 

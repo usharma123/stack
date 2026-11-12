@@ -22,13 +22,19 @@ pub const TOKEN_VAR: &str = "STACK_CHECKOUT_TOKEN";
 /// The token of the directory at `root` now, if it exists, whichever way its path is spelled.
 pub fn token(root: &Path) -> Option<String> {
     let root = &root.canonicalize().ok()?;
-    let (dev, ino) = crate::session::dir_id(root)?;
-    let created = std::fs::metadata(root)
+    token_as(root, root)
+}
+
+/// The token the directory now at `dir` had at `path`, the resolved path it was moved from:
+/// a move keeps a directory's device, inode and creation time, and only its path changes.
+pub fn token_as(path: &Path, dir: &Path) -> Option<String> {
+    let (dev, ino) = crate::session::dir_id(dir)?;
+    let created = std::fs::metadata(dir)
         .ok()
         .and_then(|m| m.created().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or_else(String::new, |d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()));
-    Some(sha256_hex(format!("{}\0{dev}\0{ino}\0{created}", root.display()).as_bytes())[..32].to_string())
+    Some(sha256_hex(format!("{}\0{dev}\0{ino}\0{created}", path.display()).as_bytes())[..32].to_string())
 }
 
 #[cfg(test)]
@@ -49,5 +55,16 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         assert_ne!(token(&root).unwrap(), first, "a new directory at the same path");
         assert!(token(&parent.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn a_moved_directory_had_the_token_its_old_path_gives_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let (old, new) = (parent.path().canonicalize().unwrap().join("old"), parent.path().canonicalize().unwrap().join("new"));
+        std::fs::create_dir(&old).unwrap();
+        let before = token(&old).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        assert_eq!(token_as(&old, &new).as_deref(), Some(before.as_str()));
+        assert_ne!(token(&new).unwrap(), before, "the path is part of it");
     }
 }

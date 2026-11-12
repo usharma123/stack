@@ -359,6 +359,8 @@ struct Mcp {
     child: std::process::Child,
     stdout: BufReader<std::process::ChildStdout>,
     id: u64,
+    /// The checkout every call names: the server never acts on its own working directory.
+    dir: PathBuf,
 }
 
 impl Mcp {
@@ -367,7 +369,7 @@ impl Mcp {
         command.current_dir(f.path("app")).stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command.spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self { child, stdout, id: 0 }
+        Self { child, stdout, id: 0, dir: f.path("app").canonicalize().unwrap() }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -379,7 +381,8 @@ impl Mcp {
         serde_json::from_str(&reply).unwrap()
     }
 
-    fn call(&mut self, tool: &str, args: Value) -> Value {
+    fn call(&mut self, tool: &str, mut args: Value) -> Value {
+        args["dir"] = json!(self.dir);
         self.request("tools/call", json!({ "name": tool, "arguments": args }))["result"]["structuredContent"].clone()
     }
 }
@@ -446,6 +449,30 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     fs::remove_file(&entry).unwrap();
     let r = mcp.call("stack_skill", json!({ "tool": "fnox", "name": "fnox" }));
     assert_eq!(r["error"]["code"], "skill_not_found", "an entrypoint gone before discovery: {r}");
+}
+
+#[test]
+fn the_cli_prints_the_same_skill_stack_skill_returns() {
+    let f = Fixture::new(PROJECT);
+    let out = f.ok(&["skill", "mbx", "--name", "mbx-advanced"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "# mbx-advanced 1.22.0\nDocumentation only. SENTINEL-DOC\n");
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("# mbx 1.22.0 skill mbx-advanced ("), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut cli = f.json(&["skill", "fnox"]);
+    let mut mcp = Mcp::start(&f);
+    mcp.request("initialize", json!({ "protocolVersion": "2025-06-18" }));
+    let mut over_mcp = mcp.call("stack_skill", json!({ "tool": "fnox" }));
+    over_mcp.as_object_mut().unwrap().remove("project");
+    // How long each call took is the one field that may differ.
+    assert!(cli.as_object_mut().unwrap().remove("duration_ms").is_some_and(|d| d.is_u64()), "{cli}");
+    assert!(over_mcp.as_object_mut().unwrap().remove("duration_ms").is_some_and(|d| d.is_u64()), "{over_mcp}");
+    assert_eq!(cli, over_mcp);
+    // The same refusals, with the CLI's exit codes.
+    let several = f.json(&["skill", "mbx"]);
+    assert_eq!(several["error"]["code"], "usage", "{several}");
+    assert_eq!(several["error"]["details"][0]["names"], json!(["mbx", "mbx-advanced"]), "{several}");
+    assert_eq!(f.json(&["skill", "pitchfork"])["error"]["code"], "skill_not_found");
+    let out = f.command(&["skill", "fnox", "--name", ""]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "an empty name is a usage error");
 }
 
 const SYNC_PROJECT: &str = "[tools]\nfnox = \"1.39\"\nmbx = \"1.22.0\"\n\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n\n[skills]\ndir = \".claude/skills\"\n";

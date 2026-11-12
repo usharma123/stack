@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use stack::error::{Result, StackError};
@@ -7,6 +7,7 @@ use stack::mcp::{self, parse_duration};
 use stack::oci::{self, Reference};
 use stack::project::{self, default_cache_dir, Options, Report};
 use stack::compose::LoadedBundle;
+use stack::contract::{self, Call};
 use stack::secrets::Grant;
 use stack::session::{self, Ctx, LeaseOptions, Require};
 use stack::source::Mode;
@@ -18,12 +19,16 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "stack", version, about = "Reusable, agent-safe development stacks")]
 struct Cli {
-    /// Project directory containing stack.toml
-    #[arg(short = 'C', long = "dir", global = true, default_value = ".")]
-    dir: PathBuf,
+    /// Project directory containing stack.toml (default: the nearest one at or above the
+    /// working directory, searching up to the Git worktree root)
+    #[arg(short = 'C', long = "dir", global = true)]
+    dir: Option<PathBuf>,
     /// Machine-readable output: a single JSON object on stdout
     #[arg(long, global = true)]
     json: bool,
+    /// No progress lines on stderr while lifecycle commands run
+    #[arg(short, long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -58,18 +63,40 @@ enum Cmd {
         #[arg(long)]
         all_skills: bool,
     },
+    /// Print the SKILL.md of a pinned tool's agent skill (as listed by `inspect`)
+    Skill {
+        /// Tool name as `inspect` lists it under skills, e.g. fnox
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        tool: String,
+        /// Skill name, needed only when the tool ships several
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: Option<String>,
+    },
     /// Install the locked tools and service binaries without starting anything
     Install,
-    /// Show the last lines a service wrote, as kept by the supervisor
+    /// Show the last lines services wrote, as kept by the supervisor
     Logs {
-        /// Service name from the composed stack
-        service: String,
+        /// Services from the composed stack (default: every service, each line prefixed)
+        services: Vec<String>,
         /// Number of lines from the end (default 100)
         #[arg(long, value_name = "N", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=10_000))]
         tail: u64,
         /// Only output of the current process, not of earlier runs the supervisor kept
         #[arg(long)]
         since_start: bool,
+        /// Only output written in the last DURATION (e.g. 10m, 2h)
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+        /// Only lines containing this text (a plain substring, not a regex); --tail counts
+        /// matching lines
+        #[arg(long, value_name = "TEXT")]
+        grep: Option<String>,
+        /// Match --grep ignoring case
+        #[arg(short = 'i', long, requires = "grep")]
+        ignore_case: bool,
+        /// Keep printing new lines until interrupted (polls the supervisor every second; not with --json)
+        #[arg(short, long)]
+        follow: bool,
     },
     /// Start services, verify each one, and record a session
     Up {
@@ -77,13 +104,28 @@ enum Cmd {
         #[arg(long)]
         ttl: Option<String>,
         /// Reclaim the session when this process exits. Pass a long-lived process such as the
-        /// agent runner or CI job, not a shell that exits after this command
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(session::MAX_OWNER_PID)))]
-        owner_pid: Option<u32>,
+        /// agent runner or CI job, not a shell that exits after this command. `ancestor:<name>`
+        /// picks the nearest ancestor of this command with that command name (e.g. ancestor:claude)
+        #[arg(long, value_name = "PID|ancestor:NAME", value_parser = owner_arg)]
+        owner_pid: Option<stack::lease::Owner>,
+        /// On a port conflict with another program, give this checkout's conflicting ports new
+        /// numbers and continue (the result lists old and new). The other program is left alone
+        #[arg(long)]
+        reassign_ports: bool,
         /// Give up after this long (e.g. 5m), exit 124 and keep what was launched recorded for
         /// `status` and `down`. Covers the whole startup. Default 10m
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Run no init task (`init = [...]` of a service), even pending ones
+        #[arg(long)]
+        no_init: bool,
+        /// Run this service's init tasks again from the first, whatever was recorded (repeatable)
+        #[arg(long, value_name = "SERVICE", conflicts_with = "no_init")]
+        reinit: Vec<String>,
+        /// Before the first start, fill each data directory that does not exist yet from this
+        /// snapshot (see `stack snapshot`); its init counts as done
+        #[arg(long, value_name = "NAME")]
+        from_snapshot: Option<String>,
     },
     /// Restart services of the running session (all when none are named), then verify again
     Restart {
@@ -117,6 +159,15 @@ enum Cmd {
         /// fnox itself to read ungranted secrets, which are not redacted
         #[arg(long = "secret", value_name = "KEY")]
         secret: Vec<String>,
+        /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
+        #[arg(long)]
+        up: bool,
+        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        #[arg(long, value_name = "DURATION", requires = "up")]
+        ttl: Option<String>,
+        /// Install pinned tools that are missing instead of failing with tools_not_installed
+        #[arg(long)]
+        install: bool,
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
@@ -128,6 +179,12 @@ enum Cmd {
         /// call: planning, including installing missing pins, is included. Default: no limit
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
+        #[arg(long)]
+        up: bool,
+        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        #[arg(long, value_name = "DURATION", requires = "up")]
+        ttl: Option<String>,
         /// Extra arguments, appended to the task's command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -142,9 +199,17 @@ enum Cmd {
         /// scripts written when this was not the default)
         #[arg(long)]
         stop_supervisor: bool,
+        /// Then remove the service data `up` recorded for this checkout, where it is safe to,
+        /// and release its ports and identity tokens
+        #[arg(long)]
+        purge: bool,
     },
     /// Renew this project's session lease
-    Renew,
+    Renew {
+        /// Set the lease's TTL (e.g. 30m), giving a session without a lease one
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
+    },
     /// Reclaim sessions with expired leases or deleted projects (machine-wide)
     Gc {
         /// Keep running in the foreground and collect every --interval (for a supervisor such as
@@ -160,6 +225,27 @@ enum Cmd {
         /// Also remove the service data of deleted checkouts (otherwise only reported)
         #[arg(long)]
         reclaim_data: bool,
+        /// Show what would be reclaimed (sessions, and the ports and data of deleted checkouts)
+        /// and change nothing
+        #[arg(long, conflicts_with_all = ["watch", "stop_orphans"])]
+        dry_run: bool,
+        /// Also stop a deleted checkout's service when its supervisor id, pid, port and process
+        /// start time all still match the record (see `stack gc` in the docs for the remaining race)
+        #[arg(long)]
+        stop_orphans: bool,
+    },
+    /// List every checkout Stack has records for on this machine (read-only, liveness checks only)
+    Ps {
+        /// Skip measuring data directories on disk, which can be slow
+        #[arg(long)]
+        no_size: bool,
+    },
+    /// After a checkout was moved or renamed, carry its records and service data to the new path
+    Mv {
+        /// Where the checkout was
+        old: PathBuf,
+        /// Where it is now
+        new: PathBuf,
     },
     /// Publish a bundle directory to an OCI registry
     Publish {
@@ -174,31 +260,157 @@ enum Cmd {
     /// Download mise into stack's data directory unless one is already on PATH
     Setup {
         /// Install stack's pinned mise even when another mise is on PATH
-        #[arg(long)]
+        #[arg(long, conflicts_with = "gc_agent")]
         force: bool,
+        /// Instead of mise: write a launchd agent (macOS) or systemd user unit (Linux) running
+        /// `stack gc --watch`, and print the command that loads it. Loads nothing unless --enable
+        #[arg(long)]
+        gc_agent: bool,
+        /// With --gc-agent: print the file instead of writing it
+        #[arg(long, requires = "gc_agent", conflicts_with_all = ["remove", "enable"])]
+        print: bool,
+        /// With --gc-agent: delete the file (with --enable, unload the agent first)
+        #[arg(long, requires = "gc_agent")]
+        remove: bool,
+        /// With --gc-agent: also run the load (or, with --remove, unload) command
+        #[arg(long, requires = "gc_agent")]
+        enable: bool,
+    },
+    /// Print the environment `stack exec` would give a command, for `eval "$(stack env)"`;
+    /// unverified services' addresses are withheld as exec withholds them
+    Env {
+        /// Shell syntax (default: from $SHELL, else bash)
+        #[arg(long, value_enum)]
+        shell: Option<stack::shell::Shell>,
+    },
+    /// Print a snippet that loads the stack's environment from another tool (direnv's .envrc)
+    Hook {
+        #[arg(value_enum)]
+        tool: stack::shell::Hook,
+    },
+    /// Print a shell completion script
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Check that mise, git and tar are usable and the project compiles
     Doctor,
+    /// List every error code with its meaning, default hint and whether a retry can succeed
+    Errors {
+        /// Print docs/user/errors.md instead
+        #[arg(long)]
+        markdown: bool,
+    },
     /// Serve the stack tools over MCP (stdio)
     Mcp,
+    /// Save, restore, list or remove snapshots of service data, shared by every checkout of
+    /// the project
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Copy this checkout's postgres and redis data (stopping and restarting them if running)
+    Save {
+        name: String,
+        /// Only this service (repeatable); default every postgres and redis service
+        #[arg(long = "service", value_name = "SERVICE")]
+        services: Vec<String>,
+        /// Replace a snapshot of the same name
+        #[arg(long)]
+        force: bool,
+    },
+    /// Replace this checkout's data with a snapshot (stopping and restarting services if running)
+    Restore { name: String },
+    /// List this project's snapshots
+    List,
+    /// Remove a snapshot
+    Rm { name: String },
+}
+
+/// The call this process is answering, for the envelope `emit` and `fail` print.
+static CALL: std::sync::Mutex<Option<Call>> = std::sync::Mutex::new(None);
+
+fn call() -> Call {
+    CALL.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Call::new(command_from_args()))
+}
+
+fn update_call(f: impl FnOnce(&mut Call)) {
+    let mut guard = CALL.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(|| Call::new(command_from_args())));
+}
+
+/// The subcommand named on the command line, for envelopes of calls clap refused: the first
+/// argument (before `--`) that names one. Empty when none does.
+fn command_from_args() -> String {
+    let cmd = Cli::command();
+    let names: Vec<String> = cmd.get_subcommands().map(|s| s.get_name().to_string()).collect();
+    std::env::args_os()
+        .skip(1)
+        .take_while(|a| a != "--")
+        .filter_map(|a| a.into_string().ok())
+        .find(|a| names.contains(a))
+        .unwrap_or_default()
 }
 
 fn main() -> ExitCode {
     stack::setup::use_managed_tools();
-    let cli = match Cli::try_parse() {
+    update_call(|_| {});
+    let matches = match Cli::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(e) => return usage_error(e),
+    };
+    let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => return usage_error(e),
     };
+    update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
     if let Cmd::Mcp = cli.cmd {
         return match mcp::serve() {
-            Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from((128 + signal) as u8)),
+            Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from(contract::child_exit(None, Some(signal.into())))),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
     }
-    let root = match cli.dir.canonicalize() {
-        Ok(root) => root,
-        Err(e) => return fail(cli.json, StackError::new("dir_not_found", format!("{}: {e}", cli.dir.display()))),
+    if let Cmd::Completions { shell } = &cli.cmd {
+        clap_complete::generate(*shell, &mut Cli::command(), "stack", &mut std::io::stdout());
+        return ExitCode::SUCCESS;
+    }
+    if let Cmd::Hook { tool } = &cli.cmd {
+        print!("{}", stack::shell::hook(*tool));
+        return ExitCode::SUCCESS;
+    }
+    if let Cmd::Errors { markdown } = cli.cmd {
+        if markdown {
+            print!("{}", stack::error::registry_markdown());
+            return ExitCode::SUCCESS;
+        }
+        return emit(cli.json, &stack::error::registry_json(), || {
+            for i in stack::error::REGISTRY {
+                println!("{:<22} {}{}", i.code, i.meaning, if i.retryable { " (retryable)" } else { "" });
+                println!("{:<22} hint: {}", "", i.hint);
+            }
+        });
+    }
+    // Without -C, the nearest stack.toml at or above the working directory. Commands then run
+    // in the caller's directory, as they did before when it held stack.toml.
+    let (root, discovery) = match &cli.dir {
+        Some(dir) => match dir.canonicalize() {
+            Ok(root) => (root, None),
+            Err(e) => return fail(cli.json, StackError::new("dir_not_found", format!("{}: {e}", dir.display()))),
+        },
+        None => match stack::discover::from_cwd() {
+            Ok(d) => (d.root.clone(), Some(d)),
+            Err(e) => return fail(cli.json, StackError::new("dir_not_found", format!("working directory: {e}"))),
+        },
     };
+    // `exec` runs its command where it was called from when the project was found above it.
+    let child_dir = discovery.as_ref().map(|d| d.from.clone()).filter(|from| *from != root);
+    // Steps as they start and end, for people at a terminal only.
+    let _progress = (!cli.json && !cli.quiet).then(stack::progress::Terminal::if_tty).flatten().map(stack::progress::observe);
+    update_call(|c| c.dir = Some(root.clone()));
     let ctx = Ctx { root: root.clone(), cache: default_cache_dir(), state: default_state_dir() };
     let opts = |mode, write, reassign_ports| Options {
         root: root.clone(),
@@ -220,7 +432,15 @@ fn main() -> ExitCode {
         }),
         Cmd::Compile { update, locked, reassign_ports } => {
             let mode = if *update { Mode::Update } else if *locked { Mode::Frozen } else { Mode::UseLock };
-            project::compile(&opts(mode, true, *reassign_ports)).map(|mut r| {
+            stack::progress::started("compile");
+            let compiled = project::compile(&opts(mode, true, *reassign_ports));
+            stack::progress::notify(stack::progress::Event {
+                step: "compile",
+                phase: if compiled.is_ok() { stack::progress::Phase::Ok } else { stack::progress::Phase::Failed },
+                code: compiled.as_ref().err().map(|e| e.code),
+                detail: None,
+            });
+            compiled.map(|mut r| {
                 r.attach_skills(&ctx.cache, false);
                 report(cli.json, &r)
             })
@@ -230,16 +450,35 @@ fn main() -> ExitCode {
             r.attach_skills(&ctx.cache, *all_skills);
             report(cli.json, &r)
         }),
-        Cmd::Up { ttl, owner_pid, timeout } => ttl
+        Cmd::Skill { tool, name } => stack::skills::pinned(&root, &ctx.cache, &ctx.state, tool, name.as_deref()).map(|skill| {
+            emit(cli.json, &skill, || {
+                eprintln!("# {} {} skill {} ({})", skill.tool, skill.version, skill.name, skill.entrypoint.display());
+                print!("{}", skill.text);
+            })
+        }),
+        Cmd::Up { ttl, owner_pid, timeout, reassign_ports, no_init, reinit, from_snapshot } => ttl
             .as_deref()
             .map(parse_duration)
             .transpose()
-            .and_then(|ttl_secs| Ok((ttl_secs, startup_timeout(timeout.as_deref())?)))
-            .and_then(|(ttl_secs, timeout)| session::up(&ctx, LeaseOptions { ttl_secs, owner_pid: *owner_pid }, timeout))
+            .and_then(|ttl_secs| {
+                let timeout = startup_timeout(timeout.as_deref())?;
+                Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout))
+            })
+            .and_then(|(ttl_secs, owner_pid, timeout)| {
+                let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone(), from_snapshot: from_snapshot.clone() };
+                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, opts)
+            })
             .map(|r| {
                 emit(cli.json, &r, || {
+                    for p in &r.reassigned_ports {
+                        println!("{:<12} port {} -> {} (reassigned: another program held {})", p.service, p.old, p.new, p.old);
+                    }
                     for c in &r.checks {
                         println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                    }
+                    for (service, o) in &r.init {
+                        let ran = if o.ran.is_empty() { String::new() } else { format!(" (ran {})", o.ran.join(", ")) };
+                        println!("{service:<12} init {}{ran}", o.status);
                     }
                     println!("session {}", r.session.id);
                     for w in &r.warnings {
@@ -268,18 +507,20 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Logs { service, tail, since_start } => session::logs(&ctx, service, *tail as usize, *since_start).map(|r| {
-            emit(cli.json, &r, || {
-                // On stderr, so the lines themselves stay pipeable.
-                if let (Some(at), false) = (r.started_at, r.since_start) {
-                    eprintln!("# current {} process started {}s ago; --since-start shows only its output",
-                        r.service, stack::state::now().saturating_sub(at));
-                }
-                for line in &r.lines {
-                    println!("{line}");
-                }
-            })
-        }),
+        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow } => logs(
+            &ctx,
+            cli.json,
+            stack::logs::Query {
+                services: services.clone(),
+                tail: *tail as usize,
+                since_start: *since_start,
+                since_secs: None,
+                grep: grep.clone(),
+                ignore_case: *ignore_case,
+            },
+            since.as_deref(),
+            *follow,
+        ),
         Cmd::Restart { services, changed, timeout } => startup_timeout(timeout.as_deref())
             .and_then(|timeout| if *changed { session::restart_changed(&ctx, timeout) } else { session::restart(&ctx, services, timeout) })
             .map(|r| {
@@ -300,6 +541,8 @@ fn main() -> ExitCode {
                 }
                 if let Some(why) = &r.lease_expired {
                     println!("lease: {why}");
+                } else if let Some(line) = r.lease.line() {
+                    println!("lease: {line}");
                 }
                 for c in &r.checks {
                     match &c.reason {
@@ -307,11 +550,14 @@ fn main() -> ExitCode {
                         Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
                     }
                 }
+                for (service, state) in r.init.iter().filter(|(_, s)| **s != stack::init_tasks::InitState::None) {
+                    println!("{service:<12} init {state}");
+                }
                 warn_changed(&r.checks);
             });
-            if healthy { code } else { ExitCode::FAILURE }
+            if healthy { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
         }),
-        Cmd::Exec { require, require_all, timeout, secret, cmd } => {
+        Cmd::Exec { require, require_all, timeout, secret, up, ttl, install, cmd } => {
             let req = if *require_all {
                 Require::All
             } else if require.is_empty() {
@@ -319,16 +565,40 @@ fn main() -> ExitCode {
             } else {
                 Require::Only(require.clone())
             };
-            run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
-                session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured })
+            prepare(*up, ttl.as_deref(), *install).and_then(|prepare| {
+                run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
+                    session::plan_prepared(&ctx, prepare, || {
+                        session::plan_exec_with(&ctx, cmd, &req, &Grant { keys: secret.clone(), captured }).map(|mut plan| {
+                            plan.dir = child_dir.clone();
+                            plan
+                        })
+                    })
+                })
             })
         }
-        Cmd::Run { task, timeout, args } => {
-            run_command(&ctx, cli.json, timeout.as_deref(), |captured| session::plan_task(&ctx, task, args, captured))
-        }
-        Cmd::Down { keep_supervisor, stop_supervisor: _ } => session::down_with(&ctx, !*keep_supervisor).map(|r| {
+        Cmd::Run { task, timeout, up, ttl, args } => prepare(*up, ttl.as_deref(), false).and_then(|prepare| {
+            run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
+                session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
+            })
+        }),
+        Cmd::Down { keep_supervisor, stop_supervisor: _, purge } => session::down_purging(&ctx, !*keep_supervisor, *purge).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                if let Some(p) = &r.purge {
+                    for d in &p.data {
+                        println!("{} {}: {}", if d.kept { "kept" } else { "data" }, d.service, d.outcome);
+                    }
+                    if p.data.is_empty() {
+                        println!("no service data recorded for this checkout");
+                    }
+                    let ports: Vec<String> = p.released_ports.iter().map(|r| format!("{} {}", r["service"].as_str().unwrap_or_default(), r["port"])).collect();
+                    if !ports.is_empty() {
+                        println!("released ports: {}", ports.join(", "));
+                    }
+                    if p.released_identities > 0 {
+                        println!("released {} identity token(s)", p.released_identities);
+                    }
+                }
                 if let Some(supervisor) = &r.supervisor {
                     match (supervisor["stopped"].as_bool(), supervisor["reason"].as_str()) {
                         (Some(true), Some(_)) => println!("supervisor not running"),
@@ -343,21 +613,46 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Renew => session::renew(&ctx).map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
-        Cmd::Gc { watch: true, interval, max_passes, reclaim_data } => gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data),
-        Cmd::Gc { reclaim_data, .. } => session::gc_checked(&ctx.state, *reclaim_data).map(|r| {
+        Cmd::Renew { ttl } => ttl
+            .as_deref()
+            .map(parse_duration)
+            .transpose()
+            .and_then(|ttl_secs| session::renew_with(&ctx, ttl_secs))
+            .map(|s| emit(cli.json, &s, || println!("renewed session {}", s.id))),
+        Cmd::Gc { watch: true, interval, max_passes, reclaim_data, stop_orphans, .. } => {
+            gc_watch(&ctx.state, cli.json, interval.as_deref(), *max_passes, *reclaim_data, *stop_orphans)
+        }
+        Cmd::Gc { dry_run: true, reclaim_data, .. } => session::gc_plan(&ctx.state, *reclaim_data).map(|r| emit(cli.json, &r, || print_gc_plan(&r))),
+        Cmd::Gc { reclaim_data, stop_orphans, .. } => session::gc_checked(&ctx.state, *reclaim_data, *stop_orphans).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
+        Cmd::Ps { no_size } => stack::fleet::ps(&ctx.state, !*no_size).map(|r| emit(cli.json, &r, || stack::fleet::print_ps(&r))),
+        Cmd::Mv { old, new } => std::env::current_dir()
+            .map_err(|e| StackError::new("io", format!("current directory: {e}")))
+            .and_then(|cwd| stack::fleet::mv(&ctx.state, &cwd, old, new))
+            .map(|r| emit(cli.json, &r, || stack::fleet::print_mv(&r))),
         Cmd::Publish { bundle, target, force } => publish(bundle, target, *force).map(|r| {
             emit(cli.json, &r, || println!("published {}\nuse: bundle = \"{}\"", r["digest"], r["pinned"].as_str().unwrap_or_default()))
         }),
-        Cmd::Setup { force } => stack::setup::run(*force).map(|r| {
+        Cmd::Setup { gc_agent: true, print, remove, enable, .. } => gc_agent(cli.json, *print, *remove, *enable),
+        Cmd::Setup { force, .. } => stack::setup::run(*force).map(|r| {
             emit(cli.json, &r, || {
                 let how = if r.installed { "installed" } else { "already available" };
                 println!("mise {} {how} at {}", r.version, r.mise.display());
                 println!("ready; run `stack doctor` to check the rest");
             })
         }),
+        Cmd::Env { shell } if cli.json && shell.is_some() => Err(stack::shell::json_conflict()),
+        Cmd::Env { shell } => stack::shell::plan(&ctx).map(|r| {
+            emit(cli.json, &r, || {
+                for w in &r.withheld {
+                    eprintln!("stack: not verified: {} ({}); withheld: {}", w.service, w.reason.as_deref().unwrap_or("unknown"),
+                        if w.vars.is_empty() { "nothing".to_string() } else { w.vars.join(", ") });
+                }
+                print!("{}", stack::shell::render(&r, shell.unwrap_or_else(stack::shell::default_shell)));
+            })
+        }),
+        Cmd::Hook { .. } | Cmd::Completions { .. } => unreachable!("handled above"),
         Cmd::Doctor => stack::doctor::run(&root, &ctx.cache, &ctx.state).map(|checks| {
             emit(cli.json, &checks, || {
                 for c in &checks {
@@ -365,26 +660,27 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Mcp => unreachable!("handled above"),
+        Cmd::Mcp | Cmd::Errors { .. } => unreachable!("handled above"),
+        Cmd::Snapshot { action } => snapshot(&ctx, cli.json, action),
     };
+    // Without -C, a missing stack.toml says where the search looked.
+    let result = result.map_err(|e| match &discovery {
+        Some(d) => d.explain(e),
+        None => e,
+    });
     match result {
         Ok(code) => code,
-        // Like `timeout(1)`, and like `exec --timeout`.
-        Err(e) if e.code == "timed_out" => {
-            fail(cli.json, e);
-            ExitCode::from(124)
-        }
+        // `fail` gives `timed_out` 124, like `timeout(1)` and `exec --timeout`.
         // A start the caller's signal cancelled ends as that signal would have ended it.
         Err(e) if e.code == "cancelled" => {
             let signal = stack::process::passed_on().unwrap_or(15);
             fail(cli.json, e);
-            ExitCode::from((128 + signal) as u8)
+            ExitCode::from(contract::child_exit(None, Some(signal.into())))
         }
         // Like an argument error clap rejects: the same code, a hint, and exit 2.
         Err(e) if e.code == "usage" => {
             let help = format!("run `stack {} --help` for usage", subcommand());
-            fail(cli.json, mcp::with_usage_hint(e, &help));
-            ExitCode::from(2)
+            fail(cli.json, mcp::with_usage_hint(e, &help))
         }
         Err(e) => fail(cli.json, e),
     }
@@ -392,12 +688,108 @@ fn main() -> ExitCode {
 
 /// The subcommand's name, as clap parsed the arguments it already accepted.
 fn subcommand() -> String {
-    use clap::CommandFactory;
-    Cli::command()
-        .try_get_matches_from(std::env::args_os())
-        .ok()
-        .and_then(|m| m.subcommand_name().map(String::from))
-        .unwrap_or_default()
+    call().command
+}
+
+/// `--up`, `--ttl` and `--install` of `exec` and `run`, checked before anything runs.
+fn prepare(up: bool, ttl: Option<&str>, install: bool) -> Result<session::Prepare> {
+    let ttl_secs = ttl.map(parse_duration).transpose()?;
+    Ok(session::Prepare { up, ttl_secs, install })
+}
+
+/// `--owner-pid`: a process ID or `ancestor:<name>`, checked as an argument (exit 2).
+fn owner_arg(value: &str) -> std::result::Result<stack::lease::Owner, String> {
+    stack::lease::Owner::parse(value).map_err(|e| e.message)
+}
+
+/// `stack logs`: one service as before, several (every one when none is named) with each line
+/// prefixed by its service, or following until interrupted.
+fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>, follow: bool) -> Result<ExitCode> {
+    q.since_secs = since.map(parse_duration).transpose()?;
+    if follow {
+        if as_json {
+            return Err(StackError::new("usage", "--follow cannot be combined with --json")
+                .hint("run `stack logs --json` repeatedly, or `stack logs --follow` without --json"));
+        }
+        return stack::logs::follow(ctx, &q, Duration::from_secs(1)).map(|()| ExitCode::SUCCESS);
+    }
+    Ok(match stack::logs::fetch(ctx, &q)? {
+        stack::logs::Logs::One(r) => emit(as_json, &r, || {
+            // On stderr, so the lines themselves stay pipeable.
+            if let (Some(at), false) = (r.started_at, r.since_start) {
+                eprintln!("# current {} process started {}s ago; --since-start shows only its output",
+                    r.service, stack::state::now().saturating_sub(at));
+            }
+            let _ = stack::logs::print_lines(&r.service, None, &r.lines);
+        }),
+        stack::logs::Logs::Many(m) => emit(as_json, &m, || {
+            let width = m.services.keys().chain(m.errors.keys()).map(String::len).max().unwrap_or(0);
+            for (name, e) in &m.errors {
+                eprintln!("# {name}: error[{}]: {}", e.code, e.message);
+            }
+            for (name, r) in &m.services {
+                let _ = stack::logs::print_lines(name, Some(width), &r.lines);
+            }
+        }),
+    })
+}
+
+/// `stack setup --gc-agent`: print, write or remove the agent under `$HOME`.
+fn gc_agent(as_json: bool, print: bool, remove: bool, enable: bool) -> Result<ExitCode> {
+    use stack::gc_agent::Action;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .ok_or_else(|| StackError::new("usage", "HOME is not set to an absolute path").hint("set HOME, then run `stack setup --gc-agent` again"))?;
+    let action = if print { Action::Print } else if remove { Action::Remove } else { Action::Write };
+    let r = stack::gc_agent::run(action, enable, &home)?;
+    Ok(emit(as_json, &r, || match action {
+        Action::Print => print!("{}", r.content.as_deref().unwrap_or_default()),
+        Action::Remove => {
+            println!("{} {}", if r.removed { "removed" } else { "nothing to remove at" }, r.path.display());
+            if r.ran {
+                println!("unloaded with: {}", r.command);
+            } else {
+                println!("if it was loaded, unload it with:\n  {}", r.command);
+            }
+        }
+        Action::Write => {
+            println!("wrote {}", r.path.display());
+            if r.ran {
+                println!("loaded with: {}", r.command);
+            } else {
+                println!("load it with:\n  {}", r.command);
+            }
+        }
+    }))
+}
+
+fn snapshot(ctx: &Ctx, as_json: bool, action: &SnapshotCmd) -> Result<ExitCode> {
+    use stack::snapshot;
+    let steps = |r: &snapshot::SnapshotReport, verb: &str| {
+        println!("{verb} snapshot {} ({})", r.name, r.services.join(", "));
+        if !r.restarted.is_empty() {
+            println!("restarted and verified {}", r.restarted.join(", "));
+        }
+    };
+    match action {
+        SnapshotCmd::Save { name, services, force } => {
+            snapshot::save(ctx, name, services, *force).map(|r| emit(as_json, &r, || steps(&r, "saved")))
+        }
+        SnapshotCmd::Restore { name } => snapshot::restore(ctx, name).map(|r| emit(as_json, &r, || steps(&r, "restored"))),
+        SnapshotCmd::List => snapshot::list(ctx).map(|r| {
+            emit(as_json, &r, || {
+                for m in &r.snapshots {
+                    let services: Vec<String> = m.services.iter().map(|(n, s)| format!("{n} {} {} init {}", s.preset, s.version, s.init)).collect();
+                    println!("{:<20} {}  from {}", m.name, services.join("; "), m.source.display());
+                }
+                if r.snapshots.is_empty() {
+                    println!("no snapshots for this project");
+                }
+            })
+        }),
+        SnapshotCmd::Rm { name } => snapshot::rm(ctx, name).map(|r| emit(as_json, &r, || println!("removed snapshot {name}"))),
+    }
 }
 
 /// `--timeout` of `up` and `restart`: at least one second, 10 minutes when omitted.
@@ -406,6 +798,34 @@ fn startup_timeout(timeout: Option<&str>) -> Result<Duration> {
         None => Ok(session::DEFAULT_STARTUP_TIMEOUT),
         Some(0) => Err(StackError::new("usage", "--timeout must be at least 1s")),
         Some(secs) => Ok(Duration::from_secs(secs)),
+    }
+}
+
+fn print_gc_plan(plan: &session::GcDryRun) {
+    for p in &plan.would_reclaim {
+        let busy = if p.busy { ", busy: a command is running" } else { "" };
+        println!("{}: {} (would {}{busy})", p.project.display(), p.reason, p.action.replace('_', " "));
+        for s in &p.services {
+            let pid = s.pid.map(|pid| format!(" pid {pid}{}", if s.pid_alive == Some(true) { " (alive)" } else { "" })).unwrap_or_default();
+            println!("  {} port {}{pid}", s.service, s.port);
+        }
+    }
+    for d in &plan.deleted_checkouts {
+        let after = if d.after_session { " (once its session is reclaimed)" } else { "" };
+        println!("{}: deleted checkout{after}", d.project.display());
+        for p in &d.ports {
+            println!("  {} port {} would be released", p.service, p.port);
+        }
+        for data in &d.data {
+            let what = if data.action == "remove_if_safe" { "would be removed if safe" } else { "would be reported and kept" };
+            println!("  {} data {} {what}", data.service, data.dir.display());
+        }
+    }
+    for w in &plan.warnings {
+        eprintln!("warning: {w}");
+    }
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() {
+        println!("nothing to reclaim");
     }
 }
 
@@ -429,7 +849,7 @@ fn print_gc(entries: &[session::GcEntry]) {
 /// Foreground periodic collection. Each pass is reported as it completes (one JSON object per
 /// line with --json). A failing pass is reported and retried at the next interval; the exit
 /// code after --max-passes reflects the last pass.
-fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>, reclaim_data: bool) -> Result<ExitCode> {
+fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Option<u64>, reclaim_data: bool, stop_orphans: bool) -> Result<ExitCode> {
     let interval = interval.map(parse_duration).transpose()?.unwrap_or(60);
     if interval == 0 {
         return Err(StackError::new("usage", "--interval must be at least 1s"));
@@ -437,12 +857,19 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
     let mut pass = 0u64;
     loop {
         pass += 1;
-        let result = session::gc_checked(state, reclaim_data);
+        let mut this = call();
+        this.started = std::time::Instant::now();
+        let result = session::gc_checked(state, reclaim_data, stop_orphans);
         let ok = result.is_ok();
         if as_json {
             let line = match &result {
-                Ok(entries) => json!({ "ok": true, "data": { "pass": pass, "at": stack::state::now(), "reclaimed": entries } }),
-                Err(e) => json!({ "ok": false, "error": e, "pass": pass, "at": stack::state::now() }),
+                Ok(entries) => this.success(json!({ "pass": pass, "at": stack::state::now(), "reclaimed": entries })),
+                Err(e) => {
+                    let mut line = this.failure(e);
+                    line["pass"] = json!(pass);
+                    line["at"] = json!(stack::state::now());
+                    line
+                }
             };
             println!("{line}");
         } else {
@@ -455,7 +882,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
         use std::io::Write;
         let _ = std::io::stdout().flush();
         if max_passes.is_some_and(|max| pass >= max) {
-            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(contract::exit::ERROR) });
         }
         std::thread::sleep(Duration::from_secs(interval));
     }
@@ -463,7 +890,7 @@ fn gc_watch(state: &Path, as_json: bool, interval: Option<&str>, max_passes: Opt
 
 fn emit<T: Serialize>(as_json: bool, value: &T, human: impl FnOnce()) -> ExitCode {
     if as_json {
-        println!("{}", json!({ "ok": true, "data": value }));
+        println!("{}", call().success(serde_json::to_value(value).expect("results serialize")));
     } else {
         human();
     }
@@ -517,6 +944,9 @@ fn report(as_json: bool, r: &Report) -> ExitCode {
         }
         for (name, port) in &r.ports {
             println!("port {name} = {port}");
+        }
+        for (name, e) in &r.init {
+            println!("init {name} = [{}] ({})", e.value.join(", "), e.origin);
         }
         for o in &s.overrides {
             let replaced = if o.replaced.is_empty() { "nothing".into() } else { o.replaced.join(", ") };
@@ -596,6 +1026,13 @@ fn warn_changed(checks: &[session::Check]) {
 }
 
 fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result<ExitCode> {
+    for step in &plan.prepared {
+        match step["step"].as_str() {
+            Some("up") => eprintln!("stack: ran `stack up` first ({})", step["reason"].as_str().unwrap_or("unknown")),
+            Some("install") => eprintln!("stack: installed missing pins first: {}", step["missing"]),
+            _ => {}
+        }
+    }
     warn_unverified(&plan.checks);
     warn_changed(&plan.checks);
     for warning in &plan.secret_warnings {
@@ -605,7 +1042,7 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     for var in &plan.removed {
         command.env_remove(var);
     }
-    command.args(&plan.args).envs(&plan.env).current_dir(&ctx.root);
+    command.args(&plan.args).envs(&plan.env).current_dir(plan.dir.as_deref().unwrap_or(&ctx.root));
     let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
     let code = match timeout {
         None => {
@@ -619,12 +1056,12 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
             let (code, timed_out) = stack::process::run_with_deadline(&mut command, stack::process::bounded(timeout)).map_err(start_error)?;
             if timed_out {
                 eprintln!("stack: command did not finish within {}s and was killed", timeout.as_secs());
-                return Ok(ExitCode::from(124));
+                return Ok(ExitCode::from(contract::exit::TIMED_OUT));
             }
             code
         }
     };
-    Ok(ExitCode::from(code.unwrap_or(1).clamp(0, 255) as u8))
+    Ok(ExitCode::from(contract::child_exit(code.map(i64::from), None)))
 }
 
 /// One JSON object on stdout: the command's bounded output and exit code, never its raw stream.
@@ -634,12 +1071,12 @@ fn exec_json(ctx: &Ctx, mut plan: session::ExecPlan, timeout: Option<Duration>) 
     let timeout = timeout.unwrap_or(Duration::from_secs(365 * 24 * 3600));
     let result = mcp::run_and_finish(ctx, &mut plan, timeout)?;
     if result["timed_out"] == true {
-        println!("{}", json!({ "ok": false, "error": mcp::timed_out(timeout, result, "raise --timeout") }));
-        return Ok(ExitCode::from(124));
+        println!("{}", call().failure(&mcp::timed_out(timeout, result, "raise --timeout")));
+        return Ok(ExitCode::from(contract::exit::TIMED_OUT));
     }
     // Like a shell: a command ended by a signal reports 128 + its number.
-    let code = result["exit_code"].as_i64().or_else(|| result["signal"].as_i64().map(|s| 128 + s)).unwrap_or(1).clamp(0, 255) as u8;
-    println!("{}", json!({ "ok": true, "data": result }));
+    let code = contract::child_exit(result["exit_code"].as_i64(), result["signal"].as_i64());
+    println!("{}", call().success(result));
     Ok(ExitCode::from(code))
 }
 
@@ -676,8 +1113,7 @@ fn usage_error(e: clap::Error) -> ExitCode {
         e.exit();
     }
     let (message, hint) = usage_text(&e.render().to_string());
-    fail(true, StackError::new("usage", message).hint(hint));
-    ExitCode::from(2)
+    fail(true, StackError::new("usage", message).hint(hint))
 }
 
 /// clap's rendered error as one message and a hint: the error with the lines that continue it
@@ -706,19 +1142,20 @@ fn usage_text(rendered: &str) -> (String, String) {
     (message, hint.join("; "))
 }
 
+/// Report `e` and return its exit code: 2 for `usage`, 124 for `timed_out`, 70 otherwise.
 fn fail(as_json: bool, e: StackError) -> ExitCode {
     if as_json {
-        println!("{}", json!({ "ok": false, "error": e }));
+        println!("{}", call().failure(&e));
     } else {
         print_error(&e);
     }
-    ExitCode::FAILURE
+    ExitCode::from(contract::error_exit(&e))
 }
 
 /// An error for people, on stderr: the message, then the hint and details that say what to do.
 fn print_error(e: &StackError) {
     eprintln!("error[{}]: {}", e.code, e.message);
-    if let Some(hint) = &e.hint {
+    if let Some(hint) = e.effective_hint() {
         eprintln!("  hint: {hint}");
     }
     for d in &e.details {
