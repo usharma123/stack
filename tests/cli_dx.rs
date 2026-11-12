@@ -198,7 +198,6 @@ fn logs_of_every_service_are_prefixed_filtered_and_split_per_service() {
 #[test]
 fn mcp_logs_of_every_service_filtered() {
     let fixture = Fixture::new(TWO);
-    fixture.ok(&["install"]);
     fs::write(fixture.dir.path().join("logs-web.txt"), "a\nboom\n").unwrap();
     fs::write(fixture.dir.path().join("logs-worker.txt"), "b\n").unwrap();
     let app = fixture.app();
