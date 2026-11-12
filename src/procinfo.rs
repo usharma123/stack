@@ -368,7 +368,10 @@ mod tests {
     fn a_child_started_now_has_a_start_time_now() {
         let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
         let before = now();
-        let mut child = child();
+        // Its own marker: another test counts the children carrying the default one.
+        let mut child = child_with(|c| {
+            c.env("STACK_PROCINFO_TEST", "started");
+        });
         let started = process(child.id()).and_then(|p| p.started_unix_ms());
         child.kill().unwrap();
         child.wait().unwrap();
