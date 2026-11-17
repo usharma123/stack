@@ -233,9 +233,10 @@ fn a_gc_problem_is_a_warning_of_up_never_its_failure() {
     assert_eq!(gc["status"], "warning", "{gc}");
     assert!(gc["detail"]["warnings"][0].as_str().unwrap().contains("broken.json"), "{gc}");
     assert!(up["data"]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().starts_with("gc: ")), "{up}");
-    // The standalone collector still reports it.
+    // The standalone collector still reports it, as a checkout it left alone.
     let (ok, result) = fixture.gc(&[]);
-    assert!(!ok && result["error"]["code"] == "state_invalid", "{result}");
+    assert!(!ok && result["error"]["code"] == "gc_incomplete", "{result}");
+    assert_eq!(result["error"]["details"][0]["reason"], "session record unreadable", "{result}");
 }
 
 #[test]

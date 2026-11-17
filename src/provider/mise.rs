@@ -311,6 +311,27 @@ pub fn require(root: &Path, requirements: &[Requirement]) -> Result<Option<CalVe
     Ok(Some(version))
 }
 
+/// [`require`], with the release Stack recorded for this exact mise binary in `state` when
+/// there is one (see [`super::env_cache::recorded_version`]), and recording what it asked.
+pub fn require_in(state: &Path, root: &Path, requirements: &[Requirement]) -> Result<Option<CalVer>> {
+    if requirements.is_empty() {
+        return Ok(None);
+    }
+    let caller = super::env_cache::Caller::current();
+    let recorded = super::env_cache::recorded_version(&caller, state).and_then(|v| CalVer::parse(&v));
+    let version = match recorded {
+        Some(version) => version,
+        None => {
+            let before = super::env_cache::version_identity(&caller);
+            let version = provider_version(root)?;
+            super::env_cache::record_version(&caller, state, before.as_deref(), &version.to_string());
+            version
+        }
+    };
+    check_requirements(version, requirements)?;
+    Ok(Some(version))
+}
+
 /// One version on one line; anything else is not an answer stack can lock.
 pub fn parse_resolved(stdout: &str) -> Option<String> {
     let lines: Vec<&str> = stdout.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
@@ -533,7 +554,7 @@ pub use crate::supervisor::DaemonStatus;
 
 /// Inherited provider settings may redefine aliases, backends or the config search path.
 /// Keep storage and network credentials, but reserve configuration selection to Stack.
-fn config_key(key: &str) -> bool {
+pub(crate) fn config_key(key: &str) -> bool {
     (key.starts_with("MISE_") && !matches!(key,
         "MISE_DATA_DIR" | "MISE_CACHE_DIR" | "MISE_STATE_DIR" | "MISE_GITHUB_TOKEN"))
         || key.starts_with("__MISE")
@@ -946,14 +967,71 @@ pub fn refusals(text: &str) -> Vec<Refusal> {
     out
 }
 
-/// The environment mise would give a command: tools on PATH, env, service connection vars.
-pub fn env(root: &Path) -> Result<IndexMap<String, String>> {
+/// `mise env --json` as mise printed it: the environment mise would give a command (tools on
+/// PATH, env, service connection vars). Commands get it through [`provide`].
+fn env_raw(root: &Path) -> Result<IndexMap<String, String>> {
     let out = checked(root, &["env", "--json"], "provider_failed")?;
-    let mut env: IndexMap<String, String> = serde_json::from_slice(&out.stdout)
-        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise env --json` output: {e}")))?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| StackError::new("provider_failed", format!("unexpected `mise env --json` output: {e}")))
+}
+
+/// What a command gets of mise's answer: without mise's own selection variables, with Stack's.
+fn finish_env(root: &Path, mut env: IndexMap<String, String>) -> IndexMap<String, String> {
     env.retain(|key, _| !config_key(key));
     env.extend(config_env(root));
-    Ok(env)
+    env
+}
+
+/// The environment mise gives a command in `root` (see [`env_raw`] and [`finish_env`]) and
+/// which of `pins` are not installed (as [`scratch::not_installed`]), from the answer Stack
+/// kept when it is current (see [`super::env_cache`]); otherwise mise is asked both, at once,
+/// and the answer kept when it can be. `state` is Stack's state directory, `cache` its cache
+/// (for the scratch root).
+pub fn provide(state: &Path, cache: &Path, root: &Path, pins: &[Pin]) -> (Result<IndexMap<String, String>>, Result<Vec<Pin>>) {
+    let (env, missing) = provide_some(state, cache, root, pins, true, true);
+    (env.expect("asked"), missing.expect("asked"))
+}
+
+/// [`provide`] when only the environment is needed: the installed releases are asked too only
+/// when the answer could be kept.
+pub fn provide_env(state: &Path, cache: &Path, root: &Path, pins: &[Pin]) -> Result<IndexMap<String, String>> {
+    provide_some(state, cache, root, pins, true, false).0.expect("asked")
+}
+
+/// [`provide`] when only the missing pins are needed: the environment is asked too only when
+/// the answer could be kept.
+pub fn provide_missing(state: &Path, cache: &Path, root: &Path, pins: &[Pin]) -> Result<Vec<Pin>> {
+    provide_some(state, cache, root, pins, false, true).1.expect("asked")
+}
+
+type Provided = (Option<Result<IndexMap<String, String>>>, Option<Result<Vec<Pin>>>);
+
+fn provide_some(state: &Path, cache: &Path, root: &Path, pins: &[Pin], want_env: bool, want_missing: bool) -> Provided {
+    let caller = super::env_cache::Caller::current();
+    let pending = match super::env_cache::lookup(&caller, state, root, pins) {
+        Ok(env) => return (Some(Ok(finish_env(root, env))), Some(Ok(Vec::new()))),
+        Err(pending) => pending,
+    };
+    // Both answers are needed to keep one.
+    let keep = pending.keepable();
+    let (ask_env, ask_missing) = (want_env || keep, want_missing || keep);
+    let (raw, installed) = std::thread::scope(|scope| {
+        let bound = crate::process::inherit();
+        let installed = ask_missing.then(|| {
+            scope.spawn(move || {
+                let _deadline = bound.enter();
+                super::scratch::installed(cache, pins)
+            })
+        });
+        let raw = ask_env.then(|| env_raw(root));
+        (raw, installed.map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))))
+    });
+    if let (Some(Ok(env)), Some(Ok(found))) = (&raw, &installed) {
+        if found.missing.is_empty() {
+            super::env_cache::remember(&caller, state, root, pins, pending, env, &found.paths);
+        }
+    }
+    (raw.map(|r| r.map(|env| finish_env(root, env))), installed.map(|r| r.map(|found| found.missing)))
 }
 
 /// Whether mise expands `$VAR` in `[env]` values after rendering their templates (its

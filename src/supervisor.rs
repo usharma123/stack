@@ -149,6 +149,13 @@ pub struct State {
     pub applied: u64,
     #[serde(default)]
     pub services: IndexMap<String, Instance>,
+    /// The checkout this record is of, as the spec it acted on named it (path and token), so a
+    /// read of this one file says whose processes it names (see [`shutdown_accounted`]).
+    /// Absent in records Stack 0.1.23's supervisor wrote, which are then no evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// A process by pid, start time (see [`procinfo::Process::started`]) and boot (see
@@ -278,12 +285,20 @@ pub fn alive(state: &State) -> bool {
 /// Replace `path` with `bytes` in one rename. Not synced: a crash loses at most the last write
 /// of a file that describes processes, which a crash ends anyway.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    stage(path, bytes)?.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// A temporary file beside `path` holding all of `bytes`, readable by its owner only (the mode
+/// set on the file itself, never on `path` after it is published), ready to rename over it.
+fn stage(path: &Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
+    use std::os::unix::fs::PermissionsExt;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(bytes)?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    tmp.as_file().set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(tmp)
 }
 
 /// What the supervisor in `dir` reports for each service, with a status for every service of
@@ -461,7 +476,6 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
     spec.revision = spec.revision.max(state.applied) + 1;
     let bytes = serde_json::to_vec_pretty(&spec).expect("spec serializes");
     write_atomic(&spec_path(dir), &bytes).map_err(|e| io_error(spec_path(dir).display(), e))?;
-    restrict(&spec_path(dir));
     let mut spawned_at = None;
     if !signal_supervisor(&state, libc::SIGHUP) {
         let left = recover(&state, spec.token.as_deref());
@@ -470,7 +484,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
         }
         if spec.shutdown {
             // Nothing to start: record that the dead supervisor's services are gone.
-            let done = State { supervisor: None, applied: spec.revision, services: settled(&state.services) };
+            let done = State { supervisor: None, applied: spec.revision, services: settled(&state.services), project: spec.project.clone(), token: spec.token.clone() };
             write_state(dir, &done).map_err(|e| io_error(state_path(dir).display(), e))?;
             return Ok(done);
         }
@@ -495,7 +509,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
                 return Err(unconfirmed(left));
             }
             if spec.shutdown {
-                let done = State { supervisor: None, applied: spec.revision, services: settled(&now.services) };
+                let done = State { supervisor: None, applied: spec.revision, services: settled(&now.services), project: spec.project.clone(), token: spec.token.clone() };
                 write_state(dir, &done).map_err(|e| io_error(state_path(dir).display(), e))?;
                 return Ok(done);
             }
@@ -542,11 +556,6 @@ fn write_state(dir: &Path, state: &State) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The spec and state are the services' environment: readable by their owner only.
-fn restrict(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
 
 /// Make `specs` the services' definitions and run `names` (others keep running, or not, as they
 /// were). Returns once the supervisor spawned them.
@@ -581,6 +590,193 @@ pub fn stop(dir: &Path, names: &[String]) -> Result<()> {
     wait_gone(dir, Some(names))
 }
 
+/// The services `spec` ever asked to run (wanted now, or started at some point): what a
+/// `state.json` must give an account of (see [`accounts_for`]).
+pub fn asked_to_run(spec: &Spec) -> Vec<String> {
+    spec.services.iter().filter(|(_, s)| s.want || s.start_seq > 0).map(|(n, _)| n.clone()).collect()
+}
+
+/// Whether `state` is affirmative evidence of what became of every service in `asked` (see
+/// [`asked_to_run`]) under `spec`: it acknowledged a request (`applied` at least 1) and none
+/// the spec never made (`applied` at most its revision), it records each of those services,
+/// and every process it names (the supervisor's and each service's) carries the boot it ran
+/// in. A `state.json` that only parses (`{}`, every field defaulted) is not evidence. Why not,
+/// when it is not.
+pub fn accounts_for(spec: &Spec, state: &State, asked: &[String]) -> std::result::Result<(), String> {
+    if state.applied == 0 {
+        return Err("its state.json records no request the supervisor acted on".into());
+    }
+    if state.applied > spec.revision {
+        return Err(format!("its state.json acknowledges request {} of a spec that made {}", state.applied, spec.revision));
+    }
+    let missing: Vec<&str> = asked.iter().filter(|n| !state.services.contains_key(*n)).map(String::as_str).collect();
+    if !missing.is_empty() {
+        return Err(format!("its state.json records nothing of {}", missing.join(", ")));
+    }
+    let processes = state.supervisor.iter().chain(state.services.values().filter_map(|i| i.process.as_ref()));
+    if processes.into_iter().any(|p| p.boot.is_none()) {
+        return Err("its state.json names a process without the boot it ran in".into());
+    }
+    Ok(())
+}
+
+/// The checkout a recovering `down` expects a supervisor record to be of, and the services that
+/// record must account for (see [`accounts_for`]).
+#[derive(Debug, Clone)]
+pub struct Expected<'a> {
+    pub project: &'a Path,
+    pub token: &'a str,
+    pub asked: &'a [String],
+}
+
+/// [`shutdown`] for a checkout whose own session record is lost (`stack down` recovering it):
+/// only on the evidence of [`accounts_for`] in a record of exactly the `expected` checkout (its
+/// `spec.json` naming that path and token), before the shutdown is written, when it is written,
+/// and on every look while waiting; strays are looked for by the expected token, never by one
+/// read back. A `spec.json` or `state.json` that goes missing, cannot be read, names another
+/// checkout or stops being that evidence is `state_invalid`: an empty list of live processes
+/// then proves nothing.
+pub fn shutdown_accounted(dir: &Path, expected: &Expected) -> Result<()> {
+    // Neither a check and the write after it nor a check and the signal after it can be made
+    // atomic against a program that replaces files in Stack's own state directory. What this
+    // does instead: every state it acts on identifies itself (its own `project` and `token`)
+    // in the same read that is acted on; every write is staged completely, mode included, in a
+    // temporary file, and only then is the file it replaces read again (the spec must still be
+    // the very file checked, the state must name this checkout), with nothing but the rename
+    // after that check; nothing is chmod'ed by name after publishing; and nothing is ever
+    // signalled or written on the strength of a state that does not name this checkout. The
+    // window left is exactly the instant between that check and the rename.
+    seam("evidence");
+    evidence(dir, expected)?;
+    let (mut spec, checked) = read_spec_identified(dir)?;
+    ours(dir, &spec, expected).map_err(|why| not_evidence(dir, why))?;
+    seam("after_spec_check");
+    // The state the shutdown and the signal are decided from, read once and checked.
+    let state = identified_state(dir, expected)?;
+    accounts_for(&spec, &state, expected.asked).map_err(|why| not_evidence(dir, why))?;
+    spec.shutdown = true;
+    spec.services.values_mut().for_each(|s| s.want = false);
+    spec.revision = spec.revision.max(state.applied) + 1;
+    // Staged completely first (mode included); then the spec about to be replaced is read
+    // again, and must be the same file and still this checkout's; then only the rename.
+    let path = spec_path(dir);
+    let bytes = serde_json::to_vec_pretty(&spec).expect("spec serializes");
+    let staged = stage(&path, &bytes).map_err(|e| io_error(path.display(), e))?;
+    seam("spec_staged");
+    let (again, now) = read_spec_identified(dir)?;
+    if now != checked {
+        return Err(not_evidence(dir, "its spec.json was replaced".into()));
+    }
+    ours(dir, &again, expected).map_err(|why| not_evidence(dir, why))?;
+    staged.persist(&path).map_err(|e| io_error(path.display(), e.error))?;
+    // The pid signalled is the one the checked state names.
+    if !signal_supervisor(&state, libc::SIGHUP) {
+        settle_dead(dir, expected, &state, spec.revision)?;
+    } else {
+        let deadline = Instant::now() + crate::process::bounded(APPLY_TIMEOUT);
+        let mut pause = Duration::from_millis(1);
+        loop {
+            seam("ack_poll");
+            let now = identified_state(dir, expected)?;
+            if now.applied >= spec.revision {
+                break;
+            }
+            if !alive(&now) {
+                settle_dead(dir, expected, &now, spec.revision)?;
+                break;
+            }
+            if crate::process::expired() {
+                return Err(StackError::new("timed_out", "the deadline passed while the service supervisor applied a change"));
+            }
+            if Instant::now() >= deadline {
+                return Err(failed("stop_unconfirmed", format!("the service supervisor in {} did not answer within {}s", dir.display(), APPLY_TIMEOUT.as_secs()), dir));
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(10));
+        }
+    }
+    wait_gone_with(dir, None, Some(expected))
+}
+
+/// For a recovering shutdown whose supervisor is dead (`state`, read and identified): stop what
+/// it left by the expected token, then record its services gone at `revision`, after reading
+/// the state about to be replaced again and finding it still this checkout's.
+fn settle_dead(dir: &Path, expected: &Expected, state: &State, revision: u64) -> Result<()> {
+    let left = recover(state, Some(expected.token));
+    if !left.is_empty() {
+        return Err(unconfirmed(left));
+    }
+    let done = State { supervisor: None, applied: revision, services: settled(&state.services), ..state.clone() };
+    publish_state_checked(dir, expected, &done)
+}
+
+/// Write `state` in a recovering shutdown: staged completely (mode included), then the state
+/// about to be replaced read again and required to name this checkout, then only the rename.
+fn publish_state_checked(dir: &Path, expected: &Expected, state: &State) -> Result<()> {
+    let path = state_path(dir);
+    let bytes = serde_json::to_vec_pretty(state).expect("state serializes");
+    let staged = stage(&path, &bytes).map_err(|e| io_error(path.display(), e))?;
+    seam("state_staged");
+    identified_state(dir, expected)?;
+    staged.persist(&path).map_err(|e| io_error(path.display(), e.error))?;
+    Ok(())
+}
+
+/// `spec.json` and the device and inode of the file it was read from.
+fn read_spec_identified(dir: &Path) -> Result<(Spec, (u64, u64))> {
+    use std::os::unix::fs::MetadataExt;
+    let path = spec_path(dir);
+    let gone = || not_evidence(dir, "its spec.json is gone".into());
+    let mut file = fs::File::open(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { gone() } else { io_error(path.display(), e) })?;
+    let meta = file.metadata().map_err(|e| io_error(path.display(), e))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_error(path.display(), e))?;
+    let spec = serde_json::from_slice(&bytes).map_err(|e| invalid(&path, e))?;
+    Ok((spec, (meta.dev(), meta.ino())))
+}
+
+/// `state.json`, only when it names the `expected` checkout itself.
+fn identified_state(dir: &Path, expected: &Expected) -> Result<State> {
+    let state = read_state(dir)?.ok_or_else(|| not_evidence(dir, "its state.json is gone".into()))?;
+    if state.project.as_deref() != Some(expected.project) || state.token.as_deref() != Some(expected.token) {
+        return Err(not_evidence(dir, format!("its state.json in {} does not name this checkout", dir.display())));
+    }
+    Ok(state)
+}
+
+/// What a recovering shutdown checks at each named point; a test can act there.
+fn seam(_at: &'static str) {
+    #[cfg(test)]
+    tests::at_evidence_seam(_at);
+}
+
+fn not_evidence(dir: &Path, why: String) -> StackError {
+    StackError::new("state_invalid", format!("the supervisor record in {} is not evidence of what runs: {why}", dir.display()))
+        .hint("nothing was stopped on its word and every record was kept: check what may still run for this checkout and stop it yourself")
+}
+
+/// Whether `spec` is of the `expected` checkout: its path and its token.
+fn ours(dir: &Path, spec: &Spec, expected: &Expected) -> std::result::Result<(), String> {
+    if spec.project.as_deref() != Some(expected.project) || spec.token.as_deref() != Some(expected.token) {
+        return Err(format!("its spec.json in {} is not this checkout's", dir.display()));
+    }
+    Ok(())
+}
+
+/// The state `dir` records, when it is [`accounts_for`] evidence in a record of the `expected`
+/// checkout; `state_invalid` otherwise.
+fn evidence(dir: &Path, expected: &Expected) -> Result<State> {
+    let lost = |why: String| not_evidence(dir, why);
+    let spec = read_spec(dir)?.ok_or_else(|| lost("its spec.json is gone".into()))?;
+    ours(dir, &spec, expected).map_err(lost)?;
+    let state = read_state(dir)?.ok_or_else(|| lost("its state.json is gone".into()))?;
+    accounts_for(&spec, &state, expected.asked).map_err(lost)?;
+    if state.project.as_deref() != Some(expected.project) || state.token.as_deref() != Some(expected.token) {
+        return Err(lost(format!("its state.json in {} does not name this checkout", dir.display())));
+    }
+    Ok(state)
+}
+
 /// Stop every service and the supervisor, and wait until all of them are gone.
 pub fn shutdown(dir: &Path) -> Result<()> {
     if read_spec(dir)?.is_none() && read_state(dir)?.is_none() {
@@ -596,10 +792,22 @@ pub fn shutdown(dir: &Path) -> Result<()> {
 /// Wait until the named services' processes (every one's, and the supervisor, with `None`)
 /// are gone. What a supervisor that died meanwhile left is stopped here.
 fn wait_gone(dir: &Path, names: Option<&[String]>) -> Result<()> {
+    wait_gone_with(dir, names, None)
+}
+
+/// [`wait_gone`]; with `accounted`, each look at the state must be evidence of the expected
+/// checkout (see [`shutdown_accounted`]).
+fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expected>) -> Result<()> {
     let deadline = Instant::now() + crate::process::bounded(STOP_WAIT);
     let mut pause = Duration::from_millis(2);
     loop {
-        let state = state_lossy(dir);
+        if accounted.is_some() {
+            seam("wait_poll");
+        }
+        let state = match accounted {
+            Some(expected) => evidence(dir, expected)?,
+            None => state_lossy(dir),
+        };
         let left: Vec<serde_json::Value> = state
             .services
             .iter()
@@ -611,14 +819,21 @@ fn wait_gone(dir: &Path, names: Option<&[String]>) -> Result<()> {
             return Ok(());
         }
         if !alive(&state) {
-            let token = read_spec(dir).ok().flatten().and_then(|s| s.token);
+            // Recovering: the expected token, never what the spec says now.
+            let token = match accounted {
+                Some(expected) => Some(expected.token.to_string()),
+                None => read_spec(dir).ok().flatten().and_then(|s| s.token),
+            };
             let survivors = recover(&state, token.as_deref());
             if !survivors.is_empty() {
                 return Err(unconfirmed(survivors));
             }
             if names.is_none() {
-                write_state(dir, &State { supervisor: None, applied: state.applied, services: settled(&state.services) })
-                    .map_err(|e| io_error(state_path(dir).display(), e))?;
+                let settled_state = State { supervisor: None, applied: state.applied, services: settled(&state.services), ..state.clone() };
+                match accounted {
+                    Some(expected) => publish_state_checked(dir, expected, &settled_state)?,
+                    None => write_state(dir, &settled_state).map_err(|e| io_error(state_path(dir).display(), e))?,
+                }
             }
             return Ok(());
         }
@@ -1175,7 +1390,7 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
         // Manifest order, as commands list them.
         let order: Vec<&String> = spec.services.keys().collect();
         services.sort_by_key(|name, _| order.iter().position(|n| *n == name).unwrap_or(usize::MAX));
-        let state = State { supervisor: if done { None } else { me.clone() }, applied, services };
+        let state = State { supervisor: if done { None } else { me.clone() }, applied, services, project: spec.project.clone(), token: spec.token.clone() };
         if last_written.as_ref() != Some(&state) {
             match write_state(dir, &state) {
                 Ok(()) => {
@@ -1843,6 +2058,226 @@ pub fn legacy_data_dir(root: &Path, service: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::os::unix::process::CommandExt;
+
+    type SeamHook = Box<dyn FnMut(&str)>;
+
+    thread_local! {
+        /// Run at each named point of a recovering shutdown (see `seam`).
+        static EVIDENCE_SEAM: RefCell<Option<SeamHook>> = RefCell::new(None);
+    }
+
+    pub(super) fn at_evidence_seam(at: &'static str) {
+        EVIDENCE_SEAM.with(|seam| {
+            if let Some(hook) = seam.borrow_mut().as_mut() {
+                hook(at);
+            }
+        });
+    }
+
+    /// A spec and state of the checkout at `project` with `token`: `web` asked to run, its
+    /// process (if any) and the supervisor's as given, and the state naming its checkout.
+    fn record(project: &str, token: &str, process: Option<Proc>, supervisor: Option<Proc>, applied: u64) -> (Spec, State) {
+        let service = ServiceSpec {
+            argv: vec!["true".into()],
+            env: IndexMap::new(),
+            cwd: PathBuf::from("/"),
+            port: 20001,
+            ready: Ready::Spawned,
+            stop_signal: libc::SIGTERM,
+            data_dir: None,
+            retries: 0,
+            want: true,
+            start_seq: 1,
+        };
+        let spec = Spec { revision: applied.max(1), shutdown: false, project: Some(project.into()), token: Some(token.into()), services: IndexMap::from([("web".to_string(), service)]) };
+        let instance = Instance {
+            status: if process.is_some() { "running" } else { "stopped" }.into(),
+            group: process.as_ref().map(|p| p.pid),
+            process,
+            port: 20001,
+            data_dir: None,
+            stop_signal: libc::SIGTERM,
+            started_at_ms: 0,
+            exit: None,
+            restarts: 0,
+        };
+        let state = State {
+            supervisor,
+            applied,
+            services: IndexMap::from([("web".to_string(), instance)]),
+            project: Some(project.into()),
+            token: Some(token.into()),
+        };
+        (spec, state)
+    }
+
+    fn write(dir: &Path, (spec, state): &(Spec, State)) {
+        fs::write(spec_path(dir), serde_json::to_vec(spec).unwrap()).unwrap();
+        fs::write(state_path(dir), serde_json::to_vec(state).unwrap()).unwrap();
+    }
+
+    fn files(dir: &Path) -> (Vec<u8>, Vec<u8>) {
+        (fs::read(spec_path(dir)).unwrap(), fs::read(state_path(dir)).unwrap())
+    }
+
+    /// A child in a process group of its own: `sleep`, or one that ignores SIGHUP.
+    fn child(ignore_hup: bool) -> std::process::Child {
+        let script = if ignore_hup { "trap '' HUP; exec sleep 30" } else { "exec sleep 30" };
+        let child = std::process::Command::new("sh").args(["-c", script]).process_group(0).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        child
+    }
+
+    fn stop(mut child: std::process::Child) -> bool {
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        alive
+    }
+
+    fn mine() -> (Vec<String>, PathBuf) {
+        (vec!["web".to_string()], PathBuf::from("/checkouts/mine"))
+    }
+
+    /// Run a recovering shutdown of `/checkouts/mine` with `at` swapping in `foreign`.
+    fn recover_swapping(dir: &Path, at: &'static str, foreign: (Spec, State)) -> Result<()> {
+        let target = dir.to_path_buf();
+        let mut foreign = Some(foreign);
+        EVIDENCE_SEAM.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |point| {
+                if point == at {
+                    if let Some(foreign) = foreign.take() {
+                        write(&target, &foreign);
+                    }
+                }
+            }))
+        });
+        let (asked, project) = mine();
+        let result = shutdown_accounted(dir, &Expected { project: &project, token: "mine-token", asked: &asked });
+        EVIDENCE_SEAM.with(|seam| *seam.borrow_mut() = None);
+        result
+    }
+
+    fn refused(result: Result<()>, at: &str) {
+        let e = result.expect_err(at);
+        assert_eq!(e.code, "state_invalid", "{at}: {e:?}");
+        assert!(e.message.contains("not this checkout's") || e.message.contains("does not name this checkout") || e.message.contains("was replaced"), "{at}: {e:?}");
+    }
+
+    #[test]
+    fn a_recovering_shutdown_never_acts_on_a_record_swapped_in_after_its_spec_check() {
+        // Swapped in after the spec was checked and before the state is read: the other
+        // checkout's live supervisor must not be signalled, nor its files touched.
+        for point in ["evidence", "after_spec_check"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+            let theirs = child(false);
+            let foreign = record("/checkouts/theirs", "their-token", None, Proc::observe(theirs.id()), 1);
+            let result = recover_swapping(dir.path(), point, foreign.clone());
+            let after = files(dir.path());
+            refused(result, point);
+            assert!(stop(theirs), "{point}: the other checkout's supervisor was signalled");
+            write(tempfile::tempdir().unwrap().path(), &foreign);
+            assert_eq!(after, (serde_json::to_vec(&foreign.0).unwrap(), serde_json::to_vec(&foreign.1).unwrap()), "{point}: its files changed");
+        }
+    }
+
+    #[test]
+    fn a_recovering_shutdown_never_writes_over_a_record_swapped_in_while_it_waits_for_the_acknowledgement() {
+        // This checkout's supervisor is alive (it ignores the SIGHUP, so it never acknowledges);
+        // while it is waited for, another checkout's record is put in place: a dead supervisor,
+        // no services running and an older revision, which a settle would overwrite.
+        let dir = tempfile::tempdir().unwrap();
+        let ours = child(true);
+        write(dir.path(), &record("/checkouts/mine", "mine-token", None, Proc::observe(ours.id()), 1));
+        let foreign = record("/checkouts/theirs", "their-token", None, None, 1);
+        let result = recover_swapping(dir.path(), "ack_poll", foreign.clone());
+        let after = files(dir.path());
+        stop(ours);
+        refused(result, "ack_poll");
+        assert_eq!(after, (serde_json::to_vec(&foreign.0).unwrap(), serde_json::to_vec(&foreign.1).unwrap()), "its files changed");
+    }
+
+    #[test]
+    fn a_recovering_shutdown_never_signals_another_checkouts_process_found_while_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &record("/checkouts/mine", "mine-token", Some(Proc { pid: 1, started: 1, boot: Some("an-earlier-boot".into()) }), None, 1));
+        let theirs = child(false);
+        let foreign = record("/checkouts/theirs", "their-token", Proc::observe(theirs.id()), None, 1);
+        let result = recover_swapping(dir.path(), "wait_poll", foreign.clone());
+        let after = files(dir.path());
+        refused(result, "wait_poll");
+        assert!(stop(theirs), "the other checkout's process was signalled");
+        assert_eq!(after, (serde_json::to_vec(&foreign.0).unwrap(), serde_json::to_vec(&foreign.1).unwrap()));
+    }
+
+    /// Replace `path` (a new file, by rename) with `bytes`, mode 0644.
+    fn replace(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        let fresh = path.with_extension("foreign");
+        fs::write(&fresh, bytes).unwrap();
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::rename(&fresh, path).unwrap();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A recovering shutdown whose `point` replaces the file at `path` (`spec.json` or
+    /// `state.json`) with another checkout's while the write is staged.
+    fn replaced_while_staging(point: &'static str, path_of: fn(&Path) -> PathBuf, foreign: Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        // A dead supervisor and a service from an earlier boot: the state write is reached too.
+        write(dir.path(), &record("/checkouts/mine", "mine-token", Some(Proc { pid: 1, started: 1, boot: Some("an-earlier-boot".into()) }), None, 1));
+        let path = path_of(dir.path());
+        let (target, bytes) = (path.clone(), foreign.clone());
+        EVIDENCE_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(move |at| if at == point { replace(&target, &bytes) })));
+        let (asked, project) = mine();
+        let result = shutdown_accounted(dir.path(), &Expected { project: &project, token: "mine-token", asked: &asked });
+        EVIDENCE_SEAM.with(|seam| *seam.borrow_mut() = None);
+        refused(result, point);
+        assert_eq!(fs::read(&path).unwrap(), foreign, "{point}: the replacement was overwritten");
+        assert_eq!(mode(&path), 0o644, "{point}: the replacement's mode was changed");
+        // Nothing staged is left behind as a record.
+        assert!(fs::read_dir(dir.path()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".tmp")));
+    }
+
+    #[test]
+    fn a_destination_replaced_while_the_write_is_staged_is_never_overwritten() {
+        let (spec, state) = record("/checkouts/theirs", "their-token", None, None, 1);
+        replaced_while_staging("spec_staged", spec_path, serde_json::to_vec(&spec).unwrap());
+        replaced_while_staging("state_staged", state_path, serde_json::to_vec(&state).unwrap());
+    }
+
+    #[test]
+    fn a_state_without_the_checkouts_identity_is_no_evidence() {
+        // What Stack 0.1.23's supervisor wrote: everything but the identity.
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, mut state) = record("/checkouts/mine", "mine-token", None, None, 1);
+        state.project = None;
+        state.token = None;
+        write(dir.path(), &(spec, state));
+        let before = files(dir.path());
+        let (asked, project) = mine();
+        let e = shutdown_accounted(dir.path(), &Expected { project: &project, token: "mine-token", asked: &asked }).unwrap_err();
+        assert!(e.code == "state_invalid" && e.message.contains("does not name this checkout"), "{e:?}");
+        assert_eq!(files(dir.path()), before, "a refused recovery wrote");
+    }
+
+    #[test]
+    fn a_recovering_shutdown_of_this_checkouts_record_settles_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &record("/checkouts/mine", "mine-token", Some(Proc { pid: 1, started: 1, boot: Some("an-earlier-boot".into()) }), None, 1));
+        let (asked, project) = mine();
+        shutdown_accounted(dir.path(), &Expected { project: &project, token: "mine-token", asked: &asked }).unwrap();
+        let state = read_state(dir.path()).unwrap().unwrap();
+        assert_eq!((state.project.as_deref(), state.token.as_deref()), (Some(Path::new("/checkouts/mine")), Some("mine-token")));
+        assert!(state.services["web"].process.is_none() && read_spec(dir.path()).unwrap().unwrap().shutdown);
+    }
 
     #[test]
     fn versions_are_read_by_their_major_component() {
@@ -1937,6 +2372,8 @@ mod tests {
             supervisor: Some(live.clone()),
             applied: 1,
             services: [("a".to_string(), instance("running", Some(live.clone()))), ("b".to_string(), instance("running", Some(reused.clone())))].into_iter().collect(),
+            project: None,
+            token: None,
         };
         write_state(dir.path(), &state).unwrap();
         let listed = daemons(dir.path(), &[("c".into(), 20003, None)]);
@@ -1957,7 +2394,7 @@ mod tests {
         for boot in [Some("another-boot".to_string()), None] {
             let elsewhere = Proc { boot, ..live.clone() };
             assert!(!elsewhere.alive());
-            let state = State { supervisor: Some(elsewhere.clone()), applied: 1, services: [("a".to_string(), instance("running", Some(elsewhere)))].into_iter().collect() };
+            let state = State { supervisor: Some(elsewhere.clone()), applied: 1, services: [("a".to_string(), instance("running", Some(elsewhere)))].into_iter().collect(), project: None, token: None };
             write_state(dir.path(), &state).unwrap();
             assert_eq!((daemons(dir.path(), &[])[0].status.as_str(), daemons(dir.path(), &[])[0].pid), ("stopped", None));
             assert!(unresolved(dir.path()).is_empty(), "nothing of another boot is a candidate");

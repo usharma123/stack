@@ -107,8 +107,22 @@ const LS_LIMIT: usize = 4 * 1024 * 1024;
 /// names exactly `pins` (with their options). A pin counts as installed only when mise lists
 /// that exact release as installed; anything mise cannot answer is an error, never "installed".
 pub fn not_installed(cache: &Path, pins: &[Pin]) -> Result<Vec<Pin>> {
+    installed(cache, pins).map(|i| i.missing)
+}
+
+/// What [`installed`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Installed {
+    /// Pins mise does not list as installed.
+    pub missing: Vec<Pin>,
+    /// The install directory mise reports for each installed pin, in the order of the pins.
+    pub paths: Vec<PathBuf>,
+}
+
+/// [`not_installed`], with the install directory mise reports for each pin it lists installed.
+pub fn installed(cache: &Path, pins: &[Pin]) -> Result<Installed> {
     if pins.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Installed::default());
     }
     let failed = |why: String| {
         StackError::new("provider_failed", format!("cannot tell whether the pinned tools are installed: {why}"))
@@ -127,15 +141,17 @@ pub fn not_installed(cache: &Path, pins: &[Pin]) -> Result<Vec<Pin>> {
     }
     let listed: IndexMap<String, Vec<serde_json::Value>> =
         serde_json::from_str(out.stdout.trim()).map_err(|_| failed("`mise ls --json` printed something stack cannot read".into()))?;
-    Ok(pins
-        .iter()
-        .filter(|pin| {
-            !listed.get(&pin.tool).is_some_and(|rows| {
-                rows.iter().any(|r| r["version"].as_str() == Some(pin.spec.version.as_str()) && r["installed"] == true)
-            })
-        })
-        .cloned()
-        .collect())
+    let mut found = Installed::default();
+    for pin in pins {
+        let row = listed.get(&pin.tool).and_then(|rows| {
+            rows.iter().find(|r| r["version"].as_str() == Some(pin.spec.version.as_str()) && r["installed"] == true)
+        });
+        match row {
+            Some(row) => found.paths.extend(row["install_path"].as_str().map(PathBuf::from)),
+            None => found.missing.push(pin.clone()),
+        }
+    }
+    Ok(found)
 }
 
 /// A private provider root, removed on drop with the links mise made to it.

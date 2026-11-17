@@ -13,7 +13,7 @@ use crate::identity;
 use crate::lease::LeaseSummary;
 use crate::ports;
 use crate::session::{self, Session};
-use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json, FileLock};
+use crate::state::{now, pid_alive, project_key, project_lock, write_json, FileLock};
 use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::json;
@@ -42,7 +42,8 @@ pub struct Checkout {
     /// `present`, `missing`, or `replaced` (another directory now has this path).
     pub dir: &'static str,
     /// `running` (every service live), `partial`, `stopped`, `launching`, `recorded` (a session
-    /// without services), or `reserved` (ports, tokens or data recorded, no session).
+    /// without services), `reserved` (ports, tokens or data recorded, no session), or
+    /// `unreadable` (a session record that cannot be read).
     pub state: &'static str,
     pub session: Option<SessionSummary>,
     pub lease: Option<LeaseSummary>,
@@ -52,6 +53,9 @@ pub struct Checkout {
     /// is left, so gc releases its ports and reports its recorded data, which `gc
     /// --reclaim-data` removes where it can confirm it is safe to.
     pub reclaimable: bool,
+    /// Why its session record cannot be read (state `unreadable`): run `stack down` in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +101,8 @@ pub struct Totals {
 /// Every checkout with a session record, port reservations, identity tokens or recorded data.
 pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
     let mut sessions: BTreeMap<PathBuf, Session> = BTreeMap::new();
-    for session in indexed_sessions(state)? {
+    let (indexed, unreadable) = indexed_sessions(state)?;
+    for session in indexed {
         sessions.insert(session.project.clone(), session);
     }
     let reservations = ports::all(state)?;
@@ -107,6 +112,7 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
     paths.extend(reservations.iter().map(|r| r.project.clone()));
     paths.extend(tokens.iter().map(|(p, _)| p.clone()));
     paths.extend(data.iter().map(|e| e.project.clone()));
+    paths.extend(unreadable.keys().cloned());
     paths.sort();
     paths.dedup();
 
@@ -167,7 +173,9 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
             .collect();
         let live = |row: &ServiceRow| row.pid_alive.unwrap_or(row.port_accepting);
         let live_count = services.iter().filter(|r| live(r)).count();
+        let unreadable_record = unreadable.get(&path).cloned();
         let state_name = match session {
+            None if unreadable_record.is_some() => "unreadable",
             None => "reserved",
             Some(s) if s.launching => "launching",
             Some(s) if s.services.is_empty() => "recorded",
@@ -175,8 +183,8 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
             Some(_) if live_count > 0 => "partial",
             Some(_) => "stopped",
         };
-        // As `gc` decides: a missing directory with no session left.
-        let reclaimable = !dir_exists && session.is_none();
+        // As `gc` decides: a missing directory with no session left (an unreadable one is left).
+        let reclaimable = !dir_exists && session.is_none() && unreadable_record.is_none();
         let bytes: u64 = services.iter().filter_map(|r| r.data_bytes).sum();
         totals.checkouts += 1;
         totals.running += usize::from(state_name == "running");
@@ -197,6 +205,7 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
             services,
             identity_tokens: tokens.iter().filter(|(p, _)| *p == path).count(),
             reclaimable,
+            unreadable: unreadable_record,
             path,
         });
     }
@@ -211,23 +220,34 @@ impl ServiceRow {
 
 /// The session index: each readable record. A file another command removes between listing and
 /// reading is skipped.
-fn indexed_sessions(state: &Path) -> Result<Vec<Session>> {
+/// And each checkout (or, when no other record names it, the record) whose session record, the
+/// index's or the project copy, cannot be read, with the record's error.
+fn indexed_sessions(state: &Path) -> Result<(Vec<Session>, IndexMap<PathBuf, String>)> {
     let Ok(entries) = fs::read_dir(state.join("sessions")) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), IndexMap::new()));
     };
     let mut out = Vec::new();
+    let mut unreadable = IndexMap::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let session: Session = read_json(&path)?;
+        // An unreadable record is listed as such; the others are listed as usual.
+        let session = match session::readable_session(state, &path)? {
+            Ok(Some(session)) => session,
+            Ok(None) => continue,
+            Err((checkout, e)) => {
+                unreadable.insert(checkout, e.message);
+                continue;
+            }
+        };
         if session.project.as_os_str().is_empty() {
             continue;
         }
         out.push(session);
     }
-    Ok(out)
+    Ok((out, unreadable))
 }
 
 fn accepting(port: u16) -> bool {
@@ -296,6 +316,9 @@ pub fn print_ps(report: &PsReport) {
     let now = now();
     for c in &report.checkouts {
         let mut line = format!("{}  {}", c.path.display(), c.state);
+        if c.unreadable.is_some() {
+            line.push_str(" (session record cannot be read; run `stack down` in it)");
+        }
         if c.dir != "present" {
             line.push_str(&format!(" (directory {})", c.dir));
         }
@@ -431,8 +454,11 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
     }
     let old_index = session::index_path(state, &old);
     let mirror = new.join(".stack").join("session.json");
-    let mut session: Option<Session> =
-        if old_index.exists() { Some(read_json(&old_index)?) } else { read_json::<Session>(&mirror).ok().filter(|s| s.project == old) };
+    // Either record unreadable refuses the move (see `session::session_record`).
+    let mut session: Option<Session> = match session::session_record(&old_index)? {
+        Some(indexed) => Some(indexed),
+        None => session::session_record(&mirror)?.filter(|s| s.project == old),
+    };
 
     // What `up` recorded for this very directory carries the token it had at `old`.
     let moved_token = checkout::token_as(&old, &new);
@@ -588,7 +614,7 @@ fn resolve_old(state: &Path, old: &Path, new: &Path) -> Result<PathBuf> {
     let reservations = ports::all(state)?;
     let tokens = identity::holders(state)?;
     let data = datadirs::entries(state)?;
-    let mirror: Option<Session> = read_json::<Session>(&new.join(".stack").join("session.json")).ok();
+    let mirror: Option<Session> = session::session_record(&new.join(".stack").join("session.json"))?;
     let recorded = |c: &PathBuf| {
         session::index_path(state, c).exists()
             || reservations.iter().any(|r| r.project == *c)

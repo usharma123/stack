@@ -339,7 +339,7 @@ codes! {
     "start_failed", true, [STATUS], "The supervisor could not start a service.",
         "Read the output in details and `stack logs <service>`, fix the cause, then run `stack up` again.";
     "state_invalid", false, [], "A Stack state file is unreadable or corrupt.",
-        "Delete the state file the message names to reset it, then retry.";
+        "For a session record, run `stack down` in that checkout: it stops what the checkout's supervisor recorded and removes the record once that is confirmed. For other state files, delete the file the message names, then retry.";
     "stop_failed", true, [], "The supervisor could not stop a service.",
         "Retry `stack down`; details carry the supervisor's output.";
     "stop_unconfirmed", true, [], "Services did not stop in time.",

@@ -596,6 +596,12 @@ fn main() -> ExitCode {
         Cmd::Down { keep_supervisor, stop_supervisor: _, purge } => session::down_purging(&ctx, !*keep_supervisor, *purge).map(|r| {
             emit(cli.json, &r, || {
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                for record in &r.removed_unreadable {
+                    println!("removed unreadable session record {}", record.display());
+                }
+                if let Some(checked) = &r.recovery_checked {
+                    println!("checked: {checked}");
+                }
                 if let Some(p) = &r.purge {
                     for d in &p.data {
                         println!("{} {}: {}", if d.kept { "kept" } else { "data" }, d.service, d.outcome);
@@ -822,6 +828,9 @@ fn print_gc_plan(plan: &session::GcDryRun) {
             println!("  {} port {}{pid}", s.service, s.port);
         }
     }
+    for u in &plan.unreadable {
+        println!("{}: {} (left alone; run `stack down` in it)", u.project.display(), u.reason);
+    }
     for d in &plan.deleted_checkouts {
         let after = if d.after_session { " (once its session is reclaimed)" } else { "" };
         println!("{}: deleted checkout{after}", d.project.display());
@@ -836,7 +845,7 @@ fn print_gc_plan(plan: &session::GcDryRun) {
     for w in &plan.warnings {
         eprintln!("warning: {w}");
     }
-    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() {
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() {
         println!("nothing to reclaim");
     }
 }

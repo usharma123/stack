@@ -645,6 +645,27 @@ fn an_expired_lease_is_not_healthy_until_it_is_renewed() {
 }
 
 #[test]
+fn env_renews_the_lease_as_status_does_and_registers_nothing_as_running() {
+    let fixture = Fixture::new();
+    fixture.ok(&["up", "--ttl", "30s"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let session_file = app.join(".stack/session.json");
+    let before = read_value(&session_file);
+    let renewed = before["lease"]["renewed_at"].as_u64().unwrap();
+    while unix_now() <= renewed {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let out = fixture.ok(&["env"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("STACK_SESSION='{}'", before["id"].as_str().unwrap())));
+    let after = read_value(&session_file);
+    assert!(after["lease"]["renewed_at"].as_u64().unwrap() > renewed, "{after}");
+    assert_eq!(after["active_executions"], json!({}));
+    assert!(fs::read_dir(completions(&fixture)).map_or(true, |d| d.count() == 0));
+    assert_eq!(after["id"], before["id"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
 fn a_renewal_made_while_a_finished_command_waits_for_the_lock_is_kept() {
     let fixture = Fixture::new();
     fixture.ok(&["up", "--ttl", "1s"]);
@@ -6676,4 +6697,322 @@ fn a_launched_but_unrecorded_service_is_stopped_by_up_and_replaced() {
     assert!(!pid_alive(first), "the unrecorded process was left running: {up}");
     assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
     fixture.ok(&["down"]);
+}
+
+// ---- unreadable session records ----------------------------------------------------------
+
+fn index_record(fixture: &Fixture) -> std::path::PathBuf {
+    fs::read_dir(fixture.dir.path().join("state/sessions")).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap()
+}
+
+fn supervisor_record_dir(fixture: &Fixture) -> std::path::PathBuf {
+    fs::read_dir(fixture.dir.path().join("state/supervisors")).unwrap().next().unwrap().unwrap().path()
+}
+
+fn running_pid(fixture: &Fixture) -> u32 {
+    fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap()
+}
+
+/// `args` fails `state_invalid`, naming `stack down`.
+fn refused_unreadable(fixture: &Fixture, args: &[&str]) {
+    let mut with_json = vec!["--json"];
+    with_json.extend_from_slice(args);
+    let out = fixture.command(&with_json).output().unwrap();
+    let result = json_result(&out);
+    assert!(!out.status.success(), "{args:?} succeeded: {result}");
+    assert_eq!(result["error"]["code"], "state_invalid", "{args:?}: {result}");
+    assert!(result["error"]["hint"].as_str().unwrap_or_default().contains("stack down"), "{args:?}: {result}");
+}
+
+#[test]
+fn an_unreadable_session_record_stops_every_command_but_down_which_recovers_it() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let pid = running_pid(&fixture);
+    let ports_before = fs::read_to_string(fixture.dir.path().join("state/ports.json")).unwrap();
+    // A machine crash left the index record empty.
+    let index = index_record(&fixture);
+    fs::write(&index, "").unwrap();
+    for args in [&["status"][..], &["exec", "--", "true"], &["env"], &["up"], &["restart"]] {
+        refused_unreadable(&fixture, args);
+    }
+    // Nothing was started beside the running service, or stopped.
+    assert!(pid_alive(pid));
+    assert_eq!(running_pid(&fixture), pid, "another instance was started");
+    // `gc` reports it, and stops, reclaims and releases nothing of it.
+    let out = fixture.command(&["--json", "gc"]).output().unwrap();
+    let gc = json_result(&out);
+    assert_eq!(gc["error"]["code"], "gc_incomplete", "{gc}");
+    assert!(gc["error"]["details"].to_string().contains("session record unreadable"), "{gc}");
+    assert!(gc["error"]["hint"].as_str().unwrap().contains("stack down"), "{gc}");
+    assert!(pid_alive(pid));
+    assert_eq!(fs::read_to_string(&index).unwrap(), "", "gc touched the record");
+    assert_eq!(fs::read_to_string(fixture.dir.path().join("state/ports.json")).unwrap(), ports_before);
+    // `down` stops what the supervisor recorded and only then removes the record.
+    let down = json_result(&fixture.ok(&["--json", "down"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(down["data"]["removed_unreadable"].to_string().contains(index.file_name().unwrap().to_str().unwrap()), "{down}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!pid_alive(pid));
+    assert!(!index.exists());
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!((status["ok"].clone(), status["data"]["session"].clone()), (json!(true), json!(null)), "{status}");
+}
+
+#[test]
+fn an_unreadable_project_copy_is_not_overridden_by_a_readable_index_nor_reclaimed_by_gc() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--ttl", "1s"]);
+    let pid = running_pid(&fixture);
+    let copy = fixture.dir.path().join("app/.stack/session.json");
+    fs::write(&copy, "{\"id\":").unwrap();
+    refused_unreadable(&fixture, &["status"]);
+    // The lease expired: still nothing is reclaimed while the record cannot be read.
+    thread::sleep(Duration::from_millis(2200));
+    let gc = json_result(&fixture.command(&["--json", "gc"]).output().unwrap());
+    assert!(gc["error"]["details"].to_string().contains("session record unreadable"), "{gc}");
+    assert!(pid_alive(pid), "gc stopped a checkout whose record it could not read");
+    assert!(index_record(&fixture).exists());
+    // The pass inside another `up` leaves it alone too (and says so); this checkout's own `up`
+    // refuses.
+    refused_unreadable(&fixture, &["up"]);
+    assert!(pid_alive(pid));
+    fixture.ok(&["down"]);
+    assert!(!copy.exists());
+}
+
+#[test]
+fn down_without_the_supervisors_own_record_of_this_checkout_keeps_everything() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let pid = running_pid(&fixture);
+    let index = index_record(&fixture);
+    fs::write(&index, "").unwrap();
+    let dir = supervisor_record_dir(&fixture);
+    let spec = fs::read(dir.join("spec.json")).unwrap();
+    // Unreadable, then naming another checkout: refused, nothing stopped or removed.
+    fs::write(dir.join("spec.json"), "{").unwrap();
+    let result = json_result(&fixture.command(&["--json", "down"]).output().unwrap());
+    assert_eq!(result["error"]["code"], "state_invalid", "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("nothing was stopped and every record was kept"), "{result}");
+    let mut other: Value = serde_json::from_slice(&spec).unwrap();
+    other["project"] = json!("/elsewhere");
+    fs::write(dir.join("spec.json"), other.to_string()).unwrap();
+    let out = fixture.command(&["--json", "down"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "state_invalid", "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("not this checkout's"), "{result}");
+    assert!(pid_alive(pid));
+    assert!(index.exists() && fs::read(&index).unwrap().is_empty());
+    // With its own record back, `down` recovers.
+    fs::write(dir.join("spec.json"), &spec).unwrap();
+    fixture.ok(&["down"]);
+    assert!(!index.exists());
+}
+
+#[test]
+fn down_recovering_an_unreadable_record_never_signals_a_process_the_supervisor_record_does_not_match() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let service = running_pid(&fixture);
+    let index = index_record(&fixture);
+    fs::write(&index, "").unwrap();
+    // The supervisor dies; its record now names, by pid only, an unrelated process (the
+    // recorded start time is the service's, not this process's).
+    let dir = supervisor_record_dir(&fixture);
+    let mut state: Value = serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
+    let supervisor = state["supervisor"]["pid"].as_u64().unwrap() as i32;
+    unsafe { libc::kill(supervisor, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(supervisor as u32) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    state["services"]["web"]["pid"] = json!(bystander.id());
+    fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let out = fixture.command(&["--json", "down"]).output().unwrap();
+    let bystander_alive = bystander.try_wait().unwrap().is_none();
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    assert!(bystander_alive, "down signalled a process its record did not match: {}", String::from_utf8_lossy(&out.stdout));
+    // The service itself (carrying the checkout's token) was stopped, and only then the record
+    // removed.
+    assert_eq!(json_result(&out)["data"]["confirmed"], true, "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!pid_alive(service));
+    assert!(!index.exists());
+}
+
+/// Up a listening `web`, then empty its index record: the checkout and its record.
+fn unreadable_with_service() -> (Fixture, std::path::PathBuf) {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let index = index_record(&fixture);
+    fs::write(&index, "").unwrap();
+    (fixture, index)
+}
+
+fn edit_state(fixture: &Fixture, edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+    let path = supervisor_record_dir(fixture).join("state.json");
+    let before = fs::read(&path).unwrap();
+    let mut state: Value = serde_json::from_slice(&before).unwrap();
+    edit(&mut state);
+    fs::write(&path, state.to_string()).unwrap();
+    before
+}
+
+fn down_refused(fixture: &Fixture, says: &str) {
+    let result = json_result(&fixture.command(&["--json", "down"]).output().unwrap());
+    assert_eq!(result["error"]["code"], "state_invalid", "{result}");
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(message.contains(says) && message.contains("every record was kept"), "{result}");
+}
+
+#[test]
+fn recovery_needs_a_supervisor_state_that_accounts_for_every_service() {
+    let (fixture, index) = unreadable_with_service();
+    let pid = running_pid(&fixture);
+    let state = supervisor_record_dir(&fixture).join("state.json");
+    // `{}` parses, and is no evidence of anything.
+    let original = fs::read(&state).unwrap();
+    fs::write(&state, "{}").unwrap();
+    down_refused(&fixture, "records no request");
+    // A state that does not record a service the spec names.
+    fs::write(&state, &original).unwrap();
+    edit_state(&fixture, |s| {
+        s["services"].as_object_mut().unwrap().remove("web");
+    });
+    down_refused(&fixture, "records nothing of web");
+    // A process recorded without its boot.
+    fs::write(&state, &original).unwrap();
+    edit_state(&fixture, |s| {
+        s["services"]["web"]["process"].as_object_mut().unwrap().remove("boot");
+    });
+    down_refused(&fixture, "without the boot");
+    assert!(pid_alive(pid), "a refused recovery stopped something");
+    assert!(fs::read(&index).unwrap().is_empty());
+    // With the evidence back, it recovers.
+    fs::write(&state, &original).unwrap();
+    fixture.ok(&["down"]);
+    assert!(!index.exists() && !pid_alive(pid));
+}
+
+#[test]
+fn recovery_after_a_reboot_takes_an_earlier_boots_record_as_proof_its_processes_are_gone() {
+    let (fixture, index) = unreadable_with_service();
+    // The machine went down: nothing of the checkout runs, and the supervisor's record is of
+    // the boot before.
+    let service = running_pid(&fixture);
+    let supervisor = supervisor_pid(&fixture);
+    for pid in [supervisor, service] {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (pid_alive(service) || pid_alive(supervisor)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    edit_state(&fixture, |s| {
+        s["supervisor"]["boot"] = json!("an-earlier-boot");
+        s["services"]["web"]["process"]["boot"] = json!("an-earlier-boot");
+    });
+    let down = json_result(&fixture.ok(&["--json", "down"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!index.exists());
+}
+
+fn supervisor_pid(fixture: &Fixture) -> u32 {
+    let state: Value = serde_json::from_slice(&fs::read(supervisor_record_dir(fixture).join("state.json")).unwrap()).unwrap();
+    state["supervisor"]["pid"].as_u64().unwrap() as u32
+}
+
+#[test]
+fn an_unreadable_project_copy_is_reported_by_gc_and_its_dry_run_alike_before_and_after_expiry() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--ttl", "2s"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    fs::write(app.join(".stack/session.json"), "").unwrap();
+    for _ in ["before expiry", "after expiry"] {
+        let (ok, gc) = fixture.gc(&[]);
+        assert!(!ok && gc["error"]["details"][0]["reason"] == "session record unreadable", "{gc}");
+        assert_eq!(gc["error"]["details"][0]["project"], json!(app), "{gc}");
+        let (ok, plan) = fixture.gc(&["--dry-run"]);
+        assert!(ok, "{plan}");
+        assert_eq!(plan["data"]["would_reclaim"], json!([]), "{plan}");
+        assert_eq!(plan["data"]["unreadable"][0]["project"], json!(app), "{plan}");
+        thread::sleep(Duration::from_millis(2500));
+    }
+    assert!(pid_alive(running_pid(&fixture)));
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn an_unreadable_record_names_its_checkout_where_another_record_does() {
+    let (fixture, index) = unreadable_with_service();
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    // gc and ps name the checkout (from the supervisor's spec and the port registry), not the
+    // record file; ps lists it as unreadable instead of failing.
+    let (_, gc) = fixture.gc(&[]);
+    assert_eq!(gc["error"]["details"][0]["project"], json!(app), "{gc}");
+    assert!(gc["error"]["details"][0]["error"].as_str().unwrap().contains(&format!("checkout {}", app.display())), "{gc}");
+    let ps = json_result(&fixture.ok(&["--json", "ps", "--no-size"]));
+    let row = ps["data"]["checkouts"].as_array().unwrap().iter().find(|c| c["path"] == json!(app)).cloned().unwrap_or_else(|| panic!("{ps}"));
+    assert_eq!(row["state"], "unreadable", "{ps}");
+    assert!(row["unreadable"].as_str().unwrap().contains(index.file_name().unwrap().to_str().unwrap()), "{ps}");
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_tools_only_checkouts_unreadable_record_is_cleared_by_down_and_listed_by_ps() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    fixture.ok(&["up"]);
+    let index = index_record(&fixture);
+    fs::write(&index, "").unwrap();
+    let ps = json_result(&fixture.ok(&["--json", "ps", "--no-size"]));
+    assert!(ps["data"]["checkouts"].as_array().unwrap().iter().any(|c| c["state"] == "unreadable"), "{ps}");
+    // No supervisor ever ran for it and no port is reserved for it: nothing of it can run.
+    assert!(!fixture.dir.path().join("state/supervisors").exists());
+    let down = json_result(&fixture.ok(&["--json", "down"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert_eq!(down["data"]["recovery_checked"], stack::session::TOOLS_ONLY_CHECKED, "{down}");
+    assert!(!index.exists());
+    fixture.ok(&["status", "--json"]);
+}
+
+/// macOS hides the environment of its own binaries: a process of them carrying the checkout's
+/// token is not seen. `down` clears the record, says what it could and could not check, and
+/// signals nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn clearing_a_tools_only_record_says_what_was_checked_and_never_signals_an_unseen_token_carrier() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
+    fixture.ok(&["up"]);
+    let app = fixture.dir.path().join("app").canonicalize().unwrap();
+    let token = stack::checkout::token(&app).unwrap();
+    let mut carrier = Command::new("/bin/sleep").arg("30").env(stack::checkout::TOKEN_VAR, &token).spawn().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    if stack::procinfo::carrying(stack::checkout::TOKEN_VAR, &token).iter().any(|p| p.pid == carrier.id()) {
+        let _ = carrier.kill();
+        let _ = carrier.wait();
+        eprintln!("skipping: this machine shows /bin/sleep's environment");
+        return;
+    }
+    let index = index_record(&fixture);
+    fs::write(&index, "").unwrap();
+    let out = fixture.ok(&["down"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let alive = carrier.try_wait().unwrap().is_none();
+    let _ = carrier.kill();
+    let _ = carrier.wait();
+    assert!(alive, "down signalled a process it could not see");
+    assert!(text.contains(&format!("checked: {}", stack::session::TOOLS_ONLY_CHECKED)), "{text}");
+    assert!(text.contains("a process whose environment cannot be read is not seen") && text.contains("not tracked once the record is lost"), "{text}");
+    assert!(!index.exists());
 }
