@@ -6,7 +6,11 @@
 - **Versions are exact.** Every tool and preset service is locked to an exact release
   (`3.13` → `3.13.16`), so a fresh machine installs the same versions after upstream releases
   more. `up`, `exec` and `status` refuse a missing or stale pin, and `exec` refuses to run
-  when a pinned release is not installed rather than use whatever `PATH` holds.
+  when a pinned release is not installed rather than use whatever `PATH` holds. Stack keeps
+  what mise last answered about a checkout's environment and uses it only while the mise
+  binary, the environment, the generated configuration and lock and every pinned release's
+  install directory are unchanged; installing, removing or reinstalling a release, a new pin
+  or a mise upgrade asks mise again.
 - **Downloads are checksummed.** On every platform `[lock] platforms` lists, a download must
   match the checksum in `stack.lock` (and the signer, for packslip tools), or the install fails
   with `artifact_mismatch`. Not covered: platforms or backends mise cannot lock, npm and Python

@@ -94,7 +94,7 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `snapshot_unsupported` | The service or its data directory cannot be snapshotted (only postgres and redis data in real directories). | Use the service's own dump and restore tools through `stack exec` instead. | no | - |
 | `source_invalid` | A bundle source or publish target is malformed. | Use a valid source, such as path:../b, git+https://...?ref=v1 or oci:<registry>/<repo>:<tag>. | no | - |
 | `start_failed` | The supervisor could not start a service. | Read the output in details and `stack logs <service>`, fix the cause, then run `stack up` again. | yes | `stack status` |
-| `state_invalid` | A Stack state file is unreadable or corrupt. | Delete the state file the message names to reset it, then retry. | no | - |
+| `state_invalid` | A Stack state file is unreadable or corrupt. | For a session record, run `stack down` in that checkout: it stops what the checkout's supervisor recorded and removes the record once that is confirmed. For other state files, delete the file the message names, then retry. | no | - |
 | `stop_failed` | The supervisor could not stop a service. | Retry `stack down`; details carry the supervisor's output. | yes | - |
 | `stop_unconfirmed` | Services did not stop in time. | Retry `stack down` (or `stack restart`); details list the processes still alive. | yes | - |
 | `tag_exists` | The OCI tag already points to different content. | Publish a new tag, or pass --force to move this one. | no | - |

@@ -333,7 +333,8 @@ Stack started under Pitchfork, `logs` asks Pitchfork (`pitchfork logs`) until th
 Prints the environment `stack exec` would give a command right now, as `export` lines for
 `eval "$(stack env)"` (`--shell fish` for fish; the default follows `$SHELL`). It is planned
 exactly like `exec`: pinned tools must be installed, every service is checked, and an
-unverified service's connection variables are poisoned or unset just as `exec` does. A
+unverified service's connection variables are poisoned or unset just as `exec` does. It renews
+a TTL lease as `exec` does, but records no command as running. A
 comment, and a line on stderr, names each unverified service and what was withheld.
 `--json` returns `{env, unset, withheld, skipped}`.
 
@@ -356,6 +357,17 @@ and confirms nothing runs there. Another program listening on one of this checko
 reported under `conflicts` and left alone. A service process the supervisor started for this
 checkout but lost track of (its environment carries the checkout's token) is stopped too,
 listed with `"unrecorded": true`.
+
+A session record that cannot be read (left empty by a machine crash, say) makes every other
+command in the checkout fail `state_invalid`. `down` then stops what the checkout's supervisor
+recorded, with the same checks, and removes the record once that is confirmed
+(`removed_unreadable`). With no supervisor directory there is nothing to stop, and the record
+is cleared when there is no supervisor record, no port reserved for this checkout, and no
+process seen carrying its token (a process whose environment cannot be read is not seen);
+commands started with `stack exec` are not tracked once the record is lost. `down` reports
+exactly that (`recovery_checked`, and a `checked:` line). Without the supervisor's own record of this checkout, or with one that does not
+account for every service, it stops nothing, keeps everything and says so. A record that
+changes while `down` runs is kept and named.
 
 The checkout's supervisor (see [worktrees](worktrees.md#services-and-the-supervisor)) stops each
 service's process group (Postgres with `SIGINT`, the rest with `SIGTERM`, `SIGKILL` 10 seconds
@@ -425,7 +437,12 @@ pass; after `--max-passes`, the exit code is 70 if the last pass failed). Stack 
 agent runner.
 
 `gc` decides from each session's record which ones look expired or belong to a deleted
-checkout, and locks only those. If another command holds one of them, `gc` waits for it.
+checkout, and locks only those. If another command holds one of them, `gc` waits for it. A
+record it cannot read, the index's or the checkout's own copy, is reported (`gc_incomplete`,
+reason `session record unreadable`, naming the checkout where Stack can tell) and nothing of
+that checkout is stopped, reclaimed or released; the other checkouts are handled as usual.
+`--dry-run` lists it under `unreadable` and plans nothing for it; `ps` shows it as
+`unreadable`. Run `stack down` in it.
 
 `--dry-run` reports what `gc` would do and changes nothing: no lock, no supervisor query, no
 record touched, no data directory opened. Each entry under `would_reclaim` has the

@@ -118,6 +118,24 @@ output (mise's answer when no release matches) is an error, not a version.
 - **Verification** happens on every `exec` and `status`, not from the record: supervisor state,
   PID alive, supervisor port equals assigned port, TCP accept, then identity. Postgres and Redis
   connect with the app's own URL and compare the server's data directory to the supervisor's.
+  Stack asks this itself over the wire (`src/wire.rs`): a Postgres protocol 3.0 startup (no
+  `client_encoding`, so the text comes as psql on a pipe receives it) and the simple query
+  `select current_setting('data_directory')`, or Redis `CONFIG GET dir`, and compares the text
+  `psql -Atc` or `redis-cli` would print, exactly as before. A Postgres answer must be what
+  psql accepts: one RowDescription of one column, rows of that width, CommandComplete, then a
+  well-formed ReadyForQuery; notices, parameter changes and notifications between them must be
+  well formed too, and RESP lengths are digits as Redis writes them (no sign, no leading
+  zero). Text that is not UTF-8 is left to psql. The client fallback runs
+  `psql -X`, so `~/.psqlrc` cannot change what it prints. It does so only
+  for a URL naming an IP address and port, a user and database for Postgres, and no password,
+  query or second host, when no client variable could change the connection (`PG*` other than
+  `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` and `PGCONNECT_TIMEOUT`; any `REDISCLI_*`), and
+  only while the server asks for no authentication and, for Postgres, accepts the plain
+  connection (a refusal other than starting up or shutting down may want the SSL or GSS
+  encryption psql tries first). Otherwise `psql` or `redis-cli` from the stack's PATH is run
+  as before. An error, a refusal, a malformed, partial or oversized reply
+  (16 KiB per message, 64 KiB in all) or no complete answer within 5 seconds (3 to connect)
+  fails verification; it never falls back to the client.
   A service with an `identity` probe is `instance` only when the probe, run with the app's
   environment minus every `STACK_IDENTITY_*` variable, prints exactly the checkout's token for
   it. The token is random per checkout and service, kept in machine state like ports, given to
@@ -137,6 +155,42 @@ output (mise's answer when no release matches) is an error, not a version.
   become a URL that names only the invalid host. Only values that name no host (ports, users,
   databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
   turns this into a refusal to run.
+- **Provider environment.** `exec`, `run`, `env`, `status` and `up` need `mise env --json` and
+  whether every pin is installed (`mise ls --json` in a scratch root). Stack keeps the two
+  answers together in `$STACK_STATE_DIR/projects/<checkout key>.provider-env.json` (mode 0600,
+  replaced atomically, the last 8 written, by key; a hit does not move an answer up) and uses
+  them instead of starting mise while nothing they depend on changed
+  (`src/provider/env_cache.rs`). The key is the mise binary (the first `mise` on PATH, links
+  resolved, by path, device, inode, size and modification and change times; a script that runs
+  another file, or an empty or relative PATH entry at or before it, which mise started in the
+  checkout would resolve there, means no key), mise's whole environment as Stack starts it, the
+  checkout's path, the generated configuration and rendered lock by content, whether
+  `.stack/provider-config` is absent or a real empty directory (anything in it, or a link,
+  means no key: settings there can make mise read files nothing covers), and the pins. Each
+  pin's install directory as mise reported it, and the tool directory above it, must be real
+  directories (a link's target could change unseen) and are recorded with every entry directly
+  inside them (name, kind, device, inode, size, times), which must be unchanged. mise's
+  `incomplete` marker (`$MISE_CACHE_DIR/<tool>/<version>/incomplete`) is not recorded: mise
+  replaces the install directory whenever it sets one, which the record sees. An answer is
+  kept only when every pin was installed; when the configuration has no template syntax and no
+  `$` in an `[env]` value; when every configured tool is a pin whose locked backend is not a
+  plugin (asdf, vfox, or one Stack does not know); when every variable mise returned is the
+  configuration's own value or lies under an install directory and every `PATH` entry is the
+  caller's, an install's or a declared `_.path`; when the key was the same after asking; and
+  when every recorded entry last changed at least 2 seconds before mise was asked. The
+  configuration checks run before mise is asked, so a question whose answer would never be
+  kept asks only what the caller needs. The file is used as read: like the session and port
+  records, `$STACK_STATE_DIR` is trusted, and whatever can write it can set the PATH of later
+  commands. Under
+  Stack's isolation mise reads no other configuration file (`mise.toml`, `.mise.toml`,
+  `.tool-versions`, other `conf.d` files and the isolated directory's `config.toml` or
+  `conf.d` were checked against mise 2026.10.3). Anything else asks mise, as before. An install
+  that runs, `down --purge` and `gc` of a deleted checkout drop the file. Any change to mise's
+  environment is another key, so a caller that changes a variable on every call (hyperfine's
+  `HYPERFINE_RANDOMIZED_ENVIRONMENT_OFFSET`) always asks mise. The release `mise version`
+  printed is recorded the same way for the binary it came from (`mise-version.json`), and `up`,
+  `install` and `restart` trust the generated configuration once per content, as `exec`
+  already did (trusting it again before an install that does run).
 - **Secret grants.** Stack resolves grants itself rather than using mise's native task
   secrets, because `exec` computes the environment with `mise env --json` and runs the program
   itself, so a mise-side grant would not reach it. Names are checked at compile and plan time
@@ -209,7 +263,8 @@ output (mise's answer when no release matches) is an error, not a version.
   pid `state.json` records while that pid still has the recorded process start time, or start a
   supervisor when none runs, and wait until `state.json` reports the revision applied. The
   supervisor holds `<dir>/lock` (`flock`) for life, so two never run for one checkout; a second
-  one finds it held and exits. It writes `state.json` atomically: its own pid and start time, and
+  one finds it held and exits. It writes `state.json` atomically: the checkout's path and
+  token (from the spec), its own pid and start time, and
   for each service its status (`starting`, `running`, `stopping`, `stopped`, `failed`), pid,
   process start time, process group, port, data directory and how it last ended. Each service is
   spawned directly (a `run` command through `/bin/sh -c`) in a session and process group of its
@@ -395,8 +450,55 @@ output (mise's answer when no release matches) is an error, not a version.
   (records and logs) and releases the path's reservations and tokens.
 - **Concurrent access.** Compile, renew, execution registration and lifecycle operations share
   a per-project advisory lock released by the kernel on process death. Each JSON write uses a
-  unique temporary file and atomic replacement. The machine session index is authoritative if
-  a crash interrupts updating the project mirror.
+  unique temporary file and atomic replacement. A session record that changes ownership or what
+  was launched is waited for on disk (`up` when not finding the same verified launch running,
+  `restart`, `down`). One where all that changed is executions in progress, a lease renewal or
+  when services were last verified (`exec`, `status`, `env`, and `up` finding the same verified
+  launch running) is not, and a machine crash may leave such a record empty or partial on
+  filesystems that do not flush a file's data before replacing it. A session record (the
+  machine index's or the project copy) that exists but cannot be read or parsed is a state of
+  its own, never no session, an expired or a stale one, and the other copy does not stand in
+  for it: `status`, `exec`, `run`, `env`, `up`, `restart` and the commands that use the record
+  fail `state_invalid`, naming `stack down`, and start nothing; `gc` (and its pass in another
+  checkout's `up`) reports it and stops, reclaims, releases and removes nothing of that
+  checkout (whichever copy is damaged, expired or not), going on with the others; `gc
+  --dry-run` lists it the same way and plans nothing for it; `ps` marks it `unreadable`. Each
+  names the checkout where the supervisor's `spec.json` or the port registry does, else the
+  record. Only `stack down`, under the checkout's lock, recovers it. It reads both copies once
+  (what decides one is unreadable is what any removal is compared with). With the supervisor's
+  own records of exactly that checkout (`spec.json` naming its path and its directory's token,
+  and a `state.json` that acknowledged a request (`applied` at least 1, at most the spec's
+  revision), records every service the spec ever asked to run, and names every process with
+  its boot), it stops what they show as `down` stops anything, each process only while its
+  pid, start time and boot match (a record of an earlier boot names nothing alive, which is
+  how a checkout is recovered after a reboot), and only while the state stays that evidence
+  throughout the wait. Every read of `state.json` in this path must itself name that
+  checkout's path and token (a `state.json` written by Stack 0.1.23's supervisor names none and
+  is no evidence); the supervisor signalled is the one named by a state read that passed that
+  check, and every write of `spec.json` or `state.json` is staged completely in a temporary file
+  (its mode set on that file, never on the path after publishing), then re-reads the file it
+  replaces (the spec must still be the very file checked, the state must name the checkout),
+  with nothing but the rename after that check. A write cannot be made atomic with its check
+  against a program that replaces files in Stack's own state directory; the window left is
+  exactly the instant between that check and the rename, and nothing is signalled on
+  unidentified state. With no supervisor
+  directory at all there is nothing to stop, and the record is cleared when what can be
+  checked holds: no supervisor record, no port reserved for this checkout, no process seen
+  carrying its token (a process whose environment cannot be read is not seen). Commands
+  started with `stack exec` are not tracked once the record is lost. `down` reports exactly
+  that (`recovery_checked`), not that nothing runs. A port reserved, a process seen carrying
+  the token, no token, or a supervisor directory without usable evidence refuses. Either way
+  each copy is moved to a private name beside it that is never read as a record, checked to
+  be the same file with the same bytes, and only then unlinked; one that changed is put back
+  without replacing anything at its path (both kept and named if something took it), and one
+  that appeared is kept and named. Without that evidence, or on a stop it
+  cannot confirm, it fails `state_invalid` and keeps every record, reservation and data
+  directory. Every Stack command writes session records under the checkout's lock, so none
+  races this; another program, or a Stack with another `STACK_STATE_DIR` (whose lock is
+  another file) writing the project copy, is what the comparison guards against. Nothing here
+  claims durability across power loss.
+  The machine session index is authoritative if a crash interrupts updating the project
+  mirror.
 - **MCP execution.** Unix process groups bound command descendants. Output is drained through
   nonblocking pipes with fixed-size tails; neither a full pipe nor a detached descendant can
   extend collection beyond command completion or the deadline.
