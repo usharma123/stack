@@ -159,6 +159,7 @@ fn assign_outside(
     let (file, lock) = paths(state);
     let _guard = FileLock::acquire(&lock)?;
     let mut reg: Registry = read_json(&file)?;
+    let before = reserved(&reg);
 
     reg.reservations.retain(|r| r.project.exists());
     reg.reservations.retain(|r| {
@@ -192,8 +193,21 @@ fn assign_outside(
         out.insert(req.service.clone(), port);
     }
 
-    write_json(&file, &reg)?;
+    // Every command of every checkout comes through here, nearly always to be given the ports
+    // it already has: the registry is written (and synced) only when what it reserves changed.
+    // The order of its entries, which the loop above changes, means nothing. A registry that
+    // does not exist yet is still created, as it always was.
+    if reserved(&reg) != before || !file.exists() {
+        write_json(&file, &reg)?;
+    }
     Ok(out)
+}
+
+/// What a registry reserves, whatever the order of its entries.
+fn reserved(reg: &Registry) -> Vec<(PathBuf, String, u16)> {
+    let mut all: Vec<(PathBuf, String, u16)> = reg.reservations.iter().map(|r| (r.project.clone(), r.service.clone(), r.port)).collect();
+    all.sort_unstable();
+    all
 }
 
 /// Give `services` of `project` new ports (after another program took theirs), keeping its
