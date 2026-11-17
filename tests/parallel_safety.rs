@@ -316,6 +316,12 @@ fn gc_dry_run_reports_what_would_be_reclaimed_and_changes_nothing() {
 // ---- gc --stop-orphans -------------------------------------------------------------------
 
 const WEB: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\n";
+/// A service command for Stack's supervisor that listens on `$PORT` until stopped.
+const LISTEN: &str = r#"exec "$REVIEW_PYTHON" -c 'import os,socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(os.environ["PORT"]))); s.listen(); time.sleep(600)'"#;
+/// [`WEB`], listening.
+fn listening_web() -> String {
+    WEB.replace("run='true'", &format!("run='''{LISTEN}'''"))
+}
 const WEB_ID: &str = "app-0123456789abcdef/web";
 
 /// A detached process standing in for a supervised service, killed when dropped.
@@ -345,25 +351,28 @@ struct Running {
 }
 
 impl Fixture {
-    /// `stack up` of one supervised service that is really running and listening.
+    /// A session of one service as Stack 0.1.23 left it under Pitchfork (the fake `pitchfork`
+    /// in `bin/`): a native `up` of a listening service gives the record its digests and
+    /// directory identity and is stopped, then the record is rewritten to name a detached
+    /// process as the service, Pitchfork as its supervisor and `WEB_ID` as its id, and the
+    /// service's port is held by a listener of the test's.
     fn start_web(&self) -> Running {
         let inspect = json_result(&self.ok(&["inspect", "--json"]));
         let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+        fs::write(self.path("bundle/bundle.toml"), listening_web()).unwrap();
+        self.ok(&["compile"]);
+        self.ok(&["up"]);
+        let index = fs::read_dir(self.path("state/sessions")).unwrap().next().unwrap().unwrap().path();
+        let mut session: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        self.ok(&["down"]);
         let service = Detached::spawn();
-        fs::write(
-            self.path("daemons-started.json"),
-            json!([{ "id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
-        )
-        .unwrap();
-        let up = self.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !self.path("started").exists() {
-            assert!(Instant::now() < deadline, "provider start never ran");
-            thread::sleep(Duration::from_millis(10));
+        session["provider"] = json!({ "pitchfork": self.path("bin/pitchfork"), "state_dir": self.path("pfs") });
+        session["services"]["web"]["pid"] = json!(service.0);
+        session["services"]["web"]["provider_id"] = json!(WEB_ID);
+        for path in [index, self.path("app/.stack/session.json")] {
+            fs::write(path, session.to_string()).unwrap();
         }
         let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let out = up.wait_with_output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
         Running { service, port, listener: Some(listener) }
     }
 
@@ -388,7 +397,6 @@ impl Fixture {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stop_orphans_stops_a_deleted_checkouts_service_only_when_every_recorded_fact_matches() {
     let fixture = Fixture::with_bundle(WEB);
     let mut running = fixture.start_web();
@@ -427,7 +435,6 @@ fn stop_orphans_stops_a_deleted_checkouts_service_only_when_every_recorded_fact_
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stop_orphans_never_stops_a_service_whose_supervisor_reports_another_pid() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web();
@@ -625,32 +632,11 @@ fn exec_install_installs_missing_pins_instead_of_failing() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_reassign_ports_moves_a_port_another_program_holds_and_leaves_the_program_alone() {
     let fixture = Fixture::with_bundle(WEB);
-    // A provider that starts a supervised listener on whatever port web is assigned when it
-    // starts, as a real daemon would.
-    let real = fixture.path("bin/mise-fake");
-    fs::rename(fixture.path("bin/mise"), &real).unwrap();
-    write_exe(
-        &fixture.path("bin/mise"),
-        &format!(
-            r#"#!/bin/sh
-if test "$1 $2" = "daemons start"; then
-  "$REVIEW_PYTHON" -c '
-import json, os, sys
-f = sys.argv[1]
-r = json.load(open(os.path.join(os.environ["STACK_STATE_DIR"], "ports.json")))
-p = [x["port"] for x in r["reservations"] if x["service"] == "web"][0]
-open(os.path.join(f, "listen-port"), "w").write(str(p))
-json.dump([{{"id": "{WEB_ID}", "name": "web", "status": "running", "port": p}}], open(os.path.join(f, "daemons-started.json"), "w"))
-' "$REVIEW_FIXTURE"
-fi
-exec "{}" "$@"
-"#,
-            real.display()
-        ),
-    );
+    // web listens on whatever port it is assigned when it starts, as a real daemon would.
+    fs::write(fixture.path("bundle/bundle.toml"), listening_web()).unwrap();
+    fixture.ok(&["compile"]);
     let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
     let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
     let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
@@ -705,7 +691,6 @@ fn a_repeated_up_skips_the_install_only_while_every_pin_is_installed() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn commands_in_one_checkout_plan_side_by_side_and_every_one_is_recorded_then_released() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);

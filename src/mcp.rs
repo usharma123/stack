@@ -414,7 +414,7 @@ fn tool_definitions() -> Value {
             "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. dry_run only reports. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
             machine_wide_schema(json!({
                 "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
-                "stop_orphans": { "type": "boolean", "description": "Also stop a deleted checkout's service where gc would offer recovery.stop, only when its supervisor id, pid, port and process start time all still match the record (Pitchfork cannot compare and stop in one step: a daemon restarted under the same id at that moment would be stopped)" },
+                "stop_orphans": { "type": "boolean", "description": "Also stop a deleted checkout's service where gc would offer recovery.stop, only when its supervisor id, pid, port and process start time all still match the record (for services an older Stack started under Pitchfork, which cannot compare and stop in one step; Stack's own supervisor stops a deleted checkout's services by recorded pid and start time without this flag)" },
                 "dry_run": { "type": "boolean", "description": "Change nothing and take no lock: report what would be reclaimed (would_reclaim: session, project, reason, action, services) and what deleted checkouts would release (deleted_checkouts: ports, and data with action remove_if_safe under reclaim_data, else report)" }
             }), &[], REPORTED_DIR)),
         tool("stack_ps", "List checkouts", annotations("List checkouts", true, None, true, false),
@@ -427,7 +427,7 @@ fn tool_definitions() -> Value {
                 "to": { "type": "string", "description": "Where it is now: an absolute path, or relative to `dir`" }
             }), &["from", "to"], "Optional absolute path that relative `from` and `to` resolve against")),
         tool("stack_doctor", "Check prerequisites", annotations("Check prerequisites", true, None, true, false),
-            "Check that the providers Stack needs (mise, git, tar) are installed, that the supervisor's socket path fits this platform, and that the project compiles. Use it when setup-level errors appear, such as a missing provider or socket_path_too_long. Returns a list of {name, ok, detail} checks; doctor_failed lists them all when one fails.",
+            "Check that the providers Stack needs (mise, git, tar) are installed and that the project compiles. Use it when setup-level errors appear, such as a missing provider. Returns a list of {name, ok, detail} checks; doctor_failed lists them all when one fails.",
             schema(json!({}), &[])),
         tool("stack_errors", "List error codes", annotations("List error codes", true, None, true, false),
             "List every error code Stack can return. Use it to learn what a code means and what fixes it without the docs. Returns each code's meaning, default hint, whether retrying the same call unchanged can succeed (retryable), and the operations that fix it (next).",

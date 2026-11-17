@@ -189,10 +189,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Stop services; succeeds only once their processes are gone. Then stops the Pitchfork
-    /// supervisor that ran them if Stack started it and no other session or daemon uses it
+    /// Stop services; succeeds only once their processes are gone. Stack's supervisor for the
+    /// checkout exits with them (for services an older Stack started under Pitchfork, its
+    /// supervisor is stopped if Stack started it and nothing else uses it)
     Down {
-        /// Leave the supervisor running even when Stack started it and nothing else uses it
+        /// Leave a Pitchfork supervisor an older Stack started running (Stack's own supervisor
+        /// always exits with the checkout's services)
         #[arg(long, conflicts_with = "stop_supervisor")]
         keep_supervisor: bool,
         /// Stop the supervisor as above: what `down` does unless told to keep it (accepted for
@@ -357,6 +359,16 @@ fn command_from_args() -> String {
 }
 
 fn main() -> ExitCode {
+    // Stack's own supervisor and preset runner: hidden modes of this binary, dispatched before
+    // anything else runs (the supervisor forks, which needs a process with one thread).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match args.get(1).and_then(|a| a.to_str()) {
+        Some(stack::supervisor::SUPERVISE) if args.len() == 3 => {
+            return ExitCode::from(stack::supervisor::main_supervise(std::path::Path::new(&args[2])) as u8);
+        }
+        Some(stack::supervisor::PRESET) => return ExitCode::from(stack::supervisor::main_preset(&args[2..]).clamp(0, 255) as u8),
+        _ => {}
+    }
     stack::setup::use_managed_tools();
     update_call(|_| {});
     let matches = match Cli::command().try_get_matches() {

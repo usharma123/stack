@@ -11,6 +11,8 @@ use tempfile::TempDir;
 
 #[path = "support/python.rs"]
 mod python;
+#[path = "support/servers.rs"]
+mod servers;
 
 /// mise as stack drives it: answers from files a test writes under `$REVIEW_FIXTURE`.
 const FAKE_MISE: &str = include_str!("fakes/mise.sh");
@@ -111,7 +113,8 @@ esac
     }
 
     fn command_at(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_stack"));
+        // `STACK_TEST_BIN` runs another build (to show a regression test fails without its fix).
+        let mut command = Command::new(std::env::var("STACK_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_stack").to_string()));
         command
             .args(["-C", dir.to_str().unwrap()])
             .args(args)
@@ -127,6 +130,8 @@ esac
             .env("REVIEW_PYTHON", python::python())
             .env("STACK_STATE_DIR", self.dir.path().join("state"))
             .env("STACK_CACHE_DIR", self.dir.path().join("cache"))
+            // Where mise's presets kept data for an older Stack (see `legacy_data`).
+            .env("MISE_STATE_DIR", self.dir.path().join("mise-state"))
             // The supervisor's state directory is the test's own unless a test names one: Stack
             // writes its supervisor lock there, never in the caller's Pitchfork state.
             .env("PITCHFORK_STATE_DIR", self.dir.path().join("pfs"));
@@ -161,7 +166,6 @@ esac
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_comma_list_given_to_require_is_answered_with_one_flag_per_service() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
     let out = fixture.command(&["--json", "exec", "--require", "web,api", "--", "true"]).output().unwrap();
@@ -450,43 +454,18 @@ fn supervisor_failure_preserves_ownership_instead_of_confirming_cleanup() {
     fixture.ok(&["up"]);
     let paths = fixture.session_paths();
     let mut session: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
+    // A recorded process Stack's supervisor does not run (and so cannot stop) is still alive:
+    // `down` must not confirm, and keeps the record.
     session["services"] = json!({ "worker": { "port":0, "pid":std::process::id(), "identity":"liveness", "verified_at":0 } });
     for path in &paths {
         fs::write(path, session.to_string()).unwrap();
     }
-    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
     let out = fixture.command(&["down", "--json"]).output().unwrap();
     assert!(!out.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
-        "provider_failed"
-    );
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "stop_unconfirmed");
     for path in paths {
-        assert_eq!(
-            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
-            session
-        );
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(), session);
     }
-}
-
-#[test]
-fn recorded_ownership_is_used_even_when_the_supervisor_lists_no_daemons() {
-    let fixture = Fixture::new();
-    fixture.ok(&["up"]);
-    let paths = fixture.session_paths();
-    let mut session: Value = serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap();
-    session["services"] = json!({ "worker": { "port":0, "pid":std::process::id(), "identity":"liveness", "verified_at":0 } });
-    for path in &paths {
-        fs::write(path, session.to_string()).unwrap();
-    }
-    fs::write(fixture.dir.path().join("fail-stop"), "").unwrap();
-    let out = fixture.command(&["down", "--json"]).output().unwrap();
-    assert!(!out.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"],
-        "stop_failed"
-    );
-    assert!(paths.iter().all(|p| p.exists()));
 }
 
 #[test]
@@ -1080,7 +1059,6 @@ fn printed(stdout: &str) -> std::collections::BTreeMap<String, String> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
     let fixture = Fixture::with_bundle(
         "[bundle]\nname='test'\n[services.postgres]\npreset='postgres'\n[services.redis]\npreset='redis'\n",
@@ -1179,19 +1157,13 @@ fn unverified_endpoints_keep_an_unresolvable_host_for_every_host_form() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn verified_endpoints_pass_through_and_are_poisoned_once_verification_fails() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let inspect: Value =
         serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
     let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
     fixture.set_env(&[("WEB_URL", format!("http://[::1]:{port}/health"))]);
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }])
-            .to_string(),
-    )
-    .unwrap();
+    fixture.sleepers();
 
     // Accept connections only once the provider has started, so `up` sees nothing to stop first.
     let up = fixture
@@ -1269,7 +1241,6 @@ fn dumped(fixture: &Fixture) -> std::collections::BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -1418,7 +1389,6 @@ fn assert_refused(output: &str, context: &str) {
 const UNVERIFIED: &str = "unverified.stack.invalid";
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
     let Some(psql) = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|d| d.join("psql"))
@@ -1799,7 +1769,6 @@ fn exec_timeout_without_json_keeps_the_output_and_kills_the_whole_command() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_session_copied_in_from_another_checkout_is_ignored_and_never_committed() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1821,7 +1790,6 @@ fn a_session_copied_in_from_another_checkout_is_ignored_and_never_committed() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_changed_restarts_exactly_the_services_whose_watched_files_changed() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();
@@ -1846,7 +1814,6 @@ fn restart_changed_restarts_exactly_the_services_whose_watched_files_changed() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();
@@ -1870,8 +1837,6 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let after = restarted["data"]["checks"][0]["pid"].as_u64().unwrap();
     assert_ne!(after, before, "a new process");
     assert!(!pid_alive(before as u32));
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(log.contains("daemons stop -- web") && log.contains("daemons start -- web"), "{log}");
 
     // The new process is the verified one, and it loaded the edit.
     let status = json_result(&fixture.ok(&["status", "--json"]));
@@ -1879,12 +1844,14 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     assert!(status["data"]["checks"][0].get("changed_since_start").is_none(), "{status}");
     fixture.ok(&["exec", "--require", "web", "--", "true"]);
 
-    // Logs since the start ask the supervisor for that instant onwards.
-    fs::write(fixture.dir.path().join("logs.txt"), "new\n").unwrap();
+    // Logs since the start keep only what the new process wrote.
+    let log = fs::read_dir(fixture.dir.path().join("state/supervisors")).unwrap().next().unwrap().unwrap().path().join("logs/web.log");
+    let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut file, b"1000 from the old process\n").unwrap();
+    std::io::Write::write_all(&mut file, format!("{} new\n", u64::MAX / 2).as_bytes()).unwrap();
     let logs = json_result(&fixture.ok(&["logs", "web", "--since-start", "--json"]));
     assert_eq!(logs["data"]["since_start"], true);
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(log.lines().any(|l| l.starts_with("daemons logs -- web") && l.contains("--since 20")), "{log}");
+    assert_eq!(logs["data"]["lines"], json!(["new"]), "{logs}");
 
     let out = fixture.command(&["restart", "nope", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
@@ -1894,7 +1861,6 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_and_restart_results_carry_one_check_per_service_and_leave_internals_to_the_record() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -1916,78 +1882,68 @@ fn up_and_restart_results_carry_one_check_per_service_and_leave_internals_to_the
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_restart_records_the_replacement_it_launched() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     let up = json_result(&fixture.ok(&["up", "--json"]));
     let old = up["data"]["checks"][0]["pid"].as_u64().unwrap();
-    // The environment fails after the restart's own start, not `up`'s: restart asks for it
-    // first, to know which supervisor it is about to address.
-    fs::remove_file(fixture.dir.path().join("started")).unwrap();
-    fs::write(fixture.dir.path().join("fail-env-after-start"), "").unwrap();
-    let out = fixture.command(&["restart", "web", "--json"]).output().unwrap();
+    // The replacement starts but never becomes ready within the restart's time.
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    let out = fixture.command(&["restart", "web", "--timeout", "2s", "--json"]).output().unwrap();
     assert!(!out.status.success());
-    let replacement: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    let replacement = fixture.session()["services"]["web"]["pid"].as_u64().expect("the replacement is recorded") as u32;
     assert_ne!(u64::from(replacement), old);
+    assert!(pid_alive(replacement));
     for path in fixture.session_paths() {
         let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record["launching"], true, "{record}");
         assert_eq!(record["services"]["web"]["pid"], replacement, "{record}");
     }
-    fs::remove_file(fixture.dir.path().join("fail-env-after-start")).unwrap();
     let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
     assert_eq!(status["data"]["healthy"], false, "{status}");
     let out = fixture.command(&["restart", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "session_stale");
 
-    // A deleted checkout's GC keeps the incomplete record rather than releasing a live service.
+    // A deleted checkout's GC stops what Stack's supervisor recorded for it (by pid and start
+    // time) before releasing the record.
     let moved = fixture.dir.path().join("moved");
     fs::rename(fixture.dir.path().join("app"), &moved).unwrap();
     let gc = json_result(&fixture.command_at(fixture.dir.path(), &["gc", "--json"]).output().unwrap());
-    assert_eq!(gc["ok"], false, "{gc}");
-    assert_eq!(fixture.index_files(), 1);
-    assert!(pid_alive(replacement));
+    assert_eq!(gc["ok"], true, "{gc}");
+    assert_eq!(fixture.index_files(), 0);
+    assert!(!pid_alive(replacement));
     fs::rename(&moved, fixture.dir.path().join("app")).unwrap();
+    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
     fixture.ok(&["up"]);
     fixture.ok(&["exec", "--require", "web", "--", "true"]);
     fixture.ok(&["down"]);
-    assert!(!pid_alive(replacement));
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn retrying_an_incomplete_launch_keeps_what_it_recorded_until_down_confirms_it() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     fixture.ok(&["up"]);
-    // After the restart's own start (see `a_failed_restart_records_the_replacement_it_launched`).
-    fs::remove_file(fixture.dir.path().join("started")).unwrap();
-    fs::write(fixture.dir.path().join("fail-env-after-start"), "").unwrap();
-    assert!(!fixture.command(&["restart", "web", "--json"]).output().unwrap().status.success());
-    let replacement: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
-    fs::remove_file(fixture.dir.path().join("fail-env-after-start")).unwrap();
+    // A restart whose replacement does not become ready in time (see
+    // `a_failed_restart_records_the_replacement_it_launched`).
+    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    assert!(!fixture.command(&["restart", "web", "--timeout", "2s", "--json"]).output().unwrap().status.success());
+    let replacement = fixture.session()["services"]["web"]["pid"].as_u64().unwrap() as u32;
 
-    // The recovery `up` fails right after writing its launch record.
-    fs::write(fixture.dir.path().join("fail-query-after-one"), "").unwrap();
-    let retry = json_result(&fixture.command(&["up", "--json"]).output().unwrap());
+    // The recovery `up` runs out of time too: the same process is still the one recorded.
+    let retry = json_result(&fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap());
     assert_eq!(retry["ok"], false, "{retry}");
-    fs::remove_file(fixture.dir.path().join("fail-query-after-one")).unwrap();
     let record: Value = serde_json::from_slice(&fs::read(&fixture.session_paths()[0]).unwrap()).unwrap();
     assert_eq!(record["services"]["web"]["pid"], replacement, "{record}");
+    assert_eq!(record["launching"], true, "{record}");
 
-    // Even with the supervisor listing nothing, the recorded process is stopped, not abandoned.
-    fs::write(fixture.dir.path().join("daemons.json"), "[]").unwrap();
+    // The recorded process is stopped, not abandoned.
     let down = json_result(&fixture.command(&["down", "--json"]).output().unwrap());
-    let alive = pid_alive(replacement);
-    if alive {
-        Command::new("kill").arg(replacement.to_string()).status().unwrap();
-    }
-    assert!(down["ok"] == false || !alive, "down confirmed while {replacement} lived: {down}");
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(replacement), "down confirmed while {replacement} lived: {down}");
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_legacy_session_copy_is_ignored_unless_it_may_be_the_last_record_of_a_live_service() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -2020,7 +1976,6 @@ fn a_legacy_session_copy_is_ignored_unless_it_may_be_the_last_record_of_a_live_s
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_moved_checkouts_only_record_is_kept_and_named() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -2043,7 +1998,6 @@ fn a_moved_checkouts_only_record_is_kept_and_named() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn mcp_restart_rejects_a_malformed_service_list_before_stopping_anything() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -2062,7 +2016,6 @@ fn mcp_restart_rejects_a_malformed_service_list_before_stopping_anything() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn watch_compares_modification_times_below_a_second() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     let file = fixture.dir.path().join("app/main.py");
@@ -2083,7 +2036,6 @@ fn watch_compares_modification_times_below_a_second() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_watch_too_large_to_scan_is_reported_incomplete() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['wide']\n");
     let wide = fixture.dir.path().join("app/wide");
@@ -2101,7 +2053,6 @@ fn a_watch_too_large_to_scan_is_reported_incomplete() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_keeps_a_legacy_process_start_time_unknown() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -2265,26 +2216,23 @@ fn end(pid: u32) {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
     let pf = dir.join("pf");
-    let run = |args: &[&str]| -> Value {
-        let out = fixture.command(args).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+    let legacy = fixture.legacy_record(&pf);
+    let supervisor = |args: &[&str]| -> Value {
+        legacy();
+        let out = fixture.command(args).output().unwrap();
         let result = json_result(&out);
         assert!(out.status.success(), "{args:?}: {result}");
-        result
+        result["data"]["supervisor"].clone()
     };
-    let supervisor = |args: &[&str]| run(args)["data"]["supervisor"].clone();
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    run(&["up", "--json"]);
-    // Every request of `up` that could start the supervisor carried this Stack state's mark.
-    let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
-    assert!(mark.starts_with("stack-") && mark.len() == 38, "{mark}");
-    let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-    assert!(marks.contains(&format!("daemons start {mark}")) && !marks.contains("unset"), "{marks}");
+    // The mark Stack 0.1.23 wrote before it first started a supervisor.
+    let mark = "stack-0123456789abcdef0123456789abcdef".to_string();
+    fs::write(dir.join("state/supervisor-owner"), format!("{mark}\n")).unwrap();
     let pid = fake_supervisor(&fixture, Some(&mark));
+    legacy();
 
     // Another checkout's session records the same supervisor, through another name for its
     // state directory.
@@ -2318,7 +2266,6 @@ fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it(
     for (list, reason) in [
         (json!([{ "id": "someone-else/db", "status": "running" }]), "daemon someone-else/db is running".to_string()),
         (json!([{ "id": "someone-else/db", "status": "waiting" }]), "daemon someone-else/db is waiting".to_string()),
-        (json!([{ "id": "someone-else/db", "status": "restarting" }]), "daemon someone-else/db is restarting".to_string()),
         (json!([{ "id": "someone-else/db" }]), "daemon someone-else/db is in a state Pitchfork did not report".to_string()),
         (json!([{ "id": "someone-else/db", "status": "stopped", "pid": me }]), format!("daemon someone-else/db is stopped, but its process {me} is alive")),
     ] {
@@ -2327,57 +2274,32 @@ fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it(
         assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!(reason)), "{list}: {kept}");
         assert!(alive(pid));
     }
-    // A daemon with a schedule needs the supervisor between runs, after a failed run and while
-    // disabled (Pitchfork 2.29.0 runs a disabled daemon on its schedule too); one whose
-    // schedule Stack cannot read might have one.
+    // A daemon with a schedule needs the supervisor between runs.
     let status = |id: &str, body: Value| {
         let path = dir.join("pf-status").join(format!("{id}.json"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body.to_string()).unwrap();
     };
     let cron = "*/10 * * * * *";
-    let scheduled = format!("daemon someone-else/timer runs on the schedule `{cron}`, which needs the supervisor between runs");
-    for (listed, said, reason) in [
-        (json!({ "status": "stopped", "pid": null, "disabled": false }), json!({ "status": "stopped", "pid": null, "cron_schedule": cron }), scheduled.clone()),
-        (json!({ "status": "failed" }), json!({ "status": "failed", "cron_schedule": cron, "cron_last_run": "2026-10-21T09:52:29-04:00" }), scheduled.clone()),
-        (json!({ "status": "stopped", "disabled": true }), json!({ "status": "stopped", "cron_schedule": cron }), scheduled.clone()),
-        (json!({ "status": "stopped" }), json!({ "status": "stopped", "cron_schedule": 10 }), "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer reported the schedule 10".to_string()),
-        (json!({ "status": "stopped" }), json!({ "cron_schedule": null }), "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer reported no status".to_string()),
-        (json!({ "status": "stopped" }), json!({ "id": "someone-else/other", "status": "stopped" }), "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer described '\"someone-else/other\"'".to_string()),
-        (json!({ "status": "stopped" }), Value::Null, "cannot tell whether daemon someone-else/timer runs on a schedule: pitchfork status someone-else/timer: not found".to_string()),
-    ] {
-        let mut listed = listed;
-        listed["id"] = json!("someone-else/timer");
-        fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }, listed]).to_string()).unwrap();
-        status("someone-else/db", json!({ "id": "someone-else/db", "status": "stopped" }));
-        let _ = fs::remove_file(dir.join("pf-status/someone-else/timer.json"));
-        if !said.is_null() {
-            let mut said = said;
-            if said.get("id").is_none() {
-                said["id"] = json!("someone-else/timer");
-            }
-            status("someone-else/timer", said);
-        }
-        let kept = supervisor(&["down", "--json"]);
-        assert_eq!((kept["stopped"].clone(), kept["reason"].clone()), (json!(false), json!(reason)), "{listed}: {kept}");
-        assert!(alive(pid));
-    }
-    // Without a schedule (omitted, as Pitchfork omits it, or null), a stopped or failed daemon
-    // is over.
+    fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/timer", "status": "stopped" }]).to_string()).unwrap();
+    status("someone-else/timer", json!({ "id": "someone-else/timer", "status": "stopped", "cron_schedule": cron }));
+    let kept = supervisor(&["down", "--json"]);
+    assert_eq!(kept["reason"], format!("daemon someone-else/timer runs on the schedule `{cron}`, which needs the supervisor between runs"), "{kept}");
+    // Without a schedule a stopped or failed daemon is over.
     fs::write(dir.join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "stopped" }, { "id": "x/y", "status": "failed" }]).to_string()).unwrap();
+    status("someone-else/db", json!({ "id": "someone-else/db", "status": "stopped" }));
     status("x/y", json!({ "id": "x/y", "status": "failed", "pid": null, "cron_schedule": null }));
 
     // Asked to keep it, through the CLI and MCP.
     assert_eq!(supervisor(&["down", "--keep-supervisor", "--json"]), json!({ "stopped": false, "reason": "asked to keep it" }));
-    let mcp = fixture.mcp(&[("stack_down", json!({ "stop_supervisor": false }))], &[("PITCHFORK_STATE_DIR", pf.to_str().unwrap())]);
+    legacy();
+    let mcp = fixture.mcp(&[("stack_down", json!({ "stop_supervisor": false }))], &[]);
     assert_eq!(mcp[0]["structuredContent"]["data"]["supervisor"], json!({ "stopped": false, "reason": "asked to keep it" }), "{}", mcp[0]);
     let out = fixture.command(&["down", "--keep-supervisor", "--stop-supervisor"]).output().unwrap();
     assert!(!out.status.success(), "the two flags contradict each other");
     assert!(alive(pid));
 
-    // Another Stack command asking it something meanwhile holds its lock: kept. The lock is
-    // the supervisor's, in its state directory, whatever Stack state or name reached it.
-    assert!(!dir.join("state/supervisors").exists());
+    // Another Stack command asking it something meanwhile holds its lock: kept.
     let held = fs::File::open(pf.join("stack-supervisor.lock")).unwrap();
     // SAFETY: flock on a descriptor this test owns.
     assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_SH) }, 0);
@@ -2390,779 +2312,42 @@ fn down_stops_the_supervisor_stack_started_by_default_once_nothing_else_uses_it(
     let stopped = supervisor(&["down", "--json"]);
     assert_eq!(stopped, json!({ "stopped": true, "state_dir": pf }), "{stopped}");
     assert!(!alive(pid) && !dir.join("pf-supervisor").exists());
-    // Again, and in a checkout that never ran `up`: nothing to stop, and nothing is started to
-    // find that out (listing daemons would start a supervisor).
-    let before = fs::read_to_string(dir.join("pitchfork.log")).unwrap().len();
+    // Again: nothing to stop, and nothing is started to find that out.
     assert_eq!(supervisor(&["down", "--json"]), json!({ "stopped": true, "reason": "it was not running" }));
-    let fresh = dir.join("fresh");
-    fs::create_dir(&fresh).unwrap();
-    for file in ["stack.toml", "stack.lock"] {
-        fs::copy(dir.join("app").join(file), fresh.join(file)).unwrap();
-    }
-    fixture.command_at(&fresh, &["compile"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-    let out = fixture.command_at(&fresh, &["--json", "down"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-    assert_eq!(json_result(&out)["data"]["supervisor"], json!({ "stopped": true, "reason": "it was not running" }), "{}", json_result(&out));
-    let asked = &fs::read_to_string(dir.join("pitchfork.log")).unwrap()[before..];
-    assert!(!asked.contains(" list") && !asked.contains(" stop"), "{asked}");
 
     // MCP without the field stops it by default, and the old flag still works.
     let pid = fake_supervisor(&fixture, Some(&mark));
-    let mcp = fixture.mcp(&[("stack_down", json!({}))], &[("PITCHFORK_STATE_DIR", pf.to_str().unwrap())]);
+    legacy();
+    let mcp = fixture.mcp(&[("stack_down", json!({}))], &[]);
     assert_eq!(mcp[0]["structuredContent"]["data"]["supervisor"]["stopped"], true, "{}", mcp[0]);
     assert!(!alive(pid));
     let pid = fake_supervisor(&fixture, Some(&mark));
     assert_eq!(supervisor(&["down", "--stop-supervisor", "--json"])["stopped"], true);
     assert!(!alive(pid));
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn an_up_through_the_same_supervisor_waits_for_a_down_deciding_to_stop_it_whatever_its_stack_state() {
-    // A's `down` has looked at what the supervisor runs and is about to stop it when B, another
-    // checkout using the same Pitchfork state directory, runs `up`: from another Stack state,
-    // and from the same one as a control. B must not ask the supervisor anything until A is
-    // done, or A stops it under B's freshly started service.
-    for b_state in ["state-b", "state"] {
-        let fixture = Fixture::with_bundle(WEB);
-        let dir = fixture.dir.path();
-        let pf = dir.join("pf");
-        supervise_listener(&fixture, assigned_port(&fixture, "web"));
-        let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-        assert!(out.status.success(), "{}", json_result(&out));
-        let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
-        let supervisor = fake_supervisor(&fixture, Some(&mark));
-
-        let b = dir.join("b");
-        fs::create_dir(&b).unwrap();
-        for file in ["stack.toml", "stack.lock"] {
-            fs::copy(dir.join("app").join(file), b.join(file)).unwrap();
-        }
-        let in_b = |args: &[&str]| {
-            let mut command = fixture.command_at(&b, args);
-            command.env("PITCHFORK_STATE_DIR", &pf).env("STACK_STATE_DIR", dir.join(b_state));
-            command
-        };
-        assert!(in_b(&["compile"]).output().unwrap().status.success());
-        let inspected = json_result(&in_b(&["inspect", "--json"]).output().unwrap());
-        let b_port = u16::try_from(inspected["data"]["ports"]["web"].as_u64().unwrap()).unwrap();
-
-        // A holds its lock alone, with the daemons it saw (none running) in hand.
-        fs::write(dir.join("pf-list-gate"), "").unwrap();
-        let down = fixture
-            .command(&["down", "--json"])
-            .env("PITCHFORK_STATE_DIR", &pf)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let until = Instant::now() + Duration::from_secs(30);
-        while !dir.join("list-ready").exists() {
-            assert!(Instant::now() < until, "A never asked what the supervisor runs");
-            thread::sleep(Duration::from_millis(20));
-        }
-        let asked = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-        supervise_listener(&fixture, b_port);
-        let mut up = in_b(&["up", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        thread::sleep(Duration::from_millis(1500));
-        assert!(up.try_wait().unwrap().is_none(), "{b_state}: B's `up` finished while A was deciding");
-        assert_eq!(fs::read_to_string(dir.join("owner-marks.log")).unwrap(), asked, "{b_state}: B asked the supervisor while A was deciding");
-        assert!(alive(supervisor));
-
-        // A goes on and stops the supervisor nothing used; then B starts afresh.
-        fs::write(dir.join("release-list"), "").unwrap();
-        let down = down.wait_with_output().unwrap();
-        let result = json_result(&down);
-        assert!(down.status.success(), "{result}");
-        assert_eq!(result["data"]["supervisor"], json!({ "stopped": true, "state_dir": pf }), "{b_state}: {result}");
-        assert!(!alive(supervisor));
-        let up = up.wait_with_output().unwrap();
-        let result = json_result(&up);
-        assert!(up.status.success(), "{b_state}: {result}");
-        let b_mark = fs::read_to_string(dir.join(b_state).join("supervisor-owner")).unwrap().trim().to_string();
-        let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-        assert!(marks[asked.len()..].contains(&format!("daemons start {b_mark}")), "{b_state}: {marks}");
-        assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok(), "{b_state}: B's service is not listening");
-        let status = json_result(&in_b(&["status", "--json"]).output().unwrap());
-        assert_eq!(status["data"]["healthy"], true, "{b_state}: {status}");
-        assert!(in_b(&["down"]).output().unwrap().status.success());
-    }
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_reused_session_asks_the_supervisor_its_environment_reaches_only_once_a_down_deciding_to_stop_it_is_done() {
-    // B, another checkout in another Stack state, last ran its unchanged generation under the
-    // supervisor of `pf-old` (`moved`), under a record that names no supervisor (`legacy`, as
-    // records before Stack kept one), or under `pf` itself (`current`, the control). Its service
-    // was then stopped behind Stack's back. Now its environment reaches `pf`, whose supervisor
-    // A's `down` has looked at and is about to stop: B's `up`, `restart` and `down` must hold
-    // `pf`'s lock, not the recorded one or none, and ask nothing until A is done.
-    for (record, command) in [("moved", "up"), ("legacy", "up"), ("current", "up"), ("moved", "restart"), ("legacy", "restart"), ("moved", "down")] {
-        let case = format!("{record} {command}");
-        let fixture = Fixture::with_bundle(WEB);
-        let dir = fixture.dir.path();
-        let pf = dir.join("pf");
-        let b = dir.join("b");
-        fs::create_dir(&b).unwrap();
-        for file in ["stack.toml", "stack.lock"] {
-            fs::copy(dir.join("app").join(file), b.join(file)).unwrap();
-        }
-        let in_b = |pitchfork: &Path, args: &[&str]| {
-            let mut command = fixture.command_at(&b, args);
-            command.env("PITCHFORK_STATE_DIR", pitchfork).env("STACK_STATE_DIR", dir.join("state-b"));
-            command
-        };
-        assert!(in_b(&pf, &["compile"]).output().unwrap().status.success());
-        let inspected = json_result(&in_b(&pf, &["inspect", "--json"]).output().unwrap());
-        let b_port = u16::try_from(inspected["data"]["ports"]["web"].as_u64().unwrap()).unwrap();
-
-        // B's verified generation, then its service stopped through Pitchfork alone.
-        let first = if record == "moved" { dir.join("pf-old") } else { pf.clone() };
-        supervise_listener(&fixture, b_port);
-        let out = in_b(&first, &["up", "--json"]).output().unwrap();
-        assert!(out.status.success(), "{case}: {}", json_result(&out));
-        let b_session = || -> Value { serde_json::from_slice(&fs::read(b.join(".stack/session.json")).unwrap()).unwrap() };
-        assert_eq!(b_session()["provider"]["state_dir"], json!(first), "{case}");
-        if record == "legacy" {
-            let copies = fs::read_dir(dir.join("state-b/sessions")).unwrap().map(|e| e.unwrap().path());
-            for path in copies.chain([b.join(".stack/session.json")]) {
-                let mut session: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                session.as_object_mut().unwrap().remove("provider");
-                fs::write(&path, session.to_string()).unwrap();
-            }
-        }
-        let b_id = b_session()["id"].clone();
-        assert!(Command::new(dir.join("bin/pitchfork")).arg("stop").env("REVIEW_FIXTURE", dir).status().unwrap().success());
-        fs::write(dir.join("daemons.json"), json!([{ "id": "app-test/web", "name": "web", "status": "stopped", "port": b_port }]).to_string()).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok() {
-            assert!(Instant::now() < until, "{case}: B's service did not stop");
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        // A runs under `pf`, which Stack started for it.
-        supervise_listener(&fixture, assigned_port(&fixture, "web"));
-        let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-        assert!(out.status.success(), "{case}: {}", json_result(&out));
-        let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
-        let supervisor = fake_supervisor(&fixture, Some(&mark));
-
-        // A holds `pf`'s lock alone, with the daemons it saw (none running) in hand.
-        fs::write(dir.join("pf-list-gate"), "").unwrap();
-        let down = fixture
-            .command(&["down", "--json"])
-            .env("PITCHFORK_STATE_DIR", &pf)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let until = Instant::now() + Duration::from_secs(30);
-        while !dir.join("list-ready").exists() {
-            assert!(Instant::now() < until, "{case}: A never asked what the supervisor runs");
-            thread::sleep(Duration::from_millis(20));
-        }
-        let asked = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-        supervise_listener(&fixture, b_port);
-        if command == "down" {
-            // The supervisor still reports B's daemon running, so B's `down` asks it to stop.
-            fs::write(dir.join("daemons.json"), json!([{ "id": "app-test/web", "name": "web", "status": "running", "port": b_port }]).to_string()).unwrap();
-        }
-        let mut b_command = in_b(&pf, &[command, "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        thread::sleep(Duration::from_millis(1500));
-        assert!(b_command.try_wait().unwrap().is_none(), "{case}: B's `{command}` finished while A was deciding");
-        assert_eq!(fs::read_to_string(dir.join("owner-marks.log")).unwrap(), asked, "{case}: B asked the supervisor while A was deciding");
-        assert!(alive(supervisor), "{case}");
-        if command == "up" {
-            // B's record already names the supervisor it is about to start its service under.
-            assert_eq!(b_session()["provider"]["state_dir"], json!(pf), "{case}");
-        }
-
-        // A goes on and stops the supervisor nothing used; then B goes on.
-        fs::write(dir.join("release-list"), "").unwrap();
-        let down = down.wait_with_output().unwrap();
-        let result = json_result(&down);
-        assert!(down.status.success(), "{case}: {result}");
-        assert_eq!(result["data"]["supervisor"], json!({ "stopped": true, "state_dir": pf }), "{case}: {result}");
-        assert!(!alive(supervisor), "{case}");
-        let out = b_command.wait_with_output().unwrap();
-        let result = json_result(&out);
-        assert!(out.status.success(), "{case}: {result}");
-        let b_mark = fs::read_to_string(dir.join("state-b/supervisor-owner")).unwrap().trim().to_string();
-        let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-        let verb = if command == "down" { "stop" } else { "start" };
-        assert!(marks[asked.len()..].contains(&format!("daemons {verb} {b_mark}")), "{case}: {marks}");
-        if command != "down" {
-            assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok(), "{case}: B's service is not listening");
-            let status = json_result(&in_b(&pf, &["status", "--json"]).output().unwrap());
-            assert_eq!(status["data"]["healthy"], true, "{case}: {status}");
-            // Now naming the supervisor that runs it; a restart keeps the generation's identity.
-            let session = b_session();
-            assert_eq!(session["provider"]["state_dir"], json!(pf), "{case}: {session}");
-            if command == "restart" {
-                assert_eq!(session["id"], b_id, "{case}: {session}");
-            }
-            assert!(in_b(&pf, &["down"]).output().unwrap().status.success(), "{case}");
-        }
-    }
-}
-
-/// A service whose setup rewrites what the provider config renders `PITCHFORK_STATE_DIR` from
-/// (`provider-target`, see the fake mise) with `desired-target`, in a checkout that has one.
-const RETARGETING: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\nsetup='test ! -f desired-target || cp desired-target provider-target'\n";
-
-/// The requests made from `project` that may start or stop something, each with the Pitchfork
-/// state directory it reached, from the `skip`th line of what the fake mise recorded.
-fn requests_from(dir: &Path, project: &Path, skip: usize) -> Vec<String> {
-    let log = fs::read_to_string(dir.join("request-targets.log")).unwrap_or_default();
-    let from = format!("{} ", project.canonicalize().unwrap().display());
-    log.lines().skip(skip).filter(|l| l.starts_with(&from)).map(|l| l[from.len()..].to_string()).collect()
-}
-
-fn request_count(dir: &Path) -> usize {
-    fs::read_to_string(dir.join("request-targets.log")).unwrap_or_default().lines().count()
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_setup_that_changes_the_supervisor_the_environment_names_starts_nothing_through_either() {
-    // B's provider config renders PITCHFORK_STATE_DIR from `provider-target`, over the value B
-    // inherits; B's setup copies `desired-target` there. B's unchanged generation last ran under
-    // `pf-old`, its service since stopped, and A's `down` is deciding to stop `pf`'s supervisor.
-    // `changed`: `provider-target` names `pf-old` when B's `up` begins, so B chooses and locks
-    // `pf-old`, and its setup then makes the environment name `pf`, whose lock B does not hold:
-    // B must refuse before any request, never start its service under `pf` while A decides.
-    // `stable` (the control): it names `pf` already, so B locks `pf`, waits for A, then starts.
-    for case in ["changed", "stable"] {
-        let fixture = Fixture::with_bundle(RETARGETING);
-        let dir = fixture.dir.path();
-        let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-        let b = dir.join("b");
-        fs::create_dir(&b).unwrap();
-        for file in ["stack.toml", "stack.lock"] {
-            fs::copy(dir.join("app").join(file), b.join(file)).unwrap();
-        }
-        let in_b = |args: &[&str]| {
-            let mut command = fixture.command_at(&b, args);
-            command.env("PITCHFORK_STATE_DIR", dir.join("pf-inherited")).env("STACK_STATE_DIR", dir.join("state-b"));
-            command
-        };
-        let name = |file: &str, state: &Path| fs::write(b.join(file), state.to_str().unwrap()).unwrap();
-        name("provider-target", &old);
-        name("desired-target", &old);
-        assert!(in_b(&["compile"]).output().unwrap().status.success());
-        let inspected = json_result(&in_b(&["inspect", "--json"]).output().unwrap());
-        let b_port = u16::try_from(inspected["data"]["ports"]["web"].as_u64().unwrap()).unwrap();
-
-        // B's verified generation under `pf-old`, then its service stopped through Pitchfork alone.
-        supervise_listener(&fixture, b_port);
-        let out = in_b(&["up", "--json"]).output().unwrap();
-        assert!(out.status.success(), "{case}: {}", json_result(&out));
-        let b_session = || -> Value { serde_json::from_slice(&fs::read(b.join(".stack/session.json")).unwrap()).unwrap() };
-        assert_eq!(b_session()["provider"]["state_dir"], json!(old), "{case}");
-        assert!(requests_from(dir, &b, 0).iter().any(|r| r == &format!("daemons start -- web => {}", old.display())), "{case}");
-        assert!(Command::new(dir.join("bin/pitchfork")).arg("stop").env("REVIEW_FIXTURE", dir).status().unwrap().success());
-        fs::write(dir.join("daemons.json"), json!([{ "id": "app-test/web", "name": "web", "status": "stopped", "port": b_port }]).to_string()).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok() {
-            assert!(Instant::now() < until, "{case}: B's service did not stop");
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        // A runs under `pf`, which Stack started for it.
-        supervise_listener(&fixture, assigned_port(&fixture, "web"));
-        let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-        assert!(out.status.success(), "{case}: {}", json_result(&out));
-        let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
-        let supervisor = fake_supervisor(&fixture, Some(&mark));
-
-        // B's setup will make its environment name `pf`.
-        name("desired-target", &pf);
-        if case == "stable" {
-            name("provider-target", &pf);
-        }
-
-        // A holds `pf`'s lock alone, with the daemons it saw (none running) in hand.
-        fs::write(dir.join("pf-list-gate"), "").unwrap();
-        let mut down = fixture
-            .command(&["down", "--json"])
-            .env("PITCHFORK_STATE_DIR", &pf)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let until = Instant::now() + Duration::from_secs(30);
-        while !dir.join("list-ready").exists() {
-            assert!(Instant::now() < until, "{case}: A never asked what the supervisor runs");
-            thread::sleep(Duration::from_millis(20));
-        }
-        let asked = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-        let requested = request_count(dir);
-        supervise_listener(&fixture, b_port);
-        let mut b_up = in_b(&["up", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let waiting = if case == "changed" {
-            // Refused at once, while A still decides: B never waits for `pf`'s lock, as it
-            // never asks `pf` anything.
-            let until = Instant::now() + Duration::from_secs(20);
-            while b_up.try_wait().unwrap().is_none() {
-                assert!(Instant::now() < until, "{case}: B's `up` did not finish");
-                thread::sleep(Duration::from_millis(20));
-            }
-            assert!(down.try_wait().unwrap().is_none(), "{case}: A finished before B");
-            let out = b_up.wait_with_output().unwrap();
-            let result = json_result(&out);
-            assert!(!out.status.success(), "{case}: {result}");
-            let error = &result["error"];
-            assert_eq!(error["code"], "supervisor_changed", "{case}: {result}");
-            let chosen = error["details"].as_array().unwrap().iter().find(|d| d.get("chosen").is_some()).unwrap().clone();
-            assert_eq!((chosen["chosen"].clone(), chosen["now"].clone()), (json!(old), json!(pf)), "{case}: {result}");
-            let steps = error["details"].as_array().unwrap().last().unwrap()["steps"].clone();
-            assert_eq!(steps.as_array().unwrap().last().unwrap()["step"], "start", "{case}: {result}");
-            // B's setup ran and made its change; nothing was asked of either supervisor since.
-            assert_eq!(fs::read_to_string(b.join("provider-target")).unwrap(), pf.to_str().unwrap(), "{case}");
-            assert_eq!(requests_from(dir, &b, requested), Vec::<String>::new(), "{case}: B made a request");
-            assert_eq!(fs::read_to_string(dir.join("owner-marks.log")).unwrap(), asked, "{case}: B asked a supervisor");
-            assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_err(), "{case}: B's service started");
-            // The record still names the supervisor B chose, under which nothing started.
-            assert_eq!(b_session()["provider"]["state_dir"], json!(old), "{case}");
-            None
-        } else {
-            thread::sleep(Duration::from_millis(1500));
-            assert!(b_up.try_wait().unwrap().is_none(), "{case}: B's `up` finished while A was deciding");
-            assert_eq!(fs::read_to_string(dir.join("owner-marks.log")).unwrap(), asked, "{case}: B asked the supervisor while A was deciding");
-            // B's record already names the supervisor it is about to start its service under.
-            assert_eq!(b_session()["provider"]["state_dir"], json!(pf), "{case}");
-            Some(b_up)
-        };
-        assert!(alive(supervisor), "{case}");
-
-        // A goes on and stops the supervisor nothing used.
-        fs::write(dir.join("release-list"), "").unwrap();
-        let down = down.wait_with_output().unwrap();
-        let result = json_result(&down);
-        assert!(down.status.success(), "{case}: {result}");
-        assert_eq!(result["data"]["supervisor"], json!({ "stopped": true, "state_dir": pf }), "{case}: {result}");
-        assert!(!alive(supervisor), "{case}");
-
-        // B then starts under `pf`: the control as it waited, the changed case run again, which
-        // chooses `pf` from its beginning. Every request it made reached the supervisor it locked.
-        let b_up = waiting.unwrap_or_else(|| in_b(&["up", "--json"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
-        let out = b_up.wait_with_output().unwrap();
-        let result = json_result(&out);
-        assert!(out.status.success(), "{case}: {result}");
-        let made = requests_from(dir, &b, requested);
-        assert!(made.contains(&format!("daemons start -- web => {}", pf.display())), "{case}: {made:?}");
-        assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", pf.display()))), "{case}: {made:?}");
-        let b_mark = fs::read_to_string(dir.join("state-b/supervisor-owner")).unwrap().trim().to_string();
-        let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-        assert!(marks[asked.len()..].contains(&format!("daemons start {b_mark}")), "{case}: {marks}");
-        assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok(), "{case}: B's service is not listening");
-        let status = json_result(&in_b(&["status", "--json"]).output().unwrap());
-        assert_eq!(status["data"]["healthy"], true, "{case}: {status}");
-        assert_eq!(b_session()["provider"]["state_dir"], json!(pf), "{case}");
-        assert!(in_b(&["down"]).output().unwrap().status.success(), "{case}");
-    }
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_restart_whose_setup_changes_the_supervisor_starts_nothing_through_the_new_one() {
-    // The provider config renders PITCHFORK_STATE_DIR from `provider-target`, which names
-    // `pf-old` until the setup copies `desired-target` (`pf`) there. `restart` chooses `pf-old`
-    // and stops the service there; the service's setup runs after.
-    let fixture = Fixture::with_bundle(RETARGETING);
-    let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-    let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-    let name = |file: &str, state: &Path| fs::write(app.join(file), state.to_str().unwrap()).unwrap();
-    name("provider-target", &old);
-    name("desired-target", &old);
-    let port = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, port);
-    fixture.ok(&["up"]);
-    assert_eq!(fixture.session()["provider"]["state_dir"], json!(old));
-    name("desired-target", &pf);
-    let requested = request_count(&dir);
-    let out = fixture.command(&["restart", "web", "--json"]).output().unwrap();
-    let result = json_result(&out);
-    assert!(!out.status.success(), "{result}");
-    assert_eq!(result["error"]["code"], "supervisor_changed", "{result}");
-    let made = requests_from(&dir, &app, requested);
-    assert!(made.contains(&format!("daemons stop -- web => {}", old.display())), "{made:?}");
-    assert!(made.iter().all(|r| !r.starts_with("daemons start") && r.ends_with(&format!("=> {}", old.display()))), "{made:?}");
-    let session = fixture.session();
-    assert_eq!((session["launching"].clone(), session["provider"]["state_dir"].clone()), (json!(true), json!(old)), "{session}");
-    // Run again, `up` chooses `pf` from its beginning and starts there.
-    let requested = request_count(&dir);
-    fixture.ok(&["up"]);
-    let made = requests_from(&dir, &app, requested);
-    assert!(made.contains(&format!("daemons start -- web => {}", pf.display())) && made.iter().all(|r| r.ends_with(&format!("=> {}", pf.display()))), "{made:?}");
-    assert_eq!(fixture.session()["provider"]["state_dir"], json!(pf));
-    fixture.ok(&["down"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_later_wave_whose_setup_changes_the_supervisor_is_refused_before_its_request() {
-    // db starts under `pf-old`, which `provider-target` names (see the fake mise); then api's
-    // setup, run once db is ready, makes the environment name `pf` before api is requested.
-    let fixture = Fixture::with_bundle(
-        "[bundle]\nname='test'\n[services.db]\nrun='true'\nready_cmd='test -f db-ready'\n[services.api]\nrun='true'\ndepends_on=['db']\nsetup='cp desired-target provider-target'\n",
-    );
-    let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-    let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-    let name = |file: &str, state: &Path| fs::write(app.join(file), state.to_str().unwrap()).unwrap();
-    name("provider-target", &old);
-    name("desired-target", &pf);
-    let (db, api) = (assigned_port(&fixture, "db"), assigned_port(&fixture, "api"));
-    // As in `restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_nothing_when_it_is_not_ready`:
-    // the supervisor's listener stands for api, db is a socket bound once something started.
-    fs::write(dir.join("listen-port"), api.to_string()).unwrap();
-    fs::write(dir.join("listen-service"), "api").unwrap();
-    let running = json!([{ "id": "app-test/db", "name": "db", "status": "running", "port": db }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
-    fs::write(dir.join("daemons-started.json"), running.to_string()).unwrap();
-    let (send, held) = std::sync::mpsc::channel();
-    let started = dir.join("started");
-    let binder = thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(60);
-        while !started.exists() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(20));
-        }
-        send.send(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap()).unwrap();
-    });
-    fs::write(app.join("db-ready"), "").unwrap();
-    let out = fixture.command(&["up", "--json"]).output().unwrap();
-    let db_socket = held.recv().unwrap();
-    binder.join().unwrap();
-    let result = json_result(&out);
-    assert!(!out.status.success(), "{result}");
-    assert_eq!(result["error"]["code"], "supervisor_changed", "{result}");
-    assert_eq!(fs::read_to_string(dir.join("start-requests.log")).unwrap(), "daemons start -- db\n", "api was requested");
-    let made = requests_from(&dir, &app, 0);
-    assert!(made.contains(&format!("daemons start -- db => {}", old.display())), "{made:?}");
-    assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{made:?}");
-    // db, started under `pf-old`, stays recorded there; nothing claims to run under `pf`.
-    let session = fixture.session();
-    assert_eq!((session["launching"].clone(), session["provider"]["state_dir"].clone()), (json!(true), json!(old)), "{session}");
-    drop(db_socket);
-    fixture.ok(&["down"]);
-}
-
-#[test]
-fn the_generated_environment_ends_with_the_binding_of_supervisor_requests() {
-    // A project's own PITCHFORK_STATE_DIR comes first, as written; Stack's `_.file` directive
-    // last, which mise applies after it (see `mise::BINDING_VAR`). Tools alone get none.
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[env]\nPITCHFORK_STATE_DIR=\"{{ exec(command='cat provider-target') | trim }}\"\n[services.web]\nrun='true'\n");
-    let config = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
-    let declared = config.find("PITCHFORK_STATE_DIR = \"{{ exec(command='cat provider-target') | trim }}\"").expect(&config);
-    let binding = config
-        .find("[env._]\nfile = \"{{ get_env(name='STACK_SUPERVISOR_BINDING', default='.stack/provider-config/no-supervisor-binding.json') }}\"")
-        .expect(&config);
-    assert!(declared < binding, "{config}");
-    let table: toml::Table = config.parse().unwrap();
-    let env = table["env"].as_table().unwrap();
-    assert_eq!(env.keys().next_back().map(String::as_str), Some("_"), "{config}");
-    let tools = Fixture::with_bundle("[bundle]\nname='test'\n[env]\nA='1'\n");
-    let config = fs::read_to_string(tools.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
-    assert!(!config.contains("STACK_SUPERVISOR_BINDING"), "{config}");
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_change_made_as_a_start_is_requested_cannot_take_it_outside_the_lock() {
-    // A owns `pf`'s supervisor and its `down` is deciding to stop it, holding `pf`'s lock alone
-    // with the daemons it saw (none running) in hand. B, another checkout in another Stack
-    // state, renders PITCHFORK_STATE_DIR from `provider-target` (see the fake mise), which names
-    // `pf-old` whenever Stack looks; another program makes it name `pf` exactly as mise renders
-    // B's start request, after Stack's last look (`retarget-at-start`). The request must still
-    // reach `pf-old`, whose lock B holds and which its record names: nothing may start under
-    // `pf`, and A's stop of `pf` (which takes the services it runs with it, see the fake
-    // pitchfork) must leave B's service running.
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-    fs::write(dir.join("supervisor-owns-services"), "").unwrap();
-    let b = dir.join("b");
-    fs::create_dir(&b).unwrap();
-    for file in ["stack.toml", "stack.lock"] {
-        fs::copy(dir.join("app").join(file), b.join(file)).unwrap();
-    }
-    let in_b = |args: &[&str]| {
-        let mut command = fixture.command_at(&b, args);
-        // An inherited binding never decides where a request goes, nor anything else.
-        command
-            .env("PITCHFORK_STATE_DIR", dir.join("pf-inherited"))
-            .env("STACK_STATE_DIR", dir.join("state-b"))
-            .env("STACK_SUPERVISOR_BINDING", dir.join("not-a-binding.json"));
-        command
-    };
-    fs::write(dir.join("not-a-binding.json"), json!({ "PITCHFORK_STATE_DIR": pf }).to_string()).unwrap();
-    fs::write(b.join("provider-target"), old.to_str().unwrap()).unwrap();
-    fs::write(b.join("desired-target"), pf.to_str().unwrap()).unwrap();
-    assert!(in_b(&["compile"]).output().unwrap().status.success());
-    let inspected = json_result(&in_b(&["inspect", "--json"]).output().unwrap());
-    let b_port = u16::try_from(inspected["data"]["ports"]["web"].as_u64().unwrap()).unwrap();
-
-    // A runs under `pf`, which Stack started for it.
+    // A session of Stack's own supervisor reports that supervisor gone with its services.
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-    assert!(out.status.success(), "{}", json_result(&out));
-    let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
-    let supervisor = fake_supervisor(&fixture, Some(&mark));
-
-    fs::write(dir.join("pf-list-gate"), "").unwrap();
-    let mut down = fixture
-        .command(&["down", "--json"])
-        .env("PITCHFORK_STATE_DIR", &pf)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let until = Instant::now() + Duration::from_secs(30);
-    while !dir.join("list-ready").exists() {
-        assert!(Instant::now() < until, "A never asked what the supervisor runs");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let requested = request_count(dir);
-    let bound = fs::read_to_string(dir.join("bindings.log")).unwrap().lines().count();
-    fs::write(dir.join("daemons.json"), "[]").unwrap();
-    supervise_listener(&fixture, b_port);
-    fs::write(dir.join("retarget-at-start"), "").unwrap();
-
-    // B starts while A still decides: it never needs `pf`'s lock, as it never asks `pf`.
-    let out = in_b(&["up", "--json"]).output().unwrap();
-    let result = json_result(&out);
-    assert!(out.status.success(), "{result}");
-    assert!(down.try_wait().unwrap().is_none(), "A finished before B");
-    // The input changed as the start request was rendered, after every look Stack took ...
-    assert!(dir.join("retargeted").exists());
-    assert_eq!(fs::read_to_string(b.join("provider-target")).unwrap(), pf.to_str().unwrap());
-    // ... and every request B made, that start included, reached `pf-old`.
-    let made = requests_from(dir, &b, requested);
-    assert!(made.contains(&format!("daemons start -- web => {}", old.display())), "{made:?}");
-    assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{made:?}");
-    let session: Value = serde_json::from_slice(&fs::read(b.join(".stack/session.json")).unwrap()).unwrap();
-    assert_ne!(session["launching"], json!(true), "{session}");
-    assert_eq!(session["provider"]["state_dir"], json!(old), "{session}");
-    // Only the requests that may start or stop something carried a binding, Stack's own.
-    let bindings = fs::read_to_string(dir.join("bindings.log")).unwrap();
-    let expected = dir.join("state-b/supervisor-bindings").canonicalize().unwrap();
-    for line in bindings.lines().skip(bound) {
-        let (call, binding) = line.rsplit_once(' ').unwrap();
-        match call {
-            "daemons start" | "daemons stop" | "x --" => assert!(Path::new(binding).starts_with(&expected), "{line}"),
-            _ => assert_eq!(binding, "unset", "{line}"),
-        }
-    }
-    let service: u32 = fs::read_to_string(dir.join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
-
-    // A goes on and stops the supervisor nothing used; B's service, run by `pf-old`, runs on.
-    fs::write(dir.join("release-list"), "").unwrap();
-    let down = down.wait_with_output().unwrap();
-    let result = json_result(&down);
-    assert!(down.status.success(), "{result}");
-    assert_eq!(result["data"]["supervisor"], json!({ "stopped": true, "state_dir": pf }), "{result}");
-    assert!(!alive(supervisor));
-    assert!(alive(service), "A's stop of `pf` ended B's service");
-    assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_ok(), "B's service is not listening");
-    let status = json_result(&in_b(&["status", "--json"]).output().unwrap());
-    assert_eq!(status["data"]["healthy"], true, "{status}");
-    assert!(in_b(&["down"]).output().unwrap().status.success());
-    assert!(std::net::TcpStream::connect(("127.0.0.1", b_port)).is_err(), "B's service still runs");
+    fixture.ok(&["up"]);
+    let native = json_result(&fixture.ok(&["down", "--json"]))["data"]["supervisor"].clone();
+    assert_eq!(native["stopped"], true, "{native}");
+    assert!(native["state_dir"].as_str().unwrap().contains("/state/supervisors/"), "{native}");
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn every_request_reaches_the_supervisor_its_command_chose_however_the_environment_renders_it() {
-    // `provider-target` names `pf-old` whenever Stack looks; another program makes it name `pf`
-    // exactly as mise renders one request (see the fake mise): the supervisor's own start in
-    // `up`, the stop of `restart` or of `down`. That request still reaches `pf-old`, whose lock
-    // the command holds; a command with more to ask then finds the environment naming `pf` and
-    // asks nothing more of either (`supervisor_changed`), its record still naming `pf-old`.
-    for (case, at, args) in [
-        ("up", "x --", &["up", "--json"][..]),
-        ("restart", "daemons stop", &["restart", "web", "--json"][..]),
-        ("down", "daemons stop", &["down", "--json"][..]),
-    ] {
-        let fixture = Fixture::with_bundle(WEB);
-        let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-        let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-        fs::write(app.join("provider-target"), old.to_str().unwrap()).unwrap();
-        fs::write(app.join("desired-target"), pf.to_str().unwrap()).unwrap();
-        let port = assigned_port(&fixture, "web");
-        supervise_listener(&fixture, port);
-        if case != "up" {
-            fixture.ok(&["up"]);
-        }
-        let requested = request_count(&dir);
-        fs::write(dir.join("retarget-at"), at).unwrap();
-        let out = fixture.command(args).output().unwrap();
-        let result = json_result(&out);
-        assert!(dir.join("retargeted").exists(), "{case}: the environment never changed");
-        let made = requests_from(&dir, &app, requested);
-        assert!(made.iter().any(|r| r.starts_with(at)), "{case}: {made:?}");
-        assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{case}: a request reached `pf`: {made:?}");
-        if case == "down" {
-            assert!(out.status.success(), "{case}: {result}");
-            assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "{case}: the service still runs");
-            continue;
-        }
-        assert!(!out.status.success(), "{case}: {result}");
-        assert_eq!(result["error"]["code"], "supervisor_changed", "{case}: {result}");
-        assert!(!made.iter().any(|r| r.starts_with("daemons start")), "{case}: started after the change: {made:?}");
-        assert_eq!(fixture.session()["provider"]["state_dir"], json!(old), "{case}");
-        fixture.ok(&["down"]);
-    }
-}
-
-/// The `[env._]` table a Stack from before the binding never wrote (see `mise::BINDING_VAR`).
-const BINDING_DIRECTIVE: &str = "[env._]\nfile = \"{{ get_env(name='STACK_SUPERVISOR_BINDING', default='.stack/provider-config/no-supervisor-binding.json') }}\"\n\n";
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_configuration_written_before_the_binding_still_binds_the_stop_of_down() {
-    // A Stack from before the binding started the service under `pf-old` and wrote the
-    // configuration without the `_.file` directive; `down`, from the CLI or MCP, uses it as it
-    // finds it, even once stack.toml changed since (`stale`). `provider-target` names `pf-old`
-    // whenever Stack looks and `pf` as mise renders the stop, while another command holds
-    // `pf`'s lock alone. The stop must still reach `pf-old`, the configuration gaining the
-    // directive and nothing else: exactly what `compile` writes.
-    for case in ["down", "mcp", "stale"] {
-        let fixture = Fixture::with_bundle(WEB);
-        let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-        let (pf, old) = (dir.join("pf"), dir.join("pf-old"));
-        fs::write(app.join("provider-target"), old.to_str().unwrap()).unwrap();
-        fs::write(app.join("desired-target"), pf.to_str().unwrap()).unwrap();
-        let port = assigned_port(&fixture, "web");
-        supervise_listener(&fixture, port);
-        fixture.ok(&["up"]);
-        let path = app.join(".config/mise/conf.d/stack.toml");
-        let current = fs::read_to_string(&path).unwrap();
-        assert!(current.contains(BINDING_DIRECTIVE), "{current}");
-        fs::write(&path, current.replacen(BINDING_DIRECTIVE, "", 1)).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        if case == "stale" {
-            let manifest = fs::read_to_string(app.join("stack.toml")).unwrap();
-            fs::write(app.join("stack.toml"), format!("{manifest}[services.api]\nrun='true'\n")).unwrap();
-        }
-        fs::create_dir_all(&pf).unwrap();
-        let held = fs::File::create(pf.join("stack-supervisor.lock")).unwrap();
-        // SAFETY: flock on a descriptor this test owns.
-        assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) }, 0);
-        let requested = request_count(&dir);
-        fs::write(dir.join("retarget-at"), "daemons stop").unwrap();
-        let result = if case == "mcp" {
-            let mcp = fixture.mcp(&[("stack_down", json!({}))], &[]);
-            assert_ne!(mcp[0]["isError"], json!(true), "{case}: {}", mcp[0]);
-            mcp[0]["structuredContent"].clone()
-        } else {
-            let out = fixture.command(&["down", "--json"]).output().unwrap();
-            let result = json_result(&out);
-            assert!(out.status.success(), "{case}: {result}");
-            result
-        };
-        assert!(dir.join("retargeted").exists(), "{case}: the environment never changed");
-        let made = requests_from(&dir, &app, requested);
-        assert!(made.iter().any(|r| r.starts_with("daemons stop")), "{case}: {made:?}");
-        assert!(made.iter().all(|r| r.ends_with(&format!("=> {}", old.display()))), "{case}: a request reached `pf`: {made:?} {result}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), current, "{case}");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640, "{case}");
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "{case}: the service still runs");
-        drop(held);
-    }
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_configuration_that_cannot_bind_a_stop_asks_the_supervisor_nothing() {
-    // A configuration Stack cannot make bind its requests (another `_.file`, or a file `compile` did not
-    // write) is left as it is, and nothing is asked: `supervisor_unbound`, the service running.
-    // `compile` writes it again, and `down` then stops the service.
-    let other = "[env._]\nfile = \"elsewhere.json\"\n\n";
-    for (case, edit) in [("other file", other), ("not generated", "")] {
-        let fixture = Fixture::with_bundle(WEB);
-        let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-        let port = assigned_port(&fixture, "web");
-        supervise_listener(&fixture, port);
-        fixture.ok(&["up"]);
-        let path = app.join(".config/mise/conf.d/stack.toml");
-        let current = fs::read_to_string(&path).unwrap();
-        let mut changed = current.replacen(BINDING_DIRECTIVE, edit, 1);
-        if case == "not generated" {
-            changed = changed.replacen("# Generated by `stack compile`", "# Written by hand", 1);
-        }
-        fs::write(&path, &changed).unwrap();
-        let requested = request_count(&dir);
-        let out = fixture.command(&["down", "--json"]).output().unwrap();
-        let result = json_result(&out);
-        assert!(!out.status.success(), "{case}: {result}");
-        assert_eq!(result["error"]["code"], "supervisor_unbound", "{case}: {result}");
-        assert!(result["error"]["hint"].as_str().unwrap().contains("stack compile"), "{case}: {result}");
-        assert_eq!(requests_from(&dir, &app, requested), Vec::<String>::new(), "{case}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), changed, "{case}");
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "{case}: the service was stopped");
-        fixture.ok(&["compile"]);
-        assert_eq!(fs::read_to_string(&path).unwrap(), current, "{case}");
-        fixture.ok(&["down"]);
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "{case}: the service still runs");
-    }
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_command_that_cannot_tell_which_supervisor_it_reaches_asks_it_nothing() {
-    // Without PITCHFORK_STATE_DIR or HOME, Pitchfork's state directory cannot be predicted, so
-    // no lock could keep another checkout's `down` from stopping the supervisor meanwhile.
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    let pf = dir.join("pf");
-    let blind = |args: &[&str]| {
-        let out = fixture.command(args).env_remove("PITCHFORK_STATE_DIR").env_remove("HOME").env_remove("XDG_STATE_HOME").output().unwrap();
-        assert!(!out.status.success(), "{args:?}");
-        let result = json_result(&out);
-        assert_eq!(result["error"]["code"], "supervisor_unknown", "{args:?}: {result}");
-        assert!(result["error"]["hint"].as_str().unwrap().contains("PITCHFORK_STATE_DIR"), "{result}");
-        result
-    };
-    let asked = || fs::read_to_string(dir.join("owner-marks.log")).unwrap_or_default();
-    let port = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, port);
-    let result = blind(&["up", "--json"]);
-    let steps = result["error"]["details"].as_array().unwrap().last().unwrap()["steps"].clone();
-    assert_eq!(steps.as_array().unwrap().last().unwrap()["step"], "preflight", "{result}");
-    assert_eq!(asked(), "", "nothing may be asked of the supervisor");
-    assert!(!dir.join("start-requests.log").exists());
-
-    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-    assert!(out.status.success(), "{}", json_result(&out));
-    let before = asked();
-    blind(&["restart", "--json"]);
-    blind(&["down", "--json"]);
-    assert_eq!(asked(), before, "restart and down asked the supervisor anyway");
-    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "the service was stopped");
-    let out = fixture.command(&["down", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
-    assert!(out.status.success(), "{}", json_result(&out));
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_keeps_a_supervisor_stack_cannot_show_it_started() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
     let pf = dir.join("pf");
+    let legacy = fixture.legacy_record(&pf);
     let supervisor = || -> Value {
-        let out = fixture.command(&["down", "--json"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
+        legacy();
+        let out = fixture.command(&["down", "--json"]).output().unwrap();
         let result = json_result(&out);
         assert!(out.status.success(), "{result}");
         result["data"]["supervisor"].clone()
     };
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    // A mark in stack's own environment (a service of another Stack state running it, say)
-    // never reaches a request.
-    let foreign = "stack-ffffffffffffffffffffffffffffffff";
-    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).env("STACK_SUPERVISOR_OWNER", foreign).output().unwrap();
-    assert!(out.status.success(), "{}", json_result(&out));
-    let mark = fs::read_to_string(dir.join("state/supervisor-owner")).unwrap().trim().to_string();
-    let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-    assert!(marks.lines().all(|l| l.ends_with(&mark)) && marks.contains("daemons start"), "{marks}");
+    // Its own mark: tests run side by side in one process group.
+    let mark = "stack-1111111111111111aaaaaaaaaaaaaaaa".to_string();
+    fs::write(dir.join("state/supervisor-owner"), format!("{mark}\n")).unwrap();
     let not_started = |pid: u32| format!("this Stack state did not start supervisor pid {pid}: it was running before Stack used it, or something else started it");
 
     // Running before Stack used it, or started by another Stack state.
@@ -3186,14 +2371,7 @@ fn down_keeps_a_supervisor_stack_cannot_show_it_started() {
     fs::write(&record, "not a mark\n").unwrap();
     let kept = supervisor();
     assert_eq!(kept["reason"], format!("Stack cannot tell whether it started this supervisor: {} does not hold an owner mark Stack wrote", record.display()), "{kept}");
-    fs::remove_file(dir.join("owner-marks.log")).unwrap();
-    let out = fixture.command(&["up", "--json"]).env("PITCHFORK_STATE_DIR", &pf).env("STACK_SUPERVISOR_OWNER", foreign).output().unwrap();
-    assert!(out.status.success(), "{}", json_result(&out));
     assert_eq!(fs::read_to_string(&record).unwrap(), "not a mark\n");
-    // Its requests carry no mark at all.
-    let marks = fs::read_to_string(dir.join("owner-marks.log")).unwrap();
-    assert!(marks.lines().all(|l| l.ends_with(" unset")) && marks.contains("daemons start"), "{marks}");
-    fixture.command(&["down"]).env("PITCHFORK_STATE_DIR", &pf).output().unwrap();
     fs::remove_file(&record).unwrap();
     assert!(supervisor()["reason"].as_str().unwrap().ends_with("supervisor-owner does not exist"));
     assert!(alive(pid));
@@ -3204,7 +2382,8 @@ fn down_keeps_a_supervisor_stack_cannot_show_it_started() {
     assert_eq!(supervisor(), json!({ "stopped": false, "reason": "pitchfork supervisor stop: cannot stop the supervisor" }));
     assert!(alive(pid));
     fs::remove_file(dir.join("pf-fail-supervisor-stop")).unwrap();
-    assert_eq!(supervisor()["stopped"], true);
+    let stopped = supervisor();
+    assert_eq!(stopped["stopped"], true, "{stopped}");
     assert!(!alive(pid));
 
     // A checkout without services has no supervisor to report.
@@ -3214,7 +2393,6 @@ fn down_keeps_a_supervisor_stack_cannot_show_it_started() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_before_any_up_in_a_checkout_without_its_generated_configuration_confirms_nothing_runs() {
     let fixture = Fixture::with_bundle(WEB);
     let app = fixture.dir.path().join("app");
@@ -3224,7 +2402,7 @@ fn down_before_any_up_in_a_checkout_without_its_generated_configuration_confirms
     let result = json_result(&out);
     assert!(out.status.success(), "{result}");
     assert_eq!((result["ok"].clone(), result["data"]["confirmed"].clone()), (json!(true), json!(true)), "{result}");
-    assert!(app.join(".config/mise/conf.d/stack.toml").exists(), "down writes the configuration from stack.lock");
+    assert!(!app.join(".config").exists(), "Stack's supervisor needs no generated configuration to stop anything");
 
     // A checkout that owns nothing (never compiled here) gets no configuration and no ports.
     let other = fixture.dir.path().join("other");
@@ -3239,7 +2417,6 @@ fn down_before_any_up_in_a_checkout_without_its_generated_configuration_confirms
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn adding_or_editing_a_task_keeps_the_running_session_current() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -3265,7 +2442,6 @@ fn adding_or_editing_a_task_keeps_the_running_session_current() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restart_refuses_a_session_started_from_another_configuration() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -3326,61 +2502,44 @@ fn argument_errors_honour_json() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_start_keeps_ownership_even_after_the_service_is_removed() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "name": "web", "status": "running", "pid": std::process::id() }]).to_string(),
-    )
-    .unwrap();
-    fs::write(fixture.dir.path().join("fail-start"), "").unwrap();
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='exit 3'\n");
     let out = fixture.command(&["up", "--json"]).output().unwrap();
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(result["error"]["code"], "start_failed");
+    assert_eq!(result["error"]["code"], "start_failed", "{result}");
+    assert_eq!(result["error"]["details"][0]["exit"], "exit code 3", "{result}");
+    assert_eq!(fixture.session()["launching"], true, "the launch stays recorded");
 
     // The launch record withholds the service: nothing verified it.
     let status: Value = serde_json::from_slice(&fixture.command(&["status", "--json"]).output().unwrap().stdout).unwrap();
     assert_eq!(status["data"]["checks"][0]["ready"], false);
 
-    // Dropping the service also drops its port reservation; the launch record still names it.
+    // Dropping the service also drops its port reservation; the launch record still names it,
+    // and `down` stops what the supervisor runs for it before forgetting it.
     fs::write(fixture.dir.path().join("bundle/bundle.toml"), "[bundle]\nname='test'\n").unwrap();
     fixture.ok(&["compile"]);
-    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
-    let out = fixture.command(&["down", "--json"]).output().unwrap();
-    assert!(!out.status.success(), "down confirmed cleanup without asking the supervisor");
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "provider_failed");
-    assert!(fixture.session_paths().iter().all(|p| p.exists()));
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(fixture.session_paths().iter().all(|p| !p.exists() || p.is_dir()));
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_failed_start_reports_the_services_error_without_the_supervisors_animation() {
-    let fixture = Fixture::with_bundle(WEB);
-    let frame = |n: u32| format!("{} [{WEB_ID}] waiting for delay (3s)...\n\r", char::from_u32(0x280b + n).unwrap());
-    let said = |line: &str| format!("\u{2022} [{WEB_ID}] {line}\n");
-    let output: String = [
-        frame(0),
-        said("Traceback (most recent call last):"),
-        frame(1),
-        said("  File \"/p/server.py\", line 2, in <module>"),
-        frame(2),
-        said("RuntimeError: bad edit"),
-        frame(3),
-        format!("\u{1b}[31mpitchfork ERROR\u{1b}[0m Daemon {WEB_ID} failed to start\n"),
-    ]
-    .concat();
-    fs::write(fixture.dir.path().join("fail-start"), output).unwrap();
-    let out = fixture.command(&["up", "--json"]).env("NO_COLOR", "1").env("CI", "1").output().unwrap();
+    let run = r#"printf 'Traceback (most recent call last):\n  File "/p/server.py", line 2, in <module>\nRuntimeError: bad edit\n' >&2; exit 1"#;
+    let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.web]\nrun='''{run}'''\n"));
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["error"]["code"], "start_failed", "{result}");
+    assert_eq!(result["error"]["message"], "web exited while starting (exit code 1)", "{result}");
     assert_eq!(
         result["error"]["details"][0]["output"],
-        format!(
-            "[web] Traceback (most recent call last):\n[web]   File \"/p/server.py\", line 2, in <module>\n[web] RuntimeError: bad edit\npitchfork ERROR Daemon {WEB_ID} failed to start\nstart failed"
-        ),
+        "Traceback (most recent call last):\n  File \"/p/server.py\", line 2, in <module>\nRuntimeError: bad edit",
         "{result}"
     );
+    // The same lines are the service's log.
+    let logs = json_result(&fixture.ok(&["logs", "web", "--json"]));
+    assert_eq!(logs["data"]["lines"][2], "RuntimeError: bad edit", "{logs}");
+    fixture.ok(&["down"]);
 }
 
 #[cfg(unix)]
@@ -3399,16 +2558,11 @@ fn non_unicode_arguments_never_crash_usage_errors() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn startup_time_does_not_consume_the_idle_ttl() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
     let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
-    )
-    .unwrap();
+    fixture.sleepers();
     fs::write(fixture.dir.path().join("slow-start"), "3").unwrap();
     let up = fixture.command(&["up", "--ttl", "2s", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -3451,50 +2605,6 @@ fn mise_resolution_with_no_matching_release_fails_before_writing_anything() {
     let out = fixture.command(&["exec", "--json", "--", "true"]).output().unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["error"]["code"], "lock_outdated");
     assert!(!fs::read_to_string(&log).unwrap_or_default().contains("latest"));
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_long_supervisor_socket_path_fails_before_install_and_doctor_reports_it() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
-    let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
-    let suffix = "/sock/main.sock".len();
-    // One byte over, made of two-byte characters so a character count would pass it.
-    let long = |extra: usize| format!("/tmp/{}", "é".repeat((limit - suffix - 5 + extra) / 2) + &"x".repeat((limit - suffix - 5 + extra) % 2));
-    let log = fixture.dir.path().join("mise.log");
-    for (via_config, value) in [(true, long(1)), (false, long(1))] {
-        let _ = fs::remove_file(&log);
-        let mut command = fixture.command(&["up", "--json"]);
-        if via_config {
-            fixture.set_env(&[("PITCHFORK_STATE_DIR", value.clone())]);
-        } else {
-            fixture.set_env(&[]);
-            command.env("PITCHFORK_STATE_DIR", &value);
-        }
-        let out = command.output().unwrap();
-        assert!(!out.status.success());
-        let err: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(err["error"]["code"], "socket_path_too_long", "{err}");
-        assert_eq!(err["error"]["details"][0]["bytes"], limit + 1, "{err}");
-        let steps = &err["error"]["details"][1]["steps"];
-        assert_eq!(steps.as_array().unwrap().last().unwrap()["step"], "preflight", "{err}");
-        assert_eq!(err["error"]["details"][1]["changed"], false);
-        let calls = fs::read_to_string(&log).unwrap();
-        assert!(!calls.contains("install") && !calls.contains("daemons start"), "{calls}");
-
-        let out = fixture.command(&["doctor", "--json"]).env("PITCHFORK_STATE_DIR", &value).output().unwrap();
-        let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
-        let check = doctor["error"]["details"].as_array().unwrap().iter().find(|c| c["name"] == "pitchfork_socket").cloned();
-        assert_eq!(check.unwrap()["ok"], false, "{doctor}");
-    }
-    // Exactly at the limit is accepted, as Pitchfork accepts it.
-    fixture.set_env(&[]);
-    let out = fixture.command(&["doctor", "--json"]).env("PITCHFORK_STATE_DIR", long(0)).output().unwrap();
-    let doctor: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let checks = doctor["data"].as_array().or(doctor["error"]["details"].as_array()).unwrap().clone();
-    let check = checks.iter().find(|c| c["name"] == "pitchfork_socket").unwrap();
-    assert_eq!(check["ok"], true, "{doctor}");
-    assert!(check["detail"].as_str().unwrap().contains(&format!("({limit} of {limit} bytes")), "{doctor}");
 }
 
 /// A TCP "service" whose answer the test controls: each connection gets the current reply
@@ -3554,7 +2664,6 @@ fn web_status(fixture: &Fixture) -> Value {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn identity_probes_accept_only_this_checkouts_instance() {
     let fixture = Fixture::with_bundle(PROBED_WEB);
     fs::write(fixture.dir.path().join("bundle/probe.py"), PROBE_PY).unwrap();
@@ -3564,13 +2673,9 @@ fn identity_probes_accept_only_this_checkouts_instance() {
     let config: toml::Table = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap().parse().unwrap();
     let token = config["env"]["STACK_IDENTITY_WEB"].as_str().unwrap().to_string();
     assert!(token.starts_with("stack-") && token.len() > 30, "{token}");
-    assert!(!config["daemons"]["web"].as_table().unwrap().contains_key("identity"), "probe is not provider config");
+    assert!(!config.contains_key("daemons"), "services are not provider config");
     fixture.set_env(&[("WEB_PORT", port.to_string()), ("STACK_IDENTITY_WEB", token.clone())]);
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
-    )
-    .unwrap();
+    fixture.sleepers();
 
     // The correct instance verifies as an instance, not merely as alive.
     let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
@@ -3634,18 +2739,13 @@ fn identity_probes_accept_only_this_checkouts_instance() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn services_without_probes_stay_liveness_only() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
     let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
     let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
     let config = fs::read_to_string(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
     assert!(!config.contains("STACK_IDENTITY"), "{config}");
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "name": "web", "status": "running", "pid": std::process::id(), "port": port }]).to_string(),
-    )
-    .unwrap();
+    fixture.sleepers();
     let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
     while !fixture.dir.path().join("started").exists() {
         thread::sleep(Duration::from_millis(10));
@@ -3690,27 +2790,29 @@ struct Running {
 }
 
 impl Fixture {
-    /// `stack up` of one supervised service that is really running and listening.
+    /// A session of one service as Stack 0.1.23 left it, running under Pitchfork (the fake
+    /// `pitchfork` in `bin/`): a native `up` of a listening service (see [`supervise_listener`])
+    /// gives the record its digests and directory identity and is stopped, then the record is
+    /// rewritten to name a detached process as the service, Pitchfork as its supervisor and
+    /// `WEB_ID` as its id, and the service's port is held by a listener of the test's.
     fn start_web(&self, up_args: &[&str]) -> Running {
-        let inspect: Value = serde_json::from_slice(&self.ok(&["inspect", "--json"]).stdout).unwrap();
-        let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
-        let service = Detached::spawn();
-        fs::write(
-            self.dir.path().join("daemons-started.json"),
-            json!([{ "id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
-        )
-        .unwrap();
+        let port = assigned_port(self, "web");
+        supervise_listener(self, port);
         let mut args = vec!["up", "--json"];
         args.extend_from_slice(up_args);
-        let up = self.command(&args).stdout(Stdio::piped()).spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !self.dir.path().join("started").exists() {
-            assert!(Instant::now() < deadline, "provider start never ran");
-            thread::sleep(Duration::from_millis(10));
+        let up = self.command(&args).output().unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stdout));
+        let index = fs::read_dir(self.dir.path().join("state/sessions")).unwrap().next().unwrap().unwrap().path();
+        let mut session: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        self.ok(&["down"]);
+        let service = Detached::spawn();
+        session["provider"] = json!({ "pitchfork": self.dir.path().join("bin/pitchfork"), "state_dir": self.dir.path().join("pfs") });
+        session["services"]["web"]["pid"] = json!(service.0);
+        session["services"]["web"]["provider_id"] = json!(WEB_ID);
+        for path in [index, self.dir.path().join("app/.stack/session.json")] {
+            fs::write(path, session.to_string()).unwrap();
         }
         let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let out = up.wait_with_output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
         Running { service, port, listener: Some(listener) }
     }
 
@@ -3736,13 +2838,87 @@ impl Fixture {
         fs::read_dir(self.dir.path().join("state/sessions")).map_or(0, |d| d.count())
     }
 
+    /// Make the bundle's `run='true'` services processes that run until stopped without
+    /// listening (see [`SLEEPER`]): the test then stands in for what they serve, binding their
+    /// ports once `started` exists. Compiles again; ports are kept.
+    fn sleepers(&self) {
+        let path = self.dir.path().join("bundle/bundle.toml");
+        let bundle = fs::read_to_string(&path).unwrap();
+        fs::write(&path, bundle.replace("run='true'", &format!("run='''{SLEEPER}'''"))).unwrap();
+        self.ok(&["compile"]);
+    }
+
+    /// A closure that records this checkout's session as Stack 0.1.23 left it under the
+    /// Pitchfork supervisor of state directory `pf` (the fake `pitchfork` in `bin/`), with
+    /// nothing of it running any more: what `down` then decides about that supervisor. The
+    /// record's digests and directory identity come from a native `up` of a listening service,
+    /// stopped before this returns.
+    fn legacy_record(&self, pf: &Path) -> impl Fn() + '_ {
+        supervise_listener(self, assigned_port(self, "web"));
+        self.ok(&["up"]);
+        let index = fs::read_dir(self.dir.path().join("state/sessions")).unwrap().next().unwrap().unwrap().path();
+        let mut session: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        self.ok(&["down"]);
+        session["provider"] = json!({ "pitchfork": self.dir.path().join("bin/pitchfork"), "state_dir": pf });
+        session["services"]["web"].as_object_mut().unwrap().remove("pid");
+        session["services"]["web"]["provider_id"] = json!(WEB_ID);
+        let mirror = self.dir.path().join("app/.stack/session.json");
+        move || {
+            for path in [&index, &mirror] {
+                fs::write(path, session.to_string()).unwrap();
+            }
+        }
+    }
+
+    /// Make the bundle's `web` a Postgres preset served by the stand-ins of
+    /// `support/servers.rs` (installed in `bin/`), and compile again; its port is kept.
+    fn postgres_web(&self) -> u16 {
+        servers::install(&self.dir.path().join("bin"));
+        let path = self.dir.path().join("bundle/bundle.toml");
+        let bundle = fs::read_to_string(&path).unwrap();
+        fs::write(&path, bundle.replace("[services.web]\nrun='true'", "[services.web]\npreset='postgres'\nversion='17'")).unwrap();
+        self.ok(&["compile"]);
+        let port = assigned_port(self, "web");
+        // What mise renders from the generated configuration's `[env]` (the fake answers from
+        // `env.json`).
+        self.set_env(&[("DATABASE_URL", format!("postgresql://postgres@127.0.0.1:{port}/postgres"))]);
+        port
+    }
+
+    /// `web`'s data directory where mise's preset kept it for this checkout, as an older Stack
+    /// left it (`<MISE_STATE_DIR>/daemons/<hash>/data/web`, its `state.json` naming the
+    /// checkout), initialised for Postgres 17.
+    fn legacy_data(&self, hash: &str) -> std::path::PathBuf {
+        let state = self.dir.path().join("mise-state/daemons").join(hash);
+        let data = state.join("data/web");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join(".mise-daemon-version"), "postgres:17").unwrap();
+        let app = self.dir.path().join("app").canonicalize().unwrap();
+        fs::write(state.join("state.json"), json!({ "root": app }).to_string()).unwrap();
+        data
+    }
+
+    /// Have Stack's supervisor directory `dir` report `service` running as `pid`.
+    fn report_running(&self, dir: &Path, service: &str, pid: u32) {
+        let started = stack::procinfo::process(pid).unwrap().started;
+        let boot = stack::procinfo::boot_id();
+        let state = json!({ "supervisor": null, "applied": 1, "services": { service: { "status": "running", "process": { "pid": pid, "started": started, "boot": boot }, "port": 1, "stop_signal": 15 } } });
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    }
+
+    /// What Stack's supervisor for the checkout last wrote (its `state.json`).
+    fn supervisor_state(&self) -> Value {
+        let dir = fs::read_dir(self.dir.path().join("state/supervisors")).unwrap().next().unwrap().unwrap().path();
+        serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap()
+    }
+
     fn pitchfork_log(&self) -> String {
         fs::read_to_string(self.dir.path().join("pitchfork.log")).unwrap_or_default()
     }
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn deleted_projects_are_retained_until_the_supervisor_confirms_terminal_cleanup() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -3790,7 +2966,6 @@ fn awkward_provider(fixture: &Fixture) -> (String, String) {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -3835,7 +3010,6 @@ fn a_deleted_checkouts_recovery_commands_reach_the_recorded_supervisor_verbatim(
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn every_gc_mode_shows_the_recovery_commands() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -3863,7 +3037,6 @@ fn every_gc_mode_shows_the_recovery_commands() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -3904,7 +3077,6 @@ fn stale_or_reused_pids_are_never_signalled_and_ownership_is_kept() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_foreign_process_on_a_dead_services_port_is_left_alone() {
     let fixture = Fixture::with_bundle(WEB);
     let mut running = fixture.start_web(&[]);
@@ -3923,7 +3095,6 @@ fn a_foreign_process_on_a_dead_services_port_is_left_alone() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_reused_directory_inode_does_not_inherit_the_old_sessions_authority() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -3964,7 +3135,6 @@ fn sessions_without_directory_birth_times_remain_readable() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&["--ttl", "1s"]);
@@ -4001,7 +3171,6 @@ fn a_replaced_project_directory_does_not_inherit_the_old_sessions_authority() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn nonterminal_supervisor_states_keep_ownership_even_when_the_recorded_pid_is_dead() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -4024,7 +3193,6 @@ fn nonterminal_supervisor_states_keep_ownership_even_when_the_recorded_pid_is_de
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&[]);
@@ -4053,7 +3221,6 @@ fn an_active_command_protects_a_deleted_projects_services_until_it_finishes() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web(&["--ttl", "2s"]);
@@ -4099,46 +3266,28 @@ fn watch_mode_reclaims_an_expired_lease_without_another_up_but_not_a_renewed_one
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn configured_home_cannot_hide_an_overlong_supervisor_socket() {
-    let fixture = Fixture::with_bundle(WEB);
-    let long = format!("/tmp/{}", "x".repeat(120));
-    fixture.set_env(&[("HOME", long.clone())]);
-    let out = fixture.command(&["up", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
-    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(result["error"]["code"], "socket_path_too_long", "{result}");
-    let calls = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(!calls.contains("install") && !calls.contains("daemons start"), "{calls}");
-    fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[env]\nHOME={long:?}\n")).unwrap();
-    let out = fixture.command(&["doctor", "--json"]).env_remove("PITCHFORK_STATE_DIR").env_remove("XDG_STATE_HOME").output().unwrap();
-    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(result["error"]["details"].as_array().unwrap().iter().any(|c| c["name"] == "pitchfork_socket" && c["ok"] == false), "{result}");
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn every_partial_start_failure_preserves_observed_ownership() {
-    for failure in ["fail-start", "fail-env-after-start", "fail-query-after-one"] {
-        let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.other]\nrun='false'\n");
-        let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
-        let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
-        let other_port = inspect["data"]["ports"]["other"].as_u64().unwrap() as u16;
-        let service = Detached::spawn();
-        fs::write(fixture.dir.path().join("daemons-started.json"), json!([
-            {"id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port},
-            {"id": "app-0123456789abcdef/other", "name": "other", "status": "errored", "port": other_port}
-        ]).to_string()).unwrap();
-        fs::write(fixture.dir.path().join(failure), "").unwrap();
-        let out = fixture.command(&["up", "--json"]).output().unwrap();
-        assert!(!out.status.success(), "{failure}");
-        for file in fixture.session_paths() {
-            let record: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
-            assert_eq!(record["launching"], true, "{failure}: {record}");
-            assert_eq!(record["services"]["web"]["pid"], service.0, "{failure}: {record}");
-            assert_eq!(record["services"]["web"]["provider_id"], WEB_ID, "{failure}: {record}");
-            assert_eq!(record["services"]["other"]["provider_id"], "app-0123456789abcdef/other", "{failure}: {record}");
-        }
+    // One service runs (without listening, so it never verifies), the other exits at once.
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.other]\nrun='false'\n");
+    fixture.sleepers();
+    let out = fixture.command(&["up", "--json"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(json_result(&out)["error"]["code"], "start_failed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.dir.path().join("pf-tracked-pid").exists() {
+        assert!(Instant::now() < deadline, "web never started");
+        thread::sleep(Duration::from_millis(10));
     }
+    let web: u64 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    for file in fixture.session_paths() {
+        let record: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        assert_eq!(record["launching"], true, "{record}");
+        assert_eq!(record["services"]["web"]["pid"], web, "{record}");
+        assert!(record["services"]["other"]["pid"].is_null(), "{record}");
+        assert_eq!(record["provider"]["supervisor"], "stack", "{record}");
+    }
+    fixture.ok(&["down"]);
+    assert!(!pid_alive(web as u32));
 }
 
 // ---- port conflicts -------------------------------------------------------------------------
@@ -4154,7 +3303,6 @@ fn json_result(out: &Output) -> Value {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -4193,304 +3341,25 @@ fn a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure(
     assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
 }
 
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_runs_daemons_with_the_mise_stack_runs() {
-    // Pitchfork finds mise for `mise x` only in a few fixed places, unless told. A supervisor
-    // that cannot find it runs every project's daemons with the tools of the project that
-    // started it, so another project's service gets another release.
-    let fixture = Fixture::with_bundle(WEB);
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    fixture.ok(&["up", "--json"]);
-    let log = fs::read_to_string(fixture.dir.path().join("supervisor-start.log")).unwrap();
-    let mise = fixture.dir.path().join("bin/mise");
-    let expected = format!("x -- pitchfork supervisor start|{}", mise.display());
-    assert!(!log.is_empty() && log.lines().all(|line| line == expected), "expected `{expected}`:\n{log}");
-    fixture.ok(&["down", "--json"]);
-}
+/// A service command for Stack's supervisor that runs until stopped without listening, recording
+/// that it started (`started`) and its pid (`pf-tracked-pid`).
+const SLEEPER: &str = r#"echo $$ >"$REVIEW_FIXTURE/pf-tracked-pid"; touch "$REVIEW_FIXTURE/started"; exec sleep 600"#;
 
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_absolutely() {
-    supervisor_outlives_a_timed_out_start(None, "bin/mise", None);
-}
+/// A service command for Stack's supervisor: listens on `$PORT` until stopped, recording its
+/// pid in `pf-tracked-pid`. With `slow-start`, it first waits that many seconds.
+const LISTEN: &str = r#"if test -f "$REVIEW_FIXTURE/slow-start"; then sleep "$(cat "$REVIEW_FIXTURE/slow-start")"; fi; exec "$REVIEW_PYTHON" -c 'import os,socket,time; open(os.environ["REVIEW_FIXTURE"]+"/pf-tracked-pid","w").write(str(os.getpid())); s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(os.environ["PORT"]))); s.listen(); time.sleep(600)'"#;
 
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_path_names_mise_relatively() {
-    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", None);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_when_mise_is_in_the_project() {
-    // An empty PATH entry means the working directory.
-    supervisor_outlives_a_timed_out_start(Some(""), "app/mise", None);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_directory_named_mise() {
-    // The OS skips a directory named `mise` on PATH, searchable or not, for the file after it.
-    supervisor_outlives_a_timed_out_start(None, "bin/mise", Some(Decoy::Directory));
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_directory_named_mise() {
-    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", Some(Decoy::Directory));
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_mise_only_others_may_run() {
-    // The OS skips a file this user may not run for the file after it, whatever others may.
-    supervisor_outlives_a_timed_out_start(None, "bin/mise", Some(Decoy::OthersOnly));
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_starts_outlives_a_timed_out_request_past_a_relative_mise_only_others_may_run() {
-    supervisor_outlives_a_timed_out_start(Some("bin"), "app/bin/mise", Some(Decoy::OthersOnly));
-}
-
-/// What comes before the mise to find on PATH, named `mise` in an entry of the same kind.
-enum Decoy {
-    /// A searchable directory.
-    Directory,
-    /// A file, mode 0645: executable by others, but not by its owner, the user running stack.
-    OthersOnly,
-}
-
-/// The wrong mise: one stack must never run. It records that it ran.
-const WRONG_MISE: &str = "#!/bin/sh\necho \"$0 $*\" >>\"$REVIEW_FIXTURE/wrong-mise.log\"\nexit 1\n";
-
-fn running_as_root() -> bool {
-    // SAFETY: geteuid cannot fail.
-    unsafe { libc::geteuid() == 0 }
-}
-
-/// `stack -C app up --timeout 2s` from another directory, with mise on PATH as `entry` names it
-/// (`None`: the fixture's absolute `bin`) and found at `mise_at`. The directory stack runs in
-/// has its own `bin/mise` and `mise`, which a relative entry must not find: the provider runs
-/// mise in the project. The request is cut short; the supervisor stack started before it is
-/// in a session of its own, so it survives, and the request never starts one in its group.
-/// A `decoy` is in an entry of the same kind before it (`decoy/mise`, under the project when
-/// relative).
-fn supervisor_outlives_a_timed_out_start(entry: Option<&str>, mise_at: &str, decoy: Option<Decoy>) {
-    if matches!(decoy, Some(Decoy::OthersOnly)) && running_as_root() {
-        // Root may run a file any execute bit allows, and the OS runs the decoy for it too.
-        eprintln!("skipped: needs a user other than root");
-        return;
-    }
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    let mise = dir.join(mise_at);
-    if !mise.exists() {
-        fs::create_dir_all(mise.parent().unwrap()).unwrap();
-        fs::copy(dir.join("bin/mise"), &mise).unwrap();
-    }
-    let caller = dir.join("caller");
-    fs::create_dir_all(caller.join("bin")).unwrap();
-    for name in ["bin/mise", "mise"] {
-        fs::write(caller.join(name), WRONG_MISE).unwrap();
-        fs::set_permissions(caller.join(name), fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    // The rest of PATH, without any other mise.
-    let rest = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .filter(|d| d.is_absolute() && !d.join("mise").exists())
-        .collect::<Vec<_>>();
-    let first = entry.map_or_else(|| dir.join("bin"), std::path::PathBuf::from);
-    let decoy = decoy.map(|kind| {
-        let entry = if entry.is_some() { std::path::PathBuf::from("decoy") } else { dir.join("decoy") };
-        // An absolute entry replaces the project path it is joined to.
-        let decoy = dir.join("app").join(&entry).join("mise");
-        match kind {
-            Decoy::Directory => {
-                fs::create_dir_all(&decoy).unwrap();
-                fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            Decoy::OthersOnly => {
-                fs::create_dir_all(decoy.parent().unwrap()).unwrap();
-                fs::write(&decoy, WRONG_MISE).unwrap();
-                fs::set_permissions(&decoy, fs::Permissions::from_mode(0o645)).unwrap();
-            }
-        }
-        entry
-    });
-    let path = std::env::join_paths(decoy.into_iter().chain([first]).chain(rest)).unwrap();
-    let run = |args: &[&str]| fixture.command(args).current_dir(&caller).env("PATH", &path).output().unwrap();
-    fs::write(dir.join("supervisor-process"), "").unwrap();
-    fs::write(dir.join("slow-start"), "30").unwrap();
-    fs::remove_file(dir.join("mise-self.log")).unwrap();
-
-    let out = run(&["up", "--timeout", "2s", "--json"]);
-    assert_eq!(out.status.code(), Some(124), "{}", String::from_utf8_lossy(&out.stdout));
-    assert_eq!(json_result(&out)["error"]["details"][0]["cause"]["code"], "start_failed");
-    let recorded = fs::read_to_string(dir.join("supervisor-pid")).expect("no supervisor started");
-    let (pid, by) = recorded.trim().split_once(' ').unwrap();
-    let supervisor = Detached(pid.parse().unwrap());
-    assert_eq!(by, "detached", "the request started the supervisor in the group its deadline kills");
-    assert!(supervisor.alive(), "the supervisor ended with the timed-out request");
-    // The supervisor was started with, and told to run daemons with, the mise the request ran.
-    let expected = mise.canonicalize().unwrap();
-    let starts = fs::read_to_string(dir.join("supervisor-start.log")).unwrap();
-    let told = starts.trim().strip_prefix("x -- pitchfork supervisor start|").unwrap();
-    assert_eq!(Path::new(told).canonicalize().unwrap(), expected, "{starts}");
-    let ran = fs::read_to_string(dir.join("mise-self.log")).unwrap();
-    for call in ["x --", "daemons start"] {
-        assert!(ran.lines().any(|l| l.ends_with(call)), "no `mise {call}`:\n{ran}");
-    }
-    assert!(ran.lines().all(|l| Path::new(l.rsplitn(3, ' ').last().unwrap()) == expected), "{ran}");
-    assert!(!dir.join("wrong-mise.log").exists(), "{}", fs::read_to_string(dir.join("wrong-mise.log")).unwrap());
-
-    // Later commands see the launch still recorded, stop it, and leave the supervisor running.
-    fs::remove_file(dir.join("slow-start")).unwrap();
-    let status = json_result(&run(&["status", "--json"]));
-    assert_eq!(status["data"]["session"]["launching"], true, "{status}");
-    let down = run(&["down", "--json"]);
-    assert_eq!(json_result(&down)["data"]["confirmed"], true, "{}", String::from_utf8_lossy(&down.stdout));
-    assert!(supervisor.alive());
-    assert_eq!(fs::read_to_string(dir.join("supervisor-pid")).unwrap(), recorded);
-    assert!(!dir.join("wrong-mise.log").exists());
-}
-
-/// The `mise` calls the fixture has seen since `from` lines of its log.
-fn mise_calls(fixture: &Fixture, from: usize) -> Vec<String> {
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap_or_default();
-    log.lines().skip(from).map(str::to_string).collect()
-}
-
-fn no_supervisor_request(calls: &[String]) {
-    let requests: Vec<_> = calls.iter().filter(|c| c.starts_with("daemons start") || c.starts_with("daemons stop")).collect();
-    assert!(requests.is_empty(), "a request was made, whose client could start the supervisor in a killable group: {requests:?}");
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_cannot_start_stops_up_before_any_request_and_a_retry_succeeds() {
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    fs::write(dir.join("supervisor-process"), "").unwrap();
-    fs::write(dir.join("x-fail"), "").unwrap();
-    let from = mise_calls(&fixture, 0).len();
-
-    let out = fixture.command(&["up", "--timeout", "30s", "--json"]).output().unwrap();
-    let result = json_result(&out);
-    assert!(!out.status.success() && out.status.code() != Some(124), "{result}");
-    let error = &result["error"];
-    assert_eq!(error["code"], "start_failed", "{result}");
-    assert!(error["message"].as_str().unwrap().contains("`mise x -- pitchfork supervisor start` failed"), "{result}");
-    assert!(error["hint"].as_str().unwrap().contains("in the project to see why"), "{result}");
-    let calls = mise_calls(&fixture, from);
-    assert!(calls.iter().any(|c| c.starts_with("x -- pitchfork supervisor start")), "{calls:?}");
-    no_supervisor_request(&calls);
-    assert!(!dir.join("supervisor-pid").exists(), "a supervisor was started");
-
-    // Without a deadline `down` is unchanged, and once the supervisor can start, `up` works.
-    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
-    fs::remove_file(dir.join("x-fail")).unwrap();
-    fixture.ok(&["up", "--timeout", "30s", "--json"]);
-    let recorded = fs::read_to_string(dir.join("supervisor-pid")).expect("no supervisor started");
-    let (pid, by) = recorded.trim().split_once(' ').unwrap();
-    let supervisor = Detached(pid.parse().unwrap());
-    assert_eq!(by, "detached");
-    assert!(supervisor.alive());
-    fixture.ok(&["down", "--json"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_cannot_start_stops_restart_before_it_stops_anything() {
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    fixture.ok(&["up", "--json"]);
-    let service = fs::read_to_string(dir.join("pf-tracked-pid")).unwrap().trim().parse::<u32>().unwrap();
-    fs::write(dir.join("x-fail"), "").unwrap();
-    let from = mise_calls(&fixture, 0).len();
-
-    for args in [&["restart", "--timeout", "30s", "--json"][..], &["restart", "web", "--timeout", "30s", "--json"]] {
-        let out = fixture.command(args).output().unwrap();
-        let result = json_result(&out);
-        assert!(!out.status.success() && out.status.code() != Some(124), "{result}");
-        assert_eq!(result["error"]["code"], "stop_failed", "{result}");
-        assert!(pid_alive(service), "the service was stopped");
-    }
-    no_supervisor_request(&mise_calls(&fixture, from));
-    fs::remove_file(dir.join("x-fail")).unwrap();
-    fixture.ok(&["restart", "web", "--json"]);
-    assert!(!pid_alive(service), "the old service survived the restart");
-    fixture.ok(&["down", "--json"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_stack_cannot_run_stops_up_before_any_request() {
-    // A mise first on PATH that names a missing interpreter: the OS skips it for a bare
-    // `mise`, but run by path it cannot be started at all.
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    fs::create_dir(dir.join("broken")).unwrap();
-    fs::write(dir.join("broken/mise"), "#!/nonexistent/interpreter\n").unwrap();
-    fs::set_permissions(dir.join("broken/mise"), fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(dir.join("supervisor-process"), "").unwrap();
-    let path = format!("{}:{}:{}", dir.join("broken").display(), dir.join("bin").display(), std::env::var("PATH").unwrap());
-    let from = mise_calls(&fixture, 0).len();
-
-    let out = fixture.command(&["up", "--timeout", "30s", "--json"]).env("PATH", path).output().unwrap();
-    let result = json_result(&out);
-    assert!(!out.status.success() && out.status.code() != Some(124), "{result}");
-    assert_eq!(result["error"]["code"], "provider_unavailable", "{result}");
-    assert!(result["error"]["message"].as_str().unwrap().contains("broken/mise"), "{result}");
-    no_supervisor_request(&mise_calls(&fixture, from));
-    assert!(!dir.join("supervisor-pid").exists(), "a supervisor was started");
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_start_still_running_at_the_deadline_is_left_to_finish_and_no_request_is_made() {
-    let fixture = Fixture::with_bundle(WEB);
-    let dir = fixture.dir.path();
-    fs::write(dir.join("supervisor-process"), "").unwrap();
-    fs::write(dir.join("x-hang"), "30").unwrap();
-    let from = mise_calls(&fixture, 0).len();
-
-    let started = Instant::now();
-    let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
-    let elapsed = started.elapsed();
-    let result = json_result(&out);
-    let hung = Detached(fs::read_to_string(dir.join("x-hang-pid")).expect("the start never ran").trim().parse().unwrap());
-    assert_eq!(out.status.code(), Some(124), "{result}");
-    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
-    let cause = &result["error"]["details"][0]["cause"];
-    assert_eq!(cause["code"], "start_failed", "{result}");
-    assert!(cause["message"].as_str().unwrap().contains("cut short by the deadline"), "{result}");
-    // Left running in a session of its own, not in a group stack kills.
-    assert!(hung.alive(), "the start was killed");
-    let group = Command::new("ps").args(["-o", "pgid=", "-p", &hung.0.to_string()]).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&group.stdout).trim(), hung.0.to_string());
-    no_supervisor_request(&mise_calls(&fixture, from));
-    assert!(!dir.join("supervisor-pid").exists(), "a supervisor was started");
-    // The launch stays recorded for `down`, which needs no deadline.
-    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
-    assert_eq!(status["data"]["session"]["launching"], true, "{status}");
-    assert_eq!(json_result(&fixture.ok(&["down", "--json"]))["data"]["confirmed"], true);
-}
-
-/// The fake supervisor starts a listener on `port` at `daemons start` and kills it at stop.
+/// Make the bundle's services listen on their ports (see [`LISTEN`]) instead of exiting at
+/// once, and compile again. `port` is the service's assigned port, which this keeps.
 fn supervise_listener(fixture: &Fixture, port: u16) {
-    fs::write(fixture.dir.path().join("listen-port"), port.to_string()).unwrap();
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "id": "app-test/web", "name": "web", "status": "running", "port": port }]).to_string(),
-    )
-    .unwrap();
+    let path = fixture.dir.path().join("bundle/bundle.toml");
+    let bundle = fs::read_to_string(&path).unwrap();
+    fs::write(&path, bundle.replace("run='true'", &format!("run='''{LISTEN}'''"))).unwrap();
+    fixture.ok(&["compile"]);
+    assert_eq!(assigned_port(fixture, "web"), port);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_killed_service_is_reported_as_not_running_not_as_a_changed_process() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
@@ -4503,73 +3372,15 @@ fn a_killed_service_is_reported_as_not_running_not_as_a_changed_process() {
     }
     let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
     let reason = status["data"]["checks"][0]["reason"].as_str().unwrap_or_else(|| panic!("{status}")).to_string();
-    assert!(reason.contains("is not accepting connections"), "{reason}");
+    assert!(reason.contains("supervisor reports 'failed'"), "{reason}");
     assert!(reason.contains("is gone") && reason.ends_with("run `stack up` to start it again"), "{reason}");
     assert!(!reason.contains("changed since launch"), "{reason}");
     fixture.ok(&["down"]);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_start_request_still_waiting_once_every_service_verifies_is_ended_not_waited_for() {
-    let fixture = Fixture::with_bundle(WEB);
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
-    let started = Instant::now();
-    let up = json_result(&fixture.ok(&["up", "--timeout", "2m", "--json"]));
-    assert!(started.elapsed() < Duration::from_secs(20), "waited {:?} on the request", started.elapsed());
-    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
-    let client: u32 = fs::read_to_string(fixture.dir.path().join("hung-client")).unwrap().trim().parse().unwrap();
-    let gone = Instant::now() + Duration::from_secs(5);
-    while pid_alive(client) && Instant::now() < gone {
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(!pid_alive(client), "the request was left running");
-    let supervised: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
-    assert!(pid_alive(supervised), "ending the request stopped the service");
-    fixture.ok(&["down"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_service_whose_request_returned_counts_as_ready_for_ending_another_request() {
-    // NATS readiness is the provider's alone; its request returned, so it passed it.
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.queue]\npreset='nats'\n[services.web]\nrun='true'\n");
-    let (queue, web) = (assigned_port(&fixture, "queue"), assigned_port(&fixture, "web"));
-    supervise_listener(&fixture, web);
-    // The queue listens once the supervisor started it.
-    let started_marker = fixture.dir.path().join("started");
-    let (hold, release) = std::sync::mpsc::channel::<()>();
-    let listener = thread::spawn(move || {
-        while !started_marker.exists() {
-            thread::sleep(Duration::from_millis(20));
-        }
-        let _queue = std::net::TcpListener::bind(("127.0.0.1", queue)).unwrap();
-        let _ = release.recv_timeout(Duration::from_secs(120));
-    });
-    let daemons = json!([
-        { "id": "app-test/queue", "name": "queue", "status": "running", "port": queue },
-        { "id": "app-test/web", "name": "web", "status": "running", "port": web },
-    ]);
-    fs::write(fixture.dir.path().join("daemons-started.json"), daemons.to_string()).unwrap();
-    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
-    fs::write(fixture.dir.path().join("hang-service"), "web").unwrap();
-    let started = Instant::now();
-    let out = fixture.command(&["up", "--timeout", "1m", "--json"]).output().unwrap();
-    let up = json_result(&out);
-    assert_eq!(up["ok"], true, "{up}");
-    assert!(started.elapsed() < Duration::from_secs(20), "waited {:?}", started.elapsed());
-    drop(hold);
-    listener.join().unwrap();
-    fixture.ok(&["down"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_declared_readiness_check_holds_the_start_until_it_passes() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nready_cmd='test -f ready && test -n \"$PORT\"'\n");
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
+    let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.web]\nrun='''{LISTEN}'''\nready_cmd='test -f ready && test -n \"$PORT\"'\n"));
     let out = fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap();
     let result = json_result(&out);
     assert_eq!(result["error"]["code"], "timed_out", "a listening service is not ready before its check passes: {result}");
@@ -4580,18 +3391,21 @@ fn a_declared_readiness_check_holds_the_start_until_it_passes() {
     let readiness = &cause.as_array().unwrap().iter().find_map(|d| d.get("readiness")).unwrap_or_else(|| panic!("{result}"))[0];
     assert_eq!((readiness["service"].clone(), readiness["exit_code"].clone()), (json!("web"), json!(1)), "{result}");
     assert_eq!(readiness["ready_cmd"], "test -f ready && test -n \"$PORT\"", "{result}");
+    fixture.ok(&["down"]);
     // A check that cannot run at all (no `sh` on the stack's PATH) never passes, and the
     // report says why it did not run, rather than nothing.
     fs::write(fixture.dir.path().join("app/ready"), "").unwrap();
     let env = fs::read(fixture.dir.path().join("env.json")).unwrap();
     let no_shell = fixture.dir.path().join("no-shell");
     fs::create_dir(&no_shell).unwrap();
-    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": no_shell }).to_string()).unwrap();
+    let python_dir = Path::new(&python::python()).parent().unwrap().to_path_buf();
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": format!("{}:{}", no_shell.display(), python_dir.display()) }).to_string()).unwrap();
     let result = json_result(&fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap());
     assert_eq!(result["error"]["code"], "timed_out", "{result}");
     let hint = result["error"]["hint"].as_str().unwrap();
     assert!(hint.starts_with("web's ready_cmd could not be run (cannot run it through sh"), "{hint}");
     fs::write(fixture.dir.path().join("env.json"), env).unwrap();
+    fixture.ok(&["down"]);
     let started = Instant::now();
     let up = json_result(&fixture.ok(&["up", "--timeout", "2m", "--json"]));
     assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
@@ -4600,58 +3414,12 @@ fn a_declared_readiness_check_holds_the_start_until_it_passes() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_service_the_supervisor_launched_but_never_records_fails_the_start_quickly() {
-    let fixture = Fixture::with_bundle(WEB);
-    let port = assigned_port(&fixture, "web");
-    let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
-    fs::write(fixture.dir.path().join("unrecorded-port"), port.to_string()).unwrap();
-    fs::write(fixture.dir.path().join("unrecorded-start"), &token).unwrap();
-    let started = Instant::now();
-    let out = fixture.command(&["up", "--timeout", "2m", "--json"]).output().unwrap();
-    let result = json_result(&out);
-    let listener: u32 = fs::read_to_string(fixture.dir.path().join("unrecorded-pid")).unwrap().trim().parse().unwrap();
-    let cleanup = Lost { wrapper: listener, listener, worker: None };
-    assert!(started.elapsed() < Duration::from_secs(40), "waited {:?}", started.elapsed());
-    // The request was ended before `up` returned, not left to a thread `up` exits without.
-    let client: u32 = fs::read_to_string(fixture.dir.path().join("unrecorded-client")).unwrap().trim().parse().unwrap();
-    assert!(!pid_alive(client), "the start request outlived up");
-    assert_eq!(result["error"]["code"], "start_failed", "{result}");
-    assert!(result["error"]["message"].as_str().unwrap().contains("has not recorded it"), "{result}");
-    assert_eq!(result["error"]["details"][0]["pid"], listener, "{result}");
-    assert_eq!(result["error"]["details"].as_array().unwrap().last().unwrap()["retry_safe"], true, "{result}");
-
-    fs::remove_file(fixture.dir.path().join("unrecorded-start")).unwrap();
-    let down = json_result(&fixture.ok(&["down", "--json"]));
-    assert_eq!(down["data"]["confirmed"], true, "{down}");
-    assert!(!pid_alive(listener), "down left the unrecorded service running");
-    drop(cleanup);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn services_are_started_one_request_at_a_time() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
-    let out = fixture.command(&["up", "--timeout", "3s", "--json"]).output().unwrap();
-    assert!(!out.status.success());
-    let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
-    assert_eq!(requests, "daemons start -- web\ndaemons start -- api\n");
-    fixture.ok(&["down"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_and_safe() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
     let app = dir.join("app");
-    let port = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, port);
-    let data = dir.join("mise-state/daemons/0123/data/web");
-    let daemon = |status: &str| json!([{ "id": "app-test/web", "name": "web", "status": status, "port": port, "data_dir": data }]).to_string();
-    fs::write(dir.join("daemons-started.json"), daemon("running")).unwrap();
-    fs::write(dir.join("daemons.json"), daemon("stopped")).unwrap();
-    fs::create_dir_all(&data).unwrap();
+    let port = fixture.postgres_web();
+    let data = fixture.legacy_data("0123");
     fs::write(data.join("rows"), "seeded").unwrap();
     let token = stack::checkout::token(&app).unwrap();
     fixture.ok(&["up"]);
@@ -4660,7 +3428,8 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
     // device and inode) and which supervisor runs the service.
     let ledger: Value = serde_json::from_slice(&fs::read(dir.join("state/data.json")).unwrap()).unwrap();
     assert_eq!(ledger["entries"][0]["checkout"], token.as_str(), "{ledger}");
-    assert_eq!(ledger["entries"][0]["supervisor"]["id"], "app-test/web", "{ledger}");
+    assert_eq!(ledger["entries"][0]["supervisor"]["id"], "web", "{ledger}");
+    assert!(ledger["entries"][0]["supervisor"]["state_dir"].as_str().unwrap().contains("/state/supervisors/"), "{ledger}");
     assert_eq!(ledger["entries"][0]["location"], json!(data.canonicalize().unwrap()), "{ledger}");
     assert!(ledger["entries"][0]["identity"].is_array(), "{ledger}");
     let recorded = ledger["entries"][0].clone();
@@ -4697,12 +3466,12 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
 
     // Nor while the recorded supervisor still reports the service running.
     let mut busy = Command::new("sleep").arg("30").spawn().unwrap();
-    fs::write(dir.join("pf-status.json"), json!({ "id": "app-test/web", "status": "running", "pid": busy.id() }).to_string()).unwrap();
+    let supervisor_dir = std::path::PathBuf::from(recorded["supervisor"]["state_dir"].as_str().unwrap());
+    fixture.report_running(&supervisor_dir, "web", busy.id());
     let outcomes = gc(&["gc", "--reclaim-data", "--json"]);
     let _ = busy.kill();
     let _ = busy.wait();
-    fs::remove_file(dir.join("pf-status.json")).unwrap();
-    assert!(outcomes.iter().any(|o| o.contains("the supervisor reports app-test/web as \"running\"")), "{outcomes:?}");
+    assert!(outcomes.iter().any(|o| o.contains("Stack's supervisor reports web running")), "{outcomes:?}");
     assert!(data.join("rows").exists());
 
     // Data whose marker now names another checkout is never touched, and no longer reported.
@@ -4768,7 +3537,6 @@ fn gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_an
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_services_setup_runs_before_each_start_and_a_failing_one_stops_it() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nsetup='echo \"setup port=$PORT\" >> setup.log'\n");
     let port = assigned_port(&fixture, "web");
@@ -4800,46 +3568,29 @@ fn a_services_setup_runs_before_each_start_and_a_failing_one_stops_it() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_service_is_requested_only_once_the_services_it_depends_on_are_ready() {
     // Declared first, but it waits for its dependency, which never becomes ready here.
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.api]\nrun='true'\ndepends_on=['db']\n[services.db]\nrun='true'\n");
     let out = fixture.command(&["up", "--timeout", "3s", "--json"]).output().unwrap();
+    let result = json_result(&out);
     assert!(!out.status.success());
-    let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
-    assert_eq!(requests, "daemons start -- db\n", "{requests}");
+    assert!(result.to_string().contains("\"not_started\":[\"api\"]"), "{result}");
+    let state = fixture.supervisor_state();
+    assert!(state["services"]["db"].is_object() && state["services"].get("api").is_none(), "{state}");
     fixture.ok(&["down"]);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_again_still_checks_that_a_running_dependency_passes_its_readiness() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.db]\nrun='true'\nready_cmd='test -f db-ready'\n[services.api]\nrun='true'\ndepends_on=['db']\n");
-    let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-    let (db, api) = (assigned_port(&fixture, "db"), assigned_port(&fixture, "api"));
-    // As in the restart test below: the supervisor's listener stands for api, and db is a
-    // socket this test holds, bound once the supervisor was first asked to start something.
-    fs::write(dir.join("listen-port"), api.to_string()).unwrap();
-    fs::write(dir.join("listen-service"), "api").unwrap();
-    // db is reported with a live process, as a supervisor reports what it runs.
-    let mut db_process = Command::new("sleep").arg("600").spawn().unwrap();
-    let running = json!([{ "id": "app-test/db", "name": "db", "status": "running", "port": db, "pid": db_process.id() }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
-    fs::write(dir.join("daemons-started.json"), running.to_string()).unwrap();
-    let (send, held) = std::sync::mpsc::channel();
-    let started = dir.join("started");
-    let binder = thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(60);
-        while !started.exists() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(20));
-        }
-        send.send(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap()).unwrap();
-    });
+    let fixture = Fixture::with_bundle(&format!(
+        "[bundle]\nname='test'\n[services.db]\nrun='''{LISTEN}'''\nready_cmd='test -f db-ready'\n[services.api]\nrun='''{LISTEN}'''\ndepends_on=['db']\n"
+    ));
+    let app = fixture.dir.path().join("app");
     fs::write(app.join("db-ready"), "").unwrap();
     fixture.ok(&["up"]);
-    let db_socket = held.recv().unwrap();
-    binder.join().unwrap();
     // Both still run and verify, so a second `up` has nothing to start.
-    fixture.ok(&["up"]);
+    let again = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(again["data"]["checks"].as_array().unwrap().iter().all(|c| c["ready"] == true), "{again}");
 
     // db still runs but no longer passes its ready_cmd: api must not be reported started on it.
     fs::remove_file(app.join("db-ready")).unwrap();
@@ -4849,44 +3600,21 @@ fn up_again_still_checks_that_a_running_dependency_passes_its_readiness() {
     assert_eq!(result["ok"], false, "{result}");
     assert!(result["error"].to_string().contains("db"), "{result}");
     fs::write(app.join("db-ready"), "").unwrap();
-    drop(db_socket);
-    db_process.kill().unwrap();
-    db_process.wait().unwrap();
     fixture.ok(&["down"]);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_nothing_when_it_is_not_ready() {
-    let fixture = Fixture::with_bundle(
-        "[bundle]\nname='test'\n[services.db]\nrun='true'\nready_cmd='test -f db-ready'\n[services.api]\nrun='true'\ndepends_on=['db']\nsetup='echo setup >> setup.log'\n",
-    );
+    let fixture = Fixture::with_bundle(&format!(
+        "[bundle]\nname='test'\n[services.db]\nrun='''{LISTEN}'''\nready_cmd='test -f db-ready'\n[services.api]\nrun='''{LISTEN}'''\ndepends_on=['db']\nsetup='echo setup >> setup.log'\n"
+    ));
     let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
-    let (db, api) = (assigned_port(&fixture, "db"), assigned_port(&fixture, "api"));
-    // The supervisor's own listener stands for api; db is a socket this test holds, bound
-    // once the supervisor was first asked to start something.
-    fs::write(dir.join("listen-port"), api.to_string()).unwrap();
-    fs::write(dir.join("listen-service"), "api").unwrap();
-    let running = json!([{ "id": "app-test/db", "name": "db", "status": "running", "port": db }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
-    fs::write(dir.join("daemons-started.json"), running.to_string()).unwrap();
-    let (send, held) = std::sync::mpsc::channel();
-    let started = dir.join("started");
-    let binder = thread::spawn(move || {
-        let until = Instant::now() + Duration::from_secs(60);
-        while !started.exists() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(20));
-        }
-        send.send(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap()).unwrap();
-    });
     fs::write(app.join("db-ready"), "").unwrap();
     fixture.ok(&["up"]);
-    let mut db_socket = Some(held.recv().unwrap());
-    binder.join().unwrap();
     let log = || fs::read_to_string(app.join("setup.log")).unwrap();
-    let requests = || fs::read_to_string(dir.join("start-requests.log")).unwrap();
-    let api_pid = || -> u32 { fs::read_to_string(dir.join("pf-tracked-pid")).unwrap().trim().parse().unwrap() };
-    assert_eq!((log(), requests()), ("setup\n".to_string(), "daemons start -- db\ndaemons start -- api\n".to_string()));
-    let pid = api_pid();
+    let pid_of = |name: &str| -> u32 { fixture.session()["services"][name]["pid"].as_u64().unwrap() as u32 };
+    assert_eq!(log(), "setup\n");
+    let pid = pid_of("api");
 
     // db alive but failing its ready_cmd, then db stopped: `restart api` stops, sets up and
     // starts nothing, and says why.
@@ -4898,8 +3626,8 @@ fn restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_noth
         assert_eq!(error["code"], "dependency_not_ready", "{case}: {error}");
         assert!(error["message"].as_str().unwrap().contains("api depends on db"), "{case}: {error}");
         assert!(error["hint"].as_str().unwrap().contains("stack restart db"), "{case}: {error}");
-        assert_eq!((log(), requests()), ("setup\n".to_string(), "daemons start -- db\ndaemons start -- api\n".to_string()), "{case}: api was set up or requested");
-        assert!(pid_alive(pid) && api_pid() == pid, "{case}: the running api was stopped");
+        assert_eq!(log(), "setup\n", "{case}: api was set up");
+        assert!(pid_alive(pid), "{case}: the running api was stopped");
         assert_eq!(fs::read(app.join(".stack/session.json")).unwrap(), session, "{case}: the session record changed");
         error
     };
@@ -4917,19 +3645,25 @@ fn restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_noth
     assert!(error.to_string().contains("cannot run it through sh"), "{error}");
     fs::write(dir.join("env.json"), env).unwrap();
     fs::write(app.join("db-ready"), "").unwrap();
-    drop(db_socket.take());
-    let stopped = json!([{ "id": "app-test/db", "name": "db", "status": "stopped", "port": db }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
-    fs::write(dir.join("daemons.json"), stopped.to_string()).unwrap();
+    // db's process gone.
+    let db = pid_of("db");
+    unsafe { libc::kill(db as i32, libc::SIGKILL) };
+    let gone = Instant::now() + Duration::from_secs(5);
+    while pid_alive(db) && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(20));
+    }
     refused("db stopped");
 
-    // With db running and ready again, the same restart sets api up and starts it anew.
-    db_socket = Some(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap());
-    fs::write(dir.join("daemons.json"), running.to_string()).unwrap();
+    // `up` starts db again and, since api depended on the dead one, sets api up and starts it
+    // after it; then the same restart as above sets api up and starts it anew.
+    fixture.ok(&["up"]);
+    assert_eq!(log(), "setup\nsetup\n");
+    let pid = pid_of("api");
     let restarted = json_result(&fixture.ok(&["restart", "api", "--json"]));
     assert_eq!(restarted["data"]["restarted"], json!(["api"]), "{restarted}");
-    assert_eq!(log(), "setup\nsetup\n");
-    assert_ne!(api_pid(), pid, "api was not started anew");
-    drop(db_socket);
+    assert_eq!(log(), "setup\nsetup\nsetup\n");
+    assert_ne!(pid_of("api"), pid, "api was not started anew");
+    assert!(!pid_alive(pid));
     fixture.ok(&["down"]);
 }
 
@@ -4955,7 +3689,6 @@ fn setup_waiting(app: &Path) -> u32 {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_signal_during_setup_cancels_the_start_however_the_setup_ends() {
     let mut sentinel = Command::new("sleep").arg("60").spawn().unwrap();
     // A setup that exits 0 on SIGTERM, then one that ignores it until a second signal.
@@ -4988,7 +3721,6 @@ fn a_signal_during_setup_cancels_the_start_however_the_setup_ends() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_signal_to_the_mcp_server_during_setup_cancels_the_start_and_ends_the_server() {
     let fixture = cancellable_setup(true);
     let (dir, app) = (fixture.dir.path(), fixture.dir.path().join("app"));
@@ -5014,26 +3746,19 @@ fn a_signal_to_the_mcp_server_during_setup_cancels_the_start_and_ends_the_server
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_is_kept() {
     let fixture = Fixture::with_bundle(WEB);
-    let port = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, port);
-    let data = fixture.dir.path().join("mise-state/daemons/0123/data/web");
-    let daemon = json!([{ "id": "app-test/web", "name": "web", "status": "running", "port": port, "data_dir": data }]);
-    fs::write(fixture.dir.path().join("daemons-started.json"), daemon.to_string()).unwrap();
-    let stopped = json!([{ "id": "app-test/web", "name": "web", "status": "stopped", "port": port, "data_dir": data }]);
-    fs::write(fixture.dir.path().join("daemons.json"), stopped.to_string()).unwrap();
+    fixture.postgres_web();
+    // Data mise's preset kept for this path before markers existed is found and adopted.
+    let data = fixture.legacy_data("0123");
     let marker = data.with_file_name("web.stack-checkout");
     let token = stack::checkout::token(&fixture.dir.path().join("app")).unwrap();
     let aside = || fs::read_dir(data.parent().unwrap()).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("web.replaced-")).collect::<Vec<_>>();
-
-    // Data from before markers existed is adopted, not moved.
-    fs::create_dir_all(&data).unwrap();
     fs::write(data.join("legacy"), "").unwrap();
     let up = json_result(&fixture.ok(&["up", "--json"]));
     assert!(up["data"].get("warnings").is_none(), "{up}");
     assert!(data.join("legacy").exists());
+    assert!(!fixture.dir.path().join("initdb.log").exists(), "existing data is never initialised again");
     let owner: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
     assert_eq!(owner["checkout"], token.as_str());
     fixture.ok(&["down"]);
@@ -5052,14 +3777,15 @@ fn data_a_previous_checkout_at_this_path_left_is_moved_aside_and_this_checkouts_
     assert_eq!(moved.len(), 2, "the directory and its marker: {moved:?}");
     let moved_dir = data.with_file_name(moved.iter().find(|n| !n.ends_with(".stack-checkout")).unwrap());
     assert!(moved_dir.join("legacy").exists(), "kept, not deleted");
-    assert!(!data.exists(), "this checkout starts empty");
+    assert!(!data.join("legacy").exists(), "this checkout starts empty");
+    assert!(fs::read_to_string(fixture.dir.path().join("initdb.log")).unwrap().contains("-U postgres --auth=trust"), "a new cluster");
+    assert_eq!(fs::read_to_string(data.join(".mise-daemon-version")).unwrap(), "postgres:17");
     let owner: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
     assert_eq!(owner["checkout"], token.as_str());
     fixture.ok(&["down"]);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_confirms_only_once_a_lost_service_is_gone_even_when_it_outlives_its_port() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5073,7 +3799,6 @@ fn down_confirms_only_once_a_lost_service_is_gone_even_when_it_outlives_its_port
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_confirms_only_once_every_process_of_a_lost_service_is_gone() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5088,7 +3813,6 @@ fn down_confirms_only_once_every_process_of_a_lost_service_is_gone() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_stops_a_process_a_lost_service_starts_while_it_stops() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5106,7 +3830,6 @@ fn down_stops_a_process_a_lost_service_starts_while_it_stops() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_stops_a_service_child_that_keeps_the_port_after_the_supervisor_stops_its_leader() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5128,38 +3851,6 @@ fn down_stops_a_service_child_that_keeps_the_port_after_the_supervisor_stops_its
     assert_eq!(down["data"]["confirmed"], true, "{down}");
     assert!(started.elapsed() < Duration::from_secs(15), "waited {:?} before stopping it", started.elapsed());
     assert!(!pid_alive(lost.wrapper) && !pid_alive(lost.listener), "{down}");
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_service_waiting_for_one_declared_after_it_does_not_hold_back_its_start() {
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.api]\nrun='true'\n");
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    // web is ready only once api's start was requested, and its request holds mise's project
-    // lock until then.
-    fs::write(fixture.dir.path().join("wait-for"), "api").unwrap();
-    let out = fixture.command(&["up", "--timeout", "20s", "--json"]).output().unwrap();
-    let requests = fs::read_to_string(fixture.dir.path().join("start-requests.log")).unwrap();
-    assert_eq!(requests, "daemons start -- web\ndaemons start -- api\n", "{}", String::from_utf8_lossy(&out.stdout));
-    fixture.ok(&["down"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_supervisor_start_still_running_does_not_hold_back_verified_services() {
-    let fixture = Fixture::with_bundle(WEB);
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
-    fixture.ok(&["up"]);
-    fs::write(fixture.dir.path().join("x-hang"), "600").unwrap();
-    let started = Instant::now();
-    let out = fixture.command(&["up", "--timeout", "1m", "--json"]).output().unwrap();
-    let hung: i32 = fs::read_to_string(fixture.dir.path().join("x-hang-pid")).unwrap().trim().parse().unwrap();
-    unsafe { libc::kill(hung, libc::SIGKILL) };
-    let up = json_result(&out);
-    assert_eq!(up["ok"], true, "{up}");
-    assert!(started.elapsed() < Duration::from_secs(20), "waited {:?}", started.elapsed());
-    fs::remove_file(fixture.dir.path().join("x-hang")).unwrap();
-    fixture.ok(&["down"]);
 }
 
 /// A service process the supervisor launched and then lost track of, as Pitchfork 2.29.0 did
@@ -5235,7 +3926,6 @@ child.wait()
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_service_process_the_supervisor_lost_is_stopped_by_up_and_down_never_called_foreign() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5254,10 +3944,11 @@ fn a_service_process_the_supervisor_lost_is_stopped_by_up_and_down_never_called_
     let supervised: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
     // The supervisor loses its process; another one of this checkout takes the port.
     unsafe { libc::kill(supervised as i32, libc::SIGKILL) };
-    fs::write(fixture.dir.path().join("daemons-started.json"), json!([{ "id": "app-test/web", "name": "web", "status": "stopped", "port": port }]).to_string()).unwrap();
-    fs::copy(fixture.dir.path().join("daemons-started.json"), fixture.dir.path().join("daemons.json")).unwrap();
+    let gone = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(10));
+    }
     let lost = lost_service(port, &token);
-    supervise_listener(&fixture, port);
     let up = json_result(&fixture.ok(&["up", "--json"]));
     assert_eq!(step(&up, "ports")["detail"]["stopped"], json!([{ "service": "web", "port": port, "pid": lost.listener, "unrecorded": true }]), "{up}");
     assert!(!pid_alive(lost.wrapper) && !pid_alive(lost.listener));
@@ -5283,22 +3974,11 @@ fn a_service_process_the_supervisor_lost_is_stopped_by_up_and_down_never_called_
 
 /// After `compile --reassign-ports` while `web` still runs on `old`: the provider reports the
 /// daemon running with its *new* configured port `new`, Pitchfork reports the actual `old`.
-fn report_generation_change(fixture: &Fixture, old: u16, new: u16) {
-    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
-    fs::write(
-        fixture.dir.path().join("daemons.json"),
-        json!([{ "id": "app-test/web", "name": "web", "status": "running", "pid": pid, "port": new }]).to_string(),
-    )
-    .unwrap();
-    fs::write(
-        fixture.dir.path().join("pf-status.json"),
-        json!({ "id": "app-test/web", "status": "running", "pid": pid, "active_port": old }).to_string(),
-    )
-    .unwrap();
-}
+/// Stack's supervisor reports where a service really listens, so a generation change needs no
+/// stand-in for Pitchfork's active port.
+fn report_generation_change(_fixture: &Fixture, _old: u16, _new: u16) {}
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_foreign_listener_on_the_new_port_of_a_changed_generation_is_a_conflict_after_the_old_stops() {
     let fixture = Fixture::with_bundle(WEB);
     let old = assigned_port(&fixture, "web");
@@ -5322,12 +4002,9 @@ fn a_foreign_listener_on_the_new_port_of_a_changed_generation_is_a_conflict_afte
     // The old generation was stopped: its process is gone and its port closed.
     assert!(!pid_alive(pid), "old service survived the generation change");
     assert!(std::net::TcpStream::connect(("127.0.0.1", old)).is_err());
-    let log = fs::read_to_string(fixture.dir.path().join("pitchfork.log")).unwrap();
-    assert!(log.contains("status --json app-test/web"), "active port was not asked of the supervisor:\n{log}");
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_during_a_changed_generation_stops_the_old_service_and_reports_the_new_ports_squatter() {
     let fixture = Fixture::with_bundle(WEB);
     let old = assigned_port(&fixture, "web");
@@ -5348,66 +4025,11 @@ fn down_during_a_changed_generation_stops_the_old_service_and_reports_the_new_po
     assert!(!pid_alive(pid));
 }
 
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn without_a_record_the_supervisors_active_port_decides_what_is_owned() {
-    // No session record, the provider reports the daemon with a configured port it does not
-    // listen on, and a squatter holds that configured port. Only Pitchfork's active port can
-    // tell the two apart; discarding its answer would wait on the squatter.
-    let fixture = Fixture::with_bundle(WEB);
-    let old = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, old);
-    fixture.ok(&["up", "--json"]);
-    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
-    for path in fixture.session_paths() {
-        fs::remove_file(path).unwrap();
-    }
-    fixture.ok(&["compile", "--reassign-ports"]);
-    let new = assigned_port(&fixture, "web");
-    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
-    report_generation_change(&fixture, old, new);
-
-    let started = Instant::now();
-    let down = json_result(&fixture.ok(&["down", "--json"]));
-    assert!(started.elapsed() < Duration::from_secs(10), "waited on the squatter: {down}");
-    assert_eq!(down["data"]["conflicts"][0]["port"], new, "{down}");
-    assert!(!pid_alive(pid), "old service survived");
-    assert!(std::net::TcpStream::connect(("127.0.0.1", old)).is_err());
-    // The supervisor was discovered without a record and asked for the active port.
-    let log = fs::read_to_string(fixture.dir.path().join("pitchfork.log")).unwrap();
-    assert!(log.contains("status --json app-test/web"), "{log}");
-    let mise_log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(mise_log.contains("which pitchfork"), "{mise_log}");
-
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn without_a_record_or_an_active_port_the_configured_port_is_waited_for_not_assumed_foreign() {
-    let fixture = Fixture::with_bundle(WEB);
-    let old = assigned_port(&fixture, "web");
-    supervise_listener(&fixture, old);
-    fixture.ok(&["up", "--json"]);
-    for path in fixture.session_paths() {
-        fs::remove_file(path).unwrap();
-    }
-    fixture.ok(&["compile", "--reassign-ports"]);
-    let new = assigned_port(&fixture, "web");
-    let _squatter = std::net::TcpListener::bind(("127.0.0.1", new)).unwrap();
-    report_generation_change(&fixture, old, new);
-    // The supervisor knows no such daemon: nothing establishes where it listens.
-    fs::remove_file(fixture.dir.path().join("pf-status.json")).unwrap();
-    let out = fixture.command(&["down", "--json"]).output().unwrap();
-    assert_eq!(json_result(&out)["error"]["code"], "stop_unconfirmed");
-    assert!(std::net::TcpStream::connect(("127.0.0.1", new)).is_ok(), "the squatter was ended");
-}
-
 fn pid_alive(pid: u32) -> bool {
     Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success()
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_pinned_port_held_by_another_program_points_at_the_override() {
     let fixture = Fixture::with_bundle(WEB);
     let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -5427,7 +4049,6 @@ fn a_pinned_port_held_by_another_program_points_at_the_override() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5437,13 +4058,8 @@ fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
     // Same generation, daemon still running on the port: `up` reuses it rather than refusing.
     let second = json_result(&fixture.ok(&["up", "--json"]));
     assert_eq!(second["data"]["session"]["id"], first["data"]["session"]["id"]);
+    assert_eq!(second["data"]["checks"][0]["pid"], first["data"]["checks"][0]["pid"], "the same process");
     assert!(second["data"]["steps"].as_array().unwrap().iter().all(|s| s["status"] == "ok"), "{second}");
-
-    // The supervisor refusing to stop is still a failure; a running service is never "foreign".
-    fs::write(fixture.dir.path().join("fail-stop"), "").unwrap();
-    let out = fixture.command(&["down", "--json"]).output().unwrap();
-    assert_eq!(json_result(&out)["error"]["code"], "stop_failed");
-    fs::remove_file(fixture.dir.path().join("fail-stop")).unwrap();
     let down = json_result(&fixture.ok(&["down", "--json"]));
     assert_eq!(down["data"]["confirmed"], true);
     assert!(down["data"]["conflicts"].is_null(), "{down}");
@@ -5453,15 +4069,12 @@ fn stacks_own_running_service_on_its_port_is_not_a_conflict() {
 // ---- install and logs ----------------------------------------------------------------------
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn install_puts_locked_tools_in_place_without_starting_or_recording_anything() {
     let fixture = Fixture::with_bundle(WEB);
     let result = json_result(&fixture.ok(&["install", "--json"]));
     let steps: Vec<&str> = result["data"]["steps"].as_array().unwrap().iter().map(|s| s["step"].as_str().unwrap()).collect();
-    assert_eq!(steps, ["compile", "preflight", "install"], "{result}");
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(log.contains("install --yes --quiet"), "{log}");
-    assert!(!log.contains("daemons start") && !log.contains("daemons stop"), "{log}");
+    assert_eq!(steps, ["compile", "install"], "{result}");
+    assert!(!fixture.dir.path().join("state/supervisors").exists(), "no supervisor");
     assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
     let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
     assert!(status["data"]["session"].is_null() && status["data"]["checks"][0]["ready"] == false, "{status}");
@@ -5476,31 +4089,32 @@ fn install_puts_locked_tools_in_place_without_starting_or_recording_anything() {
 
 #[test]
 fn logs_return_a_bounded_tail_of_what_the_supervisor_kept() {
-    let fixture = Fixture::with_bundle(WEB);
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='''printf 'one\\ntwo\\nthree\\n'; exec sleep 600'''\n");
     let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "logs_failed", "never started: the supervisor has nothing");
     let out = fixture.command(&["logs", "nope", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
 
-    fs::write(fixture.dir.path().join("logs.txt"), "one\ntwo\nthree\n").unwrap();
+    // Started (it never listens, so `up` fails): what it wrote is kept.
+    let _ = fixture.command(&["up", "--timeout", "2s"]).output().unwrap();
     let result = json_result(&fixture.ok(&["logs", "web", "--tail", "2", "--json"]));
-    assert_eq!(result["data"]["lines"], json!(["two", "three"]));
+    assert_eq!(result["data"]["lines"], json!(["two", "three"]), "{result}");
     assert_eq!(result["data"]["truncated"], false);
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(log.contains("daemons logs -- web -n 2 --raw --no-pager"), "{log}");
     let out = fixture.ok(&["logs", "web"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "one\ntwo\nthree\n");
+    assert!(String::from_utf8_lossy(&out.stdout).ends_with("one\ntwo\nthree\n"), "{}", String::from_utf8_lossy(&out.stdout));
     let out = fixture.command(&["logs", "web", "--tail", "0"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
+    // No provider process is asked for logs.
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
+    assert!(!log.contains("daemons"), "{log}");
+    fixture.ok(&["down"]);
 }
 
 #[test]
 fn status_of_a_checkout_never_compiled_here_says_to_start_it_without_asking_the_supervisor() {
     let fixture = Fixture::with_bundle(WEB);
-    // A fresh worktree has the committed stack.lock but no generated provider config, and an
-    // unconfigured `mise daemons` blames its own settings; it must not be asked.
+    // A fresh worktree has the committed stack.lock but no generated provider config.
     fs::remove_file(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
-    fs::write(fixture.dir.path().join("fail-query"), "").unwrap();
     let out = fixture.command(&["status", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "unhealthy");
     let result = json_result(&out);
@@ -5510,12 +4124,10 @@ fn status_of_a_checkout_never_compiled_here_says_to_start_it_without_asking_the_
     assert!(result["data"]["checks"][0]["reason"].as_str().unwrap().contains("stack up"), "{result}");
     let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
     assert!(json_result(&out)["error"]["hint"].as_str().unwrap().contains("stack up"));
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(!log.contains("daemons --json") && !log.contains("daemons logs"), "{log}");
+    assert!(!fixture.dir.path().join("state/supervisors").exists(), "no supervisor was started to find that out");
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_launched_checkout_missing_its_generated_config_is_still_asked_about() {
     let fixture = Fixture::with_bundle(WEB);
     let port = assigned_port(&fixture, "web");
@@ -5605,7 +4217,6 @@ fn tasks_get_the_real_session_or_none_and_a_declared_stack_session_is_refused_fi
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn run_refuses_while_any_service_is_unverified() {
     // Even a task that names no services: `mise run` would hand it every service's endpoint
     // again, including the ones stack withholds.
@@ -5643,69 +4254,6 @@ fn mcp_runs_tasks_and_can_reassign_ports() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn interrupting_up_stops_its_start_request_so_nothing_launches_after_down() {
-    use std::os::unix::process::CommandExt;
-    let fixture = Fixture::with_bundle(WEB);
-    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
-    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
-    // Like Ctrl-C in a terminal: the signal goes to stack's foreground process group.
-    let mut up = fixture.command(&["up", "--json"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let waiting = fixture.dir.path().join("client-waiting");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !waiting.exists() {
-        assert!(Instant::now() < deadline, "the start request's client never started");
-        thread::sleep(Duration::from_millis(20));
-    }
-    unsafe { libc::kill(-(up.id() as i32), libc::SIGINT) };
-    assert!(!up.wait().unwrap().success());
-    fixture.ok(&["down"]);
-    thread::sleep(Duration::from_secs(3));
-    assert!(!fixture.dir.path().join("late-launch").exists(), "a client of the interrupted start acted after down");
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn interrupting_up_stops_every_start_request_running_at_once() {
-    use std::os::unix::process::CommandExt;
-    // queue's request waits for readiness (NATS's check is the provider's, so it is never
-    // ended early) while web's waits for mise's project lock: two requests at once.
-    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.queue]\npreset='nats'\n[services.web]\nrun='true'\n");
-    let queue = assigned_port(&fixture, "queue");
-    supervise_listener(&fixture, queue);
-    let daemons = json!([{ "id": "app-test/queue", "name": "queue", "status": "running", "port": queue }]);
-    fs::write(fixture.dir.path().join("daemons-started.json"), daemons.to_string()).unwrap();
-    fs::write(fixture.dir.path().join("hang-after-start"), "600").unwrap();
-    fs::write(fixture.dir.path().join("hang-service"), "queue").unwrap();
-    let mut up = fixture.command(&["up", "--json"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let clients = ["queue", "web"].map(|s| fixture.dir.path().join(format!("client-{s}")));
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !clients.iter().all(|c| c.exists()) {
-        if Instant::now() >= deadline {
-            let _ = up.kill();
-            let _ = up.wait();
-            panic!("both requests never ran at once");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(300));
-    unsafe { libc::kill(-(up.id() as i32), libc::SIGINT) };
-    assert!(!up.wait().unwrap().success());
-    let pids: Vec<u32> = clients.iter().map(|c| fs::read_to_string(c).unwrap().trim().parse().unwrap()).collect();
-    let gone = Instant::now() + Duration::from_secs(5);
-    while pids.iter().any(|p| pid_alive(*p)) && Instant::now() < gone {
-        thread::sleep(Duration::from_millis(50));
-    }
-    for pid in &pids {
-        if pid_alive(*pid) {
-            unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
-            panic!("start request {pid} outlived the interrupted up");
-        }
-    }
-    fixture.ok(&["down"]);
-}
-
-#[test]
 fn an_ignored_hangup_stays_ignored_after_captured_commands() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
@@ -5735,14 +4283,21 @@ fn an_ignored_hangup_stays_ignored_after_captured_commands() {
 }
 
 /// `web` as the supervisor reports it once started: running as `service`, which never listens.
-fn supervise_never_ready(fixture: &Fixture, service: &Detached) {
-    let port = assigned_port(fixture, "web");
-    fs::write(fixture.dir.path().join("pf-tracked-pid"), service.0.to_string()).unwrap();
-    fs::write(
-        fixture.dir.path().join("daemons-started.json"),
-        json!([{ "id": "app-test/web", "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
-    )
-    .unwrap();
+fn supervise_never_ready(fixture: &Fixture) {
+    fixture.sleepers();
+}
+
+/// The pid of the service a [`SLEEPER`] or [`LISTEN`] command started, once it recorded it.
+fn service_pid(fixture: &Fixture) -> u32 {
+    let path = fixture.dir.path().join("pf-tracked-pid");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = fs::read_to_string(&path).ok().and_then(|p| p.trim().parse().ok()) {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the service never started");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn launch_records(fixture: &Fixture) -> Vec<Value> {
@@ -5772,11 +4327,9 @@ fn assert_cut_short_verifying(error: &Value, service: &str) {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_down() {
     let fixture = Fixture::with_bundle(WEB);
-    let service = Detached::spawn();
-    supervise_never_ready(&fixture, &service);
+    supervise_never_ready(&fixture);
     let start = Instant::now();
     let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
     let took = start.elapsed();
@@ -5791,10 +4344,11 @@ fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_dow
     assert_cut_short_verifying(error, "web");
 
     // Nothing stopped the service, and its ownership is recorded as an incomplete launch.
-    assert!(service.alive());
+    let service = service_pid(&fixture);
+    assert!(pid_alive(service));
     for record in launch_records(&fixture) {
         assert_eq!(record["launching"], true, "{record}");
-        assert_eq!(record["services"]["web"]["pid"], service.0, "{record}");
+        assert_eq!(record["services"]["web"]["pid"], service, "{record}");
     }
     let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
     assert_eq!(status["data"]["healthy"], false, "{status}");
@@ -5802,44 +4356,30 @@ fn up_gives_up_at_its_timeout_and_keeps_a_never_ready_service_recorded_until_dow
 
     // `down` stops it through the supervisor, and nothing is left for GC.
     fixture.ok(&["down"]);
-    assert!(!service.alive());
+    assert!(!pid_alive(service));
     assert_eq!(json_result(&fixture.ok(&["gc", "--json"]))["data"], json!([]));
 
     // Once the service can become ready, the same command succeeds.
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let path = fixture.dir.path().join("bundle/bundle.toml");
+    fs::write(&path, fs::read_to_string(&path).unwrap().replace(SLEEPER, LISTEN)).unwrap();
+    fixture.ok(&["compile"]);
     fixture.ok(&["up", "--timeout", "30s"]);
     fixture.ok(&["exec", "--require", "web", "--", "true"]);
     fixture.ok(&["down"]);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn mcp_up_reports_its_timeout_as_an_error_and_down_still_stops_what_launched() {
     let fixture = Fixture::with_bundle(WEB);
-    let service = Detached::spawn();
-    supervise_never_ready(&fixture, &service);
-    mcp_up_times_out_and_down_stops(&fixture, &service);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn mcp_up_cut_short_while_verifying_keeps_what_launched_for_down() {
-    let fixture = Fixture::with_bundle(WEB);
-    let service = Detached::spawn();
-    supervise_never_ready(&fixture, &service);
-    fs::write(fixture.dir.path().join("slow-env-after-start"), "30").unwrap();
-    let start = Instant::now();
-    let cause = mcp_up_times_out_and_down_stops(&fixture, &service);
-    assert_eq!(cause["code"], "provider_failed", "{cause}");
-    assert_eq!(cause["message"], "mise env --json was cut short by the deadline", "{cause}");
-    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    supervise_never_ready(&fixture);
+    mcp_up_times_out_and_down_stops(&fixture);
 }
 
 /// `stack_up` of `service` (supervised, never ready) with a 2s timeout, then `stack_status` and
 /// `stack_down` from the same server: the timeout is a tool error that leaves the launch
 /// recorded and unhealthy, and `down` stops it. Returns the timeout's cause. On a loaded
 /// machine 1s can pass before the start, when nothing was launched yet.
-fn mcp_up_times_out_and_down_stops(fixture: &Fixture, service: &Detached) -> Value {
+fn mcp_up_times_out_and_down_stops(fixture: &Fixture) -> Value {
     let results = fixture.mcp(&[("stack_up", json!({ "timeout_secs": 2 })), ("stack_status", json!({})), ("stack_down", json!({}))], &[]);
     assert_eq!(results[0]["isError"], true, "{}", results[0]);
     let error = &results[0]["structuredContent"]["error"];
@@ -5847,56 +4387,26 @@ fn mcp_up_times_out_and_down_stops(fixture: &Fixture, service: &Detached) -> Val
     assert_eq!(error["message"], "`stack up` did not finish within 2s");
     assert!(error["hint"].as_str().unwrap().contains("`stack down` stops them"), "{error}");
     assert_cut_short_verifying(error, "web");
+    let service = service_pid(fixture);
     let status = &results[1]["structuredContent"]["data"];
     assert_eq!(status["healthy"], false, "{status}");
     assert_eq!(status["session"]["launching"], true, "{status}");
-    assert_eq!(status["session"]["services"]["web"]["pid"], service.0, "{status}");
+    assert_eq!(status["session"]["services"]["web"]["pid"], service, "{status}");
     assert_eq!(results[2]["isError"], false, "{}", results[2]);
-    assert!(!service.alive());
+    assert!(!pid_alive(service));
     assert!(fixture.session_paths().iter().all(|p| !p.exists()), "the launch is still recorded after down");
     error["details"][0]["cause"].clone()
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
-fn a_start_request_cut_short_by_the_timeout_is_killed_with_its_process_group() {
-    let fixture = Fixture::with_bundle(WEB);
-    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
-    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
-    let start = Instant::now();
-    let out = fixture.command(&["up", "--timeout", "2s"]).output().unwrap();
-    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
-    assert_eq!(out.status.code(), Some(124));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("error[timed_out]: `stack up` did not finish within 2s"), "{stderr}");
-    assert!(stderr.contains("cut short: error[start_failed]"), "{stderr}");
-    assert!(fixture.dir.path().join("client-waiting").exists(), "the start request never ran");
-    // What the supervisor reported after the cut-short start is recorded, not forgotten.
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    let after_start = log.split("daemons start").nth(1).expect("start requested");
-    assert!(after_start.contains("daemons --json"), "{log}");
-    for record in launch_records(&fixture) {
-        assert_eq!(record["launching"], true, "{record}");
-    }
-    // The request's own descendants went with it: none acts after the timeout.
-    thread::sleep(Duration::from_secs(3));
-    assert!(!fixture.dir.path().join("late-launch").exists(), "a client of the cut-short start acted later");
-    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
-    fixture.ok(&["down"]);
-}
-
-#[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn startup_waits_for_a_busy_project_only_until_its_timeout() {
     use std::os::unix::process::CommandExt;
-    let fixture = Fixture::with_bundle(WEB);
-    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
-    fs::write(fixture.dir.path().join("late-client"), "").unwrap();
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nsetup='touch \"$REVIEW_FIXTURE/client-waiting\"; sleep 30'\n");
     let mut first = fixture.command(&["up", "--timeout", "60s"]).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let waiting = fixture.dir.path().join("client-waiting");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !waiting.exists() {
-        assert!(Instant::now() < deadline, "the first start request never started");
+        assert!(Instant::now() < deadline, "the first start never reached its setup");
         thread::sleep(Duration::from_millis(20));
     }
 
@@ -5914,17 +4424,15 @@ fn startup_waits_for_a_busy_project_only_until_its_timeout() {
 
     unsafe { libc::kill(-(first.id() as i32), libc::SIGINT) };
     assert!(!first.wait().unwrap().success());
-    fs::remove_file(fixture.dir.path().join("slow-start")).unwrap();
     fixture.ok(&["down"]);
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_restart_cut_short_keeps_the_session_and_records_the_incomplete_launch() {
     let fixture = Fixture::with_bundle(WEB);
     supervise_listener(&fixture, assigned_port(&fixture, "web"));
     let up = json_result(&fixture.ok(&["up", "--json"]));
-    fs::write(fixture.dir.path().join("slow-start"), "30").unwrap();
+    fs::write(fixture.dir.path().join("slow-start"), "6").unwrap();
     let start = Instant::now();
     let out = fixture.command(&["restart", "web", "--timeout", "2s", "--json"]).output().unwrap();
     assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
@@ -5966,8 +4474,7 @@ fn startup_timeouts_are_checked_before_any_lifecycle_work() {
         assert_eq!(result["isError"], true, "{result}");
         assert_eq!(result["structuredContent"]["error"]["code"], "usage", "{result}");
     }
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(!log.contains("daemons"), "{log}");
+    assert!(!fixture.dir.path().join("state/supervisors").exists(), "nothing was started");
     assert!(!fixture.dir.path().join("app/.stack/session.json").exists());
     assert_eq!(fixture.index_files(), 0);
 }
@@ -6239,7 +4746,6 @@ fn fnox_log(fixture: &Fixture) -> Vec<String> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_grant_reaches_only_its_command_and_is_redacted_from_captured_output() {
     let fixture = secrets_fixture("[services.db]\npreset = 'postgres'\nversion = '17'\n");
     let script = r#"printf '%s\n' "$DEPLOY_KEY"; printf 'x%sy\n' "$DEPLOY_KEY" >&2; env | sort"#;
@@ -7336,7 +5842,6 @@ fn a_tasks_own_output_is_returned_as_it_wrote_it_and_never_read_for_refusals() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn version_2_locks_install_plainly_and_required_policies_refuse_before_any_install() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n");
     // The lock the fixture compiled, turned into version 2.
@@ -7452,7 +5957,6 @@ fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordina
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_mise_too_old_for_the_lock_fails_install_and_up_before_ports_identities_or_config_change() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[services.web]\nrun='true'\n");
     let platform = stack::artifacts::current_platform();
@@ -7521,24 +6025,18 @@ fn a_mise_too_old_for_the_lock_stops_install_before_rendering_and_doctor_says_so
 
 // ---- machine-wide commands -------------------------------------------------------------------
 
-/// `web` started under the fake supervisor with a data directory of `bytes` bytes, as mise
-/// reports one for a preset service; `up` records it (marker, machine data record).
+/// `web`, a Postgres preset, started by Stack's supervisor with the data directory mise's preset
+/// kept for this checkout (see `legacy_data`), holding `bytes` bytes; `up` records it (marker,
+/// machine data record).
 fn up_with_data(fixture: &Fixture, up_args: &[&str], bytes: usize) -> (u16, std::path::PathBuf) {
-    let dir = fixture.dir.path();
-    let port = assigned_port(fixture, "web");
-    supervise_listener(fixture, port);
-    let data = dir.join("mise-state/daemons/0123/data/web");
-    let daemon = |status: &str| json!([{ "id": "app-test/web", "name": "web", "status": status, "port": port, "data_dir": data }]).to_string();
-    fs::write(dir.join("daemons-started.json"), daemon("running")).unwrap();
-    fs::write(dir.join("daemons.json"), daemon("stopped")).unwrap();
-    fs::create_dir_all(&data).unwrap();
+    let port = fixture.postgres_web();
+    let data = fixture.legacy_data("0123");
     fs::write(data.join("rows"), vec![b'x'; bytes]).unwrap();
     fixture.ok(&[&["up"], up_args].concat());
     (port, data)
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
@@ -7599,21 +6097,22 @@ fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn mv_carries_a_moved_checkouts_ports_tokens_and_data_to_its_new_path() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
     let (port, data) = up_with_data(&fixture, &[], 8192);
     fixture.ok(&["down"]);
     let app = dir.join("app").canonicalize().unwrap();
+    let supervisor = dir.join("state/supervisors").join(stack::state::project_key(&app));
+    assert!(supervisor.join("state.json").exists(), "the stopped supervisor's record stays until the checkout moves");
     // An identity token, as a compile gives a service with an identity probe.
     let token = "stack-0123456789abcdef0123456789abcdef";
     fs::write(dir.join("state/identities.json"), json!({ "tokens": [{ "project": app, "service": "web", "token": token }] }).to_string()).unwrap();
     let tokens = || -> Value { serde_json::from_slice(&fs::read(dir.join("state/identities.json")).unwrap()).unwrap() };
     let moved = dir.canonicalize().unwrap().join("moved");
     fs::rename(&app, &moved).unwrap();
-    let new_data = dir.join("mise-state/daemons/4567/data/web");
-    fs::write(dir.join("daemons-ls.json"), json!([{ "name": "web", "status": "available", "data_dir": new_data }]).to_string()).unwrap();
+    // Where Stack keeps a checkout's data at the new path.
+    let new_data = dir.join("state/data").join(stack::state::project_key(&moved)).join("web");
 
     // Relative paths, from the parent directory.
     let out = fixture.command_at(dir, &["mv", "app", "moved", "--json"]).current_dir(dir).output().unwrap();
@@ -7625,6 +6124,7 @@ fn mv_carries_a_moved_checkouts_ports_tokens_and_data_to_its_new_path() {
     assert_eq!(m["data"][0]["to"].as_str(), new_data.to_str(), "{result}");
     assert_eq!(fs::read(new_data.join("rows")).unwrap().len(), 8192);
     assert!(!data.exists() && !data.with_file_name("web.stack-checkout").exists(), "the old directory and marker are gone");
+    assert!(!supervisor.exists(), "the supervisor directory of the old path is forgotten");
     // Marked and recorded as the checkout's under the token its new path gives it.
     let new_token = stack::checkout::token(&moved).unwrap();
     let marker: Value = serde_json::from_slice(&fs::read(new_data.with_file_name("web.stack-checkout")).unwrap()).unwrap();
@@ -7716,11 +6216,10 @@ fn mv_refuses_what_it_cannot_do_safely_and_changes_nothing() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn down_purge_removes_the_data_up_recorded_only_where_gc_would_and_releases_ports() {
     let fixture = Fixture::with_bundle(WEB);
     let dir = fixture.dir.path();
-    let (port, data) = up_with_data(&fixture, &[], 8192);
+    let (_port, data) = up_with_data(&fixture, &[], 8192);
     let marker = data.with_file_name("web.stack-checkout");
     fs::write(data.with_file_name("unsaved.txt"), "keep me").unwrap();
     let purge = |args: &[&str]| -> Value {
@@ -7732,15 +6231,9 @@ fn down_purge_removes_the_data_up_recorded_only_where_gc_would_and_releases_port
     };
 
     // The supervisor the record names does not report the service stopped: the data is kept.
-    fs::create_dir_all(dir.join("pf-status/app-test")).unwrap();
-    fs::write(dir.join("pf-status/app-test/web.json"), json!({ "id": "app-test/web", "status": "running" }).to_string()).unwrap();
-    let p = purge(&[]);
-    assert_eq!(p["complete"], false, "{p}");
-    assert_eq!(p["data"][0]["kept"], true, "{p}");
-    assert!(p["data"][0]["outcome"].as_str().unwrap().contains("the supervisor reports app-test/web as \"running\""), "{p}");
-    assert!(data.join("rows").exists() && marker.exists());
-    assert_eq!(p["released_ports"], json!([{ "service": "web", "port": port }]), "{p}");
-    fs::remove_dir_all(dir.join("pf-status")).unwrap();
+    // (Stack's supervisor reports nothing running once `down` confirmed the stop; data whose
+    // recorded supervisor reports its service running is kept: see
+    // `gc_releases_a_removed_checkouts_ports_and_removes_its_data_only_when_asked_and_safe`.)
 
     // Confirmed: removed with its marker, and nothing beside it; the record is settled.
     let p = purge(&[]);
@@ -7848,4 +6341,339 @@ fn every_error_code_is_registered_with_a_hint_a_retry_flag_and_next_steps() {
     let results = fixture.mcp(&[("stack_restart", json!({})), ("stack_errors", json!({}))], &[]);
     assert_eq!(results[0]["structuredContent"]["error"]["next"], failed["error"]["next"], "{}", results[0]);
     assert_eq!(results[1]["structuredContent"]["data"], listed["data"], "{}", results[1]);
+}
+
+// ---- Stack's own supervisor -----------------------------------------------------------------
+
+/// The supervisor of the checkout killed outright: its service runs on unsupervised, so it is
+/// no longer verified (its endpoints withheld); `down` stops it from the recorded pid, start
+/// time and group, and `up` replaces it under a new supervisor.
+#[test]
+fn a_killed_supervisor_leaves_nothing_down_cannot_stop_and_up_replaces_it() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let service = service_pid(&fixture);
+    let supervisor = fixture.supervisor_state()["supervisor"]["pid"].as_u64().unwrap() as u32;
+    unsafe { libc::kill(supervisor as i32, libc::SIGKILL) };
+    let gone = Instant::now() + Duration::from_secs(5);
+    while pid_alive(supervisor) && Instant::now() < gone {
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(200));
+    if pid_alive(service) {
+        // macOS: nothing stops it on its own.
+        let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+        assert_eq!(status["data"]["checks"][0]["ready"], false, "{status}");
+        assert!(status["data"]["checks"][0]["reason"].as_str().unwrap().contains("orphaned"), "{status}");
+        let out = fixture.ok(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]);
+        assert_eq!(printed(&String::from_utf8_lossy(&out.stdout))["STACK_UNVERIFIED"], "web");
+    }
+    // `up` stops the orphan (if any) and starts the service again under a new supervisor.
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    assert!(!pid_alive(service));
+    let replacement = fixture.session()["services"]["web"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(replacement, service);
+    // Killed again, `down` alone stops what it left and confirms.
+    let supervisor = fixture.supervisor_state()["supervisor"]["pid"].as_u64().unwrap() as u32;
+    unsafe { libc::kill(supervisor as i32, libc::SIGKILL) };
+    thread::sleep(Duration::from_millis(200));
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(replacement));
+    assert!(fixture.supervisor_state()["supervisor"].is_null());
+}
+
+/// Services start in their dependency order through Stack's supervisor: one starts only once
+/// what it depends on verified and is ready, and services of one wave start together.
+#[test]
+fn up_starts_each_wave_once_the_one_before_is_ready_and_a_wave_at_once() {
+    let slow = format!("sleep 1; {LISTEN}");
+    let check = r#"if "$REVIEW_PYTHON" -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1)' "$DB_PORT"; then echo up; else echo down; fi >"$REVIEW_FIXTURE/db-at-api-start"; "#;
+    let fixture = Fixture::with_bundle(&format!(
+        "[bundle]\nname='test'\n[services.db]\nrun='''{slow}'''\n[services.cache]\nrun='''{slow}'''\n[services.api]\nrun='''{check}{LISTEN}'''\ndepends_on=['db', 'cache']\n"
+    ));
+    let db = assigned_port(&fixture, "db");
+    fixture.set_env(&[("DB_PORT", db.to_string())]);
+    let started = Instant::now();
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let took = started.elapsed();
+    assert!(up["data"]["checks"].as_array().unwrap().iter().all(|c| c["ready"] == true), "{up}");
+    assert_eq!(fs::read_to_string(fixture.dir.path().join("db-at-api-start")).unwrap().trim(), "up", "api started before db was ready");
+    // db and cache took a second each, together.
+    assert!(took < Duration::from_millis(1900), "the first wave started one at a time: {took:?}");
+    fixture.ok(&["down"]);
+}
+
+/// A session Stack 0.1.23 started under Pitchfork: `status` asks Pitchfork about it, `restart`
+/// refuses, and `up` stops it through Pitchfork and starts the service under Stack's own
+/// supervisor.
+#[test]
+fn a_session_running_under_pitchfork_is_asked_there_and_moved_by_up() {
+    let fixture = Fixture::with_bundle(WEB);
+    let running = fixture.start_web(&[]);
+    let pid = running.service.0;
+    fixture.supervisor_tracks(pid, running.port);
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["checks"][0]["pid"], pid, "{status}");
+    assert!(fixture.pitchfork_log().contains(&format!("status --json {WEB_ID}")), "{}", fixture.pitchfork_log());
+    let out = fixture.command(&["restart", "--json"]).output().unwrap();
+    let error = json_result(&out)["error"].clone();
+    assert_eq!(error["code"], "session_stale", "{error}");
+    assert!(error["hint"].as_str().unwrap().contains("stack up"), "{error}");
+    drop(running.listener);
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(fixture.pitchfork_log().contains(&format!("stop -- {WEB_ID}")), "stopped through Pitchfork: {}", fixture.pitchfork_log());
+    assert!(!pid_alive(pid));
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    let record = fixture.session();
+    assert_eq!(record["provider"]["supervisor"], "stack", "{record}");
+    assert_eq!(record["provider"]["pitchfork"], "", "{record}");
+    fixture.ok(&["down"]);
+}
+
+// ---- review fixes ---------------------------------------------------------------------------
+
+impl Fixture {
+    fn remove_session_records(&self) {
+        let _ = fs::remove_file(self.dir.path().join("app/.stack/session.json"));
+        if let Ok(entries) = fs::read_dir(self.dir.path().join("state/sessions")) {
+            for e in entries.flatten() {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+
+    fn supervisor_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("state/supervisors").join(stack::state::project_key(&self.dir.path().join("app").canonicalize().unwrap()))
+    }
+
+    fn kill_supervisor(&self) -> u32 {
+        let pid = self.supervisor_state()["supervisor"]["pid"].as_u64().unwrap() as u32;
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let gone = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) && Instant::now() < gone {
+            thread::sleep(Duration::from_millis(10));
+        }
+        pid
+    }
+}
+
+/// Council item 4: no data is replaced while a server a dead supervisor left still runs, even
+/// with no launch record left to say so.
+#[test]
+fn a_snapshot_is_never_restored_under_a_server_a_dead_supervisor_left_running() {
+    let fixture = Fixture::with_bundle(WEB);
+    let (_port, data) = up_with_data(&fixture, &[], 64);
+    fs::write(data.join("rows"), "before").unwrap();
+    fixture.ok(&["snapshot", "save", "base"]);
+    fs::write(data.join("rows"), "after").unwrap();
+    let server = fixture.session()["services"]["web"]["pid"].as_u64().unwrap() as u32;
+    fixture.kill_supervisor();
+    fixture.remove_session_records();
+    let out = fixture.command(&["snapshot", "restore", "base", "--json"]).output().unwrap();
+    assert!(!out.status.success(), "{}", json_result(&out));
+    assert!(pid_alive(server));
+    assert_eq!(fs::read_to_string(data.join("rows")).unwrap(), "after", "data replaced under a running server");
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(server));
+}
+
+/// Council item 8: each preset service runs its own pinned release, of any major.
+#[test]
+fn each_preset_service_runs_its_own_pinned_release() {
+    for (a, b) in [("17.6", "18.1"), ("17.6", "17.11")] {
+        let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.pga]\npreset='postgres'\nversion='{a}'\n[services.pgb]\npreset='postgres'\nversion='{b}'\n"));
+        let bin = fixture.dir.path().join("bin");
+        servers::install(&bin);
+        let (da, db) = (servers::postgres_release(fixture.dir.path(), &bin, a), servers::postgres_release(fixture.dir.path(), &bin, b));
+        let path = format!("{}:{}:{}:{}", da.display(), db.display(), bin.display(), std::env::var("PATH").unwrap());
+        fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
+        // (Both share DATABASE_URL, so only one of them verifies as its instance.)
+        let _ = fixture.command(&["up", "--timeout", "10s"]).output().unwrap();
+        for (service, version) in [("pga", a), ("pgb", b)] {
+            let port = assigned_port(&fixture, service);
+            let ran = fs::read_to_string(fixture.dir.path().join(format!("postgres-{port}.version"))).unwrap_or_default();
+            assert_eq!(ran.trim(), version, "{service} ran another release");
+        }
+        fixture.ok(&["down"]);
+    }
+}
+
+/// Council item 9: dropping the Pitchfork pin an older Stack left in stack.lock leaves the
+/// running session current.
+#[test]
+fn compiling_away_the_old_pitchfork_pin_keeps_the_running_session_current() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let lock = fixture.dir.path().join("app/stack.lock");
+    let text = fs::read_to_string(&lock).unwrap();
+    fs::write(&lock, format!("{text}\n[[tool]]\nname = \"pitchfork\"\nrequested = \"2.29.0\"\nresolved = \"2.29.0\"\n")).unwrap();
+    fixture.ok(&["compile", "--locked"]);
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    fixture.ok(&["compile"]);
+    assert!(!fs::read_to_string(&lock).unwrap().contains("pitchfork"));
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!((status["data"]["stale"].clone(), status["data"]["healthy"].clone()), (json!(false), json!(true)), "{status}");
+    assert_eq!(json_result(&fixture.ok(&["up", "--json"]))["data"]["session"]["id"], up["data"]["session"]["id"], "nothing restarted");
+    fixture.ok(&["down"]);
+}
+
+/// Council item 10: two checkouts run a preset with further ports at once, each answering its
+/// own readiness check.
+#[test]
+fn two_checkouts_run_a_preset_with_further_ports_at_once() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.queue]\npreset='nats'\nversion='2.10.1'\n");
+    servers::install_nats(&fixture.dir.path().join("bin"));
+    let other = fixture.dir.path().join("app2");
+    fs::create_dir(&other).unwrap();
+    fs::copy(fixture.dir.path().join("app/stack.toml"), other.join("stack.toml")).unwrap();
+    fixture.ok(&["compile"]);
+    assert!(fixture.command_at(&other, &["compile"]).output().unwrap().status.success());
+    let monitor = |dir: &Path| -> String {
+        let config = fs::read_to_string(dir.join(".config/mise/conf.d/stack.toml")).unwrap();
+        config.lines().find(|l| l.starts_with("NATS_MONITOR_PORT")).unwrap().to_string()
+    };
+    let (mine, theirs) = (monitor(&fixture.dir.path().join("app")), monitor(&other));
+    assert_ne!(mine, theirs);
+    assert!(!mine.contains("8222"), "{mine}");
+    fixture.ok(&["up"]);
+    let out = fixture.command_at(&other, &["up", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", json_result(&out));
+    fixture.ok(&["down"]);
+    assert!(fixture.command_at(&other, &["down"]).output().unwrap().status.success());
+}
+
+/// Council item 12: at the deadline a healthy service is reported as it last verified, and the
+/// one still starting as not verified in time.
+#[test]
+fn at_the_deadline_only_the_service_still_starting_is_reported() {
+    let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.web]\nrun='''{LISTEN}'''\n[services.slow]\nrun='exec sleep 600'\nready_port=1\n"));
+    let out = fixture.command(&["up", "--timeout", "4s", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["error"]["code"], "timed_out", "{result}");
+    let cause = &result["error"]["details"][0]["cause"];
+    let failed: Vec<&str> = cause["details"].as_array().unwrap().iter().filter_map(|d| d["service"].as_str()).collect();
+    assert_eq!(failed, ["slow"], "{result}");
+    assert!(cause["details"][0]["reason"].as_str().unwrap().contains("not verified before the deadline"), "{result}");
+    fixture.ok(&["down"]);
+}
+
+/// Council item 13: a Pitchfork supervisor the migrating `up` could not stop is reported, and
+/// the next `down` tries again.
+#[test]
+fn a_pitchfork_supervisor_kept_during_migration_is_tried_again_by_down() {
+    let fixture = Fixture::with_bundle(WEB);
+    let pf = fixture.dir.path().join("pf");
+    let legacy = fixture.legacy_record(&pf);
+    let mark = "stack-2222222222222222bbbbbbbbbbbbbbbb".to_string();
+    fs::write(fixture.dir.path().join("state/supervisor-owner"), format!("{mark}\n")).unwrap();
+    let pid = fake_supervisor(&fixture, Some(&mark));
+    fs::write(fixture.dir.path().join("pf-list.json"), json!([{ "id": "someone-else/db", "status": "running" }]).to_string()).unwrap();
+    legacy();
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    let warning = up["data"]["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).find(|w| w.contains("Pitchfork supervisor")).unwrap_or_else(|| panic!("{up}")).to_string();
+    assert!(warning.contains("someone-else/db is running") && warning.contains("`stack down` tries again"), "{warning}");
+    assert!(pid_alive(pid), "a supervisor others use was stopped");
+    fs::remove_file(fixture.dir.path().join("pf-list.json")).unwrap();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["supervisor"]["pitchfork"]["stopped"], true, "{down}");
+    assert!(!pid_alive(pid));
+}
+
+/// Council item 16: `gc` shuts down a supervisor still running for a deleted checkout whose
+/// session record is gone, and stops its services, before removing its directory.
+#[test]
+fn gc_stops_a_live_supervisor_a_deleted_checkout_left_without_a_session() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let service = service_pid(&fixture);
+    let supervisor = fixture.supervisor_state()["supervisor"]["pid"].as_u64().unwrap() as u32;
+    let dir = fixture.supervisor_dir();
+    fixture.remove_session_records();
+    fs::remove_dir_all(fixture.dir.path().join("app")).unwrap();
+    let gc = json_result(&fixture.command_at(fixture.dir.path(), &["gc", "--json"]).output().unwrap());
+    assert_eq!(gc["ok"], true, "{gc}");
+    assert!(!pid_alive(service) && !pid_alive(supervisor));
+    assert!(!dir.exists());
+}
+
+/// Council item 17: the supervisor's own log is cut to its tail before it grows past a bound.
+#[test]
+fn the_supervisors_own_log_is_bounded() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let dir = fixture.supervisor_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let line = "an old line of the supervisor's own\n";
+    fs::write(dir.join("supervisor.log"), line.repeat(3 * 1024 * 1024 / line.len()) + "the last old line\n").unwrap();
+    fixture.ok(&["up"]);
+    let log = fs::read_to_string(dir.join("supervisor.log")).unwrap();
+    assert!(log.len() <= 300 * 1024, "{} bytes", log.len());
+    assert!(log.contains("the last old line") && log.starts_with(line), "the tail is kept, from a line");
+    fixture.ok(&["down"]);
+}
+
+/// Restored from the Pitchfork era: an interrupted `up` leaves nothing `down` cannot stop, and
+/// nothing starts after it.
+#[test]
+fn interrupting_up_leaves_nothing_down_cannot_stop() {
+    use std::os::unix::process::CommandExt;
+    let fixture = Fixture::with_bundle(&format!(
+        "[bundle]\nname='test'\n[services.db]\nrun='''{LISTEN}'''\n[services.web]\nrun='exec sleep 600'\ndepends_on=['db']\nsetup='touch \"$REVIEW_FIXTURE/in-setup\"; sleep 30'\n"
+    ));
+    let mut up = fixture.command(&["up", "--json"]).process_group(0).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !fixture.dir.path().join("in-setup").exists() {
+        assert!(Instant::now() < deadline, "the setup never ran");
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::kill(-(up.id() as i32), libc::SIGINT) };
+    assert!(!up.wait().unwrap().success());
+    let db = service_pid(&fixture);
+    assert!(fixture.supervisor_state()["services"].get("web").is_none(), "web started after the interrupt");
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(!pid_alive(db));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", assigned_port(&fixture, "db"))).is_err());
+}
+
+/// Restored from the Pitchfork era: without a launch record, what the supervisor runs on the
+/// checkout's port is still the checkout's to stop, and `down` waits for it.
+#[test]
+fn without_a_record_down_stops_what_the_supervisor_runs_and_waits_for_its_port() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    fixture.ok(&["up"]);
+    let service = service_pid(&fixture);
+    fixture.remove_session_records();
+    let down = json_result(&fixture.ok(&["down", "--json"]));
+    assert_eq!(down["data"]["confirmed"], true, "{down}");
+    assert!(down["data"]["conflicts"].is_null(), "its own service is not foreign: {down}");
+    assert!(!pid_alive(service));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+/// Restored from the Pitchfork era: a service process of this checkout listening on its port
+/// with nothing recording it (its record never written) is stopped by `up`, never called
+/// foreign. See also `a_service_process_the_supervisor_lost_is_stopped_by_up_and_down_never_called_foreign`.
+#[test]
+fn a_launched_but_unrecorded_service_is_stopped_by_up_and_replaced() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    fixture.ok(&["up"]);
+    let first = service_pid(&fixture);
+    // Its supervisor dies and the record of the service is lost.
+    fixture.kill_supervisor();
+    fs::remove_file(fixture.supervisor_dir().join("state.json")).unwrap();
+    fixture.remove_session_records();
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(!pid_alive(first), "the unrecorded process was left running: {up}");
+    assert_eq!(up["data"]["checks"][0]["ready"], true, "{up}");
+    fixture.ok(&["down"]);
 }

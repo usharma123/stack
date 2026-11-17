@@ -282,6 +282,16 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 
 /// Atomic write: temp file then rename.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_with(path, value, true)
+}
+
+/// [`write_json`] without waiting for the disk: for records that describe running processes
+/// only (an execution in progress), which a crash of the machine ends anyway.
+pub fn write_json_unsynced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_with(path, value, false)
+}
+
+fn write_json_with<T: Serialize>(path: &Path, value: &T, sync: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
     }
@@ -291,9 +301,11 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(path.display(), e))?;
     tmp.write_all(text.as_bytes())
         .map_err(|e| io_error(path.display(), e))?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| io_error(path.display(), e))?;
+    if sync {
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| io_error(path.display(), e))?;
+    }
     tmp.persist(path)
         .map_err(|e| io_error(path.display(), e.error))?;
     Ok(())
@@ -491,5 +503,21 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!pid_alive(pid));
+    }
+}
+
+/// An optional path that older Stack releases required: `None` is written as an empty string,
+/// which they read as a path that names nothing (and so confirms nothing), and read back as
+/// `None`.
+pub mod required_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+        Ok(Option::<PathBuf>::deserialize(d)?.filter(|p| !p.as_os_str().is_empty()))
     }
 }

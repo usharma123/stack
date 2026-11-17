@@ -292,7 +292,7 @@ fn start_matches(recorded: u64, actual: u64) -> bool {
 pub(super) fn stop_orphan(provider: Option<&ProviderRecord>, record: &ServiceRecord, refused: Unconfirmed) -> std::result::Result<String, Unconfirmed> {
     let Unconfirmed { recovery, .. } = refused;
     let keep = |why: String| Unconfirmed { why: format!("--stop-orphans: {why}; not signalled"), recovery: recovery.clone() };
-    let (Some(provider), Some(id), Some(pid)) = (provider, record.provider_id.as_deref(), record.pid) else {
+    let (Some((provider, bin)), Some(id), Some(pid)) = (provider.and_then(|p| Some((p, p.legacy()?))), record.provider_id.as_deref(), record.pid) else {
         return Err(keep("the record names no supervisor, id or pid".into()));
     };
     let Some(recorded) = record.started_at_ms else {
@@ -308,12 +308,12 @@ pub(super) fn stop_orphan(provider: Option<&ProviderRecord>, record: &ServiceRec
             rfc3339(recorded / 1000)
         )));
     }
-    match mise::supervised(&provider.pitchfork, &provider.state_dir, id) {
+    match mise::supervised(bin, &provider.state_dir, id) {
         Ok(mise::Supervised::Found { status, pid: Some(now), port: Some(port) }) if status == "running" && now == pid && port == record.port => {}
         Ok(other) => return Err(keep(format!("{id} changed before the stop ({other:?})"))),
         Err(e) => return Err(keep(e)),
     }
-    if let Err(e) = mise::stop_supervised(&provider.pitchfork, &provider.state_dir, id) {
+    if let Err(e) = mise::stop_supervised(bin, &provider.state_dir, id) {
         return Err(Unconfirmed { why: format!("--stop-orphans: {e}"), recovery });
     }
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);

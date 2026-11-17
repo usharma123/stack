@@ -290,7 +290,7 @@ fn ordinary_compile_locks_needed_pins_in_a_unique_tools_only_scratch_root_and_th
     let calls = sb.mise.calls();
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
-    assert_eq!(call.tools, ["fnox", "jq", "pitchfork", "postgres"]);
+    assert_eq!(call.tools, ["fnox", "jq", "postgres"]);
     assert_eq!(call.platforms, ["macos-arm64", "linux-x64", "linux-arm64"]);
     let config: Table = toml::from_str(&call.config).unwrap();
     assert_eq!(config.keys().collect::<Vec<_>>(), ["tools"], "only [tools]: {}", call.config);
@@ -517,13 +517,13 @@ fn requests_that_name_a_pinned_release_again_and_duplicate_pins_need_no_locking(
 
 #[test]
 fn tools_mise_cannot_lock_are_missing_with_its_reason_and_the_rest_are_written() {
-    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\n[services.cache]\npreset = \"redis\"\nversion = \"8\"\n[lock]\nplatforms = [\"linux-x64\"]\n");
-    sb.mise.unpublished.lock().unwrap().push(("pitchfork".into(), "linux-x64".into()));
+    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\nfnox = \"1.39.0\"\n[services.cache]\npreset = \"redis\"\nversion = \"8\"\n[lock]\nplatforms = [\"linux-x64\"]\n");
+    sb.mise.unpublished.lock().unwrap().push(("fnox".into(), "linux-x64".into()));
     let report = sb.compile(Mode::UseLock).unwrap();
     let a = &artifacts(&report, "cache")["linux-x64"];
     assert_eq!(a.state, stack::artifacts::State::Missing);
     assert_eq!(a.reason.as_deref(), Some("failed to resolve redis for linux-x64: failed to solve redis-server for linux-x64"));
-    let p = &artifacts(&report, "pitchfork")["linux-x64"];
+    let p = &artifacts(&report, "fnox")["linux-x64"];
     assert_eq!((p.state, p.reason.as_deref()), (stack::artifacts::State::Missing, None), "skipped without a reason");
     assert_eq!(artifacts(&report, "jq")["linux-x64"].state, stack::artifacts::State::Verified);
     assert!(report.warnings.iter().any(|w| w.contains("`mise lock` exited with status 1")), "{:?}", report.warnings);
@@ -563,11 +563,11 @@ fn checksums_of_a_platform_no_longer_listed_are_dropped_with_a_warning() {
 
 #[test]
 fn required_artifacts_under_the_default_platforms_cover_a_stack_with_a_service() {
-    // Pitchfork publishes no Intel macOS build, as for its real 2.29.0 release.
-    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n[lock]\nartifacts = \"required\"\n");
-    sb.mise.unpublished.lock().unwrap().push(("pitchfork".into(), "macos-x64".into()));
+    // A tool that publishes no Intel macOS build, as fnox's packslip release once did not.
+    let sb = Sandbox::new("[tools]\njq = \"1.7.1\"\nfnox = \"1.39.0\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n[lock]\nartifacts = \"required\"\n");
+    sb.mise.unpublished.lock().unwrap().push(("fnox".into(), "macos-x64".into()));
     let report = sb.compile(Mode::UseLock).unwrap();
-    for name in ["jq", "pitchfork", "db"] {
+    for name in ["jq", "fnox", "db"] {
         let covered = artifacts(&report, name);
         assert_eq!(covered.keys().collect::<Vec<_>>(), ["macos-arm64", "linux-x64", "linux-arm64"], "{name}");
         assert!(covered.values().all(|a| a.state == stack::artifacts::State::Verified), "{name}: {covered:?}");
@@ -583,11 +583,12 @@ fn required_artifacts_under_the_default_platforms_cover_a_stack_with_a_service()
     sb.write("[tools]\njq = \"1.7.1\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\nartifacts = \"required\"\n");
     let report = sb.compile(Mode::UseLock).unwrap();
     assert_eq!(artifacts(&report, "jq")["macos-x64"].state, stack::artifacts::State::Verified);
-    // A service stack that lists it fails on Pitchfork, with a hint that does not repeat the compile.
-    sb.write("[tools]\njq = \"1.7.1\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\nartifacts = \"required\"\n");
+    // A stack that lists it fails on the tool without that build, with a hint that does not
+    // repeat the compile.
+    sb.write("[tools]\njq = \"1.7.1\"\nfnox = \"1.39.0\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n[lock]\nplatforms = [\"macos-arm64\", \"macos-x64\"]\nartifacts = \"required\"\n");
     let e = sb.compile(Mode::UseLock).unwrap_err();
     assert_eq!(e.code, "artifact_unlocked");
-    assert_eq!(e.details.iter().map(|d| (d["name"].as_str().unwrap(), d["platform"].as_str().unwrap())).collect::<Vec<_>>(), [("pitchfork@2.29.0", "macos-x64")]);
+    assert_eq!(e.details.iter().map(|d| (d["name"].as_str().unwrap(), d["platform"].as_str().unwrap())).collect::<Vec<_>>(), [("fnox@1.39.0", "macos-x64")]);
 }
 
 #[test]

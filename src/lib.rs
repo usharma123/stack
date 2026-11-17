@@ -36,5 +36,7 @@ pub mod skills;
 pub mod snapshot;
 pub mod source;
 pub mod state;
+pub mod stopping;
+pub mod supervisor;
 pub mod timing;
 pub mod tool;

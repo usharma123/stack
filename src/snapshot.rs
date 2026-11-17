@@ -624,6 +624,12 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
     let meta = read_meta(&ctx.state, &project, name)?;
     compatible(&meta, report)?;
     let snapshot = store(&ctx.state, &project).join(name);
+    let unresolved = crate::supervisor::unresolved(&crate::supervisor::dir(&ctx.state, &ctx.root));
+    if !unresolved.is_empty() {
+        return Err(StackError::new("stop_unconfirmed", "processes of this checkout's services may still run; nothing was restored")
+            .hint("run `stack down`, which stops what it can show is this checkout's and names the rest, then retry")
+            .details(unresolved));
+    }
     let (mut restored, mut skipped) = (Vec::new(), Vec::new());
     for (service, snap) in &meta.services {
         let data = data_dir(ctx, statuses, service)?;
@@ -633,7 +639,7 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
         }
         // Nothing can be running on a directory that does not exist; still, never copy under
         // a running daemon.
-        if statuses.iter().any(|d| d.name == *service && matches!(d.status.as_str(), "running" | "starting" | "waiting")) {
+        if statuses.iter().any(|d| d.name == *service && session::may_run(d)) {
             return Err(StackError::new("snapshot_failed", format!("'{service}' is running; nothing was restored")).hint("run `stack down`, then retry"));
         }
         restored.push(restore_into(&snapshot, service, &data.location)?);

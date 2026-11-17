@@ -13,13 +13,13 @@ use tempfile::TempDir;
 
 #[path = "support/python.rs"]
 mod python;
+#[path = "support/servers.rs"]
+mod servers;
 
 const FAKE_MISE: &str = include_str!("fakes/mise.sh");
 
 /// Runs task bodies (`mise run --skip-deps --no-timings <task>`) from the configuration mise
-/// would load, and before `daemons start` creates each preset data directory that does not
-/// exist yet, writing the run file a real server leaves (`postmaster.opts`, naming its own
-/// path). Everything else goes to the shared fake.
+/// would load. Everything else goes to the shared fake.
 const WRAPPER: &str = r#"#!/bin/sh
 self=$(cd "$(dirname "$0")" && pwd)
 py=${REVIEW_PYTHON:-python3}
@@ -30,34 +30,10 @@ case "$1 $2" in
     test -f "$config" || config=$MISE_GLOBAL_CONFIG_FILE
     body=$("$py" -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["tasks"][sys.argv[2]]["run"])' "$config" "$task") || exit 97
     exec sh -c "$body" ;;
-  'daemons start')
-    "$py" -c '
-import json, os, sys
-for d in json.load(open(sys.argv[1])):
-    data = d.get("data_dir")
-    if not data:
-        continue
-    if not os.path.isdir(data):
-        os.makedirs(data, mode=0o700)
-        open(os.path.join(data, ".mise-daemon-version"), "w").write("postgres:17")
-        open(os.path.join(data, "PG_VERSION"), "w").write("17\n")
-    open(os.path.join(data, "postmaster.opts"), "w").write("postgres \"-D\" \"%s\"\n" % data)
-' "$REVIEW_FIXTURE/daemons-started.json" ;;
 esac
 exec "$self/mise-base" "$@"
 "#;
 
-/// `psql <url> -Atc ...`: the data directory of the running daemon on the URL's port.
-const PSQL: &str = r#"#!/bin/sh
-exec "${REVIEW_PYTHON:-python3}" -c '
-import json, re, sys
-port = int(re.search(r":(\d+)/", sys.argv[1]).group(1))
-for d in json.load(open(sys.argv[2])):
-    if d.get("port") == port and d.get("status") == "running":
-        print(d["data_dir"]); sys.exit(0)
-sys.exit("psql: connection refused")
-' "$1" "$REVIEW_FIXTURE/daemons.json"
-"#;
 
 const STACK: &str = r#"[services.db]
 preset = "postgres"
@@ -75,6 +51,8 @@ services = ["db"]
 
 struct Fixture {
     dir: TempDir,
+    /// Each checkout's directory, by the name a test gives it (see `env_for`).
+    roots: std::cell::RefCell<std::collections::HashMap<String, PathBuf>>,
 }
 
 fn write_exe(path: &Path, text: &str) {
@@ -105,7 +83,7 @@ impl Fixture {
         fs::create_dir(root.join("bin")).unwrap();
         write_exe(&root.join("bin/mise-base"), FAKE_MISE);
         write_exe(&root.join("bin/mise"), WRAPPER);
-        write_exe(&root.join("bin/psql"), PSQL);
+        servers::install(&root.join("bin"));
         // Knows no daemon by id, as once the fake supervisor stopped it.
         write_exe(&root.join("bin/pitchfork"), "#!/bin/sh\ncase \"$1 $2\" in 'status --json') echo 'daemon not found' >&2; exit 1 ;; esac\nexit 0\n");
         fs::write(root.join("daemons.json"), "[]").unwrap();
@@ -114,7 +92,7 @@ impl Fixture {
         git(&root.join("repo"), &["init", "-q"]);
         git(&root.join("repo"), &["add", "stack.toml"]);
         git(&root.join("repo"), &["commit", "-q", "-m", "stack"]);
-        let fixture = Self { dir };
+        let fixture = Self { dir, roots: Default::default() };
         fixture.env_for(&fixture.repo(), None);
         fixture
     }
@@ -148,8 +126,10 @@ impl Fixture {
         v["data"].clone()
     }
 
+    /// Where Stack keeps `db`'s data for `checkout` (see `env_for`).
     fn data_dir(&self, checkout: &str) -> PathBuf {
-        self.dir.path().join("mise-state").join(checkout).join("data/db")
+        let root = self.roots.borrow()[checkout].clone();
+        self.dir.path().join("state/data").join(stack::state::project_key(&root)).join("db")
     }
 
     /// What the provider reports for `checkout`: its data directory, its port, its env.
@@ -157,11 +137,8 @@ impl Fixture {
         let mut env = json!({ "PATH": format!("{}:{}", self.dir.path().join("bin").display(), std::env::var("PATH").unwrap()) });
         if let Some(checkout) = checkout {
             let port = self.ok(at, &["inspect"])["ports"]["db"].as_u64().unwrap();
+            self.roots.borrow_mut().insert(checkout.to_string(), at.canonicalize().unwrap());
             let data = self.data_dir(checkout);
-            let entry = |status: &str| json!([{ "id": format!("{checkout}/db"), "name": "db", "status": status, "port": port, "data_dir": data }]);
-            fs::write(self.dir.path().join("daemons.json"), entry("available").to_string()).unwrap();
-            fs::write(self.dir.path().join("daemons-started.json"), entry("running").to_string()).unwrap();
-            fs::write(self.dir.path().join("listen-port"), port.to_string()).unwrap();
             env["DATABASE_URL"] = json!(format!("postgresql://postgres@127.0.0.1:{port}/postgres"));
             env["DB_DATA"] = json!(data);
         }
@@ -178,7 +155,6 @@ impl Fixture {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn init_runs_once_per_data_directory_and_resumes_after_a_failure() {
     let f = Fixture::new(STACK);
     let a = f.repo();
@@ -243,7 +219,6 @@ fn init_runs_once_per_data_directory_and_resumes_after_a_failure() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn snapshots_seed_a_worktree_without_running_init() {
     let f = Fixture::new(STACK);
     let a = f.repo();
@@ -331,7 +306,6 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn snapshots_refuse_another_major_version_and_unsupported_services() {
     let f = Fixture::new(STACK);
     let a = f.repo();
@@ -404,16 +378,11 @@ fn init_lists_are_validated_composed_and_shown_with_their_origin() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_service_without_a_data_directory_runs_init_once_per_checkout() {
-    let f = Fixture::new("[services.web]\nrun = 'true'\ninit = ['setup']\n[tasks.setup]\nrun = 'echo setup >> \"$REVIEW_FIXTURE/tasks.log\"'\n");
+    let listen = r#"exec "$REVIEW_PYTHON" -c 'import os,socket,time; s=socket.socket(); s.bind(("127.0.0.1", int(os.environ["PORT"]))); s.listen(); time.sleep(600)'"#;
+    let f = Fixture::new(&format!("[services.web]\nrun = '''{listen}'''\ninit = ['setup']\n[tasks.setup]\nrun = 'echo setup >> \"$REVIEW_FIXTURE/tasks.log\"'\n"));
     let a = f.repo();
     f.ok(&a, &["compile"]);
-    let port = f.ok(&a, &["inspect"])["ports"]["web"].as_u64().unwrap();
-    let entry = |status: &str| json!([{ "id": "A/web", "name": "web", "status": status, "port": port }]).to_string();
-    fs::write(f.dir.path().join("daemons.json"), entry("available")).unwrap();
-    fs::write(f.dir.path().join("daemons-started.json"), entry("running")).unwrap();
-    fs::write(f.dir.path().join("listen-port"), port.to_string()).unwrap();
     assert_eq!(f.ok(&a, &["up"])["init"]["web"]["ran"], json!(["setup"]));
     assert_eq!(f.ok(&a, &["up"])["init"]["web"]["status"], "done");
     assert_eq!(f.tasks_log(), "setup\n");

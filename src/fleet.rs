@@ -12,7 +12,6 @@ use crate::error::{io_error, Result, StackError};
 use crate::identity;
 use crate::lease::LeaseSummary;
 use crate::ports;
-use crate::provider::mise;
 use crate::session::{self, Session};
 use crate::state::{now, pid_alive, project_key, project_lock, read_json, write_json, FileLock};
 use indexmap::IndexMap;
@@ -469,10 +468,12 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
             old.display()
         ));
     }
-    let (moves, settled) = plan_data_moves(session.as_ref(), own, &earlier, &old, &new, new_token.as_deref(), &mut notes)?;
+    let (moves, settled) = plan_data_moves(state, session.as_ref(), own, &earlier, &old, &new, new_token.as_deref(), &mut notes)?;
 
     // Changes start here. Each step undoes the earlier ones if it fails.
     let (ports_moved, ports_replaced) = ports::rekey(state, &old, &new)?;
+    // Nothing runs from the old path (checked above): its supervisor's records and logs go.
+    crate::supervisor::forget(&crate::supervisor::dir(state, &old));
     let (tokens_moved, tokens_replaced) = identity::rekey(state, &old, &new).inspect_err(|_| {
         let _ = ports::rekey(state, &new, &old);
     })?;
@@ -554,11 +555,11 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
     let moved: Vec<(PathBuf, PathBuf)> =
         done.iter().flat_map(|(e, to)| e.location.iter().chain([&e.dir]).map(move |from| (from.clone(), to.clone()))).collect();
     crate::init_tasks::rekey(state, &old, &new, &moved);
-    if !done.is_empty() {
-        notes.push(format!(
-            "the provider's other state for {} stays behind; `mise daemons prune` removes state of paths that no longer exist",
-            old.display()
-        ));
+    // Data that came from where mise's presets kept it for an older Stack leaves mise's own
+    // small record of the old path behind; nothing of Stack's stays at the old path.
+    if let Some((from, _)) = done.iter().find(|(e, _)| e.dir.components().any(|c| c.as_os_str() == "daemons")) {
+        let record = from.dir.parent().and_then(Path::parent).map(|p| p.display().to_string()).unwrap_or_default();
+        notes.push(format!("{} came from the directory mise's preset kept for the old path; mise's own record of that path ({record}) stays, and can be deleted", from.dir.display()));
     }
     Ok(MvReport {
         from: old,
@@ -607,12 +608,7 @@ fn resolve_old(state: &Path, old: &Path, new: &Path) -> Result<PathBuf> {
 /// a process carrying its checkout token. Empty means nothing does, as far as can be told.
 fn still_running(session: Option<&Session>, own: &[datadirs::Entry], token: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
-    let stopped = |pitchfork: &Path, state_dir: &Path, id: &str| match mise::supervised(pitchfork, state_dir, id) {
-        Ok(mise::Supervised::NotFound) => None,
-        Ok(mise::Supervised::Found { status, pid, .. }) if status == "stopped" && !pid.is_some_and(pid_alive) => None,
-        Ok(mise::Supervised::Found { status, .. }) => Some(format!("the supervisor reports {id} {status}")),
-        Err(e) => Some(format!("the supervisor cannot confirm {id} stopped ({e})")),
-    };
+    let stopped = |supervisor: &datadirs::Supervisor| session::service_stopped(supervisor).err();
     if let Some(session) = session {
         if session.launching {
             reasons.push("a startup was interrupted or is still in progress".to_string());
@@ -624,14 +620,16 @@ fn still_running(session: Option<&Session>, own: &[datadirs::Entry], token: Opti
             if record.port != 0 && accepting(record.port) {
                 reasons.push(format!("{name}: port {} accepts connections (possibly another program)", record.port));
             }
-            if let (Some(provider), Some(id)) = (&session.provider, &record.provider_id) {
-                reasons.extend(stopped(&provider.pitchfork, &provider.state_dir, id).map(|why| format!("{name}: {why}")));
+            if let Some(provider) = &session.provider {
+                let id = record.provider_id.clone().unwrap_or_else(|| name.clone());
+                let supervisor = datadirs::Supervisor { pitchfork: provider.pitchfork.clone(), state_dir: provider.state_dir.clone(), id };
+                reasons.extend(stopped(&supervisor).map(|why| format!("{name}: {why}")));
             }
         }
     }
     for entry in own {
         if let Some(s) = &entry.supervisor {
-            reasons.extend(stopped(&s.pitchfork, &s.state_dir, &s.id).map(|why| format!("{}: {why}", entry.service)));
+            reasons.extend(stopped(s).map(|why| format!("{}: {why}", entry.service)));
         }
     }
     let mut tokens: Vec<&str> = token.into_iter().chain(own.iter().map(|e| e.checkout.as_str())).collect();
@@ -654,7 +652,9 @@ fn unmovable(service: &str, why: String) -> StackError {
 /// find where the provider will look for it at `new`. Returns what to move, and the records to
 /// drop: data already gone, or no longer carrying the checkout's marker (as `gc` settles them).
 /// Data that cannot be told to be the checkout's own, or placed, refuses the whole move.
+#[allow(clippy::too_many_arguments)]
 fn plan_data_moves(
+    state: &Path,
     session: Option<&Session>,
     own: Vec<datadirs::Entry>,
     earlier: &[datadirs::Entry],
@@ -708,17 +708,10 @@ fn plan_data_moves(
     let Some(_) = new_token else {
         return Err(StackError::new("mv_data_unmovable", format!("cannot tell which directory {} is, so its data cannot be marked as its own", new.display())));
     };
-    let listed = mise::daemons_listed(new)?;
     let mut moves = Vec::new();
     for (entry, h) in held {
-        let to = listed.iter().find(|d| d.name == entry.service).and_then(|d| d.data_dir.clone()).map(PathBuf::from).ok_or_else(|| {
-            StackError::new("mv_data_unplaced", format!("the provider names no data directory for {} at {}", entry.service, new.display())).hint(format!(
-                "run `stack compile -C {}` so its provider configuration is current, then retry `stack mv {} {}`",
-                new.display(),
-                old.display(),
-                new.display()
-            ))
-        })?;
+        // Where Stack keeps the data of a checkout at the new path.
+        let to = crate::supervisor::new_data_dir(state, new, &entry.service);
         check_move_target(&to).map_err(|why| unmovable(&entry.service, format!("{} {why}", to.display())))?;
         moves.push(DataMove { entry, held: h, to });
     }

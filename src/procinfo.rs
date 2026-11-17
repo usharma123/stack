@@ -116,9 +116,37 @@ pub fn carrying(key: &str, value: &str) -> Vec<Process> {
         .collect()
 }
 
+/// Every live process whose process group is `group` (other than this one).
+pub fn in_group(group: u32) -> Vec<Process> {
+    let me = std::process::id();
+    imp::pids().into_iter().filter(|pid| *pid != me).filter_map(process).filter(|p| p.group == group).collect()
+}
+
+/// This boot of the machine: the kernel's boot id on Linux (`/proc/sys/kernel/random/boot_id`),
+/// the boot session UUID on macOS (`kern.bootsessionuuid`). A process identity recorded in
+/// another boot names nothing that runs now.
+pub fn boot_id() -> Option<String> {
+    static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT.get_or_init(imp::boot_id).clone()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Process;
+
+    /// `kern.bootsessionuuid`: set once per boot. (`kern.boottime` is not an identity: the
+    /// kernel rewrites it whenever the clock is stepped, after a sleep for instance.)
+    pub fn boot_id() -> Option<String> {
+        let mut buf = [0u8; 64];
+        let mut size = buf.len();
+        // SAFETY: sysctlbyname writes at most `size` bytes into `buf` and sets `size`.
+        let rc = unsafe { libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) };
+        if rc != 0 {
+            return None;
+        }
+        let id = std::str::from_utf8(&buf[..size.min(buf.len())]).ok()?.trim_end_matches('\0').trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
 
     pub fn pids() -> Vec<u32> {
         // SAFETY: with a null buffer proc_listallpids returns the count; then it writes at most
@@ -246,6 +274,11 @@ mod imp {
 mod imp {
     use super::Process;
 
+    pub fn boot_id() -> Option<String> {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(id.trim().to_string()).filter(|i| !i.is_empty())
+    }
+
     pub fn pids() -> Vec<u32> {
         std::fs::read_dir("/proc")
             .map(|entries| entries.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
@@ -295,6 +328,10 @@ mod imp {
 mod imp {
     use super::Process;
 
+    pub fn boot_id() -> Option<String> {
+        None
+    }
+
     pub fn pids() -> Vec<u32> {
         Vec::new()
     }
@@ -323,6 +360,21 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_boot_id_is_the_kernels_identity_of_this_boot_and_stable() {
+        let first = imp::boot_id().expect("a boot id");
+        assert_eq!(imp::boot_id().as_deref(), Some(first.as_str()));
+        assert_eq!(boot_id().as_deref(), Some(first.as_str()));
+        #[cfg(target_os = "macos")]
+        {
+            let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]).output().unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), first);
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(), first);
+    }
 
     /// A child to describe: this test binary (not a platform binary, whose environment macOS
     /// hides) running [`sleeper`].

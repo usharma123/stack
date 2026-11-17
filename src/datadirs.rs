@@ -47,10 +47,13 @@ pub struct Entry {
     pub identity: Option<[u64; 2]>,
 }
 
-/// A service's supervisor identity: the Pitchfork binary, its state directory and the daemon id.
+/// A service's supervisor identity: Stack's supervisor directory and the service's name, or,
+/// for data an older Stack recorded, the Pitchfork binary, its state directory and the daemon id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Supervisor {
-    pub pitchfork: PathBuf,
+    /// Empty for Stack's own supervisor (older releases require the field).
+    #[serde(default, with = "crate::state::required_path")]
+    pub pitchfork: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub id: String,
 }

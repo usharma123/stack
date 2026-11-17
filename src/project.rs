@@ -84,6 +84,11 @@ pub struct Report {
     pub init: IndexMap<String, crate::compose::Entry<Vec<String>>>,
     /// Ports assigned to this checkout. Machine-specific; never written to bundles or stack.lock.
     pub ports: IndexMap<String, u16>,
+    /// Further ports a preset needs besides its own (CockroachDB's HTTP console, NATS
+    /// monitoring, SpiceDB's HTTP and metrics), as `<service>.<role>`, reserved per checkout
+    /// like the others.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub secondary_ports: IndexMap<String, u16>,
     /// Requested and exact versions of every tool and resolvable preset service.
     pub versions: Vec<VersionReport>,
     /// Instance tokens of services with identity probes. Machine-specific, like ports.
@@ -352,6 +357,10 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
 
     let stack = compose(&loaded, &project)?;
     reserved_env(&stack)?;
+    // Stack 0.1.23 and earlier pinned Pitchfork for every stack with services. Such a pin is not
+    // the project's: locked operations read the lock without it, and the next compile drops it.
+    let legacy_pin = previous.as_ref().is_some_and(|l| l.tools.iter().any(|t| t.name == "pitchfork")) && !stack.tools.contains_key("pitchfork");
+    let previous = previous.map(|lock| without_provider_pitchfork(lock, &stack));
     let probed = probed_services(&stack)?;
     let (tools, services, mut versions) = lock_versions(&stack, previous.as_ref(), opts)?;
     let mut new_lock = Lockfile::new(locked, tools.clone(), services.clone());
@@ -367,8 +376,8 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         outcome = lock_artifacts(previous.as_ref(), &new_lock, &pins, &policy, opts)?;
         new_lock.provider_lock = outcome.provider_lock.take();
     }
-    let lock_changed = !previous.as_ref().is_some_and(|p| p.same_pins(&new_lock));
-    if opts.mode == Mode::Frozen && lock_changed {
+    let pins_changed = !previous.as_ref().is_some_and(|p| p.same_pins(&new_lock));
+    if opts.mode == Mode::Frozen && pins_changed {
         return Err(
             StackError::new("lock_outdated", "stack.toml and stack.lock disagree")
                 .hint("run `stack compile` and commit stack.lock"),
@@ -377,6 +386,9 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     if opts.mode == Mode::Frozen {
         check_committed_artifacts(&new_lock, &pins, &policy, &host)?;
     }
+    // A compile that writes drops the Pitchfork pin an older Stack left; locked mode keeps the
+    // file as it is.
+    let lock_changed = pins_changed || (legacy_pin && opts.mode != Mode::Frozen);
     if policy.required() && opts.mode != Mode::Frozen && opts.write {
         let unchecked = artifacts::unchecked_targets(new_lock.provider_lock.as_ref(), &pins, &policy.platforms, &outcome.reasons);
         if !unchecked.is_empty() {
@@ -398,7 +410,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     let output = mise::output_path(&opts.root);
     let mut ignore_warning = None;
     let (ports, identities) = if opts.write {
-        let requests: Vec<Request> = stack
+        let mut requests: Vec<Request> = stack
             .services
             .iter()
             .map(|(name, e)| Request {
@@ -406,6 +418,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
                 fixed: e.value.fixed_port(),
             })
             .collect();
+        requests.extend(secondary_keys(&stack).into_iter().map(|service| Request { service, fixed: None }));
         let ports = ports::assign(&opts.state, &opts.root, &requests, opts.reassign_ports)?;
         if lock_changed {
             lock::write(&opts.root, &new_lock)?;
@@ -426,6 +439,9 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         identities.retain(|service, _| probed.contains(service));
         (ports::lookup(&opts.state, &opts.root)?, identities)
     };
+    // The services' own ports, and the presets' further ones apart.
+    let wanted = secondary_keys(&stack);
+    let (secondary_ports, ports): (IndexMap<String, u16>, IndexMap<String, u16>) = ports.into_iter().filter(|(k, _)| stack.services.contains_key(k) || wanted.contains(k)).partition(|(k, _)| wanted.contains(k));
 
     let mut warnings = warnings(&stack);
     // A lock another Stack release wrote (often a different `stack` first on someone's PATH).
@@ -443,6 +459,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         init: stack.init.iter().filter(|(_, e)| !e.value.is_empty()).map(|(k, e)| (k.clone(), e.clone())).collect(),
         stack,
         ports,
+        secondary_ports,
         versions,
         identities,
         lock_changed,
@@ -490,6 +507,30 @@ fn probed_services(stack: &Composed) -> Result<Vec<String>> {
     Ok(seen.into_values().cloned().collect())
 }
 
+/// `lock` without the Pitchfork pin (and its entries in the embedded provider lock) an older
+/// Stack added for a stack with services, unless the stack asks for Pitchfork itself.
+pub(crate) fn without_provider_pitchfork(mut lock: Lockfile, stack: &Composed) -> Lockfile {
+    if stack.tools.contains_key("pitchfork") || !lock.tools.iter().any(|t| t.name == "pitchfork") {
+        return lock;
+    }
+    lock.tools.retain(|t| t.name != "pitchfork");
+    if let Some(tools) = lock.provider_lock.as_mut().and_then(|p| p.get_mut("tools")).and_then(toml::Value::as_table_mut) {
+        tools.remove("pitchfork");
+    }
+    lock
+}
+
+/// `<service>.<role>` for each further port the stack's presets need (see
+/// [`crate::supervisor::secondary_roles`]).
+fn secondary_keys(stack: &Composed) -> Vec<String> {
+    stack
+        .services
+        .iter()
+        .filter_map(|(name, e)| Some((name, e.value.preset.as_deref()?)))
+        .flat_map(|(name, preset)| crate::supervisor::secondary_roles(preset).iter().map(move |role| format!("{name}.{role}")))
+        .collect()
+}
+
 /// The platform a resolution ran on, recorded for reviewers of stack.lock, in mise's names
 /// (`<os>-<arch>`; the C library and CPU do not change what a version request resolves to).
 fn platform() -> String {
@@ -524,16 +565,6 @@ fn lock_versions(
         .iter()
         .map(|(name, e)| VersionRequest { kind: "tool", name: name.clone(), tool: None, requested: e.value.version.clone(), options: e.value.options.clone(), origin: e.origin.clone() })
         .collect();
-    if !stack.services.is_empty() && !stack.tools.contains_key("pitchfork") {
-        requests.push(VersionRequest {
-            kind: "tool",
-            name: "pitchfork".into(),
-            tool: None,
-            requested: mise::PITCHFORK_VERSION.into(),
-            options: ToolOptions::new(),
-            origin: "provider".into(),
-        });
-    }
     for (name, e) in &stack.services {
         let Some(preset) = e.value.preset.as_deref() else { continue };
         if let Some(tool) = mise::preset_tool(preset) {
