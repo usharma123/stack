@@ -18,14 +18,49 @@ To give a new checkout a ready database instead of an empty one, declare init ta
 one checkout and start the others from it: `stack compile --locked && stack up --from-snapshot
 seeded`. See [service data](data.md).
 
-Stopping first matters. Stack will not stop a deleted checkout's services by name, so a
-checkout removed while its services run leaves them running until you stop them yourself, or
-until `stack gc --stop-orphans` confirms each one is still the recorded process and stops it
-(see [`gc`](commands.md#gc) and [stopping orphans](commands.md#stopping-orphans)).
+Stopping first is still the clean way. A checkout removed while its services run leaves them
+running until `stack gc` stops them: it stops what Stack's supervisor recorded for the checkout,
+each process only while its pid and start time still match. Services an older Stack started
+under Pitchfork are never stopped by name; for those `stack gc --stop-orphans` confirms each one
+is still the recorded process and stops it (see [`gc`](commands.md#gc) and
+[stopping orphans](commands.md#stopping-orphans)).
 
 Checkouts do not wait on each other: the cleanup pass at the start of `stack up` skips any
 other checkout's session that another command holds, and never fails because of one. Run
 `stack gc --dry-run` to see what a pass would reclaim.
+
+## Services and the supervisor
+
+Each checkout's services run under a supervisor of its own: the `stack` binary itself, started
+by the first `stack up` in a session of its own (so it outlives that command and a closed
+terminal), with no socket and nothing shared with other checkouts. It keeps its records in
+Stack's state directory (`$STACK_STATE_DIR/supervisors/<checkout key>/`): `spec.json` (what
+should run, written by Stack commands under the checkout's lock), `state.json` (each service's
+status, pid, process start time and process group) and `logs/<service>.log`, which
+`stack logs` reads. `stack status` and `stack exec` read those files and check each pid's start
+time; they start no process to find out what runs. `stack down` stops the services and the
+supervisor exits; `stack down --purge` and `stack gc` (for a deleted checkout) also remove its
+directory. A supervisor still running for a deleted checkout whose session record is gone is
+shut down by `stack gc`, which then removes its directory.
+
+If the supervisor itself is killed, its services keep running (on Linux each service's main
+process gets its stop signal when the supervisor dies). A service's output went to the
+supervisor through a pipe, so one that writes after that gets `SIGPIPE` and may exit. `status`
+then reports them `orphaned` and withholds their endpoints; `stack up` stops them, by recorded
+pid, start time, boot and process group, together with the processes carrying the checkout's
+token that started after them, and starts them again under a new supervisor; `stack down`
+stops them the same way. A process Stack cannot show is the checkout's is not signalled: then
+`down` reports `stop_unconfirmed`, and `up` starts nothing, until it is gone (see
+[what Stack guarantees](guarantees.md)).
+
+Services started by Stack 0.1.23 or earlier run under Pitchfork. `status` and `exec` ask
+Pitchfork about them, `restart` refuses (`session_stale`), and the next `stack up` stops them
+through Pitchfork (and Pitchfork's supervisor, when Stack started it and nothing else uses it)
+and starts them under Stack's own supervisor with the same data. When Pitchfork's supervisor
+cannot be stopped then (another daemon still uses it, say), `up` warns and the next
+`stack down` tries again. `stack down` and `stack gc` stop them through Pitchfork as before.
+The first `stack compile` afterwards drops Pitchfork from `stack.lock`; Stack 0.1.23 then
+rejects that lock (`lock_outdated`) until it compiles it again.
 
 `stack down` keeps the checkout's service data, in case the checkout comes back. To remove it
 in the same step, use `stack down --purge` in the remove hook (see [`down`](commands.md#down)).
@@ -180,22 +215,20 @@ Pick the release to evaluate; npm's `latest` is the newest published one. Releas
 `exec` and `stack run` tasks a custom service's proxy URL instead of its loopback URL, and
 0.1.22 fixed `exec` only, so evaluate the task loop with a newer release. It installs the given Stack
 version from npm into a fresh `/tmp/stack-iso.*` root, moves the
-Stack, mise, Pitchfork, XDG, uv and npm stores there, runs `stack up` and your command, then
+Stack, mise, XDG, uv and npm stores there, runs `stack up` and your command, then
 stops everything. It keeps `HOME`, so your Git and SSH configuration still work. It needs
 `node`, `npm` and `python3`.
 
 - The root is deleted only when every service is confirmed stopped, the supervisor is down,
-  your global mise and Pitchfork files are unchanged, and the command exited 0. Otherwise it is
-  kept, and its path is printed on the first line.
-- To clean up a kept root, run `stack down` from the checkout with that root's environment: it
-  also stops the root's supervisor when Stack started it and nothing else uses it, and says why
-  not otherwise (a Stack older than this default needs `stack down --stop-supervisor`, or
-  `stack down` and then `stack exec -- pitchfork supervisor stop`). Delete only that exact path.
-  Never delete by pattern: another run's root looks the same.
+  your global mise files are unchanged, and the command exited 0. Otherwise it is kept, and its
+  path is printed on the first line.
+- To clean up a kept root, run `stack down` from the checkout with that root's environment: the
+  checkout's supervisor exits with its services. (A release older than 0.1.24 ran services under
+  Pitchfork: `stack down --stop-supervisor` there, or `stack down` and then
+  `stack exec -- pitchfork supervisor stop`.) Delete only that exact path. Never delete by
+  pattern: another run's root looks the same.
 - Ctrl-C, SIGTERM or SIGHUP cancels the running step and still runs cleanup. The script exits
   128 plus the signal number.
-- For several checkouts, run `stack down` in each: the supervisor is kept while the others'
-  sessions use it, and the last one stops it.
-- On Linux, if `XDG_STATE_HOME` is set, add its Pitchfork path to the script's receipt check.
+- For several checkouts, run `stack down` in each: each has its own supervisor.
 
 [All docs](../README.md)

@@ -19,6 +19,9 @@
   never a service's default) and stay the same across restarts. They stay clear of the ports
   the system gives outgoing connections, which could otherwise keep a stopped service from
   starting again; a port an earlier version assigned there is replaced. Bundles cannot pin ports.
+  A preset's further ports (the HTTP, monitoring and metrics ports of CockroachDB, NATS and
+  SpiceDB) are reserved per checkout the same way, so their readiness checks reach this
+  checkout's server.
 - **A command never reaches the wrong instance.** Before every `exec` and `run`, each service is
   checked live. Postgres and Redis are confirmed, over the app's own `DATABASE_URL` and
   `REDIS_URL`, to be this checkout's server. Other services can add an [identity
@@ -35,12 +38,28 @@
 - **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
   them. The pass in `up` never waits for, or fails because of, another checkout. For a deleted
-  checkout, `gc` by default never stops anything itself, because Pitchfork cannot
-  check and stop a process in one step. It drops the record once the services are confirmed
-  stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop them. With
-  `--stop-orphans` it stops a service only when its supervisor id, pid, port and process start
-  time all still match the record; the race that leaves is documented under
+  checkout, `gc` stops what Stack's supervisor recorded for it, each process only while its pid
+  and process start time still match the record, and drops the record once they are gone.
+  Services an older Stack started under Pitchfork are never stopped by name by default, because
+  Pitchfork cannot check and stop a process in one step: `gc` drops their record once they are
+  confirmed stopped, and otherwise reports `gc_incomplete` with commands to inspect and stop
+  them. With `--stop-orphans` it stops such a service only when its supervisor id, pid, port and
+  process start time all still match the record; the race that leaves is documented under
   [stopping orphans](commands.md#stopping-orphans).
+- **Stack stops only what it can show is the checkout's.** A process is the checkout's when
+  Stack's supervisor started it and it is still the process recorded (pid, process start time
+  and boot), when it is in the process group of a recorded service whose leader is still the
+  recorded process, or when it carries the checkout's token in its environment and started no
+  earlier than its service did. A process Stack cannot show is the checkout's is never
+  signalled; if one may still be running, `down` reports `stop_unconfirmed` and no service is
+  started and no data restored or reset while it lives. A descendant that left its service's
+  process group and dropped the token from its environment is not found. Each signal is bound
+  to the process just checked. On Linux it goes through a pidfd opened before the check, so it
+  reaches that process or none; a kernel without pidfds (before 5.3) gets no signal and the
+  stop is `stop_unconfirmed`. macOS has no such handle: the check and the signal are separate
+  calls, so a process that exits in between, and whose pid is handed to a new process in that
+  instant, would receive the signal instead. A group is signalled by its number on macOS only
+  right after its leader was checked again, with the same gap.
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was
   granted. Values never enter `stack.lock`, generated config, session records or logs, and
   are redacted from output captured with `--json` or MCP. Terminal output is not redacted, and

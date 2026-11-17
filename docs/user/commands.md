@@ -15,7 +15,7 @@
 | `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow]` | Show services' recent output (default 100 lines each) |
 | `stack env [--shell bash\|zsh\|fish]` | Print the environment `exec` would give a command, for `eval` |
 | `stack hook direnv` | Print an `.envrc` snippet that loads `stack env` |
-| `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone, then the supervisor Stack started if nothing else uses it; `--purge` also removes their data |
+| `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone; the checkout's supervisor exits with them (for services an older Stack started under Pitchfork, its supervisor is stopped if Stack started it and nothing else uses it); `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
 | `stack snapshot save\|restore\|list\|rm [NAME]` | Save and restore service data, shared by every checkout of the project ([data](data.md)) |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
@@ -25,7 +25,7 @@
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
 | `stack setup --gc-agent [--print \| --remove] [--enable]` | Write a launchd agent or systemd user unit that runs `gc --watch` |
 | `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
-| `stack doctor` | Check mise, git, tar, the supervisor socket path, and that the project compiles |
+| `stack doctor` | Check mise, git, tar, and that the project compiles |
 | `stack errors [--markdown]` | List every [error code](errors.md) with its meaning, default hint and whether a retry can succeed |
 | `stack mcp` | Serve these operations over MCP (stdio); see [coding agents](agents.md) |
 
@@ -313,16 +313,20 @@ service. With no service named, or several, it shows each one with lines prefixe
 `errors` lists services whose output could not be read. One named service keeps the
 single-service result.
 
-- `--since-start` keeps only the current process's output, which helps after a restart.
-- `--since 10m` keeps only output from the last 10 minutes. The supervisor applies the window.
+- `--since-start` keeps only the current process's output, which helps after a restart. The
+  supervisor stamps each line with the millisecond it was read, so the cut is exact.
+- `--since 10m` keeps only output from the last 10 minutes.
 - `--grep TEXT` keeps lines containing `TEXT` (a plain substring, not a regex); `-i` ignores
   case. `--tail` then counts matching lines, out of the last 10000.
-- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. The supervisor
-  offers no stream, so Stack asks it again every second. Without timestamps, identical lines
-  written within one poll may be shown once. Not with `--json`, and not over MCP.
+- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. Stack
+  reads the log again every second. Not with `--json`, and not over MCP.
 
-`unknown_service` lists the project's services; `logs_failed` means the supervisor could not
-return them.
+The output is read from `logs/<service>.log` in the checkout's supervisor directory (see
+[worktrees](worktrees.md#services-and-the-supervisor)); no process is started for it. Each log is
+rotated at 16 MiB, one older file kept; at most the last 1 MiB is read. For services an older
+Stack started under Pitchfork, `logs` asks Pitchfork (`pitchfork logs`) until the next `up`.
+`unknown_service` lists the project's services; `logs_failed` means the output could not be read
+(or the service never started in this checkout).
 
 ## env
 
@@ -347,61 +351,37 @@ direnv setups.
 ## down
 
 Stops every service and returns once the processes are gone and their ports closed. It works
-in a checkout that never ran `up`, such as a fresh clone with only `stack.toml` and `stack.lock`:
-it writes the generated configuration from `stack.lock` first, then confirms nothing runs. Another
-program listening on one of this checkout's ports is reported under `conflicts` and left
-alone. A service process the supervisor started for this checkout but lost track of is
-stopped too, listed with `"unrecorded": true`. Run `down` before deleting a checkout: Stack will not stop a deleted project's services
-by name.
+in a checkout that never ran `up`, such as a fresh clone with only `stack.toml` and `stack.lock`,
+and confirms nothing runs there. Another program listening on one of this checkout's ports is
+reported under `conflicts` and left alone. A service process the supervisor started for this
+checkout but lost track of (its environment carries the checkout's token) is stopped too,
+listed with `"unrecorded": true`.
 
-Once the services are confirmed gone, `down` also stops the Pitchfork supervisor that ran them,
-and with it its `log-sink` helpers, when all of these hold:
+The checkout's supervisor (see [worktrees](worktrees.md#services-and-the-supervisor)) stops each
+service's process group (Postgres with `SIGINT`, the rest with `SIGTERM`, `SIGKILL` 10 seconds
+later) and exits; `supervisor` is then `{"stopped": true, "state_dir": "<its directory>"}`. A
+supervisor that was killed is not needed: `down` stops what it left by the recorded pid, start
+time and process group. A checkout without services gets no `supervisor` field.
 
-- Stack started it. Every request of Stack's that may start the supervisor carries a random
-  mark of this Stack state (kept in `<state dir>/supervisor-owner`), and the supervisor and its
-  helpers inherit it. One that was already running when Stack first used it, that something
-  else or another Stack state started, or whose environment cannot be read, is kept. So is
-  every supervisor if that file holds anything but a mark Stack wrote (delete it to reset).
+For services an older Stack started under Pitchfork, `down` asks Pitchfork to stop each one by its
+recorded id, and once they are confirmed gone stops the Pitchfork supervisor that ran them, and
+with it its `log-sink` helpers, when all of these hold:
+
+- That Stack started it: the supervisor carries the mark of this Stack state Stack 0.1.23 and
+  earlier kept in `<state dir>/supervisor-owner`. One without it, or whose environment cannot be
+  read, is kept. So is every supervisor if that file holds anything but a mark Stack wrote.
 - No other checkout's session in this Stack state records the same supervisor (its state
   directory compared after resolving links), or records services without naming their
-  supervisor, and every session record can be read. Checkouts using another Stack state are
-  seen through their daemons.
+  supervisor, and every session record can be read.
 - No daemon it tracks, Stack's or anyone's, is anything but stopped, failed or errored, has a
-  process still alive, or has a schedule (`cron` in its Pitchfork configuration). Only a running
-  supervisor starts a scheduled daemon, so one between runs or after a failed run keeps it, and
-  so does a disabled one, which Pitchfork 2.29.0 still runs on its schedule. So does a daemon
-  whose schedule `pitchfork status --json` does not report in a way Stack can read. Remove the
-  schedule from its configuration to let `down` stop the supervisor.
-- No other Stack command, in any Stack state, is starting or stopping services through it.
-  Those commands share a lock kept in the supervisor's own state directory
-  (`stack-supervisor.lock`), which `down` waits up to 5 seconds to take alone before deciding,
-  so it cannot stop the supervisor between another checkout's look and its request. Each
-  command takes the lock of the supervisor its own environment reaches (where
-  `PITCHFORK_STATE_DIR` points now), whatever its session recorded; one that cannot tell which
-  supervisor that is fails with `supervisor_unknown` before asking it anything. A command keeps
-  the supervisor it chose when it began: if what `PITCHFORK_STATE_DIR` renders from changes
-  while it runs (a service's `setup` rewrites a file an `[env]` template reads, say), it fails
-  with `supervisor_changed` before asking either supervisor anything more. Anything it already
-  started stays recorded under the first one (`stack status` shows it, `stack down` stops it);
-  run the command again to use the new one. Every request itself reaches the supervisor the
-  command chose, whatever `PITCHFORK_STATE_DIR` renders by the time mise makes it, even when
-  another program changes what it renders from at that very moment: the generated provider
-  configuration ends its `[env]` with a `_.file` directive that loads, for Stack's start and
-  stop requests only, a file naming the chosen directory (in `$STACK_STATE_DIR/supervisor-bindings`).
-  When `STACK_STATE_DIR`'s path contains `*`, `?`, `[` or `]`, which mise would read as a
-  pattern, such a request fails with `supervisor_unbound` before it is made. A configuration an
-  earlier Stack generated without the directive gains it in place when `down` (or lease expiry)
-  first needs to stop something, nothing else in it changed and stack.toml not read; one Stack
-  did not generate, or that cannot take the directive, fails with `supervisor_unbound` before
-  anything is asked (run `stack compile`, then retry). Every other
-  command (`exec`, `run`, `mise env`) renders the project's environment as written. A service
-  that a supervisor Stack started runs has `PITCHFORK_STATE_DIR` naming that supervisor.
+  process still alive, or has a schedule (`cron` in its Pitchfork configuration), or one
+  `pitchfork status --json` does not report in a way Stack can read.
+- No other command holds its lock (`stack-supervisor.lock` in its state directory), which
+  `down` waits up to 5 seconds to take alone.
 
-Otherwise the supervisor is kept and `supervisor.reason` says why; that never fails `down`. A
-supervisor that is not running is not started: `supervisor` is then `{"stopped": true, "reason":
-"it was not running"}`, so `down` stays safe to repeat, including in a checkout that never ran
-`up`. A checkout without services gets no `supervisor` field. `--keep-supervisor` (MCP:
-`"stop_supervisor": false`) keeps it in every case. `--stop-supervisor`, which turned this on
+Otherwise that supervisor is kept and `supervisor.reason` says why; that never fails `down`.
+`--keep-supervisor` (MCP: `"stop_supervisor": false`) keeps it in every case; Stack's own
+supervisor always exits with the checkout's services. `--stop-supervisor`, which turned this on
 before it was the default, is still accepted and changes nothing.
 
 Service data is kept, so the next `up` finds the same databases. `down --purge` (MCP:
@@ -459,10 +439,11 @@ the recorded `data` directories, each with `action` `report` (kept and reported)
 its services are confirmed stopped.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
-confirmed its services stopped) gets its port reservations released at once. Its services'
-data, which mise keeps under its state directory (`$MISE_STATE_DIR/daemons/<hash>/data`, by
-default `~/.local/state/mise`), is reported with its size and kept; `--reclaim-data` removes
-it. Data is removed only when all of these hold, otherwise it is kept and the result says why:
+confirmed its services stopped) gets its port reservations released at once, and its
+supervisor directory (records and logs) removed. Its services' data, which Stack keeps under
+its state directory (`$STACK_STATE_DIR/data/<checkout key>/<service>`; data mise's presets kept
+for an older Stack stays where it was, under `$MISE_STATE_DIR/daemons/<hash>/data`), is
+reported with its size and kept; `--reclaim-data` removes it. Data is removed only when all of these hold, otherwise it is kept and the result says why:
 
 - `up` recorded that directory for that checkout, and its `.stack-checkout` marker still names
   it (data a later checkout at the path took over, or data Stack never recorded, is never touched),
@@ -479,8 +460,10 @@ A path that holds a directory again keeps everything: `up` moves the old data as
 [recreated checkouts](#up)). mise's own small state files for the project stay; `mise daemons
 prune` removes them, along with the data of any other deleted project mise knows about.
 
-When it cannot confirm that a deleted checkout's service stopped, `gc` fails with
-`gc_incomplete` and keeps the record. Each such service comes with `recovery.inspect`, a
+A deleted checkout's services that Stack's own supervisor runs are stopped by `gc` through
+their recorded pid, process start time and group (never another process that took the pid).
+For services an older Stack started under Pitchfork, when it cannot confirm that a deleted
+checkout's service stopped, `gc` fails with `gc_incomplete` and keeps the record. Each such service comes with `recovery.inspect`, a
 command that shows the recorded process, and sometimes `recovery.stop`. Run inspect first,
 stop only if the PID still matches, then run `gc` again. The two steps are not atomic, which
 is why Stack does not do this for you by default.
@@ -534,12 +517,12 @@ directories walks them, which can be slow for large databases: `--no-size` skips
 When a checkout was moved or renamed (`git worktree move`, `mv`), its records still name the
 old path, and Stack reports `session_conflict` in it. `stack mv <old> <new>` carries them over:
 the session record, port reservations and identity tokens, so the checkout keeps its ports.
-Relative paths resolve against the working directory. mise keeps service data per project
-path, so `mv` also moves each data directory `up` recorded for the checkout to where mise will
-look for it at the new path (asked with `mise daemons ls`, which starts nothing). The
+Relative paths resolve against the working directory. Service data is kept per checkout path,
+so `mv` also moves each data directory `up` recorded for the checkout to where Stack keeps data
+for the new path (`$STACK_STATE_DIR/data/<key of the new path>/<service>`). The
 [checkout token](../DESIGN.md#runtime-contract) follows from the path, so each moved directory
 gets the new token in its `.stack-checkout` marker and in Stack's data record, as `up` would
-write them. The rest of mise's state for the old path stays; `mise daemons prune` removes it.
+write them. The old path's supervisor directory (records and logs) is removed.
 
 Data is checked as [`gc --reclaim-data`](#gc) checks it before removing anything: it must be
 the very directory `up` recorded (where it resolved, no link on the way, the same device and
@@ -558,7 +541,6 @@ reports it); data that is already gone is dropped from the record.
 | `mv_nothing_recorded` | Nothing is recorded for the old path; `stack ps` lists what is |
 | `mv_target_missing` | The new path is not an existing directory; move the checkout first |
 | `mv_data_unmovable` | A recorded data directory cannot be confirmed to be the checkout's (replaced, linked, never seen by `up`, or named only by a session older than the data record), or its place at the new path already holds data |
-| `mv_data_unplaced` | mise names no data directory for a service at the new path: run `stack -C <new> compile` and retry |
 
 Ports and tokens that a compile at the new path assigned (a worktree hook usually compiles
 first) are replaced by the old ones, and the result's `notes` say so. A compile anywhere
@@ -578,7 +560,7 @@ stack completions fish > ~/.config/fish/completions/stack.fish
 
 ## doctor and setup
 
-`doctor` checks mise, git and tar, that Pitchfork's socket path fits the platform limit, that
+`doctor` checks mise, git and tar, that
 mise is new enough for the project's options and lock, and that the project compiles. Its
 `stack` check names this release and binary, and warns when another `stack` comes first on
 `PATH` (which hooks, agents and `stack mcp` registrations run) or when `stack.lock` was last
@@ -586,9 +568,6 @@ written by another release. `stack.lock` records that release as `written_by`; i
 of what the lock pins, so it never makes the lock outdated, and `compile` changes it only when
 it rewrites the lock anyway (and otherwise warns when it differs). When
 the stack uses fnox it also checks the declared secret names, without reading any values.
-
-Pitchfork's socket lives under its state directory. On macOS, if `up` reports
-`socket_path_too_long`, set `PITCHFORK_STATE_DIR` to a short directory.
 
 `setup` downloads the mise release Stack is tested against, unless one is on `PATH`.
 `--force` installs it anyway.

@@ -192,12 +192,19 @@ Stack's machine state per checkout, never in a data directory.
 
 ## Where data directories live
 
-mise's presets own the data. Each checkout's data directory is
-`$MISE_STATE_DIR/daemons/<checkout hash>/data/<service>` (by default under
-`~/.local/state/mise`), keyed by the checkout's path. mise creates it on the service's first
-start (`initdb` for Postgres) and reuses it afterwards as long as the major version matches.
-Stack reads the path from `mise daemons --json`, which reports it before the first start, and
-records it for the checkout when `up` claims it. Snapshots copy and replace only that recorded
+Stack runs the presets itself and owns their data. A new checkout's data directory is
+`$STACK_STATE_DIR/data/<checkout key>/<service>` (by default under `~/.local/state/stack`),
+keyed by the checkout's path. The supervisor creates it on the service's first start (for
+Postgres, `initdb -U postgres --auth=trust` into a sibling directory renamed into place, under
+the pinned `C.UTF-8` locale) and records the preset and major version in it
+(`.mise-daemon-version`, the file mise's presets wrote); it reuses the directory afterwards only
+while the major version matches, and refuses it otherwise, kept as it is. It also refuses to
+initialise data with a server whose major version is not the one stack.lock pins (one found on
+PATH because the pinned release is not installed). A checkout an older Stack ran keeps the
+directory mise's preset made for it (`$MISE_STATE_DIR/daemons/<hash>/data/<service>`): Stack
+finds it through its own data record, the session's record, or mise's state for that path, and
+never initialises a new one in its place. Stack records the directory for the checkout when `up`
+claims it. Snapshots copy and replace only that recorded
 directory. `stack down` and `stack gc` keep data directories unless asked to remove them
 (`down --purge`, `gc --reclaim-data`).
 

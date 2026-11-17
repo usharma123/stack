@@ -8,8 +8,8 @@ and data, and Stack checks every service before a command runs. Run five agents 
 worktrees and none of them will touch another's database.
 
 Define the stack once in `stack.toml`, or share it as a bundle from Git, a local path or an
-OCI registry. Stack installs tools with [mise](https://mise.jdx.dev) and runs services with
-Pitchfork.
+OCI registry. Stack installs tools with [mise](https://mise.jdx.dev) and runs services
+itself: each checkout gets a small supervisor of its own, so checkouts never wait on each other.
 
 ## Installation
 
@@ -18,8 +18,7 @@ npm install -g @ushawarma/stack
 stack setup
 ```
 
-Needs Node.js 22.14+, on macOS 13+ or Linux (x64 or arm64). Intel Macs run tools-only stacks:
-Pitchfork, which runs services, has no Intel macOS build. `stack setup` uses the mise on your
+Needs Node.js 22.14+, on macOS 13+ or Linux (x64 or arm64). `stack setup` uses the mise on your
 `PATH`, or downloads the release Stack is tested against.
 
 ## Quick start
