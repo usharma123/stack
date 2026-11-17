@@ -569,6 +569,57 @@ impl Drop for OwnedChild {
     }
 }
 
+/// Ends a wait for a child the moment it exits, rather than at the next timer tick: a thread
+/// blocks until the child can be waited for, leaving it unreaped (as [`exited`] does), and
+/// then wakes [`ExitWatch::wait`].
+///
+/// A sleep between exit checks is only as prompt as the system's timers. For a process at
+/// background priority, which is how agent harnesses and editors often run their commands,
+/// macOS stretches a 10 ms sleep to about 100 ms, and every command paid that after it exited.
+///
+/// The watching thread is never joined. It ends when the child exits or is reaped; one that
+/// was not yet waiting when the child was reaped finds no such child, or at worst waits,
+/// without reaping, for a later child that got the same ID.
+#[cfg(unix)]
+struct ExitWatch {
+    exit: std::sync::mpsc::Receiver<()>,
+    /// The thread answered or ended: nothing more will wake a wait.
+    spent: bool,
+}
+
+#[cfg(unix)]
+impl ExitWatch {
+    /// Watch `child`. Called with the forwarded signals blocked, so the thread never takes one.
+    fn new(child: &Child) -> Self {
+        let (exited, exit) = std::sync::mpsc::channel();
+        let pid = child.id() as libc::id_t;
+        // Without the thread (it could not be started) every wait is a plain sleep.
+        let spent = std::thread::Builder::new()
+            .name("exit-watch".into())
+            .spawn(move || loop {
+                // SAFETY: waitid only writes the zeroed siginfo; WNOWAIT leaves the child waitable.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let rc = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+                if rc == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    let _ = exited.send(());
+                    break;
+                }
+            })
+            .is_err();
+        Self { exit, spent }
+    }
+
+    /// Wait up to `limit`, or until the child exits. Whether it has is for [`exited`] to say.
+    fn wait(&mut self, limit: Duration) {
+        if self.spent {
+            return std::thread::sleep(limit);
+        }
+        if !matches!(self.exit.recv_timeout(limit), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+            self.spent = true;
+        }
+    }
+}
+
 #[cfg(unix)]
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let fd = pipe.as_raw_fd();
@@ -1355,6 +1406,7 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         }
         let (child, mut passed) = spawn_named(command, true, false, Command::spawn)?;
         let mut child = OwnedChild::new(child);
+        let mut watch = ExitWatch::new(&child.child);
         let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
             let start = Instant::now();
             loop {
@@ -1368,7 +1420,7 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
                 if passed.expired() {
                     break Ok(false);
                 }
-                std::thread::sleep(EXIT_CHECK_INTERVAL);
+                watch.wait(EXIT_CHECK_INTERVAL);
             }
         });
         let _ = set_mask(libc::SIG_BLOCK, held);
@@ -1417,6 +1469,7 @@ pub fn run_attached(command: &mut Command) -> io::Result<std::process::ExitStatu
             return Err(e);
         }
     };
+    let mut watch = ExitWatch::new(&child.child);
     // Whether the command was stopped after a passed-on signal, rather than exiting.
     let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| loop {
         if exited(&child.child)? {
@@ -1425,7 +1478,7 @@ pub fn run_attached(command: &mut Command) -> io::Result<std::process::ExitStatu
         if passed.expired() {
             break Ok(true);
         }
-        std::thread::sleep(EXIT_CHECK_INTERVAL);
+        watch.wait(EXIT_CHECK_INTERVAL);
     });
     let _ = set_mask(libc::SIG_BLOCK, &held);
     // One that exited keeps what it started unless a signal was its, which `retire` decides.
@@ -1536,6 +1589,7 @@ pub fn run_detached(command: &mut Command, wait: Duration) -> io::Result<Option<
         });
     }
     let mut child = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let mut watch = ExitWatch::new(&child);
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -1546,7 +1600,7 @@ pub fn run_detached(command: &mut Command, wait: Duration) -> io::Result<Option<
             std::thread::spawn(move || child.wait());
             return Ok(None);
         }
-        std::thread::sleep(EXIT_CHECK_INTERVAL);
+        watch.wait(EXIT_CHECK_INTERVAL);
     }
 }
 
@@ -2708,5 +2762,21 @@ mod tests {
         let out = capture_redacted(Command::new("sh").args(["-c", "printf 'value-of-a-1tail-xyz'; sleep 20"]), Duration::from_millis(300), 1024, Some(&r)).unwrap();
         assert!(out.timed_out);
         assert_eq!(out.stdout, "[redacted]tail-xyz");
+    }
+
+    #[test]
+    fn a_wait_for_a_child_ends_when_it_exits_and_leaves_it_to_be_reaped() {
+        let mut child = Command::new("sh").args(["-c", "sleep 0.2"]).spawn().unwrap();
+        let mut watch = ExitWatch::new(&child);
+        let start = Instant::now();
+        // Far longer than the child runs: only its exit can end this in time.
+        watch.wait(Duration::from_secs(60));
+        assert!(start.elapsed() < Duration::from_secs(30), "waited {:?}", start.elapsed());
+        assert!(exited(&child).unwrap());
+        assert!(child.wait().unwrap().success());
+        // Nothing is left to wake a later wait, which is then the plain sleep it replaces.
+        let start = Instant::now();
+        watch.wait(Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(50));
     }
 }
