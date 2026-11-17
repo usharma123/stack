@@ -996,8 +996,24 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 Err(e) => return Err(steps.fail("stop_dependents", e, true)),
             }
         }
+        // A verified session of this same generation, reached through the supervisor it
+        // recorded, whose services that supervisor all reports running, each with a live
+        // process, has nothing to start: a request would return without doing anything, after
+        // a round trip to the provider for every service. A start of no services still does
+        // what comes before the first request (the supervisor is started if it is not running,
+        // watched as any start is, so one that hangs holds nothing back). Whether each service
+        // is still this checkout's instance is for the verification below, as after a start.
+        // Anything else (a service that died, is still starting, or was never verified, or a
+        // session moving to another supervisor) is requested as before, and so is every stack
+        // whose services depend on one another: starting those in order checks that each
+        // dependency still passes its declared readiness, which nothing here does.
+        let settled = !unverified
+            && dependency_waves(&report.stack.services, &names).len() <= 1
+            && previous.as_ref().is_some_and(|p| p.provider == provider)
+            && names.iter().all(|n| before.iter().any(|d| d.name == *n && d.status == "running" && d.pid.is_some_and(pid_alive)));
         steps.begin("start");
-        if let Err(start_error) = start_in_order(ctx, &report, &names, supervisor) {
+        let started = if settled { start_watched(ctx, &report, &[], supervisor) } else { start_in_order(ctx, &report, &names, supervisor) };
+        if let Err(start_error) = started {
             let observed = record_after_failed_start(ctx);
             if let Err(error) = observed {
                 return Err(steps.fail("record_partial_start", error.with_detail(json!({ "start_error": start_error })), true));
@@ -1007,7 +1023,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         steps.ok("start", json!(null));
 
         steps.begin("verify");
-        checks = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
+        let env;
+        (checks, env) = verify_launch(ctx, &report, "up_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
         steps.ok(
             "verify",
             json!(checks
@@ -1015,7 +1032,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 .map(|c| (c.service.clone(), c.identity))
                 .collect::<IndexMap<_, _>>()),
         );
-        warnings.extend(encoding_warnings(ctx, &report, &checks));
+        warnings.extend(encoding_warnings(&report, &env, &checks));
         bind_data(ctx, &checks);
     }
 
@@ -1074,16 +1091,14 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
 /// [`mise::preset_env`]). Its data is kept as it is, never reinitialized; the warning says
 /// how to move to a `UTF8` cluster. Best effort: nothing is asked when no Postgres verified,
 /// and a query that fails warns about nothing.
-fn encoding_warnings(ctx: &Ctx, report: &Report, checks: &[Check]) -> Vec<String> {
-    let postgres: Vec<&Check> = checks
+///
+/// `env` is the environment the checks were verified with, so the provider is not asked again.
+fn encoding_warnings(report: &Report, env: &IndexMap<String, String>, checks: &[Check]) -> Vec<String> {
+    checks
         .iter()
         .filter(|c| c.ready && report.stack.services.get(&c.service).is_some_and(|s| s.value.preset.as_deref() == Some("postgres")))
-        .collect();
-    if postgres.is_empty() {
-        return Vec::new();
-    }
-    let Ok(env) = mise::env(&ctx.root) else { return Vec::new() };
-    postgres.into_iter().filter_map(|check| encoding_warning(&env, check)).collect()
+        .filter_map(|check| encoding_warning(env, check))
+        .collect()
 }
 
 /// [`encoding_warnings`] for one verified Postgres, asked over the app's `DATABASE_URL`.
@@ -1760,9 +1775,13 @@ fn declared_ready(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, na
     }
 }
 
+/// Every service's passing check with the environment they were verified with, or the step
+/// that failed and its error.
+type Verified = std::result::Result<(Vec<Check>, IndexMap<String, String>), (&'static str, StackError)>;
+
 /// Verify what a start launched, recording each supervisor listing as it is seen. Should the
 /// deadline end verification before any listing was seen, what launched is recorded anyway.
-fn verify_launch(ctx: &Ctx, report: &Report, timings: &'static str) -> std::result::Result<Vec<Check>, (&'static str, StackError)> {
+fn verify_launch(ctx: &Ctx, report: &Report, timings: &'static str) -> Verified {
     verify_until_ready(ctx, report, timings, |statuses| record_launch_observations(ctx, statuses)).inspect_err(|_| {
         if crate::process::expired() {
             // Best effort: the launch record already names the provider that can stop them.
@@ -1909,7 +1928,7 @@ fn verify_until_ready(
     report: &Report,
     timings: &'static str,
     mut observe: impl FnMut(&[DaemonStatus]) -> Result<()>,
-) -> std::result::Result<Vec<Check>, (&'static str, StackError)> {
+) -> Verified {
     let window = Instant::now() + READY_TIMEOUT;
     let deadline = crate::process::deadline().map_or(window, |d| d.min(window));
     let timings = Timings::new(timings);
@@ -1919,7 +1938,7 @@ fn verify_until_ready(
         let env = mise::env(&ctx.root).map_err(|e| ("verify", e))?;
         let checks = verify_all(&ctx.root, report, &env, &statuses, &timings);
         if checks.iter().all(|c| c.ready) {
-            return Ok(checks);
+            return Ok((checks, env));
         }
         let now = Instant::now();
         if now >= deadline {
@@ -2104,7 +2123,7 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     }
     steps.ok("start", json!(names));
     steps.begin("verify");
-    let checks = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
+    let (checks, _) = verify_launch(ctx, &report, "restart_verify").map_err(|(step, e)| steps.clone().fail(step, with_readiness(ctx, &report, &names, e), true))?;
     steps.ok("verify", json!(checks.iter().map(|c| (c.service.clone(), c.identity)).collect::<IndexMap<_, _>>()));
     bind_data(ctx, &checks);
 
@@ -2243,7 +2262,7 @@ pub fn with_stopped(
                     ("start", with_readiness_unless_cancelled(ctx, &report, &stopping, e))
                 })
             })
-            .and_then(|()| verify_launch(ctx, &report, "snapshot_verify"));
+            .and_then(|()| verify_launch(ctx, &report, "snapshot_verify").map(|(checks, _)| checks));
         match restarted {
             Ok(verified) => {
                 steps.ok("start", json!(stopping));
@@ -3246,6 +3265,25 @@ fn port_conflicts(report: &Report, statuses: &[DaemonStatus]) -> Vec<PortConflic
             conflict(name, *port, pinned)
         })
         .collect()
+}
+
+/// What listens on the port reserved for `service` when it is neither a daemon of that service
+/// the supervisor has (as in [`port_conflicts`]) nor a process of this checkout that nothing
+/// recorded (see [`stray`]), which `up` stops itself: the program `up` would refuse to start
+/// beside.
+fn foreign_listener(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], service: &str) -> Option<PortConflict> {
+    let port = *report.ports.get(service)?;
+    let owned = statuses
+        .iter()
+        .any(|d| d.name == service && d.port == Some(port) && (matches!(d.status.as_str(), "running" | "starting") || d.pid.is_some_and(pid_alive)));
+    if owned || !accepting(port) {
+        return None;
+    }
+    if crate::checkout::token(&ctx.root).is_some_and(|token| stray(service, port, &token).is_some()) {
+        return None;
+    }
+    let pinned = report.stack.services.get(service).is_some_and(|e| e.value.fixed_port().is_some());
+    Some(conflict(service, port, pinned))
 }
 
 /// `port_conflict`: which service, which port, who holds it, and what frees this checkout.
@@ -5167,6 +5205,17 @@ fn verify_session(
                 env,
                 &inherited_env(),
             );
+        }
+        // A service that is not running leaves its port to whoever takes it. Said here, where
+        // the reader is deciding what to do, rather than only when `stack up` is refused.
+        if let Some(conflict) = (!check.ready).then(|| foreign_listener(ctx, report, statuses, &check.service)).flatten() {
+            let holder = conflict.holder.map_or_else(|| "another program".to_string(), |h| format!("another program (pid {} `{}`)", h.pid, h.command));
+            let way_out = if conflict.pinned { "stop that program first" } else { "stop that program first, or run `stack up --reassign-ports`" };
+            let note = format!("{holder} is now listening on its port {}: {way_out}", conflict.port);
+            check.reason = Some(match check.reason.take() {
+                Some(reason) => format!("{reason}; {note}"),
+                None => note,
+            });
         }
         let watch = &report.stack.services[&check.service].value.watch;
         let started = session.and_then(|s| s.services.get(&check.service)).and_then(|r| r.started_at_ms);

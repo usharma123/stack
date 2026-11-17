@@ -4813,6 +4813,50 @@ fn a_service_is_requested_only_once_the_services_it_depends_on_are_ready() {
 
 #[test]
 #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
+fn up_again_still_checks_that_a_running_dependency_passes_its_readiness() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.db]\nrun='true'\nready_cmd='test -f db-ready'\n[services.api]\nrun='true'\ndepends_on=['db']\n");
+    let (dir, app) = (fixture.dir.path().to_path_buf(), fixture.dir.path().join("app"));
+    let (db, api) = (assigned_port(&fixture, "db"), assigned_port(&fixture, "api"));
+    // As in the restart test below: the supervisor's listener stands for api, and db is a
+    // socket this test holds, bound once the supervisor was first asked to start something.
+    fs::write(dir.join("listen-port"), api.to_string()).unwrap();
+    fs::write(dir.join("listen-service"), "api").unwrap();
+    // db is reported with a live process, as a supervisor reports what it runs.
+    let mut db_process = Command::new("sleep").arg("600").spawn().unwrap();
+    let running = json!([{ "id": "app-test/db", "name": "db", "status": "running", "port": db, "pid": db_process.id() }, { "id": "app-test/api", "name": "api", "status": "running", "port": api }]);
+    fs::write(dir.join("daemons-started.json"), running.to_string()).unwrap();
+    let (send, held) = std::sync::mpsc::channel();
+    let started = dir.join("started");
+    let binder = thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(60);
+        while !started.exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        send.send(std::net::TcpListener::bind(("127.0.0.1", db)).unwrap()).unwrap();
+    });
+    fs::write(app.join("db-ready"), "").unwrap();
+    fixture.ok(&["up"]);
+    let db_socket = held.recv().unwrap();
+    binder.join().unwrap();
+    // Both still run and verify, so a second `up` has nothing to start.
+    fixture.ok(&["up"]);
+
+    // db still runs but no longer passes its ready_cmd: api must not be reported started on it.
+    fs::remove_file(app.join("db-ready")).unwrap();
+    let out = fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert!(!out.status.success(), "{result}");
+    assert_eq!(result["ok"], false, "{result}");
+    assert!(result["error"].to_string().contains("db"), "{result}");
+    fs::write(app.join("db-ready"), "").unwrap();
+    drop(db_socket);
+    db_process.kill().unwrap();
+    db_process.wait().unwrap();
+    fixture.ok(&["down"]);
+}
+
+#[test]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn restarting_a_dependent_alone_first_checks_what_it_depends_on_and_changes_nothing_when_it_is_not_ready() {
     let fixture = Fixture::with_bundle(
         "[bundle]\nname='test'\n[services.db]\nrun='true'\nready_cmd='test -f db-ready'\n[services.api]\nrun='true'\ndepends_on=['db']\nsetup='echo setup >> setup.log'\n",
