@@ -40,3 +40,4 @@ pub mod stopping;
 pub mod supervisor;
 pub mod timing;
 pub mod tool;
+pub mod wire;

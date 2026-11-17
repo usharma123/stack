@@ -450,11 +450,22 @@ fn verify_one(
         .data_dir
         .as_deref()
         .ok_or((R::ProbeFailed, "supervisor did not report a data directory".to_string()))?;
+    let query = "select current_setting('data_directory')";
     let args: Vec<&str> = match bin {
-        "psql" => vec![url, "-Atc", "select current_setting('data_directory')"],
+        // `-X`: no ~/.psqlrc, whose settings (`\timing`, say) would change what it prints.
+        "psql" => vec!["-X", url, "-Atc", query],
         _ => vec!["-u", url, "--no-auth-warning", "config", "get", "dir"],
     };
-    let out = run_probe(env, bin, &args).map_err(|why| (R::ProbeFailed, why))?;
+    // Asked over the wire when that is exactly the client's question; the client otherwise.
+    let asked = match bin {
+        "psql" => crate::wire::postgres(url, env, query),
+        _ => crate::wire::redis_dir(url, env),
+    };
+    let out = match asked {
+        crate::wire::Asked::Answer(out) => out,
+        crate::wire::Asked::Fallback(_) => run_probe(env, bin, &args).map_err(|why| (R::ProbeFailed, why))?,
+        crate::wire::Asked::Failed(why) => return Err((R::ProbeFailed, why)),
+    };
     let reported = out
         .lines()
         .map(str::trim)
@@ -1296,7 +1307,12 @@ fn encoding_warnings(report: &Report, env: &IndexMap<String, String>, checks: &[
 /// [`encoding_warnings`] for one verified Postgres, asked over the app's `DATABASE_URL`.
 fn encoding_warning(env: &IndexMap<String, String>, check: &Check) -> Option<String> {
     let url = env.get("DATABASE_URL")?;
-    let encoding = run_probe(env, "psql", &[url, "-Atc", "show server_encoding"]).ok()?;
+    let query = "show server_encoding";
+    let encoding = match crate::wire::postgres(url, env, query) {
+        crate::wire::Asked::Answer(out) => out,
+        crate::wire::Asked::Fallback(_) => run_probe(env, "psql", &["-X", url, "-Atc", query]).ok()?,
+        crate::wire::Asked::Failed(_) => return None,
+    };
     let encoding = encoding.lines().map(str::trim).rfind(|l| !l.is_empty())?;
     if encoding == "UTF8" {
         return None;
@@ -5938,8 +5954,9 @@ mod tests {
             data_dir: Some(data_dir.into()),
             provider_id: None,
         };
-        let (_dir, mut env) = fake_client("psql", r#"test "$3" = 'show server_encoding' && echo SQL_ASCII"#);
-        env.insert("DATABASE_URL".into(), "postgresql://postgres@127.0.0.1:1/postgres".into());
+        // A host name: not a URL Stack asks over the wire, so psql is asked (see `wire`).
+        let (_dir, mut env) = fake_client("psql", r#"test "$1" = -X && test "$4" = 'show server_encoding' && echo SQL_ASCII"#);
+        env.insert("DATABASE_URL".into(), "postgresql://postgres@localhost:1/postgres".into());
         let warning = encoding_warning(&env, &check("/data/pg")).expect("SQL_ASCII is warned about");
         assert!(warning.starts_with("postgres: the cluster in /data/pg uses encoding SQL_ASCII"), "{warning}");
         assert!(warning.contains("kept as it is") && warning.contains("C.UTF-8") && warning.contains("pg_dumpall"), "{warning}");
@@ -5952,6 +5969,65 @@ mod tests {
         assert_eq!(encoding_warning(&env, &check("/data/pg")), None);
         env.shift_remove("DATABASE_URL");
         assert_eq!(encoding_warning(&env, &check("/data/pg")), None);
+    }
+
+    /// A Postgres on a free port that reports `data_dir` for every query, to each connection
+    /// (a bare TCP check included), until the test ends.
+    fn wire_postgres(data_dir: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                let Ok(mut c) = c else { continue };
+                let msg = |kind: u8, body: &[u8]| [&[kind][..], &((body.len() + 4) as u32).to_be_bytes(), body].concat();
+                let mut len = [0u8; 4];
+                if c.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let mut startup = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+                let _ = c.read_exact(&mut startup);
+                let _ = c.write_all(&[msg(b'R', &[0, 0, 0, 0]), msg(b'Z', b"I")].concat());
+                let mut head = [0u8; 5];
+                if c.read_exact(&mut head).is_err() {
+                    continue;
+                }
+                let mut query = vec![0u8; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize - 4];
+                let _ = c.read_exact(&mut query);
+                let row = [&[0u8, 1][..], &(data_dir.len() as u32).to_be_bytes(), data_dir.as_bytes()].concat();
+                let column = [&[0u8, 1][..], b"current_setting\0", &[0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 255, 255, 255, 255, 255, 255, 0, 0]].concat();
+                let _ = c.write_all(&[msg(b'T', &column), msg(b'D', &row), msg(b'C', b"SELECT 1\0"), msg(b'Z', b"I")].concat());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn an_answer_asked_over_the_wire_is_compared_as_the_clients_was() {
+        if std::env::vars().any(|(k, _)| k.starts_with("PG") && !["PGHOST", "PGPORT", "PGUSER", "PGDATABASE"].contains(&k.as_str())) {
+            eprintln!("skipping: a libpq variable in the environment leaves the question to psql");
+            return;
+        }
+        let service = Service { preset: Some("postgres".into()), ..Default::default() };
+        let status = |port: u16, dir: &str| DaemonStatus { id: None, name: "db".into(), status: "running".into(), pid: None, port: Some(port), data_dir: Some(dir.into()) };
+        // No psql anywhere: the answer can only come over the wire.
+        let env = |port: u16| IndexMap::from([("DATABASE_URL".to_string(), format!("postgresql://postgres@127.0.0.1:{port}/postgres")), ("PATH".to_string(), "/nonexistent".to_string())]);
+        let root = Path::new("/");
+        let port = wire_postgres("/data/this-checkout");
+        assert_eq!(verify_one(root, &service, Some(port), Some(&status(port, "/data/this-checkout")), &env(port), None), Ok(Identity::Instance));
+        let other = wire_postgres("/data/another-checkout");
+        let (code, why) = verify_one(root, &service, Some(other), Some(&status(other, "/data/this-checkout")), &env(other), None).unwrap_err();
+        assert_eq!(code, ReasonCode::WrongInstance);
+        assert!(why.contains("data dir '/data/another-checkout', expected '/data/this-checkout'"), "{why}");
+        // A URL Stack does not read itself goes to psql, run without ~/.psqlrc.
+        let (_dir, mut with_psql) = fake_client("psql", r#"test "$1" = -X && echo /data/this-checkout"#);
+        with_psql.insert("DATABASE_URL".into(), format!("postgresql://postgres@localhost:{port}/postgres"));
+        assert_eq!(verify_one(root, &service, Some(port), Some(&status(port, "/data/this-checkout")), &with_psql, None), Ok(Identity::Instance));
+        // ... and when psql is not there, it is never verified.
+        let mut by_name = env(port);
+        by_name.insert("DATABASE_URL".into(), format!("postgresql://postgres@localhost:{port}/postgres"));
+        let (code, why) = verify_one(root, &service, Some(port), Some(&status(port, "/data/this-checkout")), &by_name, None).unwrap_err();
+        assert_eq!((code, why.as_str()), (ReasonCode::ProbeFailed, "psql not found on the stack's PATH"));
     }
 
     #[cfg(unix)]
