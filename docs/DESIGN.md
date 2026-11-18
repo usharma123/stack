@@ -287,14 +287,15 @@ output (mise's answer when no release matches) is an error, not a version.
   of each pid: no process is started for it.
 - **Presets.** Stack runs the presets mise 2026.10.3 defined, as it ran them, so data they
   initialised keeps working: `stack __preset <preset> <data dir> <port> <pinned version>
-  [<role>=<port>...]` initialises the data directory when it is empty or missing and then
+  [<role>=<port>...] [templates=<dir>]` initialises the data directory when it is empty or missing and then
   becomes the server. Each preset service runs its own pinned release: its PATH starts with
   mise's install directory for that tool and version (`installs/<tool>/<version>/bin`), so two
   services pinned to different releases of one tool each get theirs, and the server's full
   version, not only its major, must be the pinned one before anything is initialised.
-  Postgres: `initdb -D <tmp> -U postgres --auth=trust` into a sibling `.stack-init-*` directory
-  renamed into place, then `postgres -D <dir> -p <port> -h 127.0.0.1 -k ""`, stopped with
-  `SIGINT`. Redis: `redis-server --bind 127.0.0.1 --port <port> --dir <dir> --appendonly yes`.
+  Postgres: a clone of the template for its server and environment (see *Postgres
+  templates*), or else `initdb -D <tmp> -U postgres --auth=trust`, into a sibling
+  `.stack-init-*` directory renamed into place, then `postgres -D <dir> -p <port> -h 127.0.0.1
+  -k ""`, stopped with `SIGINT`. Redis: `redis-server --bind 127.0.0.1 --port <port> --dir <dir> --appendonly yes`.
   CockroachDB, NATS and SpiceDB: mise's arguments, except that their secondary ports (mise's
   fixed 8080, 8222, 8443 and 9090) are reserved per checkout in the port registry, as
   `<service>.http` (CockroachDB, SpiceDB), `<service>.monitor` (NATS) and `<service>.metrics`
@@ -307,6 +308,90 @@ output (mise's answer when no release matches) is an error, not a version.
   (`DATABASE_URL`, `PG*`, `REDIS_URL`, `COCKROACH_*`, `NATS_*`, `SPICEDB_*`) and a custom service's
   `<NAME>_URL` and `<NAME>_PORT` are rendered into the generated `[env]`; a project's own value
   wins. Each preset's server is a `[tools]` entry at its pinned release.
+- **Postgres templates.** `initdb` costs about half a second of CPU and disk per new data
+  directory, and checkouts started together contend for both. Stack runs it once per recipe
+  and clones the result (`src/pgtemplate.rs`). A template is
+  `$STACK_STATE_DIR/templates/postgres/<key>/` (`data/`, the cluster with its
+  `.mise-daemon-version`, and `template.json`), about 40 MB.
+  - *Key.* A digest of: the `initdb` found on the service's PATH and the `postgres` beside it
+    (resolved path, device, inode, size, times; the `postgres` first on PATH must be that same
+    file); the install's inputs by metadata, one level each: the install directory, `bin`,
+    `lib`, `lib/postgresql` when present, the share directory (the one holding `postgres.bki`:
+    `share` or `share/postgresql`), its `extension`, `timezonesets` and `tsearch_data`, and the
+    `plpgsql` module, each entry with its identity and times, and a symbolic link with its text
+    and what it leads to; the arguments; `LC_*`, `LANG` and `TZ` as the service gets them;
+    `/etc/localtime` (link and file); the operating system release (`uname`); on Linux every
+    `libc.so.6` and `ld-musl-*` loader in `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` (and
+    their `*-linux-*` directories) and `/usr/lib/locale` with its `locale-archive`, by resolved
+    path and identity, read from disk because Stack's own Linux binaries are static musl; the
+    user; the platform; a format version. No key is made, and `initdb` runs, when the share
+    directory or the `plpgsql` module is not found, a link dangles or loops, a PATH entry
+    before `initdb` is empty or relative, an install entry changed in the last 2 seconds, or
+    (Linux) no system C library is found. Not keyed: a C library a server finds through its own
+    `RPATH`, file contents (an edit in place shows only through the times it changes), and the
+    IPv6 lines `initdb` writes into `pg_hba.conf` depending on whether `::1` resolved, which do
+    not matter while the preset listens on 127.0.0.1 only. The key includes device numbers, so
+    a volume renumbered across boots orphans its templates until `stack gc`.
+  - *Build.* A missing template is built by the first start that needs it under `<key>.lock`:
+    `initdb` into `.build-<key>-*`, the marker written and flushed, a digest of every entry of
+    the cluster (path, kind, mode, size, inode, link count, modification and change time), the
+    recipe checked again, the record written and flushed, then on macOS one `F_FULLFSYNC` (the
+    one flush of the drive's cache per template, off the path of later starts; on Linux
+    `fsync` already is that), then one rename to `<key>`. A template that could not be fully
+    flushed records the boot it was built in (`kern.bootsessionuuid`,
+    `/proc/sys/kernel/random/boot_id`) and is built again after a restart; with no boot id it
+    is not kept. Only a build whose `pg_control` layout is verified (below) and whose
+    `postgresql.conf` has the values `initdb` picks on an unconstrained machine
+    (`max_connections = 100`, `shared_buffers = 128MB`, checked on 17 and 18) is published.
+    Any other build is renamed to the data directory being made and used for it alone, and a
+    later start tries again. Other starts wait for the lock (up to 60 seconds, then run
+    `initdb` themselves) and clone the result. Only a complete build is renamed into place;
+    the next builder removes what one that died left, and a template whose record names
+    another recipe is replaced. If the build's `initdb` fails (the template's volume is full,
+    or `templates/` was removed), the failed build is discarded and `initdb` runs once at the
+    data directory; if that fails too, both errors are reported.
+  - *Clone.* `clonefile` of the directory on macOS, and nothing else: on another volume, or a
+    filesystem that cannot clone (HFS+), `initdb` runs at the data directory, since a copy
+    saves little and would need every file flushed. On Linux `FICLONE` per file (Btrfs, XFS),
+    else a plain copy, then `syncfs`; the Linux path has been type-checked, not run. Stack never
+    starts a server on a template. After each clone the template's digest is taken again and
+    must be the recorded one: any write, chmod, link, rename or new entry since the build
+    changes some change time, which cannot be set back, so the clone is of what was built;
+    otherwise the clone is discarded, the template removed and `initdb` runs. On a filesystem
+    with whole-second times a template is cloned only once 2 seconds old (its builder
+    excepted). Clones refresh `used` without the lock.
+  - *Identity.* `initdb` gives each cluster a random system identifier (in `pg_control` and in
+    the long header of each WAL segment) and a mock authentication nonce; clones would share
+    them. Physical replication, `pg_rewind`, WAL archives and backup tools such as pgBackRest
+    tell clusters apart by that identifier, and `pg_resetwal` cannot set it. So each clone
+    gets a new identifier made as `initdb` makes it (seconds, microseconds, process id) and a
+    new nonce. The edit is made only for a `pg_control_version` whose layout was verified with
+    `offsetof` against the installed server headers: 1700 (17.6, 17.11, 17.12: nonce at 256,
+    checksum at 288, WAL page magic `0xD116`) and 1800 (18.6, 18.7: nonce at 257, three bytes
+    of padding, checksum at 292, magic `0xD118`); the identifier is at 0 in `pg_control` and at
+    24 in a long WAL page header in both. The stored CRC-32C must match at the layout's offset,
+    and every WAL segment must carry the layout's magic, the long-header flag and the old
+    identifier, before anything is written; exactly the identifier, the nonce and the checksum
+    change, and the two files are flushed before the rename. Any other version, a mismatch, or
+    a big-endian target (Postgres stores these in native order; only little-endian is
+    verified) runs `initdb`. Nothing else in a never-started cluster names it or its path:
+    `-D` gives the data directory, `postmaster.pid` and `postmaster.opts` appear only once a
+    server runs, and there are no tablespaces or logs. What still comes from the template: file
+    times and the time of its checkpoint in `pg_control`.
+  - *Collection.* `stack gc` removes a template whose install's inputs changed or are gone, one
+    with an unreadable record or another format, one not fully flushed from an earlier boot,
+    one no clone was made from in 14 days (`used`), and builds or removals a process left. Each
+    is judged under its recipe's lock, taken without waiting, and only while the directory is
+    still the one listed; one locked by a build is skipped. `gc --dry-run` takes and releases
+    the same locks and lists exactly what a pass would remove, under `templates`. A clone that
+    refreshes `used` after `gc` judged a template may still see it removed: its own copy is
+    complete and checked by then, and the next start builds again. Lock files stay. Removing
+    the templates directory by hand is safe only while no build runs (a lock file unlinked under
+    a builder lets a second builder in).
+  - *Leftovers.* A `stack __preset` killed while making a data directory can leave a
+    `.stack-init-*` staging directory beside it, possibly with the identity half edited. It is
+    never moved into place (Postgres would refuse it), and nothing removes it; this was already
+    true with `initdb`.
 - **Stopping.** A stop is a spec change: the supervisor sends each unwanted service's group its
   stop signal (`SIGINT` for Postgres, `SIGTERM` otherwise), `SIGKILL`s the group after 10
   seconds, and kills what a leader left in its group as soon as the leader is reaped. `down`
@@ -450,7 +535,17 @@ output (mise's answer when no release matches) is an error, not a version.
   (records and logs) and releases the path's reservations and tokens.
 - **Concurrent access.** Compile, renew, execution registration and lifecycle operations share
   a per-project advisory lock released by the kernel on process death. Each JSON write uses a
-  unique temporary file and atomic replacement. A session record that changes ownership or what
+  unique temporary file and atomic replacement, flushed with `fsync` first. On macOS that is
+  not `F_FULLFSYNC` (what `File::sync_all` asks for): that flushes the drive's whole cache,
+  checkouts starting together queued behind one another for it, and it only adds durability
+  across power loss, which Stack does not claim (Postgres too uses `fsync` there by default).
+  After a power loss a replaced record can therefore come back unreadable, not only older. A
+  session record has the recovery rule below; the port and identity registries, `data.json`,
+  init records and data markers do not: an unreadable one fails `state_invalid` until it is
+  repaired or removed by hand (removing the identity registry issues new checkout tokens, after
+  which existing markers name no checkout and their data is refused, never reused).
+  `up` records all of a checkout's data directories in `data.json` with one write, binds them
+  with one, and writes its launch record once with what the supervisor already shows. A session record that changes ownership or what
   was launched is waited for on disk (`up` when not finding the same verified launch running,
   `restart`, `down`). One where all that changed is executions in progress, a lease renewal or
   when services were last verified (`exec`, `status`, `env`, and `up` finding the same verified

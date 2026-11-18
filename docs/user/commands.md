@@ -444,8 +444,9 @@ that checkout is stopped, reclaimed or released; the other checkouts are handled
 `--dry-run` lists it under `unreadable` and plans nothing for it; `ps` shows it as
 `unreadable`. Run `stack down` in it.
 
-`--dry-run` reports what `gc` would do and changes nothing: no lock, no supervisor query, no
-record touched, no data directory opened. Each entry under `would_reclaim` has the
+`--dry-run` reports what `gc` would do and changes nothing: no supervisor query, no record
+touched, no data directory opened, and no lock waited for (it takes and releases each Postgres
+template's lock without waiting, to list only what a pass would remove). Each entry under `would_reclaim` has the
 `session`, `project`, `reason`, `action` (`stop` for an expired lease, `release_if_stopped`
 for a deleted checkout) and the recorded `services` (`port`, `pid`, whether that pid is alive,
 supervisor id). `busy` means a command was running in it, so `gc` would leave it alone.
@@ -453,7 +454,10 @@ supervisor id). `busy` means a command was running in it, so `gc` would leave it
 the recorded `data` directories, each with `action` `report` (kept and reported), or
 `remove_if_safe` with `--reclaim-data` (removed only if the checks below pass).
 `after_session` marks a checkout whose session record is still kept: the rest goes only once
-its services are confirmed stopped.
+its services are confirmed stopped. `templates` lists the Postgres templates (see
+[service data](data.md#postgres-templates)) a pass would remove: `dir`, `reason` and `bytes`;
+one a build holds is left out, as a pass would skip it.
+`gc` removes them without listing them in its result.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once, and its

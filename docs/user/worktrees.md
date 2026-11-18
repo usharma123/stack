@@ -26,7 +26,11 @@ is still the recorded process and stops it (see [`gc`](commands.md#gc) and
 [stopping orphans](commands.md#stopping-orphans)).
 
 Checkouts do not wait on each other: the cleanup pass at the start of `stack up` skips any
-other checkout's session that another command holds, and never fails because of one. Run
+other checkout's session that another command holds, and never fails because of one. A new
+checkout's Postgres starts from a copy of an initialised cluster Stack keeps per release (see
+[Postgres templates](data.md#postgres-templates)), so its first `up` is about as quick as a
+later one; only the first new database for a release, locale and time zone runs `initdb`, once,
+however many checkouts start together. Run
 `stack gc --dry-run` to see what a pass would reclaim.
 
 ## Services and the supervisor
