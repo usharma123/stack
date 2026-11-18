@@ -106,11 +106,42 @@ pattern and contain local paths). The binaries used for each measurement (`relea
 `step1-native-supervisor`, `step2-hot-path`, `step3-fresh-worktree`) are in `bench/hillclimb/`
 there too, also ignored.
 
+## The climb is closed (2026-11-18)
+
+Step 4 profiled what was left and found it at or near the floor set by Postgres, Redis, `initdb`
+and mise. Medians of 10 to 15 interleaved runs:
+
+| operation | now | where the time goes |
+|---|---|---|
+| `up`, existing data | about 85-105 ms | Postgres needs 48 ms to accept connections; a 24 ms scan for leftovers of a previous session; 14-18 ms supervisor spawn |
+| `down` | about 110-130 ms | 95 ms waiting for Redis, which acts on SIGTERM only at its next 100 ms tick; 20 ms process scans |
+| `restart` | about 170 ms | the same Redis tick, then the Postgres start |
+| six fresh worktrees `up` | about 260 ms | `mise env` for each new checkout; six Postgres starts competing for CPU |
+| first `up` in a new state directory | about 690 ms | `initdb` is 448 ms of a 491 ms template build |
+
+Tried and not kept:
+
+- **Asking Redis to `SHUTDOWN` over its port after SIGTERM** (`down` 131 to 79 ms). Rejected in
+  review, with reproductions on Redis 8.10.3: the request could reach a different Redis on the
+  same port (and, by reading, the next generation after `restart`); `SHUTDOWN` without
+  arguments skipped a save that `shutdown-on-sigterm save` would have made; a `SHUTDOWN` whose
+  save failed cleared the pending SIGTERM, so Redis was killed at 10 s. Not worth 50 ms.
+- Redis `--hz 100`: the same gain, but more idle CPU in every worktree for the whole session.
+- Stop-wait polling capped at 5 ms instead of 20 ms: 13% on `down`.
+- Cheaper process scans and dropping `down`'s second scan: about 10 ms.
+- Overlapping stop and start in `restart`: a few ms.
+
+Found on the way, not fixed: `STACK_TIMINGS=1` with a closed stderr makes the timing writer
+panic (`src/timing.rs`), which can abort a command.
+
+Reopen this only on evidence: a Linux run with a different profile, agent transcripts where
+Stack's latency is a visible share of task time, fleets well beyond six where `up` grows worse
+than linearly, or a regression in `perf.py`'s numbers.
+
 ## Where to pick up
 
 1. Step 3 is done. Reviews now go to one standing reviewer session, not a two-reviewer council.
 2. Run the test suite and `perf.py` on Linux (item 2).
 3. Decide item 4.
-4. Next speed targets, from the last profiles: `restart` (about 220 ms, mostly Postgres stop and
-   start), `down` (bounded by Redis's 100 ms shutdown tick), and a first `up` that must build the
-   template (about 0.7-0.9 s, once per pinned release).
+4. Speed work is closed (see above). Next is the isolation claim itself: item 4, a fleet
+   isolation test, and Linux.
