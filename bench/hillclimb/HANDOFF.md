@@ -13,7 +13,7 @@ then measured and committed.
 | Earlier fixes: exit watcher, lock backoff, port registry, git exclude lookup, settled `up` | `8678fd3`..`28ffb43` | Reviewed once before this round; findings fixed |
 | 1. Supervisor built into Stack, replacing Pitchfork | `9afdcfd`, `2fe9681` | **Approved by both reviewers** |
 | 2. Exec hot path: kept mise answers, wire probes, unreadable-record recovery | `dae9b94`, `8190bfc`, `2fe46e3` | **Approved by both reviewers** |
-| 3. Fresh worktree: Postgres template clone, plain fsync, first-up trims | `692b572`, `d768ab5`, `45d3ff4` | **Fixes not re-verified** (see below) |
+| 3. Fresh worktree: Postgres template clone, plain fsync, first-up trims | `692b572`, `d768ab5`, `45d3ff4` | **Changes requested, not approved** (see below) |
 
 ## Measurements
 
@@ -51,10 +51,28 @@ runs, and nobody else has checked that:
 
 ## Open items, most important first
 
-1. **Step 3's review fixes were never re-verified.** The council's first review requested changes
-   (two must-fix, seven should-fix). The implementer reports all fixed except as noted in items 2
-   and 3, and the tree passes its tests, but neither reviewer has checked the fixes. Before
-   merging, have someone verify at least:
+1. **Step 3 is not approved: one reviewer re-checked its fixes and requests changes.** That
+   verification finished after the work was stopped; the second reviewer never ran. Its findings,
+   none of them fixed:
+   - **Must fix, reproduced with the release binary.** After corrupting byte 292 of a freshly
+     built Postgres 18 template's `pg_control`, Stack logged the checksum mismatch and still
+     installed that cluster as the checkout's data directory (`pg_controldata` warns its results
+     are untrustworthy). A cluster with an unknown control-file version also reached the checkout.
+     A wrong WAL magic correctly ran `initdb` but left the unusable template published.
+     See `src/pgtemplate.rs` around line 560: a build whose layout check fails must not be used as
+     the data directory and must not be published.
+   - **Must fix, by reading.** If both `<install>/share` and `<install>/share/postgresql` hold
+     `postgres.bki`, Stack fingerprints the first; an in-place edit under the other can leave the
+     key unchanged (`src/pgtemplate.rs` around line 199).
+   - **Should fix, by reading.** In Linux multiarch library directories only `libc.so.6` is looked
+     up, so a replaced `ld-musl-*` loader there does not change the key (around line 267).
+   - Confirmed fixed: degraded builds stay private, template flush and boot binding, the macOS
+     copy path, `gc` under its lock, the fallback when a template build fails. On unmodified 17.12
+     and 18.7 clones the edit touched only the identifier, nonce and checksum fields.
+
+   Do not merge step 3 (`692b572`..`45d3ff4`) until these are fixed and both reviewers approve.
+   The first review had requested changes (two must-fix, seven should-fix); beyond the above, have
+   someone verify at least:
    - the `pg_control` edit uses the verified layout table (17: nonce at 256, CRC at 288; 18: nonce
      at 257, CRC at 292) and falls back to `initdb` for any other version;
    - the install fingerprint covers the directory holding `postgres.bki`, its `extension`,
@@ -106,7 +124,8 @@ there too, also ignored.
 
 ## Where to pick up
 
-1. Verify step 3's fixes (item 1), ideally with the two-reviewer process used for steps 1 and 2.
+1. Fix step 3's open findings (item 1), then verify with the two-reviewer process used for
+   steps 1 and 2.
 2. Run the test suite and `perf.py` on Linux (item 2).
 3. Decide item 4.
 4. Next speed targets, from the last profiles: `restart` (about 220 ms, mostly Postgres stop and
