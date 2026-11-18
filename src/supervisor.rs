@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 /// The hidden argument that runs the supervisor: `stack __supervise <dir>`.
 pub const SUPERVISE: &str = "__supervise";
 /// The hidden argument that initialises a preset's data and runs its server:
-/// `stack __preset <preset> <data dir> <port> [<pinned version>]`.
+/// `stack __preset <preset> <data dir> <port> [<pinned version>] [<role>=<port>...] [templates=<dir>]`.
 pub const PRESET: &str = "__preset";
 
 /// How long a service may take to stop after its stop signal before its group is killed.
@@ -1894,12 +1894,13 @@ pub fn parse_major(text: &str) -> Option<String> {
 }
 
 /// Make `data_dir` hold `p`'s data for the server on PATH, as mise's presets did: a fresh
-/// directory is initialised (Postgres: `initdb -U postgres --auth=trust` into a sibling
-/// directory renamed into place, so a failed one leaves nothing half made) and records the
-/// preset and major version; existing data must record the same, or it is refused, kept as it is.
-/// A server whose version is not exactly the pinned one (the pinned release's install was not
-/// found on the service's PATH, so another release was) initialises and opens nothing.
-pub fn init_data(p: &Preset, data_dir: &Path, pinned: Option<&str>) -> std::result::Result<(), String> {
+/// directory is initialised (Postgres: a copy of the template for this server and environment
+/// under `templates`, see [`crate::pgtemplate`], else `initdb -U postgres --auth=trust`, into a
+/// sibling directory renamed into place, so a failed one leaves nothing half made) and records
+/// the preset and major version; existing data must record the same, or it is refused, kept as
+/// it is. A server whose version is not exactly the pinned one (the pinned release's install
+/// was not found on the service's PATH, so another release was) initialises and opens nothing.
+pub fn init_data(p: &Preset, data_dir: &Path, pinned: Option<&str>, templates: Option<&Path>) -> std::result::Result<(), String> {
     let version = server_version(p)?;
     if let Some(pinned) = pinned.filter(|v| parse_version(v).as_deref() == Some(*v)) {
         if version != pinned {
@@ -1938,17 +1939,10 @@ pub fn init_data(p: &Preset, data_dir: &Path, pinned: Option<&str>) -> std::resu
     }
     let staging = tempfile::Builder::new().prefix(".stack-init-").tempdir_in(parent).map_err(|e| format!("cannot create a directory in {}: {e}", parent.display()))?;
     let target = staging.path().join("data");
-    let status = std::process::Command::new("initdb")
-        .arg("-D")
-        .arg(&target)
-        .args(["-U", "postgres", "--auth=trust"])
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("cannot run initdb: {e}"))?;
-    if !status.success() {
-        return Err(format!("initdb failed ({status})"));
+    let env = |name: &str| std::env::var_os(name);
+    for note in crate::pgtemplate::make(templates, &marker, &target, &env)? {
+        eprintln!("stack: {note}");
     }
-    fs::write(target.join(VERSION_FILE), &marker).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
     if data_dir.exists() {
         // Empty, as checked above.
         fs::remove_dir(data_dir).map_err(|e| format!("cannot replace {}: {e}", data_dir.display()))?;
@@ -1962,13 +1956,18 @@ pub fn init_data(p: &Preset, data_dir: &Path, pinned: Option<&str>) -> std::resu
 pub fn main_preset(args: &[std::ffi::OsString]) -> i32 {
     use std::os::unix::process::CommandExt;
     let usage = || {
-        eprintln!("usage: stack {PRESET} <preset> <data dir> <port> [<pinned version>|-] [<role>=<port>...]");
+        eprintln!("usage: stack {PRESET} <preset> <data dir> <port> [<pinned version>|-] [<role>=<port>...] [{TEMPLATES_ARG}<dir>]");
         2
     };
     let [preset_name, data_dir, port, rest @ ..] = args else { return usage() };
     let pinned = rest.first().and_then(|p| p.to_str()).filter(|p| *p != "-" && !p.contains('='));
     let mut secondary = Secondary::new();
+    let mut templates = None;
     for arg in rest.iter().skip(1) {
+        if let Some(dir) = arg.to_str().and_then(|a| a.strip_prefix(TEMPLATES_ARG)) {
+            templates = Some(PathBuf::from(dir));
+            continue;
+        }
         let Some((role, port)) = arg.to_str().and_then(|a| a.split_once('=')) else { return usage() };
         let Ok(port) = port.parse::<u16>() else { return usage() };
         secondary.insert(role.to_string(), port);
@@ -1982,7 +1981,7 @@ pub fn main_preset(args: &[std::ffi::OsString]) -> i32 {
         return 2;
     };
     let dir = PathBuf::from(data_dir);
-    if let Err(e) = init_data(&p, &dir, pinned) {
+    if let Err(e) = init_data(&p, &dir, pinned, templates.as_deref()) {
         eprintln!("stack: {e}");
         return 1;
     }
@@ -1991,12 +1990,19 @@ pub fn main_preset(args: &[std::ffi::OsString]) -> i32 {
     127
 }
 
-/// The argv the supervisor runs for a preset service.
-pub fn preset_argv(preset: &str, data_dir: &Path, port: u16, pinned: Option<&str>, secondary: &Secondary) -> Result<Vec<String>> {
+/// How `stack __preset` is told where Postgres templates are kept (see [`crate::pgtemplate`]).
+pub const TEMPLATES_ARG: &str = "templates=";
+
+/// The argv the supervisor runs for a preset service. `templates`: where Stack keeps Postgres
+/// templates, passed to a Postgres service.
+pub fn preset_argv(preset: &str, data_dir: &Path, port: u16, pinned: Option<&str>, secondary: &Secondary, templates: Option<&Path>) -> Result<Vec<String>> {
     let exe = std::env::current_exe().map_err(|e| StackError::new("start_failed", format!("cannot find the stack executable: {e}")))?;
     let mut argv = vec![exe.to_string_lossy().into_owned(), PRESET.into(), preset.into(), data_dir.to_string_lossy().into_owned(), port.to_string()];
     argv.push(pinned.unwrap_or("-").to_string());
     argv.extend(secondary.iter().map(|(role, port)| format!("{role}={port}")));
+    if let Some(dir) = templates.filter(|_| preset == "postgres") {
+        argv.push(format!("{TEMPLATES_ARG}{}", dir.display()));
+    }
     Ok(argv)
 }
 
@@ -2334,21 +2340,21 @@ mod tests {
         let p = Preset { name: "nats", server: "placeholder", stop_signal: libc::SIGTERM, keeps_data: true };
         let p = Preset { server: Box::leak(script.to_string_lossy().into_owned().into_boxed_str()), ..p };
         let data = root.path().join("data/nats");
-        let e = init_data(&p, &data, Some("3.0.1")).unwrap_err();
+        let e = init_data(&p, &data, Some("3.0.1"), None).unwrap_err();
         assert!(e.contains("is version 2.15.3, but stack.lock pins 3.0.1") && e.contains("mise where nats-server@3.0.1"), "{e}");
         // The same major, another release: refused too.
-        let e = init_data(&p, &data, Some("2.15.4")).unwrap_err();
+        let e = init_data(&p, &data, Some("2.15.4"), None).unwrap_err();
         assert!(e.contains("is version 2.15.3, but stack.lock pins 2.15.4"), "{e}");
         assert!(!data.exists(), "nothing initialised by the wrong server");
-        init_data(&p, &data, Some("2.15.3")).unwrap();
+        init_data(&p, &data, Some("2.15.3"), None).unwrap();
         assert_eq!(fs::read_to_string(data.join(VERSION_FILE)).unwrap(), "nats:2");
-        init_data(&p, &data, None).unwrap();
+        init_data(&p, &data, None, None).unwrap();
         fs::write(data.join(VERSION_FILE), "nats:1").unwrap();
-        let e = init_data(&p, &data, None).unwrap_err();
+        let e = init_data(&p, &data, None, None).unwrap_err();
         assert!(e.contains("incompatible nats data") && e.contains("stored nats:1, current nats:2"), "{e}");
         fs::remove_file(data.join(VERSION_FILE)).unwrap();
         fs::write(data.join("x"), "").unwrap();
-        assert!(init_data(&p, &data, None).unwrap_err().contains("not initialized completely"));
+        assert!(init_data(&p, &data, None, None).unwrap_err().contains("not initialized completely"));
     }
 
     #[test]

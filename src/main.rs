@@ -842,10 +842,13 @@ fn print_gc_plan(plan: &session::GcDryRun) {
             println!("  {} data {} {what}", data.service, data.dir.display());
         }
     }
+    for t in &plan.templates {
+        println!("{}: Postgres template, {} MB, would be removed: {}", t.dir.display(), t.bytes / 1_000_000, t.reason);
+    }
     for w in &plan.warnings {
         eprintln!("warning: {w}");
     }
-    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() {
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() && plan.templates.is_empty() {
         println!("nothing to reclaim");
     }
 }

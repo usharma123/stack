@@ -256,6 +256,10 @@ pub struct GcDryRun {
     pub unreadable: Vec<GcEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deleted_checkouts: Vec<DeletedPlan>,
+    /// Postgres templates nothing can use any more (see [`crate::pgtemplate`]), which a pass
+    /// removes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<crate::pgtemplate::Unused>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -335,7 +339,7 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
         deleted[i].ports.extend(port);
         deleted[i].data.extend(data);
     }
-    Ok(GcDryRun { dry_run: true, would_reclaim: planned, unreadable, deleted_checkouts: deleted, warnings })
+    Ok(GcDryRun { dry_run: true, would_reclaim: planned, unreadable, deleted_checkouts: deleted, templates: crate::pgtemplate::collect(state, true), warnings })
 }
 
 /// How long before the recorded start a process may appear to have started: the recorded

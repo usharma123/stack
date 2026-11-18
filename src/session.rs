@@ -777,7 +777,7 @@ fn service_specs(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>) -> 
                     .filter_map(|role| Some((role.to_string(), *report.secondary_ports.get(&format!("{name}.{role}"))?)))
                     .collect();
                 let ready = declared.unwrap_or_else(|| supervisor::preset_ready(preset.name, port, &secondary));
-                (supervisor::preset_argv(preset.name, &dir, port, pinned, &secondary)?, ready, preset.stop_signal, Some(dir))
+                (supervisor::preset_argv(preset.name, &dir, port, pinned, &secondary, Some(&crate::pgtemplate::root(&ctx.state)))?, ready, preset.stop_signal, Some(dir))
             }
             None => {
                 let run = service.run.clone().ok_or_else(|| StackError::new("start_failed", format!("services.{name} has neither a preset nor a run command")))?;
@@ -993,6 +993,18 @@ fn compact_steps(steps: &[Value]) -> Vec<Value> {
 /// Preserve every observed launch identity before further provider calls can fail.
 fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()> {
     let Some(mut launch) = load(ctx)?.filter(|session| session.launching) else { return Ok(()) };
+    let before = launch.clone();
+    observe(&mut launch, statuses);
+    // A launch record written with these observations already (see `up`) is not written again.
+    if serde_json::to_value(&launch).ok() == serde_json::to_value(&before).ok() {
+        return Ok(());
+    }
+    save(ctx, &launch)
+}
+
+/// What `statuses` show of `launch`'s services: the supervisor's id, pid and data directory of
+/// each one on its recorded port.
+fn observe(launch: &mut Session, statuses: &[DaemonStatus]) {
     for daemon in statuses {
         if let Some(record) = launch.services.get_mut(&daemon.name) {
             if daemon.port != Some(record.port) { continue; }
@@ -1001,7 +1013,6 @@ fn record_launch_observations(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<()
             record.data_dir = daemon.data_dir.clone().or(record.data_dir.take());
         }
     }
-    save(ctx, &launch)
 }
 
 /// Start and verify every service, all within `timeout`: GC, waiting for the project lock,
@@ -1017,9 +1028,12 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         owner_pid(pid.into())?;
     }
     let mut steps = Steps::default();
+    let mut timings = Timings::new("up");
     let (reaped, gc_warnings) = gc_pass::before_up(&ctx.state, &mut steps);
+    timings.mark("gc");
 
     let _guard = project_lock(&ctx.state, &ctx.root).map_err(|e| steps.clone().fail("lock", e, false))?;
+    timings.mark("lock");
     let mut previous = load(ctx)?;
     if let Some(session) = previous.as_mut() {
         settle_executions(ctx, session).map_err(|e| steps.clone().fail("session", e, false))?;
@@ -1037,6 +1051,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         Err((step, e)) => return Err(steps.fail(step, e, false)),
     };
     steps.ok("compile", json!({ "ports": report.ports }));
+    timings.mark("compile");
     if let Err(e) = refuse_root(&report) {
         return Err(steps.fail("install", e, false));
     }
@@ -1057,6 +1072,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         Ok(detail) => steps.ok("install", detail),
         Err(e) => return Err(steps.fail("install", e, false)),
     }
+    timings.mark("install");
     let mut warnings = steps.skills(ctx, &report);
     // Recorded before anything starts, so a deleted project's services can still be found.
     let provider = (!report.stack.services.is_empty()).then(|| ProviderRecord::native(supervisor_dir(ctx)));
@@ -1086,6 +1102,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 steps.ok("stop_previous", detail);
             }
         }
+        timings.mark("stop_previous");
     }
     // Nothing can start on a port a foreign program holds, and the supervisor's own error
     // would come after the attempt. Stack's own daemons still running (an unchanged
@@ -1119,10 +1136,12 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
             return Err(steps.fail("ports", port_conflict_error(conflicts), false));
         }
         steps.ok("ports", if mine.is_empty() { json!(null) } else { json!({ "stopped": mine.iter().map(Stray::json).collect::<Vec<_>>() }) });
+        timings.mark("ports");
         match claim_data(ctx, &report, &statuses, provider.as_ref()) {
             Ok(moved) => warnings.extend(moved),
             Err(e) => return Err(steps.fail("data", e, false)),
         }
+        timings.mark("data");
         // After the claim: each data directory is recorded for this checkout and marked as its.
         if let Some(name) = opts.from_snapshot.as_deref() {
             match crate::snapshot::restore_before_start(ctx, &report, &statuses, name) {
@@ -1153,8 +1172,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         // recorded (a process an interrupted `up` or `restart` observed) may still run. Those
         // identifiers are kept until observations replace them or `down` confirms them gone.
         let carried = previous.as_ref().filter(|p| p.launching && !restart);
+        // Capture what runs before launch, including interrupted starts.
+        let before = listed.take().unwrap_or_else(|| listing(ctx, &report));
         if unverified {
-            let launch = Session {
+            let mut launch = Session {
                 id: new_session_id(ctx),
                 project: ctx.root.clone(),
                 lock_digest: lock_digest(&ctx.root),
@@ -1179,6 +1200,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 project_dir_id,
                 project_dir_created,
             };
+            // Written once, with what the supervisor already shows (one synced write fewer).
+            observe(&mut launch, &before);
             save(ctx, &launch).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         } else if let Some(previous) = previous.as_ref().filter(|p| p.provider != provider) {
             // The same generation, started again through the supervisor this environment
@@ -1186,9 +1209,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
             let moved = Session { provider: provider.clone(), ..previous.clone() };
             save(ctx, &moved).map_err(|e| steps.clone().fail("record_launch", e, false))?;
         }
-        // Capture what runs before launch, including interrupted starts.
-        let before = listed.take().unwrap_or_else(|| listing(ctx, &report));
         record_launch_observations(ctx, &before).map_err(|e| steps.clone().fail("record_launch", e, false))?;
+        timings.mark("record_launch");
         let names: Vec<String> = report.stack.services.keys().cloned().collect();
         // A service still running whose dependency is about to start again (it died, or never
         // ran) would keep its connections to the old one: stopped first, so it starts after it.
@@ -1226,6 +1248,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
             return Err(steps.fail("start", with_readiness_unless_cancelled(ctx, &report, &names, start_error), true));
         }
         steps.ok("start", json!(null));
+        timings.mark("start");
 
         steps.begin("verify");
         let env;
@@ -1237,8 +1260,10 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 .map(|c| (c.service.clone(), c.identity))
                 .collect::<IndexMap<_, _>>()),
         );
+        timings.mark("verify");
         warnings.extend(encoding_warnings(&report, &env, &checks));
         bind_data(ctx, &checks);
+        timings.mark("encoding_bind");
     }
 
     // Startup and verification are not idle time: the lease starts once services are verified.
@@ -1280,6 +1305,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     // waited for on disk (as `exec` and `status` renew). Anything else is.
     let durable = !previous.as_ref().is_some_and(|p| same_instance(p, &session));
     save_with(ctx, &session, durable).map_err(|e| steps.clone().fail("record_session", e, true))?;
+    timings.mark("record_session");
     let mut up = UpReport {
         session,
         checks,
@@ -1374,6 +1400,25 @@ pub(crate) fn data_marker(dir: &Path) -> PathBuf {
 fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], provider: Option<&ProviderRecord>) -> Result<Vec<String>> {
     let Some(token) = crate::checkout::token(&ctx.root) else { return Ok(Vec::new()) };
     let mut moved = Vec::new();
+    // Recorded together, with one write of the machine-wide record; what was claimed before a
+    // failure is recorded all the same.
+    let mut claimed = Vec::new();
+    let result = claim_each(ctx, report, statuses, provider, &token, &mut moved, &mut claimed);
+    let recorded = crate::datadirs::record_all(&ctx.state, claimed);
+    result.and(recorded).map(|()| moved)
+}
+
+/// [`claim_data`] for each daemon, collecting the entries to record in `claimed`.
+fn claim_each(
+    ctx: &Ctx,
+    report: &Report,
+    statuses: &[DaemonStatus],
+    provider: Option<&ProviderRecord>,
+    token: &str,
+    moved: &mut Vec<String>,
+    claimed: &mut Vec<crate::datadirs::Entry>,
+) -> Result<()> {
+    let token = token.to_string();
     for daemon in statuses {
         let Some(dir) = daemon.data_dir.as_deref().map(PathBuf::from) else { continue };
         let running = matches!(daemon.status.as_str(), "running" | "starting") || daemon.pid.is_some_and(pid_alive);
@@ -1388,7 +1433,7 @@ fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], provider: O
         let entry = crate::datadirs::Entry { project: ctx.root.clone(), service: daemon.name.clone(), dir: dir.clone(), checkout: token.clone(), supervisor, location, identity };
         if running || owner.as_deref() == Some(token.as_str()) {
             if owner.as_deref() == Some(token.as_str()) {
-                crate::datadirs::record(&ctx.state, entry)?;
+                claimed.push(entry);
             }
             continue;
         }
@@ -1413,9 +1458,9 @@ fn claim_data(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], provider: O
             ));
         }
         crate::state::write_json(&marker, &json!({ "checkout": token }))?;
-        crate::datadirs::record(&ctx.state, entry)?;
+        claimed.push(entry);
     }
-    Ok(moved)
+    Ok(())
 }
 
 /// The checkout token a data directory's marker names. An unreadable marker says no more than
@@ -1434,12 +1479,13 @@ pub(crate) fn marker_owner(bytes: &[u8]) -> Option<String> {
 /// directory was never bound is kept by `gc`, never removed.
 fn bind_data(ctx: &Ctx, checks: &[Check]) {
     let Some(token) = crate::checkout::token(&ctx.root) else { return };
-    for check in checks.iter().filter(|c| c.ready) {
-        let Some(dir) = check.data_dir.as_deref().map(Path::new) else { continue };
-        if data_owner(dir).as_deref() == Some(token.as_str()) {
-            let _ = crate::datadirs::bind(&ctx.state, dir, &token);
-        }
-    }
+    let dirs: Vec<&Path> = checks
+        .iter()
+        .filter(|c| c.ready)
+        .filter_map(|c| c.data_dir.as_deref().map(Path::new))
+        .filter(|dir| data_owner(dir).as_deref() == Some(token.as_str()))
+        .collect();
+    let _ = crate::datadirs::bind_all(&ctx.state, &dirs, &token);
 }
 
 /// Start `names` in the order [`dependency_waves`] gives: each wave of services is started
@@ -4829,6 +4875,9 @@ pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result
     let mut entries = pass.reclaimed;
     entries.extend(pass.unreadable);
     entries.extend(reclaim_deleted(state, remove_data)?);
+    // Postgres templates nothing can use any more (see `pgtemplate`): a cache, removed quietly;
+    // `gc --dry-run` lists them.
+    crate::pgtemplate::collect(state, false);
     let failed = entries.iter().filter(|e| !e.stopped).count();
     if failed == 0 {
         return Ok(entries);

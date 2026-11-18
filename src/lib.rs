@@ -22,6 +22,7 @@ pub mod logs;
 pub mod manifest;
 pub mod mcp;
 pub mod oci;
+pub mod pgtemplate;
 pub mod ports;
 pub mod process;
 pub mod progress;
