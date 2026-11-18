@@ -692,7 +692,8 @@ fn main() -> ExitCode {
         // A start the caller's signal cancelled ends as that signal would have ended it.
         Err(e) if e.code == "cancelled" => {
             let signal = stack::process::passed_on().unwrap_or(15);
-            fail(cli.json, e);
+            // Reported like any failure, but the exit status is the signal's, not the error's.
+            report_failure(cli.json, &e);
             ExitCode::from(contract::child_exit(None, Some(signal.into())))
         }
         // Like an argument error clap rejects: the same code, a hint, and exit 2.
@@ -843,7 +844,7 @@ fn print_gc_plan(plan: &session::GcDryRun) {
         }
     }
     for t in &plan.templates {
-        println!("{}: Postgres template, {} MB, would be removed: {}", t.dir.display(), t.bytes / 1_000_000, t.reason);
+        println!("{}: Postgres template, {} MB, a pass would try to remove it: {}", t.dir.display(), t.bytes / 1_000_000, t.reason);
     }
     for w in &plan.warnings {
         eprintln!("warning: {w}");
@@ -1168,12 +1169,17 @@ fn usage_text(rendered: &str) -> (String, String) {
 
 /// Report `e` and return its exit code: 2 for `usage`, 124 for `timed_out`, 70 otherwise.
 fn fail(as_json: bool, e: StackError) -> ExitCode {
-    if as_json {
-        println!("{}", call().failure(&e));
-    } else {
-        print_error(&e);
-    }
+    report_failure(as_json, &e);
     ExitCode::from(contract::error_exit(&e))
+}
+
+/// Say what failed, as [`fail`] does, without choosing the exit code.
+fn report_failure(as_json: bool, e: &StackError) {
+    if as_json {
+        println!("{}", call().failure(e));
+    } else {
+        print_error(e);
+    }
 }
 
 /// An error for people, on stderr: the message, then the hint and details that say what to do.

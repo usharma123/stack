@@ -316,78 +316,104 @@ output (mise's answer when no release matches) is an error, not a version.
   - *Key.* A digest of: the `initdb` found on the service's PATH and the `postgres` beside it
     (resolved path, device, inode, size, times; the `postgres` first on PATH must be that same
     file); the install's inputs by metadata, one level each: the install directory, `bin`,
-    `lib`, `lib/postgresql` when present, the share directory (the one holding `postgres.bki`:
-    `share` or `share/postgresql`), its `extension`, `timezonesets` and `tsearch_data`, and the
-    `plpgsql` module, each entry with its identity and times, and a symbolic link with its text
-    and what it leads to; the arguments; `LC_*`, `LANG` and `TZ` as the service gets them;
-    `/etc/localtime` (link and file); the operating system release (`uname`); on Linux every
-    `libc.so.6` and `ld-musl-*` loader in `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64` (and
-    their `*-linux-*` directories) and `/usr/lib/locale` with its `locale-archive`, by resolved
-    path and identity, read from disk because Stack's own Linux binaries are static musl; the
-    user; the platform; a format version. No key is made, and `initdb` runs, when the share
-    directory or the `plpgsql` module is not found, a link dangles or loops, a PATH entry
-    before `initdb` is empty or relative, an install entry changed in the last 2 seconds, or
-    (Linux) no system C library is found. Not keyed: a C library a server finds through its own
-    `RPATH`, file contents (an edit in place shows only through the times it changes), and the
-    IPv6 lines `initdb` writes into `pg_hba.conf` depending on whether `::1` resolved, which do
-    not matter while the preset listens on 127.0.0.1 only. The key includes device numbers, so
-    a volume renumbered across boots orphans its templates until `stack gc`.
+    `lib`, `lib/postgresql` when present, each share directory holding `postgres.bki` (`share`,
+    `share/postgresql`, or both when both hold one), its `extension`, `timezonesets` and
+    `tsearch_data`, and the `plpgsql` module, each entry with its identity and times, and a
+    symbolic link with its text and what it leads to; the arguments; `LC_*`, `LANG` and `TZ` as
+    the service gets them; `/etc/localtime` (link and file); the operating system release
+    (`uname`); on Linux every `libc.so.6`, `ld-musl-*` loader and `libc.musl-*` in `/lib`,
+    `/lib64`, `/usr/lib`, `/usr/lib64` and their `*-linux-*` multiarch directories, and
+    `/usr/lib/locale` with its `locale-archive`, by resolved path and identity, read from disk
+    because Stack's own Linux binaries are static musl; the user; the platform; a format version
+    (`stack-pg-template-3`: a template recorded under another is rebuilt, and removed by `stack
+    gc`). No key is made, and `initdb` runs, when the share directory or the `plpgsql` module is
+    not found, a link dangles or loops, a PATH entry before `initdb` is empty or relative, an
+    install entry changed in the last 2 seconds, or (Linux) no system C library is found or one
+    of those library directories exists but cannot be listed. Not keyed: a C library a server
+    finds through its own `RPATH`, file contents (an edit in place shows only through the times
+    it changes), and the IPv6 lines `initdb` writes into `pg_hba.conf` depending on whether
+    `::1` resolved, which do not matter while the preset listens on 127.0.0.1 only. The key
+    includes device numbers, so a volume renumbered across boots orphans its templates until
+    `stack gc`.
   - *Build.* A missing template is built by the first start that needs it under `<key>.lock`:
     `initdb` into `.build-<key>-*`, the marker written and flushed, a digest of every entry of
     the cluster (path, kind, mode, size, inode, link count, modification and change time), the
     recipe checked again, the record written and flushed, then on macOS one `F_FULLFSYNC` (the
-    one flush of the drive's cache per template, off the path of later starts; on Linux
-    `fsync` already is that), then one rename to `<key>`. A template that could not be fully
-    flushed records the boot it was built in (`kern.bootsessionuuid`,
-    `/proc/sys/kernel/random/boot_id`) and is built again after a restart; with no boot id it
-    is not kept. Only a build whose `pg_control` layout is verified (below) and whose
+    one flush of the drive's cache per template, off the path of later starts; on Linux `fsync`
+    already is that), then one rename to `<key>`. A template that could not be fully flushed
+    records the boot it was built in (`kern.bootsessionuuid`, `/proc/sys/kernel/random/boot_id`)
+    and is built again after a restart; with no boot id it is not kept. No template is built for
+    a major release whose layout is not verified (below); its data directories are made by
+    `initdb`. A build the identity edit would refuse (an unverified `pg_control_version`, a
+    checksum that does not match, a WAL segment without the layout's magic, long header or
+    identifier; checked before anything else) is discarded, never published and never used: it
+    may be damaged, so `initdb` runs at the data directory. Only a build that passes and whose
     `postgresql.conf` has the values `initdb` picks on an unconstrained machine
-    (`max_connections = 100`, `shared_buffers = 128MB`, checked on 17 and 18) is published.
-    Any other build is renamed to the data directory being made and used for it alone, and a
-    later start tries again. Other starts wait for the lock (up to 60 seconds, then run
-    `initdb` themselves) and clone the result. Only a complete build is renamed into place;
-    the next builder removes what one that died left, and a template whose record names
-    another recipe is replaced. If the build's `initdb` fails (the template's volume is full,
-    or `templates/` was removed), the failed build is discarded and `initdb` runs once at the
-    data directory; if that fails too, both errors are reported.
+    (`max_connections = 100`, `shared_buffers = 128MB`, checked on 17 and 18) is published; a
+    build that passes with other values is renamed to the data directory being made and used for
+    it alone, and a later start tries again. Other starts wait for the lock (up to 60 seconds,
+    then run `initdb` themselves) and clone the result. Only a complete build is renamed into
+    place; the next builder removes what one that died left, and a template whose record names
+    another recipe is replaced. If the build's `initdb` fails (the template's volume is full, or
+    `templates/` was removed), the failed build is discarded and `initdb` runs once at the data
+    directory; if that fails too, both errors are reported.
   - *Clone.* `clonefile` of the directory on macOS, and nothing else: on another volume, or a
-    filesystem that cannot clone (HFS+), `initdb` runs at the data directory, since a copy
-    saves little and would need every file flushed. On Linux `FICLONE` per file (Btrfs, XFS),
-    else a plain copy, then `syncfs`; the Linux path has been type-checked, not run. Stack never
-    starts a server on a template. After each clone the template's digest is taken again and
-    must be the recorded one: any write, chmod, link, rename or new entry since the build
-    changes some change time, which cannot be set back, so the clone is of what was built;
-    otherwise the clone is discarded, the template removed and `initdb` runs. On a filesystem
-    with whole-second times a template is cloned only once 2 seconds old (its builder
-    excepted). Clones refresh `used` without the lock.
+    filesystem that cannot clone (HFS+), `initdb` runs at the data directory, since a copy saves
+    little and would need every file flushed. On Linux `FICLONE` per file (Btrfs, XFS), else a
+    plain copy, then `syncfs`; the Linux path has been type-checked, not run. Stack never starts
+    a server on a template. After each clone the template's digest is taken again and must be
+    the recorded one: any write, chmod, link, rename or new entry since the build changes some
+    change time, which cannot be set back, so the clone is of what was built; otherwise the
+    clone is discarded, Stack tries to retire the template (see *Retiring*) and `initdb` runs.
+    The record a start clones by and the directory it clones are one generation: a start without the lock
+    takes the directory's identity before and after reading the record and, if a rebuild
+    replaced it meanwhile, reads it again under the lock. On a filesystem with whole-second
+    times a template is cloned only once 2 seconds old (its builder excepted). Clones refresh
+    `used` without the lock.
   - *Identity.* `initdb` gives each cluster a random system identifier (in `pg_control` and in
     the long header of each WAL segment) and a mock authentication nonce; clones would share
     them. Physical replication, `pg_rewind`, WAL archives and backup tools such as pgBackRest
-    tell clusters apart by that identifier, and `pg_resetwal` cannot set it. So each clone
-    gets a new identifier made as `initdb` makes it (seconds, microseconds, process id) and a
-    new nonce. The edit is made only for a `pg_control_version` whose layout was verified with
+    tell clusters apart by that identifier, and `pg_resetwal` cannot set it. So each clone gets
+    a new identifier made as `initdb` makes it (seconds, microseconds, process id) and a new
+    nonce. The edit is made only for a `pg_control_version` whose layout was verified with
     `offsetof` against the installed server headers: 1700 (17.6, 17.11, 17.12: nonce at 256,
-    checksum at 288, WAL page magic `0xD116`) and 1800 (18.6, 18.7: nonce at 257, three bytes
-    of padding, checksum at 292, magic `0xD118`); the identifier is at 0 in `pg_control` and at
-    24 in a long WAL page header in both. The stored CRC-32C must match at the layout's offset,
-    and every WAL segment must carry the layout's magic, the long-header flag and the old
+    checksum at 288, WAL page magic `0xD116`) and 1800 (18.6, 18.7: nonce at 257, three bytes of
+    padding, checksum at 292, magic `0xD118`); the identifier is at 0 in `pg_control` and at 24
+    in a long WAL page header in both. The stored CRC-32C must match at the layout's offset, and
+    every WAL segment must carry the layout's magic, the long-header flag and the old
     identifier, before anything is written; exactly the identifier, the nonce and the checksum
-    change, and the two files are flushed before the rename. Any other version, a mismatch, or
-    a big-endian target (Postgres stores these in native order; only little-endian is
-    verified) runs `initdb`. Nothing else in a never-started cluster names it or its path:
-    `-D` gives the data directory, `postmaster.pid` and `postmaster.opts` appear only once a
-    server runs, and there are no tablespaces or logs. What still comes from the template: file
-    times and the time of its checkpoint in `pg_control`.
+    change, and the two files are flushed before the rename. Any other version, a mismatch, or a
+    big-endian target (Postgres stores these in native order; only little-endian is verified)
+    runs `initdb`. When the edit fails on a clone for any reason (contents it refuses, damage to
+    the clone since it was made, a full disk), the clone is discarded; if the
+    template's lock can be taken, the template itself is then checked as the edit checks a copy
+    (read-only, under that lock), kept if it passes and, if it is refused, Stack tries to
+    retire it (see *Retiring*); then `initdb` runs. Nothing else in a never-started cluster
+    names it or its path: `-D` gives the data directory, `postmaster.pid` and `postmaster.opts`
+    appear only once a server runs, and there are no tablespaces or logs. What still comes from
+    the template: file times and the time of its checkpoint in `pg_control`.
+  - *Retiring.* A template that changed since its build, or that the edit refuses, is never
+    used for a data directory: every start that clones it checks it and runs `initdb`. Before
+    that `initdb`, the start tries to remove the template: it waits up to 5 seconds for the
+    template's lock (so a held lock delays the start's `initdb` by up to that long), and under
+    the lock removes it only while its record is still the one the clone was made by (a rebuilt
+    template's record differs), by renaming it aside in one step. The service's log says what
+    happened, also when that `initdb` fails: removed; kept because the template itself passes;
+    the lock could not be taken within the wait, so nothing was checked or removed; already
+    replaced or gone, so nothing was removed; or left in place because the lock could not be
+    opened, or the record could not be read, or the template could not be checked or renamed,
+    with the error. A later start that clones a template still there tries again.
   - *Collection.* `stack gc` removes a template whose install's inputs changed or are gone, one
-    with an unreadable record or another format, one not fully flushed from an earlier boot,
-    one no clone was made from in 14 days (`used`), and builds or removals a process left. Each
-    is judged under its recipe's lock, taken without waiting, and only while the directory is
-    still the one listed; one locked by a build is skipped. `gc --dry-run` takes and releases
-    the same locks and lists exactly what a pass would remove, under `templates`. A clone that
+    with an unreadable record or another format, one not fully flushed from an earlier boot, one
+    no clone was made from in 14 days (`used`), and builds or removals a process left. Each is
+    judged under its recipe's lock, taken without waiting, and only while the directory is still
+    the one listed; one locked by a build is skipped. `gc --dry-run` takes and releases the same
+    locks and lists, under `templates`, what a pass would try to remove; a pass can still leave
+    one in place (a rename that fails), and does not list templates in its result. A clone that
     refreshes `used` after `gc` judged a template may still see it removed: its own copy is
-    complete and checked by then, and the next start builds again. Lock files stay. Removing
-    the templates directory by hand is safe only while no build runs (a lock file unlinked under
-    a builder lets a second builder in).
+    complete and checked by then, and the next start builds again. Lock files stay. Removing the
+    templates directory by hand is safe only while no build runs (a lock file unlinked under a
+    builder lets a second builder in).
   - *Leftovers.* A `stack __preset` killed while making a data directory can leave a
     `.stack-init-*` staging directory beside it, possibly with the identity half edited. It is
     never moved into place (Postgres would refuse it), and nothing removes it; this was already

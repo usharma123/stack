@@ -19,16 +19,20 @@
 //!   bound to the boot it was built in). Others wait for the lock (up to [`BUILD_WAIT`]) and clone
 //!   the result. A build that died is never used: only a complete one is renamed into place, and
 //!   the next builder removes what a dead one left.
-//! - **Only a template like any other.** A build is published only when Stack knows how to give
-//!   its copies their own identity (its `pg_control` layout is in [`LAYOUTS`]) and `initdb` chose
-//!   the settings it chooses on an unconstrained machine ([`UNCONSTRAINED`]): one that probed a
-//!   machine short of shared memory is used for that one data directory and not kept.
+//! - **Only a template like any other.** No template is built for a release whose `pg_control`
+//!   layout is not in [`LAYOUTS`]. A build is published only when the identity edit accepts it
+//!   ([`check_editable`]: a verified layout, a matching checksum, WAL segments of that layout and
+//!   cluster) and `initdb` chose the settings it chooses on an unconstrained machine
+//!   ([`UNCONSTRAINED`]). A build the edit refuses may be damaged: it is discarded, and the data
+//!   directory is initialised by `initdb`. One that probed a machine short of shared memory is
+//!   used for that one data directory and not kept.
 //! - **Never changed unseen.** Stack never starts a server on a template. After each clone the
 //!   template's digest is taken again and must be the one recorded at build: any write, chmod,
 //!   link, rename or new file since then changes some entry's change time, which no one can set
 //!   back, so the clone is of what was built. On a filesystem with whole-second times, a template
 //!   is used only once its newest entry is [`SETTLE`] old. A template that fails the check is
-//!   removed and the data directory initialised by `initdb`.
+//!   never used: the data directory is initialised by `initdb` and the template retired (see
+//!   [`retire`]).
 //! - **Each clone its own cluster.** Postgres stamps a cluster with a random system identifier
 //!   at `initdb` (in `pg_control` and the long header of each WAL segment), and replication,
 //!   `pg_rewind`, WAL archives and backup tools tell clusters apart by it. A clone is given a
@@ -41,7 +45,9 @@
 //!   cloned (on macOS anything but `clonefile`), or a clone that cannot be told apart from its
 //!   template: the data directory is initialised by `initdb` as before, and the reason goes to
 //!   the service's log. A template build whose `initdb` fails is retried once at the data
-//!   directory.
+//!   directory. A template that the identity edit refuses (checked on the template itself when
+//!   a copy fails) or that changed since it was built is never used; the first start that can
+//!   take its lock tries to remove it, and the log says what became of it ([`retire`]).
 //!
 //! `stack gc` removes templates whose install changed or is gone, and templates no clone was
 //! made from in [`UNUSED`].
@@ -54,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Bumped whenever what a template holds, or how it is keyed or checked, changes.
-pub const FORMAT: &str = "stack-pg-template-2";
+pub const FORMAT: &str = "stack-pg-template-3";
 /// The arguments the preset runs `initdb` with, besides `-D`.
 pub const INITDB_ARGS: &[&str] = &["-U", "postgres", "--auth=trust"];
 /// The environment `initdb` reads that shapes what it writes: the cluster's locale and
@@ -65,6 +71,8 @@ const ENV: &[&str] = &["LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MO
 pub const BUILD_WAIT: Duration = Duration::from_secs(60);
 /// See the module documentation: an install or template entry must be at least this old.
 pub const SETTLE: Duration = crate::provider::env_cache::SETTLE;
+/// How long a start whose copy of a template failed waits for the template's lock to remove it.
+pub const RETIRE_WAIT: Duration = Duration::from_secs(5);
 /// `stack gc` removes a template no data directory was made from in this long.
 pub const UNUSED: Duration = Duration::from_secs(14 * 24 * 3600);
 /// What `initdb` writes in `postgresql.conf` when its probes are not constrained by the machine
@@ -190,30 +198,33 @@ impl Fingerprint {
 }
 
 /// The inputs of `initdb` in the install at `install`, by metadata, without walking it all: the
-/// install directory, `bin`, `lib`, `lib/postgresql` when present, the share directory (the one
-/// holding `postgres.bki`: `share` or `share/postgresql`), its `extension`, `timezonesets` and
-/// `tsearch_data`, each with every entry directly inside, and the `plpgsql` module `initdb`
+/// install directory, `bin`, `lib`, `lib/postgresql` when present, each share directory (one
+/// holding `postgres.bki`: `share`, `share/postgresql` or both), its `extension`, `timezonesets`
+/// and `tsearch_data`, each with every entry directly inside, and the `plpgsql` module `initdb`
 /// loads. A symbolic link among them is recorded with its text and what it leads to. Returns a
 /// digest and the latest change time among them, or why there is none (no share directory,
 /// no `plpgsql` module, a link that dangles or loops, anything unreadable).
 pub fn install_snapshot(install: &Path) -> Result<(String, Option<SystemTime>), String> {
     let mut print = Fingerprint::default();
-    let share_rel = ["share", "share/postgresql"]
-        .into_iter()
-        .find(|rel| install.join(rel).join("postgres.bki").is_file())
-        .ok_or_else(|| format!("no postgres.bki in {0}/share or {0}/share/postgresql", install.display()))?;
-    let share = install.join(share_rel);
+    // Which one initdb reads is compiled into it: every one that could be is recorded.
+    let shares: Vec<&str> = ["share", "share/postgresql"].into_iter().filter(|rel| install.join(rel).join("postgres.bki").is_file()).collect();
+    if shares.is_empty() {
+        return Err(format!("no postgres.bki in {0}/share or {0}/share/postgresql", install.display()));
+    }
     print.listing(".", install)?;
     print.listing("bin", &install.join("bin"))?;
     print.listing("lib", &install.join("lib"))?;
     if install.join("lib/postgresql").exists() {
         print.listing("lib/postgresql", &install.join("lib/postgresql"))?;
     }
-    print.listing(share_rel, &share)?;
-    print.listing(&format!("{share_rel}/extension"), &share.join("extension"))?;
-    for sub in ["timezonesets", "tsearch_data"] {
-        if share.join(sub).exists() {
-            print.listing(&format!("{share_rel}/{sub}"), &share.join(sub))?;
+    for share_rel in shares {
+        let share = install.join(share_rel);
+        print.listing(share_rel, &share)?;
+        print.listing(&format!("{share_rel}/extension"), &share.join("extension"))?;
+        for sub in ["timezonesets", "tsearch_data"] {
+            if share.join(sub).exists() {
+                print.listing(&format!("{share_rel}/{sub}"), &share.join(sub))?;
+            }
         }
     }
     let module = ["lib/postgresql", "lib"]
@@ -240,34 +251,63 @@ fn uname() -> String {
     }
 }
 
+/// Record in `print` every `libc.so.6`, `ld-musl-*` loader and `libc.musl-*` directly in each of
+/// `bases` or in one of their `*-linux-*` multiarch directories (`x86_64-linux-gnu`), as
+/// [`Fingerprint::entry`] does; how many. A directory that cannot be listed (other than one
+/// that does not exist) is an error, as a link that dangles is.
+#[cfg(any(target_os = "linux", test))]
+fn c_libraries(print: &mut Fingerprint, bases: &[&Path]) -> Result<usize, String> {
+    let is_libc = |name: &str| name == "libc.so.6" || name.starts_with("ld-musl-") || name.starts_with("libc.musl-");
+    // A directory that is not there holds nothing; one that cannot be listed may hold the C
+    // library, so it makes no key.
+    let sorted = |dir: &Path| -> Result<Vec<String>, String> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot list {}: {e}", dir.display())),
+        };
+        let mut names = entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned())).collect::<Result<Vec<_>, _>>().map_err(|e| format!("cannot list {}: {e}", dir.display()))?;
+        names.sort();
+        Ok(names)
+    };
+    // Whether `path` (followed) is a directory: not there is not one; unreadable is no key.
+    let is_dir = |path: &Path| match fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut found = 0;
+    for base in bases {
+        for name in sorted(base)? {
+            let path = base.join(&name);
+            if is_libc(&name) {
+                print.entry(&path.display().to_string(), &path)?;
+                found += 1;
+            } else if name.contains("-linux-") && is_dir(&path)? {
+                for lib in sorted(&path)?.into_iter().filter(|n| is_libc(n)) {
+                    let lib = path.join(lib);
+                    print.entry(&lib.display().to_string(), &lib)?;
+                    found += 1;
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The operating system release, and on Linux the system C library and locale data, whose
 /// collation versions and locales `initdb` records. The C library is identified from outside
-/// Stack's own binary (which may be static musl): every `libc.so.6` and `ld-musl-*` loader in
-/// the standard library directories, by resolved path and file identity, and the locale
-/// archive. None found on Linux is no key. A server linked against a C library elsewhere (its
-/// own `RPATH`) is not covered.
+/// Stack's own binary (which may be static musl): every `libc.so.6`, `ld-musl-*` loader and
+/// `libc.musl-*` in the standard library directories and their `*-linux-*` multiarch
+/// directories ([`c_libraries`]), by resolved path and file identity, and the locale archive.
+/// None found on Linux is no key. A server linked against a C library elsewhere (its own
+/// `RPATH`) is not covered.
 fn system() -> Result<String, String> {
     let mut out = uname();
     #[cfg(target_os = "linux")]
     {
         let mut print = Fingerprint::default();
-        let mut found = 0;
-        let is_libc = |name: &str| name == "libc.so.6" || name.starts_with("ld-musl-") || name.starts_with("libc.musl-");
-        for base in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
-            let Ok(entries) = fs::read_dir(base) else { continue };
-            let mut names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-            names.sort();
-            for name in names {
-                let path = Path::new(base).join(&name);
-                if is_libc(&name) {
-                    print.entry(&path.display().to_string(), &path)?;
-                    found += 1;
-                } else if name.contains("-linux-") && path.join("libc.so.6").exists() {
-                    print.entry(&path.join("libc.so.6").display().to_string(), &path.join("libc.so.6"))?;
-                    found += 1;
-                }
-            }
-        }
+        let found = c_libraries(&mut print, &[Path::new("/lib"), Path::new("/lib64"), Path::new("/usr/lib"), Path::new("/usr/lib64")])?;
         if found == 0 {
             return Err("cannot find the system C library (libc.so.6 or ld-musl) in /lib or /usr/lib".into());
         }
@@ -439,11 +479,108 @@ fn remove_tree(path: &Path) {
 }
 
 /// Move `dir` out of the way in one step (so no one clones a half-removed template), then
-/// remove it.
-fn discard(root: &Path, key: &str, dir: &Path) {
+/// remove it. Once this returns `Ok` nothing is at `dir`; what was moved aside and could not be
+/// removed is left for the next builder or `stack gc`.
+fn discard(root: &Path, key: &str, dir: &Path) -> std::io::Result<()> {
     let aside = unique(root, &format!(".stale-{key}-"));
-    if fs::rename(dir, &aside).is_ok() {
-        remove_tree(&aside);
+    fs::rename(dir, &aside)?;
+    remove_tree(&aside);
+    Ok(())
+}
+
+fn identity(dir: &Path) -> Option<(u64, u64)> {
+    #[cfg(test)]
+    tests::between_reads(0);
+    fs::symlink_metadata(dir).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// The record of the template at `dir` for `recipe` (see [`read_record`]), read while that
+/// directory stayed the same one (its identity before and after the read agree), so it is not
+/// the record of a template a rebuild replaced meanwhile. `None` when there is no such template
+/// or it was replaced while being read.
+fn generation(dir: &Path, recipe: &Recipe) -> Option<Record> {
+    unmoved(
+        || identity(dir),
+        || {
+            #[cfg(test)]
+            tests::between_reads(1);
+            let record = read_record(dir, recipe);
+            #[cfg(test)]
+            tests::between_reads(2);
+            record
+        },
+    )
+}
+
+/// What `read` gives, if `look` gave the same thing before it and after it: `look` runs first,
+/// then `read`, then `look` again, in that order and no other, so that whatever `read` saw
+/// belongs to what both looks saw.
+fn unmoved<I: PartialEq, R>(look: impl Fn() -> Option<I>, read: impl FnOnce() -> Option<R>) -> Option<R> {
+    let before = look()?;
+    let read = read()?;
+    (look()? == before).then_some(read)
+}
+
+/// What became of a template a failed copy said must go.
+#[derive(Debug, PartialEq)]
+enum Retired {
+    Removed,
+    /// The template itself passes the identity edit's check: only the copy was at fault.
+    Kept,
+    /// Its lock could not be taken within the wait: nothing was checked or removed.
+    LockHeld,
+    /// The directory is gone, or holds another template (a different record).
+    Replaced,
+    /// The lock could not be taken, or the template could not be read, checked or moved aside.
+    Failed(String),
+}
+
+impl Retired {
+    /// For the log, after "the template in <dir> ...".
+    fn says(&self) -> String {
+        match self {
+            Self::Removed => "it was removed".into(),
+            Self::Kept => "the template itself passes the check, so it was kept and only the copy discarded".into(),
+            Self::LockHeld => "its lock could not be taken within the wait, so nothing was checked or removed; a later start that copies it tries again".into(),
+            Self::Replaced => "it had already been replaced or removed, so nothing was removed".into(),
+            Self::Failed(e) => format!("it was left in place: {e}; a later start that copies it tries again"),
+        }
+    }
+}
+
+/// Try to remove the template at `dir`, under its lock (`held`, or taken waiting at most
+/// `wait`), and only while it still holds the record `copied` was made by (a rebuilt template's
+/// record differs: its digest names other inodes). With `check`, the template is first checked
+/// as the identity edit checks a copy ([`check_editable`], read-only), and kept if it passes.
+fn retire(root: &Path, key: &str, dir: &Path, copied: &Record, check: bool, held: Option<crate::state::FileLock>, wait: Duration) -> Retired {
+    let _guard = match held {
+        Some(held) => held,
+        None => match lock(root, key, wait) {
+            Ok(lock) => lock,
+            Err(LockError::Held(_)) => return Retired::LockHeld,
+            Err(LockError::Failed(e)) => return Retired::Failed(e),
+        },
+    };
+    let bytes = match fs::read(dir.join(RECORD)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) => return Retired::Replaced,
+        Err(e) => return Retired::Failed(format!("cannot read its record: {e}")),
+    };
+    match serde_json::from_slice::<Record>(&bytes) {
+        Ok(record) if record == *copied => {}
+        Ok(_) => return Retired::Replaced,
+        Err(e) => return Retired::Failed(format!("cannot read its record: {e}")),
+    }
+    if check {
+        match check_editable(&dir.join("data")) {
+            Ok(()) => return Retired::Kept,
+            Err(e) if refused(&e) => {}
+            Err(e) => return Retired::Failed(format!("cannot check it: {e}")),
+        }
+    }
+    match discard(root, key, dir) {
+        Ok(()) => Retired::Removed,
+        Err(e) => Retired::Failed(format!("cannot move it aside: {e}")),
     }
 }
 
@@ -459,35 +596,43 @@ fn read_record(dir: &Path, recipe: &Recipe) -> Option<Record> {
     (record.format == FORMAT && record.recipe == recipe.text && durable).then_some(record)
 }
 
+/// Why the lock was not taken.
+enum LockError {
+    /// Someone held it for the whole wait.
+    Held(String),
+    /// It could not be opened or locked.
+    Failed(String),
+}
+
+impl From<LockError> for Failure {
+    fn from(e: LockError) -> Self {
+        match e {
+            LockError::Held(why) | LockError::Failed(why) => fallback(why),
+        }
+    }
+}
+
 /// The lock serialising builds of one template; held until dropped.
-fn lock(root: &Path, key: &str, wait: Duration) -> Result<crate::state::FileLock, Failure> {
+fn lock(root: &Path, key: &str, wait: Duration) -> Result<crate::state::FileLock, LockError> {
     let path = root.join(format!("{key}.lock"));
     let until = Instant::now() + wait;
     let mut pause = Duration::from_millis(2);
     loop {
         match crate::state::FileLock::try_acquire(&path) {
             Ok(Some(lock)) => return Ok(lock),
-            Ok(None) if Instant::now() >= until => return Err(fallback(format!("another first start has held {} for {} ms", path.display(), wait.as_millis()))),
+            Ok(None) if Instant::now() >= until => return Err(LockError::Held(format!("another first start has held {} for {} ms", path.display(), wait.as_millis()))),
             Ok(None) => {
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(Duration::from_millis(25));
             }
-            Err(e) => return Err(fallback(format!("cannot lock {}: {}", path.display(), e.message))),
+            Err(e) => return Err(LockError::Failed(format!("cannot lock {}: {}", path.display(), e.message))),
         }
     }
 }
 
-/// Why the cluster `initdb` wrote in `data` cannot be a template, if it cannot: a `pg_control`
-/// layout [`distinguish`] does not know, or settings `initdb` chose on a constrained machine.
+/// Why the cluster `initdb` wrote in `data`, which [`distinguish`] can edit, is still not kept as
+/// a template, if it is not: settings `initdb` chose on a constrained machine.
 fn unpublishable(data: &Path) -> Option<String> {
-    let mut control = vec![0u8; CONTROL_SAFE];
-    let read = fs::File::open(data.join("global").join("pg_control")).and_then(|mut f| f.read_exact(&mut control));
-    if let Err(e) = read {
-        return Some(format!("cannot read its pg_control: {e}"));
-    }
-    if let Err(why) = layout(&control) {
-        return Some(why);
-    }
     let conf = match fs::read_to_string(data.join("postgresql.conf")) {
         Ok(conf) => conf,
         Err(e) => return Some(format!("cannot read its postgresql.conf: {e}")),
@@ -535,9 +680,11 @@ enum Built {
 }
 
 /// Build the template for `recipe` under its lock (the caller holds it): `initdb` into a
-/// build directory, the flushed marker, then either the digest, the record, a full flush and one
+/// build directory, the flushed marker, the check that its copies can be given their own
+/// identity ([`check_editable`]), then either the digest, the record, a full flush and one
 /// rename into place, or (see [`unpublishable`]) the build moved to `target` for that data
-/// directory alone.
+/// directory alone. A build that fails the check is discarded, never moved to `target` and
+/// never published: the caller runs `initdb` at the data directory.
 fn build(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Result<Built, Failure> {
     let key = &recipe.key;
     let dir = root.join(key);
@@ -549,7 +696,7 @@ fn build(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Pat
         }
     }
     if fs::symlink_metadata(&dir).is_ok() {
-        discard(root, key, &dir);
+        discard(root, key, &dir).map_err(|e| fallback(format!("cannot move the old template in {} aside: {e}", dir.display())))?;
     }
     let staging = unique(root, &format!(".build-{key}-"));
     fs::DirBuilder::new().mode(0o700).create(&staging).map_err(|e| fallback(format!("cannot create {}: {e}", staging.display())))?;
@@ -557,6 +704,9 @@ fn build(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Pat
         let data = staging.join("data");
         run_initdb(initdb, &data).map_err(Failure::Initdb)?;
         write_marker(&data, marker).map_err(|e| fallback(format!("cannot write the marker: {e}")))?;
+        // A pg_control or WAL segment the identity edit refuses may be a damaged cluster: neither
+        // a template nor this data directory.
+        check_editable(&data).map_err(|e| fallback(format!("the template build cannot be given its copies' own identity, so it was discarded: {e}")))?;
         if let Some(why) = unpublishable(&data) {
             fs::rename(&data, target).map_err(|e| fallback(format!("{why}; and cannot move the build to the data directory: {e}")))?;
             return Ok(Built::Private(why));
@@ -608,11 +758,13 @@ fn build(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Pat
 /// template, building the template first when there is none. Returns what was done, for the
 /// log.
 pub fn initialise(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Result<String, Failure> {
-    initialise_waiting(root, recipe, initdb, marker, target, env, BUILD_WAIT)
+    initialise_waiting(root, recipe, initdb, marker, target, env, (BUILD_WAIT, RETIRE_WAIT))
 }
 
-/// [`initialise`], waiting at most `wait` for another start building the template.
-fn initialise_waiting(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Path, env: &dyn Fn(&str) -> Option<OsString>, wait: Duration) -> Result<String, Failure> {
+/// [`initialise`], waiting at most `waits.0` for another start building the template and
+/// `waits.1` for its lock to remove a template whose copy failed.
+fn initialise_waiting(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str, target: &Path, env: &dyn Fn(&str) -> Option<OsString>, waits: (Duration, Duration)) -> Result<String, Failure> {
+    let (wait, retire_wait) = waits;
     let started = Instant::now();
     if !recipe.settled() {
         return Err(fallback(format!("the Postgres install in {} changed in the last {}s", recipe.install.display(), SETTLE.as_secs())));
@@ -620,12 +772,13 @@ fn initialise_waiting(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str,
     let dir = root.join(&recipe.key);
     let mut built = false;
     let mut held = None;
-    let record = match read_record(&dir, recipe) {
+    // Without the lock, a template being replaced as it is read is read again under the lock.
+    let record = match generation(&dir, recipe) {
         Some(record) => record,
         None => {
             fs::DirBuilder::new().recursive(true).mode(0o700).create(root).map_err(|e| fallback(format!("cannot create {}: {e}", root.display())))?;
             held = Some(lock(root, &recipe.key, wait)?);
-            match read_record(&dir, recipe) {
+            match generation(&dir, recipe) {
                 // Built while this one waited.
                 Some(record) => record,
                 None => match build(root, recipe, initdb, marker, target, env)? {
@@ -643,21 +796,15 @@ fn initialise_waiting(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str,
     if record.coarse && !built && SystemTime::now().duration_since(recent).map_or(true, |age| age < SETTLE) {
         return Err(fallback(format!("the template in {} is on a filesystem with whole-second times and was built in the last {}s", dir.display(), SETTLE.as_secs())));
     }
-    let identity = fs::symlink_metadata(&dir).map(|m| (m.dev(), m.ino())).ok();
     let cloned = clone_tree(&dir.join("data"), target);
     // The template must still be exactly what was built: then the clone, made since, is too.
+    // (A template replaced since its record was read fails this too: the digest names inodes.
+    // `retire` then leaves the new one alone.)
     let unchanged = tree_digest(&dir.join("data")).is_ok_and(|(digest, ..)| digest == record.digest);
     if !unchanged {
         let _ = fs::remove_dir_all(target);
-        // Removed under the lock, and only while it is still the directory cloned from.
-        let guard = match held.take() {
-            Some(held) => Some(held),
-            None => lock(root, &recipe.key, Duration::from_secs(5)).ok(),
-        };
-        if guard.is_some() && fs::symlink_metadata(&dir).map(|m| (m.dev(), m.ino())).ok() == identity {
-            discard(root, &recipe.key, &dir);
-        }
-        return Err(fallback(format!("the template in {} changed since it was built; it was removed", dir.display())));
+        let retired = retire(root, &recipe.key, &dir, &record, false, held.take(), retire_wait);
+        return Err(fallback(format!("the template in {} changed since it was built; {}", dir.display(), retired.says())));
     }
     let how = match cloned {
         Ok(how) => how,
@@ -668,9 +815,13 @@ fn initialise_waiting(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str,
     };
     let system_identifier = match distinguish(target) {
         Ok(id) => id,
+        // The fault may be the copy's (damaged since the clone, a full disk) or the template's
+        // (every copy of it would be refused): the template itself is checked, and goes only if
+        // it is refused too.
         Err(e) => {
             let _ = fs::remove_dir_all(target);
-            return Err(fallback(format!("cannot give the copy of {} its own identity: {e}", dir.display())));
+            let retired = retire(root, &recipe.key, &dir, &record, true, held.take(), retire_wait);
+            return Err(fallback(format!("cannot give the copy of the template in {} its own identity ({e}); {}", dir.display(), retired.says())));
         }
     };
     // When a data directory was last made from it, for `stack gc`. Best effort, without the
@@ -689,11 +840,15 @@ fn initialise_waiting(root: &Path, recipe: &Recipe, initdb: &Path, marker: &str,
 /// `marker`, as the service's `env` finds Postgres: from a template under `templates` when one
 /// can be used (see [`initialise`]), else by `initdb` at `target`, which also runs once more
 /// when the template's own `initdb` failed (both errors are reported if it fails too). Returns
-/// what to say in the service's log.
+/// what to say in the service's log. A release without a verified [`Layout`] (by the major in
+/// `marker`, `postgres:<major>`) makes no template: its build could never be published.
 pub fn make(templates: Option<&Path>, marker: &str, target: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Result<Vec<String>, String> {
     let initdb = env("PATH").and_then(|path| find(&path, "initdb"));
+    let major = marker.rsplit_once(':').map_or(marker, |(_, m)| m);
+    let verified = LAYOUTS.iter().any(|l| major.parse() == Ok(l.major));
     let attempt = match (templates, &initdb) {
         (None, _) => Err(Failure::Fallback(String::new())),
+        (Some(_), _) if !verified => Err(fallback(format!("no template for Postgres {major}: Stack has not verified its pg_control layout"))),
         (Some(_), None) => Err(fallback("initdb is not found on PATH by an absolute directory")),
         (Some(root), Some(initdb)) => Recipe::new(initdb, env).map_err(Failure::Fallback).and_then(|recipe| initialise(root, &recipe, initdb, marker, target, env)),
     };
@@ -709,7 +864,9 @@ pub fn make(templates: Option<&Path>, marker: &str, target: &Path, env: &dyn Fn(
     let made = run_initdb(&program, target).and_then(|()| write_marker(target, marker).map_err(|e| format!("cannot write {}: {e}", target.display())));
     match (made, earlier) {
         (Ok(()), _) => Ok(notes),
-        (Err(e), Some(first)) => Err(format!("the template's initdb failed ({first}), and so did initdb at the data directory ({e})")),
+        (Err(e), Some(first)) => Err(format!("the template's initdb failed ({first}), and the data directory could not be made either ({e})")),
+        // Why the template was not used, and what became of it, is still said.
+        (Err(e), None) if !notes.is_empty() => Err(format!("{}; and the data directory could not be made: {e}", notes.join("; "))),
         (Err(e), None) => Err(e),
     }
 }
@@ -807,6 +964,8 @@ pub const NONCE_LEN: usize = 32;
 /// A `pg_control` and WAL layout [`distinguish`] may edit.
 #[derive(Debug, PartialEq)]
 pub struct Layout {
+    /// The Postgres major release.
+    pub major: u32,
     /// `PG_CONTROL_VERSION`, at offset 8 of `pg_control`.
     pub control_version: u32,
     /// `XLOG_PAGE_MAGIC`, the first two bytes of every WAL page.
@@ -823,8 +982,8 @@ pub struct Layout {
 /// bytes of padding precede the checksum). The system identifier is at 0 in `pg_control` and at
 /// 24 in a long WAL page header in both. Anything else is not edited: `initdb` runs.
 pub const LAYOUTS: &[Layout] = &[
-    Layout { control_version: 1700, wal_magic: 0xD116, nonce: 256, crc: 288 },
-    Layout { control_version: 1800, wal_magic: 0xD118, nonce: 257, crc: 292 },
+    Layout { major: 17, control_version: 1700, wal_magic: 0xD116, nonce: 256, crc: 288 },
+    Layout { major: 18, control_version: 1800, wal_magic: 0xD118, nonce: 257, crc: 292 },
 ];
 
 /// CRC-32C (Castagnoli), as Postgres checksums `pg_control`.
@@ -876,25 +1035,55 @@ fn flush(file: &fs::File) -> std::io::Result<()> {
 /// and mock authentication nonce, as `initdb` would have (see [`distinguish_with`]).
 pub fn distinguish(data: &Path) -> std::io::Result<u64> {
     let mut nonce = [0u8; NONCE_LEN];
-    fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut nonce)).map_err(|e| std::io::Error::other(format!("cannot read /dev/urandom: {e}")))?;
+    #[cfg(test)]
+    tests::before_edit(data);
     distinguish_with(data, new_system_identifier(), nonce)
 }
 
-/// Write `id` and `nonce` into the cluster in `data`: in `pg_control` at the offsets of its
-/// verified [`layout`] (its checksum recomputed; nothing else changes) and in the long header of
-/// every WAL segment, each of which must carry the layout's page magic and name the old
-/// identifier. Each changed file is flushed before this returns. Anything unexpected is an
-/// error before anything is written; the caller removes the copy on any error.
-pub fn distinguish_with(data: &Path, id: u64, nonce: [u8; NONCE_LEN]) -> std::io::Result<u64> {
+/// Whether `e`, from [`check_editable`], is the check refusing the cluster's contents rather
+/// than trouble reading them.
+fn refused(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData
+}
+
+/// The files of the cluster in `data` that [`distinguish_with`] edits, opened and checked.
+struct Editable {
+    layout: &'static Layout,
+    control_file: fs::File,
+    control: Vec<u8>,
+    /// Every WAL segment, each with the layout's page magic, a long header and the cluster's
+    /// identifier.
+    headers: Vec<fs::File>,
+}
+
+/// Whether [`distinguish_with`] can edit the cluster in `data`: its `pg_control` has a verified
+/// [`layout`] with a matching checksum, and every WAL segment carries that layout's page magic
+/// and names the cluster. Nothing is written.
+fn check_editable(data: &Path) -> std::io::Result<()> {
+    editable(data, false).map(drop)
+}
+
+/// The cluster's contents refusing the edit are `InvalidData` (see [`refused`]): a layout or
+/// WAL header it does not accept, and a file or directory missing or too short.
+fn editable(data: &Path, write: bool) -> std::io::Result<Editable> {
+    let open = |path: &Path| fs::OpenOptions::new().read(true).write(write).open(path);
     let invalid = |what: String| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let content = |path: &Path| {
+        let path = path.to_path_buf();
+        move |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof => std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {e}", path.display())),
+            _ => e,
+        }
+    };
     let control_path = data.join("global").join("pg_control");
-    let mut control_file = fs::OpenOptions::new().read(true).write(true).open(&control_path)?;
+    let mut control_file = open(&control_path).map_err(content(&control_path))?;
     let mut control = vec![0u8; CONTROL_SAFE];
-    control_file.read_exact(&mut control)?;
+    control_file.read_exact(&mut control).map_err(content(&control_path))?;
     let layout = layout(&control).map_err(|why| invalid(format!("{}: {why}", control_path.display())))?;
     let old: [u8; 8] = control[..8].try_into().expect("8 bytes");
     let mut segments = Vec::new();
-    for entry in fs::read_dir(data.join("pg_wal"))? {
+    for entry in fs::read_dir(data.join("pg_wal")).map_err(content(&data.join("pg_wal")))? {
         let entry = entry?;
         let name = entry.file_name();
         let segment = name.len() == 24 && name.to_string_lossy().bytes().all(|b| b.is_ascii_hexdigit());
@@ -907,15 +1096,30 @@ pub fn distinguish_with(data: &Path, id: u64, nonce: [u8; NONCE_LEN]) -> std::io
     }
     let mut headers = Vec::new();
     for path in &segments {
-        let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = open(path).map_err(content(path))?;
         let mut header = [0u8; XLP_SYSID + 8];
-        file.read_exact(&mut header)?;
+        file.read_exact(&mut header).map_err(content(path))?;
         let magic = u16::from_le_bytes([header[0], header[1]]);
         let info = u16::from_le_bytes([header[2], header[3]]);
         if magic != layout.wal_magic || info & XLP_LONG_HEADER == 0 || header[XLP_SYSID..] != old {
             return Err(invalid(format!("{}: not a WAL segment of this cluster", path.display())));
         }
         headers.push(file);
+    }
+    Ok(Editable { layout, control_file, control, headers })
+}
+
+/// Write `id` and `nonce` into the cluster in `data`: in `pg_control` at the offsets of its
+/// verified [`layout`] (its checksum recomputed; nothing else changes) and in the long header of
+/// every WAL segment, each of which must carry the layout's page magic and name the old
+/// identifier (see [`check_editable`]). Each changed file is flushed before this returns.
+/// Anything unexpected is an error before anything is written; the caller removes the copy on
+/// any error.
+pub fn distinguish_with(data: &Path, id: u64, nonce: [u8; NONCE_LEN]) -> std::io::Result<u64> {
+    let Editable { layout, mut control_file, mut control, headers } = editable(data, true)?;
+    #[cfg(test)]
+    if tests::EDIT_WRITE_FAILS.with(|f| f.get()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::StorageFull, "No space left on device (injected)"));
     }
     control[..8].copy_from_slice(&id.to_le_bytes());
     control[layout.nonce..layout.nonce + NONCE_LEN].copy_from_slice(&nonce);
@@ -1015,8 +1219,8 @@ pub fn collect(state: &Path, dry_run: bool) -> Vec<Unused> {
         if !dry_run {
             if leftover {
                 remove_tree(&path);
-            } else {
-                discard(&root, &key, &path);
+            } else if discard(&root, &key, &path).is_err() {
+                continue;
             }
         }
         out.push(Unused { dir: path, reason, bytes });

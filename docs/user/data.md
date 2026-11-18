@@ -227,19 +227,26 @@ Stack's state directory, or on a filesystem that cannot clone, is made by `initd
   authentication nonce: Postgres stamps each cluster with a random identifier, which
   replication, `pg_rewind`, WAL archives and backup tools use to tell clusters apart, so Stack
   gives each copy a new one. It does this only for Postgres releases whose file layout it has
-  checked (17 and 18); for others every new database is made by `initdb`. File times and the
-  time of the cluster's first checkpoint come from when the template was built.
+  checked (17 and 18); for others every new database is made by `initdb`. A template build it
+  cannot do this for (a damaged control file, say) is never used or kept, and the database is
+  made by `initdb` instead. A published template it cannot do this for is never used either:
+  each new database that copies it first tries to remove it, waiting up to 5 seconds for the
+  template's lock, and the service's log says what came of that (removed, or not and why).
+  File times and the time of the cluster's first checkpoint come from when the template was
+  built.
 - A template is kept only when `initdb` was not held back by the machine (on a machine short of
   shared memory it lowers `max_connections`): such a build is used for that one database and
   the next new database tries again. A template is flushed to stable storage before it is
   used; one that could not be is used only until the machine restarts.
 - Stack never runs a server on a template, and checks after every copy that nothing changed it
-  since it was built; one that changed is removed and `initdb` runs instead. So does anything
-  else that goes wrong with a template, including a full disk where templates are kept; the
-  service's log (`stack logs postgres`) says which way a database was made.
-- `stack gc` removes templates whose release was reinstalled or removed, and ones unused for
-  14 days; `stack gc --dry-run` lists them. Deleting the directory by hand is safe while no
-  `stack up` is starting a new database: the next one builds what it needs.
+  since it was built; one that changed is never used, `initdb` runs instead, and Stack tries to
+  remove the template the same way. Anything else that goes wrong with a template, including
+  a full disk where templates are kept, also makes the database by `initdb`; the service's log
+  (`stack logs postgres`) says which way a database was made.
+- `stack gc` removes templates whose release was reinstalled or removed, and ones unused for 14
+  days; `stack gc --dry-run` lists the ones a pass would try to remove. Deleting the directory
+  by hand is safe while no `stack up` is starting a new database: the next one builds what it
+  needs.
 
 ## Errors
 
