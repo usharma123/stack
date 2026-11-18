@@ -302,13 +302,32 @@ fn write_json_with<T: Serialize>(path: &Path, value: &T, sync: bool) -> Result<(
     tmp.write_all(text.as_bytes())
         .map_err(|e| io_error(path.display(), e))?;
     if sync {
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| io_error(path.display(), e))?;
+        sync_file(tmp.as_file()).map_err(|e| io_error(path.display(), e))?;
     }
     tmp.persist(path)
         .map_err(|e| io_error(path.display(), e.error))?;
     Ok(())
+}
+
+/// Flush `file` to the disk, as a state write waits for it before replacing a record: `fsync`.
+/// On macOS that hands the data to the drive without also flushing the drive's own cache
+/// (`F_FULLFSYNC`, which `File::sync_all` asks for): a flush of the whole device, which many
+/// checkouts starting at once queue behind one another for, and which buys durability across
+/// power loss, which Stack does not claim (Postgres, too, uses `fsync` there by default).
+fn sync_file(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid open descriptor.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
 }
 
 #[cfg(target_os = "linux")]
