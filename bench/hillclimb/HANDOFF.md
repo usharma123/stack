@@ -1,7 +1,7 @@
 # Hill-climb handoff
 
-Written 2026-11-18. Work stopped here at the owner's request. Everything is committed and pushed
-on `fix/exercise-findings` (17 commits ahead of `main`, no pull request opened).
+Updated 2026-11-18, after step 3's review findings were fixed and approved. Everything is
+committed and pushed on `fix/exercise-findings` (no pull request opened).
 
 ## What this branch does
 
@@ -13,7 +13,7 @@ then measured and committed.
 | Earlier fixes: exit watcher, lock backoff, port registry, git exclude lookup, settled `up` | `8678fd3`..`28ffb43` | Reviewed once before this round; findings fixed |
 | 1. Supervisor built into Stack, replacing Pitchfork | `9afdcfd`, `2fe9681` | **Approved by both reviewers** |
 | 2. Exec hot path: kept mise answers, wire probes, unreadable-record recovery | `dae9b94`, `8190bfc`, `2fe46e3` | **Approved by both reviewers** |
-| 3. Fresh worktree: Postgres template clone, plain fsync, first-up trims | `692b572`, `d768ab5`, `45d3ff4` | **Changes requested, not approved** (see below) |
+| 3. Fresh worktree: Postgres template clone, plain fsync, first-up trims | `692b572`, `d768ab5`, `45d3ff4`, plus the review fixes after `5588514` | **Approved** after six review rounds (see below) |
 
 ## Measurements
 
@@ -21,16 +21,16 @@ then measured and committed.
 to `results.jsonl`; `python3 bench/hillclimb/chart.py` renders `hillclimb.html`. Milliseconds, one
 run per row on a machine that was not always quiet, so treat differences under about 20% as noise.
 
-| | 0.1.23 released | step 1 | step 2 | step 3 |
-|---|---|---|---|---|
-| `up`, two services, existing data | 2280 | 220 | 138 | 89 |
-| `down` | 2296 | 98 | 94 | 148 |
-| `restart` | 1968 | 187 | 256 | 219 |
-| six fresh worktrees `up` at once | 4262 | 1431 | 1440 | 315 |
-| `exec -- true` | 110 | 44 | 12 | 13 |
-| `status` | 58 | 37 | 8 | 8 |
-| `up`, already running | 600 | 101 | 13 | 36 |
-| 24 execs across six worktrees | 790 | 305 | 82 | 80 |
+| | 0.1.23 released | step 1 | step 2 | step 3 | step 3, reviewed |
+|---|---|---|---|---|---|
+| `up`, two services, existing data | 2280 | 220 | 138 | 89 | 83 |
+| `down` | 2296 | 98 | 94 | 148 | 108 |
+| `restart` | 1968 | 187 | 256 | 219 | 167 |
+| six fresh worktrees `up` at once | 4262 | 1431 | 1440 | 315 | 256 |
+| `exec -- true` | 110 | 44 | 12 | 13 | 12 |
+| `status` | 58 | 37 | 8 | 8 | 8 |
+| `up`, already running | 600 | 101 | 13 | 36 | 13 |
+| 24 execs across six worktrees | 790 | 305 | 82 | 80 | 69 |
 
 Two numbers in the step 3 column are not regressions according to the implementer's interleaved
 runs, and nobody else has checked that:
@@ -51,34 +51,18 @@ runs, and nobody else has checked that:
 
 ## Open items, most important first
 
-1. **Step 3 is not approved: one reviewer re-checked its fixes and requests changes.** That
-   verification finished after the work was stopped; the second reviewer never ran. Its findings,
-   none of them fixed:
-   - **Must fix, reproduced with the release binary.** After corrupting byte 292 of a freshly
-     built Postgres 18 template's `pg_control`, Stack logged the checksum mismatch and still
-     installed that cluster as the checkout's data directory (`pg_controldata` warns its results
-     are untrustworthy). A cluster with an unknown control-file version also reached the checkout.
-     A wrong WAL magic correctly ran `initdb` but left the unusable template published.
-     See `src/pgtemplate.rs` around line 560: a build whose layout check fails must not be used as
-     the data directory and must not be published.
-   - **Must fix, by reading.** If both `<install>/share` and `<install>/share/postgresql` hold
-     `postgres.bki`, Stack fingerprints the first; an in-place edit under the other can leave the
-     key unchanged (`src/pgtemplate.rs` around line 199).
-   - **Should fix, by reading.** In Linux multiarch library directories only `libc.so.6` is looked
-     up, so a replaced `ld-musl-*` loader there does not change the key (around line 267).
-   - Confirmed fixed: degraded builds stay private, template flush and boot binding, the macOS
-     copy path, `gc` under its lock, the fallback when a template build fails. On unmodified 17.12
-     and 18.7 clones the edit touched only the identifier, nonce and checksum fields.
-
-   Do not merge step 3 (`692b572`..`45d3ff4`) until these are fixed and both reviewers approve.
-   The first review had requested changes (two must-fix, seven should-fix); beyond the above, have
-   someone verify at least:
-   - the `pg_control` edit uses the verified layout table (17: nonce at 256, CRC at 288; 18: nonce
-     at 257, CRC at 292) and falls back to `initdb` for any other version;
-   - the install fingerprint covers the directory holding `postgres.bki`, its `extension`,
-     `timezonesets` and `tsearch_data` entries, and followed links;
-   - a template built with reduced `max_connections`/`shared_buffers` is not published;
-   - `gc` re-checks a template under its lock before deleting it.
+1. **Step 3's review findings are fixed and approved.** A template build or a published
+   template the identity edit refuses never becomes a checkout's data directory; the checkout
+   gets a plain `initdb`, and Stack tries to remove the template under its lock and logs what
+   happened (removed, lock not taken, already replaced, or the error). Damage to a copy alone
+   keeps a healthy template. The install fingerprint covers every share directory holding
+   `postgres.bki` and every C library and musl loader, and gives no key on any listing or
+   metadata error. The template format is now `stack-pg-template-3`; earlier templates are not
+   cloned and `gc` collects them. Reviewed over six rounds by two reviewers (the last round by
+   one), with release-binary reproductions on Postgres 17.12 and 18.7. Left open as follow-ups,
+   judged not to block: the "cannot check it" branch of `retire` has no test; a transient
+   error reading a template counts as "changed since it was built" and retires it; a template
+   directory swapped for a symlink under a paused start is not detected.
 2. **Nothing has ever run on Linux.** Every step's Linux code (`PR_SET_PDEATHSIG`, pidfd
    signalling, `/proc` paths, `FICLONE` reflink and copy, the C library key) was type-checked with
    `cargo clippy --target x86_64-unknown-linux-gnu` only. The release targets are musl, which was
@@ -124,8 +108,7 @@ there too, also ignored.
 
 ## Where to pick up
 
-1. Fix step 3's open findings (item 1), then verify with the two-reviewer process used for
-   steps 1 and 2.
+1. Step 3 is done. Reviews now go to one standing reviewer session, not a two-reviewer council.
 2. Run the test suite and `perf.py` on Linux (item 2).
 3. Decide item 4.
 4. Next speed targets, from the last profiles: `restart` (about 220 ms, mostly Postgres stop and
