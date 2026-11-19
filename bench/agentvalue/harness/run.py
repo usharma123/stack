@@ -699,6 +699,9 @@ def cmd_plan(args):
         'claude', '-p', '{prompt}', '--model', '{model}', '--effort', '{effort}', '--output-format', 'stream-json', '--verbose',
         '--safe-mode', '--strict-mcp-config', '--no-session-persistence', '--disable-slash-commands',
         '--permission-mode', 'bypassPermissions', '--tools', 'Bash,Read,Edit,Write', '--max-budget-usd', '{max_usd}']
+    if agent_command and agent_command[0] == 'claude' and shutil.which('claude'):
+        # Pin the CLI to its versioned binary: a host-wide update must not change it under a plan.
+        agent_command = [os.path.realpath(shutil.which('claude'))] + agent_command[1:]
     plan = {'kind': args.kind, 'name': args.name, 'created': now(), 'seed': args.seed, 'protocol_rev': git_rev(),
             'config': {'tasks': [t['id'] for t in TASKS], 'model': args.model, 'effort': args.effort,
                        'agent_seconds': args.agent_seconds, 'max_usd_per_agent': args.max_usd, 'agent_command': agent_command,

@@ -1,0 +1,1821 @@
+{
+  "pair": 1,
+  "arm": "stack",
+  "root": "/tmp/avr1s-06otu3_b",
+  "run_id": "avr1s-06otu3-b",
+  "started": 1795054474.944,
+  "steps": [
+    {
+      "name": "compile",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "compile"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054475.005,
+      "seconds": 1.03,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"compile\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":1026,\"data\":{\"bundles\":[],\"stack\":{\"tools\":{\"python\":{\"value\":\"3.13.16\",\"origin\":\"project\"},\"uv\":{\"value\":\"0.12.23\",\"origin\":\"project\"}},\"env\":{},\"services\":{\"postgres\":{\"value\":{\"preset\":\"postgres\",\"version\":\"17.11\"},\"origin\":\"project\"},\"redis\":{\"value\":{\"preset\":\"redis\",\"version\":\"7.4.7\"},\"origin\":\"project\"},\"api\":{\"value\":{\"run\":\"export IDENTITY_TOKEN=\\\"$STACK_IDENTITY_API\\\"; exec uv run --frozen python app.py\",\"identity\":{\"command\":\"python3 -c \\\"import os,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:'+os.environ['API_PORT']+'/identity',timeout=5).read().decode())\\\"\"},\"watch\":[\"app.py\",\"ledger/db.py\",\"ledger/cache.py\",\"ledger/jobs.py\",\"ledger/config.py\"],\"depends_on\":[\"postgres\",\"redis\"],\"setup\":\"uv run --frozen python migrate.py\"},\"origin\":\"project\"},\"worker\":{\"value\":{\"run\":\"export WORKER_HEALTH_PORT=\\\"$PORT\\\"; exec uv run --frozen python worker.py\",\"watch\":[\"worker.py\",\"ledger/db.py\",\"ledger/cache.py\",\"ledger/jobs.py\",\"ledger/config.py\"],\"depends_on\":[\"postgres\",\"redis\"]},\"origin\":\"project\"}},\"tasks\":{\"migrate\":{\"value\":{\"run\":\"uv run --frozen python migrate.py\",\"services\":[\"postgres\"]},\"origin\":\"project\"},\"seed\":{\"value\":{\"run\":\"uv run --frozen python seed.py\",\"services\":[\"postgres\",\"redis\"]},\"origin\":\"project\"},\"test\":{\"value\":{\"run\":\"uv run --frozen pytest -q\",\"services\":[\"postgres\",\"redis\",\"api\",\"worker\"]},\"origin\":\"project\"},\"smoke\":{\"value\":{\"run\":\"uv run --frozen python smoke.py\",\"services\":[\"postgres\",\"redis\",\"api\"]},\"origin\":\"project\"}},\"bin_paths\":[],\"overrides\":[]},\"init\":{\"postgres\":{\"value\":[\"seed\"],\"origin\":\"project\"}},\"ports\":{\"postgres\":23440,\"redis\":26128,\"api\":27427,\"worker\":22622},\"versions\":[{\"kind\":\"tool\",\"name\":\"python\",\"requested\":\"3.13.16\",\"resolved\":\"3.13.16\",\"origin\":\"project\",\"backend\":\"core:python\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:88b362e2e9754787c07f2847b717b127e60f77976e20847a0489f3043c925f2c\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:f326b7a386bf22def82e55dc3b95d2bef8b7c938b4c98ec32dd65433e7720b50\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:83621f7b2b1e5da63cae0b4c67612974547b14262676608e830e246cb832d07d\",\"change\":\"added\"}}},{\"kind\":\"tool\",\"name\":\"uv\",\"requested\":\"0.12.23\",\"resolved\":\"0.12.23\",\"origin\":\"project\",\"backend\":\"aqua:astral-sh/uv\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:6524bd338177ed50d035d39354e12545e993bbeba2ecbddf0480c5b3a81d313f\",\"change\":\"added\"}}},{\"kind\":\"service\",\"name\":\"postgres\",\"tool\":\"postgres\",\"requested\":\"17.11\",\"resolved\":\"17.11\",\"origin\":\"project\",\"backend\":\"conda:postgresql\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:65c13363a5e112b1023f3afe8ecae2d99eb08377087f2cb036a611fabb9ec010\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:5c6a27b5c33570c158b88bd0a7f30fafa66c5d825ad9e4471eb92526ba8a39fe\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:c7ca0f8a6e98eaec05c7c531fdc96139432adbc5f65540211745a836928331ee\",\"change\":\"added\"}}},{\"kind\":\"service\",\"name\":\"redis\",\"tool\":\"redis\",\"requested\":\"7.4.7\",\"resolved\":\"7.4.7\",\"origin\":\"project\",\"backend\":\"conda:redis-server\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:8a7bc4793cab62363d54872a9ded8a1ac76cf87a33ec30baf5d34dc4c549041b\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:c49d1f8c19a5f045bf7526825429fd94c520e2081c1246734301aeb2006aa6b6\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:ed53b59a1439f406a18a0023f7651ca1994c5e467b93d9f651a3f045c2bfc691\",\"change\":\"added\"}}}],\"lock_changed\":true,\"provider\":\"mise\",\"output\":\"/private/tmp/avr1s-06otu3_b/main/.config/mise/conf.d/stack.toml\",\"written\":true,\"skills\":[{\"tool\":\"python\",\"version\":\"3.13.16\",\"origin\":\"project\",\"status\":\"no_skill\"},{\"tool\":\"uv\",\"version\":\"0.12.23\",\"origin\":\"project\",\"status\":\"no_skill\"},{\"tool\":\"postgres\",\"version\":\"17.11\",\"origin\":\"project\",\"services\":[\"postgres\"],\"status\":\"no_skill\"},{\"tool\":\"redis\",\"version\":\"7.4.7\",\"origin\":\"project\",\"services\":[\"redis\"],\"status\":\"no_skill\"}]}}\n",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "init",
+        "-q"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.037,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "user.name",
+        "agent"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.052,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "user.email",
+        "agent@example.invalid"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.06,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "core.hooksPath",
+        "/dev/null"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.069,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "commit.gpgsign",
+        "false"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.078,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "add",
+        "-A"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.085,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "Starting point"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.11,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_up",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "up",
+        "--ttl",
+        "4h",
+        "--timeout",
+        "5m"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054476.144,
+      "seconds": 2.57,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"up\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":2562,\"data\":{\"session\":{\"id\":\"c1a4c8e39d7c\",\"started_at\":1795054478,\"lease\":{\"ttl_secs\":14400,\"renewed_at\":1795054478}},\"lease\":{\"kind\":\"ttl\",\"ttl_secs\":14400,\"renewed_at\":1795054478,\"expires_at\":1795068878,\"expired\":false},\"checks\":[{\"service\":\"postgres\",\"ready\":true,\"port\":23440,\"pid\":82501,\"identity\":\"instance\",\"checked_at\":1795054477},{\"service\":\"redis\",\"ready\":true,\"port\":26128,\"pid\":82502,\"identity\":\"instance\",\"checked_at\":1795054477},{\"service\":\"api\",\"ready\":true,\"port\":27427,\"pid\":82604,\"identity\":\"instance\",\"checked_at\":1795054478},{\"service\":\"worker\",\"ready\":true,\"port\":22622,\"pid\":82605,\"identity\":\"liveness\",\"checked_at\":1795054478}],\"steps\":[{\"step\":\"gc\",\"status\":\"ok\"},{\"step\":\"compile\",\"status\":\"ok\"},{\"step\":\"install\",\"status\":\"ok\",\"detail\":{\"artifacts\":{\"platform\":\"macos-arm64\",\"verified\":[\"python@3.13.16\",\"uv@0.12.23\",\"postgres@17.11\",\"redis@7.4.7\"],\"exempt\":[],\"unsupported\":[],\"missing\":[]},\"locked\":[\"python\",\"uv\",\"postgres\",\"redis\"],\"plain\":[],\"boundary\":\"mise checks the recorded checksum (and packslip signer) of artifacts it downloads; a release already installed on this machine is reported installed without being checked again\",\"skipped\":\"every pinned release is already installed\"}},{\"step\":\"stop_previous\",\"status\":\"ok\"},{\"step\":\"ports\",\"status\":\"ok\"},{\"step\":\"start\",\"status\":\"ok\"},{\"step\":\"verify\",\"status\":\"ok\"},{\"step\":\"init\",\"status\":\"ok\",\"detail\":{\"service\":\"postgres\",\"task\":\"seed\",\"exit_code\":0,\"secs\":0}}],\"init\":{\"postgres\":{\"status\":\"done\",\"ran\":[\"seed\"]}}}}\n",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_env",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "exec",
+        "--",
+        "sh",
+        "-c",
+        "printf \"DATABASE_URL=%s\nREDIS_URL=%s\nAPI_URL=%s\n\" \"$DATABASE_URL\" \"$REDIS_URL\" \"$API_URL\""
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054478.71,
+      "seconds": 0.06,
+      "stdout": "DATABASE_URL=postgresql://postgres@127.0.0.1:23440/postgres\nREDIS_URL=redis://127.0.0.1:26128\nAPI_URL=http://127.0.0.1:27427\n",
+      "stderr": ""
+    },
+    {
+      "name": "canary_plant",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "plant",
+        "dbf20bdbf8ca"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054478.77,
+      "seconds": 0.13,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"df7ed21dc8a0fd8ada71ac4b77142092b53cb27927548edad4cbbcdde094217c\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:dbf20bdbf8ca\"], \"redis_sha256\": \"2985efdac46c7a060ce59cd0247687c8a91c03e2f399bc3deac9444151192319\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "canary_before",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "fingerprint"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054481.403,
+      "seconds": 0.14,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"df7ed21dc8a0fd8ada71ac4b77142092b53cb27927548edad4cbbcdde094217c\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:dbf20bdbf8ca\"], \"redis_sha256\": \"2985efdac46c7a060ce59cd0247687c8a91c03e2f399bc3deac9444151192319\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/invoice-notes",
+        "/tmp/avr1s-06otu3_b/wt-notes"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054481.786,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/pay-receipts",
+        "/tmp/avr1s-06otu3_b/wt-pay"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054481.817,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/customer-table",
+        "/tmp/avr1s-06otu3_b/wt-cust"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054481.847,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "canary_after",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "fingerprint"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054540.253,
+      "seconds": 0.15,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"df7ed21dc8a0fd8ada71ac4b77142092b53cb27927548edad4cbbcdde094217c\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:dbf20bdbf8ca\"], \"redis_sha256\": \"2985efdac46c7a060ce59cd0247687c8a91c03e2f399bc3deac9444151192319\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "gc_reclaim",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "gc",
+        "--reclaim-data"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054579.963,
+      "seconds": 0.23,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"gc\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":177,\"data\":[{\"project\":\"/private/tmp/avr1s-06otu3_b/wt-notes\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 28053 released\"},{\"service\":\"redis\",\"outcome\":\"port 25429 released\"},{\"service\":\"api\",\"outcome\":\"port 21673 released\"},{\"service\":\"worker\",\"outcome\":\"port 28532 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/8d4896274caffa99/postgres removed (40810813 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/8d4896274caffa99/redis removed (1760 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr1s-06otu3_b/m/stack/state/supervisors/8d4896274caffa99 removed\"}]},{\"project\":\"/private/tmp/avr1s-06otu3_b/wt-pay\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 21752 released\"},{\"service\":\"redis\",\"outcome\":\"port 27738 released\"},{\"service\":\"api\",\"outcome\":\"port 29943 released\"},{\"service\":\"worker\",\"outcome\":\"port 20004 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/708b03ca8144fe2c/postgres removed (40827394 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/708b03ca8144fe2c/redis removed (3113 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr1s-06otu3_b/m/stack/state/supervisors/708b03ca8144fe2c removed\"}]},{\"project\":\"/private/tmp/avr1s-06otu3_b/wt-cust\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 22703 released\"},{\"service\":\"redis\",\"outcome\":\"port 28779 released\"},{\"service\":\"api\",\"outcome\":\"port 20471 released\"},{\"service\":\"worker\",\"outcome\":\"port 25860 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/postgres removed (40895885 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/redis removed (775 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr1s-06otu3_b/m/stack/state/supervisors/ffdaabe2946a2765 removed\"}]}]}\n",
+      "stderr": ""
+    },
+    {
+      "name": "ps_after_disposal",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "ps"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054580.515,
+      "seconds": 0.01,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"ps\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":4,\"data\":{\"checks\":\"liveness only: the recorded pid exists and the port accepts connections. Not proof that it is this checkout's instance; run `stack status` in the checkout for that\",\"checkouts\":[{\"path\":\"/private/tmp/avr1s-06otu3_b/main\",\"dir_exists\":true,\"dir\":\"present\",\"state\":\"running\",\"session\":{\"id\":\"c1a4c8e39d7c\",\"started_at\":1795054478,\"launching\":false},\"lease\":{\"kind\":\"ttl\",\"ttl_secs\":14400,\"renewed_at\":1795054478,\"expires_at\":1795068878,\"expired\":false},\"services\":[{\"name\":\"postgres\",\"port\":23440,\"pid\":82501,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":\"/tmp/avr1s-06otu3_b/m/stack/state/data/145b970bac3decdf/postgres\",\"data_bytes\":40951808},{\"name\":\"redis\",\"port\":26128,\"pid\":82502,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":\"/tmp/avr1s-06otu3_b/m/stack/state/data/145b970bac3decdf/redis\",\"data_bytes\":16384},{\"name\":\"api\",\"port\":27427,\"pid\":82604,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":null,\"data_bytes\":null},{\"name\":\"worker\",\"port\":22622,\"pid\":82605,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":null,\"data_bytes\":null}],\"identity_tokens\":1,\"reclaimable\":false},{\"path\":\"/private/tmp/avr1s-06otu3_b/wt-cust\",\"dir_exists\":false,\"dir\":\"missing\",\"state\":\"reserved\",\"session\":null,\"lease\":null,\"services\":[],\"identity_tokens\":1,\"reclaimable\":true},{\"path\":\"/private/tmp/avr1s-06otu3_b/wt-notes\",\"dir_exists\":false,\"dir\":\"missing\",\"state\":\"reserved\",\"session\":null,\"lease\":null,\"services\":[],\"identity_tokens\":1,\"reclaimable\":true},{\"path\":\"/private/tmp/avr1s-06otu3_b/wt-pay\",\"dir_exists\":false,\"dir\":\"missing\",\"state\":\"reserved\",\"session\":null,\"lease\":null,\"services\":[],\"identity_tokens\":1,\"reclaimable\":true}],\"totals\":{\"checkouts\":4,\"running\":1,\"services\":4,\"services_live\":4,\"ports_reserved\":4,\"data_bytes\":40968192,\"reclaimable_bytes\":0}}}\n",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_down",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "down"
+      ],
+      "cwd": "/tmp/avr1s-06otu3_b/main",
+      "exit": 0,
+      "started": 1795054580.524,
+      "seconds": 0.16,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":158,\"data\":{\"stopped\":[{\"service\":\"api\",\"pid\":82604},{\"service\":\"postgres\",\"pid\":82501},{\"service\":\"redis\",\"pid\":82502},{\"service\":\"worker\",\"pid\":82605}],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr1s-06otu3_b/m/stack/state/supervisors/145b970bac3decdf\"}}}\n",
+      "stderr": ""
+    }
+  ],
+  "agents": {
+    "invoice-notes": {
+      "worktree": "/tmp/avr1s-06otu3_b/wt-notes",
+      "marker": "wt-notes",
+      "started": 1795054481.914,
+      "pid": 82866,
+      "ended": 1795054513.22,
+      "seconds": 30.98,
+      "exit": 0,
+      "timed_out": false,
+      "observed_after_exit_s": 0.33,
+      "left_running": [],
+      "cli_helpers_left": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "existing_api_intact": true,
+          "note_default": true,
+          "create_with_note": true,
+          "patch_note": true,
+          "cache_after_patch": true,
+          "database_after_patch": true,
+          "other_invoice_untouched": true,
+          "migration_rerun_safe": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "498ed0b1fd2a016f8191599bcaf0a9f938f6a163 Add optional note to invoices"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_add_invoice_note"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 4,
+        "bash_calls": 4,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 5,
+          "duration_ms": 30568,
+          "duration_api_ms": 26602,
+          "total_cost_usd": 0.0794417,
+          "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 11061,
+            "cache_read_input_tokens": 47477,
+            "output_tokens": 3043,
+            "output_tokens_details": {
+              "thinking_tokens": 319
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 11061,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "global",
+            "iterations": [
+              {
+                "input_tokens": 2,
+                "output_tokens": 500,
+                "cache_read_input_tokens": 15416,
+                "cache_creation_input_tokens": 275,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 0,
+                  "ephemeral_1h_input_tokens": 275
+                },
+                "type": "message"
+              }
+            ],
+            "speed": "standard",
+            "fallback_credit": null
+          },
+          "modelUsage": {
+            "claude-sonnet-5-5": {
+              "inputTokens": 10,
+              "outputTokens": 3043,
+              "cacheReadInputTokens": 47477,
+              "cacheCreationInputTokens": 11061,
+              "webSearchRequests": 0,
+              "costUSD": 0.0794417,
+              "contextWindow": 1000000,
+              "maxOutputTokens": 128000,
+              "thinkingTokens": 319,
+              "cacheCreationEphemeral5mInputTokens": 0,
+              "cacheCreationEphemeral1hInputTokens": 11061,
+              "canonicalModel": "claude-sonnet-5-5",
+              "provider": "firstParty",
+              "costBasis": "list"
+            }
+          }
+        },
+        "model": "claude-sonnet-5-5",
+        "unparsed_lines": 0,
+        "claude_code_version": "2.1.327",
+        "tools": [
+          "Bash",
+          "Edit",
+          "Read",
+          "Write"
+        ],
+        "final_text": "Invoices now have an optional note, and the work is committed on `feature/invoice-notes`. The suite passed against this worktree's services (9 tests). I then ran `stack down`, which stopped only this worktree's four services.\n\n- **Migration:** `migrations/20261118_add_invoice_note.sql` adds `note text NOT NULL DEFAULT ''`. Existing invoices are kept, and ones that never had a note read as `\"\"`. I didn't edit any existing migration.\n- **API:**\n  - `GET /invoices/<id>` now returns `note`.\n  - `POST /invoices` accepts an optional `note`.\n  - `PATCH /invoices/<id>` accepts `note` along with `customer` and `cents`.\n  - A `note` that isn't a string gets a 400 on both POST and PATCH, including `null` on PATCH.\n- **Cache:** the existing PATCH never cleared the Redis entry, so a cached GET would have kept showing the old data. PATCH now deletes the cached invoice after the update commits. A cached entry with no `note` key, such as one written before this change, is treated as a miss and reloaded from the database.\n- **Tests:** I added tests for the default empty note, creating with a note, and PATCHing a note and reading it back through a cached GET. They also cover a later PATCH of another field keeping the note, and rejecting a non-string note. The schema test now expects the new migration.\n\nThe code changes are in `app.py`, `ledger/db.py` and `ledger/cache.py`."
+      },
+      "compliance": {
+        "committed": true,
+        "ran_tests": true
+      }
+    },
+    "pay-receipts": {
+      "worktree": "/tmp/avr1s-06otu3_b/wt-pay",
+      "marker": "wt-pay",
+      "started": 1795054481.917,
+      "pid": 82868,
+      "ended": 1795054526.875,
+      "seconds": 44.63,
+      "exit": 0,
+      "timed_out": false,
+      "observed_after_exit_s": 0.33,
+      "left_running": [],
+      "cli_helpers_left": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "existing_api_intact": true,
+          "pay_marks_paid": true,
+          "cache_after_pay": true,
+          "receipt_recorded": true,
+          "duplicate_job_one_receipt": true,
+          "pay_twice_conflict": true,
+          "pay_unknown_404": true,
+          "existing_receipts_kept": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "88910c734a4e3caf731c33050831f041dd7fecd4 Add POST /invoices/<id>/pay with idempotent receipt issuing"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_receipts_unique_invoice"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 7,
+        "bash_calls": 6,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 8,
+          "duration_ms": 44271,
+          "duration_api_ms": 35078,
+          "total_cost_usd": 0.1065645,
+          "usage": {
+            "input_tokens": 14,
+            "cache_creation_input_tokens": 13006,
+            "cache_read_input_tokens": 79925,
+            "output_tokens": 4652,
+            "output_tokens_details": {
+              "thinking_tokens": 659
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 13006,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "global",
+            "iterations": [
+              {
+                "input_tokens": 2,
+                "output_tokens": 613,
+                "cache_read_input_tokens": 17308,
+                "cache_creation_input_tokens": 328,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 0,
+                  "ephemeral_1h_input_tokens": 328
+                },
+                "type": "message"
+              }
+            ],
+            "speed": "standard",
+            "fallback_credit": null
+          },
+          "modelUsage": {
+            "claude-sonnet-5-5": {
+              "inputTokens": 14,
+              "outputTokens": 4652,
+              "cacheReadInputTokens": 79925,
+              "cacheCreationInputTokens": 13006,
+              "webSearchRequests": 0,
+              "costUSD": 0.1065645,
+              "contextWindow": 1000000,
+              "maxOutputTokens": 128000,
+              "thinkingTokens": 659,
+              "cacheCreationEphemeral5mInputTokens": 0,
+              "cacheCreationEphemeral1hInputTokens": 13006,
+              "canonicalModel": "claude-sonnet-5-5",
+              "provider": "firstParty",
+              "costBasis": "list"
+            }
+          }
+        },
+        "model": "claude-sonnet-5-5",
+        "unparsed_lines": 0,
+        "claude_code_version": "2.1.327",
+        "tools": [
+          "Bash",
+          "Edit",
+          "Read",
+          "Write"
+        ],
+        "final_text": "`POST /invoices/<id>/pay` is in and committed on `feature/pay-receipts`. All 10 tests passed against this worktree's services, and I've stopped them with `stack down`.\n\n- **Pay endpoint:** an open invoice becomes paid in one atomic update. The endpoint then clears the cached copy and queues `issue_receipt`. An already-paid invoice returns 409 and queues nothing, and an unknown id returns 404. `GET /invoices/<id>` shows `paid` straight after, even if the invoice was cached (the code is in `app.py` and `ledger/db.py`).\n- **No duplicate receipts:** a new migration, `migrations/20261118_receipts_unique_invoice.sql`, removes any existing duplicate receipts and adds a unique index on `receipts.invoice_id`. The worker's insert now ignores a repeat for the same invoice, so a redelivered job can't record a second receipt.\n- **Paid-only receipts:** the worker also skips jobs for invoices that aren't paid. I added that check myself, going by the handler's docstring (\"Record a receipt for a paid invoice\").\n- **Tests:** I added tests for each of these cases in `tests/test_api.py`. They include a redelivery test that pushes the same job onto the queue three times and expects one receipt. I also updated the migrations check to include the new migration.\n\nOne race I left alone: a `GET` that read the invoice from the database just before the payment commits could write the old copy back into the cache after the payment clears it. The stale copy would then last up to the 5-minute cache expiry. Closing it would need a version check or a short lock around the cache write.\n\n`PATCH /invoices/<id>` has a similar problem that was already there. It rewrites `status` from a copy it read earlier, so a payment landing at the wrong moment could be undone. I didn't change it."
+      },
+      "compliance": {
+        "committed": true,
+        "ran_tests": true
+      }
+    },
+    "customer-table": {
+      "worktree": "/tmp/avr1s-06otu3_b/wt-cust",
+      "marker": "wt-cust",
+      "started": 1795054481.92,
+      "pid": 82869,
+      "ended": 1795054535.25,
+      "seconds": 53.03,
+      "exit": 0,
+      "timed_out": false,
+      "observed_after_exit_s": 0.3,
+      "left_running": [],
+      "cli_helpers_left": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "existing_api_intact": true,
+          "customers_deduplicated": true,
+          "customer_column_dropped": true,
+          "customer_fk": true,
+          "post_reuses_customer": true,
+          "post_new_customer": true,
+          "customer_invoices_endpoint": true,
+          "migration_rerun_safe": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "cdd9f99c208b2d7b8bcf80dca4150490702e091f Move customer names into a customers table"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_create_customers"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 9,
+        "bash_calls": 8,
+        "tool_errors": 1,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 10,
+          "duration_ms": 52616,
+          "duration_api_ms": 45515,
+          "total_cost_usd": 0.136374,
+          "usage": {
+            "input_tokens": 18,
+            "cache_creation_input_tokens": 15855,
+            "cache_read_input_tokens": 123380,
+            "output_tokens": 6058,
+            "output_tokens_details": {
+              "thinking_tokens": 1037
+            },
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": "standard",
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 15855,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": "global",
+            "iterations": [
+              {
+                "input_tokens": 2,
+                "output_tokens": 619,
+                "cache_read_input_tokens": 20085,
+                "cache_creation_input_tokens": 400,
+                "cache_creation": {
+                  "ephemeral_5m_input_tokens": 0,
+                  "ephemeral_1h_input_tokens": 400
+                },
+                "type": "message"
+              }
+            ],
+            "speed": "standard",
+            "fallback_credit": null
+          },
+          "modelUsage": {
+            "claude-sonnet-5-5": {
+              "inputTokens": 18,
+              "outputTokens": 6058,
+              "cacheReadInputTokens": 123380,
+              "cacheCreationInputTokens": 15855,
+              "webSearchRequests": 0,
+              "costUSD": 0.136374,
+              "contextWindow": 1000000,
+              "maxOutputTokens": 128000,
+              "thinkingTokens": 1037,
+              "cacheCreationEphemeral5mInputTokens": 0,
+              "cacheCreationEphemeral1hInputTokens": 15855,
+              "canonicalModel": "claude-sonnet-5-5",
+              "provider": "firstParty",
+              "costBasis": "list"
+            }
+          }
+        },
+        "model": "claude-sonnet-5-5",
+        "unparsed_lines": 0,
+        "claude_code_version": "2.1.327",
+        "tools": [
+          "Bash",
+          "Edit",
+          "Read",
+          "Write"
+        ],
+        "final_text": "Customer names now live in their own `customers` table, and the work is committed on `feature/customer-table`. All 12 tests and the smoke check passed against this worktree's running services, and I've since stopped them with `stack down`. I didn't touch other worktrees' or the main checkout's services.\n\n- **Migration:** `migrations/20261118_create_customers.sql` is a new file, and I left the existing migrations alone. It creates `customers` with a unique name and fills it with one row per distinct invoice name. It then adds `invoices.customer_id` as a not-null foreign key, backfills it, and drops `invoices.customer`.\n- **Existing data:** I first set up the old schema with some duplicate names (two \"Dup Co\" invoices and a second \"Acme Corp\" one). After applying the migration, all six invoices kept their customer names, and the duplicates mapped to a single customer each.\n- **API:** `GET /invoices/<id>` still returns `\"customer\"` as the name. `POST /invoices` and `PATCH` reuse the customer if the name exists, or create it. The new `GET /customers/<id>/invoices` lists that customer's invoices and returns 404 for an unknown customer. The changes are in `ledger/db.py` and `app.py`.\n- **Seeding:** `seed.py` now creates the demo customers before the invoices. I purged this worktree's data, brought the stack up again, and the fresh database seeded correctly.\n- **Tests:** I added tests for the schema change, name reuse on POST, the new endpoint (a seeded customer and a missing one), and renaming a customer through PATCH. I also added the new migration to the existing schema test.\n\nPATCHing a customer name doesn't clear the invoice's Redis cache entry, so `GET /invoices/<id>` can keep returning the old name until the cache entry expires. The code did this before my change too, so I left it alone."
+      },
+      "compliance": {
+        "committed": true,
+        "ran_tests": true
+      }
+    }
+  },
+  "plan_sha256": "2328ee3294e84e5b5ff2fed75f8992da160ebb4377741ab65377da0fcc0f91a5",
+  "plan_name": "baseline-1",
+  "plan_kind": "agent_experiment",
+  "model": "claude-sonnet-5-5",
+  "effort": "high",
+  "stack_binary_sha256": "4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3",
+  "source_rev": "89b9b34355cb324d21babaaaa13c70ddf9daa00e",
+  "valid": true,
+  "invalid_reasons": [],
+  "start_commit": "a4b94de68f77932728c98168c599214a49c699af",
+  "readme_words": 505,
+  "canary_token": "dbf20bdbf8ca",
+  "bystander": {
+    "env": {
+      "DATABASE_URL": "postgresql://postgres@127.0.0.1:23440/postgres",
+      "REDIS_URL": "redis://127.0.0.1:26128",
+      "API_URL": "http://127.0.0.1:27427"
+    },
+    "fingerprint_before": {
+      "columns": [
+        [
+          "invoices",
+          "cents",
+          "integer"
+        ],
+        [
+          "invoices",
+          "customer",
+          "text"
+        ],
+        [
+          "invoices",
+          "id",
+          "integer"
+        ],
+        [
+          "invoices",
+          "status",
+          "text"
+        ],
+        [
+          "receipts",
+          "cents",
+          "integer"
+        ],
+        [
+          "receipts",
+          "id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "invoice_id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "issued_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "applied_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "version",
+          "text"
+        ]
+      ],
+      "migrations": [
+        "20261001_create_invoices",
+        "20261008_create_receipts"
+      ],
+      "invoices_sha256": "df7ed21dc8a0fd8ada71ac4b77142092b53cb27927548edad4cbbcdde094217c",
+      "receipts_sha256": "668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f",
+      "tuple_writes": [
+        161,
+        12,
+        0
+      ],
+      "redis_keys": [
+        "bystander:dbf20bdbf8ca"
+      ],
+      "redis_sha256": "2985efdac46c7a060ce59cd0247687c8a91c03e2f399bc3deac9444151192319"
+    },
+    "processes_before": [
+      {
+        "pid": 82500,
+        "started": "Wed Nov 18 21:14:36 2026",
+        "command": "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack __supervise /tmp/avr1s-06otu3_b/m/stack/state/supervisors/145b970bac3decdf"
+      },
+      {
+        "pid": 82501,
+        "started": "Wed Nov 18 21:14:36 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr1s-06otu3_b/m/stack/state/data/145b970bac3decdf/postgres -p 23440 -h 127.0.0.1 -k "
+      },
+      {
+        "pid": 82502,
+        "started": "Wed Nov 18 21:14:36 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:26128        "
+      },
+      {
+        "pid": 82604,
+        "started": "Wed Nov 18 21:14:37 2026",
+        "command": "uv run --frozen python app.py"
+      },
+      {
+        "pid": 82605,
+        "started": "Wed Nov 18 21:14:37 2026",
+        "command": "uv run --frozen python worker.py"
+      },
+      {
+        "pid": 82609,
+        "started": "Wed Nov 18 21:14:38 2026",
+        "command": "/private/tmp/avr1s-06otu3_b/main/.venv/bin/python worker.py"
+      },
+      {
+        "pid": 82610,
+        "started": "Wed Nov 18 21:14:38 2026",
+        "command": "/private/tmp/avr1s-06otu3_b/main/.venv/bin/python app.py"
+      }
+    ],
+    "fingerprint_after": {
+      "columns": [
+        [
+          "invoices",
+          "cents",
+          "integer"
+        ],
+        [
+          "invoices",
+          "customer",
+          "text"
+        ],
+        [
+          "invoices",
+          "id",
+          "integer"
+        ],
+        [
+          "invoices",
+          "status",
+          "text"
+        ],
+        [
+          "receipts",
+          "cents",
+          "integer"
+        ],
+        [
+          "receipts",
+          "id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "invoice_id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "issued_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "applied_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "version",
+          "text"
+        ]
+      ],
+      "migrations": [
+        "20261001_create_invoices",
+        "20261008_create_receipts"
+      ],
+      "invoices_sha256": "df7ed21dc8a0fd8ada71ac4b77142092b53cb27927548edad4cbbcdde094217c",
+      "receipts_sha256": "668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f",
+      "tuple_writes": [
+        161,
+        12,
+        0
+      ],
+      "redis_keys": [
+        "bystander:dbf20bdbf8ca"
+      ],
+      "redis_sha256": "2985efdac46c7a060ce59cd0247687c8a91c03e2f399bc3deac9444151192319"
+    },
+    "changed": [],
+    "processes_lost": [],
+    "foreign_migrations": []
+  },
+  "machine_state_bytes_before_agents": 81465344,
+  "machine_state_tree_before": {
+    "mise/config": 0,
+    "mise/state/trusted-configs": 0,
+    "mise/state/task-history/145b970bac3decdf": 4096,
+    "mise/state/task-history": 4096,
+    "mise/state/tracked-configs": 0,
+    "mise/state/incomplete-installs": 0,
+    "mise/state": 4096,
+    "mise": 4096,
+    "pf/state": 0,
+    "pf": 0,
+    "stack/cache/resolve": 0,
+    "stack/cache/installed": 0,
+    "stack/cache/lock": 0,
+    "stack/cache/skills": 0,
+    "stack/cache/task-config": 0,
+    "stack/cache": 0,
+    "stack/state/init": 4096,
+    "stack/state/projects": 8192,
+    "stack/state/supervisors/145b970bac3decdf": 45056,
+    "stack/state/supervisors": 45056,
+    "stack/state/sessions": 4096,
+    "stack/state/templates/postgres": 40456192,
+    "stack/state/templates": 40456192,
+    "stack/state/data/145b970bac3decdf": 40927232,
+    "stack/state/data": 40927232,
+    "stack/state": 81461248,
+    "stack/data": 0,
+    "stack": 81461248,
+    "xdg/cache": 0,
+    "xdg/config": 0,
+    "xdg/state": 0,
+    "xdg/data": 0,
+    "xdg": 0,
+    ".": 81465344
+  },
+  "sampler": {
+    "samples": 48,
+    "errors": [],
+    "processes": {
+      "main": [
+        {
+          "pid": 82500,
+          "started": "Wed Nov 18 21:14:36 2026",
+          "first": 1795054481.911563,
+          "command": "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack __supervise /tmp/avr1s-06otu3_b/m/stack/state/supervisors/145b970bac3decdf",
+          "last": 1795054539.5520372
+        },
+        {
+          "pid": 82501,
+          "started": "Wed Nov 18 21:14:36 2026",
+          "first": 1795054481.911563,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr1s-06otu3_b/m/stack/state/data/145b970bac3decdf/postgres -p 23440 -h 127.0.0.1 -k ",
+          "last": 1795054539.5520372
+        },
+        {
+          "pid": 82502,
+          "started": "Wed Nov 18 21:14:36 2026",
+          "first": 1795054481.911563,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:26128        ",
+          "last": 1795054539.5520372
+        },
+        {
+          "pid": 82604,
+          "started": "Wed Nov 18 21:14:37 2026",
+          "first": 1795054481.911563,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054539.5520372
+        },
+        {
+          "pid": 82605,
+          "started": "Wed Nov 18 21:14:37 2026",
+          "first": 1795054481.911563,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054539.5520372
+        },
+        {
+          "pid": 82609,
+          "started": "Wed Nov 18 21:14:38 2026",
+          "first": 1795054481.911563,
+          "command": "/private/tmp/avr1s-06otu3_b/main/.venv/bin/python worker.py",
+          "last": 1795054539.5520372
+        },
+        {
+          "pid": 82610,
+          "started": "Wed Nov 18 21:14:38 2026",
+          "first": 1795054481.911563,
+          "command": "/private/tmp/avr1s-06otu3_b/main/.venv/bin/python app.py",
+          "last": 1795054539.5520372
+        }
+      ],
+      "wt-notes": [
+        {
+          "pid": 82866,
+          "started": "Wed Nov 18 21:14:41 2026",
+          "first": 1795054481.911563,
+          "command": "claude -p You are one of several coding agents working on this repository at the same time. Each agent has its own git worktree and branch. Yours is the current directory, on branch feature/invoice-notes. Other agents' worktrees, and the main checkout, may have services running while you work.\\012\\0",
+          "last": 1795054512.499244
+        },
+        {
+          "pid": 82987,
+          "started": "Wed Nov 18 21:14:43 2026",
+          "first": 1795054484.376742,
+          "command": "/opt/anaconda3/bin/python /opt/anaconda3/bin/conda shell.zsh hook",
+          "last": 1795054484.376742
+        },
+        {
+          "pid": 84316,
+          "started": "Wed Nov 18 21:15:02 2026",
+          "first": 1795054502.676988,
+          "command": "stack up",
+          "last": 1795054502.676988
+        },
+        {
+          "pid": 84348,
+          "started": "Wed Nov 18 21:15:02 2026",
+          "first": 1795054502.676988,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr1s-06otu3_b/m/stack/state/data/8d4896274caffa99/postgres -p 28053 -h 127.0.0.1 -k ",
+          "last": 1795054506.355186
+        },
+        {
+          "pid": 84361,
+          "started": "Wed Nov 18 21:15:02 2026",
+          "first": 1795054502.676988,
+          "command": "uv run --frozen python migrate.py",
+          "last": 1795054502.676988
+        },
+        {
+          "pid": 84362,
+          "started": "Wed Nov 18 21:15:02 2026",
+          "first": 1795054502.676988,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-notes/.venv/bin/python migrate.py",
+          "last": 1795054502.676988
+        },
+        {
+          "pid": 84428,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054506.355186
+        },
+        {
+          "pid": 84429,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054506.355186
+        },
+        {
+          "pid": 84433,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-notes/.venv/bin/python worker.py",
+          "last": 1795054506.355186
+        },
+        {
+          "pid": 84434,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-notes/.venv/bin/python app.py",
+          "last": 1795054506.355186
+        },
+        {
+          "pid": 84451,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "stack run test",
+          "last": 1795054503.9180648
+        },
+        {
+          "pid": 84458,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795054503.9180648
+        },
+        {
+          "pid": 84465,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "uv run --frozen pytest -q",
+          "last": 1795054503.9180648
+        },
+        {
+          "pid": 84466,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-notes/.venv/bin/python /private/tmp/avr1s-06otu3_b/wt-notes/.venv/bin/pytest -q",
+          "last": 1795054503.9180648
+        },
+        {
+          "pid": 84347,
+          "started": "Wed Nov 18 21:15:02 2026",
+          "first": 1795054506.355186,
+          "command": "/tmp/avr1s-06otu3_b/bin/stack __supervise /tmp/avr1s-06otu3_b/m/stack/state/supervisors/8d4896274caffa99",
+          "last": 1795054506.355186
+        },
+        {
+          "pid": 84349,
+          "started": "Wed Nov 18 21:15:02 2026",
+          "first": 1795054506.355186,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:25429        ",
+          "last": 1795054506.355186
+        }
+      ],
+      "wt-pay": [
+        {
+          "pid": 82868,
+          "started": "Wed Nov 18 21:14:41 2026",
+          "first": 1795054481.911563,
+          "command": "claude -p You are one of several coding agents working on this repository at the same time. Each agent has its own git worktree and branch. Yours is the current directory, on branch feature/pay-receipts. Other agents' worktrees, and the main checkout, may have services running while you work.\\012\\01",
+          "last": 1795054526.048822
+        },
+        {
+          "pid": 83049,
+          "started": "Wed Nov 18 21:14:43 2026",
+          "first": 1795054484.376742,
+          "command": "/opt/anaconda3/bin/python /opt/anaconda3/bin/conda shell.zsh hook",
+          "last": 1795054484.376742
+        },
+        {
+          "pid": 84722,
+          "started": "Wed Nov 18 21:15:08 2026",
+          "first": 1795054508.81116,
+          "command": "stack up",
+          "last": 1795054508.81116
+        },
+        {
+          "pid": 84755,
+          "started": "Wed Nov 18 21:15:08 2026",
+          "first": 1795054508.81116,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr1s-06otu3_b/m/stack/state/data/708b03ca8144fe2c/postgres -p 21752 -h 127.0.0.1 -k ",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 84768,
+          "started": "Wed Nov 18 21:15:08 2026",
+          "first": 1795054508.81116,
+          "command": "uv run --frozen python migrate.py",
+          "last": 1795054508.81116
+        },
+        {
+          "pid": 84769,
+          "started": "Wed Nov 18 21:15:08 2026",
+          "first": 1795054508.81116,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/python migrate.py",
+          "last": 1795054508.81116
+        },
+        {
+          "pid": 84777,
+          "started": "Wed Nov 18 21:15:09 2026",
+          "first": 1795054510.0381591,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054512.499244
+        },
+        {
+          "pid": 84778,
+          "started": "Wed Nov 18 21:15:09 2026",
+          "first": 1795054510.0381591,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054512.499244
+        },
+        {
+          "pid": 84808,
+          "started": "Wed Nov 18 21:15:09 2026",
+          "first": 1795054510.0381591,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/python worker.py",
+          "last": 1795054512.499244
+        },
+        {
+          "pid": 84809,
+          "started": "Wed Nov 18 21:15:09 2026",
+          "first": 1795054510.0381591,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/python app.py",
+          "last": 1795054512.499244
+        },
+        {
+          "pid": 84833,
+          "started": "Wed Nov 18 21:15:09 2026",
+          "first": 1795054510.0381591,
+          "command": "stack run test",
+          "last": 1795054510.0381591
+        },
+        {
+          "pid": 84838,
+          "started": "Wed Nov 18 21:15:10 2026",
+          "first": 1795054510.0381591,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795054510.0381591
+        },
+        {
+          "pid": 84754,
+          "started": "Wed Nov 18 21:15:08 2026",
+          "first": 1795054512.499244,
+          "command": "/tmp/avr1s-06otu3_b/bin/stack __supervise /tmp/avr1s-06otu3_b/m/stack/state/supervisors/708b03ca8144fe2c",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 84756,
+          "started": "Wed Nov 18 21:15:08 2026",
+          "first": 1795054512.499244,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:27738        ",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 84990,
+          "started": "Wed Nov 18 21:15:13 2026",
+          "first": 1795054513.765665,
+          "command": "stack restart api worker",
+          "last": 1795054513.765665
+        },
+        {
+          "pid": 85032,
+          "started": "Wed Nov 18 21:15:13 2026",
+          "first": 1795054514.9957929,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 85033,
+          "started": "Wed Nov 18 21:15:13 2026",
+          "first": 1795054514.9957929,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 85036,
+          "started": "Wed Nov 18 21:15:13 2026",
+          "first": 1795054514.9957929,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/python app.py",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 85038,
+          "started": "Wed Nov 18 21:15:13 2026",
+          "first": 1795054514.9957929,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/python worker.py",
+          "last": 1795054521.113138
+        },
+        {
+          "pid": 85041,
+          "started": "Wed Nov 18 21:15:14 2026",
+          "first": 1795054514.9957929,
+          "command": "stack run test",
+          "last": 1795054517.4389062
+        },
+        {
+          "pid": 85046,
+          "started": "Wed Nov 18 21:15:14 2026",
+          "first": 1795054514.9957929,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795054517.4389062
+        },
+        {
+          "pid": 85047,
+          "started": "Wed Nov 18 21:15:14 2026",
+          "first": 1795054514.9957929,
+          "command": "uv run --frozen pytest -q",
+          "last": 1795054517.4389062
+        },
+        {
+          "pid": 85048,
+          "started": "Wed Nov 18 21:15:14 2026",
+          "first": 1795054514.9957929,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/python /private/tmp/avr1s-06otu3_b/wt-pay/.venv/bin/pytest -q",
+          "last": 1795054517.4389062
+        }
+      ],
+      "wt-cust": [
+        {
+          "pid": 82869,
+          "started": "Wed Nov 18 21:14:41 2026",
+          "first": 1795054481.911563,
+          "command": "claude -p You are one of several coding agents working on this repository at the same time. Each agent has its own git worktree and branch. Yours is the current directory, on branch feature/customer-table. Other agents' worktrees, and the main checkout, may have services running while you work.\\012\\",
+          "last": 1795054534.656167
+        },
+        {
+          "pid": 83043,
+          "started": "Wed Nov 18 21:14:43 2026",
+          "first": 1795054484.376742,
+          "command": "/opt/anaconda3/bin/python /opt/anaconda3/bin/conda shell.zsh hook",
+          "last": 1795054484.376742
+        },
+        {
+          "pid": 84449,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "stack up",
+          "last": 1795054505.129369
+        },
+        {
+          "pid": 84461,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054503.9180648,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/postgres -p 22703 -h 127.0.0.1 -k ",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 84526,
+          "started": "Wed Nov 18 21:15:04 2026",
+          "first": 1795054505.129369,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054508.81116
+        },
+        {
+          "pid": 84527,
+          "started": "Wed Nov 18 21:15:04 2026",
+          "first": 1795054505.129369,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054510.0381591
+        },
+        {
+          "pid": 84531,
+          "started": "Wed Nov 18 21:15:04 2026",
+          "first": 1795054505.129369,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python worker.py",
+          "last": 1795054510.0381591
+        },
+        {
+          "pid": 84532,
+          "started": "Wed Nov 18 21:15:04 2026",
+          "first": 1795054505.129369,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python app.py",
+          "last": 1795054508.81116
+        },
+        {
+          "pid": 84460,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054506.355186,
+          "command": "/tmp/avr1s-06otu3_b/bin/stack __supervise /tmp/avr1s-06otu3_b/m/stack/state/supervisors/ffdaabe2946a2765",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 84462,
+          "started": "Wed Nov 18 21:15:03 2026",
+          "first": 1795054506.355186,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:28779        ",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 84820,
+          "started": "Wed Nov 18 21:15:09 2026",
+          "first": 1795054510.0381591,
+          "command": "stack restart api worker",
+          "last": 1795054510.0381591
+        },
+        {
+          "pid": 84878,
+          "started": "Wed Nov 18 21:15:10 2026",
+          "first": 1795054511.276051,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 84879,
+          "started": "Wed Nov 18 21:15:10 2026",
+          "first": 1795054511.276051,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 84882,
+          "started": "Wed Nov 18 21:15:10 2026",
+          "first": 1795054511.276051,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python app.py",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 84883,
+          "started": "Wed Nov 18 21:15:10 2026",
+          "first": 1795054511.276051,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python worker.py",
+          "last": 1795054523.581146
+        },
+        {
+          "pid": 85454,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/tmp/avr1s-06otu3_b/bin/stack __supervise /tmp/avr1s-06otu3_b/m/stack/state/supervisors/ffdaabe2946a2765",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85455,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/postgres -p 22703 -h 127.0.0.1 -k ",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85456,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:28779        ",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85473,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "uv run --frozen python app.py",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85474,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85477,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python app.py",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85478,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python worker.py",
+          "last": 1795054528.492706
+        },
+        {
+          "pid": 85514,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "stack run test",
+          "last": 1795054524.813299
+        },
+        {
+          "pid": 85519,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795054524.813299
+        },
+        {
+          "pid": 85520,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "uv run --frozen pytest -q",
+          "last": 1795054524.813299
+        },
+        {
+          "pid": 85521,
+          "started": "Wed Nov 18 21:15:24 2026",
+          "first": 1795054524.813299,
+          "command": "/private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/python /private/tmp/avr1s-06otu3_b/wt-cust/.venv/bin/pytest -q",
+          "last": 1795054524.813299
+        }
+      ]
+    },
+    "ports": {
+      "23440": [
+        "main"
+      ],
+      "26128": [
+        "main"
+      ],
+      "22622": [
+        "main"
+      ],
+      "27427": [
+        "main"
+      ],
+      "28053": [
+        "wt-notes"
+      ],
+      "28532": [
+        "wt-notes"
+      ],
+      "21673": [
+        "wt-notes"
+      ],
+      "22703": [
+        "wt-cust"
+      ],
+      "25860": [
+        "wt-cust"
+      ],
+      "20471": [
+        "wt-cust"
+      ],
+      "25429": [
+        "wt-notes"
+      ],
+      "28779": [
+        "wt-cust"
+      ],
+      "21752": [
+        "wt-pay"
+      ],
+      "20004": [
+        "wt-pay"
+      ],
+      "29943": [
+        "wt-pay"
+      ],
+      "27738": [
+        "wt-pay"
+      ]
+    },
+    "cross_worktree_connections": []
+  },
+  "recovery": {
+    "invoice-notes": {
+      "agent_left": 0,
+      "down": [
+        {
+          "name": "arm_down",
+          "argv": [
+            "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+            "--json",
+            "down"
+          ],
+          "cwd": "/tmp/avr1s-06otu3_b/wt-notes",
+          "exit": 0,
+          "started": 1795054540.773,
+          "seconds": 0.02,
+          "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":13,\"data\":{\"stopped\":[],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr1s-06otu3_b/m/stack/state/supervisors/8d4896274caffa99\"}}}\n",
+          "stderr": ""
+        }
+      ],
+      "down_exit": 0,
+      "left_after_arm_down": []
+    },
+    "pay-receipts": {
+      "agent_left": 0,
+      "down": [
+        {
+          "name": "arm_down",
+          "argv": [
+            "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+            "--json",
+            "down"
+          ],
+          "cwd": "/tmp/avr1s-06otu3_b/wt-pay",
+          "exit": 0,
+          "started": 1795054541.004,
+          "seconds": 0.02,
+          "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":14,\"data\":{\"stopped\":[],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr1s-06otu3_b/m/stack/state/supervisors/708b03ca8144fe2c\"}}}\n",
+          "stderr": ""
+        }
+      ],
+      "down_exit": 0,
+      "left_after_arm_down": []
+    },
+    "customer-table": {
+      "agent_left": 0,
+      "down": [
+        {
+          "name": "arm_down",
+          "argv": [
+            "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+            "--json",
+            "down"
+          ],
+          "cwd": "/tmp/avr1s-06otu3_b/wt-cust",
+          "exit": 0,
+          "started": 1795054541.239,
+          "seconds": 0.02,
+          "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":14,\"data\":{\"stopped\":[],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr1s-06otu3_b/m/stack/state/supervisors/ffdaabe2946a2765\"}}}\n",
+          "stderr": ""
+        }
+      ],
+      "down_exit": 0,
+      "left_after_arm_down": []
+    }
+  },
+  "worktree_databases": {
+    "invoice-notes": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_add_invoice_note"
+      ],
+      "error": null,
+      "tables": [
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr1s-06otu3_b/m/stack/state/data/8d4896274caffa99/postgres"
+    },
+    "pay-receipts": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_receipts_unique_invoice"
+      ],
+      "error": null,
+      "tables": [
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr1s-06otu3_b/m/stack/state/data/708b03ca8144fe2c/postgres"
+    },
+    "customer-table": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_create_customers"
+      ],
+      "error": null,
+      "tables": [
+        "customers",
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/postgres"
+    }
+  },
+  "disposal": {
+    "steps": {
+      "invoice-notes": {
+        "name": "worktree_remove",
+        "argv": [
+          "git",
+          "-c",
+          "user.name=bench",
+          "-c",
+          "user.email=bench@example.invalid",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "init.defaultBranch=main",
+          "-c",
+          "commit.gpgsign=false",
+          "worktree",
+          "remove",
+          "--force",
+          "/tmp/avr1s-06otu3_b/wt-notes"
+        ],
+        "cwd": "/tmp/avr1s-06otu3_b/main",
+        "exit": 0,
+        "started": 1795054579.767,
+        "seconds": 0.07,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pay-receipts": {
+        "name": "worktree_remove",
+        "argv": [
+          "git",
+          "-c",
+          "user.name=bench",
+          "-c",
+          "user.email=bench@example.invalid",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "init.defaultBranch=main",
+          "-c",
+          "commit.gpgsign=false",
+          "worktree",
+          "remove",
+          "--force",
+          "/tmp/avr1s-06otu3_b/wt-pay"
+        ],
+        "cwd": "/tmp/avr1s-06otu3_b/main",
+        "exit": 0,
+        "started": 1795054579.833,
+        "seconds": 0.07,
+        "stdout": "",
+        "stderr": ""
+      },
+      "customer-table": {
+        "name": "worktree_remove",
+        "argv": [
+          "git",
+          "-c",
+          "user.name=bench",
+          "-c",
+          "user.email=bench@example.invalid",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "init.defaultBranch=main",
+          "-c",
+          "commit.gpgsign=false",
+          "worktree",
+          "remove",
+          "--force",
+          "/tmp/avr1s-06otu3_b/wt-cust"
+        ],
+        "cwd": "/tmp/avr1s-06otu3_b/main",
+        "exit": 0,
+        "started": 1795054579.898,
+        "seconds": 0.07,
+        "stdout": "",
+        "stderr": ""
+      },
+      "gc": {
+        "name": "gc_reclaim",
+        "argv": [
+          "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+          "--json",
+          "gc",
+          "--reclaim-data"
+        ],
+        "cwd": "/tmp/avr1s-06otu3_b/main",
+        "exit": 0,
+        "started": 1795054579.963,
+        "seconds": 0.23,
+        "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"gc\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":177,\"data\":[{\"project\":\"/private/tmp/avr1s-06otu3_b/wt-notes\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 28053 released\"},{\"service\":\"redis\",\"outcome\":\"port 25429 released\"},{\"service\":\"api\",\"outcome\":\"port 21673 released\"},{\"service\":\"worker\",\"outcome\":\"port 28532 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/8d4896274caffa99/postgres removed (40810813 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/8d4896274caffa99/redis removed (1760 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr1s-06otu3_b/m/stack/state/supervisors/8d4896274caffa99 removed\"}]},{\"project\":\"/private/tmp/avr1s-06otu3_b/wt-pay\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 21752 released\"},{\"service\":\"redis\",\"outcome\":\"port 27738 released\"},{\"service\":\"api\",\"outcome\":\"port 29943 released\"},{\"service\":\"worker\",\"outcome\":\"port 20004 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/708b03ca8144fe2c/postgres removed (40827394 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/708b03ca8144fe2c/redis removed (3113 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr1s-06otu3_b/m/stack/state/supervisors/708b03ca8144fe2c removed\"}]},{\"project\":\"/private/tmp/avr1s-06otu3_b/wt-cust\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 22703 released\"},{\"service\":\"redis\",\"outcome\":\"port 28779 released\"},{\"service\":\"api\",\"outcome\":\"port 20471 released\"},{\"service\":\"worker\",\"outcome\":\"port 25860 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/postgres removed (40895885 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr1s-06otu3_b/m/stack/state/data/ffdaabe2946a2765/redis removed (775 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr1s-06otu3_b/m/stack/state/supervisors/ffdaabe2946a2765 removed\"}]}]}\n",
+        "stderr": ""
+      }
+    },
+    "processes_left": {},
+    "ports_still_listening": [],
+    "worktree_dirs_left": [],
+    "service_data_left": {},
+    "machine_state_bytes_after": 81555456,
+    "machine_state_tree_after": {
+      "mise/config": 0,
+      "mise/state/trusted-configs": 0,
+      "mise/state/task-history/ffdaabe2946a2765": 12288,
+      "mise/state/task-history/145b970bac3decdf": 4096,
+      "mise/state/task-history/708b03ca8144fe2c": 8192,
+      "mise/state/task-history/8d4896274caffa99": 8192,
+      "mise/state/task-history": 32768,
+      "mise/state/tracked-configs": 0,
+      "mise/state/incomplete-installs": 0,
+      "mise/state": 32768,
+      "mise": 32768,
+      "pf/state": 0,
+      "pf": 0,
+      "stack/cache/resolve": 0,
+      "stack/cache/installed": 0,
+      "stack/cache/lock": 0,
+      "stack/cache/skills": 0,
+      "stack/cache/task-config": 0,
+      "stack/cache": 0,
+      "stack/state/init": 4096,
+      "stack/state/projects": 20480,
+      "stack/state/supervisors/145b970bac3decdf": 45056,
+      "stack/state/supervisors": 45056,
+      "stack/state/sessions": 4096,
+      "stack/state/templates/postgres": 40456192,
+      "stack/state/templates": 40456192,
+      "stack/state/data/ffdaabe2946a2765": 0,
+      "stack/state/data/145b970bac3decdf": 40976384,
+      "stack/state/data/708b03ca8144fe2c": 0,
+      "stack/state/data/8d4896274caffa99": 0,
+      "stack/state/data": 40976384,
+      "stack/state": 81522688,
+      "stack/data": 0,
+      "stack": 81522688,
+      "xdg/cache": 0,
+      "xdg/config": 0,
+      "xdg/state": 0,
+      "xdg/data": 0,
+      "xdg": 0,
+      ".": 81555456
+    },
+    "stack_records_left": [
+      "/private/tmp/avr1s-06otu3_b/wt-cust",
+      "/private/tmp/avr1s-06otu3_b/wt-notes",
+      "/private/tmp/avr1s-06otu3_b/wt-pay"
+    ]
+  },
+  "final_scan": [],
+  "survivors_after_run": [],
+  "ended": 1795054581.542,
+  "seconds": 106.6,
+  "root_kept": false
+}

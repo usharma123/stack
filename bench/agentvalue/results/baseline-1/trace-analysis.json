@@ -1,0 +1,540 @@
+{
+  "sessions": [
+    {
+      "run": "pair0-baseline",
+      "arm": "baseline",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair0-baseline",
+      "arm": "baseline",
+      "task": "pay-receipts",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py test",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair0-baseline",
+      "arm": "baseline",
+      "task": "customer-table",
+      "tool_calls": 6,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py status",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair0-stack",
+      "arm": "stack",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "stack up",
+        "stack restart",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair0-stack",
+      "arm": "stack",
+      "task": "pay-receipts",
+      "tool_calls": 6,
+      "env_commands": [
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair0-stack",
+      "arm": "stack",
+      "task": "customer-table",
+      "tool_calls": 8,
+      "env_commands": [
+        "stack status",
+        "stack up",
+        "stack status",
+        "stack restart",
+        "stack run",
+        "stack run",
+        "stack down",
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack down",
+        "stack status"
+      ],
+      "errors": [
+        {
+          "command": "stack status",
+          "error": "Exit code 1\nno session\npostgres     NOT READY  no launch record in this checkout; run `stack up`\nredis        NOT READY  no launch record in this checkout; run `stack up`\napi          NOT READY  no launch record in this checkout; run `stack up`\nworker       NOT READY  no launch record in this checkout; run `stack up`\npostgres     init pending"
+        }
+      ]
+    },
+    {
+      "run": "pair1-baseline",
+      "arm": "baseline",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair1-baseline",
+      "arm": "baseline",
+      "task": "pay-receipts",
+      "tool_calls": 6,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair1-baseline",
+      "arm": "baseline",
+      "task": "customer-table",
+      "tool_calls": 12,
+      "env_commands": [
+        "python3 dev.py status",
+        "python3 dev.py --help",
+        "python3 dev.py up",
+        "python3 dev.py exec",
+        "python3 dev.py exec",
+        "python3 dev.py exec",
+        "python3 dev.py restart",
+        "python3 dev.py exec",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down",
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": [
+        {
+          "command": "mkdir -p /tmp/cust_bak && cp app.py seed.py tests/test_api.py /tmp/cust_bak/ && cp ledger/db.py /tmp/cust_bak/db.py && git checkout app.py seed.py tests/test_api.py ledger/db.py && python3 dev.py up 2>&1 | tail -5 && python3 dev.py exec python3 -c \"\nimport psycopg,os\nc=psycopg.connect(os.environ['DA",
+          "error": "Exit code 1\nUpdated 4 paths from the index\n    \"REDIS_URL\": \"redis://127.0.0.1:34471/0\",\n    \"API_URL\": \"http://127.0.0.1:34472\",\n    \"API_PORT\": \"34472\"\n  }\n}\nTraceback (most recent call last):\n  File \"<string>\", line 2, in <module>\n    import psycopg,os\nModuleNotFoundError: No module named 'psycopg'"
+        }
+      ]
+    },
+    {
+      "run": "pair1-stack",
+      "arm": "stack",
+      "task": "invoice-notes",
+      "tool_calls": 4,
+      "env_commands": [
+        "stack up",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair1-stack",
+      "arm": "stack",
+      "task": "pay-receipts",
+      "tool_calls": 7,
+      "env_commands": [
+        "stack up",
+        "stack run",
+        "stack restart",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair1-stack",
+      "arm": "stack",
+      "task": "customer-table",
+      "tool_calls": 9,
+      "env_commands": [
+        "stack status",
+        "stack up",
+        "stack exec",
+        "stack restart",
+        "stack exec",
+        "stack run",
+        "stack run",
+        "stack down",
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": [
+        {
+          "command": "cat > migrations/20261118_create_customers.sql <<'EOF'\nCREATE TABLE customers (\n    id serial PRIMARY KEY,\n    name text NOT NULL UNIQUE\n);\nINSERT INTO customers (name) SELECT DISTINCT customer FROM invoices ORDER BY customer;\nALTER TABLE invoices ADD COLUMN customer_id integer REFERENCES customers ",
+          "error": "Exit code 1\ndiff --git a/app.py b/app.py\nindex 89865a3..f5df9f4 100644\n--- a/app.py\n+++ b/app.py\n@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n from ledger import cache, config, db\n \n INVOICE = re.compile(r'^/invoices/(\\d+)$')\n+CUSTOMER_INVOICES = re.compile(r'^/customers/(\\d+)/invoices$')\n RECEIPTS = re.compile(r'^/invoices/(\\d+)/receipts$')\n \n \n@@ -51,6 +52,"
+        }
+      ]
+    },
+    {
+      "run": "pair2-baseline",
+      "arm": "baseline",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair2-baseline",
+      "arm": "baseline",
+      "task": "pay-receipts",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py test",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair2-baseline",
+      "arm": "baseline",
+      "task": "customer-table",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair2-stack",
+      "arm": "stack",
+      "task": "invoice-notes",
+      "tool_calls": 6,
+      "env_commands": [
+        "stack status",
+        "stack up",
+        "stack status",
+        "stack run",
+        "stack down"
+      ],
+      "errors": [
+        {
+          "command": "cat > migrations/20261118_add_invoice_note.sql <<'EOF'\nALTER TABLE invoices ADD COLUMN note text NOT NULL DEFAULT '';\nEOF\npython3 - <<'EOF'\nimport re\np='ledger/db.py'; s=open(p).read()\ns=s.replace(\"    status: str\\n\",\"    status: str\\n    note: str = ''\\n\")\ns=s.replace(\"SELECT id, customer, cents, s",
+          "error": "Exit code 1\n app.py            | 13 +++++++++++--\n ledger/cache.py   |  6 +++++-\n ledger/db.py      | 13 +++++++------\n tests/test_api.py | 36 ++++++++++++++++++++++++++++++++++++\n 4 files changed, 59 insertions(+), 9 deletions(-)\nno session\npostgres     NOT READY  no launch record in this checkout; run `stack up`\nredis        NOT READY  no launch record in this checkout; run `stack up`\napi       "
+        }
+      ]
+    },
+    {
+      "run": "pair2-stack",
+      "arm": "stack",
+      "task": "pay-receipts",
+      "tool_calls": 6,
+      "env_commands": [
+        "stack up",
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack down",
+        "stack up",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair2-stack",
+      "arm": "stack",
+      "task": "customer-table",
+      "tool_calls": 9,
+      "env_commands": [
+        "stack status",
+        "stack up",
+        "stack status",
+        "stack run",
+        "stack exec",
+        "stack exec",
+        "stack down"
+      ],
+      "errors": [
+        {
+          "command": "stack run test 2>&1 | tail -15\ncat > /tmp/migtest_wtcust.py <<'EOF'\nimport os, psycopg\nfrom pathlib import Path\nbase = os.environ['DATABASE_URL']\nadmin = psycopg.connect(base, autocommit=True)\nadmin.execute('DROP DATABASE IF EXISTS migtest_wtcust')\nadmin.execute('CREATE DATABASE migtest_wtcust')\nurl",
+          "error": "Exit code 1\n[test] $ uv run --frozen pytest -q\n..........                                                               [100%]\n10 passed in 0.12s\nTraceback (most recent call last):\n  File \"/tmp/migtest_wtcust.py\", line 1, in <module>\n    import os, psycopg\nModuleNotFoundError: No module named 'psycopg'"
+        }
+      ]
+    },
+    {
+      "run": "pair3-baseline",
+      "arm": "baseline",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair3-baseline",
+      "arm": "baseline",
+      "task": "pay-receipts",
+      "tool_calls": 6,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py test",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair3-baseline",
+      "arm": "baseline",
+      "task": "customer-table",
+      "tool_calls": 6,
+      "env_commands": [
+        "python3 dev.py status",
+        "python3 dev.py up",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair3-stack",
+      "arm": "stack",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair3-stack",
+      "arm": "stack",
+      "task": "pay-receipts",
+      "tool_calls": 5,
+      "env_commands": [
+        "stack up",
+        "stack restart",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair3-stack",
+      "arm": "stack",
+      "task": "customer-table",
+      "tool_calls": 6,
+      "env_commands": [
+        "stack status",
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair4-baseline",
+      "arm": "baseline",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair4-baseline",
+      "arm": "baseline",
+      "task": "pay-receipts",
+      "tool_calls": 6,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair4-baseline",
+      "arm": "baseline",
+      "task": "customer-table",
+      "tool_calls": 10,
+      "env_commands": [
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py exec",
+        "python3 dev.py exec",
+        "python3 dev.py restart",
+        "python3 dev.py test",
+        "python3 dev.py smoke",
+        "python3 dev.py down",
+        "python3 dev.py up",
+        "python3 dev.py test",
+        "python3 dev.py test",
+        "python3 dev.py down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair4-stack",
+      "arm": "stack",
+      "task": "invoice-notes",
+      "tool_calls": 5,
+      "env_commands": [
+        "stack up",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair4-stack",
+      "arm": "stack",
+      "task": "pay-receipts",
+      "tool_calls": 7,
+      "env_commands": [
+        "stack up",
+        "stack restart",
+        "stack run",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    },
+    {
+      "run": "pair4-stack",
+      "arm": "stack",
+      "task": "customer-table",
+      "tool_calls": 6,
+      "env_commands": [
+        "stack up",
+        "stack restart",
+        "stack run",
+        "stack run",
+        "stack down"
+      ],
+      "errors": []
+    }
+  ],
+  "env_command_counts": {
+    "baseline": {
+      "python3 dev.py test": 23,
+      "python3 dev.py up": 17,
+      "python3 dev.py down": 17,
+      "python3 dev.py smoke": 14,
+      "python3 dev.py restart": 12,
+      "python3 dev.py exec": 6,
+      "python3 dev.py status": 3,
+      "python3 dev.py --help": 1
+    },
+    "stack": {
+      "stack run": 35,
+      "stack up": 19,
+      "stack down": 18,
+      "stack status": 9,
+      "stack restart": 7,
+      "stack exec": 4
+    }
+  },
+  "first_env_call_index": {
+    "baseline": [
+      2,
+      1,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      2,
+      3,
+      3,
+      2,
+      3,
+      2
+    ],
+    "stack": [
+      2,
+      3,
+      2,
+      2,
+      4,
+      3,
+      2,
+      2,
+      3,
+      2,
+      1,
+      3,
+      2,
+      2,
+      3
+    ]
+  }
+}

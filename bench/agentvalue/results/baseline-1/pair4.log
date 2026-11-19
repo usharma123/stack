@@ -1,0 +1,56 @@
+pair 4: running stack -> results/baseline-1/pair4-stack
+{
+  "arm": "stack",
+  "valid": true,
+  "invalid": [],
+  "cli_failures": [],
+  "bystander_changed": [],
+  "agents": {
+    "invoice-notes": {
+      "passed": true,
+      "seconds": 23.86,
+      "left": 0,
+      "cost": 0.0712675
+    },
+    "pay-receipts": {
+      "passed": true,
+      "seconds": 41.42,
+      "left": 0,
+      "cost": 0.1044599
+    },
+    "customer-table": {
+      "passed": true,
+      "seconds": 37.75,
+      "left": 0,
+      "cost": 0.10914589999999999
+    }
+  }
+}
+pair 4: running baseline -> results/baseline-1/pair4-baseline
+{
+  "arm": "baseline",
+  "valid": true,
+  "invalid": [],
+  "cli_failures": [],
+  "bystander_changed": [],
+  "agents": {
+    "invoice-notes": {
+      "passed": true,
+      "seconds": 27.48,
+      "left": 0,
+      "cost": 0.0735269
+    },
+    "pay-receipts": {
+      "passed": true,
+      "seconds": 42.16,
+      "left": 0,
+      "cost": 0.1007797
+    },
+    "customer-table": {
+      "passed": true,
+      "seconds": 55.6,
+      "left": 0,
+      "cost": 0.1320146
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "commits": [
+    "37fd17911e0e4d923e9037f3ddbeb1316668646e Move customer names into a customers table"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_create_customers"
+  ]
+}
