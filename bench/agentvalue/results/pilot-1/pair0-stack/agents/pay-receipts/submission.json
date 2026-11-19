@@ -1,0 +1,12 @@
+{
+  "commits": [
+    "1d4b997e7977935ba506d7097b9351982854c6d0 Add POST /invoices/<id>/pay with idempotent receipt issuing"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_receipts_unique_invoice"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "commits": [
+    "f879f9cdc3bf6e9a9ef26cbdbdc709c974b3e141 Add optional note to invoices"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_add_invoice_note"
+  ]
+}

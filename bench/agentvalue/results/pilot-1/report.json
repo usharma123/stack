@@ -1,0 +1,749 @@
+{
+  "plan": "pilot-1",
+  "kind": "agent_experiment",
+  "config": {
+    "tasks": [
+      "invoice-notes",
+      "pay-receipts",
+      "customer-table"
+    ],
+    "model": "claude-sonnet-5-5",
+    "effort": "high",
+    "agent_seconds": 1800,
+    "max_usd_per_agent": 8.0,
+    "stack_binary": "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+    "stack_binary_sha256": "4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3",
+    "source_rev": "c11637431201df3ea027ad648b5b1d90008e7316",
+    "warm_cache": "/Users/utsavsharma/.cache/stack-agentvalue/warm",
+    "locale": "en_US.UTF-8",
+    "concurrency": 3,
+    "sample_interval": 1.0
+  },
+  "agent_command": [
+    "claude",
+    "-p",
+    "{prompt}",
+    "--model",
+    "{model}",
+    "--effort",
+    "{effort}",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--safe-mode",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+    "--disable-slash-commands",
+    "--permission-mode",
+    "bypassPermissions",
+    "--tools",
+    "Bash,Read,Edit,Write",
+    "--max-budget-usd",
+    "{max_usd}"
+  ],
+  "host": {
+    "platform": "macOS-27.2.1-arm64-arm-64bit",
+    "node": "Utsavs-MacBook-Pro.local",
+    "claude": "2.1.327 (Claude Code)",
+    "mise": "2026.11.9 macos-arm64 (2026-11-16)",
+    "git": "git version 2.56.1",
+    "python_host": "Python 3.12.16",
+    "macos": "27.2.1",
+    "cpu": "Apple M5 Pro",
+    "memory_bytes": "68719476736",
+    "ncpu": "18"
+  },
+  "arms": {
+    "stack": {
+      "task_success": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "gated_success": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "cli_ok": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "committed": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "ran_tests": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "by_position": {
+        "0": {
+          "gated": {
+            "k": 3,
+            "scored": 3,
+            "assigned": 3
+          },
+          "passed": {
+            "k": 3,
+            "scored": 3,
+            "assigned": 3
+          }
+        },
+        "1": {
+          "gated": {
+            "k": 0,
+            "scored": 0,
+            "assigned": 0
+          },
+          "passed": {
+            "k": 0,
+            "scored": 0,
+            "assigned": 0
+          }
+        }
+      },
+      "teardown_ok": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "isolation_ok": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "used_own_db": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "timed_out": {
+        "k": 0,
+        "scored": 3,
+        "assigned": 3
+      },
+      "episodes_all_gated_success": 1,
+      "episodes": 1,
+      "episodes_assigned": 1,
+      "seconds_to_verified_result": {
+        "n": 3,
+        "median": 42.11,
+        "q1": 30.47,
+        "q3": 51.33,
+        "min": 30.47,
+        "max": 51.33,
+        "sd": 10.453
+      },
+      "seconds_all": {
+        "n": 3,
+        "median": 42.11,
+        "q1": 30.47,
+        "q3": 51.33,
+        "min": 30.47,
+        "max": 51.33,
+        "sd": 10.453
+      },
+      "cost_usd": {
+        "n": 3,
+        "median": 0.097,
+        "q1": 0.09,
+        "q3": 0.122,
+        "min": 0.09,
+        "max": 0.122,
+        "sd": 0.017
+      },
+      "turns": {
+        "n": 3,
+        "median": 7,
+        "q1": 6.0,
+        "q3": 8.0,
+        "min": 6,
+        "max": 8,
+        "sd": 1.0
+      },
+      "tool_calls": {
+        "n": 3,
+        "median": 6,
+        "q1": 5.0,
+        "q3": 7.0,
+        "min": 5,
+        "max": 7,
+        "sd": 1.0
+      },
+      "bash_calls": {
+        "n": 3,
+        "median": 6,
+        "q1": 5.0,
+        "q3": 6.0,
+        "min": 5,
+        "max": 6,
+        "sd": 0.577
+      },
+      "tool_errors": {
+        "n": 3,
+        "median": 0,
+        "q1": 0.0,
+        "q3": 1.0,
+        "min": 0,
+        "max": 1,
+        "sd": 0.577
+      },
+      "env_errors": {
+        "n": 3,
+        "median": 0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "min": 0,
+        "max": 0,
+        "sd": 0.0
+      },
+      "kill_commands_total": 0,
+      "benchmark_access_total": 0,
+      "not_run": 0,
+      "invalid": 0,
+      "by_task": {
+        "invoice-notes": {
+          "passed": [
+            true
+          ],
+          "gated": [
+            true
+          ],
+          "seconds": [
+            30.47
+          ],
+          "cost": [
+            0.0896545
+          ]
+        },
+        "pay-receipts": {
+          "passed": [
+            true
+          ],
+          "gated": [
+            true
+          ],
+          "seconds": [
+            51.33
+          ],
+          "cost": [
+            0.09651860000000002
+          ]
+        },
+        "customer-table": {
+          "passed": [
+            true
+          ],
+          "gated": [
+            true
+          ],
+          "seconds": [
+            42.11
+          ],
+          "cost": [
+            0.12209319999999999
+          ]
+        }
+      }
+    },
+    "baseline": {
+      "task_success": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "gated_success": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "cli_ok": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "committed": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "ran_tests": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "by_position": {
+        "0": {
+          "gated": {
+            "k": 0,
+            "scored": 0,
+            "assigned": 0
+          },
+          "passed": {
+            "k": 0,
+            "scored": 0,
+            "assigned": 0
+          }
+        },
+        "1": {
+          "gated": {
+            "k": 3,
+            "scored": 3,
+            "assigned": 3
+          },
+          "passed": {
+            "k": 3,
+            "scored": 3,
+            "assigned": 3
+          }
+        }
+      },
+      "teardown_ok": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "isolation_ok": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "used_own_db": {
+        "k": 3,
+        "scored": 3,
+        "assigned": 3
+      },
+      "timed_out": {
+        "k": 0,
+        "scored": 3,
+        "assigned": 3
+      },
+      "episodes_all_gated_success": 1,
+      "episodes": 1,
+      "episodes_assigned": 1,
+      "seconds_to_verified_result": {
+        "n": 3,
+        "median": 44.44,
+        "q1": 35.9,
+        "q3": 75.89,
+        "min": 35.9,
+        "max": 75.89,
+        "sd": 21.06
+      },
+      "seconds_all": {
+        "n": 3,
+        "median": 44.44,
+        "q1": 35.9,
+        "q3": 75.89,
+        "min": 35.9,
+        "max": 75.89,
+        "sd": 21.06
+      },
+      "cost_usd": {
+        "n": 3,
+        "median": 0.089,
+        "q1": 0.076,
+        "q3": 0.166,
+        "min": 0.076,
+        "max": 0.166,
+        "sd": 0.049
+      },
+      "turns": {
+        "n": 3,
+        "median": 6,
+        "q1": 6.0,
+        "q3": 14.0,
+        "min": 6,
+        "max": 14,
+        "sd": 4.619
+      },
+      "tool_calls": {
+        "n": 3,
+        "median": 5,
+        "q1": 5.0,
+        "q3": 13.0,
+        "min": 5,
+        "max": 13,
+        "sd": 4.619
+      },
+      "bash_calls": {
+        "n": 3,
+        "median": 5,
+        "q1": 5.0,
+        "q3": 13.0,
+        "min": 5,
+        "max": 13,
+        "sd": 4.619
+      },
+      "tool_errors": {
+        "n": 3,
+        "median": 0,
+        "q1": 0.0,
+        "q3": 1.0,
+        "min": 0,
+        "max": 1,
+        "sd": 0.577
+      },
+      "env_errors": {
+        "n": 3,
+        "median": 0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "min": 0,
+        "max": 0,
+        "sd": 0.0
+      },
+      "kill_commands_total": 0,
+      "benchmark_access_total": 0,
+      "not_run": 0,
+      "invalid": 0,
+      "by_task": {
+        "invoice-notes": {
+          "passed": [
+            true
+          ],
+          "gated": [
+            true
+          ],
+          "seconds": [
+            35.9
+          ],
+          "cost": [
+            0.07577759999999999
+          ]
+        },
+        "pay-receipts": {
+          "passed": [
+            true
+          ],
+          "gated": [
+            true
+          ],
+          "seconds": [
+            44.44
+          ],
+          "cost": [
+            0.088528
+          ]
+        },
+        "customer-table": {
+          "passed": [
+            true
+          ],
+          "gated": [
+            true
+          ],
+          "seconds": [
+            75.89
+          ],
+          "cost": [
+            0.16619860000000003
+          ]
+        }
+      }
+    }
+  },
+  "paired_gated_success_diff": {
+    "pairs": 1,
+    "per_pair": [
+      0.0
+    ],
+    "mean_diff": 0.0,
+    "ci95": null
+  },
+  "paired_task_success_diff": {
+    "pairs": 1,
+    "per_pair": [
+      0.0
+    ],
+    "mean_diff": 0.0,
+    "ci95": null
+  },
+  "discordant_pairs": {},
+  "runs": {
+    "pair0-stack": {
+      "valid": true,
+      "invalid_reasons": [],
+      "seconds": 104.1,
+      "stack_binary_sha256": "4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3",
+      "source_rev": "51802dd178ecdef29bc74aea2626d2aad6570309",
+      "contamination": [],
+      "disposal": {
+        "processes_left": {},
+        "ports_still_listening": [],
+        "service_data_left": {},
+        "stack_records_left": [
+          "/private/tmp/avr0s-nzg2usn4/wt-cust",
+          "/private/tmp/avr0s-nzg2usn4/wt-notes",
+          "/private/tmp/avr0s-nzg2usn4/wt-pay"
+        ],
+        "worktree_dirs_left": []
+      },
+      "recovery": {
+        "invoice-notes": {
+          "agent_left": 0,
+          "left_after_arm_down": 0
+        },
+        "pay-receipts": {
+          "agent_left": 0,
+          "left_after_arm_down": 0
+        },
+        "customer-table": {
+          "agent_left": 0,
+          "left_after_arm_down": 0
+        }
+      },
+      "disposal_state_growth_bytes": 90112
+    },
+    "pair0-baseline": {
+      "valid": true,
+      "invalid_reasons": [],
+      "seconds": 128.8,
+      "stack_binary_sha256": "4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3",
+      "source_rev": "51802dd178ecdef29bc74aea2626d2aad6570309",
+      "contamination": [],
+      "disposal": {
+        "processes_left": {},
+        "ports_still_listening": [],
+        "service_data_left": {},
+        "stack_records_left": null,
+        "worktree_dirs_left": []
+      },
+      "recovery": {
+        "invoice-notes": {
+          "agent_left": 0,
+          "left_after_arm_down": 0
+        },
+        "pay-receipts": {
+          "agent_left": 0,
+          "left_after_arm_down": 0
+        },
+        "customer-table": {
+          "agent_left": 0,
+          "left_after_arm_down": 0
+        }
+      },
+      "disposal_state_growth_bytes": 0
+    }
+  },
+  "rows": [
+    {
+      "pair": 0,
+      "arm": "stack",
+      "task": "invoice-notes",
+      "position": 0,
+      "status": "scored",
+      "passed": true,
+      "teardown_ok": true,
+      "isolation_ok": true,
+      "cli_ok": true,
+      "gated_success": true,
+      "used_own_db": true,
+      "committed": true,
+      "ran_tests": true,
+      "arm_down_recovered": true,
+      "unexplained_migrations": [],
+      "timed_out": false,
+      "agent_exit": 0,
+      "seconds": 30.47,
+      "cost_usd": 0.0896545,
+      "turns": 6,
+      "tool_calls": 5,
+      "bash_calls": 5,
+      "tool_errors": 0,
+      "env_errors": 0,
+      "kill_commands": 0,
+      "benchmark_access": 0,
+      "left_running": 0,
+      "failed_checks": [],
+      "fresh_ok": true,
+      "model": "claude-sonnet-5-5",
+      "cli": "2.1.327",
+      "result_subtype": "success",
+      "contamination_events": []
+    },
+    {
+      "pair": 0,
+      "arm": "stack",
+      "task": "pay-receipts",
+      "position": 0,
+      "status": "scored",
+      "passed": true,
+      "teardown_ok": true,
+      "isolation_ok": true,
+      "cli_ok": true,
+      "gated_success": true,
+      "used_own_db": true,
+      "committed": true,
+      "ran_tests": true,
+      "arm_down_recovered": true,
+      "unexplained_migrations": [],
+      "timed_out": false,
+      "agent_exit": 0,
+      "seconds": 51.33,
+      "cost_usd": 0.09651860000000002,
+      "turns": 7,
+      "tool_calls": 6,
+      "bash_calls": 6,
+      "tool_errors": 0,
+      "env_errors": 0,
+      "kill_commands": 0,
+      "benchmark_access": 0,
+      "left_running": 0,
+      "failed_checks": [],
+      "fresh_ok": true,
+      "model": "claude-sonnet-5-5",
+      "cli": "2.1.327",
+      "result_subtype": "success",
+      "contamination_events": []
+    },
+    {
+      "pair": 0,
+      "arm": "stack",
+      "task": "customer-table",
+      "position": 0,
+      "status": "scored",
+      "passed": true,
+      "teardown_ok": true,
+      "isolation_ok": true,
+      "cli_ok": true,
+      "gated_success": true,
+      "used_own_db": true,
+      "committed": true,
+      "ran_tests": true,
+      "arm_down_recovered": true,
+      "unexplained_migrations": [],
+      "timed_out": false,
+      "agent_exit": 0,
+      "seconds": 42.11,
+      "cost_usd": 0.12209319999999999,
+      "turns": 8,
+      "tool_calls": 7,
+      "bash_calls": 6,
+      "tool_errors": 1,
+      "env_errors": 0,
+      "kill_commands": 0,
+      "benchmark_access": 0,
+      "left_running": 0,
+      "failed_checks": [],
+      "fresh_ok": true,
+      "model": "claude-sonnet-5-5",
+      "cli": "2.1.327",
+      "result_subtype": "success",
+      "contamination_events": []
+    },
+    {
+      "pair": 0,
+      "arm": "baseline",
+      "task": "invoice-notes",
+      "position": 1,
+      "status": "scored",
+      "passed": true,
+      "teardown_ok": true,
+      "isolation_ok": true,
+      "cli_ok": true,
+      "gated_success": true,
+      "used_own_db": true,
+      "committed": true,
+      "ran_tests": true,
+      "arm_down_recovered": true,
+      "unexplained_migrations": [],
+      "timed_out": false,
+      "agent_exit": 0,
+      "seconds": 35.9,
+      "cost_usd": 0.07577759999999999,
+      "turns": 6,
+      "tool_calls": 5,
+      "bash_calls": 5,
+      "tool_errors": 0,
+      "env_errors": 0,
+      "kill_commands": 0,
+      "benchmark_access": 0,
+      "left_running": 0,
+      "failed_checks": [],
+      "fresh_ok": true,
+      "model": "claude-sonnet-5-5",
+      "cli": "2.1.327",
+      "result_subtype": "success",
+      "contamination_events": []
+    },
+    {
+      "pair": 0,
+      "arm": "baseline",
+      "task": "pay-receipts",
+      "position": 1,
+      "status": "scored",
+      "passed": true,
+      "teardown_ok": true,
+      "isolation_ok": true,
+      "cli_ok": true,
+      "gated_success": true,
+      "used_own_db": true,
+      "committed": true,
+      "ran_tests": true,
+      "arm_down_recovered": true,
+      "unexplained_migrations": [],
+      "timed_out": false,
+      "agent_exit": 0,
+      "seconds": 44.44,
+      "cost_usd": 0.088528,
+      "turns": 6,
+      "tool_calls": 5,
+      "bash_calls": 5,
+      "tool_errors": 0,
+      "env_errors": 0,
+      "kill_commands": 0,
+      "benchmark_access": 0,
+      "left_running": 0,
+      "failed_checks": [],
+      "fresh_ok": true,
+      "model": "claude-sonnet-5-5",
+      "cli": "2.1.327",
+      "result_subtype": "success",
+      "contamination_events": []
+    },
+    {
+      "pair": 0,
+      "arm": "baseline",
+      "task": "customer-table",
+      "position": 1,
+      "status": "scored",
+      "passed": true,
+      "teardown_ok": true,
+      "isolation_ok": true,
+      "cli_ok": true,
+      "gated_success": true,
+      "used_own_db": true,
+      "committed": true,
+      "ran_tests": true,
+      "arm_down_recovered": true,
+      "unexplained_migrations": [],
+      "timed_out": false,
+      "agent_exit": 0,
+      "seconds": 75.89,
+      "cost_usd": 0.16619860000000003,
+      "turns": 14,
+      "tool_calls": 13,
+      "bash_calls": 13,
+      "tool_errors": 1,
+      "env_errors": 0,
+      "kill_commands": 0,
+      "benchmark_access": 0,
+      "left_running": 0,
+      "failed_checks": [],
+      "fresh_ok": true,
+      "model": "claude-sonnet-5-5",
+      "cli": "2.1.327",
+      "result_subtype": "success",
+      "contamination_events": []
+    }
+  ],
+  "note": "broad kill commands are counted from the trace; collateral kills are proven only for the main checkout",
+  "missing_runs": [],
+  "foreign_runs": {},
+  "invalid_runs": []
+}
