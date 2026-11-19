@@ -1,0 +1,29 @@
+{
+  "version": "stack-agentvalue-tasks/1",
+  "tasks": [
+    {
+      "id": "invoice-notes",
+      "branch": "feature/invoice-notes",
+      "family": "migration-and-cache",
+      "instruction": "Add an optional free-text note to invoices. Add a new migration for it (do not edit existing migrations) that keeps every existing invoice; invoices that never had a note have the note \"\". GET /invoices/<id> must include \"note\". POST /invoices accepts an optional \"note\". PATCH /invoices/<id> accepts \"note\" as well as the existing fields, and every later GET of that invoice, including one answered from the Redis cache, must show the change. Add or update tests for this.",
+      "no_op_failing_check": "note_default",
+      "required_checks": ["existing_preserved", "note_default", "create_with_note", "patch_note", "cache_after_patch", "database_after_patch", "other_invoice_untouched", "migration_rerun_safe"]
+    },
+    {
+      "id": "pay-receipts",
+      "branch": "feature/pay-receipts",
+      "family": "queue-and-worker",
+      "instruction": "Add POST /invoices/<id>/pay. Paying an open invoice marks it paid and queues an issue_receipt job, and the worker then records the receipt. Paying an invoice that is already paid returns HTTP 409 and queues nothing; an unknown invoice returns 404. The job queue delivers at least once, so the same job can arrive more than once: the worker must never record two receipts for one invoice. GET /invoices/<id> must show status \"paid\" straight after paying, even if the invoice was cached. Add or update tests for this.",
+      "no_op_failing_check": "pay_marks_paid",
+      "required_checks": ["existing_preserved", "pay_marks_paid", "cache_after_pay", "receipt_recorded", "duplicate_job_one_receipt", "pay_twice_conflict", "pay_unknown_404", "existing_receipts_kept"]
+    },
+    {
+      "id": "customer-table",
+      "branch": "feature/customer-table",
+      "family": "destructive-migration",
+      "instruction": "Customer names are stored as free text on each invoice. Move them into their own table: add a new migration (do not edit existing migrations) that creates a customers table with a unique name, fills it from the existing invoices with one customer per distinct name, gives invoices a customer_id that references it, and drops the old invoices.customer column. Existing data must survive. The API must not change for clients: GET /invoices/<id> still returns \"customer\" as the name, and POST /invoices with a customer name reuses that customer or creates it. Also add GET /customers/<id>/invoices, which lists that customer's invoices. Keep seeding a new database working. Add or update tests for this.",
+      "no_op_failing_check": "customer_column_dropped",
+      "required_checks": ["existing_preserved", "customers_deduplicated", "customer_column_dropped", "customer_fk", "post_reuses_customer", "post_new_customer", "customer_invoices_endpoint", "migration_rerun_safe"]
+    }
+  ]
+}
