@@ -2,8 +2,8 @@
 """Local development for this repository. Every git worktree gets its own services.
 
 Tools are pinned in mise.toml. Each worktree runs its own PostgreSQL, Redis, API and worker,
-on ports chosen for that worktree, with data under .dev/ in the worktree. Nothing is shared
-between worktrees, so several people or agents can work in parallel.
+on ports reserved for that worktree in a machine-wide registry, with data under .dev/ in the
+worktree. Nothing is shared between worktrees, so several people or agents can work in parallel.
 
   python3 dev.py up               install pinned tools, start everything, migrate, seed a new database
   python3 dev.py status           show this worktree's services, ports and process IDs (JSON)
@@ -11,13 +11,15 @@ between worktrees, so several people or agents can work in parallel.
   python3 dev.py exec CMD...      run a command with the pinned tools and this worktree's service URLs
   python3 dev.py test [ARGS...]   run the test suite (pytest) against this worktree's services
   python3 dev.py smoke            run the smoke test against this worktree's services
-  python3 dev.py restart [api|worker]   restart the app processes after you change their code
+  python3 dev.py restart [api|worker]   apply migrations and restart the app processes after a code change
   python3 dev.py migrate          apply pending migrations now
   python3 dev.py seed             load the demo data again (safe to repeat)
   python3 dev.py logs [NAME]      show the last lines of a service's log (api, worker, postgres, redis)
   python3 dev.py down [--purge]   stop everything this worktree started and confirm it is gone;
-                                  --purge also deletes this worktree's data
+                                  --purge also deletes this worktree's data and releases its ports
 """
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -34,11 +36,11 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent
 DEV = ROOT / '.dev'
 STATE = DEV / 'state.json'
-PORTS = DEV / 'ports.json'
 PGDATA = DEV / 'postgres'
 SEEDED = DEV / 'seeded'
 APPS = {'api': ['uv', 'run', '--frozen', 'python', 'app.py'], 'worker': ['uv', 'run', '--frozen', 'python', 'worker.py']}
-SERVICES = ['postgres', 'redis', 'api']
+SERVICES = ['postgres', 'redis', 'api', 'worker']
+REGISTRY_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'ledger-dev'
 
 
 def fail(message):
@@ -58,10 +60,20 @@ def load(path, default=None):
 
 
 def save(path, data):
-    DEV.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
+
+
+@contextlib.contextmanager
+def locked(path):
+    """An exclusive lock; waits for whoever holds it (another command in this worktree, or a
+    port allocation in another worktree)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
 def port_free(port):
@@ -79,26 +91,44 @@ def listening(port):
         return connection.connect_ex(('127.0.0.1', port)) == 0
 
 
-def choose_ports():
-    """Stable ports per worktree: a slot derived from the worktree path, moving on if taken."""
-    saved = load(PORTS)
-    if saved and all(port_free(saved[name]) for name in SERVICES):
-        return saved
-    slot = int(hashlib.sha256(str(ROOT).encode()).hexdigest(), 16) % 900
-    for attempt in range(900):
-        base = 30000 + ((slot + attempt) % 900) * 10
-        ports = {name: base + offset for offset, name in enumerate(SERVICES)}
-        if all(port_free(port) for port in ports.values()):
-            save(PORTS, ports)
-            return ports
+def reserve_ports(running):
+    """This worktree's ports from the machine-wide registry, under its lock. A worktree keeps its
+    ports; a new one gets the slot its path hashes to, or the next slot no other worktree holds
+    and nothing else listens on. Entries of deleted worktrees are released."""
+    with locked(REGISTRY_DIR / 'ports.lock'):
+        registry = {path: ports for path, ports in (load(REGISTRY_DIR / 'ports.json') or {}).items() if Path(path).exists()}
+        mine = registry.get(str(ROOT))
+        if mine and set(mine) == set(SERVICES) and all(port_free(mine[n]) or n in running for n in SERVICES):
+            save(REGISTRY_DIR / 'ports.json', registry)
+            return mine
+        taken = {port for path, ports in registry.items() if path != str(ROOT) for port in ports.values()}
+        slot = int(hashlib.sha256(str(ROOT).encode()).hexdigest(), 16) % 900
+        for attempt in range(900):
+            base = 30000 + ((slot + attempt) % 900) * 10
+            ports = {name: base + offset for offset, name in enumerate(SERVICES)}
+            if not set(ports.values()) & taken and all(port_free(p) for p in ports.values()):
+                registry[str(ROOT)] = ports
+                save(REGISTRY_DIR / 'ports.json', registry)
+                return ports
     fail('no free port block found between 30000 and 38999')
 
 
-def environment(ports):
-    user = 'postgres'
-    return {'DATABASE_URL': f'postgresql://{user}@127.0.0.1:{ports["postgres"]}/postgres',
-            'REDIS_URL': f'redis://127.0.0.1:{ports["redis"]}/0',
-            'API_URL': f'http://127.0.0.1:{ports["api"]}', 'API_PORT': str(ports['api'])}
+def release_ports():
+    with locked(REGISTRY_DIR / 'ports.lock'):
+        registry = load(REGISTRY_DIR / 'ports.json') or {}
+        registry.pop(str(ROOT), None)
+        save(REGISTRY_DIR / 'ports.json', registry)
+
+
+def environment(ports, services=SERVICES):
+    env = {}
+    if 'postgres' in services:
+        env['DATABASE_URL'] = f'postgresql://postgres@127.0.0.1:{ports["postgres"]}/postgres'
+    if 'redis' in services:
+        env['REDIS_URL'] = f'redis://127.0.0.1:{ports["redis"]}/0'
+    if 'api' in services:
+        env.update(API_URL=f'http://127.0.0.1:{ports["api"]}', API_PORT=str(ports['api']))
+    return env
 
 
 def process_start(pid):
@@ -122,6 +152,8 @@ def setup():
 
 
 def start_postgres(ports, record):
+    if PGDATA.exists() and not (PGDATA / 'PG_VERSION').exists():
+        shutil.rmtree(PGDATA)  # an interrupted initdb: start again
     new_database = not PGDATA.exists()
     if new_database:
         mise('initdb', '-D', str(PGDATA), '-U', 'postgres', '-A', 'trust', '-E', 'UTF8', '--locale=en_US.UTF-8',
@@ -130,6 +162,7 @@ def start_postgres(ports, record):
          '-o', f"-h 127.0.0.1 -p {ports['postgres']} -k ''", 'start', stdout=subprocess.DEVNULL, check=True)
     pid = int((PGDATA / 'postmaster.pid').read_text().splitlines()[0])
     record['services']['postgres'] = {'pid': pid, 'started': process_start(pid), 'port': ports['postgres']}
+    save(STATE, record)
     return new_database
 
 
@@ -146,61 +179,76 @@ def start_redis(ports, record):
         time.sleep(0.05)
     pid = int(pidfile.read_text().strip())
     record['services']['redis'] = {'pid': pid, 'started': process_start(pid), 'port': ports['redis']}
+    save(STATE, record)
 
 
 def start_app(name, ports, record):
-    env = dict(os.environ, **environment(ports), PORT=str(ports['api']), IDENTITY_TOKEN=record['identity'])
+    env = dict(os.environ, **environment(ports), PORT=str(ports['api']), IDENTITY_TOKEN=record['identity'],
+               WORKER_HEALTH_PORT=str(ports['worker']))
     with (DEV / f'{name}.log').open('ab') as log:
         process = subprocess.Popen(['mise', 'x', '--', *APPS[name]], cwd=ROOT, env=env, stdout=log, stderr=log,
                                    stdin=subprocess.DEVNULL, start_new_session=True)
-    entry = {'pid': process.pid, 'started': process_start(process.pid), 'pgid': process.pid}
-    if name == 'api':
-        entry['port'] = ports['api']
-    record['services'][name] = entry
+    record['services'][name] = {'pid': process.pid, 'started': process_start(process.pid), 'pgid': process.pid, 'port': ports[name]}
     save(STATE, record)
 
 
-def wait_api(ports, record):
+def wait_ready(ports, record, names):
+    """The api must answer with this worktree's identity; the worker must answer on its health port."""
     deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(f'http://127.0.0.1:{ports["api"]}/identity', timeout=1) as response:
-                if response.read().decode() == record['identity']:
-                    return
-        except (OSError, ValueError):
-            pass
-        if not alive(record['services']['api']):
-            break
+    pending = set(names)
+    while pending and time.monotonic() < deadline:
+        if 'api' in pending:
+            try:
+                with urllib.request.urlopen(f'http://127.0.0.1:{ports["api"]}/identity', timeout=1) as response:
+                    if response.read().decode() == record['identity']:
+                        pending.discard('api')
+            except (OSError, ValueError):
+                pass
+        if 'worker' in pending and listening(ports['worker']):
+            pending.discard('worker')
+        for name in list(pending):
+            if not alive(record['services'][name]):
+                fail(f'the {name} exited while starting; see `python3 dev.py logs {name}`')
         time.sleep(0.2)
-    fail(f'the api did not become ready; see `python3 dev.py logs api`')
+    if pending:
+        fail(f'{sorted(pending)} did not become ready; see `python3 dev.py logs`')
+
+
+def migrate_and_seed(ports, new_database):
+    env = dict(os.environ, **environment(ports, ['postgres', 'redis']))
+    if mise('uv', 'run', '--frozen', 'python', 'migrate.py', env=env).returncode != 0:
+        fail('migrate.py failed. PostgreSQL and Redis keep running: fix the migration and run `python3 dev.py up` again')
+    if new_database or not SEEDED.exists():
+        if mise('uv', 'run', '--frozen', 'python', 'seed.py', env=env).returncode != 0:
+            fail('seed.py failed. PostgreSQL and Redis keep running: fix it and run `python3 dev.py up` again')
+        SEEDED.write_text('seeded\n')
 
 
 def up():
-    record = state()
-    running = {name: alive(entry) for name, entry in record['services'].items()}
-    if record['services'] and all(running.values()) and set(running) == {'postgres', 'redis', 'api', 'worker'}:
-        return print(json.dumps(summary(record), indent=2))
-    if any(running.values()):
-        fail('some services of this worktree are still running from an earlier start; run `python3 dev.py down` first')
-    setup()
-    ports = choose_ports()
-    record = {'services': {}, 'ports': ports, 'identity': secrets.token_hex(16), 'worktree': str(ROOT)}
-    save(STATE, record)  # saved early so `down` can stop a partial start
-    new_database = start_postgres(ports, record)
-    save(STATE, record)
-    start_redis(ports, record)
-    save(STATE, record)
-    env = dict(os.environ, **environment(ports))
-    if mise('uv', 'run', '--frozen', 'python', 'migrate.py', env=env).returncode != 0:
-        fail('migrate.py failed (services are running; fix it and run `python3 dev.py up` again, or `down`)')
-    if new_database or not SEEDED.exists():
-        if mise('uv', 'run', '--frozen', 'python', 'seed.py', env=env).returncode != 0:
-            fail('seed.py failed (services are running; fix it and run `python3 dev.py up` again, or `down`)')
-        SEEDED.write_text('seeded\n')
-    start_app('api', ports, record)
-    start_app('worker', ports, record)
-    wait_api(ports, record)
-    print(json.dumps(summary(record), indent=2))
+    with locked(DEV / 'lock'):
+        record = state()
+        running = {name for name, entry in record['services'].items() if alive(entry)}
+        if running == set(SERVICES):
+            return print(json.dumps(summary(record), indent=2))
+        # Anything recorded but dead is forgotten; whatever still runs is kept (a partial start resumes).
+        record['services'] = {name: entry for name, entry in record['services'].items() if name in running}
+        setup()
+        ports = reserve_ports(running)
+        if record.get('ports') and record['ports'] != ports and running:
+            fail('this worktree\'s running services use other ports than its reservation; run `python3 dev.py down` first')
+        record.update(ports=ports, identity=record.get('identity') or secrets.token_hex(16), worktree=str(ROOT))
+        save(STATE, record)  # saved early so `down` can stop a partial start
+        new_database = False
+        if 'postgres' not in running:
+            new_database = start_postgres(ports, record)
+        if 'redis' not in running:
+            start_redis(ports, record)
+        migrate_and_seed(ports, new_database)
+        missing = [name for name in APPS if name not in running]
+        for name in missing:
+            start_app(name, ports, record)
+        wait_ready(ports, record, missing)
+        print(json.dumps(summary(record), indent=2))
 
 
 def summary(record):
@@ -216,73 +264,78 @@ def status():
     print(json.dumps(summary(record), indent=2))
 
 
-def current_env():
+def current_env(need=('postgres', 'redis')):
+    """Addresses of this worktree's running services. Fails if one the command needs is not running."""
     record = state()
-    if not record['services'] or not all(alive(e) for e in record['services'].values()):
-        fail('this worktree\'s services are not all running; run `python3 dev.py up` (see `python3 dev.py status`)')
-    return environment(record['ports'])
+    running = [name for name, entry in record['services'].items() if alive(entry)]
+    missing = [name for name in need if name not in running]
+    if missing:
+        fail(f'{missing} not running in this worktree; run `python3 dev.py up` (see `python3 dev.py status`)')
+    absent = [name for name in SERVICES if name not in running]
+    if absent:
+        print(f'dev.py: note: {absent} not running; their addresses are left out', file=sys.stderr)
+    return environment(record['ports'], running)
 
 
 def stop_process(name, entry, timeout=10):
-    if not alive(entry):
-        return True
-    if name == 'postgres':
+    if name == 'postgres' and alive(entry):
         mise('pg_ctl', '-D', str(PGDATA), '-m', 'fast', '-w', 'stop', stdout=subprocess.DEVNULL)
-    else:
+    elif alive(entry):
         try:
-            if 'pgid' in entry:
-                os.killpg(entry['pgid'], signal.SIGTERM)
-            else:
-                os.kill(entry['pid'], signal.SIGTERM)
+            os.kill(entry['pid'], signal.SIGTERM)
         except ProcessLookupError:
             pass
-    deadline = time.monotonic() + timeout
-    while alive(entry) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    if alive(entry):
+    if 'pgid' in entry:  # the app's whole process group: `mise x` -> `uv run` -> python
         try:
-            os.kill(entry['pid'], signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        time.sleep(0.2)
-    if 'pgid' in entry:  # anything else the app's process group still holds (uv's child)
-        try:
-            os.killpg(entry['pgid'], signal.SIGKILL)
+            os.killpg(entry['pgid'], signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
-    return not alive(entry)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and (alive(entry) or ('port' in entry and listening(entry['port']))):
+        time.sleep(0.05)
+    if alive(entry) or ('port' in entry and listening(entry['port'])):
+        for kill in ([lambda: os.killpg(entry['pgid'], signal.SIGKILL)] if 'pgid' in entry else []) + [lambda: os.kill(entry['pid'], signal.SIGKILL)]:
+            try:
+                kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(0.5)
+    return not alive(entry) and not ('port' in entry and listening(entry['port']))
 
 
 def restart(names):
-    record = state()
-    if not record['services']:
-        fail('nothing is running; run `python3 dev.py up`')
-    for name in names or ['api', 'worker']:
-        if name not in APPS:
-            fail(f'can only restart api or worker, not {name}')
-        stop_process(name, record['services'].get(name, {}))
-        start_app(name, record['ports'], record)
-    if 'api' in (names or ['api']):
-        wait_api(record['ports'], record)
-    print(json.dumps(summary(record), indent=2))
+    with locked(DEV / 'lock'):
+        record = state()
+        if not all(alive(record['services'].get(n)) for n in ('postgres', 'redis')):
+            fail('postgres and redis are not running; run `python3 dev.py up`')
+        names = names or list(APPS)
+        for name in names:
+            if name not in APPS:
+                fail(f'can only restart api or worker, not {name}')
+        for name in names:
+            stop_process(name, record['services'].get(name) or {})
+        migrate_and_seed(record['ports'], False)
+        for name in names:
+            start_app(name, record['ports'], record)
+        wait_ready(record['ports'], record, names)
+        print(json.dumps(summary(record), indent=2))
 
 
 def down(purge):
-    record = state()
-    stopped, left = [], []
-    for name in ['worker', 'api', 'redis', 'postgres']:
-        entry = record['services'].get(name)
-        if not entry:
-            continue
-        (stopped if stop_process(name, entry) else left).append(name)
-    ports_open = [p for p in (record.get('ports') or {}).values() if listening(p)
-                  and any(alive(e) for e in record['services'].values())]
-    if left:
-        fail(f'could not stop {left}; check `python3 dev.py status`')
-    save(STATE, {'services': {}})
-    if purge and DEV.exists():
-        shutil.rmtree(DEV)
-    print(json.dumps({'stopped': stopped, 'confirmed': not left and not ports_open, 'data': 'deleted' if purge else 'kept in .dev/'}))
+    with locked(DEV / 'lock'):
+        record = state()
+        stopped, left = [], []
+        for name in ['worker', 'api', 'redis', 'postgres']:
+            entry = record['services'].get(name)
+            if entry:
+                (stopped if stop_process(name, entry) else left).append(name)
+        if left:
+            fail(f'could not stop {left}; check `python3 dev.py status`')
+        save(STATE, {'services': {}, 'ports': record.get('ports'), 'identity': record.get('identity')})
+    if purge:
+        shutil.rmtree(DEV, ignore_errors=True)
+        release_ports()
+    print(json.dumps({'stopped': stopped, 'confirmed': True, 'data': 'deleted' if purge else 'kept in .dev/'}))
 
 
 def main():
@@ -302,16 +355,15 @@ def main():
             fail('usage: python3 dev.py exec CMD...')
         raise SystemExit(mise(*rest, env=dict(os.environ, **current_env())).returncode)
     elif command == 'test':
-        raise SystemExit(mise('uv', 'run', '--frozen', 'pytest', '-q', *rest, env=dict(os.environ, **current_env())).returncode)
+        raise SystemExit(mise('uv', 'run', '--frozen', 'pytest', '-q', *rest, env=dict(os.environ, **current_env(SERVICES))).returncode)
     elif command == 'smoke':
-        raise SystemExit(mise('uv', 'run', '--frozen', 'python', 'smoke.py', env=dict(os.environ, **current_env())).returncode)
+        raise SystemExit(mise('uv', 'run', '--frozen', 'python', 'smoke.py', env=dict(os.environ, **current_env(('postgres', 'redis', 'api')))).returncode)
     elif command in {'migrate', 'seed'}:
         raise SystemExit(mise('uv', 'run', '--frozen', 'python', f'{command}.py', env=dict(os.environ, **current_env())).returncode)
     elif command == 'restart':
         restart(rest)
     elif command == 'logs':
-        names = rest or ['api', 'worker', 'postgres', 'redis']
-        for name in names:
+        for name in rest or ['api', 'worker', 'postgres', 'redis']:
             path = DEV / f'{name}.log'
             print(f'==> {name} ({path})')
             print(''.join(path.read_text(errors='replace').splitlines(True)[-40:]) if path.exists() else '(no log yet)')

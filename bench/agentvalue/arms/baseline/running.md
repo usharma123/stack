@@ -1,7 +1,7 @@
 ## Running it in this worktree
 
 Tools are pinned in `mise.toml`. `dev.py` gives this worktree its own PostgreSQL, Redis, API and worker,
-with ports chosen for this worktree and data under `.dev/`. `python3 dev.py --help` lists every command;
+with ports reserved for this worktree and data under `.dev/`. `python3 dev.py --help` lists every command;
 `status` prints JSON.
 
 - `python3 dev.py up` installs the pinned tools, starts postgres, redis, api and worker, and checks that
@@ -15,8 +15,8 @@ with ports chosen for this worktree and data under `.dev/`. `python3 dev.py --he
 - `python3 dev.py test` runs the test suite (pytest) against this worktree's services; `python3 dev.py
   smoke` runs the smoke test. `python3 dev.py migrate` and
   `python3 dev.py seed` apply migrations or load the demo data now.
-- `python3 dev.py restart api worker` restarts the app processes after you change their code (they do not
-  reload on their own).
+- `python3 dev.py restart api worker` applies pending migrations and restarts the app processes after you
+  change their code (they do not reload on their own).
 - `python3 dev.py logs <service>` shows a service's recent output.
 - `python3 dev.py down` stops everything this worktree started and confirms it is gone. The data is
   kept; `python3 dev.py down --purge` also deletes this worktree's data.

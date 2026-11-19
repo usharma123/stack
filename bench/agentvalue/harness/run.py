@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT.parent))
 import arms as legacy  # bench/arms.py
 import grade
 import observe
+import redact
 
 TASKS = json.loads((ROOT / 'tasks.json').read_text())['tasks']
 TASK = {t['id']: t for t in TASKS}
@@ -59,8 +60,9 @@ def fingerprints():
     files = {}
     for path in sorted(ROOT.rglob('*')):
         rel = path.relative_to(ROOT)
-        if path.is_file() and rel.parts[0] not in {'results'} and '__pycache__' not in rel.parts and path.suffix != '.md' \
-                and '.venv' not in rel.parts:
+        agent_facing = path.suffix == '.md' and (rel.parts[0] == 'arms' or rel.name == 'PROTOCOL.md')
+        if path.is_file() and rel.parts[0] not in {'results'} and '__pycache__' not in rel.parts \
+                and (path.suffix != '.md' or agent_facing) and '.venv' not in rel.parts:
             files[str(rel)] = sha256(path)
     for extra in ['bench/arms.py']:
         files[extra] = sha256(REPO_ROOT / extra)
@@ -119,8 +121,11 @@ class Arm:
     def up(self, cwd):
         return [self.stack, '--json', 'up', '--ttl', '4h', '--timeout', '5m'] if self.name == 'stack' else ['python3', 'dev.py', 'up']
 
+    ADDRESSES = ['sh', '-c', 'printf "DATABASE_URL=%s\nREDIS_URL=%s\nAPI_URL=%s\n" "$DATABASE_URL" "$REDIS_URL" "$API_URL"']
+
     def env_print(self):
-        return [self.stack, 'exec', '--', 'env'] if self.name == 'stack' else ['python3', 'dev.py', 'exec', 'env']
+        # Only the three addresses: never the whole environment, which holds host credentials.
+        return [self.stack, 'exec', '--', *self.ADDRESSES] if self.name == 'stack' else ['python3', 'dev.py', 'exec', *self.ADDRESSES]
 
     def down(self):
         return [self.stack, '--json', 'down'] if self.name == 'stack' else ['python3', 'dev.py', 'down']
@@ -135,7 +140,7 @@ def sh(argv, cwd, env, timeout=600, log=None, name=None):
     except subprocess.TimeoutExpired as error:
         code, out, err = 'timeout', str(error.stdout or ''), str(error.stderr or '')
     entry = {'name': name or Path(str(argv[0])).name, 'argv': [str(a) for a in argv], 'cwd': str(cwd), 'exit': code,
-             'started': started, 'seconds': round(now() - started, 2), 'stdout': out[-6000:], 'stderr': err[-6000:]}
+             'started': started, 'seconds': round(now() - started, 2), 'stdout': redact.scrub(out)[-6000:], 'stderr': redact.scrub(err)[-6000:]}
     if log is not None:
         log.append(entry)
     return entry
@@ -206,7 +211,7 @@ def capture(worktree, start_commit, out_dir, env):
 
 # ------------------------------------------------------------------ worktree databases
 
-def read_migrations(data_dir, workdir):
+def read_migrations(data_dir, workdir, token=''):
     """Start a private postgres on a worktree's data directory and read schema_migrations."""
     data_dir = Path(data_dir)
     if not (data_dir / 'PG_VERSION').exists():
@@ -225,8 +230,16 @@ def read_migrations(data_dir, workdir):
                                  '-c', "SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY 1"],
                                 env=env, capture_output=True, text=True)
         canary = subprocess.run([str(grade.PG_BIN / 'psql'), '-X', '-At', '-h', '127.0.0.1', '-p', str(port), '-U', 'postgres', '-d', 'postgres',
-                                 '-c', 'SELECT count(*) FROM invoices WHERE id = 9001'], env=env, capture_output=True, text=True)
-        return {'exists': True, 'versions': q.stdout.split() if q.returncode == 0 else None, 'error': q.stderr[-300:] if q.returncode else None,
+                                 '-c', f"SELECT count(*) FROM invoices i WHERE row_to_json(i)::text LIKE '%main-checkout {token}%'"],
+                                env=env, capture_output=True, text=True)
+        if 'customers' in tables.stdout.split():
+            in_customers = subprocess.run([str(grade.PG_BIN / 'psql'), '-X', '-At', '-h', '127.0.0.1', '-p', str(port), '-U', 'postgres',
+                                           '-d', 'postgres', '-c', f"SELECT count(*) FROM customers c WHERE row_to_json(c)::text LIKE '%main-checkout {token}%'"],
+                                          env=env, capture_output=True, text=True)
+            canary = canary if canary.stdout.strip() not in ('', '0') else in_customers
+        missing_table = q.returncode != 0 and 'schema_migrations' in q.stderr and 'does not exist' in q.stderr
+        return {'exists': True, 'versions': q.stdout.split() if q.returncode == 0 else ([] if missing_table else None),
+                'error': q.stderr[-300:] if q.returncode and not missing_table else None,
                 'tables': tables.stdout.split(), 'has_main_canary': canary.stdout.strip() not in ('', '0')}
     finally:
         subprocess.run([str(grade.PG_BIN / 'pg_ctl'), '-D', str(data_dir), '-m', 'fast', '-w', 'stop'], env=env, capture_output=True)
@@ -361,6 +374,16 @@ def stop_tree(proc, grace=10):
         proc.wait(10)
 
 
+def cli_paths(argv0):
+    """Paths that identify the agent CLI's own binary, so its housekeeping helpers can be told apart."""
+    found = shutil.which(argv0) or argv0
+    paths = {found, os.path.realpath(found)}
+    return tuple(p for p in paths if p and p.startswith('/'))
+
+
+CORE_SERVICE = re.compile(r'(/bin/postgres |redis-server|python (app|worker)\.py|uv run|__supervise)')
+
+
 def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=False, tasks=None):
     config = dict(plan['config'])
     if tasks:
@@ -369,7 +392,11 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
     root = Path(tempfile.mkdtemp(prefix=f'avr{pair_index}{arm_name[0]}-', dir='/tmp'))
-    record = {'pair': pair_index, 'arm': arm_name, 'root': str(root), 'started': now(), 'steps': [], 'agents': {},
+    run_id = root.name.replace('_', '-')
+    observe.RUN_SUFFIX = f'.{run_id}'
+    record = {'pair': pair_index, 'arm': arm_name, 'root': str(root), 'run_id': run_id, 'started': now(), 'steps': [], 'agents': {},
+              'plan_sha256': plan.get('_sha256'), 'plan_name': plan.get('name'), 'plan_kind': plan.get('kind'),
+              'model': config['model'], 'effort': config['effort'],
               'stack_binary_sha256': sha256(config['stack_binary']), 'source_rev': git_rev(), 'valid': True, 'invalid_reasons': []}
     steps = record['steps']
     sampler = None
@@ -378,10 +405,13 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         record['valid'] = False
         record['invalid_reasons'].append(reason)
 
+    def marker(name):
+        return f'{name}.{run_id}'
+
     try:
         grade.ensure_grader_venv()
         bin_dir = arm.bin_dir(root)
-        env_main = machine_env(root, bin_dir, marker='main')
+        env_main = machine_env(root, bin_dir, marker=marker('main'))
         main = root / 'main'
         shutil.copytree(ROOT / 'fixture', main, ignore=shutil.ignore_patterns('__pycache__', '.venv', '.pytest_cache'))
         arm.files(main)
@@ -390,11 +420,14 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             r = sh([arm.stack, '--json', 'compile'], main, env_main, log=steps, name='compile')
             if r['exit'] != 0:
                 raise RuntimeError('stack compile failed')
-        for argv in [[*GIT, 'init', '-q'], [*GIT, 'add', '-A'], [*GIT, 'commit', '-q', '-m', 'Starting point']]:
+        for argv in [[*GIT, 'init', '-q'], ['git', 'config', 'user.name', 'agent'], ['git', 'config', 'user.email', 'agent@example.invalid'],
+                     ['git', 'config', 'core.hooksPath', '/dev/null'], ['git', 'config', 'commit.gpgsign', 'false'],
+                     [*GIT, 'add', '-A'], [*GIT, 'commit', '-q', '-m', 'Starting point']]:
             if sh(argv, main, env_main, log=steps, name='git')['exit'] != 0:
                 raise RuntimeError(f'{argv} failed')
         start_commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=main, capture_output=True, text=True).stdout.strip()
         record['start_commit'] = start_commit
+        record['readme_words'] = len((main / 'README.md').read_text().split())
 
         # The bystander: the main checkout's own running services with local data nobody else may touch.
         r = sh(arm.up(main), main, env_main, log=steps, name='bystander_up')
@@ -404,14 +437,16 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         if not {'DATABASE_URL', 'REDIS_URL'} <= set(bystander_env):
             raise RuntimeError(f'could not read the bystander addresses: {bystander_env}')
         token = hashlib.sha256(f'{root}{now()}'.encode()).hexdigest()[:12]
+        record['canary_token'] = token
         genv = grade.base_env(bystander_env)
         planted = sh([grade.GRADER_PY, HERE / 'canary.py', 'plant', token], main, genv, log=steps, name='canary_plant')
         if planted['exit'] != 0:
             raise RuntimeError('canary plant failed')
-        time.sleep(2.5)  # let PostgreSQL flush the planting session's write counters
+        time.sleep(2.5)  # let PostgreSQL flush the planting session's write counters (diagnostic only)
         before = json.loads(sh([grade.GRADER_PY, HERE / 'canary.py', 'fingerprint'], main, genv, log=steps, name='canary_before')['stdout'])
         groups_of = lambda names: owned_paths(arm, main, env_main, {n: (main if n == 'main' else root / n) for n in names})
-        bystander_procs = observe.attributed(groups_of(['main']))['main']
+        durable = lambda rows: [r for r in rows if CORE_SERVICE.search(r['command'])]
+        bystander_procs = durable(observe.attributed(groups_of(['main']))['main'])
         record['bystander'] = {'env': bystander_env, 'fingerprint_before': before,
                                'processes_before': [{k: p[k] for k in ['pid', 'started', 'command']} for p in bystander_procs]}
 
@@ -427,11 +462,37 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
 
         names = {task: SHORT[task] for task in worktrees}
         all_names = ['main'] + [names[t] for t in worktrees]
-        sampler = observe.Sampler(lambda: groups_of(all_names), out_dir / 'sampler.jsonl', interval=config.get('sample_interval', 1.0))
+        sampler = observe.Sampler(lambda: groups_of(all_names), out_dir / 'sampler.jsonl', interval=config.get('sample_interval', 1.0),
+                                  ignore_clients=(str(bin_dir / 'stack'), arm.stack))
         sampler.start()
 
-        # Launch every agent at once.
-        procs, agent_dirs = {}, {}
+        # Launch every agent at once; each one's exit is observed by its own thread.
+        agent_dirs, threads, helpers = {}, [], None
+        lock = threading.Lock()
+
+        def watch(task, proc, started_mono, out, err):
+            timed_out = False
+            try:
+                proc.wait(config['agent_seconds'])
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                stop_tree(proc)
+            ended_mono = time.monotonic()
+            out.close(); err.close()
+            groups = groups_of([names[task]])  # fresh: the agent may have created its state just now
+            left = observe.attributed(groups, exclude={proc.pid})[names[task]]
+            listeners, _ = observe.tcp()
+            cli_own = [p for p in left if p['command'].startswith(helpers or ('\0',))]
+            left = [p for p in left if p not in cli_own]
+            left_pids = {p['pid'] for p in left}
+            with lock:
+                record['agents'][task].update(
+                    ended=now(), seconds=round(ended_mono - started_mono, 2), exit=proc.returncode, timed_out=timed_out,
+                    observed_after_exit_s=round(time.monotonic() - ended_mono, 2),
+                    left_running=[{k: p[k] for k in ['pid', 'started', 'command', 'marker']} for p in left],
+                    cli_helpers_left=[{k: p[k] for k in ['pid', 'command']} for p in cli_own],
+                    left_listening=sorted(port for port, pid in listeners.items() if pid in left_pids))
+
         for task, path in worktrees.items():
             adir = out_dir / 'agents' / task
             adir.mkdir(parents=True)
@@ -441,7 +502,8 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             template = agent_override(task) if agent_override else config['agent_command']
             argv = substitute(template, {'prompt': prompt, 'model': config['model'], 'effort': config['effort'],
                                          'max_usd': config['max_usd_per_agent'], 'task': task})
-            env = machine_env(root, bin_dir, marker=names[task])
+            helpers = helpers or (cli_paths(argv[0]) if not agent_override else None)
+            env = machine_env(root, bin_dir, marker=marker(names[task]))
             env['DISABLE_AUTOUPDATER'] = '1'
             env['AGENTVALUE_TASK'] = task
             env['AGENTVALUE_ARM'] = arm.name
@@ -449,53 +511,52 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             out = open(adir / 'trace.jsonl', 'wb')
             err = open(adir / 'stderr.txt', 'wb')
             started = now()
+            started_mono = time.monotonic()
             proc = subprocess.Popen(argv, cwd=path, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL, start_new_session=True)
-            procs[task] = (proc, started, out, err)
             record['agents'][task] = {'worktree': str(path), 'marker': names[task], 'started': started, 'pid': proc.pid}
-
-        deadline = {task: started + config['agent_seconds'] for task, (_, started, _, _) in procs.items()}
-        pending = set(procs)
-        while pending:
-            for task in sorted(pending):
-                proc, started, out, err = procs[task]
-                timed_out = False
-                if proc.poll() is None and time.time() > deadline[task]:
-                    stop_tree(proc)
-                    timed_out = True
-                if proc.poll() is not None:
-                    out.close(); err.close()
-                    ended = now()
-                    # Whatever this worktree still runs now was left by its agent.
-                    left = observe.attributed(groups_of([names[task]]), exclude={proc.pid})[names[task]]
-                    listeners, _ = observe.tcp()
-                    left_pids = {p['pid'] for p in left}
-                    entry = record['agents'][task]
-                    entry.update(ended=ended, seconds=round(ended - started, 2), exit=proc.returncode, timed_out=timed_out,
-                                 left_running=[{k: p[k] for k in ['pid', 'started', 'command', 'marker']} for p in left],
-                                 left_listening=sorted(port for port, pid in listeners.items() if pid in left_pids))
-                    pending.discard(task)
-            time.sleep(0.5)
+            thread = threading.Thread(target=watch, args=(task, proc, started_mono, out, err), daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        for task in worktrees:
+            if 'left_running' not in record['agents'][task]:
+                raise RuntimeError(f'no exit observation for {task}')
 
         sampler.stop()
         record['sampler'] = sampler.summary()
+        if record['sampler']['errors']:
+            invalid(f"sampler errors: {record['sampler']['errors'][:3]}")
 
         # Bystander integrity.
         after = json.loads(sh([grade.GRADER_PY, HERE / 'canary.py', 'fingerprint'], main, genv, log=steps, name='canary_after')['stdout'] or 'null')
+        if after is None:
+            invalid('could not read the bystander fingerprint after the agents')
         alive = {(p['pid'], p['started']) for p in observe.attributed(groups_of(['main']))['main']}
         lost = [p for p in record['bystander']['processes_before'] if (p['pid'], p['started']) not in alive]
         changed = sorted(k for k in before if (after or {}).get(k) != before[k])
         record['bystander'].update(fingerprint_after=after, changed=changed, processes_lost=lost)
 
-        # Stop what agents left (recorded above), so their data directories can be read.
-        leftovers = observe.attributed(groups_of([names[t] for t in worktrees]))
-        rows = [row for group in leftovers.values() for row in group]
-        record['harness_reclaim_after_agents'] = observe.reclaim(rows, root) if rows else None
+        # Each submission, captured before anything touches the worktrees.
+        submissions = {task: capture(path, start_commit, agent_dirs[task], env_main) for task, path in worktrees.items()}
+
+        # The arm's own documented stop, run on each worktree exactly as its agent left it:
+        # does the arm recover a dirty checkout? Then the harness stops anything still left.
+        disposal_groups = groups_of([names[t] for t in worktrees])
+        recovery = {}
+        for task, path in worktrees.items():
+            log = []
+            sh(arm.down(), path, env_main, log=log, name='arm_down')
+            remaining = observe.attributed({names[task]: disposal_groups[names[task]]})[names[task]]
+            recovery[task] = {'agent_left': len(record['agents'][task]['left_running']), 'down': log,
+                              'left_after_arm_down': [{k: p[k] for k in ['pid', 'command']} for p in remaining]}
+            if remaining:
+                recovery[task]['harness_reclaim'] = observe.reclaim(remaining, root)
+                if recovery[task]['harness_reclaim']['survivors']:
+                    invalid(f'processes of {task} survived reclaim')
+        record['recovery'] = recovery
 
         # Every worktree database: which migrations ran in it, compared with every worktree's files.
-        submissions = {}
-        for task, path in worktrees.items():
-            tree, info = capture(path, start_commit, agent_dirs[task], env_main)
-            submissions[task] = (tree, info)
         dirs = stack_data_dirs(arm, main, env_main)
         own = {task: set(info['migrations']) for task, (_, info) in submissions.items()}
         original = set(p.stem for p in (ROOT / 'fixture/migrations').glob('*.sql'))
@@ -503,7 +564,9 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         with tempfile.TemporaryDirectory(prefix='avd-', dir='/tmp') as tmp:
             for task, path in worktrees.items():
                 data_dir = (path / '.dev/postgres') if arm.name == 'baseline' else dirs.get(os.path.realpath(path))
-                result = read_migrations(data_dir, Path(tmp)) if data_dir else {'exists': False}
+                result = read_migrations(data_dir, Path(tmp), token) if data_dir else {'exists': False}
+                if result.get('exists') and (result.get('error') or result.get('versions') is None):
+                    invalid(f'could not read the {task} worktree database: {result.get("error")}')
                 versions = set(result.get('versions') or [])
                 others = set().union(*[own[o] for o in own if o != task]) - original - own[task]
                 result['foreign'] = sorted(versions & others)
@@ -519,30 +582,28 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             g = grade.grade(task, tree, agent_dirs[task])
             record['agents'][task]['grade'] = {k: g[k] for k in ['passed', 'fresh_ok', 'upgrade_completed', 'checks', 'failed_checks']}
             record['agents'][task]['submission'] = info
+            if g['grader_cleanup']['survivors']:
+                invalid(f'grader processes survived for {task}')
+            if not g['upgrade_completed'] and not g['upgrade'].get('error'):
+                invalid(f'the hidden checks did not complete for {task}')
 
-        # Documented removal of each worktree, then what is left of it. The groups are taken before
-        # removal, while the arm can still say which state directories belong to which checkout.
-        disposal_groups = groups_of([names[t] for t in worktrees])
-        disposal = {}
+        # Documented removal of each worktree, then what is left of it.
+        removal = {}
         for task, path in worktrees.items():
-            log = []
-            if arm.name == 'stack':
-                sh([arm.stack, '--json', 'down'], path, env_main, log=log, name='down')
-                sh([*GIT, 'worktree', 'remove', '--force', str(path)], main, env_main, log=log, name='worktree_remove')
-            else:
-                sh(['python3', 'dev.py', 'down'], path, env_main, log=log, name='down')
-                sh([*GIT, 'worktree', 'remove', '--force', str(path)], main, env_main, log=log, name='worktree_remove')
-            disposal[task] = {'log': log}
+            removal[task] = sh([*GIT, 'worktree', 'remove', '--force', str(path)], main, env_main, name='worktree_remove')
         if arm.name == 'stack':
-            disposal['gc'] = sh([arm.stack, '--json', 'gc', '--reclaim-data'], main, env_main, log=steps, name='gc_reclaim')
+            removal['gc'] = sh([arm.stack, '--json', 'gc', '--reclaim-data'], main, env_main, log=steps, name='gc_reclaim')
         left = observe.attributed(disposal_groups)
         listeners, _ = observe.tcp()
         agent_ports = {int(p) for p, marks in record['sampler']['ports'].items() if set(marks) - {'main'}}
+        data_paths = [p for n, paths in disposal_groups.items() for p in paths if '/state/data/' in p]
+        data_left = {p: du(p) for p in data_paths if Path(p).exists() and any(Path(p).iterdir())}
         record['disposal'] = {
-            'steps': disposal,
+            'steps': removal,
             'processes_left': {m: [{k: p[k] for k in ['pid', 'command']} for p in rows] for m, rows in left.items() if rows},
             'ports_still_listening': sorted(p for p in agent_ports if p in listeners),
             'worktree_dirs_left': [str(p) for p in worktrees.values() if p.exists()],
+            'service_data_left': data_left,
             'machine_state_bytes_after': du(root / 'm'),
             'machine_state_tree_after': tree_sizes(root / 'm'),
         }
@@ -555,11 +616,12 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             except (ValueError, KeyError):
                 record['disposal']['stack_records_left'] = 'unreadable'
         rows = [row for group in left.values() for row in group]
-        record['disposal']['harness_reclaim'] = observe.reclaim(rows, root) if rows else None
+        if rows:
+            record['disposal']['harness_reclaim'] = observe.reclaim(rows, root)
 
-        # The main checkout's own teardown, then a last scan of the whole run root.
+        # The main checkout's own teardown, then a last scan of the whole run.
         sh(arm.down(), main, env_main, log=steps, name='bystander_down')
-        final = legacy.owned_processes(root)
+        final = observe.run_processes(root)
         record['final_scan'] = [{k: p[k] for k in ['pid', 'command']} for p in final]
         if final:
             record['final_reclaim'] = observe.reclaim(final, root)
@@ -567,8 +629,6 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         import traceback
         invalid(f'harness error: {error!r}')
         record['traceback'] = traceback.format_exc()
-        for task, entry in record['agents'].items():
-            pass
     finally:
         if sampler and sampler.is_alive():
             sampler.stop()
@@ -581,25 +641,34 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                         os.killpg(pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
-            remaining = legacy.owned_processes(root)
+            remaining = observe.run_processes(root)
             if remaining:
                 record.setdefault('emergency_reclaim', observe.reclaim(remaining, root))
-            survivors = legacy.owned_processes(root)
+            survivors = observe.run_processes(root)
             record['survivors_after_run'] = [{k: p[k] for k in ['pid', 'command']} for p in survivors]
             if survivors:
-                invalid('processes under the run root survived every cleanup')
+                invalid('processes of this run survived every cleanup')
         except Exception as error:
             record.setdefault('cleanup_errors', []).append(repr(error))
+            invalid(f'cleanup error: {error!r}')
         record['ended'] = now()
         record['seconds'] = round(record['ended'] - record['started'], 1)
         for task, entry in record['agents'].items():
             trace = out_dir / 'agents' / task / 'trace.jsonl'
             entry['trace_metrics'] = {k: v for k, v in trace_metrics(trace).items() if k != 'bash_commands'}
-        (out_dir / 'run.json').write_text(json.dumps(record, indent=2, default=str))
+            commands = trace_metrics(trace)['bash_commands']
+            entry['compliance'] = {'committed': bool((entry.get('submission') or {}).get('commits')),
+                                   'ran_tests': any(re.search(r'\b(stack run test|dev\.py test|pytest)\b', c) for c in commands)}
+        # Retained traces and logs may contain the host environment if an agent printed it.
+        for path in out_dir.rglob('*'):
+            if path.is_file() and path.suffix in {'.jsonl', '.txt', '.json'} and 'submitted-tree' not in path.parts:
+                redact.scrub_file(path)
+        (out_dir / 'run.json').write_text(json.dumps(redact.scrub_json(record), indent=2, default=str))
         if not keep_root and record['valid']:
             shutil.rmtree(root, ignore_errors=True)
         record['root_kept'] = root.exists()
-        (out_dir / 'run.json').write_text(json.dumps(record, indent=2, default=str))
+        (out_dir / 'run.json').write_text(json.dumps(redact.scrub_json(record), indent=2, default=str))
+        observe.RUN_SUFFIX = None
     return record
 
 
@@ -617,7 +686,7 @@ def cmd_plan(args):
         'claude', '-p', '{prompt}', '--model', '{model}', '--effort', '{effort}', '--output-format', 'stream-json', '--verbose',
         '--safe-mode', '--strict-mcp-config', '--no-session-persistence', '--disable-slash-commands',
         '--permission-mode', 'bypassPermissions', '--tools', 'Bash,Read,Edit,Write', '--max-budget-usd', '{max_usd}']
-    plan = {'kind': args.kind, 'name': args.name, 'created': now(), 'seed': args.seed,
+    plan = {'kind': args.kind, 'name': args.name, 'created': now(), 'seed': args.seed, 'protocol_rev': git_rev(),
             'config': {'tasks': [t['id'] for t in TASKS], 'model': args.model, 'effort': args.effort,
                        'agent_seconds': args.agent_seconds, 'max_usd_per_agent': args.max_usd, 'agent_command': agent_command,
                        'stack_binary': str(binary), 'stack_binary_sha256': sha256(binary), 'source_rev': git_rev(),
@@ -643,13 +712,49 @@ def check_plan(plan):
     return problems
 
 
+LOCK = Path('/tmp/stack-agentvalue.lock')
+
+
+def load_plan(path):
+    raw = Path(path).read_bytes()
+    plan = json.loads(raw)
+    plan['_sha256'] = hashlib.sha256(raw).hexdigest()
+    return plan
+
+
+def host_lock():
+    """One run at a time per host: two runs would share CPU, ports and the warm cache."""
+    import fcntl
+    handle = open(LOCK, 'w')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f'another benchmark run holds {LOCK}')
+    return handle
+
+
+def cli_failures(record):
+    """Agents whose CLI ended in an error that was not a budget stop (API, auth, crash)."""
+    bad = []
+    for task, a in record.get('agents', {}).items():
+        result = (a.get('trace_metrics') or {}).get('result') or {}
+        if not a.get('timed_out') and (a.get('exit') not in (0, None) or result.get('is_error') or not result):
+            bad.append(task)
+    return bad
+
+
 def cmd_pair(args):
-    plan = json.loads(Path(args.plan).read_text())
+    plan = load_plan(args.plan)
     problems = check_plan(plan)
     if problems:
         raise SystemExit('refusing to run: ' + '; '.join(problems))
+    lock = host_lock()
     pair = plan['pairs'][args.index]
     results = Path(args.results)
+    for arm_name in pair['order']:
+        out = results / f'pair{args.index}-{arm_name}'
+        if out.exists():
+            raise SystemExit(f'{out} exists; runs are never overwritten (rerun into a new results directory)')
     for arm_name in pair['order']:
         out = results / f'pair{args.index}-{arm_name}'
         print(f'pair {args.index}: running {arm_name} -> {out}', flush=True)
@@ -657,12 +762,20 @@ def cmd_pair(args):
         summary = {t: {'passed': (a.get('grade') or {}).get('passed'), 'seconds': a.get('seconds'),
                        'left': len(a.get('left_running') or []), 'cost': ((a.get('trace_metrics') or {}).get('result') or {}).get('total_cost_usd')}
                    for t, a in record['agents'].items()}
-        print(json.dumps({'arm': arm_name, 'valid': record['valid'], 'invalid': record['invalid_reasons'],
+        failures = cli_failures(record)
+        print(json.dumps({'arm': arm_name, 'valid': record['valid'], 'invalid': record['invalid_reasons'], 'cli_failures': failures,
                           'bystander_changed': record.get('bystander', {}).get('changed'), 'agents': summary}, indent=2), flush=True)
+        # Stop rules (PROTOCOL.md, Validity): an invalid run or two CLI failures stop the experiment.
+        if not record['valid']:
+            raise SystemExit(f'stopping: run {out} is invalid: {record["invalid_reasons"]}')
+        if len(failures) >= 2:
+            raise SystemExit(f'stopping: {len(failures)} agent CLI failures in {out}: {failures}')
+    lock.close()
 
 
 def cmd_arm(args):
-    plan = json.loads(Path(args.plan).read_text())
+    plan = load_plan(args.plan)
+    lock = host_lock()
     override = None
     if args.scripted:
         modes = dict(item.split('=') for item in args.scripted.split(','))

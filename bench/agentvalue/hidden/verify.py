@@ -24,6 +24,7 @@ TREE = Path(os.environ['GRADE_TREE'])
 STARTING = Path(os.environ['GRADE_STARTING'])
 ORIGINAL_MIGRATIONS = ['20261001_create_invoices', '20261008_create_receipts']
 HIDDEN = {41: ('Ünïcode GmbH', 9900), 42: ('Umbrella', 300), 43: ('Umbrella', 450), 44: ('Acme Corp', 77)}
+STATUS = {41: 'open', 42: 'open', 43: 'paid', 44: 'open', 1: 'open', 2: 'paid', 3: 'open'}
 checks = {}
 
 
@@ -58,13 +59,33 @@ def sql(query, args=()):
 
 
 def existing_preserved():
+    """Every pre-existing invoice keeps customer, amount and status (API), and every receipt (SQL)."""
     for ident, (customer, cents) in HIDDEN.items():
         status, body = call('GET', f'/invoices/{ident}')
-        if status != 200 or body.get('customer') != customer or body.get('cents') != cents:
+        if status != 200 or body.get('customer') != customer or body.get('cents') != cents or body.get('status') != STATUS[ident]:
             print(f'existing invoice {ident}: {status} {body}', file=sys.stderr)
             return False
     status, body = call('GET', '/invoices/1')
-    return status == 200 and body.get('customer') == 'Acme Corp' and body.get('cents') == 1200
+    if not (status == 200 and body.get('customer') == 'Acme Corp' and body.get('cents') == 1200):
+        return False
+    receipts = sql('SELECT invoice_id, cents FROM receipts WHERE invoice_id IN (2, 43) ORDER BY invoice_id')
+    if receipts != [(2, 5000), (43, 450)]:
+        print(f'pre-existing receipts changed: {receipts}', file=sys.stderr)
+        return False
+    return True
+
+
+def existing_api_intact():
+    """Existing routes still work: PATCH of the amount, and listing receipts."""
+    status, body = call('PATCH', '/invoices/44', {'cents': 78})
+    if status != 200:
+        print(f'PATCH /invoices/44: {status} {body}', file=sys.stderr)
+        return False
+    # Read back from the database: a stale cached GET after PATCH is the starting code's known bug,
+    # which only invoice-notes is asked to fix.
+    stored = sql('SELECT cents FROM invoices WHERE id = 44')
+    status, receipts = call('GET', '/invoices/43/receipts')
+    return stored == [(78,)] and status == 200 and [r.get('cents') for r in receipts or []] == [450]
 
 
 def migrations_sound():
@@ -75,9 +96,10 @@ def migrations_sound():
             print(f'original migration {name} was changed or removed', file=sys.stderr)
             return False
     versions = [row[0] for row in sql('SELECT version FROM schema_migrations ORDER BY version')]
-    new = [v for v in versions if v not in ORIGINAL_MIGRATIONS]
-    if not new or not set(ORIGINAL_MIGRATIONS) <= set(versions):
-        print(f'schema_migrations: {versions}', file=sys.stderr)
+    new = {v for v in versions if v not in ORIGINAL_MIGRATIONS}
+    files = {p.stem for p in (TREE / 'migrations').glob('*.sql')} - set(ORIGINAL_MIGRATIONS)
+    if not new or not set(ORIGINAL_MIGRATIONS) <= set(versions) or new != files:
+        print(f'schema_migrations {sorted(versions)} vs new migration files {sorted(files)}', file=sys.stderr)
         return False
     before = schema_fingerprint()
     rerun = subprocess.run([os.environ['GRADE_UV'], 'run', '--frozen', 'python', 'migrate.py'], cwd=TREE, capture_output=True,
@@ -90,14 +112,21 @@ def migrations_sound():
 
 
 def schema_fingerprint():
-    return sql("SELECT table_name, column_name, data_type, is_nullable FROM information_schema.columns "
-               "WHERE table_schema = 'public' ORDER BY 1, 2")
+    columns = sql("SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns "
+                  "WHERE table_schema = 'public' ORDER BY 1, 2")
+    constraints = sql("SELECT conrelid::regclass::text, pg_get_constraintdef(oid) FROM pg_constraint "
+                      "WHERE connamespace = 'public'::regnamespace ORDER BY 1, 2")
+    indexes = sql("SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1")
+    counts = [(t, sql(f'SELECT count(*) FROM "{t}"')[0][0]) for (t,) in
+              sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1")]
+    return columns, constraints, indexes, counts
 
 
 # ---------------------------------------------------------------- invoice-notes
 
 def invoice_notes():
     check('existing_preserved', existing_preserved)
+    check('existing_api_intact', existing_api_intact)
     check('note_default', lambda: call('GET', '/invoices/41')[1].get('note') == '' and call('GET', '/invoices/1')[1].get('note') == '')
 
     def create_with_note():
@@ -117,12 +146,21 @@ def invoice_notes():
         state['patched'] = status == 200
         return status == 200
     check('patch_note', patch_note)
-    check('cache_after_patch', lambda: state.get('patched') and (lambda b: b.get('note') == 'call first' and b.get('cents') == 333)(call('GET', '/invoices/42')[1]))
+    def cache_after_patch():
+        body = call('GET', '/invoices/42')[1]
+        if not (state.get('patched') and body.get('note') == 'call first' and body.get('cents') == 333):
+            return False
+        # The read path must still use the cache: some Redis value now holds the patched invoice.
+        cached = [R.get(k) for k in R.scan_iter('*') if R.type(k) == 'string']
+        return any(v and 'call first' in v for v in cached)
+    check('cache_after_patch', cache_after_patch)
 
     def database_after_patch():
         R.flushdb()  # whatever the cache holds, the next read must come from the database
         body = call('GET', '/invoices/42')[1]
-        return body.get('note') == 'call first' and body.get('cents') == 333 and body.get('customer') == 'Umbrella'
+        stored = sql("SELECT row_to_json(i)::text FROM invoices i WHERE id = 42")[0][0]
+        return body.get('note') == 'call first' and body.get('cents') == 333 and body.get('customer') == 'Umbrella' \
+            and '"call first"' in stored
     check('database_after_patch', database_after_patch)
 
     def other_untouched():
@@ -210,61 +248,138 @@ def parse_monitor(line):
 WRITES = ('RPUSH', 'LPUSH', 'XADD', 'ZADD', 'SADD', 'LPUSHX', 'RPUSHX')
 
 
+class Worker:
+    """The grader runs the submitted worker itself, so it can hold jobs back and release them."""
+
+    def __init__(self):
+        self.proc = None
+
+    def start(self):
+        import signal as _signal
+        if self.proc is None or self.proc.poll() is not None:
+            self.proc = subprocess.Popen([os.environ['GRADE_UV'], 'run', '--frozen', 'python', 'worker.py'], cwd=TREE,
+                                         stdout=subprocess.DEVNULL, stderr=open(os.environ.get('GRADE_WORKER_LOG', os.devnull), 'ab'),
+                                         stdin=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(1.5)
+
+    def stop(self):
+        import signal as _signal
+        if self.proc is not None and self.proc.poll() is None:
+            for sig in (_signal.SIGTERM, _signal.SIGKILL):
+                try:
+                    os.killpg(self.proc.pid, sig)
+                except ProcessLookupError:
+                    break
+                try:
+                    self.proc.wait(5)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        self.proc = None
+
+
+def writes_during(fn):
+    """Run fn() while capturing every Redis write command; returns (fn's result, the writes)."""
+    monitor = Monitor()
+    try:
+        result = fn()
+        time.sleep(0.5)
+    finally:
+        monitor.close()
+    return result, [a for a in monitor.commands if a and a[0].decode('latin-1').upper() in WRITES]
+
+
+def replayable(args):
+    """A captured enqueue as it can be sent again: an explicit stream ID becomes '*'."""
+    args = list(args)
+    if args[0].decode('latin-1').upper() == 'XADD':
+        i = 2
+        while i < len(args) and args[i].decode('latin-1').upper() in ('NOMKSTREAM', 'MAXLEN', 'MINID', '=', '~', 'LIMIT') or \
+                (i > 2 and args[i - 1].decode('latin-1').upper() in ('MAXLEN', 'MINID', 'LIMIT', '=', '~')):
+            i += 1
+        if i < len(args):
+            args[i] = b'*'
+    return args
+
+
 def pay_receipts():
     check('existing_preserved', existing_preserved)
-    state = {}
+    check('existing_api_intact', existing_api_intact)
+    worker, state = Worker(), {}
+    try:
+        def pay_marks_paid():
+            call('GET', '/invoices/41')  # warm the cache
+            (status, _), writes = writes_during(lambda: call('POST', '/invoices/41/pay'))
+            state['paid'] = status is not None and 200 <= status < 300
+            state['enqueued'] = writes
+            return state['paid']
+        check('pay_marks_paid', pay_marks_paid)
+        check('cache_after_pay', lambda: state.get('paid') and call('GET', '/invoices/41')[1].get('status') == 'paid')
 
-    def pay_marks_paid():
-        call('GET', '/invoices/41')  # warm the cache
-        status, _ = call('POST', '/invoices/41/pay')
-        state['paid'] = status is not None and 200 <= status < 300
-        return state['paid']
-    check('pay_marks_paid', pay_marks_paid)
-    check('cache_after_pay', lambda: state.get('paid') and call('GET', '/invoices/41')[1].get('status') == 'paid')
-    check('receipt_recorded', lambda: state.get('paid') and [r[0] for r in wait_receipts(41, 1)] == [9900])
+        def receipt_recorded():
+            # With the worker held back, paying must queue a job and record nothing yet.
+            if not state.get('paid') or not state.get('enqueued'):
+                print(f"paid={state.get('paid')} enqueued={len(state.get('enqueued') or [])}", file=sys.stderr)
+                return False
+            if receipts_for(41):
+                print('a receipt existed before the worker ran', file=sys.stderr)
+                return False
+            worker.start()
+            return [r[0] for r in wait_receipts(41, 1)] == [9900]
+        check('receipt_recorded', receipt_recorded)
 
-    def duplicate_job_one_receipt():
-        monitor = Monitor()
-        status, _ = call('POST', '/invoices/42/pay')
-        if status is None or not 200 <= status < 300:
-            return False
-        if [r[0] for r in wait_receipts(42, 1)] != [300]:
-            return False
-        time.sleep(0.5)
-        monitor.close()
-        replays = [args for args in list(monitor.commands) if args and args[0].decode('latin-1').upper() in WRITES]
-        if not replays:
-            print('no queued job observed on Redis', file=sys.stderr)
-            return False
-        raw = redis.Redis.from_url(os.environ['REDIS_URL'])  # bytes in, bytes out
-        for _ in range(2):
-            for args in replays:
-                raw.execute_command(*args)
-        time.sleep(4)
-        got = [r[0] for r in receipts_for(42)]
-        if got != [300]:
-            print(f'receipts for 42 after duplicate delivery: {got}', file=sys.stderr)
-        return got == [300]
-    check('duplicate_job_one_receipt', duplicate_job_one_receipt)
+        def duplicate_job_one_receipt():
+            if not state.get('enqueued') or receipts_for(41) == []:
+                return False
+            worker.stop()
+            keys = set()
+            raw = redis.Redis.from_url(os.environ['REDIS_URL'])
+            for _ in range(2):
+                for args in state['enqueued']:
+                    raw.execute_command(*replayable(args))
+                    keys.add(args[1])
+            worker.start()
+            deadline = time.monotonic() + 10
+            lists = [k for k in keys if raw.type(k) == b'list']
+            while time.monotonic() < deadline and any(raw.llen(k) for k in lists):
+                time.sleep(0.2)
+            if any(raw.llen(k) for k in lists):
+                print('the redelivered job was never consumed', file=sys.stderr)
+                return False
+            time.sleep(3)
+            got = [r[0] for r in receipts_for(41)]
+            if got != [9900]:
+                print(f'receipts for 41 after duplicate delivery: {got}', file=sys.stderr)
+            return got == [9900]
+        check('duplicate_job_one_receipt', duplicate_job_one_receipt)
 
-    def pay_twice():
-        status, _ = call('POST', '/invoices/41/pay')
-        time.sleep(2)
-        return status == 409 and [r[0] for r in receipts_for(41)] == [9900]
-    check('pay_twice_conflict', pay_twice)
-    check('pay_unknown_404', lambda: call('POST', '/invoices/999999/pay')[0] == 404)
-    check('existing_receipts_kept', lambda: [r[0] for r in receipts_for(43)] == [450] and [r[0] for r in receipts_for(2)] == [5000])
+        def pay_twice():
+            (status, _), writes = writes_during(lambda: call('POST', '/invoices/41/pay'))
+            time.sleep(1.5)
+            return status == 409 and not writes and [r[0] for r in receipts_for(41)] == [9900]
+        check('pay_twice_conflict', pay_twice)
+
+        def pay_unknown():
+            (status, _), writes = writes_during(lambda: call('POST', '/invoices/999999/pay'))
+            return status == 404 and not writes
+        check('pay_unknown_404', pay_unknown)
+        check('existing_receipts_kept', lambda: [r[0] for r in receipts_for(43)] == [450] and [r[0] for r in receipts_for(2)] == [5000])
+    finally:
+        worker.stop()
 
 
 # ---------------------------------------------------------------- customer-table
 
 def customer_table():
     check('existing_preserved', existing_preserved)
+    check('existing_api_intact', existing_api_intact)
 
     def deduplicated():
         names = [row[0] for row in sql('SELECT name FROM customers')]
         expected = {'Acme Corp', 'Globex', 'Zoë Café', 'Ünïcode GmbH', 'Umbrella'}
-        return expected <= set(names) and len(names) == len(set(names))
+        unique = sql("SELECT 1 FROM pg_index x JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = x.indkey[0] "
+                     "WHERE x.indrelid = 'customers'::regclass AND x.indisunique AND x.indnatts = 1 AND a.attname = 'name'")
+        return expected <= set(names) and len(names) == len(set(names)) and bool(unique)
     check('customers_deduplicated', deduplicated)
     check('customer_column_dropped', lambda: not sql("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' "
                                                      "AND table_name = 'invoices' AND column_name = 'customer'"))

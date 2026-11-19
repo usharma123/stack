@@ -77,12 +77,17 @@ class Step(Exception):
 
 
 def run(argv, cwd, env, timeout=180, log=None, name=''):
+    """Run one grading step in a session of its own; on timeout its whole process group is killed."""
     started = time.monotonic()
+    proc = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
     try:
-        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        code, out, err = result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired as error:
-        code, out, err = 'timeout', (error.stdout or b'').decode(errors='replace') if isinstance(error.stdout, bytes) else (error.stdout or ''), 'timeout'
+        out, err = proc.communicate(timeout=timeout)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        stop_group(proc)
+        out, err = proc.communicate()
+        code, err = 'timeout', (err or '') + '\ntimeout'
     entry = {'step': name, 'argv': [str(a) for a in argv], 'exit': code, 'seconds': round(time.monotonic() - started, 2),
              'stdout': out[-4000:], 'stderr': err[-4000:]}
     if log is not None:
@@ -99,6 +104,13 @@ class Services:
         self.pgdata = workdir / 'pgdata'
 
     def __enter__(self):
+        try:
+            return self._start()
+        except BaseException:
+            self.__exit__(None, None, None)  # stop whatever did start before failing
+            raise
+
+    def _start(self):
         env = base_env()
         r = run([PG_BIN / 'initdb', '-D', self.pgdata, '-A', 'trust', '-U', 'postgres', '-E', 'UTF8', '--locale=en_US.UTF-8'],
                 self.dir, env, log=self.log, name='initdb')
@@ -137,7 +149,7 @@ class Services:
 
     def __exit__(self, *exc):
         self.stop_apps()
-        if hasattr(self, 'redis'):
+        if getattr(self, 'redis', None) is not None:
             stop_group(self.redis)
         if (self.pgdata / 'postmaster.pid').exists():
             run([PG_BIN / 'pg_ctl', '-D', self.pgdata, '-m', 'fast', '-w', 'stop'], self.dir, base_env(), log=self.log, name='pg_stop')
@@ -168,9 +180,10 @@ def listening(port):
 
 
 def prepare_tree(source, dest, starting=None):
-    """Copy a tree without runtime directories. With `starting`, protected files come from it."""
+    """Copy a tree without runtime directories or symbolic links (a link could reach outside the
+    submission). With `starting`, protected files come from it."""
     def ignore(directory, names):
-        return [n for n in names if n in RUNTIME_DIRS]
+        return [n for n in names if n in RUNTIME_DIRS or os.path.islink(os.path.join(directory, n))]
     shutil.copytree(source, dest, ignore=ignore, symlinks=True)
     if starting is not None:
         for name in PROTECTED:
@@ -181,11 +194,12 @@ def prepare_tree(source, dest, starting=None):
     return dest
 
 
-def start_app(services, tree, log):
+def start_app(services, tree, log, worker=True):
     api_port = free_port()
     services.start(tree, [str(UV), 'run', '--frozen', 'python', 'app.py'], 'api',
                    {'PORT': str(api_port), 'IDENTITY_TOKEN': 'grader'})
-    services.start(tree, [str(UV), 'run', '--frozen', 'python', 'worker.py'], 'worker', {})
+    if worker:
+        services.start(tree, [str(UV), 'run', '--frozen', 'python', 'worker.py'], 'worker', {})
     url = f'http://127.0.0.1:{api_port}'
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -240,9 +254,10 @@ def upgrade(task_id, tree, starting, workdir):
                                       ('migrate', [UV, 'run', '--frozen', 'python', 'migrate.py'], tree)]:
                 if run(argv, where, env, log=log, name=name)['exit'] != 0:
                     raise Step(f'{name} failed while upgrading an existing database')
-            url = start_app(services, tree, log)
+            # For the queue task the hidden checks run the worker themselves, to hold jobs back.
+            url = start_app(services, tree, log, worker=task_id != 'pay-receipts')
             env = base_env({**services.env(), 'API_URL': url, 'GRADE_TREE': str(tree), 'GRADE_STARTING': str(starting),
-                            'GRADE_UV': str(UV)})
+                            'GRADE_UV': str(UV), 'GRADE_WORKER_LOG': str(workdir / 'verify-worker.log')})
             verify = run([GRADER_PY, HIDDEN / 'verify.py', task_id], tree, env, timeout=240, log=log, name='verify')
             lines = [line for line in verify['stdout'].splitlines() if line.startswith('{')]
             checks = json.loads(lines[-1]) if lines else {}
@@ -251,6 +266,17 @@ def upgrade(task_id, tree, starting, workdir):
             result['error'] = str(error)
     result['log'] = log
     return result
+
+
+def reclaim_under(path):
+    """Stop anything a grading run left (a submission's daemon, say) and report it."""
+    sys.path.insert(0, str(HERE))
+    import observe
+    left = observe.legacy.owned_processes(path)
+    if not left:
+        return {'left': [], 'survivors': []}
+    result = observe.reclaim(left, path)
+    return {'left': [{k: p[k] for k in ['pid', 'command']} for p in left], 'survivors': result['survivors']}
 
 
 def grade(task_id, submitted_tree, out_dir):
@@ -268,11 +294,12 @@ def grade(task_id, submitted_tree, out_dir):
         (tmp / 'upgrade').mkdir()
         f = fresh(fresh_tree, starting, tmp / 'fresh')
         u = upgrade(task_id, upgrade_tree, starting, tmp / 'upgrade')
+        cleanup = reclaim_under(tmp)
     checks = u.get('checks', {})
     missing = [c for c in task['required_checks'] if c not in checks]
     failed = [c for c in task['required_checks'] if checks.get(c) is not True]
     passed = bool(f.get('completed') and f.get('smoke') and f.get('original_tests') and u.get('completed') and not failed)
-    result = {'task': task_id, 'passed': passed, 'fresh_ok': bool(f.get('completed') and f.get('smoke') and f.get('original_tests')),
+    result = {'task': task_id, 'passed': passed, 'grader_cleanup': cleanup, 'fresh_ok': bool(f.get('completed') and f.get('smoke') and f.get('original_tests')),
               'upgrade_completed': bool(u.get('completed')), 'checks': checks, 'failed_checks': failed, 'missing_checks': missing,
               'fresh': f, 'upgrade': u}
     (out_dir / 'grade.json').write_text(json.dumps(result, indent=2))

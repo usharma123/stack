@@ -4,7 +4,9 @@ A small invoice API: Python 3.13, PostgreSQL 17 and Redis 7.
 
 - `app.py` is the HTTP API (`GET/POST /invoices`, `GET/PATCH /invoices/<id>`, `GET /invoices/<id>/receipts`,
   `GET /health`). It reads invoices through a Redis cache (`ledger/cache.py`).
-- `worker.py` runs background jobs that the API queues on a Redis list (`ledger/jobs.py`).
+- `worker.py` runs background jobs that the API queues on a Redis list (`ledger/jobs.py`). When
+  `WORKER_HEALTH_PORT` is set it also answers on that port, which the dev tooling uses to check that
+  the worker is up; keep that endpoint if you change the worker.
 - `ledger/db.py` holds the SQL. `ledger/config.py` reads every address from the environment
   (`DATABASE_URL`, `REDIS_URL`, `PORT`); nothing hardcodes a port.
 - `migrate.py` applies the SQL files in `migrations/` in file-name order, each once, recording them in

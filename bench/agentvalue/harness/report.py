@@ -14,16 +14,22 @@ from pathlib import Path
 import random
 import statistics
 
+TARGET_WORDS = ('worker', 'app.py', 'postgres', 'redis', 'python', 'uv', 'supervise')
 KILL_SCOPE_NOTE = 'broad kill commands are counted from the trace; collateral kills are proven only for the main checkout'
 
 
-def load_runs(plan, results):
-    runs = {}
+def load_runs(plan, results, plan_sha=None):
+    """Runs of this plan only: a run.json from another plan (or a self-test) is reported as foreign, not used."""
+    runs, foreign = {}, {}
     for pair in plan['pairs']:
         for arm in pair['order']:
             path = Path(results) / f"pair{pair['index']}-{arm}" / 'run.json'
-            runs[(pair['index'], arm)] = json.loads(path.read_text()) if path.exists() else None
-    return runs
+            run = json.loads(path.read_text()) if path.exists() else None
+            if run is not None and plan_sha and run.get('plan_sha256') != plan_sha:
+                foreign[f"pair{pair['index']}-{arm}"] = run.get('plan_sha256')
+                run = None
+            runs[(pair['index'], arm)] = run
+    return runs, foreign
 
 
 def contamination(run):
@@ -36,11 +42,15 @@ def contamination(run):
     for version in by.get('foreign_migrations') or []:
         culprits = [t for t, m in own.items() if version in m]
         events.append({'kind': 'migration_in_main', 'detail': version, 'culprits': culprits})
-    other_changes = [c for c in by.get('changed') or [] if c not in ('migrations', 'tuple_writes', 'columns')]
-    if (by.get('changed') and not by.get('foreign_migrations')) or other_changes:
-        events.append({'kind': 'main_state_changed', 'detail': by.get('changed'), 'culprits': []})
+    # Write counters move with statistics flushes and catalog activity: diagnostic, never a gate.
+    explained = {'migrations', 'columns'} if by.get('foreign_migrations') else set()
+    other_changes = [c for c in by.get('changed') or [] if c not in explained | {'tuple_writes'}]
+    if other_changes:
+        events.append({'kind': 'main_state_changed', 'detail': other_changes, 'culprits': []})
     if by.get('processes_lost'):
-        killers = [t for t, a in agents.items() if (a.get('trace_metrics') or {}).get('kill_commands')]
+        lost_words = {w for p in by['processes_lost'] for w in TARGET_WORDS if w in p['command']}
+        killers = [t for t, a in agents.items()
+                   if any(w in cmd for cmd in (a.get('trace_metrics') or {}).get('kill_commands') or [] for w in lost_words)]
         events.append({'kind': 'main_process_killed', 'detail': [p['command'][:80] for p in by['processes_lost']], 'culprits': killers})
     for victim, db in (run.get('worktree_databases') or {}).items():
         for version in db.get('foreign') or []:
@@ -79,11 +89,19 @@ def agent_rows(plan, runs):
                 own_new = set((a.get('submission') or {}).get('migrations') or []) - set(
                     v for v in ['20261001_create_invoices', '20261008_create_receipts'])
                 used_own_db = bool(db.get('exists')) and bool(own_new & set(db.get('versions') or []))
+                if 'left_running' not in a or 'grade' not in a:
+                    rows.append({**row, 'status': 'invalid', 'reasons': ['missing exit observation or grade']})
+                    continue
                 teardown_ok = not a.get('left_running') and not a.get('left_listening')
                 isolation_ok = not culprit and not unattributed
                 passed = bool(g.get('passed'))
+                cli_ok = a.get('exit') == 0 and result.get('subtype') == 'success' and not result.get('is_error')
+                compliance = a.get('compliance') or {}
                 rows.append({**row, 'status': 'scored', 'passed': passed, 'teardown_ok': teardown_ok, 'isolation_ok': isolation_ok,
-                             'gated_success': passed and teardown_ok and isolation_ok, 'used_own_db': used_own_db,
+                             'cli_ok': cli_ok, 'gated_success': passed and teardown_ok and isolation_ok and cli_ok, 'used_own_db': used_own_db,
+                             'committed': compliance.get('committed'), 'ran_tests': compliance.get('ran_tests'),
+                             'arm_down_recovered': not ((run.get('recovery') or {}).get(task) or {}).get('left_after_arm_down'),
+                             'unexplained_migrations': db.get('unexplained') or [],
                              'timed_out': bool(a.get('timed_out')), 'agent_exit': a.get('exit'), 'seconds': a.get('seconds'),
                              'cost_usd': result.get('total_cost_usd'), 'turns': result.get('num_turns'),
                              'tool_calls': m.get('tool_calls'), 'bash_calls': m.get('bash_calls'), 'tool_errors': m.get('tool_errors'),
@@ -131,7 +149,7 @@ def bootstrap_pairs(plan, rows, key, reps=10000, seed=7):
             'ci95': [round(boots[int(0.025 * reps)], 3), round(boots[int(0.975 * reps)], 3)]}
 
 
-def summarize(plan, runs):
+def summarize(plan, runs, foreign=None):
     rows = agent_rows(plan, runs)
     arms = {}
     for arm in ('stack', 'baseline'):
@@ -142,7 +160,10 @@ def summarize(plan, runs):
         for r in scored:
             episodes.setdefault(r['pair'], []).append(r['gated_success'])
         arms[arm] = {
-            'task_success': rate(mine, 'passed'), 'gated_success': rate(mine, 'gated_success'),
+            'task_success': rate(mine, 'passed'), 'gated_success': rate(mine, 'gated_success'), 'cli_ok': rate(mine, 'cli_ok'),
+            'committed': rate(mine, 'committed'), 'ran_tests': rate(mine, 'ran_tests'),
+            'by_position': {pos: {'gated': rate([r for r in mine if r['position'] == pos], 'gated_success'),
+                                  'passed': rate([r for r in mine if r['position'] == pos], 'passed')} for pos in (0, 1)},
             'teardown_ok': rate(mine, 'teardown_ok'), 'isolation_ok': rate(mine, 'isolation_ok'), 'used_own_db': rate(mine, 'used_own_db'),
             'timed_out': rate(mine, 'timed_out'),
             'episodes_all_gated_success': sum(1 for v in episodes.values() if len(v) == len(plan['config']['tasks']) and all(v)),
@@ -171,14 +192,19 @@ def summarize(plan, runs):
         'valid': v.get('valid'), 'invalid_reasons': v.get('invalid_reasons'), 'seconds': v.get('seconds'),
         'stack_binary_sha256': v.get('stack_binary_sha256'), 'source_rev': v.get('source_rev'),
         'contamination': contamination(v) if v.get('valid') else None,
-        'disposal': {k2: (v.get('disposal') or {}).get(k2) for k2 in ['processes_left', 'ports_still_listening', 'stack_records_left']},
+        'disposal': {k2: (v.get('disposal') or {}).get(k2) for k2 in ['processes_left', 'ports_still_listening', 'service_data_left',
+                                                                      'stack_records_left', 'worktree_dirs_left']},
+        'recovery': {t: {'agent_left': r.get('agent_left'), 'left_after_arm_down': len(r.get('left_after_arm_down') or [])}
+                     for t, r in (v.get('recovery') or {}).items()},
         'disposal_state_growth_bytes': ((v.get('disposal') or {}).get('machine_state_bytes_after') or 0) - (v.get('machine_state_bytes_before_agents') or 0),
     } for k, v in runs.items()}
     return {'plan': plan['name'], 'kind': plan['kind'], 'config': {k: plan['config'][k] for k in plan['config'] if k != 'agent_command'},
             'agent_command': plan['config']['agent_command'], 'host': plan['host'], 'arms': arms,
             'paired_gated_success_diff': bootstrap_pairs(plan, rows, 'gated_success'),
             'paired_task_success_diff': bootstrap_pairs(plan, rows, 'passed'),
-            'discordant_pairs': discordant, 'runs': runs_meta, 'rows': rows, 'note': KILL_SCOPE_NOTE}
+            'discordant_pairs': discordant, 'runs': runs_meta, 'rows': rows, 'note': KILL_SCOPE_NOTE,
+            'missing_runs': sorted(k for k, v in runs_meta.items() if v is None), 'foreign_runs': foreign or {},
+            'invalid_runs': sorted(k for k, v in runs_meta.items() if v and not v['valid'])}
 
 
 def markdown(summary):
@@ -189,7 +215,9 @@ def markdown(summary):
     def stat(x):
         return '–' if not x.get('n') else f"median {x['median']} [IQR {x['q1']}–{x['q3']}], range {x['min']}–{x['max']}, n={x['n']}"
     a, b = summary['arms']['stack'], summary['arms']['baseline']
-    for label, key, fn in [('Task success (hidden checks)', 'task_success', frac), ('Gated success (task + teardown + isolation)', 'gated_success', frac),
+    for label, key, fn in [('Task success (hidden checks)', 'task_success', frac),
+                           ('Gated success (task + teardown + isolation + clean CLI exit)', 'gated_success', frac),
+                           ('Agent CLI ended cleanly', 'cli_ok', frac), ('Committed its work', 'committed', frac), ('Ran the tests', 'ran_tests', frac),
                            ('Teardown gate held', 'teardown_ok', frac), ('Isolation gate held', 'isolation_ok', frac),
                            ('Used its own database', 'used_own_db', frac), ('Timed out', 'timed_out', frac),
                            ('Seconds to verified result', 'seconds_to_verified_result', stat), ('Seconds, all scored', 'seconds_all', stat),
@@ -200,6 +228,9 @@ def markdown(summary):
     lines.append(f"| Broad kill commands | {a['kill_commands_total']} | {b['kill_commands_total']} |")
     lines.append(f"| Benchmark-file access in traces | {a['benchmark_access_total']} | {b['benchmark_access_total']} |")
     lines.append(f"| Not run / invalid agent slots | {a['not_run']} / {a['invalid']} | {b['not_run']} / {b['invalid']} |")
+    lines.append(f"| Gated success by position (first / second in pair) | {frac(a['by_position'][0]['gated'])} / {frac(a['by_position'][1]['gated'])} | "
+                 f"{frac(b['by_position'][0]['gated'])} / {frac(b['by_position'][1]['gated'])} |")
+    lines += ['', f"Missing runs: {summary['missing_runs']}; invalid runs: {summary['invalid_runs']}; runs from another plan ignored: {summary['foreign_runs']}"]
     lines += ['', f"Paired difference in gated success (stack − baseline, per-pair mean, bootstrap over pairs): {summary['paired_gated_success_diff']}",
               f"Paired difference in task success: {summary['paired_task_success_diff']}", f"Discordant pairs: {summary['discordant_pairs']}", '']
     lines += ['| Pair | Arm | Pos | Task | Status | Pass | Teardown | Isolation | Seconds | Cost | Tools | Env err | Failed checks |',
@@ -217,8 +248,11 @@ def main():
     parser.add_argument('--results', required=True)
     parser.add_argument('--out')
     args = parser.parse_args()
-    plan = json.loads(Path(args.plan).read_text())
-    summary = summarize(plan, load_runs(plan, args.results))
+    raw = Path(args.plan).read_bytes()
+    plan = json.loads(raw)
+    import hashlib
+    runs, foreign = load_runs(plan, args.results, hashlib.sha256(raw).hexdigest())
+    summary = summarize(plan, runs, foreign)
     out = Path(args.out or args.results)
     (out / 'report.json').write_text(json.dumps(summary, indent=2, default=str))
     (out / 'report.md').write_text(markdown(summary))

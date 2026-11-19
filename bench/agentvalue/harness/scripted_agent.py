@@ -26,16 +26,19 @@ def run(argv, **kw):
     print(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': str(len(argv)), 'name': 'Bash',
                                                                     'input': {'command': ' '.join(argv)}}]}}), flush=True)
     r = subprocess.run(argv, capture_output=True, text=True, **kw)
-    print(r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr, flush=True)
+    print(f'exit {r.returncode}:', r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr, flush=True)
+    if r.returncode != 0 and mode == 'reference':
+        print(json.dumps({'type': 'result', 'subtype': 'error', 'is_error': True, 'failed': argv}), flush=True)
+        sys.exit(1)
     return r
 
 
-cli = {'stack': {'up': ['stack', 'up', '--ttl', '1h'], 'test': ['stack', 'run', 'test'], 'down': ['stack', 'down'],
+cli = {'stack': {'up': ['stack', 'up'], 'test': ['stack', 'run', 'test'], 'down': ['stack', 'down'],
                  'migrate': ['stack', 'run', 'migrate'], 'restart': ['stack', 'restart', 'api', 'worker'],
-                 'env': ['stack', 'exec', '--', 'env']},
+                 'env': ['stack', 'exec', '--', 'sh', '-c', 'echo DATABASE_URL=$DATABASE_URL; echo REDIS_URL=$REDIS_URL']},
        'baseline': {'up': ['python3', 'dev.py', 'up'], 'test': ['python3', 'dev.py', 'test'], 'down': ['python3', 'dev.py', 'down'],
                     'migrate': ['python3', 'dev.py', 'migrate'], 'restart': ['python3', 'dev.py', 'restart', 'api', 'worker'],
-                    'env': ['python3', 'dev.py', 'exec', 'env']}}[arm]
+                    'env': ['python3', 'dev.py', 'exec', 'sh', '-c', 'echo DATABASE_URL=$DATABASE_URL; echo REDIS_URL=$REDIS_URL']}}[arm]
 
 if mode == 'noop':
     sys.exit(0)
@@ -55,7 +58,8 @@ if mode == 'contaminate':
     grader_py = str(Path.home() / '.cache/stack-agentvalue/grader/venv/bin/python')
     run([grader_py, 'migrate.py'], env={**os.environ, **main_env})
 if mode == 'pkill':
-    run(['pkill', '-f', 'python worker.py'])
+    # Careless, but scoped to this benchmark's run roots so validation can never touch the host.
+    run(['pkill', '-f', r'/tmp/avr[^ ]*/.venv/bin/python worker\.py|uv run --frozen python worker\.py'])
 if mode != 'leave-running':
     run(cli['down'])
-print(json.dumps({'type': 'result', 'subtype': 'success', 'scripted': mode}))
+print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'scripted': mode}))

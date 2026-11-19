@@ -7,3 +7,5 @@ results/**/grade-*/
 results/**/submission.patch
 __pycache__/
 results/selftest-1/
+results/validation-r2-wip*/
+results/validation-20261118-eaf1cb7/

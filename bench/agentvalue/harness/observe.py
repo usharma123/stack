@@ -20,11 +20,79 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import arms as legacy  # bench/arms.py: process_table, same_process, reclaim, owns
 
 MARKER = re.compile(r'(?:^|\s)AGENTVALUE_WT=([A-Za-z0-9_.-]+)')
+# Markers are "<group>.<run id>", so a process from another run (or an unrelated program) never
+# counts as this run's. Set by the runner before anything is observed.
+RUN_SUFFIX = None
+
+
+def group_of_marker(mark):
+    if mark and RUN_SUFFIX and mark.endswith(RUN_SUFFIX):
+        return mark[:-len(RUN_SUFFIX)]
+    return None
+
+
+def _out(argv):
+    """A command's stdout as text; process environments and file names need not be UTF-8."""
+    return subprocess.run(argv, capture_output=True).stdout.decode('utf-8', errors='replace')
+
+
+def _process_table():
+    """bench/arms.py's process_table, decoding command lines that are not UTF-8."""
+    rows = {}
+    for line in _out(['ps', '-axww', '-o', 'pid=,ppid=,pgid=,stat=,lstart=,command=']).splitlines():
+        parts = line.split(None, 9)
+        if len(parts) < 10 or parts[3].startswith('Z'):
+            continue
+        pid = int(parts[0])
+        rows[pid] = {'pid': pid, 'ppid': int(parts[1]), 'pgid': int(parts[2]), 'started': ' '.join(parts[4:9]), 'command': parts[9]}
+    return rows
+
+
+def _process_identity(pid):
+    parts = _out(['ps', '-ww', '-p', str(pid), '-o', 'stat=,lstart=,command=']).strip().split(None, 6)
+    if len(parts) < 7 or parts[0].startswith('Z'):
+        return None
+    return {'started': ' '.join(parts[1:6]), 'command': parts[6]}
+
+
+def _owned_processes(root):
+    """bench/arms.py's owned_processes (command line, cwd or open file under root), decoding safely."""
+    roots = legacy._roots(root)
+    rows = _process_table()
+    owned = {pid: 'command' for pid, row in rows.items() if legacy._under(roots, row['command'])}
+    current = None
+    for line in _out(['lsof', '-nP', '-w', '-u', str(os.getuid()), '-Fpn']).splitlines():
+        if line.startswith('p'):
+            current = int(line[1:])
+        elif line.startswith('n') and current is not None and legacy._under(roots, line[1:]):
+            owned.setdefault(current, 'open_file')
+    ancestors, pid = set(), os.getpid()
+    while pid in rows and pid not in ancestors:
+        ancestors.add(pid)
+        pid = rows[pid]['ppid']
+    return [dict(rows[pid], reason=reason) for pid, reason in sorted(owned.items()) if pid in rows and pid not in ancestors]
+
+
+def _owns(root, pid):
+    roots = legacy._roots(root)
+    identity = _process_identity(pid)
+    if identity is None:
+        return False
+    if legacy._under(roots, identity['command']):
+        return True
+    return any(line.startswith('n') and legacy._under(roots, line[1:])
+               for line in _out(['lsof', '-nP', '-w', '-a', '-p', str(pid), '-Fn']).splitlines())
+
+
+legacy.process_table = _process_table
+legacy.process_identity = _process_identity
+legacy.owned_processes = _owned_processes
+legacy.owns = _owns
 
 
 def markers():
     """pid -> worktree marker for every live process that carries one."""
-    out = subprocess.run(['ps', '-axww', '-E', '-o', 'pid=,command='], capture_output=True, text=True).stdout
+    out = _out(['ps', '-axww', '-E', '-o', 'pid=,command='])
     found = {}
     for line in out.splitlines():
         line = line.strip()
@@ -40,7 +108,7 @@ def open_paths(pids=None):
     argv = ['lsof', '-nP', '-w', '-Fpn'] + (['-p', ','.join(str(p) for p in pids)] if pids else ['-u', str(os.getuid())])
     if pids is not None and not pids:
         return {}
-    out = subprocess.run(argv, capture_output=True, text=True).stdout
+    out = _out(argv)
     paths, pid = {}, None
     for line in out.splitlines():
         if line.startswith('p'):
@@ -54,7 +122,7 @@ def owner_of(pid, command, marks, paths, groups):
     """The group a process belongs to: its marker, else its command line or any open path under a
     group's paths. `groups` maps name -> list of paths (the worktree, plus any per-checkout state
     directories the arm keeps elsewhere)."""
-    mark = marks.get(pid)
+    mark = group_of_marker(marks.get(pid))
     if mark in groups:
         return mark
     texts = [command] + sorted(paths.get(pid, ()))
@@ -87,9 +155,19 @@ def attributed(groups, exclude=()):
     return result
 
 
+LOOPBACK = ('127.0.0.1', 'localhost', '[::1]', '*', '0.0.0.0', '[::]')
+
+
+def _split(endpoint):
+    host, _, port = endpoint.rpartition(':')
+    return host, port
+
+
 def tcp():
-    """Listening sockets and established connections of this user's processes."""
-    out = subprocess.run(['lsof', '-nP', '-w', '-iTCP', '-a', '-u', str(os.getuid()), '-FpnT'], capture_output=True, text=True).stdout
+    """Listening ports on this host's loopback/wildcard addresses -> pid, and established
+    connections as (pid, remote host, remote port). Only connections to a local address count
+    as reaching another worktree's listener."""
+    out = _out(['lsof', '-nP', '-w', '-iTCP', '-a', '-u', str(os.getuid()), '-FpnT'])
     listeners, connections, pid, name = {}, [], None, None
     for line in out.splitlines():
         if line.startswith('p'):
@@ -99,12 +177,14 @@ def tcp():
         elif line.startswith('TST=') and pid is not None and name is not None:
             state = line[4:]
             if state == 'LISTEN':
-                port = name.rsplit(':', 1)[-1]
-                if port.isdigit():
+                host, port = _split(name)
+                if port.isdigit() and host in LOOPBACK:
                     listeners[int(port)] = pid
             elif state == 'ESTABLISHED' and '->' in name:
                 local, remote = name.split('->')
-                connections.append((pid, local.rsplit(':', 1)[-1], remote.rsplit(':', 1)[-1]))
+                host, port = _split(remote)
+                if host in LOOPBACK[:3]:
+                    connections.append((pid, host, port))
     return listeners, connections
 
 
@@ -114,12 +194,15 @@ class Sampler(threading.Thread):
     process listens on (cross-worktree access). Short-lived connections between samples are
     missed, so this is evidence of access, never proof of its absence."""
 
-    def __init__(self, groups, out, interval=1.0):
+    def __init__(self, groups, out, interval=1.0, ignore_clients=()):
         """`groups` is a callable returning {name: [paths]}; it is refreshed every few samples
         because an arm may create a checkout's state directories only when it first starts."""
         super().__init__(daemon=True)
         self.groups_fn, self.out, self.interval = groups, Path(out), interval
         self.groups, self.resolved = groups(), {}
+        # Stack's own probes (`stack ps`, `status`) connect to every checkout's ports by design;
+        # they are not an agent reaching another worktree's data.
+        self.ignore_clients = tuple(ignore_clients)
         self.stop_event = threading.Event()
         self.seen = {}        # (marker, pid, started) -> {first, last, command}
         self.ports = {}       # port -> set of markers that listened on it
@@ -146,11 +229,13 @@ class Sampler(threading.Thread):
         # Processes with sockets but no marker or path in their command line (redis, postgres
         # children, supervisors) are resolved once through their open files, cached by identity.
         unknown = [pid for pid in set(listeners.values()) | {c[0] for c in connections}
-                   if pid in rows and (pid, rows[pid]['started']) not in self.resolved
+                   if pid in rows and self.resolved.get((pid, rows[pid]['started'])) is None
                    and owner_of(pid, rows[pid]['command'], marks, {}, self.groups) is None]
         paths = open_paths(unknown) if unknown else {}
         for pid in unknown:
-            self.resolved[(pid, rows[pid]['started'])] = owner_of(pid, rows[pid]['command'], marks, paths, self.groups)
+            found = owner_of(pid, rows[pid]['command'], marks, paths, self.groups)
+            if found:  # unresolved processes are retried on later samples, once paths are known
+                self.resolved[(pid, rows[pid]['started'])] = found
         owner = {}
         for pid, row in rows.items():
             mark = owner_of(pid, row['command'], marks, {}, self.groups) or self.resolved.get((pid, row['started']))
@@ -164,9 +249,11 @@ class Sampler(threading.Thread):
             if mark:
                 self.ports.setdefault(port, set()).add(mark)
         events = []
-        for pid, local, remote in connections:
+        for pid, host, remote in connections:
             client = owner.get(pid)
             if not client or not remote.isdigit():
+                continue
+            if rows.get(pid, {}).get('command', '').startswith(self.ignore_clients):
                 continue
             server = port_owner.get(int(remote))
             if server and server != client:
@@ -197,8 +284,14 @@ def _same(row):
     return now is not None and now['started'] == row['started'] and now['command'].rstrip() == row['command'].rstrip()
 
 
+def _owned(pid, root):
+    if RUN_SUFFIX and group_of_marker(markers().get(pid)) is not None:
+        return True
+    return legacy.owns(root, pid)
+
+
 def _signal(row, signum, root):
-    if not _same(row) or not legacy.owns(root, row['pid']):
+    if not _same(row) or not _owned(row['pid'], root):
         return False
     try:
         os.kill(row['pid'], signum)
@@ -223,3 +316,18 @@ def reclaim(rows, root, grace=5):
     time.sleep(0.2)
     result['survivors'] = [row['pid'] for row in rows if _same(row)]
     return result
+
+
+def run_processes(root):
+    """Every live process of this run: under its root (command, cwd, open file) or carrying its marker."""
+    found = {p['pid']: p for p in legacy.owned_processes(root)}
+    if RUN_SUFFIX:
+        rows = legacy.process_table()
+        ancestors, pid = set(), os.getpid()
+        while pid in rows and pid not in ancestors:
+            ancestors.add(pid)
+            pid = rows[pid]['ppid']
+        for pid, mark in markers().items():
+            if pid in rows and pid not in ancestors and group_of_marker(mark) is not None:
+                found.setdefault(pid, dict(rows[pid], reason='marker'))
+    return list(found.values())

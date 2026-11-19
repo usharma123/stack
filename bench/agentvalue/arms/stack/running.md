@@ -14,8 +14,8 @@ single machine-readable result (`stack mcp` serves the same operations over MCP)
   variables into your shell.
 - `stack run test` runs the test suite (pytest) against this worktree's services; `stack run smoke` runs
   the smoke test. `stack run migrate` and `stack run seed` apply migrations or load the demo data now.
-- `stack restart api worker` restarts the app processes after you change their code (they do not reload
-  on their own; `stack status` tells you when a watched file changed).
+- `stack restart api worker` applies pending migrations and restarts the app processes after you change
+  their code (they do not reload on their own; `stack status` tells you when a watched file changed).
 - `stack logs <service>` shows a service's recent output.
 - `stack down` stops everything this worktree started and confirms it is gone. The data is kept;
   `stack down --purge` also deletes this worktree's data.

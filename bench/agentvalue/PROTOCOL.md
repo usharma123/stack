@@ -81,22 +81,29 @@ The harness copies the binary built from this worktree onto PATH as `stack`.
 - Services: preset `postgres` and `redis`; the `api` (identity probe, `setup` runs `migrate.py`);
   the `worker`.
 - Tasks: `migrate`, `seed` (an init task, run once per new database), `test`, `smoke`.
-- One accommodation: Stack verifies every service by connecting to its port, and this build has no
-  way to declare a service that does not listen. The worker therefore serves an optional health
-  port, enabled only through `WORKER_HEALTH_PORT` in the Stack arm's `run` line. That is a finding
-  about Stack, recorded in the report.
+- The worker serves an optional health port when `WORKER_HEALTH_PORT` is set. The shared README
+  states that contract, and both arms use it. It exists because Stack verifies every service by
+  connecting to its port, and this build has no way to declare a service that does not listen.
+  That is a finding about Stack, recorded in the report.
 
 **Baseline.** The repository contains `arms/baseline/mise.toml`, which pins the same versions with
 the same mise backends Stack locks (`conda:postgresql`, `conda:redis-server`), and
 `arms/baseline/dev.py`. `dev.py` is the per-worktree setup layer the research describes
 (RESEARCH.md §4):
 
-- ports from a hash of the worktree path, in 10-port slots, moving to the next free slot;
+- ports from a machine-wide registry under a lock: a 10-port slot from a hash of the worktree path,
+  moving to the next slot that no other worktree holds and nothing else listens on;
+- a lock per worktree for `up`, `restart` and `down`;
+- an `up` that resumes a partial start, keeping what runs and starting the rest, and redoes an
+  interrupted `initdb`;
 - its own PostgreSQL (`initdb -E UTF8`), Redis, API and worker per worktree, with data under `.dev/`;
-- migrations on every `up`, and seeding once per new database (the same rule as Stack's init task);
-- an identity check on the API, `status` and `env` output, `exec`, `test`, `smoke`, `migrate`,
-  `seed`, `restart`, `logs`;
-- `down`, which confirms every recorded process is gone, and `down --purge`.
+- migrations on every `up` and `restart` (as Stack's `setup` runs them), and seeding once per new
+  database (the same rule as Stack's init task);
+- an identity check on the API and a health check on the worker, `status` and `env` output, `exec`,
+  `test`, `smoke`, `migrate`, `seed`, `restart`, `logs`. Commands that need only the database work
+  while the API is down;
+- `down`, which stops each app's whole process group and confirms only when every recorded process
+  is gone and its port is closed; `down --purge` also releases the ports.
 
 A `stack` stub on PATH answers "command not found", so a host-wide Stack cannot leak into this arm.
 
@@ -115,7 +122,7 @@ independently before the first paired trial, with instructions to look for sandb
 - the same prompt;
 - a README with the same project section and a "Running it in this worktree" section that lists the
   same operations in the same order: up, status, exec/env, test/smoke/migrate/seed, restart, logs,
-  down. The sections are 248 words (Stack, which also names `--json` and MCP) and 225 words
+  down. The sections are 252 words (Stack, which also names `--json` and MCP) and 229 words
   (baseline);
 - the same pinned versions and the same warm download cache;
 - the same locale (`en_US.UTF-8`);
@@ -197,17 +204,19 @@ final message never decides anything.
 | Measure | Definition and detector |
 |---|---|
 | **Task success** | `harness/grade.py`, the same for both arms. The grader starts its own pinned PostgreSQL and Redis on private ports and runs the submitted code twice. **fresh**: an empty database, the submitted `migrate.py` and `seed.py`, the API and worker, then the *original* smoke test and *original* API tests. **upgrade**: the *starting* code's migrations and seed, then hidden data the agent never sees (non-ASCII names, duplicate customer names, an existing receipt), then the submitted migrations, API and worker, then the task's hidden checks (`hidden/verify.py`). Success needs both runs to complete, the smoke and original tests to pass, and every required check to be true. Benchmark-owned files (`smoke.py`, `pyproject.toml`, `uv.lock`, arm files, README) always come from the starting code |
-| **Teardown gate** (per agent) | At the moment the agent's CLI exits: no live process attributed to its worktree, and no port listened on by one. Anything recorded fails the gate, whether or not the arm's `down` would later stop it |
-| **Isolation gate** (per agent) | No contamination event names this agent as the culprit, and the run has no contamination event without a culprit. The events: (a) a migration from an agent's branch recorded in the main checkout's `schema_migrations`; (b) any other change to the bystander fingerprint (columns, invoice and receipt contents, Redis keys and values); (c) a bystander process gone at the end (pid and start time); (d) a migration from one agent's branch in another worktree's database, read by starting a private postgres on that database after the agents finish; (e) the main checkout's canary row in a worktree database; (f) a TCP connection, seen by the 1 s sampler, from a process of one worktree to a port another worktree's process listens on. Culprit for (a) and (d): the agent whose branch has that migration file. For (c): the agents whose traces contain broad kill commands. For (f): the client's worktree. A gap between samples can hide a short connection, so (f) is evidence of access, never proof of its absence |
-| **Gated success** (primary) | Task success **and** teardown gate **and** isolation gate |
+| **Teardown gate** (per agent) | Observed by a thread per agent as soon as its CLI exits (the delay is recorded): no live process attributed to its worktree, and no port listened on by one. Ownership paths are taken fresh at that moment. Processes of the agent CLI's own binary are listed separately and do not count. Anything recorded fails the gate, whether or not the arm's `down` would later stop it |
+| **Isolation gate** (per agent) | No contamination event names this agent as the culprit, and the run has no contamination event without a culprit. The events: (a) a migration from an agent's branch recorded in the main checkout's `schema_migrations`; (b) any other change to the bystander fingerprint (columns, invoice and receipt contents, Redis keys and values; PostgreSQL write counters are recorded but never gate, because statistics flushes move them); (c) a durable bystander process (postmaster, Redis, the API, the worker, Stack's supervisor) gone at the end (pid and start time); (d) a migration from one agent's branch in another worktree's database, read by starting a private postgres on that database after the agents finish; (e) the main checkout's canary row, matched by its token, in a worktree database; (f) a TCP connection, seen by the 1 s sampler, from a process of one worktree to a loopback port another worktree's process listens on (Stack's own `ps`/`status` probes excluded). Culprit for (a) and (d): the agent whose branch has that migration file. For (c): the agents whose broad kill commands name the lost process's program. For (f): the client's worktree. A worktree database that exists but cannot be read makes the run invalid. A migration found in a database that matches no branch's files (a renamed migration, say) is listed for review and does not gate. A gap between samples can hide a short connection, so (f) is evidence of access, never proof of its absence |
+| **Gated success** (primary) | Task success **and** teardown gate **and** isolation gate **and** a clean CLI exit (exit 0 and a `success` result event) |
 | **Episode success** | All three agents of a run have gated success: a system-level outcome, analogous to pass^k |
-| **Time to a verified result** | Agent wall-clock seconds from launch to CLI exit, reported for gated successes only. Failures are counted, never imputed. Setup and grading time are excluded |
+| **Time to a verified result** | Agent wall-clock seconds from launch to CLI exit (monotonic clock), reported for gated successes only. It includes the agent's own provisioning of its worktree, and excludes the harness's setup and grading. Failures are counted, never imputed |
+| **Compliance** (secondary) | Whether the agent committed on its branch and ran the tests (`stack run test`, `dev.py test` or `pytest` in its commands). Reported, never gated: grading uses the whole worktree |
 | **Tool calls, turns, retries** | From the stream-json trace: `tool_use` blocks (all, and Bash), `num_turns`, tool results with `is_error` (the proxy for retries), and tool results matching an environment-error pattern (address in use, connection refused, wrong database or role) |
 | **Broad kill commands** | Bash commands matching `pkill`, `killall`, `fuser -k`, `kill -9`, `lsof -t … | xargs kill`, or `kill $(…)`. Counted; collateral damage is proven only through event (c) |
 | **Cost and tokens** | The CLI's `result` event: `total_cost_usd` (list price, not a bill) and usage |
 | **Used its own database** | Positive evidence that the agent really used its services: its worktree database exists and has its own new migration applied. Not a gate; a guard against "passed the gates by never starting anything" |
 | **Human interventions** | 0 by construction (no channel); reported, not measured |
-| **Disposal residue** (per arm) | After each worktree's documented removal (Stack: `stack down`, `git worktree remove`, then `stack gc --reclaim-data`; baseline: `dev.py down`, `git worktree remove`), record: processes still attributed, ports agents listened on that still listen, worktree directories left, and the growth of `root/m` with a directory listing. Service data (a PostgreSQL or Redis data directory) left behind fails the arm's lifecycle check. Metadata records under 1 MiB are listed as observations |
+| **Recovery of a dirty checkout** (per agent, not a gate) | Right after the agents, before any harness cleanup, the arm's documented `down` runs in each worktree exactly as its agent left it. Recorded: what the agent left, and what is still attributed after `down`. Only then does the harness stop anything left, which is recorded separately |
+| **Disposal residue** (per arm) | After each worktree's documented removal (Stack: `stack down`, `git worktree remove`, then `stack gc --reclaim-data`; baseline: `dev.py down`, `git worktree remove`), record: processes still attributed, ports agents listened on that still listen, worktree directories left, and the growth of `root/m` with a directory listing. Service data (a non-empty PostgreSQL or Redis data directory of a removed worktree, located through the arm's own records taken before removal) left behind fails the arm's lifecycle check. Metadata records under 1 MiB are listed as observations |
 | **Benchmark access** | Tool inputs that mention this repository, `bench/agentvalue`, the grader's directory, `oracles/` or `hidden/`. Any hit is reported with the trace |
 
 ### Validity
@@ -278,7 +287,11 @@ commit listed below.
 
 | Commit | Change | Reason |
 |---|---|---|
-| (this commit) | Protocol fixed | — |
+| `d1ef3c5` | Protocol fixed | — |
+| (next commit) | Hidden checks: a new required check `existing_api_intact` in every task (PATCH still updates the amount in the database; receipts still list). Pre-existing statuses and receipts are compared at the SQL level. `pay-receipts`: the grader runs the worker itself, proves the job is queued while the worker is held back and that no receipt exists before it runs, replays the captured job with the worker stopped and checks it was consumed, and requires that a 409 or 404 queues nothing. `customer-table`: a unique constraint on the name is required. `invoice-notes`: the note must be stored in the database and the read path must still use the cache. The migration ledger must match the new migration files exactly, and the rerun check covers constraints, indexes and row counts | The independent review reproduced two submissions that passed while wrong (a worker that never issues receipts; a migration that drops the unique name, deletes receipts and breaks PATCH). Each is now a validation mutant that must fail |
+| (next commit) | Gated success also requires a clean CLI exit. Teardown is observed per agent at exit with fresh ownership paths; CLI helpers are excluded. Isolation: write counters no longer gate, kill culprits must name the lost program, the canary is matched by token, unreadable worktree databases invalidate the run, Stack's probes are not cross-worktree traffic, connections must reach a loopback listener. Compliance is reported. The arm's own `down` is tried on the dirty checkout before harness cleanup | Review findings 6–9, 14 and 15: gates that could pass a bad trial or fail a good one |
+| (next commit) | Baseline `dev.py`: a lock-guarded port registry, a per-worktree lock, resumable `up`, migration on `restart`, a worker health check, commands that need only the database, and a `down` that confirms ports are closed. Shared README: the worker health contract | Review findings 1–3: the baseline's recovery and shutdown were weaker than its README promised, which would have handicapped it |
+| (next commit) | The harness never logs a whole environment: addresses are read with a three-variable query, and every recorded output and retained trace is scrubbed of credential-like values. Run-qualified process markers, marker-based cleanup, grader partial-start cleanup, stop rules enforced by `pair`, a host lock, plan digests bound into runs, agent-facing Markdown and this protocol bound into the plan | Review finding 4 (a host credential reached a committed record; removed from the branch by rewriting the protocol commit), 5, 12 and 13 |
 
 ## Limitations
 
