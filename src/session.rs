@@ -3183,7 +3183,19 @@ fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRe
                 .into_iter()
                 .filter(|p| !strays.iter().any(|s| s.chain.iter().chain(&s.members).any(|q| q.same(p))))
                 .collect();
-            let survivors = stop_strays(&strays, &others, Some(&carriers));
+            // A group not signalled as one (it holds a command) is looked at again while its
+            // members are stopped one by one: a worker a member started since is stopped too.
+            let mixed: Vec<u32> = strays.iter().filter(|s| s.group.is_none()).filter_map(|s| s.chain.last()).filter(|top| top.group == top.pid).map(|top| top.group).collect();
+            let rescan = || {
+                let mut found = carriers();
+                for p in mixed.iter().flat_map(|group| crate::procinfo::in_group(*group)) {
+                    if !exempt.covers(&p) && !found.iter().any(|q| q.same(&p)) {
+                        found.push(p);
+                    }
+                }
+                found
+            };
+            let survivors = stop_strays(&strays, &others, Some(&rescan));
             if !survivors.is_empty() {
                 return Err(StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
                     .hint("retry `stack down`; stopping is safe to repeat")

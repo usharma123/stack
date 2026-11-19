@@ -139,7 +139,7 @@ fn identities(state: &Path) -> Vec<String> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "lock"))
+        .filter(|p| p.extension().is_some_and(|x| x == "lock") && fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
         .filter_map(|p| Some(p.file_stem()?.to_str()?.to_string()))
         .collect()
 }
@@ -215,6 +215,8 @@ impl StartedBy<'_> {
 
 #[cfg(test)]
 thread_local! {
+    /// Fail to start the thread that records a spawned command's PID, as a thread limit would.
+    pub(crate) static WRITER_THREAD_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Fail the write that records a spawned command's PID, as a full disk would.
     pub(crate) static SPAWN_WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -255,7 +257,7 @@ pub struct Registration {
     finished: bool,
     /// The write recording the spawned command, done beside the command's start; finished
     /// before the entry is removed.
-    recording: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    recording: Recording,
 }
 
 /// Register a command about to be started for the checkout at `root`, running `program`, by
@@ -278,6 +280,42 @@ pub fn register(state: &Path, root: &Path, started_by: StartedBy, program: &Path
     Ok(Registration { handle: Handle { path, lock, id }, finished: false, recording: Default::default() })
 }
 
+/// Start the thread that records a command's process. Tests can make it fail as a thread
+/// limit would.
+fn writer_thread(job: impl FnOnce() + Send + 'static) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if WRITER_THREAD_FAILS.with(|f| f.get()) {
+        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+    }
+    std::thread::Builder::new().name("stack-command-record".into()).spawn(job)
+}
+
+type Recording = std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>;
+
+/// Record the process `pid` as the command of `handle`'s entry: observed now, while the child
+/// cannot have been reaped, and written beside its start.
+fn record_spawn(handle: &Handle, recording: &Recording, pid: u32) {
+    // Observed now, while the child cannot have been reaped; written beside its start.
+    let process = procinfo::process(pid);
+    let record = |handle: Handle, process| {
+        if let Err(e) = handle.record(process) {
+            eprintln!("stack: cannot record the command's process in the command registry ({e}); once this Stack process is gone, `stack down` is not confirmed until `stack down --forget-unrecorded`");
+        }
+    };
+    // Beside the command, so it does not wait for the write. A thread that cannot be
+    // started (a process or thread limit) must not lose the record or end this process
+    // with the command running: the write is then made here.
+    let (theirs, observed) = (handle.clone(), process.clone());
+    match writer_thread(move || record(theirs, observed)) {
+        Ok(write) => {
+            if let Ok(mut slot) = recording.lock() {
+                *slot = Some(write);
+            }
+        }
+        Err(_) => record(handle.clone(), process),
+    }
+}
+
 impl Registration {
     /// Have the next process this thread spawns recorded as the command (see
     /// [`crate::process::on_next_spawn`]). If that write fails, the entry keeps counting: while
@@ -285,18 +323,7 @@ impl Registration {
     pub fn record_next_spawn(&self) -> crate::process::SpawnHook {
         let handle = self.handle.clone();
         let recording = self.recording.clone();
-        crate::process::on_next_spawn(Box::new(move |pid| {
-            // Observed now, while the child cannot have been reaped; written beside its start.
-            let process = procinfo::process(pid);
-            let write = std::thread::spawn(move || {
-                if let Err(e) = handle.record(process) {
-                    eprintln!("stack: cannot record the command's process in the command registry ({e}); once this Stack process is gone, `stack down` is not confirmed until `stack down --forget-unrecorded`");
-                }
-            });
-            if let Ok(mut slot) = recording.lock() {
-                *slot = Some(write);
-            }
-        }))
+        crate::process::on_next_spawn(Box::new(move |pid| record_spawn(&handle, &recording, pid)))
     }
 
     /// Remove the entry: the command ended.
@@ -441,6 +468,15 @@ fn marked(mark: &str) -> Vec<Process> {
 /// The registry is read under its lock; one that cannot be read, or that holds an unrecorded
 /// entry, is an error.
 pub fn after_down(state: &Path, root: &Path, older_pids: &[u32], exempt: &Exempt) -> Result<Vec<RunningCommand>> {
+    // A registry this `down` could not read when it decided what to stop (so it stopped no
+    // leftover) is not confirmed by this `down`, even if it has become readable since.
+    if let Some(e) = &exempt.blind {
+        let again = StackError::new("state_invalid", e.message.clone());
+        return Err(match &e.hint {
+            Some(hint) => again.hint(hint.clone()),
+            None => again,
+        });
+    }
     let (path, lock) = files(state, root)?;
     let me = procinfo::process(std::process::id());
     let _lock = FileLock::acquire(&lock)?;
@@ -696,6 +732,39 @@ mod tests {
         fs::write(&path, "nonsense").unwrap();
         assert!(super::listed(&state, &root).is_err());
         assert!(after_down(&state, &root, &[], &Exempt::default()).is_err());
+    }
+
+    /// A `down` that could not read the registry when it decided what to stop is not confirmed,
+    /// even if the registry has become readable (or was cleared) since.
+    #[test]
+    fn a_down_that_began_with_an_unreadable_registry_is_never_confirmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("root"));
+        fs::create_dir_all(&root).unwrap();
+        let blind = Exempt { blind: Some(StackError::new("state_invalid", "the command registry cannot be read")), ..Exempt::default() };
+        assert!(after_down(&state, &root, &[], &Exempt::default()).unwrap().is_empty(), "nothing registered, and readable now");
+        let error = confirm(2, after_down(&state, &root, &[], &blind)).unwrap_err();
+        assert_eq!((error.code, error.details[0]["kind"].as_str()), ("stop_unconfirmed", Some("registry")), "{}", error.message);
+    }
+
+    /// The thread that records a spawned command's PID cannot be started (a thread limit): the
+    /// PID is recorded all the same, by the caller, so the command stays known.
+    #[test]
+    fn a_writer_thread_that_cannot_start_does_not_lose_the_commands_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("root"));
+        fs::create_dir_all(&root).unwrap();
+        let mut registration = register(&state, &root, StartedBy::Exec, Path::new("/bin/sleep")).unwrap();
+        let mut command = child(&[]);
+        WRITER_THREAD_FAILS.with(|f| f.set(true));
+        record_spawn(&registration.handle, &registration.recording, command.id());
+        WRITER_THREAD_FAILS.with(|f| f.set(false));
+        assert!(registration.recording.lock().unwrap().is_none(), "no thread was started");
+        let running = after_down(&state, &root, &[], &Exempt::default()).unwrap();
+        assert_eq!((running.len(), running[0].pid), (1, Some(command.id())), "recorded by its own PID");
+        command.kill().unwrap();
+        command.wait().unwrap();
+        registration.finish().unwrap();
     }
 
     /// The write recording a spawned command's PID fails (a full disk): the entry stays, and once
