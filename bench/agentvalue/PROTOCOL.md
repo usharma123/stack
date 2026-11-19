@@ -1,7 +1,10 @@
 # Stack agent-value benchmark: protocol
 
-Status: fixed before any paired trial. Every later change to scoring, gates or analysis must be a
-separate commit that says why, and is listed under [Changes](#changes) with its commit.
+Status: **version 2**, fixed on 2026-11-19 before any version 2 trial. Version 1 (three agents, no
+faults) is the text up to [Version 2](#version-2-fault-injection-five-agents-the-fixed-stack-build);
+its first baseline is in [REPORT.md](REPORT.md). Version 2 adds to it and replaces only what its
+section says it replaces. Every change to scoring, gates or analysis is a separate commit that says
+why, listed under [Changes](#changes) with its commit.
 
 The research behind these choices is in [RESEARCH.md](RESEARCH.md). The harness is in `harness/`.
 The commands are in [README.md](README.md).
@@ -283,6 +286,232 @@ whole of `bench/agentvalue/`, in particular:
 Findings and what was done about each are recorded in REPORT.md. Any fix that touches scoring is a
 commit listed below.
 
+## Version 2: fault injection, five agents, the fixed Stack build
+
+### Why
+
+The version 1 baseline hit the ceiling in both arms: 15/15 on task success and every gate. A
+benchmark at the ceiling cannot judge a change to Stack. Version 2 makes the episodes harder in
+three ways, and leaves the baseline arm, the agent model and its settings exactly as they were.
+
+Version 1 and version 2 results are not compared with each other: the Stack build, the task set
+and the concurrency all differ.
+
+### What stays the same
+
+- The fixture app, the grader design, and the three version 1 tasks with their hidden checks.
+- The baseline arm: `arms/baseline/dev.py`, `mise.toml` and its README section, unchanged.
+- The agent: Claude Code headless, `claude-sonnet-5-5`, effort `high`, the same flags and budgets
+  (1800 s and US$8 per session), identical in both arms. The plan pins the CLI's versioned binary.
+- The prompt for an ordinary agent, the process attribution rule, the bystander and its canary.
+- Every version 1 measure, gate and validity rule, unless a line below replaces it.
+
+### What changes
+
+**1. The Stack build.** The Stack arm uses `fix/exercise-findings` at `a5d4785`, built with
+`cargo build --release --locked` from a `git archive` of that commit, outside any checkout
+(`~/.cache/stack-agentvalue/stack-a5d4785/`). Release binary sha256:
+`b0931a8be40bc65855a1139d10a8f7f66c136e5a564b58cf9994a58f511fdd17`. In this build `stack down`
+exits 70 (`stop_unconfirmed`) while a command Stack started for the checkout (`exec`, `run`, MCP)
+still runs, and names its PID. The plan records the revision and the hash, and `pair` refuses to
+run if the binary's hash differs.
+
+**2. Five agents.** Five agents start at the same moment, one worktree each, beside the main
+checkout's running services. Two tasks join the three from version 1:
+
+| Task | Branch | What it exercises |
+|---|---|---|
+| `invoice-list` | `feature/invoice-list` | A new `GET /invoices` with status and customer filters and id-based paging, and a migration that adds an index |
+| `void-invoices` | `feature/void-invoices` | A new status reached through `POST /invoices/<id>/void`, a migration that replaces a check constraint, state rules (409s) and cache invalidation |
+
+Both are validated like the others: the starting code fails, the reference passes, and near-miss
+mutants fail the check they should.
+
+The machine budget is recorded per run: cores, memory, the 1-minute load average before the
+bystander starts and after the last agent exits, the number of concurrent sessions, and each
+session's time and dollar budget. Both arms of a pair run on the same host, one after the other.
+
+**3. Fault injection.** Every pair has one scenario and one victim task, both fixed by the plan and
+the same in both arms.
+
+*Scenario `agent-kill`.*
+
+1. All five agents start.
+2. The trigger is the first 1 s sample in which a process attributed to the victim's worktree
+   listens on a TCP port: its services have started.
+3. 3 s after the trigger, the harness sends SIGKILL to the victim's agent CLI process, and to that
+   process only. Whatever tool command it was running is left as it is, as after a crash. The
+   harness records what the worktree was running at that moment.
+4. 10 s after the kill, the harness starts a fresh agent session in the victim's worktree: the same
+   CLI, model, settings and budget, with the recovery prompt below.
+5. The other four agents (the survivors) are not told anything and are not touched.
+6. The episode ends when the survivors and the recovery agent have exited or hit their budgets.
+
+*Scenario `service-kill`.*
+
+1. All five agents start.
+2. The trigger is the first sample in which the victim worktree's PostgreSQL postmaster is running
+   and listening.
+3. 3 s after the trigger, the harness sends SIGKILL to that postmaster (pid and start time checked
+   again first). Nothing else is done: the victim's own agent has to notice and cope.
+4. The episode ends when all five agents have exited or hit their budgets.
+
+PostgreSQL is the service killed in every `service-kill` pair, because it holds the state.
+
+*A missed fault.* If the victim's CLI exits before the kill is due, or no trigger is seen within
+600 s of launch, the fault is recorded as missed and nothing is injected. The run stays valid for
+the ordinary measures. Its fault measures are missing, the pair is left out of the paired fault
+comparisons, and the report lists it.
+
+*The recovery prompt* (identical in both arms; `{branch}` and `{instruction}` as in the ordinary
+prompt):
+
+> You are taking over from another coding agent. It was working on the task below in this git
+> worktree (the current directory, on branch {branch}) and stopped unexpectedly partway through. It
+> will not come back. Its edits may be incomplete, and it may have left this worktree's services
+> running or half started. Other agents' worktrees, and the main checkout, have services running
+> while you work.
+>
+> Your task:
+> {instruction}
+>
+> Read README.md first: it explains how to run the project and its services in this worktree. Check
+> what state the worktree and its services are in, then finish the task. Before you finish, run the
+> tests against your worktree's running services and make sure they pass, and commit your work on
+> your branch. When you are done, stop everything that is running for this worktree, including
+> anything the previous agent left, and leave other worktrees' and the main checkout's services
+> alone.
+
+**4. The teardown procedure.** After the episode, the harness tears down every worktree exactly as
+it was left, with the arm's documented procedure. Nothing is cleaned by the harness first.
+
+- **Stack:** `stack down`. If it fails `stop_unconfirmed` and lists commands of this checkout
+  (details with `kind: "command"`, not `another_checkout`), the harness does what the hint says:
+  it stops those PIDs (SIGTERM, 10 s, then SIGKILL) and runs `stack down` again, for at most three
+  rounds. Then `git worktree remove --force`, and after the last worktree `stack gc --reclaim-data`.
+- **Baseline:** `python3 dev.py down`, then `git worktree remove --force`.
+
+Two observations are taken per worktree:
+
+- **after `down`** (and Stack's follow-up rounds): every process attributed to the worktree, and
+  every port one of them listens on;
+- **after removal** (and Stack's `gc`): the worktree directory, and any non-empty PostgreSQL or Redis
+  data directory of that worktree, located through the arm's own records taken before removal.
+
+Only after the first observation is recorded does the harness stop anything left, and that is
+recorded separately. A process the harness had to stop counts as left.
+
+### Gates in version 2
+
+The version 1 gates still apply to every ordinary session: task success, teardown at the agent's
+exit, isolation, and a clean CLI exit. Version 2 adds these.
+
+| Gate | Definition and detector |
+|---|---|
+| **Teardown residue** (per worktree; the arm's lifecycle) | After the teardown procedure: no process attributed to the worktree and no port one listens on (first observation), and no worktree directory or service data directory (second observation). Reported for every worktree, and separately for the fault victim's worktree, where it is the gate the fault scenarios were built for |
+| **Others untouched** (per run) | The run has no contamination event at all: none of version 1's events (a) to (f), and none of event (g) below. The injected fault itself is never an event |
+| **Isolation, event (g): a sibling's service lost** | A durable service process of worktree X (postmaster, Redis, the API, the worker, Stack's supervisor) disappears between two samples while X's own agent is still running, X's own agent ran no command that stops or restarts services in the 10 s before, and another agent ran a kill-like command (the version 1 pattern) in the 5 s before. The culprit is that other agent. A loss that no agent's command explains is listed for review and does not gate: an app can exit because of its own agent's code. Command times come from the arrival time of each trace line, which the harness now records |
+| **Recovery session** (agent-kill) | The recovery agent is scored like any session: hidden checks on the worktree's final tree, teardown at its exit (everything attributed to the worktree, whoever started it), isolation, and a clean CLI exit |
+
+The killed agent's own session is not scored: the harness ended it. In the `agent-kill` scenario the
+victim's slot is the recovery session.
+
+**Truthful `down`** is reported next to the residue gate. A false confirmation is the arm's `down`
+exiting 0 while the first observation still finds a process of that worktree. It is counted per
+arm. It is not a separate gate, because the residue gate already fails in that case.
+
+### Measures in version 2
+
+| Measure | Definition |
+|---|---|
+| **Gated success per slot** (primary) | Five slots per run. Ordinary slots as in version 1. In `agent-kill` the victim's slot is the recovery session |
+| **Survivors finish** | Gated success among the four agents that were not the victim |
+| **Recovery** (agent-kill) | Recovery gated success, and for the recovery session: seconds from its launch to its exit, tool calls, turns, tool errors and cost |
+| **Victim copes** (service-kill) | The victim's gated success, seconds, tool calls, turns and tool errors. The same task's figures in pairs where it was not the victim are shown beside them, as description only |
+| **Episode success** | `agent-kill`: four survivors and the recovery session have gated success, the residue gate holds for every worktree, and others are untouched. `service-kill`: all five have gated success, and the same two run-level gates hold |
+| **Fault facts** | Injected or missed; seconds from launch to the kill; what the victim's worktree was running at the kill and at the end of the episode |
+| **Teardown** | Per worktree: `down`'s exit status, Stack's follow-up rounds and the PIDs it named, false confirmations, and both observations |
+| **Machine budget** | As recorded per run (see "Five agents") |
+| Effort measures | Seconds, tool calls, turns, tool errors, environment errors, kill commands and cost per session, as in version 1 |
+
+### Validation before any trial (both arms)
+
+`harness/validate.py` must show each new gate firing on a planted case and staying quiet on a clean
+one, in both arms, with scripted agents:
+
+| Planted case | Expected |
+|---|---|
+| Five clean reference agents, no fault | Every gate holds; nothing left after teardown |
+| `agent-kill` on a scripted victim, with a scripted recovery agent that finishes the task | The fault is injected at the planned point; recovery has gated success; the residue gate holds |
+| `agent-kill`, and the recovery agent leaves the worktree's services running | The recovery session fails teardown at exit; the arm's `down` then clears the worktree, so the residue gate holds |
+| A process the arm does not manage is left in a worktree (started without the arm's tooling) | The residue gate fails for that worktree in both arms |
+| `service-kill` on a scripted victim that starts its services again | The postmaster is killed at the planned point; the victim passes; the kill is not counted as contamination |
+| `service-kill` on a scripted victim that does not react | The victim fails its task; other agents are unaffected |
+| A scripted agent kills another worktree's worker by name while that worktree's agent is running | Event (g), attributed to the killer |
+| **A command left running under the arm's `exec` at teardown**: the agent starts a long command through `stack exec` / `dev.py exec`, runs the arm's `down` and exits | Teardown at exit fails in both arms. Stack at `a5d4785`: `down` is not confirmed, names the PID, and the procedure then leaves the worktree clean. Stack at `dc4b980` (the version 1 build, run as a control): `down` confirms while the command runs, a false confirmation, and the residue gate fails. Baseline: `dev.py down` confirms while the command runs, a false confirmation, and the residue gate fails. The baseline is left as it is; this is recorded as its behaviour |
+
+The version 1 planted cases (services left running, a migration run against the main checkout, a
+kill of the main checkout's worker) and every grader mutant stay in the validation.
+
+### Validity, added rules
+
+- A missed fault does not invalidate a run (see above).
+- A run is invalid if the recovery agent cannot be started, or if the harness's own kill cannot be
+  shown to have hit the planned process.
+- Agents get their environment from an allowlist, not from the host's environment minus a
+  denylist. The harness never records an environment. Every commit is scanned first
+  (`harness/scan_staged.py`) for credential patterns and for the value of any host environment
+  variable that is not on the allowlist.
+
+### Plan, order and cost
+
+- **Pilot:** one pair per scenario (4 runs, 22 sessions), to shake out the harness. Reported
+  separately.
+- **Main run:** five pairs per scenario (10 pairs, 20 runs, 110 sessions: 100 ordinary and 10
+  recovery).
+  - Pairs alternate scenarios. Within a scenario, the first arm of its first pair comes from a
+    seeded coin flip and later pairs alternate.
+  - Within a scenario, the victims are a seeded permutation of the five tasks, so each task is the
+    victim once. Both arms of a pair have the same victim.
+- **Expected cost:** version 1 sessions cost about US$0.10 each. Expect US$0.10–0.25 at five-way
+  concurrency with faults, so about US$3–6 for the pilot and US$11–28 for the main run. The hard
+  ceiling is 132 sessions × US$8. If the pilot averages more than US$1 per session, stop and
+  report before the main run.
+- **Expected duration:** 3–5 minutes per run, about 1.5 hours of trials in all.
+
+### Analysis (fixed now)
+
+- Everything is reported **per scenario and per arm**, with k/n and the assigned count, and for
+  continuous measures the median, interquartile range and range.
+- **Pairs** are compared within a scenario. A pair has the same victim task in both arms, so paired
+  differences for recovery and for the victim are within one task.
+- **When a measure separates the arms beyond run-to-run spread.** Decided per scenario, with five
+  pairs:
+  - *Rates over slots* (25 slots per arm and scenario): the pooled difference is at least 3 slots,
+    and no pair's difference has the opposite sign.
+  - *Per-run binary measures* (5 per arm and scenario: recovery, episode success, residue gate for
+    the victim's worktree, others untouched): the arms differ in at least 2 of the 5 pairs, all in
+    the same direction.
+  - *Continuous measures* (seconds, tool calls, turns, cost; the recovery and victim figures): the
+    per-pair mean differences have the same sign in all five pairs, and the median paired
+    difference is larger than half of the larger within-arm interquartile range.
+
+  Anything else is reported as not separated. Five same-signed pairs out of five is a two-sided
+  sign-test p of 0.0625, so even a "separated" measure is a descriptive finding, not a
+  significance claim.
+- A measure at floor or ceiling in both arms is reported as such, as in version 1.
+- **If both arms are still at the ceiling** on the gates and on gated success, the report says so
+  and recommends which of the two changes held back from this version to try next: a naive
+  shared-database arm, or a weaker agent model.
+- Planted validation cases are never mixed into trial results. Where a planted case separates the
+  arms by construction (the `exec` case above), the report says it is a planted case.
+
+### Review
+
+The one reviewer session (GPT-6.2 Sol) reviews this amendment and the harness changes before the
+first paired trial, and the report before it is handed back. Findings and what was done about each
+are recorded in the report. A fix that touches scoring is a commit listed below.
+
 ## Changes
 
 | Commit | Change | Reason |
@@ -295,6 +524,7 @@ commit listed below.
 | `82731b8` | Round-2 review fixes. Baseline `down` signals only processes proven to be the worktree's (recorded pid and start time, or group members whose command or working directory is inside it); a foreign listener is reported, never killed; the lifecycle lock lives outside `.dev/` and is held through `--purge`; `up` adopts services it started but never recorded and restarts apps that do not answer; `migrate` needs only PostgreSQL. Grader: bounded waits, group stop after leader exit, cleanup in `finally`; the notes cache check proves a cache hit (a database-only change must not show through), the rerun check compares table contents, uniqueness must not be partial, statuses are compared in SQL, payment must be persisted before the worker runs, and jobs must go on a Redis list (the README's contract). Gates: a failed `ps` or `stack ps` raises (the run becomes invalid) instead of reading as "nothing running"; listeners are matched by full endpoint; a killed bystander that makes the fingerprint unreadable is contamination, not an invalid run; independent schema changes are no longer pinned on a migration's owner. Agents inherit no credential-like variable and none of the host harness's (`CLAUDE*`, `T3*`, `ANTHROPIC_*` and similar); the redactor covers bare and JSON key shapes; `arm` runs only self-test plans; the report rejects runs whose plan, pair, arm, model or kind differ; budget stops are not CLI failures; recovery needs a successful `down`; no interval with fewer than three pairs | Round-2 review (P0 1–5, P1 6–10, P2 12). Three new validation mutants reproduce its counterexamples and must fail |
 | `c93c85f` (recorded in `results/baseline-1/NOTES.md` until the last pair) | An externally interrupted pair is rerun whole into the same plan, so both arms stay back to back in time. Its completed half is kept under `results/baseline-1/superseded-interrupted/` and excluded. The decision was made before looking at that half's outcomes | The host's agent server restarted during baseline pair 3 and killed its Stack run before any agent started. The bystander it had started was stopped with Stack's own `down`, and nothing survived |
 | `3ac2567` | Deviation recorded, not a scoring change: the agent CLI on the host updated itself from 2.1.327 to 2.1.328 at 21:21, between baseline pairs 2 and 3, outside the harness (`DISABLE_AUTOUPDATER` applies to the child sessions only). Every pair has both arms on one version. New plans pin the agent command to the versioned binary path, so a host update cannot change the CLI under a plan | Found in the traces' init records after the baseline |
+| (v2 amendment commit) | **Version 2.** Fault injection (`agent-kill` with a recovery agent, `service-kill`), five agents with two new tasks, the Stack arm built from `a5d4785`, the teardown procedure and the teardown-residue, others-untouched, sibling-loss and recovery gates, the planted `exec`-at-teardown check, an allowlisted agent environment and a scan of every commit, and the version 2 plan and analysis | The version 1 baseline was at the ceiling in both arms and could not judge a change to Stack. Fixed before any version 2 trial |
 
 ### Accepted for the pilot
 
