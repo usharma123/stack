@@ -369,8 +369,8 @@ within that second is a residual risk, which is stated here and not otherwise ha
 
 *What is recorded at the kill and at the handoff:* the processes of the victim's worktree (listed
 in the 2 s before the kill), the tool command the victim's CLI had outstanding (the last command in
-its trace with no result yet), and, when the recovery agent starts, whether a process started by the
-killed CLI is still running.
+its trace with no result yet), and whether a process started by the killed CLI is still running at
+the handoff (listed in the 2 s before the recovery agent starts, so the listing cannot delay it).
 
 *A missed fault.* If the victim's CLI exits before the kill is due, if the planned process is gone
 or replaced when the kill is due, or if no trigger is seen within 600 s of launch, the fault is
@@ -444,8 +444,8 @@ exit, isolation, and a clean CLI exit. Version 2 adds these.
 |---|---|
 | **Teardown residue** (per worktree; the arm's lifecycle) | After the teardown procedure: no process attributed to the worktree and no port one listens on (first observation), and no worktree directory or service data directory (second observation). Reported for every worktree, and separately for the fault victim's worktree, where it is the gate the fault scenarios were built for |
 | **Others untouched** (per run) | The run has no contamination event at all, from the launch of the agents to the end of the teardown: none of version 1's events (a) to (f), none of event (g), and no teardown collateral (below). The injected fault itself is never an event |
-| **Teardown collateral** | While the harness tears down worktree X, a durable service process of another worktree that has not been torn down yet, or of the main checkout, disappears, or the bystander's fingerprint changes. Attributed to the arm, not to an agent |
-| **Isolation, event (g): a sibling's service lost** | A durable service process of worktree X (postmaster, Redis, the API, the worker, Stack's supervisor) disappears between two samples, and another session ran a kill-like command (the version 1 pattern) that **identifies that process**: it names its pid, or its `pkill`/`killall` pattern matches the lost process's command line. A command counts as running from the arrival of its trace line to the arrival of its result, and that interval must overlap the interval between the two samples, widened by 1 s. The culprit is the session that ran it. Timing alone never gates. If X's own session, in the 10 s before, ran its arm's `down` or `restart`, or a kill that identifies the same process, the event is ambiguous: listed for review, not gated (an `up` is not such a command: it does not stop a running service). A loss that no identifying command explains is listed for review and does not gate, because an app can exit through its own agent's code. A loss counts whether or not X has a session running at that moment, which covers the time between an injected CLI kill and the recovery agent. In `service-kill`, only the injected postmaster and its own PostgreSQL child processes are exempt. Every durable service is resolved to its worktree through its open files, not only those holding a socket, and the report shows any gap between samples longer than 3 s |
+| **Teardown collateral** | While the harness tears down worktree X, a durable service process of another worktree that has not been torn down yet, or of the main checkout, disappears, or the bystander's fingerprint changes. Decided from the harness's own listing of durable processes taken just before and just after each worktree's procedure, and from the bystander check after the last removal; the 1 s sampler is too coarse for it. A process lost between one worktree's teardown and the next is listed for review and does not gate. Attributed to the arm, not to an agent |
+| **Isolation, event (g): a sibling's service lost** | A durable service process of worktree X (postmaster, Redis, the API, the worker, Stack's supervisor) disappears between two samples, and another session ran a kill-like command (the version 1 pattern) that **identifies that process**: it names its pid, its `pkill`/`killall` pattern matches the lost process's command line, or it kills by a port that process listened on. A command counts as running from the arrival of its trace line to the arrival of its result, and that interval must overlap the interval between the two samples, widened by 1 s. The culprit is the session that ran it. Timing alone never gates. If X's own session, in the 10 s before, ran its arm's `down` or `restart`, or a kill that identifies the same process, the event is ambiguous: listed for review, not gated (an `up` is not such a command: it does not stop a running service). A loss that no identifying command explains is listed for review and does not gate, because an app can exit through its own agent's code. A loss counts whether or not X has a session running at that moment, which covers the time between an injected CLI kill and the recovery agent. In `service-kill`, only the injected postmaster and its own PostgreSQL child processes are exempt. Every durable service is resolved to its worktree through its open files, not only those holding a socket, and the report shows any gap between samples longer than 3 s |
 | **Cross-worktree connections, event (f), in `agent-kill`** | Each connection event carries its time and the client process's role marker. One made by a process the killed CLI started fails the run-level gate and is not charged to the recovery session; one made by a process of the recovery session is charged to it |
 | **Recovery session** (agent-kill) | The recovery agent is scored like any session: hidden checks on the worktree's final tree, teardown at its exit (everything attributed to the worktree, whoever started it), isolation, and a clean CLI exit |
 
@@ -520,7 +520,9 @@ invoice must pass.
   machine that ran the trials (`/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/results/`), and
   the report carries every table and plan parameter inline.
 - **What can reach a record.** Agents, the bystander and every arm command get an environment the
-  benchmark builds itself: `PATH`, `SHELL`, `TMPDIR` and `LANG` are fixed benchmark values, and the
+  benchmark builds itself: `PATH`, `SHELL`, `TMPDIR` and `LANG` are fixed benchmark values (the
+  `PATH` starts with the run's own bin directory and the pinned agent CLI's directory, then a fixed
+  system list that keeps `python3` the interpreter version 1 ran on), and the
   per-run store locations and markers are the harness's own. Only `HOME`, `USER` and `LOGNAME` come
   from the host, because the agent CLI cannot sign in without them; the user name and home path
   also appear in every path. No other host variable reaches an agent, so none can reach a record
@@ -535,7 +537,8 @@ invoice must pass.
 - Every commit goes through `harness/commit.py`, which scans every staged blob in full (text,
   binary, renamed files and link targets) and the commit message for credential patterns and for
   the value of any host environment variable outside `HOME`, `USER` and `LOGNAME`, and refuses to
-  commit on a hit.
+  commit on a hit. A variable whose value is an existing path is not treated as a secret: the
+  worktree's own path is in `PWD` and in this document.
 
 ### Plan, order and cost
 
@@ -599,6 +602,13 @@ are recorded in the report. A fix that touches scoring is a commit listed below.
 
 ## Changes
 
+On 2026-11-19 the owner rewrote this branch's history to correct commit author emails. File trees,
+messages and timestamps did not change, but every commit hash did. The hashes in this log and in the
+reports up to and including `a6dda8f` are the original ones, kept as they were recorded. They still
+exist locally under `refs/backup/commit-attribution/20261119-120117/original/`, and the map from old
+to new hashes is at `/Users/utsavsharma/.t3/commit-attribution/20261119-120117/commit-map.json` on
+the machine that ran the trials. Rows added after the rewrite carry current hashes.
+
 | Commit | Change | Reason |
 |---|---|---|
 | `d1ef3c5` | Protocol fixed | — |
@@ -613,6 +623,7 @@ are recorded in the report. A fix that touches scoring is a commit listed below.
 | `5a34d58` | **Results are no longer in git.** The whole `results/` directory is ignored, and the 415 files tracked there until now are removed from the index (history is not rewritten; every file stays on disk). Reports and this protocol carry the tables, sample sizes, variability, deviations, plan parameters and change log inline, and say where the raw results are on the machine that ran them. Version 2 results follow the same rule from the start. The credential scan before each commit stays | Owner's instruction: raw outcomes and traces are retained locally, not in the repository |
 | `a2e4452` | Clarifications made while implementing version 2, before any trial. (1) The `agent-kill` trigger ignores a port the agent CLI itself listens on: it is the first sample in which one of the worktree's services listens. (2) What the victim's worktree was running is listed in the 2 s before the kill, so a slow listing cannot delay the kill. (3) Event (g): a loss is only known to lie between two samples, so the 10 s and 5 s windows are applied to that whole interval; an agent's own stop or restart includes the arm's `up`, `down`, `restart`, `pg_ctl stop`, `redis-cli shutdown` and any `kill`. (4) In `service-kill`, losses in the victim's worktree in the 10 s after the injected kill are listed for review and are not event (g). (5) A measure is called separated only with at least five compared pairs, so a pilot reports "not decided"; for continuous measures the within-arm IQR is over per-run means (recovery and victim figures: their raw values). (6) "Victim copes" compares with the same task in the same arm and scenario when it was not the victim. (7) Trace-line times are arrival times at the harness, polled every 50 ms. (8) The shared README part said `GET/POST /invoices`; only `POST` exists in the starting code, so it now says `POST /invoices` (both arms) | Ambiguities found while building the harness. None was decided after seeing a trial |
 | `a6dda8f` | **Changes after review round 1, before any trial.** The fault trigger is now a readiness milestone shared by both arms (all four services of the victim's worktree listening), with the target's identity checked again before the signal. Event (g) needs a kill that identifies the lost process, and timing alone never gates. Connections in `agent-kill` are attributed by time and role. The teardown observations count every attributed process, an unknown inventory invalidates the run, and "clean after the first `down`" is reported beside the gate. "Others untouched" now runs through the teardown, with teardown collateral as an event. "Victim copes" needs the service restored and a test passed after the fault. A missed fault or invalid run is rerun once as a whole pair and is never a success. A measure is decided only with five paired values. Trial plans are checked against this protocol. Records: benchmark-owned environment values, traces published only scrubbed, a full-blob commit scan on the commit path. Hidden checks: `invoice-list` needs an index led by `status` that also covers `id`, full items compared on every page and more than 100 rows; `void-invoices` checks the whole status domain and no longer requires a stale read after a void | The reviewer showed that the first trigger landed at different provisioning stages in the two arms (validation records: Stack with all four services up, the baseline still in `dev.py up`), reproduced two wrong submissions that passed and a correct one that failed, and found gates that timing alone could trip or clear, report denominators that counted a missed fault as a success, and scan gaps |
+| (v2 review-1 code commit) | The code for review round 1, and the clarifications made while writing it, before any trial. (1) The handoff listing is taken in the 2 s before the recovery launch. (2) Teardown collateral is decided from the harness's own listings just before and after each worktree's teardown; a loss between two teardowns is listed, not gated. (3) Event (g) also accepts a kill by a port the lost process listened on. (4) The commit scan does not treat an existing path as a secret. (5) The fixed `PATH` keeps the `python3` version 1 ran on. (6) A harness defect found by validation: `run_arm` left SIGINT and SIGTERM ignored after its first run in a process, so later runs in the same validation started agents that ignored SIGTERM; it now restores the handlers | Review round 1's findings and the implementer's report. None was decided after seeing a trial |
 
 ### Accepted for the pilot
 

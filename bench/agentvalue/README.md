@@ -26,7 +26,8 @@ and cost.
 | `harness/report.py` | The report over a plan (version 2 plans get the per-scenario report; version 1 plans the version 1 report) |
 | `harness/validate.py` | The harness self-check |
 | `harness/scripted_agent.py` | Scripted stand-ins for agents, for validation only |
-| `harness/scan_staged.py` | The credential scan run before every commit |
+| `harness/commit.py` | The only way to commit: scans every staged blob in full (text, binary, renames, link targets, path names) and the message, then commits |
+| `harness/scan_staged.py` | The scanning library `commit.py` uses; also scans a directory (`--dir`) |
 | `results/` | Not in git. Plans, run records, traces and generated reports are written here and kept on the machine that ran the trials; REPORT.md carries the tables inline and says where they are |
 
 A run directory `results/<plan>/pair<i>-<arm>/` holds `run.json`, `sampler.jsonl`, and one directory per
@@ -55,7 +56,7 @@ STACK=~/.cache/stack-agentvalue/stack-a5d4785/src/target/release/stack   # sha25
 
 # 1. Validate the harness: grader (five tasks, all mutants), then every planted case in both arms,
 #    and the exec case once with the version 1 build (target/release/stack at dc4b980) as control.
-#    About 25 minutes.
+#    About 40 minutes.
 python3 bench/agentvalue/harness/validate.py --out bench/agentvalue/results/validation-<rev>
 
 # 2. Fix a plan: scenarios alternate, victims a seeded permutation per scenario, arm order per
@@ -74,13 +75,20 @@ python3 bench/agentvalue/harness/run.py pair --plan bench/agentvalue/results/pil
 python3 bench/agentvalue/harness/report.py --plan bench/agentvalue/results/pilot-2/plan.json \
   --results bench/agentvalue/results/pilot-2
 
-# 5. Before every commit: scan what is staged (or a directory before staging it).
-python3 bench/agentvalue/harness/scan_staged.py
-python3 bench/agentvalue/harness/scan_staged.py --dir bench/agentvalue/results/pilot-2
+# 3b. A pair whose first attempt had an invalid run or a missed fault is run once more, whole:
+python3 bench/agentvalue/harness/run.py pair --plan bench/agentvalue/results/pilot-2/plan.json \
+  --index 0 --attempt 2 --results bench/agentvalue/results/pilot-2      # writes pair0.2-<arm>
+
+# 5. Every commit goes through the scan (it refuses on any hit and never prints the value).
+python3 bench/agentvalue/harness/commit.py -m "message"
+python3 bench/agentvalue/harness/scan_staged.py --dir <directory>     # a directory before staging
 ```
 
-`pair` refuses to run if the Stack binary, the agent CLI binary or any benchmark file changed since
-the plan, or if the plan is not a version 2 plan. To rerun after a change, make a new plan and run
+`plan` and `pair` (before each arm) refuse a trial plan that does not match the protocol: the
+Stack binary's sha256 (a5d4785's), `--stack-rev a5d4785`, a scenario and a victim in every pair, the
+agent CLI pinned to its versioned binary with a recorded hash, and the warm cache the runner uses.
+`pair` also refuses if the Stack binary, the agent CLI binary or any benchmark file changed since
+the plan. The report compares the latest complete attempt of each pair and lists every attempt. To rerun after a change, make a new plan and run
 every pair again.
 
 A self-test of one arm with scripted agents and a chosen fault:
@@ -92,6 +100,9 @@ python3 bench/agentvalue/harness/run.py arm --plan /tmp/selftest-plan.json --arm
   --scripted 'invoice-list=stall,invoice-list.recovery=reference' --scenario agent-kill --victim invoice-list
 ```
 
-Agents, the bystander and every arm command the harness runs get their environment from an
-allowlist (`ENV_ALLOWLIST` in `harness/run.py`): from the host only `PATH`, `HOME`, `USER`, `LOGNAME`,
-`SHELL` and `TMPDIR`; everything else is set by the harness. No record holds an environment.
+Agents, the bystander and every arm command the harness runs get an environment the benchmark
+builds (`machine_env` in `harness/run.py`): `PATH` (the run's bin directory, the pinned CLI's
+directory and `BASE_PATH`), `SHELL`, `TMPDIR` (under the run root) and `LANG` are fixed; only `HOME`,
+`USER` and `LOGNAME` come from the host. No record holds an environment. Agent traces are written to
+a staging file under the run root; only a scrubbed copy is published to the results directory (also
+for an interrupted or invalid run), and every retained file is scrubbed after grading.

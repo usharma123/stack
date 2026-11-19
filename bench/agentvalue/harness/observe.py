@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import arms as legacy  # bench/arms.py: process_table, same_process, reclaim, owns
 
 MARKER = re.compile(r'(?:^|\s)AGENTVALUE_WT=([A-Za-z0-9_.-]+)')
+ROLE = re.compile(r'(?:^|\s)AGENTVALUE_ROLE=(agent|recovery)(?=\s|$)')
+OBSERVE_TIMEOUT = 60  # every observation subprocess is bounded, so a join on an observer always ends
 # Markers are "<group>.<run id>", so a process from another run (or an unrelated program) never
 # counts as this run's. Set by the runner before anything is observed.
 RUN_SUFFIX = None
@@ -35,7 +37,10 @@ def _out(argv):
     """A command's stdout as text; process environments and file names need not be UTF-8. A failed
     `ps` raises: an empty listing must never pass for "nothing running". (`lsof` exits 1 whenever
     some file cannot be inspected, so its status is not used.)"""
-    result = subprocess.run(argv, capture_output=True)
+    try:
+        result = subprocess.run(argv, capture_output=True, timeout=OBSERVE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'{argv[0]} did not finish within {OBSERVE_TIMEOUT} s')
     if argv[0] == 'ps' and result.returncode not in (0, 1) or (argv[0] == 'ps' and '-ax' in ' '.join(argv) and not result.stdout):
         raise RuntimeError(f'{argv[0]} failed ({result.returncode}): {result.stderr[-300:]!r}')
     return result.stdout.decode('utf-8', errors='replace')
@@ -95,17 +100,29 @@ legacy.owned_processes = _owned_processes
 legacy.owns = _owns
 
 
-def markers():
-    """pid -> worktree marker for every live process that carries one."""
+def marks_and_roles():
+    """pid -> worktree marker, and pid -> role marker (AGENTVALUE_ROLE: agent or recovery), for every
+    live process whose environment carries them. Only these two values are read; nothing else of
+    any environment is kept."""
     out = _out(['ps', '-axww', '-E', '-o', 'pid=,command='])
-    found = {}
+    found, roles = {}, {}
     for line in out.splitlines():
         line = line.strip()
         pid, _, rest = line.partition(' ')
+        if not pid.isdigit():
+            continue
         match = MARKER.search(rest)
-        if match and pid.isdigit():
+        if match:
             found[int(pid)] = match[1]
-    return found
+            role = ROLE.search(rest)
+            if role:
+                roles[int(pid)] = role[1]
+    return found, roles
+
+
+def markers():
+    """pid -> worktree marker for every live process that carries one."""
+    return marks_and_roles()[0]
 
 
 def open_paths(pids=None):
@@ -197,7 +214,51 @@ def tcp():
 # A durable service process: a postmaster (its children are titled "postgres: ..."), Redis, the
 # API or the worker (the `uv run` wrapper and the interpreter it starts), or Stack's supervisor.
 DURABLE = re.compile(r'/bin/postgres\s|redis-server|\bpython3?\s+(?:app|worker)\.py\b|__supervise')
-POSTMASTER = re.compile(r'/bin/postgres\s')
+POSTMASTER = re.compile(r'/bin/postgres\s+(?:.*\s)?-D\s+(\S+)')
+SERVICES = ('postgres', 'redis', 'api', 'worker')
+
+
+def service_kind(command):
+    """Which of a worktree's services a process is, from its command line (None if none)."""
+    if POSTMASTER.search(command):
+        return 'postgres'
+    if re.search(r'(?:^|/)redis-server(?:\s|$)', command):
+        return 'redis'
+    if re.search(r'\bpython3?\s+app\.py\b', command):
+        return 'api'
+    if re.search(r'\bpython3?\s+worker\.py\b', command):
+        return 'worker'
+    if '__supervise' in command:
+        return 'supervisor'
+    return None
+
+
+def postmaster_data_dir(command):
+    match = POSTMASTER.search(command)
+    return match[1] if match else None
+
+
+def under_any(paths, text):
+    return any(legacy._under(legacy._roots(p), text) for p in paths)
+
+
+def ready_services(group, groups, owner, listeners, rows):
+    """The four services of `group` that run and listen: kind -> {pid, started, command, port}. The
+    postmaster must have its data directory under the group's own paths; every process must belong
+    to the group (marker, command or open files) and listen on a TCP port. Never by port number."""
+    paths = groups.get(group) or []
+    found = {}
+    for port, pid in sorted(listeners.items()):
+        row = rows.get(pid)
+        if row is None or owner.get(pid) != group:
+            continue
+        kind = service_kind(row['command'])
+        if kind not in SERVICES or kind in found:
+            continue
+        if kind == 'postgres' and not under_any(paths, postmaster_data_dir(row['command']) or ''):
+            continue
+        found[kind] = {'pid': pid, 'started': row['started'], 'command': row['command'][:300], 'port': port}
+    return found
 
 
 class Sampler(threading.Thread):
@@ -207,19 +268,22 @@ class Sampler(threading.Thread):
     missed, so this is evidence of access, never proof of its absence.
 
     Each sample also records which durable service processes of a group are gone from the
-    process table since the previous sample (event (g) works from these), and is handed to every
-    callable in `listeners` (the fault injector's trigger)."""
+    process table since the previous sample (event (g) and teardown collateral work from these),
+    every postmaster seen listening (service restored), and is handed to every callable in
+    `listeners` (the fault trigger). A sample's time is taken after its listings."""
 
     def __init__(self, groups, out, interval=1.0, ignore_clients=(), t0=None, listeners=()):
-        """`groups` is a callable returning {name: [paths]}; it is refreshed every few samples
-        because an arm may create a checkout's state directories only when it first starts.
-        Times `m` are monotonic seconds since `t0` (the run's clock)."""
+        """`groups` is a callable returning {name: [paths]}, refreshed on every sample because an
+        arm may create a checkout's state directories only when it first starts. Times `m` are
+        monotonic seconds since `t0` (the run's clock)."""
         super().__init__(daemon=True)
         self.groups_fn, self.out, self.interval = groups, Path(out), interval
         self.t0 = time.monotonic() if t0 is None else t0
         self.listeners = list(listeners)
-        self.durable_prev = {}  # (pid, started) -> (group, command, m)
+        self.durable_prev = {}  # (pid, started) -> (group, command, m, ports)
         self.losses = []        # durable processes gone between two samples
+        self.postmasters = {}   # (group, pid, started) -> first m seen listening
+        self.times = []         # (begun_m, stamped_m) of every sample
         self.groups, self.resolved = groups(), {}
         # Stack's own probes (`stack ps`, `status`) connect to every checkout's ports by design;
         # they are not an agent reaching another worktree's data.
@@ -241,17 +305,16 @@ class Sampler(threading.Thread):
                 self.stop_event.wait(self.interval)
 
     def sample(self, log):
-        now = time.time()
-        mono = round(time.monotonic() - self.t0, 3)
-        if self.samples % 5 == 0:
-            self.groups = self.groups_fn()
+        begun = round(time.monotonic() - self.t0, 3)
+        self.groups = self.groups_fn()
         rows = legacy.process_table()
-        marks = markers()
+        marks, roles = marks_and_roles()
         listeners, connections = tcp()
         endpoints = listeners.pop('by_endpoint', {})
-        # Processes with sockets but no marker or path in their command line (redis, postgres
-        # children, supervisors) are resolved once through their open files, cached by identity.
-        unknown = [pid for pid in set(listeners.values()) | {c[0] for c in connections}
+        # Processes with no marker or path in their command line (redis, supervisors) are resolved
+        # through their open files, cached by identity: those with sockets and every durable service.
+        unknown = [pid for pid in set(listeners.values()) | {c[0] for c in connections} |
+                   {pid for pid, row in rows.items() if DURABLE.search(row['command'])}
                    if pid in rows and self.resolved.get((pid, rows[pid]['started'])) is None
                    and owner_of(pid, rows[pid]['command'], marks, {}, self.groups) is None]
         paths = open_paths(unknown) if unknown else {}
@@ -259,6 +322,9 @@ class Sampler(threading.Thread):
             found = owner_of(pid, rows[pid]['command'], marks, paths, self.groups)
             if found:  # unresolved processes are retried on later samples, once paths are known
                 self.resolved[(pid, rows[pid]['started'])] = found
+        now = time.time()                                   # stamped after the listings
+        mono = round(time.monotonic() - self.t0, 3)
+        self.times.append((begun, mono))
         owner = {}
         for pid, row in rows.items():
             mark = owner_of(pid, row['command'], marks, {}, self.groups) or self.resolved.get((pid, row['started']))
@@ -268,14 +334,20 @@ class Sampler(threading.Thread):
                 entry = self.seen.setdefault(key, {'first': now, 'first_m': mono, 'command': row['command'][:300]})
                 entry['last'] = now
                 entry['last_m'] = mono
+        ports_of = {}
+        for port, pid in listeners.items():
+            ports_of.setdefault(pid, []).append(port)
         # Durable processes gone from the process table since the previous sample (pid and start time).
         alive = {(pid, row['started']) for pid, row in rows.items()}
-        for key, (group, command, seen_m) in self.durable_prev.items():
+        for key, (group, command, seen_m, ports) in self.durable_prev.items():
             if key not in alive:
-                self.losses.append({'group': group, 'pid': key[0], 'started': key[1], 'command': command[:300],
-                                    'last_seen_m': seen_m, 'gone_m': mono})
-        self.durable_prev = {(pid, rows[pid]['started']): (group, rows[pid]['command'], mono)
+                self.losses.append({'group': group, 'pid': key[0], 'started': key[1], 'command': command[:1000],
+                                    'kind': service_kind(command), 'ports': ports, 'last_seen_m': seen_m, 'gone_m': mono})
+        self.durable_prev = {(pid, rows[pid]['started']): (group, rows[pid]['command'], mono, sorted(ports_of.get(pid, [])))
                              for pid, group in owner.items() if DURABLE.search(rows[pid]['command'])}
+        for pid in ports_of:
+            if pid in owner and service_kind(rows[pid]['command']) == 'postgres':
+                self.postmasters.setdefault((owner[pid], pid, rows[pid]['started']), mono)
         port_owner = {port: owner.get(pid) for port, pid in listeners.items()}
         for port, mark in port_owner.items():
             if mark:
@@ -293,14 +365,16 @@ class Sampler(threading.Thread):
                 endpoints.get(('0.0.0.0', int(remote))) or endpoints.get(('[::]', int(remote)) if host == '[::1]' else None)
             server = owner.get(server_pid)
             if server and server != client:
-                events.append({'t': now, 'm': mono, 'client': client, 'client_pid': pid, 'client_cmd': rows.get(pid, {}).get('command', '')[:200],
+                events.append({'t': now, 'm': mono, 'client': client, 'client_pid': pid, 'client_started': rows.get(pid, {}).get('started'),
+                               'client_role': roles.get(pid), 'client_cmd': rows.get(pid, {}).get('command', '')[:200],
                                'server': server, 'port': int(remote)})
         self.cross.extend(events)
         self.samples += 1
-        log.write(json.dumps({'t': round(now, 2), 'm': mono, 'procs': {m: sorted(p for p, o in owner.items() if o == m) for m in set(owner.values())},
+        log.write(json.dumps({'t': round(now, 2), 'm': mono, 'begun_m': begun,
+                              'procs': {m: sorted(p for p, o in owner.items() if o == m) for m in set(owner.values())},
                               'listen': {str(p): m for p, m in port_owner.items() if m}, 'cross': events}) + '\n')
         log.flush()
-        info = {'m': mono, 'owner': owner, 'listeners': listeners, 'rows': rows}
+        info = {'m': mono, 'owner': owner, 'listeners': listeners, 'rows': rows, 'groups': self.groups, 'roles': roles}
         for listener in self.listeners:
             try:
                 listener(info)
@@ -309,15 +383,36 @@ class Sampler(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
-        self.join(10)
+        self.join(OBSERVE_TIMEOUT * 4)
 
     def summary(self):
         processes = {}
         for (mark, pid, started), entry in self.seen.items():
             processes.setdefault(mark, []).append({'pid': pid, 'started': started, **entry})
+        stamps = [m for _, m in self.times]
+        gaps = [{'after_m': a, 'before_m': b, 'seconds': round(b - a, 3)} for a, b in zip(stamps, stamps[1:]) if b - a > 3]
         return {'samples': self.samples, 'errors': self.errors[:20], 'processes': processes,
                 'ports': {str(p): sorted(m) for p, m in self.ports.items()}, 'cross_worktree_connections': self.cross,
-                'durable_losses': self.losses}
+                'durable_losses': self.losses, 'gaps_over_3s': gaps,
+                'first_m': stamps[0] if stamps else None, 'last_m': stamps[-1] if stamps else None,
+                'postmasters_listening': [{'group': g, 'pid': pid, 'started': st, 'first_listen_m': m}
+                                          for (g, pid, st), m in self.postmasters.items()]}
+
+
+def role_of(pid):
+    """The AGENTVALUE_ROLE marker of one process (None if unreadable)."""
+    match = ROLE.search(_out(['ps', '-ww', '-E', '-p', str(pid), '-o', 'command=']))
+    return match[1] if match else None
+
+
+def mark_of(pid):
+    match = MARKER.search(_out(['ps', '-ww', '-E', '-p', str(pid), '-o', 'command=']))
+    return match[1] if match else None
+
+
+def listens(pid):
+    out = _out(['lsof', '-nP', '-w', '-a', '-p', str(pid), '-iTCP', '-sTCP:LISTEN', '-Fp'])
+    return any(line == f'p{pid}' for line in out.splitlines())
 
 
 def _same(row):

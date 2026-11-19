@@ -25,23 +25,51 @@ def scrub(text):
     return MISE_DIFF.sub(lambda m: f'{m[1]}=<redacted>', text)
 
 
+SECRET_NAME = re.compile(r'^[A-Za-z0-9_.-]*' + KEYWORDS + r'[A-Za-z0-9_.-]*$', re.I)
+# Keys that look credential-like but are counters or names (token counts in usage, the CLI's own
+# identity tokens count), never a secret value.
+NOT_SECRET = re.compile(r'tokens$|_tokens_|tokens_details|identity_tokens|^(?:input|output)_tokens', re.I)
+
+
 def scrub_json(value):
+    """Scrub a parsed JSON value: every string, and every string held under a credential-like key at
+    any depth (`{"SOME_TOKEN": "..."}`)."""
     if isinstance(value, str):
         return scrub(value)
     if isinstance(value, list):
         return [scrub_json(v) for v in value]
     if isinstance(value, dict):
-        return {k: scrub_json(v) for k, v in value.items()}
+        return {k: ('<redacted>' if isinstance(v, str) and isinstance(k, str) and SECRET_NAME.match(k) and not NOT_SECRET.search(k)
+                    and v != '<redacted>' else scrub_json(v)) for k, v in value.items()}
     return value
+
+
+def scrub_text(raw, whole=False):
+    """Scrub a text file's content: with `whole` (a .json file) the document as parsed JSON; otherwise
+    line by line, each line parsed when it is JSON (traces), so the line count never changes."""
+    if whole:
+        try:
+            return json.dumps(scrub_json(json.loads(raw)), indent=2)
+        except ValueError:
+            pass
+    out = []
+    for line in raw.split('\n'):
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, (dict, list)):
+                new = json.dumps(scrub_json(parsed))
+                out.append(new if new != json.dumps(parsed) else line)
+                continue
+        except ValueError:
+            pass
+        out.append(scrub(line))
+    return '\n'.join(out)
 
 
 def scrub_file(path):
     path = Path(path)
     raw = path.read_text(errors='replace')
-    try:
-        new = json.dumps(scrub_json(json.loads(raw)), indent=2)
-    except ValueError:
-        new = '\n'.join(scrub(line) for line in raw.split('\n'))
+    new = scrub_text(raw, whole=path.suffix == '.json')
     if new != raw:
         path.write_text(new)
         return True

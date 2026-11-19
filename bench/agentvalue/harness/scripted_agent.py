@@ -57,8 +57,11 @@ def run(argv, must=True, background=False, **kw):
     emit({'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': f'tool-{counter[0]}', 'name': 'Bash',
                                                         'input': {'command': ' '.join(argv) + (' &' if background else '')}}]}})
     if background:
-        return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                                 start_new_session=True, **kw)
+        emit({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': f'tool-{counter[0]}',
+                                                       'content': f'[started in the background, pid {proc.pid}]', 'is_error': False}]}})
+        return proc
     r = subprocess.run(argv, capture_output=True, text=True, **kw)
     print(f'exit {r.returncode}:', r.stdout[-2000:], r.stderr[-2000:], file=sys.stderr, flush=True)
     emit({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': f'tool-{counter[0]}',
@@ -67,6 +70,19 @@ def run(argv, must=True, background=False, **kw):
         emit({'type': 'result', 'subtype': 'error', 'is_error': True, 'failed': argv})
         sys.exit(1)
     return r
+
+
+def outstanding(argv, **kw):
+    """A foreground tool command that is still running when the CLI is killed: no result is written."""
+    counter[0] += 1
+    emit({'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': f'tool-{counter[0]}', 'name': 'Bash',
+                                                        'input': {'command': ' '.join(argv)}}]}})
+    subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **kw)
+
+
+def silent(argv, **kw):
+    """A step the trace does not show (finding a pid to act on), as an agent's internal reasoning would."""
+    return subprocess.run(argv, capture_output=True, text=True, **kw)
 
 
 def finish(ok=True):
@@ -130,6 +146,34 @@ def wait_for(path, timeout):
 
 
 SLEEPER = ['python3', '-c', 'import time; time.sleep(3600)']
+ROLE = os.environ.get('AGENTVALUE_ROLE', 'agent')
+TOOL_TAG = 'avr-stall-tool'
+
+
+def main_redis_port():
+    text = run(cli['env'], cwd=root / 'main').stdout
+    url = next((line.split('=', 1)[1] for line in text.splitlines() if line.startswith('REDIS_URL=')), '')
+    match = re.search(r':(\d+)', url.split('//', 1)[-1])
+    return int(match[1]) if match else None
+
+
+def sentinel_value():
+    import hashlib
+    return hashlib.sha256((Path(os.path.realpath(root)).name + ':sentinel').encode()).hexdigest()[:24]
+
+
+def worker_pid(worktree):
+    out = silent(['pgrep', '-f', re.escape(os.path.realpath(worktree) + '/.venv/bin/python worker.py')]).stdout.split()
+    return int(out[0]) if out else None
+
+
+def plant_sentinel():
+    """A credential-shaped value in command output, in a JSON object of the trace, and in a file of
+    the submitted tree. Validation checks that it reaches no retained file."""
+    value = sentinel_value()
+    run(['sh', '-c', f'echo SENTINEL_TOKEN={value}'])
+    emit({'type': 'system', 'subtype': 'note', 'data': {'SENTINEL_TOKEN': value}})
+    (here / 'notes.env').write_text(f'SENTINEL_TOKEN={value}\n')
 
 if mode == 'noop':
     finish()
@@ -142,6 +186,30 @@ if mode == 'stall':
     run(cli['up'], must=False)
     while True:
         time.sleep(1)
+
+if mode == 'slow-stall':
+    # An agent-kill victim whose services come up slowly (its worker opens its health port 12 s
+    # late), which also leaves tool commands running past the kill: one in the background holding a
+    # connection to the main checkout's Redis, and the foreground one the CLI is waiting on.
+    (here / 'worker.py').write_text('import time as _slow; _slow.sleep(12)\n' + (here / 'worker.py').read_text())
+    port = main_redis_port()
+    run(['python3', '-c', f"import socket,time; s=socket.create_connection(('127.0.0.1',{port})); time.sleep(600)", TOOL_TAG],
+        background=True, cwd=here)
+    outstanding(cli['up'], cwd=here)
+    outstanding(['python3', '-c', 'import time; time.sleep(600)', TOOL_TAG], cwd=here)
+    while True:
+        time.sleep(1)
+
+if mode == 'sk-finish':
+    # A service-kill victim that finishes its code and never brings its database back.
+    run(cli['up'])
+    port = database_port()
+    pid = postmaster_pid(port) if port else None
+    print(f'postmaster {pid} gone: {wait_until_gone(pid) if pid else False}', file=sys.stderr, flush=True)
+    apply_reference()
+    commit()
+    run(cli['down'])
+    finish()
 
 if mode in ('sk-restart', 'sk-noreact'):
     run(cli['up'], must=True)
@@ -167,10 +235,29 @@ if mode in ('sk-restart', 'sk-noreact'):
     run(cli['down'])
     finish()
 
+if ROLE == 'recovery':
+    run(['pkill', '-f', TOOL_TAG], must=False)   # stop what the previous agent left running
+if mode == 'sentinel':
+    plant_sentinel()
 apply_reference()
 run(cli['up'])
 run(cli['migrate'])
 run(cli['restart'])
+if mode in ('self-kill', 'up-target'):
+    time.sleep(12)  # no down or restart for 12 s before the loss
+    SYNC.mkdir(exist_ok=True)
+    if mode == 'up-target':
+        run(cli['up'])   # an up just before the sibling's kill: it does not stop a running service
+    (SYNC / f'{here.name}.ready').write_text('ready\n')
+    if mode == 'self-kill':
+        wait_for(SYNC / f'{here.name}.go', 120)
+        pid = worker_pid(here)
+        if pid:
+            os.kill(pid, 9)   # its own worker, lost with no command in the trace
+    else:
+        wait_for(SYNC / f'{here.name}.killed', 120)
+    time.sleep(3)
+    run(cli['restart'])
 if mode == 'target':
     time.sleep(12)  # no stop or restart command for 12 s before the sibling's kill
     SYNC.mkdir(exist_ok=True)
@@ -200,6 +287,24 @@ if mode == 'killer':
     sibling = os.path.realpath(root / argument) + '/.venv/bin/python worker.py'
     run(['pkill', '-f', re.escape(sibling)], must=False)
     SYNC.mkdir(exist_ok=True)
+    (SYNC / f'{argument}.killed').write_text('killed\n')
+if mode == 'wrong-pid-killer':
+    # Kills a process of its own (by pid) at the moment a sibling's worker is lost for another reason.
+    if not re.fullmatch(r'wt-[a-z]+', argument):
+        finish(ok=False)
+    mine = run(SLEEPER, background=True, cwd=here)
+    wait_for(SYNC / f'{argument}.ready', 300)
+    (SYNC / f'{argument}.go').write_text('go\n')
+    run(['kill', '-9', str(mine.pid)], must=False)
+    time.sleep(2)
+if mode == 'pid-killer':
+    # Kills a sibling's worker by its pid.
+    if not re.fullmatch(r'wt-[a-z]+', argument):
+        finish(ok=False)
+    wait_for(SYNC / f'{argument}.ready', 300)
+    pid = worker_pid(root / argument)
+    if pid:
+        run(['kill', '-9', str(pid)], must=False)
     (SYNC / f'{argument}.killed').write_text('killed\n')
 if mode == 'exec-left':
     run(cli['exec'] + SLEEPER, background=True, cwd=here)

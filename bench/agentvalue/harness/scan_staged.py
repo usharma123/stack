@@ -7,10 +7,11 @@
 Two kinds of hit:
 - a credential pattern (private key block, cloud and API key formats, a JWT, or a secret-named
   variable assigned a long literal value);
-- the value of any host environment variable that is not on the agent allowlist
-  (run.ENV_ALLOWLIST), when the value is 8 characters or more. A value that names an existing file
-  or directory on this host is not a credential and is skipped, as is a value equal to an
-  allowlisted variable's value.
+- the value of any host environment variable other than HOME, USER and LOGNAME, when the value is
+  8 characters or more, also when split across lines or JSON-escaped. A value that names an
+  existing file or directory on this host is not a credential and is skipped.
+
+Every commit goes through commit.py, which scans every staged blob in full with this module.
 
 Exits 1 with file and line for every hit, naming the pattern or the variable, never the value.
 """
@@ -40,13 +41,18 @@ PATTERNS = {
 }
 
 
-def host_values():
-    """(name, value) of host variables outside the allowlist that could be a credential."""
-    import run
-    allowed_values = {os.environ[k] for k in run.ENV_ALLOWLIST if k in os.environ}
+HOST_EXEMPT = ('HOME', 'USER', 'LOGNAME')   # the only host values that may appear (they are in every path)
+
+
+def host_values(environ=None):
+    """(name, value) of host variables other than HOME, USER and LOGNAME whose value could be a
+    credential: 8 characters or more, not a path that exists on this host, not equal to an exempt
+    variable's value."""
+    environ = os.environ if environ is None else environ
+    exempt_values = {environ[k] for k in HOST_EXEMPT if k in environ}
     found = []
-    for name, value in os.environ.items():
-        if name in run.ENV_ALLOWLIST or len(value) < 8 or value in allowed_values:
+    for name, value in environ.items():
+        if name in HOST_EXEMPT or len(value) < 8 or value in exempt_values:
             continue
         if value.startswith('/') and os.path.exists(value):
             continue  # a path on this host, not a credential
@@ -54,15 +60,26 @@ def host_values():
     return sorted(found, key=lambda item: -len(item[1]))
 
 
-def scanner():
-    values = host_values()
+def variants(text):
+    """The text as written, and with line breaks, line continuations and JSON escapes removed, so a
+    value split across lines or escaped in a JSON string is still found (host values only)."""
+    joined = re.sub(r'\\\r?\n|\r?\n|\r', '', text)
+    unescaped = joined.replace('\\/', '/').replace('\\n', '').replace('\\"', '"')
+    return {text, joined, unescaped}
+
+
+def scanner(environ=None):
+    values = host_values(environ)
     combined = re.compile('|'.join(f'(?P<v{i}>{re.escape(v)})' for i, (_, v) in enumerate(values))) if values else None
 
     def scan(text):
         hits = [name for name, pattern in PATTERNS.items() if pattern.search(text)]
         if combined:
-            for match in combined.finditer(text):
-                hits.append(f'value of host variable {values[int(match.lastgroup[1:])][0]}')
+            for variant in variants(text):
+                for match in combined.finditer(variant):
+                    hit = f'value of host variable {values[int(match.lastgroup[1:])][0]}'
+                    if hit not in hits:
+                        hits.append(hit)
         return hits
     return scan
 
@@ -93,13 +110,25 @@ def directory_lines(root):
             yield str(path), number, line
 
 
-def scan_lines(lines):
-    scan = scanner()
+def scan_lines(lines, environ=None):
+    scan = scanner(environ)
     return [(path, number, hit) for path, number, text in lines for hit in scan(text)]
 
 
-def scan_directory(root):
-    return scan_lines(directory_lines(root))
+def scan_directory(root, environ=None):
+    return scan_lines(directory_lines(root), environ)
+
+
+def scan_blob(data, environ=None):
+    """Hits in a whole blob, text or binary (decoded byte for byte, so ASCII secrets inside binary
+    data are found too)."""
+    scan = scanner(environ)
+    hits = []
+    for text in (data.decode('utf-8', errors='replace'), data.decode('latin-1')):
+        for hit in scan(text):
+            if hit not in hits:
+                hits.append(hit)
+    return hits
 
 
 def main():
