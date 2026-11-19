@@ -1201,6 +1201,31 @@ fn decide(commands: &mut [Named], arrival: u64, signal: libc::c_int) -> (Vec<(i3
     (targets, any && all_passing)
 }
 
+/// What is told the PID of a spawned command (see [`on_next_spawn`]).
+type SpawnReport = Box<dyn FnOnce(u32)>;
+
+thread_local! {
+    /// What the next command this thread spawns is reported to (see [`on_next_spawn`]).
+    static ON_SPAWN: std::cell::RefCell<Option<SpawnReport>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Report the PID of the next command this thread spawns through a function here to `hook`
+/// (Stack records a command it starts for a checkout this way). Cleared when the returned guard
+/// is dropped, whether or not anything was spawned.
+pub fn on_next_spawn(hook: SpawnReport) -> SpawnHook {
+    ON_SPAWN.with(|h| *h.borrow_mut() = Some(hook));
+    SpawnHook(())
+}
+
+/// Clears what [`on_next_spawn`] set when dropped.
+pub struct SpawnHook(());
+
+impl Drop for SpawnHook {
+    fn drop(&mut self) {
+        ON_SPAWN.with(|h| h.borrow_mut().take());
+    }
+}
+
 /// Spawn `command` and name its process group (see [`Registry`]), under the registry's lock.
 /// A signal arriving from the moment the spawn begins is the command's too. A `leader` command
 /// stays in stack's own group; its PID names it. Nothing is spawned while a signal that
@@ -1219,6 +1244,9 @@ fn spawn_named(command: &mut Command, passing: bool, leader: bool, spawn: impl F
     drop(registry);
     #[cfg(test)]
     stage(Stage::Registered);
+    if let Some(hook) = ON_SPAWN.with(|h| h.borrow_mut().take()) {
+        hook(child.id());
+    }
     Ok((child, passed))
 }
 

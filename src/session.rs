@@ -24,6 +24,8 @@ use crate::lease::LeaseSummary;
 
 mod gc_pass;
 mod prepare;
+use crate::commands;
+pub use crate::commands::RunningCommand;
 pub use prepare::{needs_up, plan_prepared, up_with, Prepare, ReassignedPort, UpOptions};
 pub(crate) use gc_pass::readable_session;
 pub use gc_pass::{gc_plan, gc_with, DeletedPlan, GcDryRun, GcOptions, GcPass, GcPlanned, GcSkipped, PlannedData, PlannedPort, PlannedService};
@@ -754,6 +756,9 @@ fn service_specs(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>) -> 
         }
         service_env.insert("PORT".into(), port.to_string());
         service_env.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // Never a command's mark, whatever the provider's environment holds: a service carrying
+        // one would be taken for a command and never stopped (see `crate::commands`).
+        service_env.shift_remove(crate::checkout::COMMAND_VAR);
         let declared = match (&service.ready_cmd, service.ready_port) {
             (Some(command), _) => Some(supervisor::Ready::Command { command: command.clone() }),
             (None, Some(port)) => Some(supervisor::Ready::Port { port }),
@@ -1115,10 +1120,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         // This checkout's own service processes that no record accounts for are stopped, not
         // refused as another program's (see `Stray`).
         let token = crate::checkout::token(&ctx.root);
+        let exempt = commands::Exempt::load(&ctx.state, Some(&ctx.root));
         let (mine, conflicts): (Vec<Stray>, Vec<PortConflict>) = port_conflicts(&report, &statuses).into_iter().fold(
             (Vec::new(), Vec::new()),
             |(mut mine, mut others), c| {
-                match token.as_deref().and_then(|t| stray(&c.service, c.port, t)) {
+                match token.as_deref().and_then(|t| stray(&c.service, c.port, t, &exempt)) {
                     Some(s) => mine.push(s),
                     None => others.push(c),
                 }
@@ -2710,6 +2716,13 @@ pub struct DownReport {
     /// could not be (see [`TOOLS_ONLY_CHECKED`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_checked: Option<String>,
+    /// Unrecorded command registry entries `--forget-unrecorded` removed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub forgotten_unrecorded: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// What `down --purge` did with this checkout's recorded data, ports and identity tokens.
@@ -2760,7 +2773,23 @@ pub fn down_with(ctx: &Ctx, stop_supervisor: bool) -> Result<DownReport> {
 /// directories `up` recorded for this checkout and release its ports and identity tokens (see
 /// [`purge_locked`]), under the same project lock.
 pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<DownReport> {
+    down_forgetting(ctx, stop_supervisor, purge, false)
+}
+
+/// [`down_purging`]; with `forget_unrecorded`, first remove the checkout's command registry
+/// entries whose process was never recorded and whose Stack process is gone (see
+/// `crate::commands`), which otherwise keep every `down` unconfirmed. Nothing else in the
+/// registry is touched.
+pub fn down_forgetting(ctx: &Ctx, stop_supervisor: bool, purge: bool, forget_unrecorded: bool) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let forgotten = if forget_unrecorded { commands::forget_unrecorded(&ctx.state, &ctx.root)? } else { 0 };
+    let mut report = down_unforgetting(ctx, stop_supervisor, purge)?;
+    report.forgotten_unrecorded = forgotten;
+    Ok(report)
+}
+
+/// [`down_forgetting`] under the project lock, without forgetting anything.
+fn down_unforgetting(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<DownReport> {
     // Both copies are read once, under the lock: what decides that one is unreadable is also
     // what any removal is compared with.
     let copies = [RecordCopy::capture(&ctx.index_file()), RecordCopy::capture(&ctx.session_file())];
@@ -2770,9 +2799,16 @@ pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<Dow
     let session = load(ctx)?;
     // As in `down_locked`: a checkout with neither owns no services, and has no supervisor.
     let owns_services = !ports::lookup(&ctx.state, &ctx.root)?.is_empty() || session.as_ref().is_some_and(|s| !s.services.is_empty());
-    let recorded = session.and_then(|s| s.provider);
-    let mut report = down_locked(ctx)?;
-    if purge {
+    let recorded = session.as_ref().and_then(|s| s.provider.clone());
+    // Stack processes an older Stack recorded as running commands, known from the session only.
+    let executing: Vec<u32> = session.as_ref().map(|s| s.active_executions.values().copied().collect()).unwrap_or_default();
+    // One decision per process on what is a command, for stopping and for reporting alike.
+    let exempt = commands::Exempt::load(&ctx.state, Some(&ctx.root));
+    let mut report = down_stopping(ctx, session, None, &exempt)?;
+    // Not confirmed while a command Stack started for this checkout still runs, or that cannot
+    // be known (and nothing purged): the services are stopped all the same.
+    let running = commands::after_down(&ctx.state, &ctx.root, &executing, &exempt);
+    if purge && matches!(&running, Ok(r) if r.is_empty()) {
         report.purge = Some(purge_locked(ctx)?);
     }
     // A Pitchfork supervisor an earlier `up` moved this checkout's services off, but could not
@@ -2793,6 +2829,7 @@ pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<Dow
         }
         report.supervisor = Some(outcome);
     }
+    commands::confirm(report.stopped.len(), running)?;
     Ok(report)
 }
 
@@ -3042,7 +3079,7 @@ fn supervisor_lock(state_dir: &Path) -> PathBuf {
 /// supervisor), or, for a session an older Stack started, its services under Pitchfork.
 fn down_locked(ctx: &Ctx) -> Result<DownReport> {
     let session = load(ctx)?;
-    down_stopping(ctx, session, None)
+    down_stopping(ctx, session, None, &commands::Exempt::load(&ctx.state, Some(&ctx.root)))
 }
 
 /// What `down` recovering an unreadable record (see [`recover_unreadable`]) works from.
@@ -3057,7 +3094,11 @@ struct RecordRecovery<'a> {
 /// the supervisor stops only on the evidence of its own record (see
 /// [`supervisor::shutdown_accounted`]), and each session record is removed only while it is
 /// still what was read.
-fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRecovery>) -> Result<DownReport> {
+///
+/// `exempt` says what is a command, never to be signalled (see [`commands::Exempt`]); when this
+/// checkout's command registry cannot be read, nothing but the services' recorded processes and
+/// groups is stopped.
+fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRecovery>, exempt: &commands::Exempt) -> Result<DownReport> {
     let reserved = ports::lookup(&ctx.state, &ctx.root)?;
     // Services always hold a port reservation from compile, and a launch record names any
     // process stack started. With neither, stack owns nothing and the supervisor has nothing to
@@ -3121,13 +3162,21 @@ fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRe
     let mut others: Vec<crate::procinfo::Process> = Vec::new();
     let mut looked = false;
     let token = crate::checkout::token(&ctx.root);
-    let carriers = || token.as_deref().map(|t| crate::procinfo::carrying(crate::checkout::TOKEN_VAR, t)).unwrap_or_default();
+    // A command carrying the token (a service ran `stack exec`) is never stopped here: `down`
+    // reports it as a running command instead (see `crate::commands`).
+    let carriers = || {
+        if exempt.blind.is_some() {
+            return Vec::new();
+        }
+        let found = token.as_deref().map(|t| crate::procinfo::carrying(crate::checkout::TOKEN_VAR, t)).unwrap_or_default();
+        found.into_iter().filter(|p| !exempt.covers(p)).collect::<Vec<_>>()
+    };
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);
     let leftovers = loop {
         let pids_alive = pids.iter().any(|(_, pid)| pid_alive(*pid));
-        if !pids_alive && !looked {
+        if !pids_alive && !looked && exempt.blind.is_none() {
             looked = true;
-            strays = self::strays(&ctx.root, &candidates);
+            strays = self::strays(&ctx.root, &candidates, exempt);
             // With every recorded process gone, anything else still carrying this checkout's
             // token is a service process left behind too, listening or not.
             others = carriers()
@@ -3203,6 +3252,7 @@ fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRe
         purge: None,
         removed_unreadable: Vec::new(),
         recovery_checked: None,
+        forgotten_unrecorded: 0,
     })
 }
 
@@ -3336,7 +3386,7 @@ fn foreign_listener(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], servi
     if owned || !accepting(port) {
         return None;
     }
-    if crate::checkout::token(&ctx.root).is_some_and(|token| stray(service, port, &token).is_some()) {
+    if crate::checkout::token(&ctx.root).is_some_and(|token| stray(service, port, &token, &commands::Exempt::load(&ctx.state, Some(&ctx.root))).is_some()) {
         return None;
     }
     let pinned = report.stack.services.get(service).is_some_and(|e| e.value.fixed_port().is_some());
@@ -3377,34 +3427,43 @@ use crate::stopping::{accepting, Stray};
 /// established. Anything else, including a listener whose environment cannot be read, is not.
 /// Each process is observed before and after its environment is read, so the token is never
 /// credited to a process that replaced it under the same PID.
-fn stray(service: &str, port: u16, token: &str) -> Option<Stray> {
+///
+/// A command (see [`commands::Exempt`]) is never part of a stray, whatever its environment
+/// holds: a listener that is one is no stray, and an ancestor that is one ends the chain. A
+/// group with any member that is one (whatever that member carries) is not signalled as a
+/// group: every other member is signalled one by one, while still in the group, and any that
+/// survives makes the stop unconfirmed.
+fn stray(service: &str, port: u16, token: &str, exempt: &commands::Exempt) -> Option<Stray> {
     use crate::procinfo::{environ_has, process};
     let owned = |pid: u32| {
         let before = process(pid)?;
         let carries = environ_has(pid, crate::checkout::TOKEN_VAR, token) == Some(true);
-        (carries && before.current().is_some()).then_some(before)
+        (carries && before.current().is_some() && !exempt.covers(&before)).then_some(before)
     };
     let mut chain = vec![owned(ports::holder(port)?.pid)?];
     while let Some(parent) = Some(chain.last()?.parent).filter(|p| *p > 1).and_then(owned) {
         chain.push(parent);
     }
     let top = chain.last()?;
-    let group = (top.group == top.pid).then_some(top.group);
-    let members = group
-        .map(|g| {
-            crate::procinfo::carrying(crate::checkout::TOKEN_VAR, token)
-                .into_iter()
-                .filter(|p| p.group == g && !chain.iter().any(|c| c.same(p)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let leads = top.group == top.pid;
+    let in_group = if leads { crate::procinfo::in_group(top.group) } else { Vec::new() };
+    let mixed = in_group.iter().any(|p| exempt.covers(p));
+    let group = (leads && !mixed).then_some(top.group);
+    let members = if mixed {
+        // Every member but the commands, each signalled while still in the group.
+        in_group.into_iter().filter(|p| !chain.iter().any(|c| c.same(p)) && !exempt.covers(p)).collect()
+    } else if leads {
+        crate::procinfo::carrying(crate::checkout::TOKEN_VAR, token).into_iter().filter(|p| p.group == top.group && !chain.iter().any(|c| c.same(p)) && !exempt.covers(p)).collect()
+    } else {
+        Vec::new()
+    };
     Some(Stray { service: service.to_string(), port: Some(port), chain, group, members, signal: libc::SIGTERM })
 }
 
 /// Strays on `ports` (service, port) of the checkout at `root`.
-fn strays(root: &Path, ports: &IndexMap<String, u16>) -> Vec<Stray> {
+fn strays(root: &Path, ports: &IndexMap<String, u16>, exempt: &commands::Exempt) -> Vec<Stray> {
     let Some(token) = crate::checkout::token(root) else { return Vec::new() };
-    ports.iter().filter(|(_, port)| accepting(**port)).filter_map(|(service, port)| stray(service, *port, &token)).collect()
+    ports.iter().filter(|(_, port)| accepting(**port)).filter_map(|(service, port)| stray(service, *port, &token, exempt)).collect()
 }
 
 /// Stop strays and `others` (more processes of this checkout, observed): see
@@ -3432,6 +3491,14 @@ pub struct StatusReport {
     /// Init state of each service, when any declares init tasks (see `init_tasks`).
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub init: IndexMap<String, crate::init_tasks::InitState>,
+    /// Commands Stack registered for this checkout (`exec`, `run`, MCP) still running, from
+    /// the command registry alone (see `crate::commands`; `down` also finds what they left
+    /// running). They do not make it unhealthy; `down` is not confirmed while one runs.
+    pub commands: Vec<RunningCommand>,
+    /// Why the command registry could not be read, when it could not: `commands` is then
+    /// unknown, and `down` is not confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commands_error: Option<String>,
 }
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
@@ -3473,7 +3540,13 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     }
     let data_dirs = checks.iter().map(|c| (c.service.clone(), c.data_dir.clone())).collect();
     let init = crate::init_tasks::statuses(&ctx.state, &ctx.root, &report.stack, &data_dirs);
+    let (commands, commands_error) = match commands::listed(&ctx.state, &ctx.root) {
+        Ok(listed) => listed,
+        Err(e) => (Vec::new(), Some(e.message)),
+    };
     Ok(StatusReport {
+        commands,
+        commands_error,
         init,
         artifacts,
         healthy: !stale && lease_expired.is_none() && checks.iter().all(|c| c.ready),
@@ -3546,6 +3619,9 @@ pub struct ExecPlan {
     pub task_config: Option<TaskConfig>,
     /// Where the command runs; the project root when `None`.
     pub dir: Option<PathBuf>,
+    /// The command's entry in the checkout's command registry (see `crate::commands`), removed
+    /// when the plan is dropped or finished, after the command ends. `None` for `stack env`.
+    pub command: Option<commands::Registration>,
 }
 
 /// Host that can never resolve (RFC 2606), so a poisoned endpoint fails loudly and says why.
@@ -3848,8 +3924,11 @@ fn provider_pins(report: &Report) -> Vec<mise::Pin> {
 
 /// The provider's environment for this checkout: Stack's kept answer when it is current, else
 /// mise's (see [`mise::provide`]).
+/// The command mark is Stack's alone: never taken from the provider (see `crate::commands`).
 fn provider_env(ctx: &Ctx, report: &Report) -> Result<IndexMap<String, String>> {
-    mise::provide_env(&ctx.state, &ctx.cache, &ctx.root, &provider_pins(report))
+    let mut env = mise::provide_env(&ctx.state, &ctx.cache, &ctx.root, &provider_pins(report))?;
+    env.shift_remove(crate::checkout::COMMAND_VAR);
+    Ok(env)
 }
 
 /// Which services a command needs. Unverified services are always withheld; required ones
@@ -4211,6 +4290,23 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         removed.push("STACK_SESSION".into());
     }
     env.insert("STACK_PROJECT".into(), ctx.root.to_string_lossy().into());
+    // Every command started for this checkout is registered, whatever its session, under the
+    // project lock `down` holds (see `crate::commands`), and carries the checkout's mark; `stack
+    // env` is no command, and a shell that loads it is neither.
+    // Whatever the provider's environment says: only Stack sets the mark.
+    env.shift_remove(crate::checkout::COMMAND_VAR);
+    let command = if register {
+        if let Some(mark) = crate::checkout::command_mark(&ctx.root) {
+            env.insert(crate::checkout::COMMAND_VAR.into(), mark);
+        }
+        let started_by = match &target {
+            Target::Task { name, .. } => commands::StartedBy::Run(name),
+            Target::Command { .. } => commands::StartedBy::Exec,
+        };
+        Some(commands::register(&ctx.state, &ctx.root, started_by, &program)?)
+    } else {
+        None
+    };
     timings.mark("reserve");
 
     let (secrets, secret_warnings, redactor) = match granted {
@@ -4230,6 +4326,7 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         redactor,
         task_config,
         dir: None,
+        command,
     })
 }
 
@@ -5086,7 +5183,8 @@ pub(crate) fn is_unreadable(error: &StackError) -> bool {
 /// What clearing an unreadable record with no supervisor directory rests on (see
 /// [`recover_unreadable`]): reported as it is, not as proof that nothing runs.
 pub const TOOLS_ONLY_CHECKED: &str = "no supervisor record, no port reserved for this checkout, no process seen carrying its token \
-    (a process whose environment cannot be read is not seen); commands started with `stack exec` are not tracked once the record is lost";
+    (a process whose environment cannot be read is not seen); commands Stack started for it are looked for as in every `down` \
+    (the command registry, and their mark)";
 
 /// `down` for a checkout whose session record is unreadable (see [`session_record`]).
 ///
@@ -5099,9 +5197,10 @@ pub const TOOLS_ONLY_CHECKED: &str = "no supervisor record, no port reserved for
 /// Without any supervisor directory there is nothing to stop, and the record is cleared when
 /// what can be checked holds: no supervisor record, no port reserved for this checkout, no
 /// process seen carrying its token (a process whose environment cannot be read is not seen).
-/// That is not proof that nothing of the checkout runs: commands started with `stack exec` are
-/// not tracked once the record is lost (they never carry the token, which only services get),
-/// as an ordinary `down` does not wait for them either. The report says so ([`TOOLS_ONLY_CHECKED`]).
+/// That is not proof that nothing of the checkout runs. Commands Stack started (which never
+/// carry the token, only services get it) are looked for as in every `down`, through the
+/// command registry and their mark (see `crate::commands`), and one found makes it
+/// unconfirmed. The report says what was checked ([`TOOLS_ONLY_CHECKED`]).
 ///
 /// Either way each record is then removed only while it is still what was read; anything else
 /// (no evidence, evidence that is not this checkout's, a stop that is not confirmed) fails
@@ -5120,7 +5219,8 @@ fn recover_unreadable(ctx: &Ctx, copies: &[RecordCopy; 2], purge: bool) -> Resul
         Ok(Some(spec)) => spec,
         Ok(None) if !dir.exists() => {
             let reserved = ports::lookup(&ctx.state, &ctx.root)?;
-            let carriers = token.as_deref().map(|t| crate::procinfo::carrying(crate::checkout::TOKEN_VAR, t)).unwrap_or_default();
+            let exempt = commands::Exempt::load(&ctx.state, Some(&ctx.root));
+            let carriers: Vec<_> = token.as_deref().map(|t| crate::procinfo::carrying(crate::checkout::TOKEN_VAR, t)).unwrap_or_default().into_iter().filter(|p| !exempt.covers(p)).collect();
             if !reserved.is_empty() || token.is_none() || !carriers.is_empty() {
                 return refuse(format!(
                     "Stack's supervisor never recorded anything for it, but {}",
@@ -5129,6 +5229,7 @@ fn recover_unreadable(ctx: &Ctx, copies: &[RecordCopy; 2], purge: bool) -> Resul
             }
             remove_unchanged(copies)?;
             forget_project_completions(&ctx.state, &ctx.root);
+            commands::confirm(0, commands::after_down(&ctx.state, &ctx.root, &[], &exempt))?;
             let mut report = DownReport {
                 stopped: Vec::new(),
                 confirmed: true,
@@ -5137,6 +5238,7 @@ fn recover_unreadable(ctx: &Ctx, copies: &[RecordCopy; 2], purge: bool) -> Resul
                 purge: None,
                 removed_unreadable: removed(),
                 recovery_checked: Some(TOOLS_ONLY_CHECKED.into()),
+                forgotten_unrecorded: 0,
             };
             if purge {
                 report.purge = Some(purge_locked(ctx)?);
@@ -5161,7 +5263,8 @@ fn recover_unreadable(ctx: &Ctx, copies: &[RecordCopy; 2], purge: bool) -> Resul
         }
     }
     let recovery = RecordRecovery { copies, asked };
-    let mut report = down_stopping(ctx, None, Some(&recovery)).map_err(|e| {
+    let exempt = commands::Exempt::load(&ctx.state, Some(&ctx.root));
+    let mut report = down_stopping(ctx, None, Some(&recovery), &exempt).map_err(|e| {
         if e.code == "state_invalid" {
             return e;
         }
@@ -5170,6 +5273,7 @@ fn recover_unreadable(ctx: &Ctx, copies: &[RecordCopy; 2], purge: bool) -> Resul
             .hint("retry `stack down`; stopping is safe to repeat")
             .with_detail(json!({ "cause": e }))
     })?;
+    commands::confirm(report.stopped.len(), commands::after_down(&ctx.state, &ctx.root, &[], &exempt))?;
     if purge {
         report.purge = Some(purge_locked(ctx)?);
     }
@@ -5692,7 +5796,14 @@ impl ExecPlan {
     /// Forget the execution now, before reporting the command's result: an error says the
     /// session may still record it.
     pub fn finish(&mut self) -> Result<()> {
-        self.execution.as_mut().map_or(Ok(()), ExecutionGuard::release)
+        let released = self.execution.as_mut().map_or(Ok(()), ExecutionGuard::release);
+        let unregistered = self.command.as_mut().map_or(Ok(()), commands::Registration::finish);
+        released.and(unregistered)
+    }
+
+    /// Have the next process this thread spawns recorded as this plan's command.
+    pub fn record_spawn(&self) -> Option<crate::process::SpawnHook> {
+        self.command.as_ref().map(commands::Registration::record_next_spawn)
     }
 }
 

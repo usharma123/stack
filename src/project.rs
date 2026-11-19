@@ -474,7 +474,16 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
 
 /// `STACK_SESSION` is stack's: `run` and `exec` set it to the session's id and remove it when
 /// there is none, so a declared value would be overridden or left dangling.
+/// `STACK_COMMAND_MARK` likewise: every command Stack starts gets the checkout's mark, and
+/// services must never carry one (see `checkout::COMMAND_VAR`).
 fn reserved_env(stack: &Composed) -> Result<()> {
+    if let Some(e) = stack.env.get(crate::checkout::COMMAND_VAR) {
+        return Err(StackError::new(
+            "invalid_env",
+            format!("env.{} ({}) is reserved; stack sets it to mark the commands it starts for this checkout", crate::checkout::COMMAND_VAR, e.origin),
+        )
+        .hint(format!("remove {} from [env]", crate::checkout::COMMAND_VAR)));
+    }
     match stack.env.get("STACK_SESSION") {
         Some(e) => Err(StackError::new(
             "invalid_env",

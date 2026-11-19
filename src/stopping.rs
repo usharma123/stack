@@ -200,10 +200,12 @@ pub fn stop(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn() -> Ve
 /// [`stop`], with the groups' members found by `observe`.
 #[cfg(unix)]
 fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn() -> Vec<Process>>, grace: Duration, observe: &dyn Fn(u32) -> Vec<Process>) -> Vec<Value> {
-    let mut processes: Vec<(Process, i32)> = strays
+    // A stray's members are signalled one by one only while still in the group they were
+    // observed in (a member that left it is no longer known to be the service's).
+    let mut processes: Vec<(Process, i32, bool)> = strays
         .iter()
-        .flat_map(|s| s.chain.iter().chain(&s.members).map(move |p| (p.clone(), s.signal)))
-        .chain(others.iter().map(|p| (p.clone(), libc::SIGTERM)))
+        .flat_map(|s| s.chain.iter().map(move |p| (p.clone(), s.signal, false)).chain(s.members.iter().map(move |p| (p.clone(), s.signal, true))))
+        .chain(others.iter().map(|p| (p.clone(), libc::SIGTERM, false)))
         .collect();
     // Members remembered from accepted looks at each stray's group, by stray, and whether they
     // were sent the stray's stop signal once its leader was gone.
@@ -215,7 +217,7 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
             unbound.push(p.clone());
         }
     };
-    let send = |processes: &[(Process, i32)], remembered: &mut Vec<Vec<Process>>, unbound: &mut Vec<Process>, kill: bool| {
+    let send = |processes: &[(Process, i32, bool)], remembered: &mut Vec<Vec<Process>>, unbound: &mut Vec<Process>, kill: bool| {
         for (i, stray) in strays.iter().enumerate() {
             let look = signal_group(stray, if kill { libc::SIGKILL } else { stray.signal }, observe);
             for m in look.members {
@@ -227,7 +229,10 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
                 }
             }
         }
-        for (p, sig) in processes {
+        for (p, sig, grouped) in processes {
+            if *grouped && !p.current().is_some_and(|now| now.group == p.group) {
+                continue;
+            }
             if let Sent::Unbound = signal_process(p, if kill { libc::SIGKILL } else { *sig }) {
                 mark_unbound(unbound, p);
             }
@@ -256,8 +261,8 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
     };
     // Adds what `rescan` finds that is not known yet, signalled at once with the current
     // phase's signal, and says how many that were.
-    let discover = |processes: &mut Vec<(Process, i32)>, remembered: &[Vec<Process>], unbound: &mut Vec<Process>, kill: bool| -> usize {
-        let known = |p: &Process, processes: &[(Process, i32)]| processes.iter().any(|(q, _)| q.same(p)) || remembered.iter().flatten().any(|q| q.same(p));
+    let discover = |processes: &mut Vec<(Process, i32, bool)>, remembered: &[Vec<Process>], unbound: &mut Vec<Process>, kill: bool| -> usize {
+        let known = |p: &Process, processes: &[(Process, i32, bool)]| processes.iter().any(|(q, _, _)| q.same(p)) || remembered.iter().flatten().any(|q| q.same(p));
         let found: Vec<Process> = rescan.map(|r| r()).unwrap_or_default().into_iter().filter(|p| !known(p, processes)).collect();
         for p in &found {
             if let Sent::Unbound = signal_process(p, if kill { libc::SIGKILL } else { libc::SIGTERM }) {
@@ -265,12 +270,12 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
             }
         }
         let n = found.len();
-        processes.extend(found.into_iter().map(|p| (p, libc::SIGTERM)));
+        processes.extend(found.into_iter().map(|p| (p, libc::SIGTERM, false)));
         n
     };
-    let gone = |processes: &[(Process, i32)], remembered: &[Vec<Process>]| {
+    let gone = |processes: &[(Process, i32, bool)], remembered: &[Vec<Process>]| {
         strays.iter().all(|s| s.port.map_or(true, |p| !accepting(p)))
-            && processes.iter().all(|(p, _)| p.current().is_none())
+            && processes.iter().all(|(p, _, _)| p.current().is_none())
             && remembered.iter().flatten().all(|p| p.current().is_none())
     };
     send(&processes, &mut remembered, &mut unbound, false);
@@ -297,7 +302,7 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
         std::thread::sleep(Duration::from_millis(if killing { 50 } else { 20 }));
     }
     let mut left: Vec<Value> = strays.iter().filter(|s| s.port.is_some_and(accepting)).map(Stray::json).collect();
-    let still = processes.iter().map(|(p, _)| p).chain(remembered.iter().flatten()).filter(|p| p.current().is_some());
+    let still = processes.iter().map(|(p, _, _)| p).chain(remembered.iter().flatten()).filter(|p| p.current().is_some());
     left.extend(still.map(|p| {
         let mut v = json!({ "pid": p.pid, "unrecorded": true });
         if unbound.iter().any(|q| q.same(p)) {

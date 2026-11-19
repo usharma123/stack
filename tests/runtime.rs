@@ -7013,6 +7013,6 @@ fn clearing_a_tools_only_record_says_what_was_checked_and_never_signals_an_unsee
     let _ = carrier.wait();
     assert!(alive, "down signalled a process it could not see");
     assert!(text.contains(&format!("checked: {}", stack::session::TOOLS_ONLY_CHECKED)), "{text}");
-    assert!(text.contains("a process whose environment cannot be read is not seen") && text.contains("not tracked once the record is lost"), "{text}");
+    assert!(text.contains("a process whose environment cannot be read is not seen") && text.contains("the command registry, and their mark"), "{text}");
     assert!(!index.exists());
 }

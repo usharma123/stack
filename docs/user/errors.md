@@ -96,7 +96,7 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `start_failed` | The supervisor could not start a service. | Read the output in details and `stack logs <service>`, fix the cause, then run `stack up` again. | yes | `stack status` |
 | `state_invalid` | A Stack state file is unreadable or corrupt. | For a session record, run `stack down` in that checkout: it stops what the checkout's supervisor recorded and removes the record once that is confirmed. For other state files, delete the file the message names, then retry. | no | - |
 | `stop_failed` | The supervisor could not stop a service. | Retry `stack down`; details carry the supervisor's output. | yes | - |
-| `stop_unconfirmed` | Services did not stop in time. | Retry `stack down` (or `stack restart`); details list the processes still alive. | yes | - |
+| `stop_unconfirmed` | Services did not stop in time, or a command Stack started for the checkout is still running. | Retry `stack down` (or `stack restart`); details list the processes still alive. A detail with kind "command" is a command Stack started and never stops: wait for it or end it first. | yes | - |
 | `tag_exists` | The OCI tag already points to different content. | Publish a new tag, or pass --force to move this one. | no | - |
 | `tar_unavailable` | tar is not installed or cannot run. | Install tar (git bundle sources need it), then retry; `stack doctor` checks it. | no | `stack doctor` |
 | `timed_out` | The call did not finish within its deadline. | Raise the timeout if the work needs longer; for `up`/`restart` check `stack status` first, since services may still be starting. | yes | `stack status` |

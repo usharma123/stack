@@ -30,7 +30,7 @@ act machine-wide and need no `dir`, as does `stack_errors`.
 | `stack_exec` | Runs any other command (an argv list) with the stack's tools and env |
 | `stack_restart` | Restarts services after you edit code they loaded |
 | `stack_logs` | Shows recent output of one service, or of every service; `grep`, `ignore_case` and `since` filter it |
-| `stack_down` | Stops everything and confirms it is gone |
+| `stack_down` | Stops the services and confirms everything is gone; not confirmed while a command you started still runs |
 | `stack_ps` | Lists every checkout on the machine, its services and data size (liveness only) |
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
@@ -88,6 +88,23 @@ A few things that are easy to get wrong:
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
   `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
   `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
+- **`down` is confirmed only once your commands are gone too.** A command you started with
+  `exec` or `run` (a dev server, a watcher, something you backgrounded) keeps the checkout's
+  `DATABASE_URL` and ports after the services stop. `stack down` stops the services anyway, but
+  it never stops your commands: while one runs it fails `stop_unconfirmed`, and each such
+  command is a detail with `"kind": "command"` (`pid`, `program`, `started_by`,
+  `running_secs`). Branch on that: details with `kind: "command"` mean "end or wait for these
+  commands, then run `stack down` again", and retrying sooner gives the same answer; details
+  without a `kind` are service processes that did not stop, where a retry is the fix; a
+  detail with `kind: "registry"` means Stack cannot read its record of your commands (the
+  message names the file and the hint what to check).
+  `"another_checkout": true` marks another checkout's process holding this checkout's token:
+  look at that checkout. `started_by: "older stack"` is a command an older Stack started: wait
+  for that call to finish or restart that session under this Stack. A `kind: "registry"` detail
+  about a command "whose process was never recorded" clears with `stack down
+  --forget-unrecorded` (MCP `forget_unrecorded`) once you have checked it no longer runs. `stack status` lists the commands Stack registered
+  under `commands`. See [commands still
+  running](commands.md#commands-still-running) for what can and cannot be found.
 - **Port conflicts.** `stack up --reassign-ports` (MCP `reassign_ports`) moves this checkout's
   conflicting ports and continues; the other program is left alone.
 - **Do not work around `artifact_mismatch`.** It means a download differs from what

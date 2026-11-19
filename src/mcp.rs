@@ -35,6 +35,7 @@ fn duration_schema(what: &str) -> Value {
 /// Serve the tools over stdio until the client closes stdin. Requests run concurrently (see
 /// [`server`]); every response and notification is written as one line.
 pub fn serve() -> std::io::Result<()> {
+    crate::commands::serving_mcp();
     server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
 }
 
@@ -374,7 +375,7 @@ fn tool_definitions() -> Value {
             "Return the environment stack_exec would give a command now. Use it to see which variables a command gets, or to hand them to a tool Stack cannot wrap; prefer stack_exec, which verifies on every call. Returns {env, unset, withheld, skipped}: withheld lists each unverified service and the variables removed for it; MISE_* variables are skipped.",
             schema(json!({}), &[])),
         tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
-            "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists files under a service's `watch` paths edited after it started; nothing reloads them, so call stack_restart for that service.",
+            "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists edited `watch` files; nothing reloads them, so call stack_restart. data.commands: commands Stack started here, still running.",
             schema(json!({}), &[])),
         tool("stack_exec", "Run a command", annotations("Run a command", false, None, false, true),
             "Run one command, an argv list without a shell, with the stack's tools and env, capturing its output. Use it for anything that is not a stack.toml task; for shell syntax pass [\"sh\", \"-c\", \"...\"]. Endpoints of unverified services are withheld; require or require_all refuse to run instead. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
@@ -405,10 +406,11 @@ fn tool_definitions() -> Value {
                 "ttl": { "type": "string", "description": "Set the lease's TTL, e.g. \"30m\"; gives a session without a lease one" }
             }), &[])),
         tool("stack_down", "Stop services", annotations("Stop services", false, Some(true), true, false),
-            "Stop every service of this checkout; succeeds only once their processes are confirmed gone. Use it before you finish or remove the checkout. Then stops the supervisor that ran them, if Stack started it and nothing else uses it (data.supervisor says what happened). Service data is kept unless purge is set. Returns {stopped, confirmed, supervisor}.",
+            "Stop every service of this checkout; confirmed only once their processes are gone and no command Stack started here (stack_exec, stack_run) still runs, else stop_unconfirmed lists those. Use it before you finish or remove the checkout. Their supervisor goes too if Stack started it and nothing else uses it (data.supervisor). Data kept unless purge is set. Returns {stopped, confirmed, supervisor}.",
             schema(json!({
                 "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
-                "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" }
+                "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" },
+                "forget_unrecorded": { "type": "boolean", "description": "First forget registered commands whose process was never recorded and whose Stack process is gone (a stop_unconfirmed detail of kind registry says so); check they no longer run. Nothing else is forgotten" }
             }), &[])),
         tool("stack_gc", "Reclaim stale sessions", annotations("Reclaim stale sessions", false, Some(true), true, false),
             "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. dry_run only reports. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
@@ -640,7 +642,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
             session::renew_with(ctx, ttl_secs).map(to_value)
         }
-        "stack_down" => session::down_purging(ctx, args["stop_supervisor"] != false, args["purge"] == true).map(to_value),
+        "stack_down" => session::down_forgetting(ctx, args["stop_supervisor"] != false, args["purge"] == true, args["forget_unrecorded"] == true).map(to_value),
         "stack_gc" if args["dry_run"] == true => session::gc_plan(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true, args["stop_orphans"] == true).map(to_value),
         "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
@@ -792,6 +794,7 @@ pub fn run_captured(ctx: &Ctx, plan: &session::ExecPlan, timeout: Duration) -> R
         command.env_remove(var);
     }
     // Granted values are replaced as the output streams in, before it is bounded.
+    let _recorded = plan.record_spawn();
     let output = crate::process::capture_redacted(
         command
             .args(&plan.args)

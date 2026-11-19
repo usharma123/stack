@@ -205,6 +205,10 @@ enum Cmd {
         /// and release its ports and identity tokens
         #[arg(long)]
         purge: bool,
+        /// First forget registered commands whose process was never recorded and whose Stack
+        /// process is gone (check they no longer run); nothing else is forgotten
+        #[arg(long)]
+        forget_unrecorded: bool,
     },
     /// Renew this project's session lease
     Renew {
@@ -565,6 +569,14 @@ fn main() -> ExitCode {
                 for (service, state) in r.init.iter().filter(|(_, s)| **s != stack::init_tasks::InitState::None) {
                     println!("{service:<12} init {state}");
                 }
+                for c in &r.commands {
+                    let pid = c.pid.map_or_else(|| "starting".to_string(), |p| format!("pid {p}"));
+                    let running = c.running_secs.map(|s| format!("  running {s}s")).unwrap_or_default();
+                    println!("{:<12} {pid}  {} ({}){running}", "command", c.program, c.started_by);
+                }
+                if let Some(why) = &r.commands_error {
+                    println!("{:<12} unknown: {why}", "command");
+                }
                 warn_changed(&r.checks);
             });
             if healthy { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
@@ -593,8 +605,11 @@ fn main() -> ExitCode {
                 session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
             })
         }),
-        Cmd::Down { keep_supervisor, stop_supervisor: _, purge } => session::down_purging(&ctx, !*keep_supervisor, *purge).map(|r| {
+        Cmd::Down { keep_supervisor, stop_supervisor: _, purge, forget_unrecorded } => session::down_forgetting(&ctx, !*keep_supervisor, *purge, *forget_unrecorded).map(|r| {
             emit(cli.json, &r, || {
+                if r.forgotten_unrecorded > 0 {
+                    println!("forgot {} unrecorded command(s)", r.forgotten_unrecorded);
+                }
                 println!("stopped {} service(s); confirmed", r.stopped.len());
                 for record in &r.removed_unreadable {
                     println!("removed unreadable session record {}", record.display());
@@ -1069,6 +1084,7 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     }
     command.args(&plan.args).envs(&plan.env).current_dir(plan.dir.as_deref().unwrap_or(&ctx.root));
     let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
+    let _recorded = plan.record_spawn();
     let code = match timeout {
         None => {
             // Like a shell: a command ended by a signal reports 128 + its number.

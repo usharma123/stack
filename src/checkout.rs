@@ -10,14 +10,50 @@
 //!
 //! The token is given to every service in its own environment (never to `exec` or `run`
 //! commands), so a process carrying it was launched by the supervisor for this checkout, and it
-//! marks the data directories this checkout's services use. It tells checkouts apart; it is
-//! not a credential.
+//! marks the data directories this checkout's services use. Commands get a different value
+//! derived from it ([`command_mark`]). It tells checkouts apart; it is not a credential.
 
 use crate::hash::sha256_hex;
 use std::path::Path;
 
 /// The variable through which each service receives its checkout's token.
 pub const TOKEN_VAR: &str = "STACK_CHECKOUT_TOKEN";
+
+/// The variable through which every command `exec`, `run` and the MCP server start for a
+/// checkout receives its [`command_mark`], so `down` can find what such a command left running
+/// after it ended (see `crate::commands`). Services never get it (their environment drops every
+/// `STACK_*` variable), so a process carrying it is a command, never a service, and is never
+/// stopped as one.
+pub const COMMAND_VAR: &str = "STACK_COMMAND_MARK";
+
+/// What identifies the directory at `root` beyond its path: its device, inode and, where the
+/// filesystem records one, creation time. A move keeps it (`stack mv`), and a directory
+/// recreated at the same path gets another (except on a filesystem without creation times that
+/// reuses the inode). Commands are registered under it (see `crate::commands`).
+pub fn identity(root: &Path) -> Option<String> {
+    let root = &root.canonicalize().ok()?;
+    let (dev, ino) = crate::session::dir_id(root)?;
+    Some(sha256_hex(format!("checkout\0{dev}\0{ino}\0{}", created(root)).as_bytes())[..32].to_string())
+}
+
+/// The mark of the commands Stack starts for the checkout at `root`, derived from its
+/// [`identity`]: one per checkout, kept by a move, and never equal to its token.
+pub fn command_mark(root: &Path) -> Option<String> {
+    identity(root).map(|id| command_mark_of(&id))
+}
+
+/// [`command_mark`] for a checkout's [`identity`].
+pub fn command_mark_of(identity: &str) -> String {
+    sha256_hex(format!("stack-command\0{identity}").as_bytes())[..32].to_string()
+}
+
+fn created(dir: &Path) -> String {
+    std::fs::metadata(dir)
+        .ok()
+        .and_then(|m| m.created().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(String::new, |d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+}
 
 /// The token of the directory at `root` now, if it exists, whichever way its path is spelled.
 pub fn token(root: &Path) -> Option<String> {
@@ -29,11 +65,7 @@ pub fn token(root: &Path) -> Option<String> {
 /// a move keeps a directory's device, inode and creation time, and only its path changes.
 pub fn token_as(path: &Path, dir: &Path) -> Option<String> {
     let (dev, ino) = crate::session::dir_id(dir)?;
-    let created = std::fs::metadata(dir)
-        .ok()
-        .and_then(|m| m.created().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or_else(String::new, |d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()));
+    let created = created(dir);
     Some(sha256_hex(format!("{}\0{dev}\0{ino}\0{created}", path.display()).as_bytes())[..32].to_string())
 }
 

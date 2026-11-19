@@ -68,6 +68,14 @@ pub fn dir(state: &Path, root: &Path) -> PathBuf {
     state.join("supervisors").join(crate::state::project_key(root))
 }
 
+/// What is a command, never to be signalled, for the checkout whose supervisor directory (see
+/// [`dir`]) this is: its Stack state's registries and the checkout the spec names.
+fn exempt_for(dir: &Path) -> crate::commands::Exempt {
+    let state = dir.parent().and_then(Path::parent).unwrap_or(dir);
+    let project = read_spec(dir).ok().flatten().and_then(|s| s.project);
+    crate::commands::Exempt::load(state, project.as_deref())
+}
+
 fn spec_path(dir: &Path) -> PathBuf {
     dir.join("spec.json")
 }
@@ -478,7 +486,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
     write_atomic(&spec_path(dir), &bytes).map_err(|e| io_error(spec_path(dir).display(), e))?;
     let mut spawned_at = None;
     if !signal_supervisor(&state, libc::SIGHUP) {
-        let left = recover(&state, spec.token.as_deref());
+        let left = recover(dir, &state, spec.token.as_deref());
         if !left.is_empty() {
             return Err(unconfirmed(left));
         }
@@ -504,7 +512,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
             if now.applied >= spec.revision {
                 return Ok(now);
             }
-            let left = recover(&now, spec.token.as_deref());
+            let left = recover(dir, &now, spec.token.as_deref());
             if !left.is_empty() {
                 return Err(unconfirmed(left));
             }
@@ -702,7 +710,7 @@ pub fn shutdown_accounted(dir: &Path, expected: &Expected) -> Result<()> {
 /// it left by the expected token, then record its services gone at `revision`, after reading
 /// the state about to be replaced again and finding it still this checkout's.
 fn settle_dead(dir: &Path, expected: &Expected, state: &State, revision: u64) -> Result<()> {
-    let left = recover(state, Some(expected.token));
+    let left = recover(dir, state, Some(expected.token));
     if !left.is_empty() {
         return Err(unconfirmed(left));
     }
@@ -824,7 +832,7 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
                 Some(expected) => Some(expected.token.to_string()),
                 None => read_spec(dir).ok().flatten().and_then(|s| s.token),
             };
-            let survivors = recover(&state, token.as_deref());
+            let survivors = recover(dir, &state, token.as_deref());
             if !survivors.is_empty() {
                 return Err(unconfirmed(survivors));
             }
@@ -885,10 +893,12 @@ const START_SLACK_MS: u64 = 2000;
 
 /// Whether `p`, observed, is a process of this checkout started for a service recorded as
 /// started at `started_at_ms`: it carries the checkout's token (read between two observations
-/// of it) and started no earlier than that.
-fn owned(p: &procinfo::Process, token: Option<&str>, started_at_ms: u64) -> bool {
+/// of it) and started no earlier than that, and is no command Stack started (a service may run
+/// `stack exec`, whose processes inherit the token; see [`crate::commands::Exempt`]).
+fn owned(p: &procinfo::Process, token: Option<&str>, started_at_ms: u64, exempt: &crate::commands::Exempt) -> bool {
     let Some(token) = token else { return false };
     procinfo::environ_has(p.pid, crate::checkout::TOKEN_VAR, token) == Some(true)
+        && !exempt.covers(p)
         && p.current().is_some()
         && p.started_unix_ms().is_some_and(|ms| ms + START_SLACK_MS >= started_at_ms)
 }
@@ -904,7 +914,7 @@ fn owned(p: &procinfo::Process, token: Option<&str>, started_at_ms: u64) -> bool
 /// start time means the recorded group has no member left (a pid is not handed out while a
 /// group of that number has members). A descendant that left its group and dropped the token
 /// is not found.
-fn scan(state: &State, token: Option<&str>) -> (Vec<crate::stopping::Stray>, Vec<procinfo::Process>, Vec<serde_json::Value>) {
+fn scan(state: &State, token: Option<&str>, exempt: &crate::commands::Exempt) -> (Vec<crate::stopping::Stray>, Vec<procinfo::Process>, Vec<serde_json::Value>) {
     let (mut strays, mut others, mut unverified) = (Vec::new(), Vec::<procinfo::Process>::new(), Vec::new());
     let mut earliest: Option<u64> = None;
     let mut any = false;
@@ -915,7 +925,9 @@ fn scan(state: &State, token: Option<&str>) -> (Vec<crate::stopping::Stray>, Vec
         let group = i.group.unwrap_or(record.pid);
         match procinfo::process(record.pid) {
             Some(leader) if leader.started == record.started => {
-                let leads = leader.group == group && group == leader.pid;
+                // A group with a command in it (see `owned`) is not signalled as a group: its
+                // leader is, and what stays is looked at member by member once it is gone.
+                let leads = leader.group == group && group == leader.pid && !procinfo::in_group(group).iter().any(|m| exempt.covers(m));
                 strays.push(crate::stopping::Stray {
                     service: name.clone(),
                     port: None,
@@ -928,7 +940,7 @@ fn scan(state: &State, token: Option<&str>) -> (Vec<crate::stopping::Stray>, Vec
             Some(_) => {}
             None => {
                 for member in procinfo::in_group(group) {
-                    if owned(&member, token, i.started_at_ms) {
+                    if owned(&member, token, i.started_at_ms, exempt) {
                         others.push(member);
                     } else {
                         unverified.push(serde_json::json!({
@@ -941,12 +953,13 @@ fn scan(state: &State, token: Option<&str>) -> (Vec<crate::stopping::Stray>, Vec
             }
         }
     }
-    if let (true, Some(token)) = (any, token) {
+    // Beyond the recorded groups only while it is known what is a command.
+    if let (true, Some(token), None) = (any, token, &exempt.blind) {
         let covered = |p: &procinfo::Process, strays: &[crate::stopping::Stray], others: &[procinfo::Process]| {
             strays.iter().any(|s| s.chain.iter().any(|c| c.same(p)) || s.group == Some(p.group)) || others.iter().any(|o| o.same(p))
         };
         for p in procinfo::carrying(crate::checkout::TOKEN_VAR, token) {
-            if !covered(&p, &strays, &others) && owned(&p, Some(token), earliest.unwrap_or(0)) {
+            if !covered(&p, &strays, &others) && owned(&p, Some(token), earliest.unwrap_or(0), exempt) {
                 others.push(p);
             }
         }
@@ -959,15 +972,24 @@ fn scan(state: &State, token: Option<&str>) -> (Vec<crate::stopping::Stray>, Vec
 /// [`STOP_GRACE`], every signal bound to the process observed as `crate::stopping` describes.
 /// Returns what is still alive, and what could not be shown to be the checkout's (never
 /// signalled): nothing new may start while either remains.
-pub fn recover(state: &State, token: Option<&str>) -> Vec<serde_json::Value> {
+///
+/// `dir` is the supervisor's directory, inside the Stack state whose command registries name
+/// commands never to signal.
+pub fn recover(dir: &Path, state: &State, token: Option<&str>) -> Vec<serde_json::Value> {
+    let exempt = exempt_for(dir);
     let earliest = state.services.values().filter(|i| i.process.as_ref().is_some_and(Proc::this_boot)).map(|i| i.started_at_ms).min().unwrap_or(0);
-    let rescan = |t: &str| procinfo::carrying(crate::checkout::TOKEN_VAR, t).into_iter().filter(|p| owned(p, Some(t), earliest)).collect::<Vec<_>>();
+    let rescan = |t: &str| {
+        if exempt.blind.is_some() {
+            return Vec::new();
+        }
+        procinfo::carrying(crate::checkout::TOKEN_VAR, t).into_iter().filter(|p| owned(p, Some(t), earliest, &exempt)).collect::<Vec<_>>()
+    };
     let rescan_token = token.map(|t| move || rescan(t));
     let rescan_ref: Option<&dyn Fn() -> Vec<procinfo::Process>> = rescan_token.as_ref().map(|r| r as &dyn Fn() -> Vec<procinfo::Process>);
     // Once a leader is gone its group is looked at member by member, so a second pass stops
     // what stayed in a group whose leader exited during the first; a third finds nothing new.
     for _ in 0..3 {
-        let (strays, others, unverified) = scan(state, token);
+        let (strays, others, unverified) = scan(state, token, &exempt);
         if strays.is_empty() && others.is_empty() {
             return unverified;
         }
@@ -976,7 +998,7 @@ pub fn recover(state: &State, token: Option<&str>) -> Vec<serde_json::Value> {
             return left.into_iter().chain(unverified).collect();
         }
     }
-    let (strays, others, unverified) = scan(state, token);
+    let (strays, others, unverified) = scan(state, token, &exempt);
     strays.iter().map(|s| serde_json::json!({ "service": s.service, "pid": s.chain[0].pid })).chain(others.iter().map(|p| serde_json::json!({ "pid": p.pid }))).chain(unverified).collect()
 }
 
@@ -990,7 +1012,7 @@ pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
         return Vec::new();
     }
     let token = read_spec(dir).ok().flatten().and_then(|s| s.token);
-    let (strays, others, mut unverified) = scan(&state, token.as_deref());
+    let (strays, others, mut unverified) = scan(&state, token.as_deref(), &exempt_for(dir));
     let mut found: Vec<serde_json::Value> = strays.iter().map(|s| serde_json::json!({ "service": s.service, "pid": s.chain[0].pid })).collect();
     found.extend(others.iter().map(|p| serde_json::json!({ "pid": p.pid })));
     found.append(&mut unverified);
@@ -1165,7 +1187,7 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
         Ok(spec) => spec.unwrap_or_default(),
         Err(e) => return Err(std::io::Error::other(e.message)),
     };
-    let left = recover(&previous, spec.token.as_deref());
+    let left = recover(dir, &previous, spec.token.as_deref());
     if !left.is_empty() {
         return Err(std::io::Error::other(format!("processes an earlier supervisor left could not be confirmed stopped, so nothing was started: {}", serde_json::Value::Array(left))));
     }

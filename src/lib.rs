@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod checkout;
+pub mod commands;
 pub mod compose;
 pub mod contract;
 pub mod datadirs;

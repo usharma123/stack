@@ -224,6 +224,50 @@ output (mise's answer when no release matches) is an error, not a version.
   seen that command's process exit, so a running command is never forgotten. GC ignores TTL
   expiry while an execution it saw running is recorded. An explicit runner-death policy still
   takes precedence over a surviving command.
+- **Commands and `down`.** `down` stops the services whatever runs, but is not confirmed
+  while a command Stack started for the checkout still runs (`src/commands.rs`). It fails
+  `stop_unconfirmed`, one `kind: "command"` detail per command (`pid`, `program` name,
+  `started_by`, `running_secs`, `found_by`, `another_checkout`; never arguments); `--purge`
+  then removes nothing. Sources:
+  - *Registry*: `<state>/commands/<identity>.json` (identity: a hash of the checkout
+    directory's device, inode and creation time), under `<identity>.lock`. `plan` registers
+    every registered command (not `stack env`) while it holds the project lock `down` takes
+    exclusively, before it spawns: coordinator PID, start time and boot, how it was started,
+    the program's name; the first spawn on that thread records the command's PID, start time
+    and boot (`process::on_next_spawn`); the plan removes it when finished or dropped. An
+    entry is live while its command (before that is recorded, its coordinator) is the process
+    observed in the same boot. An entry with no command recorded whose coordinator is gone is
+    *unrecorded*: never pruned, it makes `down` unconfirmed (`kind: "registry"`) and `status`
+    report `commands_error` beside the live entries, until `down --forget-unrecorded` removes
+    unrecorded entries alone under the registry lock. A registry file is removed when its last entry ends, but its lock file is never
+    removed, and keeps its identity's mark recognised (it records no path for `gc` to
+    check). A registry that cannot be read is an error the same way, and that `down` stops only
+    the services' recorded processes and groups (no leftover, stray or token-carrier stop, in
+    `down` or a supervisor's recovery); one that cannot be written refuses the command.
+    `status` lists the live entries and reads no environment.
+  - *Mark*: `STACK_COMMAND_MARK`, a hash of the identity, set on every registered command,
+    inherited by what it starts, rejected in `[env]`, and stripped from the provider's
+    environment wherever Stack reads it (`provider_env`, so services, `exec`, `env`, `status`),
+    and from every service environment. `down` searches environments for it until two passes
+    agree (at most 5).
+  - *Token*: a process carrying the checkout's service token that is exempt (below) is always
+    reported: another checkout's with `another_checkout`, a coordinator without its PID in the
+    hint.
+  - *Older Stack*: each `active_executions` PID still running that no registry names as a
+    coordinator is reported once, as `older stack`, by the `down` that removes the session; its
+    PID is never in the hint.
+  Exempt (`commands::Exempt`): a process some registry proves to be a live command or
+  coordinator (PID, start time, boot), or carrying the checkout's own mark (computed, no
+  registry needed) or the mark of an identity some registry lock file is for. One snapshot per
+  `down`, each process decided once, serves stopping and reporting. Exempt processes are never
+  signalled by `down`'s leftover search, `up`'s stray stop, or a supervisor's recovery; a
+  leftover group with any exempt member is signalled member by member (every non-exempt member,
+  each only while still in the group observed), and a recorded group the same way after its
+  leader. Only the `down` process itself is left out of what
+  counts: when it is a registered command, or the direct child of the coordinator of an entry
+  whose command is not recorded yet. Not found or not promised: listed under "commands still
+  running" in docs/user/commands.md, among them a command a live service starts in its own
+  process group, which the supervisor stops with that group.
 - **Data.** Stack (as mise did) keeps a preset's data under a directory keyed by the project's path alone,
   so a checkout recreated at a path would find its predecessor's databases. Before starting,
   `up` writes the checkout token (see *Checkout token*) to `<data dir>.stack-checkout`. Data
@@ -606,7 +650,7 @@ output (mise's answer when no release matches) is an error, not a version.
   directory at all there is nothing to stop, and the record is cleared when what can be
   checked holds: no supervisor record, no port reserved for this checkout, no process seen
   carrying its token (a process whose environment cannot be read is not seen). Commands
-  started with `stack exec` are not tracked once the record is lost. `down` reports exactly
+  Stack started are looked for as in every `down` (registry and mark). `down` reports exactly
   that (`recovery_checked`), not that nothing runs. A port reserved, a process seen carrying
   the token, no token, or a supervisor directory without usable evidence refuses. Either way
   each copy is moved to a private name beside it that is never read as a record, checked to

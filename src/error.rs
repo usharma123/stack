@@ -342,8 +342,8 @@ codes! {
         "For a session record, run `stack down` in that checkout: it stops what the checkout's supervisor recorded and removes the record once that is confirmed. For other state files, delete the file the message names, then retry.";
     "stop_failed", true, [], "The supervisor could not stop a service.",
         "Retry `stack down`; details carry the supervisor's output.";
-    "stop_unconfirmed", true, [], "Services did not stop in time.",
-        "Retry `stack down` (or `stack restart`); details list the processes still alive.";
+    "stop_unconfirmed", true, [], "Services did not stop in time, or a command Stack started for the checkout is still running.",
+        "Retry `stack down` (or `stack restart`); details list the processes still alive. A detail with kind \"command\" is a command Stack started and never stops: wait for it or end it first.";
     "tag_exists", false, [], "The OCI tag already points to different content.",
         "Publish a new tag, or pass --force to move this one.";
     "tar_unavailable", false, [DOCTOR], "tar is not installed or cannot run.",

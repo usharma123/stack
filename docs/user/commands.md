@@ -200,6 +200,12 @@ its services still answer: `lease_expired` says why, and that the next `gc` or `
 gives each service's state (`done`, `pending`, `failed`, `stale` or `none`; see
 [service data](data.md)).
 
+`commands` lists the commands Stack registered for this checkout (`exec`, `run`, MCP calls)
+that are still running, also once the session is gone, from the [command
+registry](#commands-still-running) alone: `status` reads no process's environment, so what a
+command left running after it ended is found by `down` only. Each has the fields `down`
+reports. They do not make the checkout unhealthy; `down` is not confirmed while one runs.
+
 Checking counts as using the session: `status` renews a lease that has not expired yet, like
 `exec`. An expired lease is reported, not revived, and so is the lease of a session that is
 stale or did not finish starting. The result carries a [`lease`](#leases) object.
@@ -261,7 +267,9 @@ files changed (none, when nothing did), so an agent need not pick the names out 
 
 Runs a command with the stack's tools and environment. It runs in the directory you called
 Stack from when the project was found by searching upward, and in the project directory when
-you pass `-C`. `STACK_PROJECT` always names the project directory.
+you pass `-C`. `STACK_PROJECT` always names the project directory, and `STACK_COMMAND_MARK`
+marks the command as this checkout's (see [`down`](#commands-still-running)); `stack env` sets
+neither mark, and `[env]` cannot set it.
 
 - Services that do not verify keep their variables, but with the host replaced by
   `unverified.stack.invalid`, so an app that falls back to `localhost` fails loudly instead of
@@ -351,7 +359,9 @@ direnv setups.
 
 ## down
 
-Stops every service and returns once the processes are gone and their ports closed. It works
+Stops every service and returns once the processes are gone and their ports closed, and, to
+confirm, that no command Stack started for the checkout still runs (see [commands still
+running](#commands-still-running)). It works
 in a checkout that never ran `up`, such as a fresh clone with only `stack.toml` and `stack.lock`,
 and confirms nothing runs there. Another program listening on one of this checkout's ports is
 reported under `conflicts` and left alone. A service process the supervisor started for this
@@ -363,9 +373,8 @@ command in the checkout fail `state_invalid`. `down` then stops what the checkou
 recorded, with the same checks, and removes the record once that is confirmed
 (`removed_unreadable`). With no supervisor directory there is nothing to stop, and the record
 is cleared when there is no supervisor record, no port reserved for this checkout, and no
-process seen carrying its token (a process whose environment cannot be read is not seen);
-commands started with `stack exec` are not tracked once the record is lost. `down` reports
-exactly that (`recovery_checked`, and a `checked:` line). Without the supervisor's own record of this checkout, or with one that does not
+process seen carrying its token (a process whose environment cannot be read is not seen); commands
+Stack started are looked for as in every `down` (see below). `down` reports exactly that (`recovery_checked`, and a `checked:` line). Without the supervisor's own record of this checkout, or with one that does not
 account for every service, it stops nothing, keeps everything and says so. A record that
 changes while `down` runs is kept and named.
 
@@ -395,6 +404,90 @@ Otherwise that supervisor is kept and `supervisor.reason` says why; that never f
 `--keep-supervisor` (MCP: `"stop_supervisor": false`) keeps it in every case; Stack's own
 supervisor always exits with the checkout's services. `--stop-supervisor`, which turned this on
 before it was the default, is still accepted and changes nothing.
+
+### Commands still running
+
+A command Stack started for this checkout (`exec`, `run`, an MCP `stack_exec` or `stack_run`
+call) holds its environment: `DATABASE_URL`, the ports, and so on. `down` stops the services
+whatever runs, but it does not report the checkout confirmed gone while such a command still
+runs, and it never signals one. It fails `stop_unconfirmed` (exit 70, as when a service did not
+stop), with the services stopped and the session removed. Each command is a detail with
+`"kind": "command"`, so you can tell "wait for your command" from a service process that would
+not stop (those details have no `kind`): its `pid`, `program` (the executable's name, never its
+arguments), `started_by` (`exec`, `run <task>`, `mcp stack_exec`, `mcp stack_run <task>`, or
+what Stack could tell of a process found by its environment), `running_secs` (that process's
+own age) and `found_by` (`registry`, `mark`, `token` or `session`, below). A process of another
+checkout holding this checkout's service token has `"another_checkout": true`. The hint names
+the PIDs to wait for or stop, never an MCP server's or another checkout's (for those it says to
+look at that checkout); then run `down` again. Every later `down` says the same
+until they have exited, and `--purge` removes nothing meanwhile.
+
+How Stack knows:
+
+- **The command registry.** Every command is registered before it starts and removed when it
+  ends, in `<state dir>/commands/`, keyed by the checkout directory itself (device, inode and
+  creation time), not its path: it exists without a session, outlives `down`, follows a
+  checkout moved with [`stack mv`](#mv), and a directory recreated at the same path does not
+  inherit it. An entry names the command's own process by PID and start time, so a PID that is
+  later given to another process never counts. Commands register while they plan, under the
+  lock `down` holds, so none can slip in between `down`'s look and its answer. `status` lists
+  exactly these, under `commands`. The registry's lock file stays after its last command ended, so
+  its checkout's mark stays known (nothing removes it: it records no path for `gc` to check). A
+  registry that cannot be read makes `down` unconfirmed (a detail with `"kind": "registry"`),
+  and that `down` then stops only the services' own recorded processes and groups, nothing
+  else; `status` reports `commands_error`. One that cannot be written stops the command from
+  running. If the command's process could not be recorded once it started (a full disk, say)
+  and the Stack process that started it is gone, whether it runs cannot be known: `down` stays
+  unconfirmed (`"kind": "registry"`, naming how and when it was started) and `status` lists the
+  other commands beside a `commands_error`, until you check it no longer runs and run `stack
+  down --forget-unrecorded` (MCP `forget_unrecorded`), which removes such entries alone, under
+  the registry's lock.
+- **The command mark.** Each command gets `STACK_COMMAND_MARK`, and what it starts inherits it,
+  also a child that daemonizes into a process group or session of its own and outlives the
+  command. `down` (not `status`) also searches every process's environment for it, repeating
+  until two searches agree so a process that forks and exits meanwhile does not hide its child.
+  Only an environment Stack can read is seen: not another user's process, nor, on macOS, an
+  Apple binary's such as `/bin/sh` or `/bin/sleep`. So a `/bin/sleep` that `sh -c 'sleep 60 &'`
+  leaves behind after the shell exits is not found, and neither is a process that cleared its
+  environment.
+- **The service token.** A command a service of this checkout started (a service that runs
+  `stack exec`) carries the checkout's service token too. `down` never signals a process the
+  registry shows to be a command, or the Stack process running one, of any checkout, nor one
+  carrying this checkout's mark or the mark of a checkout whose registry exists here (any other
+  mark value counts for nothing), and it reports every such process holding this checkout's
+  token: `down` is not confirmed while one lives. Each `down` decides once per process and keeps
+  to it, for stopping and reporting alike. A leftover service process whose process group holds
+  such a process is not signalled as a group: every other member is signalled one by one, while
+  still in that group, and `down` is not confirmed while any of them survives.
+- **The session (older Stack).** A command an older Stack started is not registered: Stack knows
+  only the PID of the Stack process running it, from the session. While that process runs, the
+  first `down` reports it (`started_by: "older stack"`, `found_by: "session"`) and nothing it
+  started, and its hint names no PID to stop (it may be an older MCP server). That `down`
+  removes the session, so a later one no longer knows of it: wait for that call to finish, or
+  restart that session under this Stack.
+
+Only the `down` process itself is left out, when it is the command (`stack exec -- stack
+down`, also before the Stack process running it has recorded its PID). A shell that runs `stack down` and carries on (`stack exec -- sh -c 'stack down
+--purge; more'`) counts: that `down` is not confirmed and purges nothing. Another checkout's
+commands are never counted. To end the commands yourself, signal the PIDs the hint names; ending
+a `stack exec` with SIGTERM passes the signal on to its command (see [cancelling](#exec)).
+
+What `down` cannot rule out, so a confirmed `down` does not promise:
+
+- A process a command left running whose environment Stack cannot read (another user's; on
+  macOS, Apple's own binaries such as `/bin/sh` and `/bin/sleep`) or that cleared its
+  environment, once the command that started it has ended.
+- A process forked after `down`'s last search of process environments (two agreeing searches
+  make it unlikely, not impossible).
+- What a command an older Stack started left running, and that command itself once the first
+  `down` removed the session.
+- A command a running service starts inside that service's own process group: it ends with the
+  service when the supervisor stops the group. (Stack's own `exec` and `run`, run without a
+  terminal, put their command in a group of its own.)
+- On a filesystem without creation times, a directory recreated at the same path that is given
+  the same inode is the same checkout to Stack, and inherits its registry.
+- While the registry cannot be read, a leftover service process that no supervisor record
+  names is left running (that `down` is unconfirmed anyway).
 
 Service data is kept, so the next `up` finds the same databases. `down --purge` (MCP:
 `"purge": true`) also removes it once every service is confirmed stopped, and releases the

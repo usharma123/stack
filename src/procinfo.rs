@@ -101,6 +101,15 @@ pub fn environ_has(pid: u32, key: &str, value: &str) -> Option<bool> {
     imp::environ(pid).filter(|vars| !vars.is_empty()).map(|vars| vars.iter().any(|v| v.as_slice() == wanted.as_bytes()))
 }
 
+/// The value `pid`'s environment sets `key` to: `Some(None)` when it does not set it, `None`
+/// when the environment cannot be read (see [`environ_has`]).
+pub fn environ_value(pid: u32, key: &str) -> Option<Option<String>> {
+    let prefix = format!("{key}=");
+    imp::environ(pid)
+        .filter(|vars| !vars.is_empty())
+        .map(|vars| vars.iter().find_map(|v| v.strip_prefix(prefix.as_bytes()).map(|value| String::from_utf8_lossy(value).into_owned())))
+}
+
 /// Every process whose environment sets `key` to `value` (see [`environ_has`]), other than this
 /// one, each observed before and after its environment was read, so a process that replaced
 /// another under its PID is never credited with what the other carried.

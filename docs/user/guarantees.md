@@ -64,6 +64,21 @@
   calls, so a process that exits in between, and whose pid is handed to a new process in that
   instant, would receive the signal instead. A group is signalled by its number on macOS only
   right after its leader was checked again, with the same gap.
+- **`down` confirms only what is gone.** `down` reports a checkout confirmed only once its
+  services' processes are gone, their ports closed, and no command Stack started for it
+  (`exec`, `run`, an MCP call) still runs, or could be shown to. `down` itself signals no such
+  command, and no process the registry shows to be another checkout's command, whatever its
+  environment holds: it stops the services and reports `stop_unconfirmed`, and so does every
+  later `down` while one runs, and `--purge` removes nothing. Every command is registered, by
+  its own PID, start time and boot, before it starts, under the checkout directory's identity
+  (kept by `stack mv`); a registry that cannot be read, or an entry whose process was never
+  recorded, is never taken as nothing running (the latter until `down --forget-unrecorded`). What a command left running is found by the
+  mark it inherits. Only the `down` process itself is left out, when it is the command. Not
+  promised (see [commands still running](commands.md#commands-still-running) for each): a
+  leftover whose environment cannot be read or was cleared; a process forked after `down`'s
+  last search; an older Stack's commands beyond the first `down`; a command a service starts in
+  the service's own process group, which ends with the service; and a recreated directory that
+  inherits the old inode on a filesystem without creation times.
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was
   granted. Values never enter `stack.lock`, generated config, session records or logs, and
   are redacted from output captured with `--json` or MCP. Terminal output is not redacted, and
@@ -86,7 +101,7 @@
 Stack runs mise against its own generated configuration only. Project, parent and global mise
 aliases cannot change what a locked release means, and `stack exec` carries that boundary into
 nested mise commands. Put application variables and tasks in `stack.toml` or a bundle.
-`MISE_*` variables in `[env]` are rejected, and so is `STACK_SESSION`, which Stack sets itself.
+`MISE_*` variables in `[env]` are rejected, and so are `STACK_SESSION` and `STACK_COMMAND_MARK`, which Stack sets itself.
 Running `mise` directly, outside `stack exec`, follows mise's normal rules.
 
 [All docs](../README.md)
