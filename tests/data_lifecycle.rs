@@ -203,6 +203,11 @@ fn init_runs_once_per_data_directory_and_resumes_after_a_failure() {
 
     // A recreated data directory is a new database: init is pending again; --no-init skips it.
     f.ok(&a, &["down"]);
+    // The init state outlives the session: a checkout not started still shows it.
+    let out = f.command(&a, &["status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.starts_with("not started; run `stack up`\n") && text.contains("db           init done"), "{text}");
     fs::remove_dir_all(f.data_dir("A")).unwrap();
     f.env_for(&a, Some("A"));
     let up = f.ok(&a, &["up", "--no-init"]);

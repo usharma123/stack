@@ -549,9 +549,12 @@ fn main() -> ExitCode {
                 })
             }),
         Cmd::Status => session::status(&ctx).map(|r| {
-            let healthy = r.healthy;
+            // A checkout with nothing of it started (never, or since a confirmed `down`) is not
+            // a failed check: `started: false` says so. See `contract::passed`.
+            let passed = r.healthy || !r.started;
             let code = emit(cli.json, &r, || {
                 match &r.session {
+                    _ if !r.started => println!("not started; run `stack up`"),
                     Some(s) => println!("session {}{}", s.id, if r.stale { " (stale: compiled configuration changed)" } else { "" }),
                     None => println!("no session"),
                 }
@@ -563,6 +566,13 @@ fn main() -> ExitCode {
                 for c in &r.checks {
                     match &c.reason {
                         None => println!("{:<12} ready  port {}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity)),
+                        // Not started, a service is only worth a line when there is more to it
+                        // than that (another program on its port, say).
+                        Some(_) if !r.started => {
+                            if let Some(note) = session::beyond_not_launched(c) {
+                                println!("{:<12} {note}", c.service);
+                            }
+                        }
                         Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
                     }
                 }
@@ -577,9 +587,15 @@ fn main() -> ExitCode {
                 if let Some(why) = &r.commands_error {
                     println!("{:<12} unknown: {why}", "command");
                 }
+                for what in &r.found {
+                    println!("{:<12} {what}", "found");
+                }
+                for what in &r.other_checkout {
+                    println!("{:<12} {what}", "other");
+                }
                 warn_changed(&r.checks);
             });
-            if healthy { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
+            if passed { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
         }),
         Cmd::Exec { require, require_all, timeout, secret, up, ttl, install, cmd } => {
             let req = if *require_all {
@@ -611,6 +627,9 @@ fn main() -> ExitCode {
                     println!("forgot {} unrecorded command(s)", r.forgotten_unrecorded);
                 }
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                for w in &r.warnings {
+                    eprintln!("warning: {w}");
+                }
                 for record in &r.removed_unreadable {
                     println!("removed unreadable session record {}", record.display());
                 }

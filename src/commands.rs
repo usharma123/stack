@@ -219,6 +219,35 @@ thread_local! {
     pub(crate) static WRITER_THREAD_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Fail the write that records a spawned command's PID, as a full disk would.
     pub(crate) static SPAWN_WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fail every diagnostic write, as a closed or broken stderr would; counts the attempts.
+    pub(crate) static STDERR_FAILS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Write a diagnostic line to stderr. An output error is ignored (`eprintln!` would panic): a
+/// diagnostic must never end the process, or unwind past a command it left running.
+fn diagnose(message: &str) {
+    use std::io::Write;
+    #[cfg(test)]
+    if let Some(n) = STDERR_FAILS.with(|f| f.get()) {
+        STDERR_FAILS.with(|f| f.set(Some(n + 1)));
+        let _ = writeln!(Broken, "{message}");
+        return;
+    }
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+/// An output that fails every write.
+#[cfg(test)]
+struct Broken;
+
+#[cfg(test)]
+impl std::io::Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
 }
 
 /// Where one registered command's entry is.
@@ -299,7 +328,7 @@ fn record_spawn(handle: &Handle, recording: &Recording, pid: u32) {
     let process = procinfo::process(pid);
     let record = |handle: Handle, process| {
         if let Err(e) = handle.record(process) {
-            eprintln!("stack: cannot record the command's process in the command registry ({e}); once this Stack process is gone, `stack down` is not confirmed until `stack down --forget-unrecorded`");
+            diagnose(&format!("stack: cannot record the command's process in the command registry ({e}); once this Stack process is gone, `stack down` is not confirmed until `stack down --forget-unrecorded`"));
         }
     };
     // Beside the command, so it does not wait for the write. A thread that cannot be
@@ -342,7 +371,7 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         if let Err(e) = self.finish() {
-            eprintln!("stack: cannot remove this command from the command registry ({e}); it no longer counts once its process is gone");
+            diagnose(&format!("stack: cannot remove this command from the command registry ({e}); it no longer counts once its process is gone"));
         }
     }
 }
@@ -765,6 +794,34 @@ mod tests {
         command.kill().unwrap();
         command.wait().unwrap();
         registration.finish().unwrap();
+    }
+
+    /// The thread that records a spawned command's PID cannot start, the write the caller makes
+    /// instead fails too, and so does the diagnostic about it (stderr closed or broken): nothing
+    /// panics on the launching thread, so the entry is not removed by an unwinding drop and the
+    /// running command stays known.
+    #[test]
+    fn a_diagnostic_that_cannot_be_written_keeps_the_command_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, root) = (tmp.path().join("state"), tmp.path().join("root"));
+        fs::create_dir_all(&root).unwrap();
+        let registration = register(&state, &root, StartedBy::Exec, Path::new("/bin/sleep")).unwrap();
+        let mut command = child(&[]);
+        WRITER_THREAD_FAILS.with(|f| f.set(true));
+        SPAWN_WRITE_FAILS.with(|f| f.set(true));
+        STDERR_FAILS.with(|f| f.set(Some(0)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| record_spawn(&registration.handle, &registration.recording, command.id())));
+        let attempts = STDERR_FAILS.with(|f| f.replace(None));
+        WRITER_THREAD_FAILS.with(|f| f.set(false));
+        SPAWN_WRITE_FAILS.with(|f| f.set(false));
+        assert!(outcome.is_ok(), "the diagnostic panicked");
+        assert_eq!(attempts, Some(1), "the diagnostic was attempted");
+        let (listed, _) = listed(&state, &root).unwrap();
+        assert_eq!(listed.len(), 1, "the entry is kept while the command runs");
+        assert!(!after_down(&state, &root, &[], &Exempt::default()).unwrap().is_empty(), "down is not confirmed");
+        command.kill().unwrap();
+        command.wait().unwrap();
+        drop(registration);
     }
 
     /// The write recording a spawned command's PID fails (a full disk): the entry stays, and once

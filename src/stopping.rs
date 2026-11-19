@@ -32,7 +32,22 @@ pub struct Stray {
     pub chain: Vec<Process>,
     pub group: Option<u32>,
     pub members: Vec<Process>,
+    /// What the group's number listed when its leader could not be seen holding it right before
+    /// and right after the look (see [`bracketed`]): never signalled, reported while alive.
+    pub unproven: Vec<Process>,
     pub signal: i32,
+}
+
+/// The processes in `top`'s group, listed by `observe` ([`crate::procinfo::in_group`] outside
+/// tests) only within a bracket: `top`, the identified leader, is still the process observed
+/// (pid and start time, by `current`) and leads the group right before and right after the
+/// listing. A group number is not handed out while its leader lives, so only then is the listing
+/// that group's; otherwise `Err` carries what the number listed, which may be another group's.
+pub fn bracketed(top: &Process, observe: &dyn Fn(u32) -> Vec<Process>, current: &dyn Fn(&Process) -> Option<Process>) -> Result<Vec<Process>, Vec<Process>> {
+    let leads = || current(top).is_some_and(|now| now.group == top.pid);
+    let before = leads();
+    let members = observe(top.pid);
+    if before && leads() { Ok(members) } else { Err(members) }
 }
 
 impl Stray {
@@ -176,6 +191,67 @@ fn signal_group(stray: &Stray, sig: i32, observe: &dyn Fn(u32) -> Vec<Process>) 
     }
 }
 
+/// What makes a process found by a rescan the checkout's, weakest last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Known {
+    /// Found in a group number nothing shows is still the original group (no process identified
+    /// as being in it, by pid and start time, is in it still): never signalled; reported while
+    /// it lives, so the stop is not confirmed.
+    Unproven,
+    /// Only its process group: signalled only while it is still in the group it was found in
+    /// (one that left it is no longer known to be the checkout's, and is left running and
+    /// reported).
+    InGroup,
+    /// What it is itself (the checkout's token).
+    Itself,
+}
+
+impl Known {
+    /// Whether `p`, known this way, may be signalled now.
+    fn allows(self, p: &Process) -> bool {
+        match self {
+            Known::Itself => true,
+            Known::InGroup => p.current().is_some_and(|now| now.group == p.group),
+            Known::Unproven => false,
+        }
+    }
+}
+
+/// A process a rescan found, and what makes it the checkout's.
+pub type Found = (Process, Known);
+
+/// Processes found by what they are themselves (the checkout's token), not by their group.
+pub fn independent(found: Vec<Process>) -> Vec<Found> {
+    found.into_iter().map(|p| (p, Known::Itself)).collect()
+}
+
+/// The members of each group in `groups` (a group number and the processes identified as being
+/// in it, pid and start time) that `exempt` does not cover, found by `observe` (the processes in
+/// a group, [`crate::procinfo::in_group`] outside tests). A group number is never handed out
+/// while a process of its group lives, so a look is that group's only when one identified
+/// process is still the process observed and in the group both right before and right after
+/// it: its members are then [`Known::InGroup`] and identified too. Otherwise the group may have
+/// been replaced by another with the same number: its members are [`Known::Unproven`].
+pub fn group_members(groups: &[(u32, std::cell::RefCell<Vec<Process>>)], observe: &dyn Fn(u32) -> Vec<Process>, current: &dyn Fn(&Process) -> Option<Process>, exempt: &dyn Fn(&Process) -> bool) -> Vec<Found> {
+    let mut found: Vec<Found> = Vec::new();
+    for (group, identified) in groups {
+        let held = || identified.borrow().iter().any(|p| current(p).is_some_and(|now| now.group == *group));
+        let before = held();
+        let members = observe(*group);
+        let known = if before && held() { Known::InGroup } else { Known::Unproven };
+        for p in members {
+            if exempt(&p) || found.iter().any(|(q, _)| q.same(&p)) {
+                continue;
+            }
+            if known == Known::InGroup && !identified.borrow().iter().any(|q| q.same(&p)) {
+                identified.borrow_mut().push(p.clone());
+            }
+            found.push((p, known));
+        }
+    }
+    found
+}
+
 /// How often the processes are searched again (`rescan`) while waiting for them to exit: that
 /// search reads every process's environment.
 const RESCAN_EVERY: Duration = Duration::from_millis(250);
@@ -193,19 +269,19 @@ const RESCAN_EVERY: Duration = Duration::from_millis(250);
 /// Returns what is still alive or still listening, and what could not be signalled in a bound
 /// way.
 #[cfg(unix)]
-pub fn stop(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn() -> Vec<Process>>, grace: Duration) -> Vec<Value> {
+pub fn stop(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn() -> Vec<Found>>, grace: Duration) -> Vec<Value> {
     stop_observing(strays, others, rescan, grace, &crate::procinfo::in_group)
 }
 
 /// [`stop`], with the groups' members found by `observe`.
 #[cfg(unix)]
-fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn() -> Vec<Process>>, grace: Duration, observe: &dyn Fn(u32) -> Vec<Process>) -> Vec<Value> {
+fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn() -> Vec<Found>>, grace: Duration, observe: &dyn Fn(u32) -> Vec<Process>) -> Vec<Value> {
     // A stray's members are signalled one by one only while still in the group they were
     // observed in (a member that left it is no longer known to be the service's).
-    let mut processes: Vec<(Process, i32, bool)> = strays
+    let mut processes: Vec<(Process, i32, Known)> = strays
         .iter()
-        .flat_map(|s| s.chain.iter().map(move |p| (p.clone(), s.signal, false)).chain(s.members.iter().map(move |p| (p.clone(), s.signal, true))))
-        .chain(others.iter().map(|p| (p.clone(), libc::SIGTERM, false)))
+        .flat_map(|s| s.chain.iter().map(move |p| (p.clone(), s.signal, Known::Itself)).chain(s.members.iter().map(move |p| (p.clone(), s.signal, Known::InGroup))).chain(s.unproven.iter().map(move |p| (p.clone(), s.signal, Known::Unproven))))
+        .chain(others.iter().map(|p| (p.clone(), libc::SIGTERM, Known::Itself)))
         .collect();
     // Members remembered from accepted looks at each stray's group, by stray, and whether they
     // were sent the stray's stop signal once its leader was gone.
@@ -217,7 +293,7 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
             unbound.push(p.clone());
         }
     };
-    let send = |processes: &[(Process, i32, bool)], remembered: &mut Vec<Vec<Process>>, unbound: &mut Vec<Process>, kill: bool| {
+    let send = |processes: &[(Process, i32, Known)], remembered: &mut Vec<Vec<Process>>, unbound: &mut Vec<Process>, kill: bool| {
         for (i, stray) in strays.iter().enumerate() {
             let look = signal_group(stray, if kill { libc::SIGKILL } else { stray.signal }, observe);
             for m in look.members {
@@ -229,8 +305,8 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
                 }
             }
         }
-        for (p, sig, grouped) in processes {
-            if *grouped && !p.current().is_some_and(|now| now.group == p.group) {
+        for (p, sig, known) in processes {
+            if !known.allows(p) {
                 continue;
             }
             if let Sent::Unbound = signal_process(p, if kill { libc::SIGKILL } else { *sig }) {
@@ -260,20 +336,31 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
         }
     };
     // Adds what `rescan` finds that is not known yet, signalled at once with the current
-    // phase's signal, and says how many that were.
-    let discover = |processes: &mut Vec<(Process, i32, bool)>, remembered: &[Vec<Process>], unbound: &mut Vec<Process>, kill: bool| -> usize {
-        let known = |p: &Process, processes: &[(Process, i32, bool)]| processes.iter().any(|(q, _, _)| q.same(p)) || remembered.iter().flatten().any(|q| q.same(p));
-        let found: Vec<Process> = rescan.map(|r| r()).unwrap_or_default().into_iter().filter(|p| !known(p, processes)).collect();
-        for p in &found {
+    // phase's signal, and says how many that were. One found only by its group is signalled,
+    // then and later, only while still in that group; found again by what it is itself, it no
+    // longer needs to be.
+    let discover = |processes: &mut Vec<(Process, i32, Known)>, remembered: &[Vec<Process>], unbound: &mut Vec<Process>, kill: bool| -> usize {
+        let mut found: Vec<Found> = Vec::new();
+        for (p, known) in rescan.map(|r| r()).unwrap_or_default() {
+            if let Some(entry) = processes.iter_mut().find(|(q, _, _)| q.same(&p)) {
+                entry.2 = entry.2.max(known);
+            } else if !remembered.iter().flatten().any(|q| q.same(&p)) && !found.iter().any(|(q, _)| q.same(&p)) {
+                found.push((p, known));
+            }
+        }
+        for (p, known) in &found {
+            if !known.allows(p) {
+                continue;
+            }
             if let Sent::Unbound = signal_process(p, if kill { libc::SIGKILL } else { libc::SIGTERM }) {
                 mark_unbound(unbound, p);
             }
         }
         let n = found.len();
-        processes.extend(found.into_iter().map(|p| (p, libc::SIGTERM, false)));
+        processes.extend(found.into_iter().map(|(p, known)| (p, libc::SIGTERM, known)));
         n
     };
-    let gone = |processes: &[(Process, i32, bool)], remembered: &[Vec<Process>]| {
+    let gone = |processes: &[(Process, i32, Known)], remembered: &[Vec<Process>]| {
         strays.iter().all(|s| s.port.map_or(true, |p| !accepting(p)))
             && processes.iter().all(|(p, _, _)| p.current().is_none())
             && remembered.iter().flatten().all(|p| p.current().is_none())
@@ -302,15 +389,42 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
         std::thread::sleep(Duration::from_millis(if killing { 50 } else { 20 }));
     }
     let mut left: Vec<Value> = strays.iter().filter(|s| s.port.is_some_and(accepting)).map(Stray::json).collect();
-    let still = processes.iter().map(|(p, _, _)| p).chain(remembered.iter().flatten()).filter(|p| p.current().is_some());
-    left.extend(still.map(|p| {
+    let still = processes.iter().map(|(p, _, known)| (p, *known)).chain(remembered.iter().flatten().map(|p| (p, Known::InGroup))).filter(|(p, _)| p.current().is_some());
+    left.extend(still.map(|(p, known)| {
         let mut v = json!({ "pid": p.pid, "unrecorded": true });
         if unbound.iter().any(|q| q.same(p)) {
             v["reason"] = json!("this kernel cannot signal it through a pidfd, so it was not signalled");
         }
+        // Not shown to be the checkout's: never presented as one of its processes.
+        let unproven = match known {
+            Known::Unproven => Some("found by a process group number that may since name another group; it could not be shown to belong to this checkout, so it was not signalled: check what it is before stopping it"),
+            Known::InGroup if !known.allows(p) => Some("it left the process group it was found in, so it can no longer be shown to belong to this checkout and was not signalled: check what it is before stopping it"),
+            _ => None,
+        };
+        if let Some(why) = unproven {
+            v["unproven"] = json!(true);
+            v["reason"] = json!(why);
+        }
         v
     }));
     left
+}
+
+/// `stop_unconfirmed` for what [`stop`] left (`left`, non-empty): processes it could not show to
+/// be the checkout's (`unproven`) are named as such, never as its own.
+pub fn unconfirmed(left: Vec<Value>) -> crate::error::StackError {
+    let unproven = left.iter().filter(|d| d["unproven"] == true).count();
+    let message = if unproven == left.len() {
+        "a process found with this checkout's services could not be shown to belong to it, so it was not signalled"
+    } else {
+        "a service process the supervisor no longer tracks did not stop"
+    };
+    let hint = if unproven > 0 {
+        "a detail marked `unproven` is a process Stack could not show belongs to this checkout: check what it is before stopping it yourself; then retry `stack down`"
+    } else {
+        "retry `stack down`; stopping is safe to repeat"
+    };
+    crate::error::StackError::new("stop_unconfirmed", message).hint(hint).details(left)
 }
 
 #[cfg(all(test, unix))]
@@ -330,7 +444,7 @@ mod tests {
 
     fn stray_for(leader: &std::process::Child) -> Stray {
         let top = crate::procinfo::process(leader.id()).unwrap();
-        Stray { service: "web".into(), port: None, group: Some(top.pid), chain: vec![top], members: Vec::new(), signal: libc::SIGTERM }
+        Stray { service: "web".into(), port: None, group: Some(top.pid), chain: vec![top], members: Vec::new(), unproven: Vec::new(), signal: libc::SIGTERM }
     }
 
     /// The leader of a recorded group exits between the check before its group is looked at and
@@ -359,6 +473,98 @@ mod tests {
         let _ = bystander.wait();
     }
 
+    /// A process a rescan found only by its group is signalled only while it is still in that
+    /// group: here it ignores SIGTERM, so only the kill can stop it. Recorded in a group it is no
+    /// longer in, it is left running and reported; still in it, or found by what it is itself,
+    /// it is killed.
+    #[test]
+    fn a_process_found_by_its_group_is_signalled_only_while_still_in_it() {
+        use std::os::unix::process::CommandExt;
+        for (moved, known) in [(true, Known::InGroup), (false, Known::InGroup), (true, Known::Itself), (false, Known::Unproven)] {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            // SAFETY: signal is async-signal-safe; the child ignores SIGTERM.
+            unsafe { command.pre_exec(|| { libc::signal(libc::SIGTERM, libc::SIG_IGN); Ok(()) }) };
+            let mut child = command.spawn().unwrap();
+            let mut seen = crate::procinfo::process(child.id()).unwrap();
+            if moved {
+                // As if found in a group it has left since.
+                seen.group = seen.group.wrapping_add(1_000_000);
+            }
+            let rescan = || vec![(seen.clone(), known)];
+            let left = stop_observing(&[], &[], Some(&rescan), Duration::from_millis(200), &crate::procinfo::in_group);
+            let survived = child.try_wait().unwrap().is_none();
+            let spared = known == Known::Unproven || (moved && known == Known::InGroup);
+            assert_eq!(survived, spared, "moved {moved}, {known:?}: {left:?}");
+            assert_eq!(!left.is_empty(), survived, "{left:?}");
+            // What was spared is never presented as the checkout's own.
+            assert!(left.iter().all(|d| d["unproven"] == true && d["reason"].as_str().unwrap().contains("check what it is before stopping it")), "{left:?}");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// A group's members found by number are the original group's only while a process
+    /// identified in it is still the same process in it, before and after the look: then they
+    /// are `InGroup` (and identified from then on); once every identified process is gone (the
+    /// number may have been reused), what the number lists is `Unproven`. Exempt processes are
+    /// never returned.
+    #[test]
+    fn a_group_number_counts_only_while_a_process_identified_in_it_holds_it() {
+        let p = |pid: u32, group: u32| Process { pid, parent: 1, group, started: u64::from(pid) * 10 };
+        let (anchor, worker, exempt, stranger) = (p(10, 10), p(11, 10), p(12, 10), p(13, 10));
+        let groups = vec![(10, std::cell::RefCell::new(vec![anchor.clone()]))];
+        let alive = std::cell::RefCell::new(vec![anchor.clone(), worker.clone(), exempt.clone()]);
+        let current = |q: &Process| alive.borrow().iter().find(|a| a.same(q)).cloned();
+        let observe = |_: u32| alive.borrow().clone();
+        let is_exempt = |q: &Process| q.same(&exempt);
+        let found = group_members(&groups, &observe, &current, &is_exempt);
+        assert_eq!(found, vec![(anchor.clone(), Known::InGroup), (worker.clone(), Known::InGroup)]);
+        // The anchor exits; the worker found while anchored now holds the group.
+        alive.borrow_mut().retain(|a| !a.same(&anchor));
+        assert_eq!(group_members(&groups, &observe, &current, &is_exempt), vec![(worker.clone(), Known::InGroup)]);
+        // Every identified process is gone and the number now lists another group's process.
+        *alive.borrow_mut() = vec![stranger.clone()];
+        assert_eq!(group_members(&groups, &observe, &current, &is_exempt), vec![(stranger, Known::Unproven)]);
+    }
+
+    /// The first listing of a stray's group is that group's only while its identified leader
+    /// holds it right before and right after: a leader gone (or no longer leading) on either side
+    /// makes what the number listed unproven. An unproven member is never signalled, and is
+    /// reported as not shown to be the checkout's, while the stray's own process is stopped.
+    #[test]
+    fn a_first_group_listing_without_its_leader_holding_the_number_is_unproven() {
+        let leader = Process { pid: 50, parent: 1, group: 50, started: 500 };
+        let stranger = Process { pid: 51, parent: 1, group: 50, started: 510 };
+        let observe = |_: u32| vec![stranger.clone()];
+        let held = |p: &Process| Some(p.clone());
+        assert_eq!(bracketed(&leader, &observe, &held), Ok(vec![stranger.clone()]));
+        // Gone right after the listing (the number may have been reused in between).
+        let calls = std::cell::Cell::new(0);
+        let gone_after = |p: &Process| {
+            calls.set(calls.get() + 1);
+            (calls.get() == 1).then(|| p.clone())
+        };
+        assert_eq!(bracketed(&leader, &observe, &gone_after), Err(vec![stranger.clone()]));
+        // Gone before it: never held.
+        assert_eq!(bracketed(&leader, &observe, &|_| None), Err(vec![stranger.clone()]));
+        let left_group = |p: &Process| Some(Process { group: 7, ..p.clone() });
+        assert!(bracketed(&leader, &observe, &left_group).is_err());
+
+        let mut own = sleeper(true);
+        let mut bystander = sleeper(true);
+        let mut stray = stray_for(&own);
+        stray.group = None;
+        stray.unproven = vec![crate::procinfo::process(bystander.id()).unwrap()];
+        let left = stop_observing(std::slice::from_ref(&stray), &[], None, Duration::from_millis(200), &crate::procinfo::in_group);
+        assert!(own.wait().unwrap().signal().is_some(), "the stray itself is stopped");
+        assert!(bystander.try_wait().unwrap().is_none(), "an unproven member was signalled");
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!((left[0]["pid"].as_u64(), left[0]["unproven"].as_bool()), (Some(u64::from(bystander.id())), Some(true)), "{left:?}");
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+    }
+
     /// The same look with the leader alive throughout is accepted: what it found is stopped
     /// (here a process the observer reports as a member), so the test above fails only because
     /// of the bracket.
@@ -381,6 +587,6 @@ mod tests {
 
 /// Without Unix signals nothing is stopped, so everything is reported as surviving.
 #[cfg(not(unix))]
-pub fn stop(strays: &[Stray], others: &[Process], _rescan: Option<&dyn Fn() -> Vec<Process>>, _grace: Duration) -> Vec<Value> {
+pub fn stop(strays: &[Stray], others: &[Process], _rescan: Option<&dyn Fn() -> Vec<Found>>, _grace: Duration) -> Vec<Value> {
     strays.iter().map(Stray::json).chain(others.iter().map(|p| json!({ "pid": p.pid, "unrecorded": true }))).collect()
 }

@@ -125,6 +125,23 @@ pub fn carrying(key: &str, value: &str) -> Vec<Process> {
         .collect()
 }
 
+/// [`carrying`] for several `(key, value)` pairs at once: every process whose environment sets
+/// any of them, each environment read once.
+pub fn carrying_any(pairs: &[(&str, &str)]) -> Vec<Process> {
+    let me = std::process::id();
+    let wanted: Vec<String> = pairs.iter().map(|(key, value)| format!("{key}={value}")).collect();
+    imp::pids()
+        .into_iter()
+        .filter(|pid| *pid != me && *pid > 1)
+        .filter_map(|pid| {
+            let before = process(pid)?;
+            let vars = imp::environ(pid).filter(|vars| !vars.is_empty())?;
+            let carries = vars.iter().any(|v| wanted.iter().any(|w| v.as_slice() == w.as_bytes()));
+            (carries && before.current().is_some()).then_some(before)
+        })
+        .collect()
+}
+
 /// Every live process whose process group is `group` (other than this one).
 pub fn in_group(group: u32) -> Vec<Process> {
     let me = std::process::id();

@@ -8,7 +8,7 @@
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
 | `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME]` | Start services, verify them, run pending [init tasks](data.md), record a session |
-| `stack status` | Verify every service now (exit 1 if any fails) and renew the lease |
+| `stack status` | Verify every service now (exit 1 if any fails in a started checkout) and renew the lease |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
@@ -49,7 +49,7 @@ with `--json`, `--quiet`, or when stderr is not a terminal. `NO_COLOR` turns off
 | Code | Means |
 |---|---|
 | 0 | Success |
-| 1 | `status` found a service unhealthy (`ok: true, passed: false`) |
+| 1 | `status` found a service unhealthy in a started checkout (`ok: true, passed: false`) |
 | 2 | Usage error: bad arguments or flag values (`usage`) |
 | 70 | Any other Stack error (`ok: false`); `error.code` says which |
 | 124 | Stack's own deadline passed (`timed_out`) |
@@ -73,7 +73,7 @@ command's failure, `ok: false` is Stack's. Through 0.1.22, Stack's own errors ex
 | `run` | No | The task's missing pins | Only with `--up` | Every service; all must pass | Current `stack.lock` |
 | `exec` | No | Only with `--install` (else `tools_not_installed`) | Only with `--up` | Every service; unverified ones withheld, required ones refused | `install` or `up`, or `--install`/`--up` |
 | `env` | No | No | No | Like `exec` | `install` or `up` |
-| `status` | No | No | No | Every service, now | Nothing (reports `no session`) |
+| `status` | No | No | No | Every service, now | Nothing (reports `not started`, exit 0) |
 | `down` | No | No | Stops every service | Confirms they are gone | Nothing |
 
 In practice: `compile` after editing `stack.toml`, `up` to work, `install` to warm a cache or CI
@@ -194,17 +194,56 @@ as usual.
 Checks every service now, not from a saved record: the process is alive, its port answers,
 and, for Postgres, Redis and services with an [identity probe](identity-probes.md), that it is
 this checkout's instance. `ok` stays true; `healthy` says whether everything passed, and the
-exit code is 1 when it did not. A session whose lease expired is not healthy either, though
+exit code is 1 when it did not, unless nothing of the checkout is started (below). A session whose lease expired is not healthy either, though
 its services still answer: `lease_expired` says why, and that the next `gc` or `up` stops them
 (`stack renew` or any `exec` renews a TTL lease). When a service declares init tasks, `init`
 gives each service's state (`done`, `pending`, `failed`, `stale` or `none`; see
 [service data](data.md)).
 
+**Not started.** A checkout with nothing of it started is not a failed check. `status` says so
+only when it has looked, with the same evidence `down` confirms a stop with: no session, no
+service process the supervisor reports, no command Stack started for it still running, a
+command registry that can be read, and then (only in that case, so a checkout with a session
+never pays for it) its supervisor's record read in full, whatever the manifest calls its
+services now, and every process searched for the checkout's service token and command mark. In
+practice that is a checkout that never ran `up`, or one stopped by a confirmed `down` (`down`
+removes the session, so the two look the same). `status` then prints ``not started; run `stack
+up` ``, exits 0, and reports `started: false` and `passed: true`. `healthy` is false (no
+service was verified), except in a checkout that declares no services, where it is true as it
+always was. The plain output still shows what is more than "not started": a service whose port
+another program holds (with how to reassign it), init state, which outlives a session, and
+warnings.
+
+When any of that is there, `started` is true and a service that does not verify exits 1 as
+before, with or without a session. Registered commands appear under `commands`; what the second
+look turns up appears under `found`, and the plain output prints each as a `found` line: that
+the last `stack down` here was not confirmed (see [below](#commands-still-running)), a process
+carrying the checkout's environment (such as a helper a command left running), a service still running under
+the checkout's supervisor, or why it could not look (a record that cannot be read).
+
+The second look is best effort, like `down`'s own search. A process whose environment the
+system hides from the start (on macOS, Apple's binaries such as `/bin/sleep`) and that `down`
+never reported is seen by neither. The search reads each process once, so a handoff can slip
+through it: a detached parent that exits after the process list was taken, leaving a new child
+that was not in the list.
+
+A supervisor record at this path may belong to another checkout: one that was moved away, or a
+directory that was here before this one (another token). It does not make this checkout
+started: `status` lists what it still runs under `other_checkout` (plain output: `other` lines)
+and stays not started, exit 0. `stack up` here stops those services before starting this
+checkout's own (its `stop_previous` step), and `stack down` here stops them too.
+
+So the exit code of `status` alone does not say the services are up: to assert that, check
+`data.started and data.healthy` with `--json`, or let the command that needs them say so with
+`stack exec --require-all` (refused with `service_unavailable` otherwise), or start them first
+with `--up`.
+
 `commands` lists the commands Stack registered for this checkout (`exec`, `run`, MCP calls)
 that are still running, also once the session is gone, from the [command
-registry](#commands-still-running) alone: `status` reads no process's environment, so what a
-command left running after it ended is found by `down` only. Each has the fields `down`
-reports. They do not make the checkout unhealthy; `down` is not confirmed while one runs.
+registry](#commands-still-running) alone. What a command left running after it ended is found
+by `down`, and by `status` only in a checkout with nothing else started (see `found` above).
+Each has the fields `down` reports. They do not make the checkout unhealthy, but one running makes it `started` (so not
+"not started"); `down` is not confirmed while one runs.
 
 Checking counts as using the session: `status` renews a lease that has not expired yet, like
 `exec`. An expired lease is reported, not revived, and so is the lease of a session that is
@@ -422,6 +461,22 @@ the PIDs to wait for or stop, never an MCP server's or another checkout's (for t
 look at that checkout); then run `down` again. Every later `down` says the same
 until they have exited, and `--purge` removes nothing meanwhile.
 
+**What `status` learns from it.** A `down` that ends without confirming, for any reason, leaves
+a marker for the checkout (`<state dir>/unconfirmed/`, keyed like the registry: when, and the
+error); a `down` that confirms removes it. `status` reads it: in a checkout without a session,
+the marker (or one that cannot be read) makes the checkout `started`, with a `found` line saying
+the last `down` was not confirmed and to run `stack down` again, also when a registered command
+already makes it started. So `status` never
+says "not started" after an unconfirmed `down` until a `down` confirms, and it agrees with
+`down`: once a later `down` confirms (what it reported exited, or that `down` can no longer
+see it, a limit listed below), `status` is not started either. If the marker cannot be written,
+the failing `down` says so in its message and in a detail with `"kind": "marker"`. If a `down`
+that confirms cannot remove it, its result is still the confirmed one (with any purge), plus a
+warning naming the marker's path in `warnings`: `status` keeps reporting the last `down` as
+unconfirmed until the file is deleted. `up` reads it only to warn that what that `down` reported
+may still run beside the services it starts; it does not clear it: a session then exists, which
+`status` goes by, and the next `down` decides.
+
 How Stack knows:
 
 - **The command registry.** Every command is registered before it starts and removed when it
@@ -458,7 +513,13 @@ How Stack knows:
   token: `down` is not confirmed while one lives. Each `down` decides once per process and keeps
   to it, for stopping and reporting alike. A leftover service process whose process group holds
   such a process is not signalled as a group: every other member is signalled one by one, while
-  still in that group, and `down` is not confirmed while any of them survives.
+  still in that group, and `down` is not confirmed while any of them survives. A worker that joins
+  the group meanwhile is signalled only while it is in it and while a process seen in the group
+  at the start (or found in it since) still holds the group's number; once none does, the number
+  may name another group, so what it lists is reported, never signalled. The first listing of a
+  leftover's group follows the same rule: it counts only while that leftover is seen leading the
+  group right before and right after it. Such a process, and a worker that left the group, is a detail with `"unproven": true` and a `reason`: Stack could not
+  show it belongs to this checkout, so check what it is before stopping it yourself.
 - **The session (older Stack).** A command an older Stack started is not registered: Stack knows
   only the PID of the Stack process running it, from the session. While that process runs, the
   first `down` reports it (`started_by: "older stack"`, `found_by: "session"`) and nothing it

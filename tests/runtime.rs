@@ -4137,10 +4137,10 @@ fn status_of_a_checkout_never_compiled_here_says_to_start_it_without_asking_the_
     // A fresh worktree has the committed stack.lock but no generated provider config.
     fs::remove_file(fixture.dir.path().join("app/.config/mise/conf.d/stack.toml")).unwrap();
     let out = fixture.command(&["status", "--json"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(1), "unhealthy");
+    assert_eq!(out.status.code(), Some(0), "nothing started is not a failed check");
     let result = json_result(&out);
     assert_eq!(result["ok"], true, "{result}");
-    assert_eq!(result["data"]["healthy"], false);
+    assert_eq!((&result["data"]["healthy"], &result["data"]["started"]), (&json!(false), &json!(false)), "{result}");
     assert_eq!(result["data"]["checks"][0]["ready"], false);
     assert!(result["data"]["checks"][0]["reason"].as_str().unwrap().contains("stack up"), "{result}");
     let out = fixture.command(&["logs", "web", "--json"]).output().unwrap();
@@ -6299,6 +6299,206 @@ fn a_service_that_does_not_verify_has_a_stable_reason_code() {
     assert_eq!(results[0]["structuredContent"]["data"]["checks"][0]["reason_code"], "not_launched", "{}", results[0]);
 }
 
+/// A checkout never started, or stopped by a confirmed `down`, is not a failed check: `status`
+/// exits 0, says to run `up`, and `started: false` (with `healthy: false`: nothing was verified)
+/// tells it apart from a healthy one. A started checkout with a service that is not ready, or
+/// one whose service still runs without a session, exits 1 as before.
+#[test]
+fn status_of_a_checkout_with_nothing_started_exits_0_and_says_so() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let not_started = |when: &str| {
+        let out = fixture.command(&["status"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{when}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "not started; run `stack up`\n", "{when}");
+        let out = fixture.command(&["status", "--json"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{when}");
+        let status = json_result(&out);
+        let data = &status["data"];
+        assert_eq!((&status["passed"], &data["started"], &data["healthy"]), (&json!(true), &json!(false), &json!(false)), "{when}: {status}");
+        assert_eq!(data["checks"][0]["reason_code"], "not_launched", "{when}: {status}");
+        let results = fixture.mcp(&[("stack_status", json!({}))], &[]);
+        let content = &results[0]["structuredContent"];
+        assert_eq!((&content["passed"], &content["data"]["started"]), (&json!(true), &json!(false)), "{when}: {content}");
+    };
+    not_started("never started");
+
+    fixture.ok(&["up"]);
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!((&status["passed"], &status["data"]["started"], &status["data"]["healthy"]), (&json!(true), &json!(true), &json!(true)), "{status}");
+
+    // A service of the session stopped: started, not healthy, exit 1.
+    let pid: i32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(pid as u32) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let out = fixture.command(&["status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.starts_with("session ") && text.contains("NOT READY") && !text.contains("not started"), "{text}");
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let status = json_result(&out);
+    assert_eq!((&status["passed"], &status["data"]["started"], &status["data"]["healthy"]), (&json!(false), &json!(true), &json!(false)), "{status}");
+    let results = fixture.mcp(&[("stack_status", json!({}))], &[]);
+    let content = &results[0]["structuredContent"];
+    assert_eq!((&content["ok"], &content["passed"], &content["data"]["started"]), (&json!(true), &json!(false), &json!(true)), "{content}");
+
+    // After a confirmed `down` there is no session again, and nothing runs: as never started.
+    fixture.ok(&["down"]);
+    not_started("after a confirmed down");
+}
+
+/// A service the supervisor still runs for this checkout is something started, even once its
+/// session record is gone: `status` does not call that "not started".
+#[test]
+fn status_without_a_session_but_with_a_running_service_is_not_not_started() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    for path in fixture.session_paths() {
+        fs::remove_file(path).unwrap();
+    }
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status = json_result(&out);
+    assert_eq!(out.status.code(), Some(1), "{status}");
+    assert!(status["data"]["session"].is_null(), "{status}");
+    assert_eq!((&status["passed"], &status["data"]["started"], &status["data"]["healthy"]), (&json!(false), &json!(true), &json!(false)), "{status}");
+    let text = String::from_utf8_lossy(&fixture.command(&["status"]).output().unwrap().stdout).into_owned();
+    assert!(text.starts_with("no session") && text.contains("NOT READY"), "{text}");
+    fixture.ok(&["down"]);
+}
+
+/// Not started, `status` still shows what would make `up` fail: another program on a service's
+/// port, with the way out, beside the "not started" line, and still exits 0.
+#[test]
+fn status_of_a_checkout_not_started_still_names_a_port_another_program_holds() {
+    let fixture = Fixture::with_bundle(WEB);
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    let _held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let out = fixture.command(&["status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("not started; run `stack up`"), "{text}");
+    let web = lines.next().unwrap_or_else(|| panic!("{text}"));
+    assert!(web.starts_with("web ") && web.contains(&format!("is now listening on its port {port}")) && web.contains("--reassign-ports"), "{text}");
+    assert!(!web.contains("no launch record"), "only what is more than not started: {text}");
+}
+
+/// With both session copies gone, a service still running under this checkout's supervisor is
+/// found by the look `down` relies on even when the cheap evidence misses it: (a) the manifest
+/// renamed the service, so no check names it; (b) the supervisor's record cannot be read, so it
+/// lists nothing. `status` is then `started`, exits 1, and says what it found.
+#[test]
+fn status_without_a_session_finds_a_service_the_checks_miss() {
+    for case in ["renamed", "corrupt"] {
+        let fixture = Fixture::with_bundle(WEB);
+        supervise_listener(&fixture, assigned_port(&fixture, "web"));
+        fixture.ok(&["up"]);
+        let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+        for path in fixture.session_paths() {
+            fs::remove_file(path).unwrap();
+        }
+        let bundle = fixture.dir.path().join("bundle/bundle.toml");
+        let original = fs::read_to_string(&bundle).unwrap();
+        let state = fs::read_dir(fixture.dir.path().join("state/supervisors")).unwrap().next().unwrap().unwrap().path().join("state.json");
+        let saved = fs::read(&state).unwrap();
+        if case == "renamed" {
+            fs::write(&bundle, original.replace("[services.web]", "[services.api]")).unwrap();
+            fixture.ok(&["compile"]);
+        } else {
+            fs::write(&state, "{ not json").unwrap();
+        }
+        let out = fixture.command(&["status", "--json"]).output().unwrap();
+        let status = json_result(&out);
+        assert!(pid_alive(pid), "{case}: the service runs");
+        assert_eq!(out.status.code(), Some(1), "{case}: {status}");
+        let data = &status["data"];
+        assert_eq!((&status["passed"], &data["started"], &data["healthy"], &data["session"]), (&json!(false), &json!(true), &json!(false), &Value::Null), "{case}: {status}");
+        let found = data["found"].to_string();
+        match case {
+            "renamed" => assert!(found.contains(&format!("service web (pid {pid})")), "{case}: {status}"),
+            _ => assert!(found.contains("cannot tell what this checkout's supervisor runs"), "{case}: {status}"),
+        }
+        let text = String::from_utf8_lossy(&fixture.command(&["status"]).output().unwrap().stdout).into_owned();
+        assert!(text.starts_with("no session") && text.contains("found") && !text.contains("not started"), "{case}: {text}");
+        fs::write(&state, &saved).unwrap();
+        fs::write(&bundle, &original).unwrap();
+        fixture.ok(&["compile"]);
+        fixture.ok(&["down"]);
+        assert!(!pid_alive(pid), "{case}");
+    }
+}
+
+/// A service left running by a checkout that was moved away, with its session index gone, and a
+/// fresh checkout (another directory, another token) at the same path: the supervisor record at
+/// this path is the other checkout's. `status` here does not call it this checkout's: not
+/// started, exit 0, with `other_checkout` naming what runs; `up` here stops it and starts this
+/// checkout's own.
+#[test]
+fn status_does_not_take_another_checkouts_supervisor_at_this_path_for_its_own() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up"]);
+    let pid: u32 = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).unwrap().trim().parse().unwrap();
+    for path in fixture.session_paths().into_iter().skip(1) {
+        fs::remove_file(path).unwrap();
+    }
+    let app = fixture.dir.path().join("app");
+    let old = fixture.dir.path().join("app-old");
+    fs::rename(&app, &old).unwrap();
+    fs::create_dir(&app).unwrap();
+    fs::copy(old.join("stack.toml"), app.join("stack.toml")).unwrap();
+    fs::copy(old.join("stack.lock"), app.join("stack.lock")).unwrap();
+    fixture.ok(&["compile"]);
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status = json_result(&out);
+    let data = &status["data"];
+    assert_eq!(out.status.code(), Some(0), "{status}");
+    assert_eq!((&data["started"], &status["passed"], data.get("found")), (&json!(false), &json!(true), None), "{status}");
+    let other = data["other_checkout"].to_string();
+    assert!(other.contains(&format!("service web (pid {pid}) runs for that other checkout")) && !other.contains("this checkout's supervisor"), "{status}");
+    let text = String::from_utf8_lossy(&fixture.command(&["status"]).output().unwrap().stdout).into_owned();
+    assert!(text.starts_with("not started; run `stack up`\n") && text.contains("other        the supervisor at this path"), "{text}");
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(up["data"]["steps"].as_array().unwrap().iter().any(|s| s["step"] == "stop_previous"), "{up}");
+    assert!(!pid_alive(pid), "up stops the other checkout's service first");
+    fixture.ok(&["down"]);
+}
+
+/// The marker a `down` that did not confirm leaves: `status` without a session is started and
+/// says so; `up` starts anyway and warns that what that `down` reported may still run; `up`
+/// leaves the marker, and the `down` that confirms removes it.
+#[test]
+fn an_unconfirmed_down_marker_keeps_status_started_and_up_warns() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let identity = stack::checkout::identity(&fixture.dir.path().join("app")).unwrap();
+    let marker = fixture.dir.path().join("state/unconfirmed").join(format!("{identity}.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, json!({ "at_ms": 0, "code": "stop_unconfirmed", "message": "services did not stop" }).to_string()).unwrap();
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status = json_result(&out);
+    assert_eq!((out.status.code(), &status["data"]["started"]), (Some(1), &json!(true)), "{status}");
+    assert!(status["data"]["found"][0].as_str().unwrap().contains("(stop_unconfirmed: services did not stop)"), "{status}");
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert!(up["data"]["warnings"].to_string().contains("the last `stack down` here was not confirmed"), "{up}");
+    assert!(marker.exists(), "up leaves it to the next down");
+    fixture.ok(&["down"]);
+    assert!(!marker.exists(), "a confirmed down removes it");
+    // One that cannot be read proves nothing either.
+    fs::write(&marker, "{ not json").unwrap();
+    let out = fixture.command(&["status", "--json"]).output().unwrap();
+    let status = json_result(&out);
+    assert_eq!((out.status.code(), &status["data"]["started"]), (Some(1), &json!(true)), "{status}");
+    assert!(status["data"]["found"][0].as_str().unwrap().contains("cannot tell whether the last `stack down` here was confirmed"), "{status}");
+    fixture.ok(&["down"]);
+}
+
 /// Every envelope says what ran, with which Stack, in which schema, and how long it took.
 fn assert_self_described(envelope: &Value, command: &str) {
     assert_eq!(envelope["command"], command, "{envelope}");
@@ -6331,14 +6531,15 @@ fn every_envelope_describes_itself_and_says_whether_it_passed() {
     assert_self_described(&result, "logs");
     assert_eq!(result["error"]["code"], "usage", "{result}");
 
-    // An unhealthy status succeeded but did not pass.
+    // A status of a checkout with nothing started passed (an unhealthy started one does not:
+    // `status_of_a_checkout_with_nothing_started_exits_0_and_says_so`).
     let fixture = Fixture::with_bundle(WEB);
     let result = json_result(&fixture.command(&["--json", "status"]).output().unwrap());
     assert_self_described(&result, "status");
-    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(false)), "{result}");
+    assert_eq!((result["ok"].as_bool(), result["passed"].as_bool()), (Some(true), Some(true)), "{result}");
     let results = fixture.mcp(&[("stack_status", json!({})), ("stack_inspect", json!({}))], &[]);
     assert_self_described(&results[0]["structuredContent"], "status");
-    assert_eq!(results[0]["structuredContent"]["passed"], false);
+    assert_eq!(results[0]["structuredContent"]["passed"], true);
     assert_self_described(&results[1]["structuredContent"], "inspect");
     assert_eq!(results[1]["structuredContent"]["passed"], true);
 }

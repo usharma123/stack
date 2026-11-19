@@ -126,7 +126,7 @@ passed:
 | Operation | Succeeded when |
 |---|---|
 | `exec`, `run` | `ok` is true and `data.exit_code` is 0 |
-| `status` | `ok` is true and `data.healthy` is true |
+| `status` | `ok` is true, and `data.healthy` is true or `data.started` is false |
 | anything else | `ok` is true |
 
 ```python
@@ -138,13 +138,14 @@ def succeeded(operation, envelope):
     if operation in ("exec", "run"):
         return envelope["data"]["exit_code"] == 0
     if operation == "status":
-        return envelope["data"]["healthy"]
+        # started false: nothing of the checkout runs (never started, or after `down`).
+        return envelope["data"]["healthy"] or not envelope["data"].get("started", True)
     return True
 ```
 
 Every envelope also answers that check itself: **`passed`** is false when `ok` is false, when
-`exec` or `run` exited non-zero or by a signal, and when `status` finds a service unhealthy,
-so `envelope["passed"]` is the same test without the table. Beside it, `command` names the
+`exec` or `run` exited non-zero or by a signal, and when `status` finds a service unhealthy
+in a started checkout, so `envelope["passed"]` is the same test without the table. Beside it, `command` names the
 operation (MCP tool names without `stack_`), `stack_version` the Stack release that answered,
 `schema` the version of these shapes (currently `1`, raised only on an incompatible change)
 and `duration_ms` how long the call took:
@@ -160,6 +161,18 @@ and `duration_ms` how long the call took:
 - A `status` that finds a service down still gives `ok: true`, with `data.healthy: false` and
   `data.checks` saying which service and why: a sentence in `reason` and a stable
   [`reason_code`](commands.md#reason-codes) to branch on. The CLI exits 1.
+- A `status` of a checkout with nothing started (no session, and nothing of it found running:
+  never started, or after `down`) is not a failure: the CLI exits 0 and prints ``not started;
+  run `stack up` `` (plus anything that would make `up` fail, such as a port another program
+  holds), and `data.started` is false. `data.healthy` is false too, unless the checkout declares
+  no services. It is a fine first look at a worktree. Registered commands still running appear
+  in `data.commands`; anything else the second look finds (the last `down` was not confirmed, a
+  process carrying the checkout's environment) in `data.found`, and either
+  makes it `started`. That look is best effort: a process whose environment was hidden from the
+  start (macOS's own binaries) is seen by neither `down` nor `status`, and a detached parent that
+  exits mid-scan can hand off to a child the single pass misses. To know the services are up,
+  read `data.started and data.healthy`, or skip the check and run `stack exec --up` or
+  `--require-all`.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
   `error.hint`. `error.details` carries the specifics. The CLI exits 70 (124 for
   `timed_out`); see [exit codes](commands.md#exit-codes).

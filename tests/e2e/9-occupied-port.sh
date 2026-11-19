@@ -85,10 +85,10 @@ echo 'install puts the locked binaries in place without a session'
 rm -rf "$W/appI" && cp -r "$W/appH" "$W/appI" && rm -rf "$W/appI/.stack"
 cd "$W/appI" || exit 1
 stack install --json >"$T/install-appI.json"
-assert_json '.ok and ([.data.steps[].step] == ["compile", "preflight", "install"])' "$T/install-appI.json"
+assert_json '.ok and ([.data.steps[].step] == ["compile", "install"])' "$T/install-appI.json"
 [[ ! -e .stack/session.json ]] || fail 'install recorded a session'
-if stack status --json >"$T/status-appI.json"; then fail 'status reported ready services after a plain install'; fi
-assert_json '.ok and .data.session == null and all(.data.checks[]; .ready == false)' "$T/status-appI.json"
+stack status --json >"$T/status-appI.json" || fail 'status of a checkout never started exited non-zero'
+assert_json '.ok and .passed and (.data.started == false) and (.data.healthy == false) and .data.session == null and all(.data.checks[]; .ready == false)' "$T/status-appI.json"
 stack exec -- bash -c 'command -v psql >/dev/null && command -v redis-server >/dev/null' || fail 'installed tools are not on PATH in exec'
 
 echo 'Redis with a hanging preset readiness command still starts and verifies'

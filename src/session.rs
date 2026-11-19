@@ -1317,7 +1317,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         checks,
         steps: steps.0,
         reaped,
-        warnings: gc_warnings.into_iter().chain(warnings).collect(),
+        warnings: gc_warnings.into_iter().chain(warnings).chain(unconfirmed_down(ctx).map(|_| {
+            "the last `stack down` here was not confirmed: what it reported may still run beside these services, holding their ports or data; `stack down` checks again".to_string()
+        })).collect(),
         reassigned_ports: Vec::new(),
         init: IndexMap::new(),
     };
@@ -2719,6 +2721,10 @@ pub struct DownReport {
     /// Unrecorded command registry entries `--forget-unrecorded` removed.
     #[serde(skip_serializing_if = "is_zero")]
     pub forgotten_unrecorded: usize,
+    /// What did not keep `down` from confirming but needs attention (a marker of an earlier
+    /// unconfirmed `down` that could not be removed).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -2780,12 +2786,85 @@ pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<Dow
 /// entries whose process was never recorded and whose Stack process is gone (see
 /// `crate::commands`), which otherwise keep every `down` unconfirmed. Nothing else in the
 /// registry is touched.
+///
+/// A `down` that ends without confirming (for any reason, once it holds the lock) leaves a
+/// marker for the checkout (see [`unconfirmed_marker`]), which only `status` reads: without a
+/// session it keeps the checkout started until a `down` confirms, which removes it.
 pub fn down_forgetting(ctx: &Ctx, stop_supervisor: bool, purge: bool, forget_unrecorded: bool) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
-    let forgotten = if forget_unrecorded { commands::forget_unrecorded(&ctx.state, &ctx.root)? } else { 0 };
-    let mut report = down_unforgetting(ctx, stop_supervisor, purge)?;
-    report.forgotten_unrecorded = forgotten;
-    Ok(report)
+    let result = (|| {
+        let forgotten = if forget_unrecorded { commands::forget_unrecorded(&ctx.state, &ctx.root)? } else { 0 };
+        let mut report = down_unforgetting(ctx, stop_supervisor, purge)?;
+        report.forgotten_unrecorded = forgotten;
+        Ok(report)
+    })();
+    match result {
+        Ok(mut report) => {
+            // The stop is confirmed (and any purge done) whatever becomes of the marker.
+            if let Err(e) = clear_unconfirmed(ctx) {
+                let path = unconfirmed_marker(ctx).map_or_else(String::new, |p| format!(" {}", p.display()));
+                report.warnings.push(format!(
+                    "the marker of an earlier unconfirmed `stack down`{path} could not be removed ({}); `stack status` keeps reporting that `down` as unconfirmed until it is: delete it",
+                    e.message
+                ));
+            }
+            Ok(report)
+        }
+        Err(mut e) => {
+            if let Err(why) = mark_unconfirmed(ctx, &e) {
+                e.message.push_str(&format!("; this unconfirmed `stack down` could not be recorded, so `stack status` may not show it ({})", why.message));
+                e.details.push(json!({ "kind": "marker", "error": why.message }));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Where a `down` that did not confirm leaves its marker for the checkout at `ctx.root` (keyed
+/// by the directory's identity, as the command registry is), when that identity can be computed.
+fn unconfirmed_marker(ctx: &Ctx) -> Option<PathBuf> {
+    crate::checkout::identity(&ctx.root).map(|id| ctx.state.join("unconfirmed").join(format!("{id}.json")))
+}
+
+/// The marker a `down` that did not confirm leaves: when, and its error. Nothing but `status`
+/// reads it.
+#[derive(Debug, Serialize, Deserialize)]
+struct UnconfirmedDown {
+    at_ms: u64,
+    code: String,
+    message: String,
+}
+
+fn mark_unconfirmed(ctx: &Ctx, e: &StackError) -> Result<()> {
+    let path = unconfirmed_marker(ctx).ok_or_else(|| StackError::new("state_invalid", "this directory's identity cannot be computed"))?;
+    write_json(&path, &UnconfirmedDown { at_ms: now_ms(), code: e.code.to_string(), message: e.message.clone() })
+}
+
+fn clear_unconfirmed(ctx: &Ctx) -> Result<()> {
+    match unconfirmed_marker(ctx) {
+        Some(path) => remove_if_exists(&path),
+        None => Ok(()),
+    }
+}
+
+/// What `status` says of the marker a `down` that did not confirm left, if there is one (or one
+/// that cannot be read).
+fn unconfirmed_down(ctx: &Ctx) -> Option<String> {
+    let path = unconfirmed_marker(ctx)?;
+    let unknown = |why: String| format!("cannot tell whether the last `stack down` here was confirmed ({}: {why}); run `stack down` again", path.display());
+    match fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(unknown(e.to_string())),
+        Ok(bytes) => Some(match serde_json::from_slice::<UnconfirmedDown>(&bytes) {
+            Ok(m) => format!(
+                "the last `stack down` here ({}s ago) was not confirmed ({}: {}); what it reported may still run: run `stack down` again",
+                now_ms().saturating_sub(m.at_ms) / 1000,
+                m.code,
+                m.message
+            ),
+            Err(e) => unknown(e.to_string()),
+        }),
+    }
 }
 
 /// [`down_forgetting`] under the project lock, without forgetting anything.
@@ -3184,22 +3263,42 @@ fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRe
                 .filter(|p| !strays.iter().any(|s| s.chain.iter().chain(&s.members).any(|q| q.same(p))))
                 .collect();
             // A group not signalled as one (it holds a command) is looked at again while its
-            // members are stopped one by one: a worker a member started since is stopped too.
-            let mixed: Vec<u32> = strays.iter().filter(|s| s.group.is_none()).filter_map(|s| s.chain.last()).filter(|top| top.group == top.pid).map(|top| top.group).collect();
+            // members are stopped one by one: a worker a member started since is stopped too,
+            // only while it is still in the group, and only while a process identified in that
+            // group still holds its number (see `stopping::group_members`).
+            let mixed: Vec<(u32, std::cell::RefCell<Vec<crate::procinfo::Process>>)> = strays
+                .iter()
+                .filter(|s| s.group.is_none())
+                .filter_map(|s| {
+                    let top = s.chain.last()?;
+                    if top.group != top.pid {
+                        return None;
+                    }
+                    // Every process in the group now, commands included, is identified in it
+                    // while its leader is seen leading it before and after the look.
+                    let leads = || top.current().is_some_and(|now| now.group == top.group);
+                    let mut identified: Vec<crate::procinfo::Process> = s.chain.iter().chain(&s.members).filter(|p| p.group == top.group).cloned().collect();
+                    if leads() {
+                        let members = crate::procinfo::in_group(top.group);
+                        if leads() {
+                            identified.extend(members.into_iter().filter(|p| !identified.iter().any(|q| q.same(p))).collect::<Vec<_>>());
+                        }
+                    }
+                    Some((top.group, std::cell::RefCell::new(identified)))
+                })
+                .collect();
             let rescan = || {
-                let mut found = carriers();
-                for p in mixed.iter().flat_map(|group| crate::procinfo::in_group(*group)) {
-                    if !exempt.covers(&p) && !found.iter().any(|q| q.same(&p)) {
-                        found.push(p);
+                let mut found = crate::stopping::independent(carriers());
+                for (p, known) in crate::stopping::group_members(&mixed, &crate::procinfo::in_group, &|p: &crate::procinfo::Process| p.current(), &|p| exempt.covers(p)) {
+                    if !found.iter().any(|(q, _)| q.same(&p)) {
+                        found.push((p, known));
                     }
                 }
                 found
             };
             let survivors = stop_strays(&strays, &others, Some(&rescan));
             if !survivors.is_empty() {
-                return Err(StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
-                    .hint("retry `stack down`; stopping is safe to repeat")
-                    .details(survivors));
+                return Err(crate::stopping::unconfirmed(survivors));
             }
         }
         let alive: Vec<Value> = pids
@@ -3227,7 +3326,7 @@ fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRe
     // started since the processes above were found.
     let late = carriers();
     if !late.is_empty() {
-        let survivors = stop_strays(&[], &late, Some(&carriers));
+        let survivors = stop_strays(&[], &late, Some(&|| crate::stopping::independent(carriers())));
         if !survivors.is_empty() {
             return Err(StackError::new("stop_unconfirmed", "a service process the supervisor no longer tracks did not stop")
                 .hint("retry `stack down`; stopping is safe to repeat")
@@ -3265,6 +3364,7 @@ fn down_stopping(ctx: &Ctx, session: Option<Session>, recovery: Option<&RecordRe
         removed_unreadable: Vec::new(),
         recovery_checked: None,
         forgotten_unrecorded: 0,
+        warnings: Vec::new(),
     })
 }
 
@@ -3458,7 +3558,14 @@ fn stray(service: &str, port: u16, token: &str, exempt: &commands::Exempt) -> Op
     }
     let top = chain.last()?;
     let leads = top.group == top.pid;
-    let in_group = if leads { crate::procinfo::in_group(top.group) } else { Vec::new() };
+    // The group is listed only while its leader is seen holding it before and after the look;
+    // what the number lists otherwise may be another group's: unproven, never signalled.
+    let (in_group, unproven) = match leads.then(|| crate::stopping::bracketed(top, &crate::procinfo::in_group, &|p| p.current())) {
+        Some(Ok(members)) => (members, Vec::new()),
+        Some(Err(listed)) => (Vec::new(), listed.into_iter().filter(|p| !chain.iter().any(|c| c.same(p)) && !exempt.covers(p)).collect()),
+        None => (Vec::new(), Vec::new()),
+    };
+    let leads = leads && unproven.is_empty() && !in_group.is_empty();
     let mixed = in_group.iter().any(|p| exempt.covers(p));
     let group = (leads && !mixed).then_some(top.group);
     let members = if mixed {
@@ -3469,7 +3576,7 @@ fn stray(service: &str, port: u16, token: &str, exempt: &commands::Exempt) -> Op
     } else {
         Vec::new()
     };
-    Some(Stray { service: service.to_string(), port: Some(port), chain, group, members, signal: libc::SIGTERM })
+    Some(Stray { service: service.to_string(), port: Some(port), chain, group, members, unproven, signal: libc::SIGTERM })
 }
 
 /// Strays on `ports` (service, port) of the checkout at `root`.
@@ -3480,7 +3587,7 @@ fn strays(root: &Path, ports: &IndexMap<String, u16>, exempt: &commands::Exempt)
 
 /// Stop strays and `others` (more processes of this checkout, observed): see
 /// [`crate::stopping::stop`], with [`STOP_TIMEOUT`] before the kill.
-fn stop_strays(strays: &[Stray], others: &[crate::procinfo::Process], rescan: Option<&dyn Fn() -> Vec<crate::procinfo::Process>>) -> Vec<Value> {
+fn stop_strays(strays: &[Stray], others: &[crate::procinfo::Process], rescan: Option<&dyn Fn() -> Vec<crate::stopping::Found>>) -> Vec<Value> {
     crate::stopping::stop(strays, others, rescan, STOP_TIMEOUT)
 }
 
@@ -3494,8 +3601,30 @@ pub struct StatusReport {
     pub lease: LeaseSummary,
     /// The complete compiled configuration changed since the session started.
     pub stale: bool,
-    /// Every service verified and the session is current; `stack status` exits 1 otherwise.
+    /// Every service verified and the session is current. `stack status` exits 1 when this is
+    /// false and the checkout is `started`.
     pub healthy: bool,
+    /// Whether anything of this checkout is started or may still run: a session, a service
+    /// process the supervisor runs for it, a command Stack started for it still running, a
+    /// command registry that cannot be read, or anything in `found`. False only when all of
+    /// that was looked for and none is there (a checkout never started, or stopped by a
+    /// confirmed `down`): `healthy` is then false (no service was verified) unless the stack
+    /// declares no services, and `stack status` exits 0.
+    pub started: bool,
+    /// Without a session: that the last `down` was not confirmed (its marker), always; and, with
+    /// no registered command or service process the supervisor reports either, what the look
+    /// `down` relies on found of this checkout anyway (a process carrying its service
+    /// token or command mark, a service in its supervisor's record still running), or why that
+    /// look could not be made (a supervisor record that cannot be read, no checkout token). Any
+    /// entry makes the checkout `started`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub found: Vec<String>,
+    /// Without a session: what the supervisor record at this checkout's path still runs for
+    /// another checkout (another token: one moved away, or one that was here before this one).
+    /// It does not make this checkout `started`; `stack up` here stops it before starting this
+    /// checkout's services, and `stack down` here stops it too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub other_checkout: Vec<String>,
     /// Artifact coverage of the locked releases on this machine's platform. Read from
     /// stack.lock; nothing is fetched.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3556,7 +3685,31 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
         Ok(listed) => listed,
         Err(e) => (Vec::new(), Some(e.message)),
     };
+    // The cheap evidence first; only when it says nothing runs is that proven, with the look
+    // `down` relies on, before the checkout is called not started.
+    // The supervisor's record at this path names the checkout it ran for (its token). One of
+    // another checkout (moved away, or here before this one) makes nothing of this one started.
+    let record = if session.is_some() { Ok(None) } else { supervisor::read_state(&supervisor_dir(ctx)) };
+    let mine = crate::checkout::token(&ctx.root);
+    let foreign = match &record {
+        Ok(Some(state)) => state.token.is_some() && state.token != mine,
+        _ => false,
+    };
+    let cheap = session.is_some() || (!foreign && checks.iter().any(|c| c.pid.is_some())) || !commands.is_empty() || commands_error.is_some();
+    // Without a session, a `down` that did not confirm is always said (what it reported may
+    // still run, found by nothing else); the search runs only when nothing else says started.
+    let mut found: Vec<String> = if session.is_none() { unconfirmed_down(ctx).into_iter().collect() } else { Vec::new() };
+    if !cheap {
+        found.extend(still_running(ctx, &record, foreign));
+    }
+    let other_checkout = match &record {
+        Ok(Some(state)) if foreign => other_checkout(state),
+        _ => Vec::new(),
+    };
     Ok(StatusReport {
+        started: cheap || !found.is_empty(),
+        found,
+        other_checkout,
         commands,
         commands_error,
         init,
@@ -3568,6 +3721,77 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
         session,
         checks,
     })
+}
+
+/// What of the checkout at `ctx.root` may still run although no session, registered command or
+/// supervised service says so, by the evidence `down` confirms a stop with: every service in
+/// its supervisor's record (whatever the manifest calls its services now) and that supervisor,
+/// and every process carrying the checkout's service token or command mark. A record that
+/// cannot be read, or a token that cannot be computed, is reported too: then nothing is proven.
+/// Each process environment is read once (`down` searches again while it stops processes, which
+/// may start others; a status only reports).
+fn still_running(ctx: &Ctx, record: &Result<Option<supervisor::State>>, foreign: bool) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut seen: Vec<u32> = Vec::new();
+    let dir = supervisor_dir(ctx);
+    match record {
+        // Another checkout's (see `StatusReport::other_checkout`), not this one's.
+        Ok(Some(_)) if foreign => {}
+        Ok(Some(state)) => {
+            if let Some(p) = state.supervisor.as_ref().filter(|p| p.alive()) {
+                seen.push(p.pid);
+                found.push(format!("this checkout's supervisor (pid {}) still runs", p.pid));
+            }
+            for (service, instance) in &state.services {
+                if let Some(p) = instance.live() {
+                    seen.push(p.pid);
+                    found.push(format!("service {service} (pid {}) still runs under this checkout's supervisor", p.pid));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => found.push(format!("cannot tell what this checkout's supervisor runs: {}", e.message)),
+    }
+    if let Err(e) = supervisor::read_spec(&dir) {
+        found.push(format!("cannot tell what this checkout's supervisor was asked to run: {}", e.message));
+    }
+    let token = crate::checkout::token(&ctx.root);
+    let mark = crate::checkout::command_mark(&ctx.root);
+    let Some(token) = token else {
+        found.push("this directory's checkout token cannot be computed, so its processes cannot be looked for".into());
+        return found;
+    };
+    let mut keys = vec![(crate::checkout::TOKEN_VAR, token.as_str())];
+    if let Some(mark) = &mark {
+        keys.push((crate::checkout::COMMAND_VAR, mark.as_str()));
+    }
+    for p in crate::procinfo::carrying_any(&keys) {
+        if seen.contains(&p.pid) {
+            continue;
+        }
+        // The kernel's command name, never the process's own argv[0], which may carry anything.
+        let what = crate::procinfo::named(p.pid).map_or_else(String::new, |n| format!(" `{}`", n.comm));
+        found.push(format!("process {}{what} carries this checkout's environment (a service or a command it started); `stack down` stops or reports it", p.pid));
+    }
+    found
+}
+
+/// What the supervisor record at this checkout's path, written for another checkout (another
+/// token: a checkout moved away, or one that was here before), still runs.
+fn other_checkout(state: &supervisor::State) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(p) = state.supervisor.as_ref().filter(|p| p.alive()) {
+        lines.push(format!(
+            "the supervisor at this path (pid {}) runs for another checkout that was here (another directory, another token); `stack up` here stops what it runs before starting this checkout's services, and `stack down` here stops it",
+            p.pid
+        ));
+    }
+    for (service, instance) in &state.services {
+        if let Some(p) = instance.live() {
+            lines.push(format!("service {service} (pid {}) runs for that other checkout, not this one", p.pid));
+        }
+    }
+    lines
 }
 
 /// Whether the provider can be asked about this checkout. A fresh checkout (a committed
@@ -3585,6 +3809,23 @@ fn has_provider_config(ctx: &Ctx, report: &Report, launched: bool) -> Result<boo
     Ok(true)
 }
 
+/// The reason of a service no session launched, with the provider asked about it.
+const NO_LAUNCH_RECORD: &str = "no launch record; run `stack up`";
+/// The same, for a checkout whose provider configuration was never generated.
+const NO_LAUNCH_RECORD_HERE: &str = "no launch record in this checkout; run `stack up`";
+
+/// What the check of a service no session launched says beyond that (another program on its
+/// port, say), if anything: what `stack status` of a checkout that is not started still shows.
+pub fn beyond_not_launched(check: &Check) -> Option<&str> {
+    let reason = check.reason.as_deref()?;
+    if check.reason_code != Some(ReasonCode::NotLaunched) {
+        return Some(reason);
+    }
+    let rest = [NO_LAUNCH_RECORD, NO_LAUNCH_RECORD_HERE].iter().find_map(|base| reason.strip_prefix(base)).unwrap_or(reason);
+    let rest = rest.trim_start_matches("; ");
+    (!rest.is_empty()).then_some(rest)
+}
+
 fn not_launched(report: &Report) -> Vec<Check> {
     report
         .stack
@@ -3596,7 +3837,7 @@ fn not_launched(report: &Report) -> Vec<Check> {
             port: report.ports.get(service).copied(),
             pid: None,
             identity: None,
-            reason: Some("no launch record in this checkout; run `stack up`".into()),
+            reason: Some(NO_LAUNCH_RECORD_HERE.into()),
             reason_code: Some(ReasonCode::NotLaunched),
             withheld: Vec::new(),
             changed_since_start: Vec::new(),
@@ -5251,6 +5492,7 @@ fn recover_unreadable(ctx: &Ctx, copies: &[RecordCopy; 2], purge: bool) -> Resul
                 removed_unreadable: removed(),
                 recovery_checked: Some(TOOLS_ONLY_CHECKED.into()),
                 forgotten_unrecorded: 0,
+                warnings: Vec::new(),
             };
             if purge {
                 report.purge = Some(purge_locked(ctx)?);
@@ -5612,7 +5854,7 @@ fn verify_session(
 ) -> Vec<Check> {
     let mut checks = verify_all(&ctx.root, report, env, statuses, timings);
     let reason = match session {
-        None => Some((ReasonCode::NotLaunched, "no launch record; run `stack up`")),
+        None => Some((ReasonCode::NotLaunched, NO_LAUNCH_RECORD)),
         Some(s) if s.launching => Some((
             ReasonCode::LaunchIncomplete,
             "`stack up` did not finish verifying this launch (its error says why); run `stack up` to keep waiting, or `stack down`",
@@ -5856,7 +6098,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let rescan = || {
             calls.set(calls.get() + 1);
-            if calls.get() >= 2 { vec![observed.clone()] } else { Vec::new() }
+            if calls.get() >= 2 { vec![(observed.clone(), crate::stopping::Known::Itself)] } else { Vec::new() }
         };
         let started = Instant::now();
         let survivors = stop_strays(&[], &[], Some(&rescan));

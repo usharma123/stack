@@ -934,6 +934,7 @@ fn scan(state: &State, token: Option<&str>, exempt: &crate::commands::Exempt) ->
                     chain: vec![leader],
                     group: leads.then_some(group),
                     members: Vec::new(),
+                    unproven: Vec::new(),
                     signal: i.stop_signal,
                 });
             }
@@ -982,10 +983,10 @@ pub fn recover(dir: &Path, state: &State, token: Option<&str>) -> Vec<serde_json
         if exempt.blind.is_some() {
             return Vec::new();
         }
-        procinfo::carrying(crate::checkout::TOKEN_VAR, t).into_iter().filter(|p| owned(p, Some(t), earliest, &exempt)).collect::<Vec<_>>()
+        crate::stopping::independent(procinfo::carrying(crate::checkout::TOKEN_VAR, t).into_iter().filter(|p| owned(p, Some(t), earliest, &exempt)).collect())
     };
     let rescan_token = token.map(|t| move || rescan(t));
-    let rescan_ref: Option<&dyn Fn() -> Vec<procinfo::Process>> = rescan_token.as_ref().map(|r| r as &dyn Fn() -> Vec<procinfo::Process>);
+    let rescan_ref: Option<&dyn Fn() -> Vec<crate::stopping::Found>> = rescan_token.as_ref().map(|r| r as &dyn Fn() -> Vec<crate::stopping::Found>);
     // Once a leader is gone its group is looked at member by member, so a second pass stops
     // what stayed in a group whose leader exited during the first; a third finds nothing new.
     for _ in 0..3 {

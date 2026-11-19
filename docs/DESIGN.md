@@ -761,6 +761,25 @@ Choices that are easy to revisit by accident, and why they were made.
   revisit it if real projects hit it.
 - **Skills are linked by Stack, not `mise skills sync`**, which would also link Pitchfork's
   skill and teach agents to manage daemons around Stack.
+- **`status` of a checkout with nothing started exits 0.** Agents run `status` as their first
+  look at a worktree; exiting 1 there read as a failed command and cost a round trip. "Not
+  started" is proven with the evidence `down` confirms a stop with, never inferred from a missing
+  session: only when no session, supervised service process, registered command or unreadable
+  registry says otherwise, `status` reads the supervisor's record strictly (an unreadable one is
+  no proof) and searches every process once for the checkout's token and command mark. What it
+  finds is reported as `found` and makes the checkout `started`, so an unverified service exits 1
+  as before. The hot path (a session exists) does not search. A `down` that did not
+  confirm leaves a marker (time and error, no process identities) that only `status` reads: it
+  keeps a session-less checkout started until a `down` confirms, so `status` never contradicts
+  the last `down`. Identities were tried and dropped: they had `down` reason about processes it
+  can no longer show are the checkout's. A supervisor record at this path written for another token
+  is another checkout's: listed as `other_checkout`, never counted as this one's (`up` here stops
+  it first). The search is one pass and best effort, as `down`'s is. A confirmed `down` also leaves no
+  session, so it reads as never started: nothing of it runs, and reservations and data are
+  reported elsewhere (`ps`, `down --purge`). `healthy` stays false when services were declared
+  (nothing was verified); `started: false` and `passed: true` carry the difference, so `passed`
+  keeps matching the exit code. Asserting that services are up is `data.started and
+  data.healthy`, or `exec --require-all`/`--up`, not the bare exit code.
 - **Task caching is deferred.** Most tasks depend on services, and a cached `test` would replay
   results from a different database state. Only tasks with `services = []` could be cached.
 

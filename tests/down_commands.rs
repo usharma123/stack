@@ -129,18 +129,55 @@ impl Fixture {
     }
 }
 
+/// Set by the first SIGTERM a `listen` holder with `HOLD_WORKER` gets.
+static TERMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    TERMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+extern "C" fn leave_group(_: libc::c_int) {
+    // SAFETY: setpgid is async-signal-safe.
+    unsafe { libc::setpgid(0, 0) };
+}
+
+/// Block (or unblock) SIGTERM for the calling thread; async-signal-safe.
+fn block_term(how: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: a signal set on the stack, filled and passed to sigprocmask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        if libc::sigprocmask(how, &set, std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// The command these tests run through Stack. `HOLD_MODE`: `sleep` (default) writes its PID to
 /// `HOLD_PIDFILE` and sleeps `HOLD_SECS`; `group` and `session` start a copy of itself that does
 /// that, in a process group or a session of its own, and exit at once, as a command that
-/// daemonizes does.
+/// daemonizes does. `listen` holds `HOLD_PORT` too; with `HOLD_WORKER` (a mode) it starts, on its
+/// first SIGTERM, a worker of that mode in its own process group, without the checkout's token
+/// or mark, writing its PID to `HOLD_WORKER_PIDFILE`, then exits. `leave` (a worker mode) sleeps
+/// and leaves its process group on its first SIGTERM, staying alive. `group` and `session` start
+/// their copy in `HOLD_CHILD_MODE` (default `sleep`); `exec` writes its PID, waits for the file
+/// `HOLD_TRIGGER`, then replaces itself (same PID) with `/bin/sleep`, whose environment macOS
+/// hides.
 #[test]
 #[ignore = "a command for the other tests to run through `stack exec`"]
 fn holder() {
     use std::os::unix::process::CommandExt;
     let mode = std::env::var("HOLD_MODE").unwrap_or_default();
+    if mode == "leave" {
+        // SAFETY: installs a handler that only calls setpgid.
+        unsafe { libc::signal(libc::SIGTERM, leave_group as *const () as libc::sighandler_t) };
+    }
     if mode == "group" || mode == "session" {
+        let child_mode = std::env::var("HOLD_CHILD_MODE").unwrap_or_else(|_| "sleep".into());
         let mut child = Command::new(std::env::current_exe().unwrap());
-        child.args(["--exact", "holder", "--ignored", "--test-threads", "1"]).env("HOLD_MODE", "sleep").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        child.args(["--exact", "holder", "--ignored", "--test-threads", "1"]).env("HOLD_MODE", child_mode).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if mode == "group" {
             child.process_group(0);
         } else {
@@ -156,11 +193,57 @@ fn holder() {
     }
     // `listen`: hold `HOLD_PORT` open, as a service would.
     let _listener = (mode == "listen").then(|| std::net::TcpListener::bind(("127.0.0.1", std::env::var("HOLD_PORT").unwrap().parse::<u16>().unwrap())).unwrap());
+    let worker = std::env::var("HOLD_WORKER").ok().filter(|_| mode == "listen");
+    if worker.is_some() {
+        // SAFETY: installs a handler that only stores to an atomic.
+        unsafe { libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t) };
+    }
     let pidfile = std::env::var("HOLD_PIDFILE").unwrap();
     fs::write(format!("{pidfile}.tmp"), std::process::id().to_string()).unwrap();
     fs::rename(format!("{pidfile}.tmp"), &pidfile).unwrap();
+    // A worker started with SIGTERM blocked gets one sent meanwhile only now, with its handler set
+    // and its PID published.
+    block_term(libc::SIG_UNBLOCK).unwrap();
+    if mode == "exec" {
+        let trigger = std::env::var("HOLD_TRIGGER").unwrap();
+        while !Path::new(&trigger).exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let error = Command::new("/bin/sleep").arg("60").exec();
+        panic!("exec /bin/sleep: {error}");
+    }
     let secs = std::env::var("HOLD_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
-    thread::sleep(Duration::from_secs(secs));
+    let Some(worker) = worker else {
+        thread::sleep(Duration::from_secs(secs));
+        return;
+    };
+    let until = Instant::now() + Duration::from_secs(secs);
+    while !TERMED.load(std::sync::atomic::Ordering::SeqCst) {
+        if Instant::now() >= until {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let worker_file = std::env::var("HOLD_WORKER_PIDFILE").unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", "holder", "--ignored", "--test-threads", "1"])
+        .env("HOLD_MODE", worker)
+        .env("HOLD_SECS", "60")
+        .env("HOLD_PIDFILE", &worker_file)
+        .env_remove(stack::checkout::TOKEN_VAR)
+        .env_remove(stack::checkout::COMMAND_VAR)
+        .process_group(std::process::id() as i32)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: sigprocmask is async-signal-safe. Blocked, a SIGTERM sent before the worker set
+    // its handler waits for it.
+    unsafe { child.pre_exec(|| block_term(libc::SIG_BLOCK)) };
+    // Left running on purpose: it outlives this process.
+    #[allow(clippy::zombie_processes)]
+    child.spawn().unwrap();
+    pid_in(Path::new(&worker_file));
 }
 
 /// The PID written to `path`, waiting up to 10 seconds for it.
@@ -307,6 +390,10 @@ fn down_is_not_confirmed_while_an_exec_command_runs_and_never_signals_it() {
     let (_, status) = fixture.json(&["status"]);
     assert!(status["data"]["session"].is_null(), "{status}");
     naming(&status["data"]["commands"], holder);
+    // The registered command makes it started; the unconfirmed `down` is said all the same.
+    assert!(status["data"]["found"][0].as_str().unwrap_or_default().contains("the last `stack down` here"), "{status}");
+    let text = String::from_utf8_lossy(&fixture.command(&["status"]).output().unwrap().stdout).into_owned();
+    assert!(text.contains(&format!("pid {holder}")) && text.contains("found        the last `stack down` here"), "{text}");
     let (code, again) = fixture.json(&["down"]);
     assert_unconfirmed(code, &again);
     assert!(alive(holder) && reaper.running(exec), "down signalled the command");
@@ -346,6 +433,43 @@ fn a_command_in_a_checkout_without_a_session_keeps_down_purge_unconfirmed() {
     assert_confirmed(code, &down);
 }
 
+/// A checkout with no session is "not started" (`status` exits 0) only while nothing Stack
+/// started for it runs: a registered command still running makes it `started`, and with a
+/// service that is not verified that is unhealthy (exit 1), as before. Once the command ends,
+/// it is not started again.
+#[test]
+fn a_command_running_without_a_session_is_not_reported_as_not_started() {
+    let reaper = Reaper::default();
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let (code, status) = fixture.json(&["status"]);
+    assert_eq!((code, &status["data"]["started"], &status["passed"]), (Some(0), &json!(false), &json!(true)), "{status}");
+    let pidfile = fixture.path("holder.pid");
+    let exec = reaper.child(fixture.hold("sleep", 60, &pidfile));
+    let holder = reaper.pid(pid_in(&pidfile));
+
+    // Registered before it was spawned, the command counts whether or not its PID is recorded
+    // yet (until then it is listed as starting).
+    let (code, status) = fixture.json(&["status"]);
+    assert!(status["data"]["session"].is_null(), "{status}");
+    assert_eq!(status["data"]["commands"].as_array().map(Vec::len), Some(1), "{status}");
+    assert_eq!((code, &status["data"]["started"], &status["data"]["healthy"], &status["passed"]), (Some(1), &json!(true), &json!(false), &json!(false)), "{status}");
+    let out = fixture.command(&["status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(!text.contains("not started") && text.contains("NOT READY") && text.contains("command"), "{text}");
+    // Once the registry records its PID, it is named by it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fixture.json(&["status"]).1["data"]["commands"][0]["pid"] != holder {
+        assert!(Instant::now() < deadline, "the registry never recorded pid {holder}");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    end(holder);
+    reaper.wait(exec);
+    let out = fixture.command(&["status"]).output().unwrap();
+    assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned()), (Some(0), "not started; run `stack up`\n".to_string()));
+}
+
 /// What a command started and left running when it exited (a child in a process group or a
 /// session of its own) carries the checkout's command mark: `down` finds it by that.
 #[test]
@@ -368,6 +492,63 @@ fn a_detached_child_in_its_own_group_or_session_keeps_down_unconfirmed() {
         let (code, down) = fixture.json(&["down"]);
         assert_confirmed(code, &down);
     }
+}
+
+/// A helper a `stack exec` command left running in a group of its own, once that command ended:
+/// nothing registered or supervised names it, but it carries the checkout's command mark. While
+/// it runs, `down` is not confirmed and `status` is not "not started": it is `started`, exits 1
+/// (a service is not verified) and names the helper; once it is gone, the checkout is not
+/// started.
+#[test]
+fn status_is_not_not_started_while_a_detached_helper_of_a_command_runs() {
+    let reaper = Reaper::default();
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let pidfile = fixture.path("holder.pid");
+    let exec = reaper.child(fixture.hold("group", 60, &pidfile));
+    assert_eq!(reaper.wait(exec), Some(0));
+    let child = reaper.pid(pid_in(&pidfile));
+    let (code, down) = fixture.json(&["down"]);
+    assert_unconfirmed(code, &down);
+    naming(&down["error"]["details"], child);
+
+    let (code, status) = fixture.json(&["status"]);
+    assert_eq!(status["data"]["commands"], json!([]), "{status}");
+    assert_eq!((code, &status["data"]["started"], &status["passed"]), (Some(1), &json!(true), &json!(false)), "{status}");
+    assert!(status["data"]["found"].to_string().contains(&format!("process {child} ")), "{status}");
+    let out = fixture.command(&["status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.starts_with("no session") && text.contains(&format!("found        process {child} ")), "{text}");
+
+    end(child);
+    // Gone, but no `down` has confirmed that yet.
+    assert_marked_unconfirmed(&fixture);
+    assert_confirmed_then_not_started(&fixture);
+}
+
+/// A `down` that is not confirmed and cannot record that (where its marker's directory belongs
+/// is a regular file, which no privilege writes into) still fails, and says that `status` may
+/// not show it.
+#[test]
+fn an_unconfirmed_down_that_cannot_be_recorded_says_so() {
+    let reaper = Reaper::default();
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let pidfile = fixture.path("holder.pid");
+    let exec = reaper.child(fixture.hold("group", 60, &pidfile));
+    assert_eq!(reaper.wait(exec), Some(0));
+    let child = reaper.pid(pid_in(&pidfile));
+    let markers = fixture.path("state/unconfirmed");
+    fs::create_dir_all(markers.parent().unwrap()).unwrap();
+    fs::write(&markers, "not a directory").unwrap();
+    let (code, down) = fixture.json(&["down"]);
+    assert_unconfirmed(code, &down);
+    naming(&down["error"]["details"], child);
+    assert!(down["error"]["message"].as_str().unwrap().contains("could not be recorded, so `stack status` may not show it"), "{down}");
+    assert!(down["error"]["details"].as_array().unwrap().iter().any(|d| d["kind"] == "marker" && d["error"].is_string()), "{down}");
+    assert_eq!(fs::read_to_string(&markers).unwrap(), "not a directory", "nothing was written");
+    fs::remove_file(&markers).unwrap();
+    end(child);
+    assert_confirmed_then_not_started(&fixture);
 }
 
 /// A `stack exec` started with the checkout's service token in its environment, as a service
@@ -696,6 +877,162 @@ fn a_leftover_group_holding_another_checkouts_command_is_not_signalled_as_a_grou
     assert!(reaper.running(exec) && alive(held), "another checkout's command in that group was signalled");
     end(held);
     reaper.wait(exec);
+}
+
+/// A leftover of this checkout's service (its token, its port, leading its group) shares its
+/// group with another checkout's registered `stack exec`, so the group is stopped member by
+/// member, and starts a worker (no token, no mark) in that group on its first stop signal, then
+/// exits. A worker that stays in the group is stopped; one that leaves the group on its own first
+/// signal is no longer known to be the checkout's: it is left running and `down` is not
+/// confirmed. The other checkout's command survives both.
+#[test]
+fn a_late_worker_of_a_mixed_group_is_stopped_only_while_it_stays_in_the_group() {
+    use std::os::unix::process::CommandExt;
+    for worker_mode in ["sleep", "leave"] {
+        let reaper = Reaper::default();
+        let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+        let other = fixture.add_project("other");
+        let (_, inspect) = fixture.json(&["inspect"]);
+        let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+        let token = stack::checkout::token(&fixture.path("app")).unwrap();
+        let holder = std::env::current_exe().unwrap();
+        let (leftover_file, worker_file) = (fixture.path("leftover.pid"), fixture.path("worker.pid"));
+        let leftover = reaper.child(
+            Command::new(&holder)
+                .args(["--exact", "holder", "--ignored", "--test-threads", "1"])
+                .env("HOLD_MODE", "listen")
+                .env("HOLD_PORT", port.to_string())
+                .env("HOLD_PIDFILE", &leftover_file)
+                .env("HOLD_SECS", "60")
+                .env("HOLD_WORKER", worker_mode)
+                .env("HOLD_WORKER_PIDFILE", &worker_file)
+                .env(stack::checkout::TOKEN_VAR, &token)
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        pid_in(&leftover_file);
+        let pidfile = fixture.path("other.pid");
+        let exec = {
+            let mut command = fixture.command_at(&other, &["exec", "--", holder.to_str().unwrap(), "--exact", "holder", "--ignored", "--test-threads", "1"]);
+            command.env("HOLD_SECS", "60").env("HOLD_PIDFILE", &pidfile).process_group(leftover as i32).stdout(Stdio::null()).stderr(Stdio::null());
+            reaper.child(command.spawn().unwrap())
+        };
+        let held = reaper.pid(pid_in(&pidfile));
+        let (code, down) = fixture.json(&["down"]);
+        let worker = reaper.pid(pid_in(&worker_file));
+        assert_eq!(reaper.wait(leftover), Some(0), "{worker_mode}: the leftover exits on its own once its worker runs");
+        if worker_mode == "sleep" {
+            assert_confirmed(code, &down);
+            assert!(!alive(worker), "the worker that stayed in the group was not stopped");
+        } else {
+            assert_unconfirmed(code, &down);
+            let detail = naming(&down["error"]["details"], worker);
+            assert!(detail["unrecorded"] == true && detail["unproven"] == true, "{down}");
+            assert!(detail["reason"].as_str().unwrap().contains("can no longer be shown to belong to this checkout"), "{down}");
+            assert!(down["error"]["message"].as_str().unwrap().contains("could not be shown to belong to it"), "{down}");
+            assert!(down["error"]["hint"].as_str().unwrap().contains("check what it is before stopping it"), "{down}");
+            assert!(alive(worker), "the worker that left the group was signalled");
+            assert_ne!(stack::procinfo::process(worker).unwrap().group, leftover, "it left the group");
+            // Nothing else shows it now, but `down` was not confirmed: `status` says so until a
+            // `down` confirms.
+            assert_marked_unconfirmed(&fixture);
+            end(worker);
+            assert_confirmed_then_not_started(&fixture);
+        }
+        assert!(reaper.running(exec) && alive(held), "{worker_mode}: another checkout's command in that group was signalled");
+        end(held);
+        reaper.wait(exec);
+    }
+}
+
+/// After a `down` that was not confirmed: `status` (no session) is started, exits 1 (a service is
+/// not verified) and says the last `down` was not confirmed.
+fn assert_marked_unconfirmed(fixture: &Fixture) {
+    let (code, status) = fixture.json(&["status"]);
+    assert_eq!((code, &status["data"]["started"], &status["passed"]), (Some(1), &json!(true), &json!(false)), "{status}");
+    let found = status["data"]["found"].to_string();
+    assert!(found.contains("the last `stack down` here") && found.contains("was not confirmed") && found.contains("run `stack down` again"), "{status}");
+    let out = fixture.command(&["status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.starts_with("no session") && text.contains("found        the last `stack down` here"), "{text}");
+}
+
+/// Once a `down` confirms: not started.
+fn assert_confirmed_then_not_started(fixture: &Fixture) {
+    let (code, down) = fixture.json(&["down"]);
+    assert_confirmed(code, &down);
+    let (code, status) = fixture.json(&["status"]);
+    assert_eq!((code, &status["data"]["started"], status["data"].get("found")), (Some(0), &json!(false), None), "{status}");
+}
+
+/// A `down` that confirms (and purges) but cannot remove an earlier unconfirmed `down`'s marker
+/// (here a directory stands where it is) still returns its confirmed result, purge included,
+/// with a warning naming the marker; `status` keeps saying the last `down` was unconfirmed until
+/// the marker is gone.
+#[test]
+fn a_marker_that_cannot_be_removed_does_not_hide_a_confirmed_purge() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let identity = stack::checkout::identity(&fixture.path("app")).unwrap();
+    let marker = fixture.path("state/unconfirmed").join(format!("{identity}.json"));
+    fs::create_dir_all(marker.join("held")).unwrap();
+    let (code, down) = fixture.json(&["down", "--purge"]);
+    assert_confirmed(code, &down);
+    assert!(down["data"]["purge"].is_object(), "{down}");
+    let warning = down["data"]["warnings"][0].as_str().unwrap_or_else(|| panic!("{down}"));
+    assert!(warning.contains(&marker.display().to_string()) && warning.contains("could not be removed"), "{warning}");
+    let out = fixture.command(&["down"]).output().unwrap();
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stderr).contains("warning: the marker of an earlier unconfirmed"), "{out:?}");
+    let (code, status) = fixture.json(&["status"]);
+    assert_eq!((code, &status["data"]["started"]), (Some(1), &json!(true)), "{status}");
+    assert!(status["data"]["found"][0].as_str().unwrap().contains("cannot tell whether the last `stack down` here was confirmed"), "{status}");
+    fs::remove_dir_all(&marker).unwrap();
+    let (code, status) = fixture.json(&["status"]);
+    assert_eq!((code, &status["data"]["started"]), (Some(0), &json!(false)), "{status}");
+}
+
+/// A detached child of a `stack exec` command, which `down` reported (found by its command
+/// mark), then replaced itself with `/bin/sleep` under the same PID: on macOS its environment is
+/// hidden from then on, so no search finds it (elsewhere the search still may). Either way the
+/// unconfirmed `down` keeps `status` started until a `down` confirms.
+#[test]
+fn status_stays_started_after_an_unconfirmed_down_whose_process_hid_its_environment() {
+    let reaper = Reaper::default();
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let (pidfile, trigger) = (fixture.path("holder.pid"), fixture.path("trigger"));
+    let holder = std::env::current_exe().unwrap();
+    let exec = reaper.child(
+        fixture
+            .command(&["exec", "--", holder.to_str().unwrap(), "--exact", "holder", "--ignored", "--test-threads", "1"])
+            .env("HOLD_MODE", "group")
+            .env("HOLD_CHILD_MODE", "exec")
+            .env("HOLD_TRIGGER", &trigger)
+            .env("HOLD_PIDFILE", &pidfile)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(reaper.wait(exec), Some(0));
+    let child = reaper.pid(pid_in(&pidfile));
+    let (code, down) = fixture.json(&["down"]);
+    assert_unconfirmed(code, &down);
+    assert_eq!(naming(&down["error"]["details"], child)["found_by"], "mark", "{down}");
+    fs::write(&trigger, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stack::procinfo::named(child).map(|n| n.comm) != Some("sleep".into()) {
+        assert!(Instant::now() < deadline, "{child} never became /bin/sleep");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mark = stack::checkout::command_mark(&fixture.path("app")).unwrap();
+    if stack::procinfo::environ_has(child, stack::checkout::COMMAND_VAR, &mark) == Some(true) {
+        eprintln!("note: this machine shows /bin/sleep's environment; the search finds it too");
+    }
+    assert_marked_unconfirmed(&fixture);
+    end(child);
+    assert_confirmed_then_not_started(&fixture);
 }
 
 /// Another checkout's registered command (and the Stack process running it) inherited this

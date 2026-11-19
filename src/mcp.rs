@@ -251,8 +251,8 @@ fn output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "ok": { "type": "boolean", "description": "Whether Stack did what was asked (for stack_exec and stack_run, check data.exit_code too; for stack_status, data.healthy)" },
-            "passed": { "type": "boolean", "description": "Whether what was asked for is in the wanted state: false when ok is false, when stack_exec or stack_run exited non-zero or by a signal, and when stack_status finds a service unhealthy" },
+            "ok": { "type": "boolean", "description": "Whether Stack did what was asked (for stack_exec and stack_run, check data.exit_code too; for stack_status, data.healthy and data.started)" },
+            "passed": { "type": "boolean", "description": "Whether what was asked for is in the wanted state: false when ok is false, when stack_exec or stack_run exited non-zero or by a signal, and when stack_status finds a service unhealthy in a started checkout (data.started false, nothing of the checkout started, passes)" },
             "command": { "type": "string", "description": "The operation that answered: the tool's name without stack_" },
             "stack_version": { "type": "string", "description": "The Stack release that answered" },
             "schema": { "type": "integer", "description": "Version of the envelope and result shapes; raised only on an incompatible change" },
@@ -375,7 +375,7 @@ fn tool_definitions() -> Value {
             "Return the environment stack_exec would give a command now. Use it to see which variables a command gets, or to hand them to a tool Stack cannot wrap; prefer stack_exec, which verifies on every call. Returns {env, unset, withheld, skipped}: withheld lists each unverified service and the variables removed for it; MISE_* variables are skipped.",
             schema(json!({}), &[])),
         tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
-            "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service that is down still gives ok: true, with data.healthy false and data.checks saying why. changed_since_start lists edited `watch` files; nothing reloads them, so call stack_restart. data.commands: commands Stack started here, still running.",
+            "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service down gives ok: true, data.healthy false and data.checks saying why; data.started false: nothing here is started. changed_since_start lists edited `watch` files; nothing reloads them, so call stack_restart. data.commands: commands Stack started here, still running.",
             schema(json!({}), &[])),
         tool("stack_exec", "Run a command", annotations("Run a command", false, None, false, true),
             "Run one command, an argv list without a shell, with the stack's tools and env, capturing its output. Use it for anything that is not a stack.toml task; for shell syntax pass [\"sh\", \"-c\", \"...\"]. Endpoints of unverified services are withheld; require or require_all refuse to run instead. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",

@@ -97,11 +97,13 @@ impl Call {
 }
 
 /// Whether what was asked for is in the wanted state: a command that ran exited 0, a check
-/// found everything healthy. Everything else that succeeded passed.
+/// found everything healthy or nothing started (`started: false`, a checkout never started or
+/// stopped by a confirmed `down`). Everything else that succeeded passed. Matches the CLI's exit
+/// code: 0 exactly when this is true.
 pub fn passed(command: &str, data: &Value) -> bool {
     match command {
         "exec" | "run" => data["exit_code"] == 0,
-        "status" => data["healthy"] == true,
+        "status" => data["healthy"] == true || data["started"] == false,
         _ => true,
     }
 }
@@ -143,5 +145,13 @@ mod tests {
         assert_eq!(failed["error"]["next"][0]["command"], json!(["stack", "-C", "/p", "up"]));
         assert_eq!(failed["error"]["retryable"], false);
         assert_eq!(Call::new("down").success(json!({}))["passed"], true);
+    }
+
+    #[test]
+    fn a_status_of_nothing_started_passes_and_one_started_and_unhealthy_does_not() {
+        let call = Call::new("status");
+        assert_eq!(call.success(json!({ "healthy": false, "started": false }))["passed"], true);
+        assert_eq!(call.success(json!({ "healthy": false, "started": true }))["passed"], false);
+        assert_eq!(call.success(json!({ "healthy": true, "started": true }))["passed"], true);
     }
 }
