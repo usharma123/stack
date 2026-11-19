@@ -1,0 +1,13 @@
+{
+  "commits": [
+    "0b72a83bf7db7eddd4c502444b8b7c60e739f796 Make customer reuse test rerunnable",
+    "434699365c3730655e550258054a596856bf74fa Move customer names into a customers table"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_create_customers"
+  ]
+}
