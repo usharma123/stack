@@ -446,6 +446,300 @@ def customer_table():
     check('migration_rerun_safe', migrations_sound)
 
 
-TASKS = {'invoice-notes': invoice_notes, 'pay-receipts': pay_receipts, 'customer-table': customer_table}
+# ---------------------------------------------------------------- invoice-list
+
+def rows_as_items(where='TRUE', args=()):
+    """The invoices the listing should return, straight from the database, ascending by id."""
+    return [{'id': i, 'customer': c, 'cents': n, 'status': s}
+            for i, c, n, s in sql(f'SELECT id, customer, cents, status FROM invoices WHERE {where} ORDER BY id', args)]
+
+
+def listing(query=''):
+    """GET /invoices?<query> -> (status, items or None, next, raw body)."""
+    status, body = call('GET', '/invoices' + (f'?{query}' if query else ''))
+    if status != 200 or not isinstance(body, dict) or not isinstance(body.get('invoices'), list) or 'next' not in body:
+        return status, None, None, body
+    return status, body['invoices'], body['next'], body
+
+
+def same_page(query, expected, expected_next=None):
+    status, items, nxt, body = listing(query)
+    ok = items == expected and nxt == expected_next and (nxt is None or isinstance(nxt, int))
+    if not ok:
+        print(f'GET /invoices?{query}: {status} items={[i.get("id") for i in items or [] if isinstance(i, dict)]} next={nxt!r}; '
+              f'expected {[e["id"] for e in expected]} next={expected_next!r}', file=sys.stderr)
+    return ok
+
+
+def walk(query, limit):
+    """Follow `next` from the start; returns (ids in order, pages, every page within the limit and
+    every non-final next equal to its page's last id), or None when a page is malformed."""
+    ids, pages, after, consistent = [], 0, None, True
+    while pages < 200:
+        q = '&'.join(p for p in [query, f'limit={limit}', f'after={after}' if after is not None else ''] if p)
+        status, items, nxt, _ = listing(q)
+        if items is None:
+            print(f'walk {q}: status {status}', file=sys.stderr)
+            return None
+        pages += 1
+        ids += [item.get('id') for item in items]
+        if len(items) > limit:
+            consistent = False
+        if nxt is None:
+            return ids, pages, consistent
+        if not items or nxt != items[-1].get('id'):
+            consistent = False
+            return ids, pages, consistent
+        after = nxt
+    return ids, pages, False
+
+
+BULK = list(range(200, 225))  # 25 rows the grader adds through SQL before any listing call
+
+
+def invoice_list():
+    check('existing_preserved', existing_preserved)
+    check('existing_api_intact', existing_api_intact)
+    # More rows than one default page, added before the listing is first called and with Redis
+    # emptied, so nothing the API could have cached predates them. Statuses are mixed.
+    with psycopg.connect(DB) as conn:
+        for i in BULK:
+            conn.execute('INSERT INTO invoices (id, customer, cents, status) VALUES (%s, %s, %s, %s)',
+                         (i, 'Bulk Ltd' if i % 3 else 'Umbrella', i, 'paid' if i % 6 == 0 else 'open'))
+    R.flushdb()
+
+    def all_ascending():
+        expected = rows_as_items()
+        if not same_page('limit=100', expected):
+            return False
+        # Every item carries exactly the fields GET /invoices/<id> returns, with the same values.
+        for item in expected[:4] + expected[-2:]:
+            status, single = call('GET', f"/invoices/{item['id']}")
+            if status != 200 or set(single) != set(item) or single != item:
+                print(f'GET /invoices/{item["id"]} = {single} vs listed {item}', file=sys.stderr)
+                return False
+        return True
+    check('list_all_ascending', all_ascending)
+
+    def default_limit():
+        expected = rows_as_items()
+        return len(expected) > 20 and same_page('', expected[:20], expected[19]['id'])
+    check('default_limit_20', default_limit)
+
+    def filter_status():
+        return same_page('status=open&limit=100', rows_as_items("status = 'open'")) and \
+            same_page('status=paid&limit=100', rows_as_items("status = 'paid'"))
+    check('filter_status', filter_status)
+
+    def filter_customer():
+        from urllib.parse import quote
+        return (same_page('customer=Umbrella&limit=100', rows_as_items("customer = 'Umbrella'"))
+                and same_page(f"customer={quote('Ünïcode GmbH')}&limit=100", rows_as_items("customer = %s", ('Ünïcode GmbH',)))
+                and same_page(f"customer={quote('Acme Corp')}&limit=100", rows_as_items("customer = 'Acme Corp'"))
+                and same_page('customer=Acme&limit=100', [])          # exact match, not a prefix
+                and same_page('customer=umbrella&limit=100', [])      # exact match, not case-folded
+                and same_page('customer=Nobody%20Inc', []))
+    check('filter_customer', filter_customer)
+
+    def combined():
+        return (same_page('status=open&customer=Umbrella&limit=100', rows_as_items("status = 'open' AND customer = 'Umbrella'"))
+                and same_page('status=paid&customer=Umbrella&limit=100', rows_as_items("status = 'paid' AND customer = 'Umbrella'"))
+                and same_page('customer=Umbrella&status=paid&after=42&limit=100',
+                              rows_as_items("status = 'paid' AND customer = 'Umbrella' AND id > 42"))
+                and same_page('status=paid&customer=Zo%C3%AB%20Caf%C3%A9', []))
+    check('filters_combined', combined)
+
+    def after_filter():
+        return (same_page('after=41&limit=100', rows_as_items('id > 41'))
+                and same_page('after=0&limit=100', rows_as_items())
+                and same_page('after=100000&limit=100', [])
+                and same_page('after=3&limit=3', rows_as_items('id > 3')[:3], rows_as_items('id > 3')[2]['id']))
+    check('after_filter', after_filter)
+
+    def paging():
+        for query, limit in [('', 2), ('', 5), ('', 7), ('status=open', 3), ('customer=Umbrella', 2)]:
+            where = {'': 'TRUE', 'status=open': "status = 'open'", 'customer=Umbrella': "customer = 'Umbrella'"}[query]
+            expected = [r['id'] for r in rows_as_items(where)]
+            got = walk(query, limit)
+            if got is None or got[0] != expected or not got[2] or len(set(got[0])) != len(got[0]):
+                print(f'walk {query!r} limit={limit}: {got} vs {expected}', file=sys.stderr)
+                return False
+        return True
+    check('paging_walk', paging)
+
+    def full_last_page():
+        # The last page holds exactly `limit` items: nothing lies beyond it, so next is null.
+        total = rows_as_items()
+        paid = rows_as_items("status = 'paid'")
+        umbrella = rows_as_items("customer = 'Umbrella'")
+        checks_ = [same_page(f'limit={len(total)}', total),
+                   same_page(f'status=paid&limit={len(paid)}', paid),
+                   same_page(f"customer=Umbrella&after={umbrella[-3]['id']}&limit=2", umbrella[-2:])]
+        for query, limit in [('', 4), ('status=paid', 2)]:
+            where = 'TRUE' if not query else "status = 'paid'"
+            expected = [r['id'] for r in rows_as_items(where)]
+            if len(expected) % limit:
+                print(f'grader data: {len(expected)} rows do not fill pages of {limit}', file=sys.stderr)
+                return False
+            got = walk(query, limit)
+            checks_.append(got is not None and got[0] == expected and got[1] == len(expected) // limit)
+        return all(checks_)
+    check('next_null_on_full_last_page', full_last_page)
+
+    def bad_params():
+        bad = ['status=void', 'status=closed', 'limit=0', 'limit=101', 'limit=abc', 'limit=1.5', 'limit=-1',
+               'limit=2x', 'after=-1', 'after=abc', 'after=1.5', 'after=x1']
+        codes = {q: call('GET', f'/invoices?{q}')[0] for q in bad}
+        good = {q: call('GET', f'/invoices?{q}')[0] for q in ['limit=1', 'limit=100', 'after=0', 'status=open', 'status=paid']}
+        if any(c != 400 for c in codes.values()) or any(c != 200 for c in good.values()):
+            print(f'bad parameters: {codes}; good parameters: {good}', file=sys.stderr)
+            return False
+        return True
+    check('bad_params_400', bad_params)
+
+    def status_index():
+        # An index on invoices, other than the primary key, whose key columns include status, not partial.
+        found = sql("SELECT x.indexrelid::regclass::text FROM pg_index x "
+                    "WHERE x.indrelid = 'invoices'::regclass AND NOT x.indisprimary AND x.indpred IS NULL AND x.indisvalid "
+                    "AND EXISTS (SELECT 1 FROM generate_series(1, x.indnkeyatts) k "
+                    "WHERE pg_get_indexdef(x.indexrelid, k, true) IN ('status', '\"status\"'))")
+        if not found:
+            defs = sql("SELECT indexdef FROM pg_indexes WHERE tablename = 'invoices'")
+            print(f'indexes on invoices: {defs}', file=sys.stderr)
+        return bool(found)
+    check('status_index', status_index)
+
+    def post_appears():
+        status, body = call('POST', '/invoices', {'customer': 'Initrode', 'cents': 5})
+        if status != 201:
+            return False
+        new_id = int(body['id'])
+        new = {'id': new_id, 'customer': 'Initrode', 'cents': 5, 'status': 'open'}
+        after = rows_as_items(f'id > {new_id - 1}')
+        return (new in rows_as_items() and same_page('customer=Initrode', [new])
+                and same_page(f'after={new_id - 1}&limit=1', after[:1], new_id if len(after) > 1 else None)
+                and same_page('limit=100', rows_as_items()))
+    check('post_appears_in_list', post_appears)
+    check('migration_rerun_safe', migrations_sound)
+
+
+# ---------------------------------------------------------------- void-invoices
+
+def stored(ident):
+    rows = sql('SELECT customer, cents, status FROM invoices WHERE id = %s', (ident,))
+    return rows[0] if rows else None
+
+
+def void_invoices():
+    check('existing_preserved', existing_preserved)
+    check('existing_api_intact', existing_api_intact)
+    state = {}
+
+    def void_open():
+        call('GET', '/invoices/42')  # warm the cache
+        status, body = call('POST', '/invoices/42/void')
+        state['voided'] = status is not None and 200 <= status < 300 and stored(42) == ('Umbrella', 300, 'void')
+        if not state['voided']:
+            print(f'void 42: {status} {body}; stored {stored(42)}', file=sys.stderr)
+        return state['voided'] and isinstance(body, dict) and body.get('id') == 42 and body.get('status') == 'void' \
+            and body.get('cents') == 300 and body.get('customer') == 'Umbrella'
+    check('void_open', void_open)
+
+    def cache_after_void():
+        body = call('GET', '/invoices/42')[1] or {}
+        if not (state.get('voided') and body.get('status') == 'void' and body.get('cents') == 300):
+            print(f'GET after void: {body}', file=sys.stderr)
+            return False
+        # The read path must still use the cache: a change made behind the API's back must not show.
+        with psycopg.connect(DB) as conn:
+            conn.execute('UPDATE invoices SET cents = 4242 WHERE id = 42')
+        try:
+            hit = call('GET', '/invoices/42')[1] or {}
+        finally:
+            with psycopg.connect(DB) as conn:
+                conn.execute('UPDATE invoices SET cents = 300 WHERE id = 42')
+        if hit.get('cents') != 300 or hit.get('status') != 'void':
+            print(f'GET after a database-only change returned {hit}: the read did not come from the cache', file=sys.stderr)
+            return False
+        return True
+    check('cache_after_void', cache_after_void)
+
+    def void_paid():
+        before = sql('SELECT invoice_id, cents FROM receipts ORDER BY id')
+        results = []
+        for ident, row in [(43, ('Umbrella', 450, 'paid')), (2, ('Globex', 5000, 'paid'))]:
+            call('GET', f'/invoices/{ident}')  # cached first: the answer must not depend on the cache
+            status, _ = call('POST', f'/invoices/{ident}/void')
+            results.append((status, stored(ident), call('GET', f'/invoices/{ident}')[1].get('status')))
+            if status != 409 or stored(ident) != row:
+                print(f'void paid {ident}: {status}, stored {stored(ident)}', file=sys.stderr)
+                return False
+        return all(r[2] == 'paid' for r in results) and sql('SELECT invoice_id, cents FROM receipts ORDER BY id') == before
+    check('void_paid_409', void_paid)
+
+    def void_twice():
+        if not state.get('voided'):
+            return False
+        status, _ = call('POST', '/invoices/42/void')
+        return status == 409 and stored(42) == ('Umbrella', 300, 'void')
+    check('void_twice_409', void_twice)
+
+    def void_unknown():
+        count = sql('SELECT count(*), max(id) FROM invoices')[0]
+        status, _ = call('POST', '/invoices/999999/void')
+        return status == 404 and sql('SELECT count(*), max(id) FROM invoices')[0] == count
+    check('void_unknown_404', void_unknown)
+
+    def patch_void():
+        if not state.get('voided'):
+            return False
+        results = [call('PATCH', '/invoices/42', body)[0] for body in ({'cents': 1}, {'customer': 'Someone Else'})]
+        if results != [409, 409] or stored(42) != ('Umbrella', 300, 'void'):
+            print(f'PATCH on a void invoice: {results}, stored {stored(42)}', file=sys.stderr)
+            return False
+        # An open invoice can still be patched.
+        status, _ = call('PATCH', '/invoices/41', {'cents': 9900})
+        return status == 200
+    check('patch_void_409', patch_void)
+
+    def constraint():
+        # Tried inside transactions that are rolled back, so nothing the checks write survives.
+        def attempt(statement, args):
+            with psycopg.connect(DB) as conn:
+                try:
+                    with conn.transaction():
+                        conn.execute(statement, args)
+                        raise RuntimeError('rollback')
+                except RuntimeError:
+                    return 'accepted'
+                except (psycopg.errors.IntegrityError, psycopg.errors.DataError):
+                    return 'rejected'   # a check constraint, an enum or a reference all reject
+                except psycopg.Error as error:
+                    return type(error).__name__
+        results = {
+            'update_void': attempt("UPDATE invoices SET status = 'void' WHERE id = %s", (44,)),
+            'update_bogus': attempt("UPDATE invoices SET status = 'bogus' WHERE id = %s", (44,)),
+            'update_cancelled': attempt("UPDATE invoices SET status = 'cancelled' WHERE id = %s", (41,)),
+            'insert_void': attempt("INSERT INTO invoices (customer, cents, status) VALUES (%s, 1, 'void')", ('Check',)),
+            'insert_closed': attempt("INSERT INTO invoices (customer, cents, status) VALUES (%s, 1, 'closed')", ('Check',)),
+            'insert_paid': attempt("INSERT INTO invoices (customer, cents, status) VALUES (%s, 1, 'paid')", ('Check',)),
+        }
+        expected = {'update_void': 'accepted', 'update_bogus': 'rejected', 'update_cancelled': 'rejected',
+                    'insert_void': 'accepted', 'insert_closed': 'rejected', 'insert_paid': 'accepted'}
+        if results != expected:
+            print(f'status constraint: {results}', file=sys.stderr)
+        return results == expected and stored(44)[2] == 'open' and not sql("SELECT 1 FROM invoices WHERE customer = 'Check'")
+    check('constraint_allows_void_only', constraint)
+
+    def other_untouched():
+        body41 = call('GET', '/invoices/41')[1] or {}
+        return stored(41) == ('Ünïcode GmbH', 9900, 'open') and body41.get('status') == 'open' \
+            and stored(44)[0::2] == ('Acme Corp', 'open') and stored(1) == ('Acme Corp', 1200, 'open')
+    check('other_invoice_untouched', other_untouched)
+    check('migration_rerun_safe', migrations_sound)
+
+
+TASKS = {'invoice-notes': invoice_notes, 'pay-receipts': pay_receipts, 'customer-table': customer_table,
+         'invoice-list': invoice_list, 'void-invoices': void_invoices}
 TASKS[sys.argv[1]]()
 print(json.dumps(checks))

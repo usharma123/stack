@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Stack agent-value benchmark: several agents at once, one worktree each, one repository.
 
-  plan      fix the configuration and the arm order of every pair before any trial runs
+  plan      fix the configuration, scenario, victim and arm order of every pair before any trial runs
   pair      run one planned pair end to end: both arms, in the planned order
-  arm       run one arm of a plan (used by `pair`; also for harness self-tests)
-  validate  check the harness itself: grader, reference runs in both arms, planted faults
-  report    summarize every planned run from its retained records (see report.py)
+  arm       run one arm of a self-test plan (harness self-tests and validation only)
 
-See ../PROTOCOL.md for what is measured and how each measure is detected.
+Validation is `validate.py`, the report `report.py`. See ../PROTOCOL.md for what is measured and
+how each measure is detected; this file implements protocol version 2 (five agents, fault
+injection, the teardown procedure). Version 1 records stay readable by report.py.
 """
 import argparse
 import hashlib
@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import queue
 import random
 import re
 import shutil
@@ -30,14 +31,14 @@ ROOT = HERE.parent
 REPO_ROOT = ROOT.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT.parent))
-import arms as legacy  # bench/arms.py
 import grade
 import observe
 import redact
 
 TASKS = json.loads((ROOT / 'tasks.json').read_text())['tasks']
 TASK = {t['id']: t for t in TASKS}
-SHORT = {'invoice-notes': 'wt-notes', 'pay-receipts': 'wt-pay', 'customer-table': 'wt-cust'}
+SHORT = {'invoice-notes': 'wt-notes', 'pay-receipts': 'wt-pay', 'customer-table': 'wt-cust', 'invoice-list': 'wt-list',
+         'void-invoices': 'wt-void'}
 WARM = Path(os.environ.get('AGENTVALUE_WARM', Path.home() / '.cache/stack-agentvalue/warm'))
 GITIGNORE = '.stack/\n.dev/\n.venv/\n.config/mise/\n__pycache__/\n.pytest_cache/\n'
 GIT = ['git', '-c', 'user.name=bench', '-c', 'user.email=bench@example.invalid', '-c', 'core.hooksPath=/dev/null',
@@ -49,6 +50,39 @@ Your task:
 {instruction}
 
 Read README.md first: it explains how to run the project and its services in this worktree. Before you finish, run the tests against your worktree's running services and make sure they pass, and commit your work on your branch. When you are done, stop everything you started in this worktree and leave other worktrees' and the main checkout's services alone."""
+
+# PROTOCOL.md, Version 2, "The recovery prompt", verbatim (its line breaks are only Markdown wrapping).
+RECOVERY_PROMPT = """You are taking over from another coding agent. It was working on the task below in this git worktree (the current directory, on branch {branch}) and stopped unexpectedly partway through. It will not come back. Its edits may be incomplete, and it may have left this worktree's services running or half started. Other agents' worktrees, and the main checkout, have services running while you work.
+
+Your task:
+{instruction}
+
+Read README.md first: it explains how to run the project and its services in this worktree. Check what state the worktree and its services are in, then finish the task. Before you finish, run the tests against your worktree's running services and make sure they pass, and commit your work on your branch. When you are done, stop everything that is running for this worktree, including anything the previous agent left, and leave other worktrees' and the main checkout's services alone."""
+
+PROTOCOL_VERSION = 2
+SCENARIOS = ('agent-kill', 'service-kill')
+FAULT_PARAMS = {'kill_delay_s': 3, 'recovery_delay_s': 10, 'fault_deadline_s': 600}
+
+# ------------------------------------------------------------------ the agent environment (an allowlist)
+# Built up from nothing. Host variables: only these. Everything else is set by the harness: the
+# per-run machine stores, constants, and the AGENTVALUE_* markers. The same environment is used for
+# the bystander and for every arm command the harness runs. Nothing here is ever recorded.
+HOST_VARIABLES = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR')
+MACHINE_STORES = {'STACK_STATE_DIR': 'stack/state', 'STACK_DATA_DIR': 'stack/data', 'STACK_CACHE_DIR': 'stack/cache',
+                  'MISE_STATE_DIR': 'mise/state', 'MISE_CONFIG_DIR': 'mise/config', 'MISE_GLOBAL_CONFIG_FILE': 'mise/config/config.toml',
+                  'MISE_SYSTEM_CONFIG_FILE': 'mise/config/system.toml', 'PITCHFORK_CONFIG_DIR': 'pf/config',
+                  'PITCHFORK_STATE_DIR': 'pf/state', 'PITCHFORK_LOGS_DIR': 'pf/logs', 'XDG_CONFIG_HOME': 'xdg/config',
+                  'XDG_DATA_HOME': 'xdg/data', 'XDG_CACHE_HOME': 'xdg/cache', 'XDG_STATE_HOME': 'xdg/state',
+                  'npm_config_cache': 'npm/cache', 'npm_config_userconfig': 'npm/npmrc',
+                  'npm_config_globalconfig': 'npm/global-npmrc', 'npm_config_prefix': 'npm/prefix'}
+STORE_DIRS = ['STACK_STATE_DIR', 'STACK_DATA_DIR', 'STACK_CACHE_DIR', 'MISE_STATE_DIR', 'MISE_CONFIG_DIR', 'XDG_CONFIG_HOME',
+              'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'PITCHFORK_STATE_DIR']
+WARM_STORES = ('MISE_DATA_DIR', 'MISE_CACHE_DIR', 'UV_CACHE_DIR')  # the shared warm download/install cache
+CONSTANTS = {'LANG': 'en_US.UTF-8', 'MISE_YES': '1', 'NO_COLOR': '1', 'GIT_CONFIG_NOSYSTEM': '1'}
+AGENT_CONSTANTS = {'DISABLE_AUTOUPDATER': '1'}
+MARKERS = ('AGENTVALUE_WT', 'AGENTVALUE_TASK', 'AGENTVALUE_ARM', 'AGENTVALUE_ROLE')
+ENV_ALLOWLIST = frozenset(HOST_VARIABLES) | frozenset(MACHINE_STORES) | frozenset(WARM_STORES) | frozenset(CONSTANTS) \
+    | frozenset(AGENT_CONSTANTS) | frozenset(MARKERS)
 
 
 def sha256(path):
@@ -146,22 +180,24 @@ def sh(argv, cwd, env, timeout=600, log=None, name=None):
     return entry
 
 
-def machine_env(root, bin_dir, marker=None):
-    env = legacy.isolated_env(root / 'm', cache=None, locale={'LANG': 'en_US.UTF-8'}, bin_dir=bin_dir)
-    # Shared download/install stores (a warm cache, identical for both arms). Service data,
-    # Stack state, supervisors and mise state stay per run under root/m.
+def machine_env(root, bin_dir, marker=None, **markers):
+    """The environment for the bystander, every agent and every arm command the harness runs: an
+    allowlist built up from nothing (see ENV_ALLOWLIST)."""
+    env = {key: os.environ[key] for key in HOST_VARIABLES if key in os.environ}
+    env['PATH'] = f'{bin_dir}{os.pathsep}{env.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"}'
+    env.update({key: str(root / 'm' / sub) for key, sub in MACHINE_STORES.items()})
+    # Shared download/install stores (a warm cache, identical for both arms). Service data, Stack
+    # state, supervisors and mise state stay per run under root/m.
     env.update(MISE_DATA_DIR=str(WARM / 'mise-data'), MISE_CACHE_DIR=str(WARM / 'mise-cache'), UV_CACHE_DIR=str(WARM / 'uv'))
-    for key in ['STACK_STATE_DIR', 'STACK_DATA_DIR', 'STACK_CACHE_DIR', 'MISE_STATE_DIR', 'MISE_CONFIG_DIR', 'XDG_CONFIG_HOME',
-                'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'PITCHFORK_STATE_DIR']:
+    env.update(CONSTANTS)
+    for key in STORE_DIRS:
         Path(env[key]).mkdir(parents=True, exist_ok=True)
-    env.pop('CI', None)  # agents behave as on a developer machine
-    # Nothing an agent or a service needs is a credential from the host: the agent CLI signs in from
-    # its own keychain and config. Drop every credential-like variable, and the host harness's own.
-    for key in list(env):
-        if redact.SECRET_KEY.match(f'{key}=x') or key.startswith(('CLAUDE', 'ANTHROPIC_', 'T3', 'CODEX_', 'AI_AGENT', 'OTEL_', 'MCP_', 'GIT_EDITOR', 'OLDPWD')):
-            del env[key]
     if marker:
         env['AGENTVALUE_WT'] = marker
+    env.update({key: str(value) for key, value in markers.items()})
+    stray = set(env) - ENV_ALLOWLIST
+    if stray:
+        raise RuntimeError(f'environment keys outside the allowlist: {sorted(stray)}')
     return env
 
 
@@ -351,6 +387,87 @@ def trace_metrics(path):
     return metrics
 
 
+# Commands that stop or restart services (an agent's own such command explains a loss of its own
+# services, event (g)), beside the version 1 kill pattern above (another agent's kill-like command).
+STOPS = re.compile(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart|up|stop)\b|\bpg_ctl\b[^\n]*\b(?:stop|restart|kill)\b'
+                   r'|\bredis-cli\b[^\n]*\bshutdown\b|\bkill\b|\bpkill\b|\bkillall\b')
+ARRIVALS = 'trace.arrivals.tsv'
+
+
+class TraceTimes(threading.Thread):
+    """The arrival time of every trace line, in seconds since its session's launch (monotonic),
+    written beside the trace as `<line number>\t<seconds>`. The agent CLI writes the trace file
+    itself and this thread only reads it, so the trace's content is never changed and a harness
+    crash loses at most arrival times. Times are when the harness saw the line (polled every 50 ms)."""
+
+    def __init__(self, trace, out, launched_mono):
+        super().__init__(daemon=True)
+        self.trace, self.out, self.launched = Path(trace), Path(out), launched_mono
+        self.stop_event = threading.Event()
+
+    def run(self):
+        buffer, count, stamp = b'', 0, 0.0
+        with open(self.trace, 'rb') as source, open(self.out, 'a') as out:
+            out.write('line\tseconds\n')
+            out.flush()
+            while True:
+                chunk = source.read()
+                if chunk:
+                    stamp = round(time.monotonic() - self.launched, 3)
+                    buffer += chunk
+                    *lines, buffer = buffer.split(b'\n')
+                    for _ in lines:
+                        count += 1
+                        out.write(f'{count}\t{stamp}\n')
+                    out.flush()
+                elif self.stop_event.is_set():
+                    break
+                else:
+                    time.sleep(0.05)
+            if buffer:
+                out.write(f'{count + 1}\t{stamp}\tunterminated\n')
+
+    def stop(self):
+        self.stop_event.set()
+        self.join(10)
+
+
+def timed_commands(trace, arrivals):
+    """Bash commands of a trace with the arrival time of the line that issued them (seconds since
+    launch; None when the line has no recorded arrival)."""
+    times = {}
+    if Path(arrivals).exists():
+        for row in Path(arrivals).read_text().splitlines()[1:]:
+            parts = row.split('\t')
+            if len(parts) >= 2 and parts[0].isdigit():
+                times[int(parts[0])] = float(parts[1])
+    commands = []
+    if not Path(trace).exists():
+        return commands
+    for number, line in enumerate(Path(trace).read_text(errors='replace').split('\n'), start=1):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get('type') != 'assistant':
+            continue
+        for block in (event.get('message') or {}).get('content') or []:
+            if isinstance(block, dict) and block.get('type') == 'tool_use' and block.get('name') == 'Bash':
+                commands.append({'t': times.get(number), 'command': (block.get('input') or {}).get('command', '')})
+    return commands
+
+
+def service_commands(trace, arrivals, launched_m):
+    """The commands that matter to event (g), on the run's clock: kill-like (version 1 pattern) or
+    stopping/restarting services."""
+    found = []
+    for c in timed_commands(trace, arrivals):
+        kind = 'kill' if KILL.search(c['command']) else 'stop' if STOPS.search(c['command']) else None
+        if kind:
+            found.append({'t_m': None if c['t'] is None else round(launched_m + c['t'], 3), 'kind': kind, 'command': c['command'][:300]})
+    return found
+
+
 # ------------------------------------------------------------------ one arm of one pair
 
 def substitute(template, values):
@@ -392,22 +509,247 @@ SETTLE_SECONDS = 5
 CORE_SERVICE = re.compile(r'(/bin/postgres |redis-server|python (app|worker)\.py|uv run|__supervise)')
 
 
-def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=False, tasks=None):
+def machine_budget(config, load_before):
+    def sysctl(name):
+        try:
+            return subprocess.run(['sysctl', '-n', name], capture_output=True, text=True, timeout=10).stdout.strip() or None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    memory = sysctl('hw.memsize')
+    return {'cores': os.cpu_count(), 'performance_cores': sysctl('hw.perflevel0.physicalcpu'),
+            'efficiency_cores': sysctl('hw.perflevel1.physicalcpu'),
+            'memory_bytes': int(memory) if memory and memory.isdigit() else None,
+            'load_1m_before_bystander': round(load_before, 2), 'load_1m_after_last_agent': None,
+            'concurrent_sessions': len(config['tasks']),
+            'session_budget': {'seconds': config['agent_seconds'], 'usd': config['max_usd_per_agent']}}
+
+
+def rows_of(processes, keys=('pid', 'started', 'command')):
+    return [{k: p.get(k) for k in keys} for p in processes]
+
+
+class Missed(Exception):
+    pass
+
+
+class Injector(threading.Thread):
+    """Fault injection (PROTOCOL.md, Version 2, "Fault injection"). The trigger is read from the
+    1 s sampler; the kill goes to exactly one process, whose pid and start time are checked again
+    immediately before. `agent-kill` then starts the recovery session."""
+
+    def __init__(self, scenario, victim, group, params, clock, session, snapshot, launch_recovery, launch_m):
+        super().__init__(daemon=True)
+        self.scenario, self.victim, self.group, self.params = scenario, victim, group, params
+        self.clock, self.session, self.snapshot, self.launch_recovery, self.launch_m = clock, session, snapshot, launch_recovery, launch_m
+        self.triggers = queue.Queue()
+        self.found = False
+        self.invalid = []
+        self.result = {'scenario': scenario, 'victim': victim, 'worktree': group, 'injected': False, 'missed': None,
+                       'params': dict(params), 'launch_m': launch_m}
+
+    def on_sample(self, info):
+        """Called by the sampler thread after every sample."""
+        if self.found:
+            return
+        session = self.session()
+        cli = session['pid'] if session else None
+        rows = info['rows']
+        for port, pid in sorted(info['listeners'].items()):
+            if info['owner'].get(pid) != self.group or pid == cli or pid not in rows:
+                continue
+            command = rows[pid]['command']
+            if self.scenario == 'service-kill' and not observe.POSTMASTER.search(command):
+                continue
+            self.found = True
+            self.triggers.put({'m': info['m'], 'pid': pid, 'started': rows[pid]['started'], 'command': command[:300], 'port': port})
+            return
+
+    def victim_exited(self):
+        return self.session()['exited'].is_set()
+
+    def wait_until(self, deadline_m):
+        while self.clock() < deadline_m:
+            if self.victim_exited():
+                raise Missed('the victim CLI exited before the kill was due')
+            time.sleep(min(0.05, max(0.0, deadline_m - self.clock())))
+
+    def run(self):
+        try:
+            self.inject()
+        except Missed as missed:
+            self.result['missed'] = str(missed)
+        except Exception as error:
+            import traceback
+            self.invalid.append(f'fault injection error: {error!r}')
+            self.result['error'] = traceback.format_exc()[-2000:]
+
+    def inject(self):
+        p = self.params
+        trigger = None
+        while trigger is None:
+            if self.victim_exited():
+                raise Missed('the victim CLI exited before the trigger')
+            if self.clock() > self.launch_m + p['fault_deadline_s']:
+                raise Missed(f"no trigger within {p['fault_deadline_s']} s of launch")
+            try:
+                trigger = self.triggers.get(timeout=0.2)
+            except queue.Empty:
+                pass
+        self.result['trigger'] = {**trigger, 'seconds_after_launch': round(trigger['m'] - self.launch_m, 3)}
+        due = trigger['m'] + p['kill_delay_s']
+        # What the victim's worktree runs, taken in a thread started 2 s before the kill, so that a
+        # slow listing can never delay the kill itself.
+        self.wait_until(due - 2.0)
+        snap = {'m': self.clock()}
+        def take():
+            try:
+                snap['rows'] = self.snapshot()
+            except Exception as error:
+                snap['error'] = repr(error)
+            snap['done_m'] = self.clock()
+        taker = threading.Thread(target=take, daemon=True)
+        taker.start()
+        self.wait_until(due)
+        session = self.session()
+        if self.scenario == 'agent-kill':
+            target = {'pid': session['pid'], 'started': session['pid_started'], 'command': None, 'what': 'agent CLI'}
+        else:
+            target = {'pid': trigger['pid'], 'started': trigger['started'], 'command': trigger['command'], 'what': 'postmaster'}
+        identity = observe.legacy.process_identity(target['pid'])
+        same = identity is not None and identity['started'] == target['started'] and \
+            (target['command'] is None or identity['command'].rstrip()[:300] == target['command'].rstrip())
+        if self.scenario == 'agent-kill' and self.victim_exited():
+            raise Missed('the victim CLI exited before the kill was due')
+        if not same:
+            raise Missed(f"the planned {target['what']} (pid {target['pid']}) was gone or replaced when the kill was due")
+        os.kill(target['pid'], signal.SIGKILL)
+        kill_m = self.clock()
+        taker.join(30)
+        snap_m, running = snap['m'], snap.get('rows') or []
+        # Proof that the planned process was hit: it is gone, and the agent CLI ended by SIGKILL.
+        deadline = time.monotonic() + 5
+        hit = False
+        while time.monotonic() < deadline:
+            now_identity = observe.legacy.process_identity(target['pid'])
+            gone = now_identity is None or now_identity['started'] != target['started']
+            if self.scenario == 'agent-kill':
+                hit = gone and session['exited'].is_set() and session['proc'].returncode == -signal.SIGKILL
+            else:
+                hit = gone
+            if hit:
+                break
+            time.sleep(0.05)
+        self.result.update(injected=True, kill={**target, 'm': kill_m, 'seconds_after_launch': round(kill_m - self.launch_m, 3),
+                                                'seconds_after_trigger': round(kill_m - trigger['m'], 3), 'hit_confirmed': hit,
+                                                'returncode': session['proc'].returncode if self.scenario == 'agent-kill' else None},
+                           running_at_kill={'snapshot_m': snap_m, 'seconds_before_kill': round(kill_m - snap_m, 3),
+                                            'snapshot_done_m': snap.get('done_m'), 'error': snap.get('error'),
+                                            'processes': rows_of(running)})
+        if not hit:
+            self.invalid.append(f"the harness kill could not be shown to have hit the planned {target['what']} (pid {target['pid']})")
+            return
+        if self.scenario == 'agent-kill':
+            session['record']['killed_by_harness'] = True
+            start = kill_m + p['recovery_delay_s']
+            while self.clock() < start:
+                time.sleep(min(0.1, max(0.0, start - self.clock())))
+            try:
+                key = self.launch_recovery()
+                self.result['recovery'] = {'session': key, 'launched_m': self.clock(),
+                                           'seconds_after_kill': round(self.clock() - kill_m, 3)}
+            except Exception as error:
+                self.invalid.append(f'the recovery agent could not be started: {error!r}')
+
+
+def unconfirmed_commands(stdout):
+    """`stack --json down` failing stop_unconfirmed: the commands of this checkout it names (details
+    with kind "command", not another checkout's). None when down did not fail that way."""
+    payload = None
+    for line in reversed((stdout or '').strip().splitlines()):
+        try:
+            payload = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if not isinstance(payload, dict) or payload.get('ok') is not False:
+        return None
+    error = payload.get('error') or {}
+    if error.get('code') != 'stop_unconfirmed':
+        return None
+    named = [d for d in error.get('details') or [] if isinstance(d, dict) and d.get('kind') == 'command'
+             and not d.get('another_checkout') and isinstance(d.get('pid'), int)]
+    return named or None
+
+
+def stop_pids(pids, root, grace=10):
+    """What `stack down`'s hint says to do: stop those PIDs (SIGTERM, 10 s, then SIGKILL). Only a
+    process of this run is ever signalled, and its start time is checked before every signal."""
+    rows, result = [], {'terminated': [], 'killed': [], 'gone': [], 'not_ours': [], 'survivors': []}
+    for pid in pids:
+        identity = observe.legacy.process_identity(pid)
+        if identity is None:
+            result['gone'].append(pid)
+        elif not observe._owned(pid, root):
+            result['not_ours'].append(pid)
+        else:
+            rows.append({'pid': pid, **identity})
+    stopped = observe.reclaim(rows, root, grace=grace) if rows else {'terminated': [], 'killed': [], 'not_signalled': [], 'survivors': []}
+    for key in ('terminated', 'killed', 'survivors'):
+        result[key] = stopped[key]
+    result['processes'] = rows_of(rows)
+    return result
+
+
+def stack_service_dirs(arm, main, env):
+    """Each checkout's PostgreSQL and Redis data directories, from Stack's own records."""
+    r = subprocess.run([arm.stack, '--json', 'ps'], cwd=main, env=env, capture_output=True, text=True)
+    try:
+        data = json.loads(r.stdout)['data']
+    except (ValueError, KeyError):
+        raise RuntimeError(f'stack ps failed while locating service data: {r.stdout[-300:]} {r.stderr[-300:]}')
+    dirs = {}
+    for checkout in data.get('checkouts', []):
+        for service in checkout.get('services', []):
+            if service.get('name') in ('postgres', 'redis') and service.get('data_dir'):
+                dirs.setdefault(os.path.realpath(checkout['path']), {})[service['name']] = service['data_dir']
+    return dirs
+
+
+def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=False, tasks=None, fault=None):
+    """One arm of one pair (PROTOCOL.md, Trial flow, as amended by Version 2).
+
+    `fault` overrides the pair's planned scenario and victim (self-tests and validation only);
+    `agent_override(task, role)` replaces the agent command (scripted agents, validation only)."""
     config = dict(plan['config'])
     if tasks:
         config['tasks'] = [t for t in config['tasks'] if t in tasks]
+    pair = next((p for p in plan.get('pairs', []) if p.get('index') == pair_index), {})
+    if fault is None:
+        fault = {'scenario': pair.get('scenario'), 'victim': pair.get('victim')}
+    if not fault.get('scenario') or fault.get('victim') not in config['tasks']:
+        fault = None
+    elif fault['scenario'] not in SCENARIOS:
+        raise SystemExit(f"unknown scenario {fault['scenario']!r}")
+    params = dict(FAULT_PARAMS, **(config.get('fault') or {}))
     arm = Arm(arm_name, config['stack_binary'])
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
+    load_before = os.getloadavg()[0]
     root = Path(tempfile.mkdtemp(prefix=f'avr{pair_index}{arm_name[0]}-', dir='/tmp'))
     run_id = root.name.replace('_', '-')
     observe.RUN_SUFFIX = f'.{run_id}'
-    record = {'pair': pair_index, 'arm': arm_name, 'root': str(root), 'run_id': run_id, 'started': now(), 'steps': [], 'agents': {},
+    t0 = time.monotonic()
+    clock = lambda: round(time.monotonic() - t0, 3)
+    record = {'protocol_version': PROTOCOL_VERSION, 'pair': pair_index, 'arm': arm_name, 'root': str(root), 'run_id': run_id,
+              'started': now(), 'clock': {'note': 'every *_m value is monotonic seconds since this run started', 'started_wall': now()},
+              'steps': [], 'agents': {}, 'slots': {},
+              'scenario': fault['scenario'] if fault else None, 'victim': fault['victim'] if fault else None,
               'plan_sha256': plan.get('_sha256'), 'plan_name': plan.get('name'), 'plan_kind': plan.get('kind'),
-              'model': config['model'], 'effort': config['effort'],
-              'stack_binary_sha256': sha256(config['stack_binary']), 'source_rev': git_rev(), 'valid': True, 'invalid_reasons': []}
+              'model': config['model'], 'effort': config['effort'], 'tasks': config['tasks'],
+              'stack_binary_sha256': sha256(config['stack_binary']), 'stack_rev': config.get('stack_rev'),
+              'source_rev': git_rev(), 'machine': machine_budget(config, load_before), 'valid': True, 'invalid_reasons': []}
     steps = record['steps']
-    sampler = None
+    sampler, injector, sessions = None, None, {}
 
     def invalid(reason):
         record['valid'] = False
@@ -441,12 +783,12 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         r = sh(arm.up(main), main, env_main, log=steps, name='bystander_up')
         if r['exit'] != 0:
             raise RuntimeError('bystander up failed')
-        bystander_env = parse_env(sh(arm.env_print(), main, env_main, log=steps, name='bystander_env')['stdout'])
-        if not {'DATABASE_URL', 'REDIS_URL'} <= set(bystander_env):
-            raise RuntimeError(f'could not read the bystander addresses: {bystander_env}')
+        addresses = parse_env(sh(arm.env_print(), main, env_main, log=steps, name='bystander_addresses')['stdout'])
+        if not {'DATABASE_URL', 'REDIS_URL'} <= set(addresses):
+            raise RuntimeError(f'could not read the bystander addresses: {sorted(addresses)}')
         token = hashlib.sha256(f'{root}{now()}'.encode()).hexdigest()[:12]
         record['canary_token'] = token
-        genv = grade.base_env(bystander_env)
+        genv = grade.base_env(addresses)
         planted = sh([grade.GRADER_PY, HERE / 'canary.py', 'plant', token], main, genv, log=steps, name='canary_plant')
         if planted['exit'] != 0:
             raise RuntimeError('canary plant failed')
@@ -455,8 +797,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         groups_of = lambda names: owned_paths(arm, main, env_main, {n: (main if n == 'main' else root / n) for n in names})
         durable = lambda rows: [r for r in rows if CORE_SERVICE.search(r['command'])]
         bystander_procs = durable(observe.attributed(groups_of(['main']))['main'])
-        record['bystander'] = {'env': bystander_env, 'fingerprint_before': before,
-                               'processes_before': [{k: p[k] for k in ['pid', 'started', 'command']} for p in bystander_procs]}
+        record['bystander'] = {'addresses': addresses, 'fingerprint_before': before, 'processes_before': rows_of(bystander_procs)}
 
         # Worktrees, as an orchestrator creates them. Each agent works in one.
         worktrees = {}
@@ -470,15 +811,11 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
 
         names = {task: SHORT[task] for task in worktrees}
         all_names = ['main'] + [names[t] for t in worktrees]
-        sampler = observe.Sampler(lambda: groups_of(all_names), out_dir / 'sampler.jsonl', interval=config.get('sample_interval', 1.0),
-                                  ignore_clients=(str(bin_dir / 'stack'), arm.stack))
-        sampler.start()
-
-        # Launch every agent at once; each one's exit is observed by its own thread.
-        agent_dirs, threads, helpers = {}, [], None
         lock = threading.Lock()
+        helpers = [None]
+        threads = []
 
-        def watch(task, proc, started_mono, out, err):
+        def watch(key, task, proc, started_mono, out, err, tailer, exited):
             timed_out = False
             try:
                 proc.wait(config['agent_seconds'])
@@ -486,51 +823,97 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                 timed_out = True
                 stop_tree(proc)
             ended_mono = time.monotonic()
+            exited.set()
             out.close(); err.close()
+            tailer.stop()
             groups = groups_of([names[task]])  # fresh: the agent may have created its state just now
             left = observe.attributed(groups, exclude={proc.pid})[names[task]]
             listeners, _ = observe.tcp()
             listeners.pop('by_endpoint', None)
-            cli_own = [p for p in left if p['command'].startswith(helpers or ('\0',))]
+            cli_own = [p for p in left if p['command'].startswith(helpers[0] or ('\0',))]
             left = [p for p in left if p not in cli_own]
             left_pids = {p['pid'] for p in left}
             with lock:
-                record['agents'][task].update(
-                    ended=now(), seconds=round(ended_mono - started_mono, 2), exit=proc.returncode, timed_out=timed_out,
-                    observed_after_exit_s=round(time.monotonic() - ended_mono, 2),
-                    left_running=[{k: p[k] for k in ['pid', 'started', 'command', 'marker']} for p in left],
-                    cli_helpers_left=[{k: p[k] for k in ['pid', 'command']} for p in cli_own],
+                record['agents'][key].update(
+                    ended=now(), ended_m=round(ended_mono - t0, 3), seconds=round(ended_mono - started_mono, 2), exit=proc.returncode,
+                    timed_out=timed_out, observed_after_exit_s=round(time.monotonic() - ended_mono, 2),
+                    left_running=rows_of(left, ('pid', 'started', 'command', 'marker')),
+                    cli_helpers_left=rows_of(cli_own, ('pid', 'command')),
                     left_listening=sorted(port for port, pid in listeners.items() if pid in left_pids))
 
-        for task, path in worktrees.items():
-            adir = out_dir / 'agents' / task
+        def launch(task, role):
+            key = task if role == 'agent' else f'{task}-recovery'
+            adir = out_dir / 'agents' / key
             adir.mkdir(parents=True)
-            agent_dirs[task] = adir
-            prompt = PROMPT.format(branch=TASK[task]['branch'], instruction=TASK[task]['instruction'])
-            (adir / 'prompt.txt').write_text(prompt)
-            template = agent_override(task) if agent_override else config['agent_command']
-            argv = substitute(template, {'prompt': prompt, 'model': config['model'], 'effort': config['effort'],
+            text = (PROMPT if role == 'agent' else RECOVERY_PROMPT).format(branch=TASK[task]['branch'], instruction=TASK[task]['instruction'])
+            (adir / 'prompt.txt').write_text(text)
+            template = agent_override(task, role) if agent_override else config['agent_command']
+            argv = substitute(template, {'prompt': text, 'model': config['model'], 'effort': config['effort'],
                                          'max_usd': config['max_usd_per_agent'], 'task': task})
-            helpers = helpers or (cli_paths(argv[0]) if not agent_override else None)
-            env = machine_env(root, bin_dir, marker=marker(names[task]))
-            env['DISABLE_AUTOUPDATER'] = '1'
-            env['AGENTVALUE_TASK'] = task
-            env['AGENTVALUE_ARM'] = arm.name
-            (adir / 'argv.json').write_text(json.dumps([a if a != prompt else '{prompt}' for a in argv]))
+            helpers[0] = helpers[0] or (cli_paths(argv[0]) if not agent_override else None)
+            env = machine_env(root, bin_dir, marker=marker(names[task]), AGENTVALUE_TASK=task, AGENTVALUE_ARM=arm.name,
+                              AGENTVALUE_ROLE=role)
+            env.update(AGENT_CONSTANTS)
+            (adir / 'argv.json').write_text(json.dumps([a if a != text else '{prompt}' for a in argv]))
             out = open(adir / 'trace.jsonl', 'wb')
             err = open(adir / 'stderr.txt', 'wb')
             started = now()
             started_mono = time.monotonic()
-            proc = subprocess.Popen(argv, cwd=path, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL, start_new_session=True)
-            record['agents'][task] = {'worktree': str(path), 'marker': names[task], 'started': started, 'pid': proc.pid}
-            thread = threading.Thread(target=watch, args=(task, proc, started_mono, out, err), daemon=True)
+            proc = subprocess.Popen(argv, cwd=worktrees[task], env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+            identity = observe.legacy.process_identity(proc.pid)
+            exited = threading.Event()
+            entry = {'task': task, 'role': role, 'worktree': str(worktrees[task]), 'marker': names[task], 'started': started,
+                     'launched_m': round(started_mono - t0, 3), 'pid': proc.pid, 'pid_started': identity and identity['started'],
+                     'budget': {'seconds': config['agent_seconds'], 'usd': config['max_usd_per_agent']}}
+            tailer = TraceTimes(adir / 'trace.jsonl', adir / ARRIVALS, started_mono)
+            tailer.start()
+            with lock:
+                record['agents'][key] = entry
+                sessions[key] = {'proc': proc, 'pid': proc.pid, 'pid_started': entry['pid_started'], 'exited': exited, 'record': entry}
+            thread = threading.Thread(target=watch, args=(key, task, proc, started_mono, out, err, tailer, exited), daemon=True)
             thread.start()
-            threads.append(thread)
-        for thread in threads:
-            thread.join()
+            with lock:
+                threads.append(thread)
+            return key
+
+        if fault:
+            victim = fault['victim']
+            snapshot = lambda: observe.attributed(groups_of([names[victim]]))[names[victim]]
+            injector = Injector(fault['scenario'], victim, names[victim], params, clock, lambda: sessions.get(victim), snapshot,
+                                lambda: launch(victim, 'recovery'), launch_m=None)
+        sampler = observe.Sampler(lambda: groups_of(all_names), out_dir / 'sampler.jsonl', interval=config.get('sample_interval', 1.0),
+                                  ignore_clients=(str(bin_dir / 'stack'), arm.stack), t0=t0,
+                                  listeners=[injector.on_sample] if injector else [])
+        sampler.start()
+
+        # Launch every agent at once; each one's exit is observed by its own thread.
         for task in worktrees:
-            if 'left_running' not in record['agents'][task]:
-                raise RuntimeError(f'no exit observation for {task}')
+            launch(task, 'agent')
+        record['launch_m'] = clock()
+        if injector:
+            injector.launch_m = injector.result['launch_m'] = record['launch_m']
+            injector.start()
+        while True:  # the episode: until every session (recovery included) has ended and no fault is pending
+            with lock:
+                live = [t for t in threads if t.is_alive()]
+            if not live and not (injector and injector.is_alive()):
+                break
+            time.sleep(0.2)
+        record['episode_end_m'] = clock()
+        record['machine']['load_1m_after_last_agent'] = round(os.getloadavg()[0], 2)
+        for key, entry in record['agents'].items():
+            if 'left_running' not in entry:
+                raise RuntimeError(f'no exit observation for {key}')
+        if injector:
+            record['fault'] = injector.result
+            for reason in injector.invalid:
+                invalid(reason)
+            record['fault']['running_at_end'] = {'m': clock(), 'processes': rows_of(snapshot())}
+
+        # Each worktree's scored slot: the recovery session where the victim was killed.
+        for task in worktrees:
+            record['slots'][task] = f'{task}-recovery' if f'{task}-recovery' in record['agents'] else task
 
         # A process an agent signalled last may still be shutting down (the worker finishes its
         # current one-second queue wait on SIGTERM). Let it settle before anything is compared.
@@ -549,33 +932,62 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         changed = sorted(k for k in before if (after or {}).get(k) != before[k]) if after is not None else ['unreadable']
         record['bystander'].update(fingerprint_after=after, changed=changed, processes_lost=lost)
 
-        # Each submission, captured before anything touches the worktrees.
-        submissions = {task: capture(path, start_commit, agent_dirs[task], env_main) for task, path in worktrees.items()}
+        # Each submission (the worktree's final tree), captured before anything touches the worktrees.
+        submissions = {task: capture(path, start_commit, out_dir / 'agents' / record['slots'][task], env_main)
+                       for task, path in worktrees.items()}
 
-        # The arm's own documented stop, run on each worktree exactly as its agent left it:
-        # does the arm recover a dirty checkout? Then the harness stops anything still left.
-        disposal_groups = groups_of([names[t] for t in worktrees])
-        recovery = {}
+        # The teardown procedure (PROTOCOL.md, Version 2, item 4): the arm's documented procedure on
+        # every worktree exactly as it was left; nothing is cleaned by the harness first.
+        teardown_groups = groups_of([names[t] for t in worktrees])
+        if arm.name == 'stack':
+            located = stack_service_dirs(arm, main, env_main)
+            service_dirs = {task: located.get(os.path.realpath(path), {}) for task, path in worktrees.items()}
+        else:
+            service_dirs = {task: {'postgres': str(path / '.dev/postgres'), 'redis': str(path / '.dev/redis')} for task, path in worktrees.items()}
+        teardown, leftovers = {}, {}
         for task, path in worktrees.items():
-            log = []
-            sh(arm.down(), path, env_main, log=log, name='arm_down')
-            remaining = observe.attributed({names[task]: disposal_groups[names[task]]})[names[task]]
-            recovery[task] = {'agent_left': len(record['agents'][task]['left_running']), 'down': log, 'down_exit': log[-1]['exit'],
-                              'left_after_arm_down': [{k: p[k] for k in ['pid', 'command']} for p in remaining]}
-            if remaining:
-                recovery[task]['harness_reclaim'] = observe.reclaim(remaining, root)
-                if recovery[task]['harness_reclaim']['survivors']:
+            name = names[task]
+            wenv = machine_env(root, bin_dir, marker=marker(name))
+            entry = {'procedure': [], 'rounds': [], 'service_dirs': service_dirs[task]}
+            r = sh(arm.down(), path, wenv, log=entry['procedure'], name='arm_down')
+            entry['down_exit_first'] = r['exit']
+            if arm.name == 'stack':
+                for round_number in (1, 2, 3):
+                    named = unconfirmed_commands(r['stdout'])
+                    if not named:
+                        break
+                    stopped = stop_pids([d['pid'] for d in named], root)
+                    r = sh(arm.down(), path, wenv, log=entry['procedure'], name=f'arm_down_round{round_number}')
+                    entry['rounds'].append({'round': round_number, 'named': named, 'stopped': stopped, 'down_exit': r['exit']})
+            entry['down_exit'] = r['exit']
+            # First observation: everything attributed to the worktree, and every port one listens on.
+            rows = observe.attributed({name: teardown_groups[name]})[name]
+            cli_own = [p for p in rows if p['command'].startswith(helpers[0] or ('\0',))]
+            rows = [p for p in rows if p not in cli_own]
+            listeners, _ = observe.tcp()
+            listeners.pop('by_endpoint', None)
+            pids = {p['pid'] for p in rows}
+            entry['after_down'] = {'m': clock(), 'processes': rows_of(rows, ('pid', 'started', 'command', 'marker')),
+                                   'ports': sorted(port for port, pid in listeners.items() if pid in pids),
+                                   'cli_helpers': rows_of(cli_own, ('pid', 'command'))}
+            entry['false_confirmation'] = entry['down_exit'] == 0 and bool(rows)
+            teardown[task] = entry
+            leftovers[task] = rows
+        # Only now does the harness stop anything left, recorded separately. It counts as left.
+        for task, rows in leftovers.items():
+            if rows:
+                teardown[task]['harness_reclaim'] = observe.reclaim(rows, root)
+                if teardown[task]['harness_reclaim']['survivors']:
                     invalid(f'processes of {task} survived reclaim')
-        record['recovery'] = recovery
+        record['teardown'] = teardown
 
         # Every worktree database: which migrations ran in it, compared with every worktree's files.
-        dirs = stack_data_dirs(arm, main, env_main)
         own = {task: set(info['migrations']) for task, (_, info) in submissions.items()}
         original = set(p.stem for p in (ROOT / 'fixture/migrations').glob('*.sql'))
         dbcheck = {}
         with tempfile.TemporaryDirectory(prefix='avd-', dir='/tmp') as tmp:
             for task, path in worktrees.items():
-                data_dir = (path / '.dev/postgres') if arm.name == 'baseline' else dirs.get(os.path.realpath(path))
+                data_dir = service_dirs[task].get('postgres')
                 result = read_migrations(data_dir, Path(tmp), token) if data_dir else {'exists': False}
                 if result.get('exists') and (result.get('error') or result.get('versions') is None):
                     invalid(f'could not read the {task} worktree database: {result.get("error")}')
@@ -589,34 +1001,40 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         main_versions = set((after or {}).get('migrations') or [])
         record['bystander']['foreign_migrations'] = sorted(main_versions - original)
 
-        # Hidden grading, identical for both arms.
+        # Hidden grading, identical for both arms, of each worktree's final tree; the score goes to its slot.
         for task, (tree, info) in submissions.items():
-            g = grade.grade(task, tree, agent_dirs[task])
-            record['agents'][task]['grade'] = {k: g[k] for k in ['passed', 'fresh_ok', 'upgrade_completed', 'checks', 'failed_checks']}
-            record['agents'][task]['submission'] = info
+            slot = record['slots'][task]
+            g = grade.grade(task, tree, out_dir / 'agents' / slot)
+            record['agents'][slot]['grade'] = {k: g[k] for k in ['passed', 'fresh_ok', 'upgrade_completed', 'checks', 'failed_checks']}
+            record['agents'][slot]['submission'] = info
             if g['grader_cleanup']['survivors']:
                 invalid(f'grader processes survived for {task}')
             if not g['upgrade_completed'] and not g['upgrade'].get('error'):
                 invalid(f'the hidden checks did not complete for {task}')
 
-        # Documented removal of each worktree, then what is left of it.
+        # Removal of each worktree, then (Stack) gc after the last one; the second observation.
         removal = {}
         for task, path in worktrees.items():
             removal[task] = sh([*GIT, 'worktree', 'remove', '--force', str(path)], main, env_main, name='worktree_remove')
+            teardown[task]['procedure'].append(removal[task])
         if arm.name == 'stack':
             removal['gc'] = sh([arm.stack, '--json', 'gc', '--reclaim-data'], main, env_main, log=steps, name='gc_reclaim')
-        left = observe.attributed(disposal_groups)
+        for task, path in worktrees.items():
+            data_left = {p: du(p) for p in service_dirs[task].values() if Path(p).is_dir() and any(Path(p).iterdir())}
+            entry = teardown[task]
+            entry['after_removal'] = {'m': clock(), 'worktree_dir_exists': path.exists(), 'service_data_left': data_left}
+            entry['residue_ok'] = not entry['after_down']['processes'] and not entry['after_down']['ports'] \
+                and not path.exists() and not data_left
+        left = observe.attributed(teardown_groups)
         listeners, _ = observe.tcp()
         listeners.pop('by_endpoint', None)
         agent_ports = {int(p) for p, marks in record['sampler']['ports'].items() if set(marks) - {'main'}}
-        data_paths = [p for n, paths in disposal_groups.items() for p in paths if '/state/data/' in p]
-        data_left = {p: du(p) for p in data_paths if Path(p).exists() and any(Path(p).iterdir())}
         record['disposal'] = {
             'steps': removal,
-            'processes_left': {m: [{k: p[k] for k in ['pid', 'command']} for p in rows] for m, rows in left.items() if rows},
+            'processes_left': {m: rows_of(rows, ('pid', 'command')) for m, rows in left.items() if rows},
             'ports_still_listening': sorted(p for p in agent_ports if p in listeners),
             'worktree_dirs_left': [str(p) for p in worktrees.values() if p.exists()],
-            'service_data_left': data_left,
+            'service_data_left': {t: teardown[t]['after_removal']['service_data_left'] for t in worktrees if teardown[t]['after_removal']['service_data_left']},
             'machine_state_bytes_after': du(root / 'm'),
             'machine_state_tree_after': tree_sizes(root / 'm'),
         }
@@ -635,7 +1053,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         # The main checkout's own teardown, then a last scan of the whole run.
         sh(arm.down(), main, env_main, log=steps, name='bystander_down')
         final = observe.run_processes(root)
-        record['final_scan'] = [{k: p[k] for k in ['pid', 'command']} for p in final]
+        record['final_scan'] = rows_of(final, ('pid', 'command'))
         if final:
             record['final_reclaim'] = observe.reclaim(final, root)
     except Exception as error:
@@ -647,18 +1065,16 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             sampler.stop()
         # Nothing may outlive a run.
         try:
-            for task in list(record.get('agents', {})):
-                pid = record['agents'][task].get('pid')
-                if pid:
-                    try:
-                        os.killpg(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+            for key in list(sessions):
+                try:
+                    os.killpg(sessions[key]['pid'], signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
             remaining = observe.run_processes(root)
             if remaining:
                 record.setdefault('emergency_reclaim', observe.reclaim(remaining, root))
             survivors = observe.run_processes(root)
-            record['survivors_after_run'] = [{k: p[k] for k in ['pid', 'command']} for p in survivors]
+            record['survivors_after_run'] = rows_of(survivors, ('pid', 'command'))
             if survivors:
                 invalid('processes of this run survived every cleanup')
         except Exception as error:
@@ -666,15 +1082,18 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             invalid(f'cleanup error: {error!r}')
         record['ended'] = now()
         record['seconds'] = round(record['ended'] - record['started'], 1)
-        for task, entry in record['agents'].items():
-            trace = out_dir / 'agents' / task / 'trace.jsonl'
-            entry['trace_metrics'] = {k: v for k, v in trace_metrics(trace).items() if k != 'bash_commands'}
-            commands = trace_metrics(trace)['bash_commands']
+        for key, entry in record['agents'].items():
+            adir = out_dir / 'agents' / key
+            trace = adir / 'trace.jsonl'
+            metrics = trace_metrics(trace)
+            commands = metrics.pop('bash_commands')
+            entry['trace_metrics'] = metrics
             entry['compliance'] = {'committed': bool((entry.get('submission') or {}).get('commits')),
                                    'ran_tests': any(re.search(r'\b(stack run test|dev\.py test|pytest)\b', c) for c in commands)}
+            entry['service_commands'] = service_commands(trace, adir / ARRIVALS, entry.get('launched_m') or 0.0)
         # Retained traces and logs may contain the host environment if an agent printed it.
         for path in out_dir.rglob('*'):
-            if path.is_file() and path.suffix in {'.jsonl', '.txt', '.json', '.patch'} and 'submitted-tree' not in path.parts:
+            if path.is_file() and path.suffix in {'.jsonl', '.txt', '.json', '.patch', '.tsv', '.log'} and 'submitted-tree' not in path.parts:
                 redact.scrub_file(path)
         (out_dir / 'run.json').write_text(json.dumps(redact.scrub_json(record), indent=2, default=str))
         if not keep_root and record['valid']:
@@ -687,14 +1106,51 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
 
 # ------------------------------------------------------------------ plan / pair
 
+def stack_version(binary):
+    try:
+        r = subprocess.run([str(binary), '--version'], capture_output=True, text=True, timeout=30,
+                           env={k: os.environ[k] for k in HOST_VARIABLES if k in os.environ})
+        return (r.stdout.strip() or r.stderr.strip()).splitlines()[0] if r.returncode == 0 else None
+    except (OSError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
+def plan_pairs(rng, pairs_per_scenario, tasks):
+    """PROTOCOL.md, Version 2, "Plan, order and cost": pairs alternate scenarios (which comes first
+    is a seeded coin flip); within a scenario the first pair's first arm is a seeded coin flip and
+    later pairs alternate; within a scenario the victims are a seeded permutation of the tasks
+    (a fresh permutation for every further block of len(tasks) pairs)."""
+    scenarios = list(SCENARIOS) if rng.random() < 0.5 else list(reversed(SCENARIOS))
+    first = {s: rng.choice(['stack', 'baseline']) for s in scenarios}
+    victims = {}
+    for s in scenarios:
+        order = []
+        while len(order) < pairs_per_scenario:
+            block = list(tasks)
+            rng.shuffle(block)
+            order += block
+        victims[s] = order[:pairs_per_scenario]
+    pairs = []
+    for i in range(2 * pairs_per_scenario):
+        s, j = scenarios[i % 2], i // 2
+        lead = first[s] if j % 2 == 0 else ('baseline' if first[s] == 'stack' else 'stack')
+        pairs.append({'index': i, 'scenario': s, 'victim': victims[s][j], 'order': [lead, 'baseline' if lead == 'stack' else 'stack']})
+    return pairs
+
+
 def cmd_plan(args):
     rng = random.Random(args.seed)
-    binary = Path(args.stack).resolve()
-    first = rng.choice(['stack', 'baseline'])
-    pairs = []
-    for i in range(args.pairs):
-        order = [first, 'baseline' if first == 'stack' else 'stack'] if i % 2 == 0 else [('baseline' if first == 'stack' else 'stack'), first]
-        pairs.append({'index': i, 'order': order})
+    binary = Path(args.stack).expanduser().resolve()
+    if not binary.is_file():
+        raise SystemExit(f'no Stack binary at {binary}')
+    tasks = [t['id'] for t in TASKS]
+    if args.pairs_per_scenario:
+        pairs = plan_pairs(rng, args.pairs_per_scenario, tasks)
+    else:  # a plan without faults: self-tests and validation
+        first = rng.choice(['stack', 'baseline'])
+        other = 'baseline' if first == 'stack' else 'stack'
+        pairs = [{'index': i, 'scenario': None, 'victim': None, 'order': [first, other] if i % 2 == 0 else [other, first]}
+                 for i in range(args.pairs)]
     agent_command = json.loads(args.agent_command) if args.agent_command else [
         'claude', '-p', '{prompt}', '--model', '{model}', '--effort', '{effort}', '--output-format', 'stream-json', '--verbose',
         '--safe-mode', '--strict-mcp-config', '--no-session-persistence', '--disable-slash-commands',
@@ -702,11 +1158,17 @@ def cmd_plan(args):
     if agent_command and agent_command[0] == 'claude' and shutil.which('claude'):
         # Pin the CLI to its versioned binary: a host-wide update must not change it under a plan.
         agent_command = [os.path.realpath(shutil.which('claude'))] + agent_command[1:]
-    plan = {'kind': args.kind, 'name': args.name, 'created': now(), 'seed': args.seed, 'protocol_rev': git_rev(),
-            'config': {'tasks': [t['id'] for t in TASKS], 'model': args.model, 'effort': args.effort,
+    cli = Path(agent_command[0]) if agent_command and agent_command[0].startswith('/') else None
+    plan = {'protocol_version': PROTOCOL_VERSION, 'kind': args.kind, 'name': args.name, 'created': now(), 'seed': args.seed,
+            'protocol_rev': git_rev(),
+            'config': {'tasks': tasks, 'model': args.model, 'effort': args.effort,
                        'agent_seconds': args.agent_seconds, 'max_usd_per_agent': args.max_usd, 'agent_command': agent_command,
-                       'stack_binary': str(binary), 'stack_binary_sha256': sha256(binary), 'source_rev': git_rev(),
-                       'warm_cache': str(WARM), 'locale': 'en_US.UTF-8', 'concurrency': len(TASKS), 'sample_interval': 1.0},
+                       'agent_cli_sha256': sha256(cli) if cli and cli.is_file() else None,
+                       'stack_binary': str(binary), 'stack_binary_sha256': sha256(binary), 'stack_rev': args.stack_rev,
+                       'stack_version': stack_version(binary), 'source_rev': git_rev(),
+                       'warm_cache': str(WARM), 'locale': 'en_US.UTF-8', 'concurrency': len(tasks), 'sample_interval': 1.0,
+                       'fault': dict(FAULT_PARAMS), 'faults': bool(args.pairs_per_scenario),
+                       'env_allowlist': sorted(ENV_ALLOWLIST)},
             'host': {'platform': platform.platform(), 'node': platform.node(), **tool_versions()},
             'fingerprints': fingerprints(), 'pairs': pairs}
     out = Path(args.out)
@@ -714,17 +1176,23 @@ def cmd_plan(args):
     if out.exists():
         raise SystemExit(f'{out} exists; plans are never overwritten')
     out.write_text(json.dumps(plan, indent=2))
-    print(json.dumps({'plan': str(out), 'pairs': pairs}, indent=2))
+    print(json.dumps({'plan': str(out), 'stack': {'rev': args.stack_rev, 'sha256': plan['config']['stack_binary_sha256'],
+                                                   'version': plan['config']['stack_version']}, 'pairs': pairs}, indent=2))
 
 
 def check_plan(plan):
     problems = []
-    if sha256(plan['config']['stack_binary']) != plan['config']['stack_binary_sha256']:
+    if not Path(plan['config']['stack_binary']).is_file() or sha256(plan['config']['stack_binary']) != plan['config']['stack_binary_sha256']:
         problems.append('the Stack binary changed since the plan')
+    cli, digest = plan['config']['agent_command'][0], plan['config'].get('agent_cli_sha256')
+    if digest and (not Path(cli).is_file() or sha256(cli) != digest):
+        problems.append('the agent CLI binary changed since the plan')
     current = fingerprints()
     changed = sorted(k for k in set(current) | set(plan['fingerprints']) if current.get(k) != plan['fingerprints'].get(k))
     if changed:
         problems.append(f'benchmark files changed since the plan: {changed}')
+    if plan.get('protocol_version') != PROTOCOL_VERSION:
+        problems.append(f"the plan is protocol version {plan.get('protocol_version', 1)}; this harness runs version {PROTOCOL_VERSION}")
     return problems
 
 
@@ -753,6 +1221,8 @@ def cli_failures(record):
     """Agents whose CLI ended in an error that was not a budget stop (API, auth, crash)."""
     bad = []
     for task, a in record.get('agents', {}).items():
+        if a.get('killed_by_harness'):
+            continue  # the harness ended it
         result = (a.get('trace_metrics') or {}).get('result') or {}
         budget_stop = 'budget' in str(result.get('subtype') or '') or 'max_budget' in str(result.get('subtype') or '')
         if not a.get('timed_out') and not budget_stop and (a.get('exit') not in (0, None) or result.get('is_error') or not result):
@@ -776,12 +1246,16 @@ def cmd_pair(args):
         out = results / f'pair{args.index}-{arm_name}'
         print(f'pair {args.index}: running {arm_name} -> {out}', flush=True)
         record = run_arm(plan, args.index, arm_name, out)
-        summary = {t: {'passed': (a.get('grade') or {}).get('passed'), 'seconds': a.get('seconds'),
+        summary = {t: {'passed': (a.get('grade') or {}).get('passed'), 'seconds': a.get('seconds'), 'killed': a.get('killed_by_harness', False),
                        'left': len(a.get('left_running') or []), 'cost': ((a.get('trace_metrics') or {}).get('result') or {}).get('total_cost_usd')}
                    for t, a in record['agents'].items()}
         failures = cli_failures(record)
+        fault = record.get('fault') or {}
         print(json.dumps({'arm': arm_name, 'valid': record['valid'], 'invalid': record['invalid_reasons'], 'cli_failures': failures,
-                          'bystander_changed': record.get('bystander', {}).get('changed'), 'agents': summary}, indent=2), flush=True)
+                          'scenario': record.get('scenario'), 'victim': record.get('victim'), 'injected': fault.get('injected'),
+                          'missed': fault.get('missed'), 'bystander_changed': record.get('bystander', {}).get('changed'),
+                          'residue_ok': {t: e.get('residue_ok') for t, e in (record.get('teardown') or {}).items()},
+                          'agents': summary}, indent=2), flush=True)
         # Stop rules (PROTOCOL.md, Validity): an invalid run or two CLI failures stop the experiment.
         if not record['valid']:
             raise SystemExit(f'stopping: run {out} is invalid: {record["invalid_reasons"]}')
@@ -790,45 +1264,59 @@ def cmd_pair(args):
     lock.close()
 
 
+def scripted_override(spec):
+    """task=mode[,task.recovery=mode,...] -> agent_override(task, role) running scripted_agent.py."""
+    modes = dict(item.split('=', 1) for item in spec.split(',')) if spec else {}
+    def override(task, role):
+        key = task if role == 'agent' else f'{task}.recovery'
+        return ['python3', str(HERE / 'scripted_agent.py'), modes.get(key, 'reference')]
+    return override
+
+
 def cmd_arm(args):
     plan = load_plan(args.plan)
     if plan['kind'] != 'harness_selftest':
         raise SystemExit('`arm` runs only self-test plans; experiment plans run through `pair`')
     lock = host_lock()
-    override = None
-    if args.scripted:
-        modes = dict(item.split('=') for item in args.scripted.split(','))
-        override = lambda task: ['python3', str(HERE / 'scripted_agent.py'), modes.get(task, 'reference')]
+    override = scripted_override(args.scripted) if args.scripted is not None else None
+    fault = {'scenario': args.scenario, 'victim': args.victim} if args.scenario else None
     record = run_arm(plan, args.index, args.arm, Path(args.out), agent_override=override, keep_root=args.keep_root,
-                     tasks=args.tasks.split(',') if args.tasks else None)
-    print(json.dumps({'valid': record['valid'], 'invalid': record['invalid_reasons'], 'out': args.out}, indent=2))
+                     tasks=args.tasks.split(',') if args.tasks else None, fault=fault)
+    print(json.dumps({'valid': record['valid'], 'invalid': record['invalid_reasons'], 'fault': record.get('fault'), 'out': args.out},
+                     indent=2, default=str))
+    lock.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('plan')
+    p = sub.add_parser('plan', help='fix a version 2 plan')
     p.add_argument('--name', required=True)
     p.add_argument('--kind', choices=['agent_experiment', 'harness_selftest'], default='agent_experiment')
-    p.add_argument('--pairs', type=int, required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--pairs-per-scenario', type=int, help='pairs per fault scenario (pairs alternate scenarios)')
+    group.add_argument('--pairs', type=int, help='a plan without faults (self-tests and validation)')
     p.add_argument('--seed', type=int, required=True)
+    p.add_argument('--stack', required=True, help='the Stack release binary for the Stack arm')
+    p.add_argument('--stack-rev', required=True, help='the revision that binary was built from (recorded with its sha256)')
     p.add_argument('--model', default='claude-sonnet-5-5')
     p.add_argument('--effort', default='high')
     p.add_argument('--agent-seconds', type=int, default=1800)
     p.add_argument('--max-usd', type=float, default=8.0)
     p.add_argument('--agent-command')
-    p.add_argument('--stack', default=str(REPO_ROOT / 'target/release/stack'))
     p.add_argument('--out', required=True)
-    p = sub.add_parser('pair')
+    p = sub.add_parser('pair', help='run one planned pair end to end')
     p.add_argument('--plan', required=True)
     p.add_argument('--index', type=int, required=True)
     p.add_argument('--results', required=True)
-    p = sub.add_parser('arm')
+    p = sub.add_parser('arm', help='run one arm of a self-test plan')
     p.add_argument('--plan', required=True)
     p.add_argument('--index', type=int, default=0)
     p.add_argument('--arm', choices=['stack', 'baseline'], required=True)
     p.add_argument('--out', required=True)
-    p.add_argument('--scripted', help='task=mode,... for the scripted agent (harness self-test)')
+    p.add_argument('--scripted', help='task=mode,task.recovery=mode,... for the scripted agent (harness self-test)')
+    p.add_argument('--scenario', choices=SCENARIOS, help='inject this fault (self-test)')
+    p.add_argument('--victim', help='the victim task for --scenario')
     p.add_argument('--keep-root', action='store_true')
     p.add_argument('--tasks', help='comma-separated subset of tasks (smoke tests only; never for planned pairs)')
     args = parser.parse_args()

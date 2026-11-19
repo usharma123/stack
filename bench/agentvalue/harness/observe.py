@@ -194,17 +194,32 @@ def tcp():
     return listeners, connections
 
 
+# A durable service process: a postmaster (its children are titled "postgres: ..."), Redis, the
+# API or the worker (the `uv run` wrapper and the interpreter it starts), or Stack's supervisor.
+DURABLE = re.compile(r'/bin/postgres\s|redis-server|\bpython3?\s+(?:app|worker)\.py\b|__supervise')
+POSTMASTER = re.compile(r'/bin/postgres\s')
+
+
 class Sampler(threading.Thread):
     """Samples every `interval` seconds: which worktree owns which live processes and listening
     ports, and any TCP connection from a process of one worktree to a port another worktree's
     process listens on (cross-worktree access). Short-lived connections between samples are
-    missed, so this is evidence of access, never proof of its absence."""
+    missed, so this is evidence of access, never proof of its absence.
 
-    def __init__(self, groups, out, interval=1.0, ignore_clients=()):
+    Each sample also records which durable service processes of a group are gone from the
+    process table since the previous sample (event (g) works from these), and is handed to every
+    callable in `listeners` (the fault injector's trigger)."""
+
+    def __init__(self, groups, out, interval=1.0, ignore_clients=(), t0=None, listeners=()):
         """`groups` is a callable returning {name: [paths]}; it is refreshed every few samples
-        because an arm may create a checkout's state directories only when it first starts."""
+        because an arm may create a checkout's state directories only when it first starts.
+        Times `m` are monotonic seconds since `t0` (the run's clock)."""
         super().__init__(daemon=True)
         self.groups_fn, self.out, self.interval = groups, Path(out), interval
+        self.t0 = time.monotonic() if t0 is None else t0
+        self.listeners = list(listeners)
+        self.durable_prev = {}  # (pid, started) -> (group, command, m)
+        self.losses = []        # durable processes gone between two samples
         self.groups, self.resolved = groups(), {}
         # Stack's own probes (`stack ps`, `status`) connect to every checkout's ports by design;
         # they are not an agent reaching another worktree's data.
@@ -227,6 +242,7 @@ class Sampler(threading.Thread):
 
     def sample(self, log):
         now = time.time()
+        mono = round(time.monotonic() - self.t0, 3)
         if self.samples % 5 == 0:
             self.groups = self.groups_fn()
         rows = legacy.process_table()
@@ -249,8 +265,17 @@ class Sampler(threading.Thread):
             if mark:
                 owner[pid] = mark
                 key = (mark, pid, row['started'])
-                entry = self.seen.setdefault(key, {'first': now, 'command': row['command'][:300]})
+                entry = self.seen.setdefault(key, {'first': now, 'first_m': mono, 'command': row['command'][:300]})
                 entry['last'] = now
+                entry['last_m'] = mono
+        # Durable processes gone from the process table since the previous sample (pid and start time).
+        alive = {(pid, row['started']) for pid, row in rows.items()}
+        for key, (group, command, seen_m) in self.durable_prev.items():
+            if key not in alive:
+                self.losses.append({'group': group, 'pid': key[0], 'started': key[1], 'command': command[:300],
+                                    'last_seen_m': seen_m, 'gone_m': mono})
+        self.durable_prev = {(pid, rows[pid]['started']): (group, rows[pid]['command'], mono)
+                             for pid, group in owner.items() if DURABLE.search(rows[pid]['command'])}
         port_owner = {port: owner.get(pid) for port, pid in listeners.items()}
         for port, mark in port_owner.items():
             if mark:
@@ -268,12 +293,19 @@ class Sampler(threading.Thread):
                 endpoints.get(('0.0.0.0', int(remote))) or endpoints.get(('[::]', int(remote)) if host == '[::1]' else None)
             server = owner.get(server_pid)
             if server and server != client:
-                events.append({'t': now, 'client': client, 'client_pid': pid, 'client_cmd': rows.get(pid, {}).get('command', '')[:200],
+                events.append({'t': now, 'm': mono, 'client': client, 'client_pid': pid, 'client_cmd': rows.get(pid, {}).get('command', '')[:200],
                                'server': server, 'port': int(remote)})
         self.cross.extend(events)
         self.samples += 1
-        log.write(json.dumps({'t': round(now, 2), 'procs': {m: sorted(p for p, o in owner.items() if o == m) for m in set(owner.values())},
+        log.write(json.dumps({'t': round(now, 2), 'm': mono, 'procs': {m: sorted(p for p, o in owner.items() if o == m) for m in set(owner.values())},
                               'listen': {str(p): m for p, m in port_owner.items() if m}, 'cross': events}) + '\n')
+        log.flush()
+        info = {'m': mono, 'owner': owner, 'listeners': listeners, 'rows': rows}
+        for listener in self.listeners:
+            try:
+                listener(info)
+            except Exception as error:  # a listener's failure is recorded, never fatal to sampling
+                self.errors.append(f'listener: {error!r}')
 
     def stop(self):
         self.stop_event.set()
@@ -284,7 +316,8 @@ class Sampler(threading.Thread):
         for (mark, pid, started), entry in self.seen.items():
             processes.setdefault(mark, []).append({'pid': pid, 'started': started, **entry})
         return {'samples': self.samples, 'errors': self.errors[:20], 'processes': processes,
-                'ports': {str(p): sorted(m) for p, m in self.ports.items()}, 'cross_worktree_connections': self.cross}
+                'ports': {str(p): sorted(m) for p, m in self.ports.items()}, 'cross_worktree_connections': self.cross,
+                'durable_losses': self.losses}
 
 
 def _same(row):

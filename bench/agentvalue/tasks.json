@@ -1,5 +1,5 @@
 {
-  "version": "stack-agentvalue-tasks/1",
+  "version": "stack-agentvalue-tasks/2",
   "tasks": [
     {
       "id": "invoice-notes",
@@ -52,6 +52,49 @@
         "post_reuses_customer",
         "post_new_customer",
         "customer_invoices_endpoint",
+        "migration_rerun_safe"
+      ]
+    },
+    {
+      "id": "invoice-list",
+      "branch": "feature/invoice-list",
+      "family": "list-and-index",
+      "instruction": "Add GET /invoices to list invoices as JSON: {\"invoices\": [...], \"next\": <id or null>}. Each item has the same fields as GET /invoices/<id>, and items are in ascending id order. Query parameters: status=open|paid keeps only that status; customer=<name> keeps only that customer's invoices (exact match); limit=<n> caps the page size (default 20, at most 100); after=<id> returns only invoices with a larger id. \"next\" is the id of the last invoice on the page when more matching invoices exist beyond it, otherwise null, so a client pages by passing it as after. An unknown status, a limit that is not a whole number from 1 to 100, or an after that is not a whole number of 0 or more, returns HTTP 400. Add a new migration (do not edit existing migrations) with an index on invoices that covers status and id for this query. Add or update tests for this.",
+      "no_op_failing_check": "list_all_ascending",
+      "required_checks": [
+        "existing_preserved",
+        "existing_api_intact",
+        "list_all_ascending",
+        "default_limit_20",
+        "filter_status",
+        "filter_customer",
+        "filters_combined",
+        "after_filter",
+        "paging_walk",
+        "next_null_on_full_last_page",
+        "bad_params_400",
+        "status_index",
+        "post_appears_in_list",
+        "migration_rerun_safe"
+      ]
+    },
+    {
+      "id": "void-invoices",
+      "branch": "feature/void-invoices",
+      "family": "state-and-constraint",
+      "instruction": "Add POST /invoices/<id>/void. Voiding an open invoice sets its status to \"void\" and returns the invoice. The database only allows the statuses open and paid today: add a new migration (do not edit existing migrations) so that it also allows void, still rejects any other status, and keeps every existing invoice. A paid invoice cannot be voided, and a void invoice cannot be voided again: both return HTTP 409 and change nothing. An unknown invoice returns 404. A void invoice is final: PATCH /invoices/<id> on it returns 409 and changes nothing. GET /invoices/<id> must show status \"void\" straight after voiding, even if the invoice was cached. Add or update tests for this.",
+      "no_op_failing_check": "void_open",
+      "required_checks": [
+        "existing_preserved",
+        "existing_api_intact",
+        "void_open",
+        "cache_after_void",
+        "void_paid_409",
+        "void_twice_409",
+        "void_unknown_404",
+        "patch_void_409",
+        "constraint_allows_void_only",
+        "other_invoice_untouched",
         "migration_rerun_safe"
       ]
     }
