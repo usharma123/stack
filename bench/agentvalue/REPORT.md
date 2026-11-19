@@ -6,10 +6,13 @@ Date: 2026-11-18. Branch `bench/agent-value`.
   `origin/fix/exercise-findings`. Stack 0.1.23, release build, binary sha256
   `4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3`. `cargo test --locked --all-targets`:
   746 passed.
-- **Harness.** At `b02a207`, validated 42/42 (`results/validation-b02a207/`).
-- **Plans.** `results/pilot-1/plan.json` and `results/baseline-1/plan.json`.
+- **Harness.** At `b02a207`, validated 42/42.
+- **Plans.** `pilot-1` and `baseline-1`; their parameters are under
+  [Plan parameters](#plan-parameters).
+- **Raw results.** Not in git. They are kept on this machine; see
+  [Where the raw results are](#where-the-raw-results-are).
 - **Method.** [PROTOCOL.md](PROTOCOL.md), with research in [RESEARCH.md](RESEARCH.md). Every number
-  below can be regenerated with
+  below can be regenerated on this machine from the local results with
   `python3 bench/agentvalue/harness/report.py --plan <plan> --results <dir>`.
 
 This build still has the known gap that `stack down` reports "confirmed" while commands started
@@ -90,14 +93,24 @@ Sample size: 15 agent sessions per arm (5 runs × 3 tasks), in 5 paired episodes
 Gated success and task success: every per-pair difference is 0. The bootstrap over pairs gives an
 interval of [0, 0]. No pair is discordant.
 
-**Per task** (medians over 5 repetitions, Stack | baseline). The full repetitions are in
-`results/baseline-1/analysis.txt`.
+**Per task** (medians over 5 repetitions, Stack | baseline). Every repetition is in the second table.
 
 | Task | Seconds | Tool calls | Cost USD | Notes |
 |---|---|---|---|---|
 | invoice-notes | 31.0 \| 34.4 | 5 \| 5 | 0.076 \| 0.075 | The least variable task in both arms |
 | pay-receipts | 41.4 \| 42.6 | 6 \| 6 | 0.103 \| 0.089 | Stack used one more call than its pair in 4 of 5 pairs |
 | customer-table | 44.9 \| 47.7 | 8 \| 6 | 0.114 \| 0.117 | The most variable task in both arms (baseline 5–12 calls) |
+
+Every repetition, in pair order:
+
+| Task | Arm | Seconds (pairs 0–4) | Tool calls | Turns | Cost USD |
+|---|---|---|---|---|---|
+| invoice-notes | stack | 32.4, 31.0, 34.9, 30.8, 23.9 | 5, 4, 6, 5, 5 | 6, 5, 7, 6, 6 | 0.076, 0.079, 0.088, 0.075, 0.071 |
+| invoice-notes | baseline | 34.4, 35.3, 36.4, 30.1, 27.5 | 5, 5, 5, 5, 5 | 6, 6, 6, 6, 6 | 0.077, 0.072, 0.081, 0.075, 0.074 |
+| pay-receipts | stack | 37.2, 44.6, 51.2, 34.3, 41.4 | 6, 7, 6, 5, 7 | 7, 8, 7, 6, 8 | 0.100, 0.107, 0.103, 0.088, 0.104 |
+| pay-receipts | baseline | 42.5, 49.5, 39.7, 44.0, 42.2 | 5, 6, 5, 6, 6 | 6, 7, 6, 7, 7 | 0.089, 0.091, 0.086, 0.089, 0.101 |
+| customer-table | stack | 57.4, 53.0, 44.9, 39.9, 37.8 | 8, 9, 9, 6, 6 | 9, 10, 10, 7, 7 | 0.119, 0.136, 0.114, 0.109, 0.109 |
+| customer-table | baseline | 47.7, 56.9, 38.8, 42.9, 55.6 | 6, 12, 5, 6, 10 | 7, 13, 6, 7, 11 | 0.117, 0.134, 0.106, 0.105, 0.132 |
 
 **Order:** gated success was 15/15 whatever the arm's position, so these data can show no order
 effect, and cannot rule one out.
@@ -120,8 +133,8 @@ not change any number above.
 ## Gate failures
 
 **There were none in any agent trial**: no teardown, isolation or disposal failure in the pilot or
-the baseline. Every gate was shown to fire on planted cases in validation
-(`results/validation-b02a207/validation.json`, 42 expectations):
+the baseline. Every gate was shown to fire on planted cases in validation (42 expectations, all
+passing at `b02a207`):
 
 | Planted case, both arms | Gate result |
 |---|---|
@@ -130,8 +143,7 @@ the baseline. Every gate was shown to fire on planted cases in validation
 | Agent restarts its worker with `pkill -f` and kills the main checkout's worker | Isolation fails, attributed to that agent (`main_process_killed`) |
 | Clean reference agents | Every gate holds; nothing is left after disposal |
 
-The first validation of `f9f524c` missed the planted kill once in the Stack arm
-(`results/validation-f9f524c/`). The killed worker was still finishing its one-second queue wait
+The first validation of `f9f524c` missed the planted kill once in the Stack arm. The killed worker was still finishing its one-second queue wait
 when the bystander was checked. The harness now waits 5 s after the last agent before comparing
 (`b02a207`). That was a harness defect, not a Stack result.
 
@@ -229,7 +241,9 @@ is not healthy is a deliberate contract. The owner decides whether "never starte
    server restart, between baseline pairs 2 and 3. Every pair has both arms on one version, so
    pairing holds. Plans now pin the versioned binary (PROTOCOL.md change log).
 2. **Baseline pair 3 was interrupted** by that restart before any agent started, and was rerun whole
-   under a rule set before its outcomes were seen (`results/baseline-1/NOTES.md`, `superseded-interrupted/`).
+   under a rule set before its outcomes were seen: an externally interrupted pair is rerun whole
+   into the same plan, so both arms stay back to back in time. Its completed baseline half and the
+   partial Stack run are kept locally (`baseline-1/superseded-interrupted/`) and excluded.
 3. **Pair 4 was refused once** by the plan's fingerprint check: I had added the descriptive
    `harness/analyze_traces.py` mid-plan. It was moved out of the tree for the run and added back
    afterwards. No file that affects a trial changed.
@@ -290,17 +304,108 @@ Wall-clock time:
 - the pilot: about 4 minutes;
 - the whole investigation: about 5 hours, including two host restarts.
 
-## Where everything is
+## Plan parameters
 
-- **Results** (committed: plans, `run.json`, grades, submissions, reports, analysis):
-  `bench/agentvalue/results/{pilot-1,baseline-1}/`.
-- **Full agent traces** (`trace.jsonl`, stream-json), stderr, sampler logs, submitted trees and
-  patches: on disk at the same paths, gitignored. About 3.6 MB of traces across 167 sessions,
-  including self-tests, on this host under
-  `/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/results/`.
-  They are scrubbed of credential-like values.
-- **Validation:** `results/validation-b02a207/`, binding, 42/42. Earlier ones are kept for the defects
-  they found.
+Both plans were written and committed before their runs.
+
+| | pilot-1 | baseline-1 |
+|---|---|---|
+| Pairs and arm order | 1 pair: Stack, then baseline | 5 pairs: Stack first in pairs 0, 2, 4; baseline first in pairs 1, 3 |
+| Seed | 20261118 | 1118 |
+| Stack source and binary | `dc4b980`, sha256 `4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3` | the same |
+| Harness revision when the plan was written | `c116374` | `3acd041` (both run the harness code of `b02a207`; only results and plans were committed in between) |
+| Agent model and effort | `claude-sonnet-5-5`, `high` | the same |
+| Agent CLI | Claude Code 2.1.327 | 2.1.327 in pairs 0–2, 2.1.328 in pairs 3–4 (see Deviations) |
+| Agent command | `claude -p <prompt> --model claude-sonnet-5-5 --effort high --output-format stream-json --verbose --safe-mode --strict-mcp-config --no-session-persistence --disable-slash-commands --permission-mode bypassPermissions --tools Bash,Read,Edit,Write --max-budget-usd 8` | the same |
+| Concurrency | 3 agents at once, plus the main checkout's services | the same |
+| Budgets per agent | 1800 s and US$8 | the same |
+| Tasks | `invoice-notes`, `pay-receipts`, `customer-table` | the same |
+| Locale, sampler | `en_US.UTF-8`, one sample per second | the same |
+| Host | macOS 27.2.1, Apple M5 Pro, 18 cores, 64 GiB; mise 2026.11.9, git 2.56.1 | the same |
+
+**Starting commits.** Every run builds a new one-commit repository, so each run has its own starting
+commit. Its content is the fixture plus the arm's files, and the hash differs only through the commit
+time and, in the Stack arm, the compiled lock.
+
+| Plan | Pair | Arm | Position | Starting commit | Run seconds | Sampler samples | State left outside the worktrees after disposal (bytes) |
+|---|---|---|---|---|---|---|---|
+| pilot-1 | 0 | stack | 1 | `c67815f53adf` | 104 | 47 | 90112 |
+| pilot-1 | 0 | baseline | 2 | `9f3f9503e4ea` | 129 | 67 | 0 |
+| baseline-1 | 0 | stack | 1 | `6643c642b348` | 110 | 52 | 90112 |
+| baseline-1 | 0 | baseline | 2 | `5187fd49187e` | 101 | 44 | 0 |
+| baseline-1 | 1 | baseline | 1 | `563c036ad7c8` | 110 | 52 | 0 |
+| baseline-1 | 1 | stack | 2 | `a4b94de68f77` | 107 | 48 | 90112 |
+| baseline-1 | 2 | stack | 1 | `952ec3cfaca1` | 106 | 47 | 86016 |
+| baseline-1 | 2 | baseline | 2 | `d23f36218657` | 93 | 38 | 0 |
+| baseline-1 | 3 | baseline | 1 | `030ada105bd1` | 98 | 41 | 0 |
+| baseline-1 | 3 | stack | 2 | `d47d398e6ac7` | 94 | 38 | 94208 |
+| baseline-1 | 4 | stack | 1 | `022f8bcdeb20` | 95 | 39 | 94208 |
+| baseline-1 | 4 | baseline | 2 | `d5d70e7c1723` | 110 | 51 | 0 |
+
+## Every session
+
+### baseline-1
+
+| Pair | Arm | Position | Task | Hidden checks | Teardown | Isolation | Clean exit | Seconds | Tool calls | Turns | Tool errors | Cost USD | CLI |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | stack | 1 | invoice-notes | pass | pass | pass | pass | 32.4 | 5 | 6 | 0 | 0.076 | 2.1.327 |
+| 0 | stack | 1 | pay-receipts | pass | pass | pass | pass | 37.2 | 6 | 7 | 0 | 0.100 | 2.1.327 |
+| 0 | stack | 1 | customer-table | pass | pass | pass | pass | 57.4 | 8 | 9 | 1 | 0.119 | 2.1.327 |
+| 0 | baseline | 2 | invoice-notes | pass | pass | pass | pass | 34.4 | 5 | 6 | 0 | 0.077 | 2.1.327 |
+| 0 | baseline | 2 | pay-receipts | pass | pass | pass | pass | 42.5 | 5 | 6 | 0 | 0.089 | 2.1.327 |
+| 0 | baseline | 2 | customer-table | pass | pass | pass | pass | 47.7 | 6 | 7 | 0 | 0.117 | 2.1.327 |
+| 1 | baseline | 1 | invoice-notes | pass | pass | pass | pass | 35.3 | 5 | 6 | 0 | 0.072 | 2.1.327 |
+| 1 | baseline | 1 | pay-receipts | pass | pass | pass | pass | 49.5 | 6 | 7 | 0 | 0.091 | 2.1.327 |
+| 1 | baseline | 1 | customer-table | pass | pass | pass | pass | 56.9 | 12 | 13 | 1 | 0.134 | 2.1.327 |
+| 1 | stack | 2 | invoice-notes | pass | pass | pass | pass | 31.0 | 4 | 5 | 0 | 0.079 | 2.1.327 |
+| 1 | stack | 2 | pay-receipts | pass | pass | pass | pass | 44.6 | 7 | 8 | 0 | 0.107 | 2.1.327 |
+| 1 | stack | 2 | customer-table | pass | pass | pass | pass | 53.0 | 9 | 10 | 1 | 0.136 | 2.1.327 |
+| 2 | stack | 1 | invoice-notes | pass | pass | pass | pass | 34.9 | 6 | 7 | 1 | 0.088 | 2.1.327 |
+| 2 | stack | 1 | pay-receipts | pass | pass | pass | pass | 51.2 | 6 | 7 | 0 | 0.103 | 2.1.327 |
+| 2 | stack | 1 | customer-table | pass | pass | pass | pass | 44.9 | 9 | 10 | 1 | 0.114 | 2.1.327 |
+| 2 | baseline | 2 | invoice-notes | pass | pass | pass | pass | 36.4 | 5 | 6 | 0 | 0.081 | 2.1.327 |
+| 2 | baseline | 2 | pay-receipts | pass | pass | pass | pass | 39.7 | 5 | 6 | 0 | 0.086 | 2.1.327 |
+| 2 | baseline | 2 | customer-table | pass | pass | pass | pass | 38.8 | 5 | 6 | 0 | 0.106 | 2.1.327 |
+| 3 | baseline | 1 | invoice-notes | pass | pass | pass | pass | 30.1 | 5 | 6 | 0 | 0.075 | 2.1.328 |
+| 3 | baseline | 1 | pay-receipts | pass | pass | pass | pass | 44.0 | 6 | 7 | 0 | 0.089 | 2.1.328 |
+| 3 | baseline | 1 | customer-table | pass | pass | pass | pass | 42.9 | 6 | 7 | 0 | 0.105 | 2.1.328 |
+| 3 | stack | 2 | invoice-notes | pass | pass | pass | pass | 30.8 | 5 | 6 | 0 | 0.075 | 2.1.328 |
+| 3 | stack | 2 | pay-receipts | pass | pass | pass | pass | 34.3 | 5 | 6 | 0 | 0.088 | 2.1.328 |
+| 3 | stack | 2 | customer-table | pass | pass | pass | pass | 39.9 | 6 | 7 | 0 | 0.109 | 2.1.328 |
+| 4 | stack | 1 | invoice-notes | pass | pass | pass | pass | 23.9 | 5 | 6 | 0 | 0.071 | 2.1.328 |
+| 4 | stack | 1 | pay-receipts | pass | pass | pass | pass | 41.4 | 7 | 8 | 0 | 0.104 | 2.1.328 |
+| 4 | stack | 1 | customer-table | pass | pass | pass | pass | 37.8 | 6 | 7 | 0 | 0.109 | 2.1.328 |
+| 4 | baseline | 2 | invoice-notes | pass | pass | pass | pass | 27.5 | 5 | 6 | 0 | 0.074 | 2.1.328 |
+| 4 | baseline | 2 | pay-receipts | pass | pass | pass | pass | 42.2 | 6 | 7 | 0 | 0.101 | 2.1.328 |
+| 4 | baseline | 2 | customer-table | pass | pass | pass | pass | 55.6 | 10 | 11 | 0 | 0.132 | 2.1.328 |
+
+### pilot-1
+
+| Pair | Arm | Position | Task | Hidden checks | Teardown | Isolation | Clean exit | Seconds | Tool calls | Turns | Tool errors | Cost USD | CLI |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | stack | 1 | invoice-notes | pass | pass | pass | pass | 30.5 | 5 | 6 | 0 | 0.090 | 2.1.327 |
+| 0 | stack | 1 | pay-receipts | pass | pass | pass | pass | 51.3 | 6 | 7 | 0 | 0.097 | 2.1.327 |
+| 0 | stack | 1 | customer-table | pass | pass | pass | pass | 42.1 | 7 | 8 | 1 | 0.122 | 2.1.327 |
+| 0 | baseline | 2 | invoice-notes | pass | pass | pass | pass | 35.9 | 5 | 6 | 0 | 0.076 | 2.1.327 |
+| 0 | baseline | 2 | pay-receipts | pass | pass | pass | pass | 44.4 | 5 | 6 | 0 | 0.089 | 2.1.327 |
+| 0 | baseline | 2 | customer-table | pass | pass | pass | pass | 75.9 | 13 | 14 | 1 | 0.166 | 2.1.327 |
+
+## Where the raw results are
+
+The `results/` directory is not in git (it was tracked until the commit that added this section).
+Everything a reader needs is in this report and in PROTOCOL.md. The raw records stay on the machine
+that ran the trials:
+
+`/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/results/`
+
+- `pilot-1/` and `baseline-1/`: the plan, and per run a `run.json` (every observation), the grades,
+  each agent's prompt, argv, full stream-json trace, stderr, submitted tree and patch, the sampler
+  log, and the generated `report.json` and `report.md`. `baseline-1/superseded-interrupted/` holds the
+  interrupted pair 3.
+- `validation-b02a207/`: the binding validation (42/42). Earlier validation runs are kept for the
+  defects they found.
+- About 3.6 MB of traces across 167 sessions, self-tests included. Every retained file was scrubbed
+  of credential-like values.
 
 ## Decisions for the owner
 

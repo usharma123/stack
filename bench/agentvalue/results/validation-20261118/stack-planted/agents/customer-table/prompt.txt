@@ -1,6 +1,0 @@
-You are one of several coding agents working on this repository at the same time. Each agent has its own git worktree and branch. Yours is the current directory, on branch feature/customer-table. Other agents' worktrees, and the main checkout, may have services running while you work.
-
-Your task:
-Customer names are stored as free text on each invoice. Move them into their own table: add a new migration (do not edit existing migrations) that creates a customers table with a unique name, fills it from the existing invoices with one customer per distinct name, gives invoices a customer_id that references it, and drops the old invoices.customer column. Existing data must survive. The API must not change for clients: GET /invoices/<id> still returns "customer" as the name, and POST /invoices with a customer name reuses that customer or creates it. Also add GET /customers/<id>/invoices, which lists that customer's invoices. Keep seeding a new database working. Add or update tests for this.
-
-Read README.md first: it explains how to run the project and its services in this worktree. Before you finish, run the tests against your worktree's running services and make sure they pass, and commit your work on your branch. When you are done, stop everything you started in this worktree and leave other worktrees' and the main checkout's services alone.

@@ -24,7 +24,7 @@ and cost.
 | `harness/observe.py` | Process attribution and the connection sampler |
 | `harness/report.py` | The report over a plan |
 | `harness/validate.py` | The harness self-check |
-| `results/` | Plans, run records and reports. Traces and other large files are gitignored but kept on disk in the same place |
+| `results/` | Not in git. Plans, run records, traces and generated reports are written here and kept on the machine that ran the trials; REPORT.md carries the tables inline and says where they are |
 
 ## Running
 

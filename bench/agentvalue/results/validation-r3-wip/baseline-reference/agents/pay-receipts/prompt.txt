@@ -1,6 +1,0 @@
-You are one of several coding agents working on this repository at the same time. Each agent has its own git worktree and branch. Yours is the current directory, on branch feature/pay-receipts. Other agents' worktrees, and the main checkout, may have services running while you work.
-
-Your task:
-Add POST /invoices/<id>/pay. Paying an open invoice marks it paid and queues an issue_receipt job, and the worker then records the receipt. Paying an invoice that is already paid returns HTTP 409 and queues nothing; an unknown invoice returns 404. The job queue delivers at least once, so the same job can arrive more than once: the worker must never record two receipts for one invoice. GET /invoices/<id> must show status "paid" straight after paying, even if the invoice was cached. Add or update tests for this.
-
-Read README.md first: it explains how to run the project and its services in this worktree. Before you finish, run the tests against your worktree's running services and make sure they pass, and commit your work on your branch. When you are done, stop everything you started in this worktree and leave other worktrees' and the main checkout's services alone.
