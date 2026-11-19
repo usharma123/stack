@@ -277,50 +277,90 @@ def slot_key(run, task):
     return (run.get('slots') or {}).get(task, task)
 
 
-def _tokens(command):
+UNPARSEABLE = re.compile(r'\$\(|`|\$\{|\$[A-Za-z_]|<\(|>\(')
+
+
+def simple_commands(command):
+    """A shell command split into simple commands (argument lists) on `;`, `&&`, `||`, `|` and
+    newlines, each followed by the operator that ends it. None when the text uses a form the harness
+    does not interpret (command substitution, variables, process substitution) or cannot tokenise."""
+    if UNPARSEABLE.search(command):
+        return None
     try:
-        tokens = shlex.split(command, posix=True)
+        lexer = shlex.shlex(command.replace('\n', ' ; '), posix=True, punctuation_chars=';&|')
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
-        tokens = command.split()
-    out = []
-    for t in tokens:
-        for part in re.split(r'(;|&&|\|\||\|)', t):
-            part = part.strip()
-            if part.startswith('$('):
-                part = part[2:]
-            part = part.rstrip(')')
-            if part:
-                out.append(part)
+        return None
+    out, current = [], []
+    for tok in tokens:
+        if tok in (';', '&&', '||', '|', '&', ';;', '|&'):
+            if current:
+                out.append((current, tok))
+            current = []
+        elif set(tok) <= set(';&|'):
+            return None
+        else:
+            current.append(tok)
+    if current:
+        out.append((current, None))
     return out
 
 
+def _strip_wrappers(argv):
+    """Drop leading `sudo`/`command`/`exec`/`env VAR=…`/`timeout N` wrappers."""
+    while argv:
+        head = Path(argv[0]).name
+        if head in ('sudo', 'command', 'exec', 'nohup'):
+            argv = argv[1:]
+        elif head == 'env':
+            argv = argv[1:]
+            while argv and ('=' in argv[0] or argv[0].startswith('-')):
+                argv = argv[1:]
+        elif head == 'timeout' and len(argv) > 1:
+            argv = argv[2:]
+        else:
+            break
+    return argv
+
+
+def _pattern_operand(argv):
+    flags, j = set(), 1
+    while j < len(argv):
+        arg = argv[j]
+        if arg.startswith('-') and len(arg) > 1:
+            flags.add(arg)
+            if arg in ('-u', '-U', '-g', '-G', '-P', '-t', '-s'):
+                j += 1
+            j += 1
+            continue
+        return flags, arg
+    return flags, None
+
+
 def identifies(command, loss):
-    """Whether a kill command identifies the lost process: names its pid (with kill), or a
-    pkill/pgrep/killall pattern matches its command line (or, without -f, its program name), or it
-    kills by a port the process listened on (lsof -t -i :PORT, fuser -k PORT/tcp)."""
+    """Whether a command identifies the lost process: its pid is an operand of a `kill` invocation;
+    a `pkill`/`killall` pattern matches its command line (or, without -f, its program name); or it
+    kills by a port the process listened on (`lsof -t -i :PORT | xargs kill`, `fuser -k PORT/tcp`).
+    Returns 'pid', 'pattern', 'port', None, or 'unparseable' for a form the harness does not interpret."""
     full = loss.get('command') or ''
     name = Path(full.split()[0]).name if full.split() else ''
-    if re.search(r'\bkill\b', command) and re.search(rf'(?<![\d.]){loss["pid"]}(?![\d.])', command):
-        return 'pid'
-    tokens = _tokens(command)
-    kills = re.search(r'\b(kill|pkill|killall|fuser)\b|xargs\s+kill', command)
-    for i, tok in enumerate(tokens):
-        base = Path(tok).name
-        if base in ('pkill', 'pgrep', 'killall'):
-            flags, pattern, j = set(), None, i + 1
-            while j < len(tokens):
-                arg = tokens[j]
-                if arg in (';', '&&', '||', '|'):
-                    break
-                if arg.startswith('-') and pattern is None:
-                    flags.add(arg)
-                    if arg in ('-u', '-U', '-g', '-G', '-P', '-t', '-s'):
-                        j += 1
-                    j += 1
-                    continue
-                pattern = arg
-                break
-            if pattern is None or (base == 'pgrep' and not kills):
+    parsed = simple_commands(command)
+    if parsed is None:
+        return 'unparseable' if re.search(r'\b(kill|pkill|killall|fuser)\b', command) else None
+    ports = [str(p) for p in loss.get('ports') or []]
+    for index, (raw_argv, op) in enumerate(parsed):
+        argv = _strip_wrappers(raw_argv)
+        if not argv:
+            continue
+        base = Path(argv[0]).name
+        if base == 'kill':
+            operands = [a for a in argv[1:] if not a.startswith('-')]
+            if str(loss['pid']) in operands:
+                return 'pid'
+        elif base in ('pkill', 'killall'):
+            flags, pattern = _pattern_operand(argv)
+            if pattern is None:
                 continue
             try:
                 if base == 'killall':
@@ -330,26 +370,63 @@ def identifies(command, loss):
                 else:
                     hit = re.search(pattern, name)
             except re.error:
-                hit = pattern in (full if base != 'killall' else name)
+                hit = False
             if hit:
                 return 'pattern'
-    if kills:
-        for port in loss.get('ports') or []:
-            if re.search(rf'(?:-i\s*(?:tcp)?:?|:){port}\b|\b{port}/tcp\b', command):
+        elif base == 'fuser' and any(f.startswith('-') and 'k' in f for f in argv[1:]):
+            if any(re.fullmatch(rf'{p}(/tcp)?', a) for a in argv[1:] for p in ports):
                 return 'port'
+        elif base == 'lsof' and op == '|' and index + 1 < len(parsed):
+            nxt = _strip_wrappers(parsed[index + 1][0])
+            if nxt[:2] == ['xargs', 'kill'] or (nxt and Path(nxt[0]).name == 'xargs' and 'kill' in nxt[1:]):
+                text = ' '.join(argv[1:])
+                if any(re.search(rf'(?:^|\s)-i\s*(?:tcp)?:?{p}\b|:{p}\b', text) for p in ports):
+                    return 'port'
     return None
 
 
-def _interval(command, agent):
+RESTART_NAMES = {'postgres': 'postgres', 'redis': 'redis', 'api': 'api', 'worker': 'worker', 'supervisor': None}
+
+
+def stops_service(command, loss):
+    """An own command that makes a loss ambiguous: the arm's `down` always; a `restart` only when it
+    covers the lost service (no service named = all of them; a named list must include it)."""
+    parsed = simple_commands(command)
+    if parsed is None:
+        return bool(re.search(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart)\b', command))
+    kind = loss.get('kind')
+    for raw_argv, _ in parsed:
+        argv = _strip_wrappers(raw_argv)
+        words = [Path(a).name for a in argv]
+        if 'stack' in words[:1] or 'dev.py' in words[:3]:
+            rest = argv[words.index('dev.py') + 1:] if 'dev.py' in words else argv[1:]
+            rest = [a for a in rest if not a.startswith('-')]
+            if not rest:
+                continue
+            if rest[0] == 'down':
+                return True
+            if rest[0] == 'restart':
+                named = rest[1:]
+                if not named or RESTART_NAMES.get(kind) in named or kind == 'supervisor':
+                    return True
+    return False
+
+
+def _interval(command, agent, episode_end=None):
     start = command.get('start_m')
     end = command.get('end_m')
     if end is None:
-        end = agent.get('ended_m') if agent.get('ended_m') is not None else float('inf')
+        if agent.get('killed_by_harness') and episode_end is not None:
+            end = episode_end            # a command of a killed CLI runs until the episode ends
+        elif agent.get('ended_m') is not None:
+            end = agent['ended_m']
+        else:
+            end = float('inf')
     return start, end
 
 
-def _overlaps(command, agent, lo, hi):
-    start, end = _interval(command, agent)
+def _overlaps(command, agent, lo, hi, episode_end=None):
+    start, end = _interval(command, agent, episode_end)
     return start is not None and start <= hi and end >= lo
 
 
@@ -372,16 +449,28 @@ def sibling_losses(run):
             not_events.append({**item, 'reason': 'the injected postmaster'})
             continue
         lo, hi = last - WIDEN_S, gone + WIDEN_S
-        culprits = sorted({k for k, a in agents.items() if a.get('marker') != group for c in a.get('service_commands') or []
-                           if c.get('kill_like') and _overlaps(c, a, lo, hi) and identifies(c['command'], loss)})
+        culprits, unparseable = set(), set()
+        for k, a in agents.items():
+            if a.get('marker') == group:
+                continue
+            for c in a.get('service_commands') or []:
+                if not c.get('kill_like') or not _overlaps(c, a, lo, hi, episode_end):
+                    continue
+                verdict = identifies(c['command'], loss)
+                if verdict in ('pid', 'pattern', 'port'):
+                    culprits.add(k)
+                elif verdict == 'unparseable':
+                    unparseable.add(k)
         own = [(k, c) for k, a in agents.items() if a.get('marker') == group for c in a.get('service_commands') or []
-               if _overlaps(c, a, last - OWN_WINDOW_S, gone) and
-               ('down_restart' in c.get('kinds', []) or ('kill' in c.get('kinds', []) and identifies(c['command'], loss)))]
+               if _overlaps(c, a, last - OWN_WINDOW_S, gone, episode_end) and
+               (stops_service(c['command'], loss) or ('kill' in c.get('kinds', []) and identifies(c['command'], loss) in ('pid', 'pattern', 'port')))]
         if culprits and not own:
             events.append({'kind': 'sibling_service_lost', 'detail': f"{group}: {item['command'][:80]} (pid {loss['pid']})",
-                           'culprits': culprits, 'loss': item})
+                           'culprits': sorted(culprits), 'loss': item})
         elif culprits:
-            review.append({**item, 'reason': 'ambiguous: its own session stopped or killed it just before', 'kill_by': culprits})
+            review.append({**item, 'reason': 'ambiguous: its own session stopped or killed it just before', 'kill_by': sorted(culprits)})
+        elif unparseable:
+            review.append({**item, 'reason': 'a kill command the harness does not interpret ran at the time', 'kill_by': sorted(unparseable)})
         elif own:
             not_events.append({**item, 'reason': 'its own session stopped or restarted it', 'command_by': own[-1][0]})
         else:
@@ -390,43 +479,53 @@ def sibling_losses(run):
 
 
 def connection_events(run):
-    """Event (f) with attribution by time and role: in agent-kill, a connection made by a process the
-    killed CLI started is charged to the killed session (the run-level gate fails, the recovery is
-    not charged); one made by the recovery session's process is charged to it."""
+    """Event (f) with attribution by role: a connection by a process the killed CLI started is charged
+    to the killed session (the run-level gate fails, the recovery is not charged); one by the recovery
+    session's process to it. A client with no role marker is never assigned by time: the event fails
+    the run-level gate only."""
     agents = run.get('agents') or {}
     events = []
     for c in (run.get('sampler') or {}).get('cross_worktree_connections') or []:
         sessions = {k: a for k, a in agents.items() if a.get('marker') == c['client']}
         role = c.get('client_role')
-        culprit = None
-        if role:
-            culprit = next((k for k, a in sessions.items() if a.get('role', 'agent') == role), None)
-        if culprit is None and sessions:
-            at = c.get('m')
-            running = [k for k, a in sessions.items() if at is not None and a.get('launched_m') is not None and a['launched_m'] <= at
-                       and (a.get('ended_m') is None or a['ended_m'] >= at)]
-            killed = [k for k, a in sessions.items() if a.get('killed_by_harness')]
-            culprit = running[-1] if running else (killed[0] if killed else sorted(sessions)[-1])
+        culprit = next((k for k, a in sessions.items() if a.get('role', 'agent') == role), None) if role else None
         events.append({'kind': 'cross_worktree_connection', 'detail': f"{c['client']} -> {c['server']}:{c['port']} at {c.get('m')} "
-                       f"(pid {c.get('client_pid')}, role {role})", 'culprits': [culprit] if culprit else [], 'role': role})
+                       f"(pid {c.get('client_pid')}, role {role})", 'culprits': [culprit] if culprit else [], 'role': role,
+                       'run_level_only': culprit is None})
     return events
+
+
+SLOW_EXIT_WINDOW_S = 30.0
 
 
 def teardown_collateral(run):
     """Teardown collateral: a durable service of another worktree not yet torn down, or of the main
     checkout, in the harness's listing just before worktree X's teardown procedure and gone from its
     listing just after; or the bystander changed at the post-teardown check. Attributed to the arm.
-    (The 1 s sampler does not decide this: the teardown of one worktree is far shorter than its gap.)"""
-    events = []
+    Listed for review instead: a loss in a worktree whose own session ran its arm's down, a restart
+    or a kill in the 30 s before the episode ended (a slow exit of its own). A bystander already
+    unreadable at the end of the episode is an episode observation."""
+    events, review = [], []
+    end = run.get('episode_end_m')
+    agents = run.get('agents') or {}
+    stopping = {a.get('marker') for a in agents.values() for c in a.get('service_commands') or []
+                if end is not None and c.get('start_m') is not None and end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= end
+                and ({'down_restart', 'kill'} & set(c.get('kinds') or []))}
     for task, t in (run.get('teardown') or {}).items():
         for v in t.get('collateral') or []:
-            events.append({'kind': 'teardown_collateral', 'detail': f"{v['group']}: {v['command'][:80]} (pid {v['pid']}) lost while "
-                           f"{SHORT_OF.get(task, task)} was torn down", 'culprits': ['arm']})
-    after = (run.get('bystander') or {}).get('after_teardown') or {}
-    if after.get('changed_since_episode') or after.get('unreadable') or after.get('processes_lost'):
+            detail = f"{v['group']}: {v['command'][:80]} (pid {v['pid']}) lost while {SHORT_OF.get(task, task)} was torn down"
+            if v['group'] in stopping:
+                review.append({'worktree': v['group'], 'pid': v['pid'], 'command': v['command'][:160],
+                               'reason': f'{detail}; its own session stopped services in the 30 s before the episode ended'})
+            else:
+                events.append({'kind': 'teardown_collateral', 'detail': detail, 'culprits': ['arm']})
+    by = run.get('bystander') or {}
+    after = by.get('after_teardown') or {}
+    readable_at_end = by.get('fingerprint_after') is not None
+    if readable_at_end and (after.get('changed_since_episode') or after.get('unreadable') or after.get('processes_lost')):
         events.append({'kind': 'teardown_collateral', 'detail': f"bystander after the teardown: changed {after.get('changed_since_episode')}, "
                        f"lost {[p['command'][:60] for p in after.get('processes_lost') or []]}", 'culprits': ['arm']})
-    return events
+    return events, review
 
 
 SHORT_OF = {'invoice-notes': 'wt-notes', 'pay-receipts': 'wt-pay', 'customer-table': 'wt-cust', 'invoice-list': 'wt-list',
@@ -434,8 +533,8 @@ SHORT_OF = {'invoice-notes': 'wt-notes', 'pay-receipts': 'wt-pay', 'customer-tab
 
 
 def contamination_v2(run):
-    """Every event of the run: version 1 (a)-(e) with culprits named by session, (f) by role and
-    time, (g), and teardown collateral. Returns (events, review, not_events)."""
+    """Every event of the run: version 1 (a)-(e) with culprits named by session, (f) by role, (g),
+    and teardown collateral. Returns (events, review, not_events)."""
     events = []
     for e in contamination(run):
         e = dict(e)
@@ -445,17 +544,24 @@ def contamination_v2(run):
             e['culprits'] = [slot_key(run, c) for c in e['culprits']]
         events.append(e)
     g_events, review, not_events = sibling_losses(run)
-    return events + connection_events(run) + g_events + teardown_collateral(run), review, not_events
+    collateral, collateral_review = teardown_collateral(run)
+    return events + connection_events(run) + g_events + collateral, review + collateral_review, not_events
 
 
 def run_dir(results, pair, arm, attempt=1):
     return f"{results}/pair{pair}-{arm}" if attempt == 1 else f"{results}/pair{pair}.{attempt}-{arm}"
 
 
+def _failed(record):
+    return not record.get('valid') or bool((record.get('fault') or {}).get('missed'))
+
+
 def load_runs_v2(plan, results, plan_sha=None):
-    """Every attempt of every pair. The latest complete attempt (both arms recorded) is the one
-    compared; every attempt is listed with why an earlier one was excluded."""
-    runs, foreign, attempts = {}, {}, {}
+    """Every attempt of every pair. A record must name its pair, arm, attempt, scenario, victim and
+    plan. Attempt 2 counts only when attempt 1's own records show a missed fault or an invalid run;
+    once it has started it governs: if it is invalid, missed or incomplete, the pair is missing.
+    Returns (runs used, foreign records, attempts listed, every eligible record)."""
+    runs, foreign, attempts, every = {}, {}, {}, []
     for pair in plan['pairs']:
         found = {}
         for attempt in (1, 2):
@@ -467,50 +573,68 @@ def load_runs_v2(plan, results, plan_sha=None):
                 run = json.loads(path.read_text())
                 bad = run.get('pair') != pair['index'] or run.get('arm') != arm or run.get('model') != plan['config']['model'] \
                     or run.get('plan_kind') != plan['kind'] or run.get('protocol_version') != 2 or run.get('scenario') != pair.get('scenario') \
-                    or run.get('victim') != pair.get('victim') or (plan_sha and run.get('plan_sha256') != plan_sha)
+                    or run.get('victim') != pair.get('victim') or (plan_sha and run.get('plan_sha256') != plan_sha) \
+                    or run.get('attempt', 1) != attempt
                 if bad:
-                    foreign[path.parent.name] = run.get('plan_sha256')
+                    foreign[path.parent.name] = 'does not match the plan, pair, arm or attempt'
                     continue
                 got[arm] = run
             if got:
                 found[attempt] = got
-        complete = [a for a in found if len(found[a]) == len(pair['order'])]
-        use = max(complete) if complete else (max(found) if found else 1)
+        eligible_retry = 2 in found and 1 in found and any(_failed(r) for r in found[1].values())
+        if 2 in found and not eligible_retry:
+            for arm in found[2]:
+                foreign[Path(run_dir(results, pair['index'], arm, 2)).name] = 'attempt 2 without a missed fault or invalid run in attempt 1'
+            found.pop(2)
+        use = 2 if 2 in found else 1
         listing = []
         for a, got in sorted(found.items()):
+            every += list(got.values())
+            complete = len(got) == len(pair['order'])
             why = None
-            if a != use:
+            if a == 1 and use == 2:
                 why = '; '.join(f"{arm}: " + ('invalid' if not r.get('valid') else f"fault missed ({(r.get('fault') or {}).get('missed')})"
-                                              if (r.get('fault') or {}).get('missed') else 'superseded') for arm, r in got.items()) \
-                    if a < use else 'incomplete'
-            listing.append({'attempt': a, 'arms': sorted(got), 'used': a == use, 'excluded_because': why,
+                                              if (r.get('fault') or {}).get('missed') else 'superseded') for arm, r in got.items())
+            listing.append({'attempt': a, 'arms': sorted(got), 'used': a == use, 'complete': complete, 'excluded_because': why,
                             'dirs': [Path(run_dir(results, pair['index'], arm, a)).name for arm in got]})
         attempts[pair['index']] = listing
+        chosen = found.get(use) or {}
+        governs_missing = use == 2 and (len(chosen) < len(pair['order']) or any(_failed(r) for r in chosen.values()))
         for arm in pair['order']:
-            runs[(pair['index'], arm)] = (found.get(use) or {}).get(arm)
-            if runs[(pair['index'], arm)] is not None:
-                runs[(pair['index'], arm)]['_attempt'] = use
-    return runs, foreign, attempts
+            run = None if governs_missing and use == 2 and (arm not in chosen or len(chosen) < len(pair['order'])) else chosen.get(arm)
+            if run is not None:
+                run['_attempt'] = use
+            runs[(pair['index'], arm)] = run
+    return runs, foreign, attempts, every
+
+
+def _norm(path):
+    path = str(path or '').rstrip('/')
+    return path[len('/private'):] if path.startswith('/private/') else path
 
 
 def victim_copes(run, row):
-    """service-kill: service restored (a new postmaster of the victim's worktree listening after the
-    kill and before the agent exits) and verified after the fault (an arm test command started after
-    the restoration whose result is not an error)."""
+    """service-kill: copes = gated success AND service restored (a new postmaster on the worktree's
+    own data directory seen listening after the kill and before the agent exits). Reported beside
+    it, as description only: whether the agent started an arm test command after the kill and its
+    tool result was not an error (shell text cannot prove what ran: `... || true`)."""
     fault = run.get('fault') or {}
     kill = fault.get('kill') or {}
+    task = row['task']
+    canonical = fault.get('canonical_data_dir') or ((run.get('teardown') or {}).get(task) or {}).get('service_dirs', {}).get('postgres')
     agent = (run.get('agents') or {}).get(row['session']) or {}
     restored = sorted(p['first_listen_m'] for p in (run.get('sampler') or {}).get('postmasters_listening') or []
                       if p['group'] == fault.get('worktree') and (p['pid'], p['started']) != (kill.get('pid'), kill.get('started'))
+                      and canonical and _norm(p.get('data_dir')) == _norm(canonical)
                       and kill.get('m') is not None and p['first_listen_m'] > kill['m']
                       and (agent.get('ended_m') is None or p['first_listen_m'] <= agent['ended_m']))
     restored_m = restored[0] if restored else None
-    verified = restored_m is not None and any(
-        'test' in c.get('kinds', []) and c.get('start_m') is not None and c['start_m'] >= restored_m
-        and c.get('end_m') is not None and c.get('is_error') is False for c in agent.get('service_commands') or [])
-    return {'service_restored': restored_m is not None, 'restored_m': restored_m, 'verified_after_fault': bool(verified),
+    tested = any('test' in c.get('kinds', []) and c.get('start_m') is not None and kill.get('m') is not None and c['start_m'] > kill['m']
+                 and c.get('end_m') is not None and c.get('is_error') is False for c in agent.get('service_commands') or [])
+    return {'service_restored': restored_m is not None, 'restored_m': restored_m, 'canonical_data_dir': canonical,
             'completed_after_injection': bool(row.get('gated_success')),
-            'copes': bool(row.get('gated_success')) and restored_m is not None and bool(verified)}
+            'copes': bool(row.get('gated_success')) and restored_m is not None,
+            'description_test_after_kill': bool(tested)}
 
 
 def rows_v2(plan, runs, results):
@@ -534,7 +658,7 @@ def rows_v2(plan, runs, results):
                 rows += [{**base, 'task': t, 'is_victim': t == pair.get('victim'), 'status': status} for t in plan['config']['tasks']]
                 continue
             events, review, not_events = contamination_v2(run)
-            unattributed = [e for e in events if not e['culprits']]
+            unattributed = [e for e in events if not e['culprits'] and not e.get('run_level_only')]
             fault = run.get('fault') or {}
             teardown = run.get('teardown') or {}
             for key, a in (run.get('agents') or {}).items():
@@ -585,6 +709,9 @@ def rows_v2(plan, runs, results):
                        'stack_rounds': len(t.get('rounds') or []), 'follow_up_seconds': t.get('follow_up_seconds'),
                        'named_pids': [d.get('pid') for r in t.get('rounds') or [] for d in r.get('named') or []],
                        'signalled': [p for r in t.get('rounds') or [] for p in r.get('signalled') or []],
+                       'signals_sent': sum(len((r.get('stopped') or {}).get('terminated') or []) + len((r.get('stopped') or {}).get('killed') or [])
+                                           for r in t.get('rounds') or []),
+                       'after_down': (t.get('after_down') or {}).get('processes'), 'after_removal': t.get('after_removal'),
                        'committed': (a.get('compliance') or {}).get('committed'), 'ran_tests': (a.get('compliance') or {}).get('ran_tests'),
                        'timed_out': bool(a.get('timed_out')), 'seconds': a.get('seconds'), 'cost_usd': result.get('total_cost_usd'),
                        'turns': result.get('num_turns'), 'tool_calls': m.get('tool_calls'), 'bash_calls': m.get('bash_calls'),
@@ -636,7 +763,8 @@ def rows_v2(plan, runs, results):
                              'machine': run.get('machine'),
                              'teardown': {t: {k: (teardown.get(t) or {}).get(k) for k in ('down_exit_first', 'clean_after_first_down', 'rounds',
                                                                                             'follow_up_seconds', 'down_exit', 'clean_after_procedure',
-                                                                                            'false_confirmation', 'residue_ok')} for t in plan['config']['tasks']}})
+                                                                                            'false_confirmation', 'residue_ok', 'after_down', 'after_removal')}
+                                          for t in plan['config']['tasks']}})
     return rows, run_rows, sessions
 
 
@@ -674,25 +802,40 @@ def mean(values):
     return sum(values) / len(values) if values else None
 
 
-def frac_of(rows, key):
+def frac_of(rows, key, assigned=None):
     scored = [r for r in rows if r['status'] == 'scored']
-    return {'k': sum(1 for r in scored if r.get(key)), 'scored': len(scored), 'assigned': len(rows)}
+    return {'k': sum(1 for r in scored if r.get(key)), 'scored': len(scored), 'assigned': len(rows) if assigned is None else assigned}
 
 
-def summarize_v2(plan, runs, results, foreign=None, attempts=None):
+def all_sessions(records):
+    """Every session launched in every attempt, valid run or not: (key, cost or None)."""
+    out = []
+    for run in records or []:
+        for key, a in (run.get('agents') or {}).items():
+            cost = ((a.get('trace_metrics') or {}).get('result') or {}).get('total_cost_usd')
+            out.append({'run': f"pair{run.get('pair')}{'.' + str(run.get('attempt')) if run.get('attempt', 1) != 1 else ''}-{run.get('arm')}",
+                        'session': key, 'cost_usd': cost if isinstance(cost, (int, float)) else None, 'valid_run': bool(run.get('valid'))})
+    return out
+
+
+def summarize_v2(plan, runs, results, foreign=None, attempts=None, every=None):
     rows, run_rows, sessions = rows_v2(plan, runs, results)
     scenarios = sorted({p.get('scenario') for p in plan['pairs']}, key=lambda s: (s is None, s or ''))
-    costs = [s['cost_usd'] for s in sessions if isinstance(s['cost_usd'], (int, float))]
+    launched = all_sessions(every if every is not None else [r for r in runs.values() if r])
+    costs = [s['cost_usd'] for s in launched if s['cost_usd'] is not None]
     highest = max(costs) if costs else None
     out = {'plan': plan['name'], 'kind': plan['kind'], 'protocol_version': 2,
            'config': {k: plan['config'][k] for k in plan['config'] if k not in ('agent_command', 'env_allowlist')},
            'agent_command': plan['config']['agent_command'], 'host': plan['host'], 'seed': plan.get('seed'),
            'pairs_planned': plan['pairs'], 'attempts': attempts or {}, 'scenarios': {}, 'rows': rows, 'runs': run_rows,
            'sessions': sessions,
-           'cost': {'sessions_launched': len(sessions), 'sessions_with_cost': len(costs), 'total_known_usd': round(sum(costs), 4),
+           'cost': {'sessions_launched': len(launched), 'sessions_with_cost': len(costs), 'total_known_usd': round(sum(costs), 4),
                     'highest_session_usd': highest,
-                    'stop_rule_mean_usd': round((sum(costs) + (len(sessions) - len(costs)) * (highest or 0)) / len(sessions), 4) if sessions else None,
-                    'note': 'for the pilot stop rule an unknown cost (a killed CLI writes none) counts as the highest cost seen'},
+                    'stop_rule_mean_usd': round((sum(costs) + (len(launched) - len(costs)) * highest) / len(launched), 4) if launched and costs else None,
+                    'stop_rule_status': ('undefined: no session has a cost, so the main run must not start' if launched and not costs else
+                                         'no sessions' if not launched else 'defined'),
+                    'note': 'every session launched in any attempt, valid or not; for the pilot stop rule an unknown cost (a killed CLI '
+                            'writes none) counts as the highest cost seen'},
            'foreign_runs': foreign or {}, 'missing_runs': [f"pair{r['pair']}-{r['arm']}" for r in run_rows if r['status'] == 'not_run'],
            'invalid_runs': [f"pair{r['pair']}-{r['arm']}" for r in run_rows if r['status'] == 'invalid'], 'note': V2_NOTE}
     for scenario in scenarios:
@@ -714,6 +857,8 @@ def summarize_v2(plan, runs, results, foreign=None, attempts=None):
         for arm in ('stack', 'baseline'):
             mine = [r for i in valid_pairs for r in slots(i, arm)]
             assigned = [r for r in rows if r['pair'] in indices and r['arm'] == arm]
+            n_assigned = len(indices) * len(plan['config']['tasks'])
+            fr = lambda among, key, per=len(plan['config']['tasks']): frac_of(among, key, len(indices) * per)
             fault_runs = [runrow(i, arm) for i in fault_pairs]
             valid_runs = [runrow(i, arm) for i in valid_pairs]
             victims = [r for i in fault_pairs for r in slots(i, arm) if r['is_victim']]
@@ -725,12 +870,12 @@ def summarize_v2(plan, runs, results, foreign=None, attempts=None):
             effort = lambda among: {k: describe([r[k] for r in among]) for k in ('seconds', 'tool_calls', 'turns', 'tool_errors', 'env_errors', 'cost_usd')}
             arms[arm] = {
                 'pairs_covered': {'ordinary': valid_pairs, 'fault': fault_pairs},
-                'gated_success': frac_of(mine, 'gated_success'), 'task_success': frac_of(mine, 'passed'),
-                'teardown_at_exit': frac_of(mine, 'teardown_ok'), 'isolation': frac_of(mine, 'isolation_ok'), 'cli_ok': frac_of(mine, 'cli_ok'),
-                'used_own_db': frac_of(mine, 'used_own_db'), 'committed': frac_of(mine, 'committed'), 'ran_tests': frac_of(mine, 'ran_tests'),
-                'timed_out': frac_of(mine, 'timed_out'), 'survivors_finish': frac_of(survivors, 'gated_success'),
-                'residue_worktrees': frac_of(mine, 'residue_ok'), 'clean_after_first_down': frac_of(mine, 'clean_after_first_down'),
-                'clean_after_procedure': frac_of(mine, 'clean_after_procedure'),
+                'gated_success': fr(mine, 'gated_success'), 'task_success': fr(mine, 'passed'),
+                'teardown_at_exit': fr(mine, 'teardown_ok'), 'isolation': fr(mine, 'isolation_ok'), 'cli_ok': fr(mine, 'cli_ok'),
+                'used_own_db': fr(mine, 'used_own_db'), 'committed': fr(mine, 'committed'), 'ran_tests': fr(mine, 'ran_tests'),
+                'timed_out': fr(mine, 'timed_out'), 'survivors_finish': fr(survivors, 'gated_success', len(plan['config']['tasks']) - 1),
+                'residue_worktrees': fr(mine, 'residue_ok'), 'clean_after_first_down': fr(mine, 'clean_after_first_down'),
+                'clean_after_procedure': fr(mine, 'clean_after_procedure'),
                 'residue_victim_worktree': runs_rate('residue_victim', fault_runs),
                 'others_untouched': runs_rate('others_untouched', valid_runs),
                 'episode_success': runs_rate('episode_success', fault_runs if scenario else valid_runs),
@@ -738,7 +883,7 @@ def summarize_v2(plan, runs, results, foreign=None, attempts=None):
                                   'downs_exit0': sum(1 for r in mine if r.get('down_first_status') == 'zero'),
                                   'downs_nonzero': sum(1 for r in mine if r.get('down_first_status') == 'nonzero'),
                                   'downs_timeout': sum(1 for r in mine if r.get('down_first_status') == 'timeout')},
-                'follow_up': {'rounds': sum(r.get('stack_rounds') or 0 for r in mine), 'signals': sum(len(r.get('signalled') or []) for r in mine),
+                'follow_up': {'rounds': sum(r.get('stack_rounds') or 0 for r in mine), 'signals': sum(r.get('signals_sent') or 0 for r in mine),
                               'seconds': round(sum(r.get('follow_up_seconds') or 0 for r in mine), 2)},
                 'effort_all_scored': effort(mine), 'effort_gated_success': effort(gated),
                 'kill_commands_total': sum(r['kill_commands'] for r in mine), 'benchmark_access_total': sum(r['benchmark_access'] for r in mine),
@@ -760,7 +905,7 @@ def summarize_v2(plan, runs, results, foreign=None, attempts=None):
                     'copes': {'k': sum(1 for c in copes if c.get('copes')), 'n': len(copes), 'assigned': len(indices)},
                     'completed_after_injection': {'k': sum(1 for c in copes if c.get('completed_after_injection')), 'n': len(copes), 'assigned': len(indices)},
                     'service_restored': {'k': sum(1 for c in copes if c.get('service_restored')), 'n': len(copes)},
-                    'verified_after_fault': {'k': sum(1 for c in copes if c.get('verified_after_fault')), 'n': len(copes)},
+                    'description_test_after_kill': {'k': sum(1 for c in copes if c.get('description_test_after_kill')), 'n': len(copes)},
                     **{k: describe([r[k] for r in victims]) for k in ('seconds', 'tool_calls', 'turns', 'tool_errors')},
                     'by_victim': [{'pair': r['pair'], 'task': r['task'], 'gated_success': r['gated_success'], 'seconds': r['seconds'],
                                    'tool_calls': r['tool_calls'], 'turns': r['turns'], 'tool_errors': r['tool_errors'],
@@ -878,7 +1023,8 @@ def markdown_v2(summary):
     cost = summary['cost']
     lines += ['', f"Missing runs: {summary['missing_runs']}; invalid runs: {summary['invalid_runs']}; runs from another plan ignored: {summary['foreign_runs']}",
               f"Sessions launched: {cost['sessions_launched']}; with a cost: {cost['sessions_with_cost']}; known total US${cost['total_known_usd']}; "
-              f"highest session US${cost['highest_session_usd']}; mean per session for the stop rule (unknown = highest): US${cost['stop_rule_mean_usd']}", '']
+              f"highest session US${cost['highest_session_usd']}; mean per session for the stop rule (unknown = highest): US${cost['stop_rule_mean_usd']} "
+              f"({cost['stop_rule_status']})", '']
     for scenario, sc in summary['scenarios'].items():
         a, b = sc['arms']['stack'], sc['arms']['baseline']
         lines += [f'## Scenario: {scenario} (pairs {sc["pairs"]}; ordinary measures over pairs {sc["valid_pairs"]}, fault measures over {sc["fault_pairs"]})', '',
@@ -912,7 +1058,8 @@ def markdown_v2(summary):
                 lines.append(f"| Recovery: {k} | {stat(a['recovery'][k])} | {stat(b['recovery'][k])} |")
         if 'victim_copes' in a:
             for k, label in (('copes', 'Victim copes'), ('completed_after_injection', 'Completed after the injection (gated success alone)'),
-                             ('service_restored', 'Service restored'), ('verified_after_fault', 'Verified after the fault')):
+                             ('service_restored', 'Service restored'),
+                             ('description_test_after_kill', 'Ran an arm test after the kill, result not an error (description only, not scored)')):
                 lines.append(f"| {label} | {frac(a['victim_copes'][k])} | {frac(b['victim_copes'][k])} |")
             for k in ('seconds', 'tool_calls', 'turns', 'tool_errors'):
                 lines.append(f"| Victim: {k} | {stat(a['victim_copes'][k])} | {stat(b['victim_copes'][k])} |")
@@ -958,8 +1105,14 @@ def markdown_v2(summary):
                          f"{r['residue_all']}/{r['residue_victim']}, others untouched {r['others_untouched']}, episode {r['episode_success']}")
             for task, t in r['teardown'].items():
                 lines.append(f"  - teardown `{task}`: first down exit {t['down_exit_first']}, clean after it {t['clean_after_first_down']}; "
-                             f"rounds {[(x['round'], x.get('signalled'), x['down_exit']) for x in t.get('rounds') or []]}, follow-up {t['follow_up_seconds']} s; "
-                             f"final exit {t['down_exit']}, clean after the procedure {t['clean_after_procedure']}, false confirmation {t['false_confirmation']}, residue {t['residue_ok']}")
+                             f"rounds {[(x['round'], 'TERM ' + str((x.get('stopped') or {}).get('terminated')) + ' KILL ' + str((x.get('stopped') or {}).get('killed')), x['down_exit']) for x in t.get('rounds') or []]}, "
+                             f"follow-up {t['follow_up_seconds']} s; final exit {t['down_exit']}, clean after the procedure {t['clean_after_procedure']}, "
+                             f"false confirmation {t['false_confirmation']}, residue {t['residue_ok']}")
+                after_down = t.get('after_down') or {}
+                after_removal = t.get('after_removal') or {}
+                lines.append(f"    - observation after `down`: processes {[p['command'][:60] for p in after_down.get('processes') or []]}, "
+                             f"ports {after_down.get('ports')}; after removal: worktree directory left {after_removal.get('worktree_dir_exists')}, "
+                             f"service data left {after_removal.get('service_data_left')}, processes {[p['command'][:60] for p in after_removal.get('processes') or []]}")
             for e in r['events']:
                 lines.append(f"  - event {e['kind']}: {e['detail']}; culprits {e['culprits']}")
         lines += ['', '### Sessions (every launched session, killed ones included)', '',
@@ -999,8 +1152,8 @@ def main():
     plan = json.loads(raw)
     import hashlib
     if plan.get('protocol_version') == 2:
-        runs, foreign, attempts = load_runs_v2(plan, args.results, hashlib.sha256(raw).hexdigest())
-        summary = summarize_v2(plan, runs, args.results, foreign, attempts)
+        runs, foreign, attempts, every = load_runs_v2(plan, args.results, hashlib.sha256(raw).hexdigest())
+        summary = summarize_v2(plan, runs, args.results, foreign, attempts, every)
         text = markdown_v2(summary)
     else:  # version 1 plans and results keep their own report
         runs, foreign = load_runs(plan, args.results, hashlib.sha256(raw).hexdigest())

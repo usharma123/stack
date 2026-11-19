@@ -41,6 +41,9 @@ def _out(argv):
         result = subprocess.run(argv, capture_output=True, timeout=OBSERVE_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f'{argv[0]} did not finish within {OBSERVE_TIMEOUT} s')
+    # A whole-user listing is never empty while a run is alive: an empty one is a failed listing.
+    if argv[0] == 'lsof' and '-u' in argv and '-p' not in argv and not result.stdout.strip():
+        raise RuntimeError(f'lsof returned an empty listing ({result.returncode}): {result.stderr[-300:]!r}')
     if argv[0] == 'ps' and result.returncode not in (0, 1) or (argv[0] == 'ps' and '-ax' in ' '.join(argv) and not result.stdout):
         raise RuntimeError(f'{argv[0]} failed ({result.returncode}): {result.stderr[-300:]!r}')
     return result.stdout.decode('utf-8', errors='replace')
@@ -54,7 +57,8 @@ def _process_table():
         if len(parts) < 10 or parts[3].startswith('Z'):
             continue
         pid = int(parts[0])
-        rows[pid] = {'pid': pid, 'ppid': int(parts[1]), 'pgid': int(parts[2]), 'started': ' '.join(parts[4:9]), 'command': parts[9]}
+        rows[pid] = {'pid': pid, 'ppid': int(parts[1]), 'pgid': int(parts[2]), 'stat': parts[3], 'started': ' '.join(parts[4:9]),
+                     'command': parts[9]}
     return rows
 
 
@@ -242,10 +246,21 @@ def under_any(paths, text):
     return any(legacy._under(legacy._roots(p), text) for p in paths)
 
 
-def ready_services(group, groups, owner, listeners, rows):
+def exiting(row):
+    command = row.get('command', '').strip()
+    return 'E' in row.get('stat', '') or (command.startswith('(') and command.endswith(')'))
+
+
+def norm_path(path):
+    path = str(path or '').rstrip('/')
+    return path[len('/private'):] if path.startswith('/private/') else path
+
+
+def ready_services(group, groups, owner, listeners, rows, pg_data_dir=None):
     """The four services of `group` that run and listen: kind -> {pid, started, command, port}. The
-    postmaster must have its data directory under the group's own paths; every process must belong
-    to the group (marker, command or open files) and listen on a TCP port. Never by port number."""
+    postmaster must be on `pg_data_dir`, the arm's own data directory for that worktree (a second
+    PostgreSQL elsewhere never qualifies); every process must belong to the group (marker, command
+    or open files) and listen on a TCP port. Never by port number."""
     paths = groups.get(group) or []
     found = {}
     for port, pid in sorted(listeners.items()):
@@ -255,7 +270,8 @@ def ready_services(group, groups, owner, listeners, rows):
         kind = service_kind(row['command'])
         if kind not in SERVICES or kind in found:
             continue
-        if kind == 'postgres' and not under_any(paths, postmaster_data_dir(row['command']) or ''):
+        if kind == 'postgres' and (not pg_data_dir or norm_path(postmaster_data_dir(row['command'])) != norm_path(pg_data_dir)
+                                   or not under_any(paths, postmaster_data_dir(row['command']) or '')):
             continue
         found[kind] = {'pid': pid, 'started': row['started'], 'command': row['command'][:300], 'port': port}
     return found
@@ -282,7 +298,9 @@ class Sampler(threading.Thread):
         self.listeners = list(listeners)
         self.durable_prev = {}  # (pid, started) -> (group, command, m, ports)
         self.losses = []        # durable processes gone between two samples
-        self.postmasters = {}   # (group, pid, started) -> first m seen listening
+        self.postmasters = {}   # (group, pid, started) -> (first m seen listening, data directory)
+        self.data_dirs = {}     # group -> data directories of every PostgreSQL and Redis seen running for it
+        self.redis_cwd = {}     # (pid, started) -> working directory
         self.times = []         # (begun_m, stamped_m) of every sample
         self.groups, self.resolved = groups(), {}
         # Stack's own probes (`stack ps`, `status`) connect to every checkout's ports by design;
@@ -338,16 +356,35 @@ class Sampler(threading.Thread):
         for port, pid in listeners.items():
             ports_of.setdefault(pid, []).append(port)
         # Durable processes gone from the process table since the previous sample (pid and start time).
-        alive = {(pid, row['started']) for pid, row in rows.items()}
+        # A process that is exiting (macOS shows its command as "(name)", without arguments or
+        # environment, and an exiting state) counts as gone: it can no longer be attributed or classified.
+        alive = {(pid, row['started']) for pid, row in rows.items() if not exiting(row)}
         for key, (group, command, seen_m, ports) in self.durable_prev.items():
             if key not in alive:
                 self.losses.append({'group': group, 'pid': key[0], 'started': key[1], 'command': command[:1000],
                                     'kind': service_kind(command), 'ports': ports, 'last_seen_m': seen_m, 'gone_m': mono})
-        self.durable_prev = {(pid, rows[pid]['started']): (group, rows[pid]['command'], mono, sorted(ports_of.get(pid, [])))
-                             for pid, group in owner.items() if DURABLE.search(rows[pid]['command'])}
+        current = {(pid, rows[pid]['started']): (group, rows[pid]['command'], mono, sorted(ports_of.get(pid, [])))
+                   for pid, group in owner.items() if DURABLE.search(rows[pid]['command'])}
+        # A known durable process still alive but not attributable in this sample stays tracked (with
+        # the time it was last attributed), so its loss is recorded when it goes.
+        current.update({k: v for k, v in self.durable_prev.items() if k in alive and k not in current})
+        self.durable_prev = current
         for pid in ports_of:
             if pid in owner and service_kind(rows[pid]['command']) == 'postgres':
-                self.postmasters.setdefault((owner[pid], pid, rows[pid]['started']), mono)
+                self.postmasters.setdefault((owner[pid], pid, rows[pid]['started']), (mono, postmaster_data_dir(rows[pid]['command'])))
+        for pid, group in owner.items():
+            kind = service_kind(rows[pid]['command'])
+            if kind == 'postgres':
+                self.data_dirs.setdefault(group, set()).add(postmaster_data_dir(rows[pid]['command']))
+            elif kind == 'redis':
+                key = (pid, rows[pid]['started'])
+                if key not in self.redis_cwd:
+                    out = _out(['lsof', '-nP', '-w', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'])
+                    cwd = next((l[1:] for l in out.splitlines() if l.startswith('n/')), None)
+                    if cwd:
+                        self.redis_cwd[key] = cwd
+                if self.redis_cwd.get(key):
+                    self.data_dirs.setdefault(group, set()).add(self.redis_cwd[key])
         port_owner = {port: owner.get(pid) for port, pid in listeners.items()}
         for port, mark in port_owner.items():
             if mark:
@@ -395,8 +432,9 @@ class Sampler(threading.Thread):
                 'ports': {str(p): sorted(m) for p, m in self.ports.items()}, 'cross_worktree_connections': self.cross,
                 'durable_losses': self.losses, 'gaps_over_3s': gaps,
                 'first_m': stamps[0] if stamps else None, 'last_m': stamps[-1] if stamps else None,
-                'postmasters_listening': [{'group': g, 'pid': pid, 'started': st, 'first_listen_m': m}
-                                          for (g, pid, st), m in self.postmasters.items()]}
+                'postmasters_listening': [{'group': g, 'pid': pid, 'started': st, 'first_listen_m': m, 'data_dir': d}
+                                          for (g, pid, st), (m, d) in self.postmasters.items()],
+                'service_data_dirs': {g: sorted(d for d in dirs if d) for g, dirs in self.data_dirs.items()}}
 
 
 def role_of(pid):
@@ -408,6 +446,14 @@ def role_of(pid):
 def mark_of(pid):
     match = MARKER.search(_out(['ps', '-ww', '-E', '-p', str(pid), '-o', 'command=']))
     return match[1] if match else None
+
+
+def still_listening(pids):
+    """The subset of `pids` that hold a listening TCP socket now (one lsof call)."""
+    if not pids:
+        return set()
+    out = _out(['lsof', '-nP', '-w', '-a', '-p', ','.join(str(p) for p in pids), '-iTCP', '-sTCP:LISTEN', '-Fp'])
+    return {int(l[1:]) for l in out.splitlines() if l.startswith('p') and l[1:].isdigit()}
 
 
 def listens(pid):

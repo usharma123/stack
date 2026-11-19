@@ -602,12 +602,14 @@ def invoice_list():
     check('bad_params_400', bad_params)
 
     def status_index():
-        # A valid, non-partial, non-primary index on invoices led by status, with id also a key column.
-        found = sql("SELECT x.indexrelid::regclass::text FROM pg_index x "
+        # A valid, non-partial, non-primary B-tree index on invoices whose first two key columns are
+        # status then id.
+        found = sql("SELECT x.indexrelid::regclass::text FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid "
+                    "JOIN pg_am am ON am.oid = c.relam "
                     "WHERE x.indrelid = 'invoices'::regclass AND NOT x.indisprimary AND x.indpred IS NULL AND x.indisvalid "
+                    "AND am.amname = 'btree' AND x.indnkeyatts >= 2 "
                     "AND pg_get_indexdef(x.indexrelid, 1, true) IN ('status', '\"status\"') "
-                    "AND EXISTS (SELECT 1 FROM generate_series(2, x.indnkeyatts) k "
-                    "WHERE pg_get_indexdef(x.indexrelid, k, true) IN ('id', '\"id\"'))")
+                    "AND pg_get_indexdef(x.indexrelid, 2, true) IN ('id', '\"id\"')")
         if not found:
             defs = sql("SELECT indexdef FROM pg_indexes WHERE tablename = 'invoices'")
             print(f'indexes on invoices: {defs}', file=sys.stderr)
@@ -673,14 +675,20 @@ def void_invoices():
         return bool(state.get('cache_used') and state.get('voided')) and body == {'id': 42, 'customer': 'Umbrella', 'cents': 300, 'status': 'void'}
     check('cache_after_void', cache_after_void)
 
+    def whole_table():
+        return sql('SELECT id, customer, cents, status FROM invoices ORDER BY id'), sql('SELECT id, invoice_id, cents FROM receipts ORDER BY id')
+
     def unchanged(ident, operation):
-        """A rejected operation changes nothing: the stored row and the GET answer are the same after."""
-        before_row, before_get = stored(ident), call('GET', f'/invoices/{ident}')[1]
+        """A rejected operation changes nothing: the stored row and the GET answer of the target are the
+        same after, and so is every other invoice and receipt."""
+        before_row, before_get, before_all = stored(ident), call('GET', f'/invoices/{ident}')[1], whole_table()
         status = operation()
-        after_row, after_get = stored(ident), call('GET', f'/invoices/{ident}')[1]
-        if after_row != before_row or after_get != before_get:
-            print(f'invoice {ident} changed by a rejected operation: {before_row} -> {after_row}, {before_get} -> {after_get}', file=sys.stderr)
-        return status, after_row == before_row and after_get == before_get
+        after_row, after_get, after_all = stored(ident), call('GET', f'/invoices/{ident}')[1], whole_table()
+        same = after_row == before_row and after_get == before_get and after_all == before_all
+        if not same:
+            print(f'invoice {ident}: a rejected operation changed state: {before_row} -> {after_row}, {before_get} -> {after_get}, '
+                  f'other rows changed: {after_all != before_all}', file=sys.stderr)
+        return status, same
 
     def void_paid():
         receipts = sql('SELECT invoice_id, cents FROM receipts ORDER BY id')
@@ -717,8 +725,40 @@ def void_invoices():
         return status == 200 and stored(42) == ('Umbrella', 300, 'void')
     check('patch_void_409', patch_void)
 
+    def allowed_statuses():
+        """The status set the schema allows, read from the schema itself: the CHECK constraints on
+        invoices that mention status, else the column's enum labels, else the values of a lookup
+        table it references. None when the set cannot be determined from the schema."""
+        import re as _re
+        checks = [d for (d,) in sql("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'invoices'::regclass "
+                                    "AND contype = 'c'") if _re.search(r'\bstatus\b', d)]
+        if checks:
+            sets = []
+            for d in checks:
+                literals = _re.findall(r"'((?:[^']|'')*)'", d)
+                if not literals or not _re.search(r'=\s*ANY|\bIN\b|=', d) or _re.search(r'<>|!=|NOT\s|LIKE|~', d, _re.I):
+                    return None
+                sets.append({x.replace("''", "'") for x in literals})
+            return set.intersection(*sets)
+        labels = sql("SELECT e.enumlabel FROM pg_attribute a JOIN pg_enum e ON e.enumtypid = a.atttypid "
+                     "WHERE a.attrelid = 'invoices'::regclass AND a.attname = 'status'")
+        if labels:
+            return {l for (l,) in labels}
+        ref = sql("SELECT confrelid::regclass::text, (SELECT attname FROM pg_attribute WHERE attrelid = confrelid AND attnum = confkey[1]) "
+                  "FROM pg_constraint WHERE conrelid = 'invoices'::regclass AND contype = 'f' "
+                  "AND conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'invoices'::regclass AND attname = 'status')]")
+        if ref:
+            table, column = ref[0]
+            return {v for (v,) in sql(f'SELECT "{column}" FROM {table}')}
+        return None
+
     def constraint():
-        # The whole status domain, tried inside transactions that are rolled back.
+        # The allowed set read from the schema must be exactly the three statuses; then the whole status
+        # domain is tried inside transactions that are rolled back.
+        allowed = allowed_statuses()
+        if allowed != {'open', 'paid', 'void'}:
+            print(f'status set allowed by the schema: {allowed}', file=sys.stderr)
+            return False
         def attempt(statement, args):
             with psycopg.connect(DB) as conn:
                 try:

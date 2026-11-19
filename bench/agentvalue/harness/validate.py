@@ -118,6 +118,15 @@ def _void_allows_refunded(tree):
                                        "ALTER TABLE invoices ADD CONSTRAINT invoices_status_check CHECK (status IN ('open', 'paid', 'void', 'refunded'));\n")
 
 
+def _list_status_customer_id_index(tree):
+    (tree / LIST_MIGRATION).write_text('CREATE INDEX IF NOT EXISTS invoices_status_customer_id ON invoices (status, customer, id);\n')
+
+
+def _void_allows_archived(tree):
+    (tree / VOID_MIGRATION).write_text("ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_status_check;\n"
+                                       "ALTER TABLE invoices ADD CONSTRAINT invoices_status_check CHECK (status IN ('open', 'paid', 'void', 'archived'));\n")
+
+
 def _void_never_caches_void(tree):
     # A correct alternative: a void invoice is never put in the cache (reads of it go to PostgreSQL).
     _edit(tree / 'app.py', """            cache.put_invoice(invoice.to_json())
@@ -185,12 +194,14 @@ MUTANTS = {
                      ('no index covering status (an index on customer instead)', _list_wrong_index, 'status_index'),
                      ('a partial index on status', _list_partial_index, 'status_index'),
                      ('an index on status alone', _list_status_only_index, 'status_index'),
+                     ('an index on (status, customer, id)', _list_status_customer_id_index, 'status_index'),
                      ('limit not range-checked', _list_limit_unchecked, 'bad_params_400'),
                      ('items in descending id order', _list_descending, 'list_all_ascending')],
     'void-invoices': [('void does not invalidate the cache', _void_no_invalidate, 'cache_after_void'),
                       ('reads bypass the cache entirely', _void_bypass_cache, 'cache_after_void'),
                       ('constraint dropped and not re-added', _void_constraint_dropped, 'constraint_allows_void_only'),
                       ('constraint also allows another status (refunded)', _void_allows_refunded, 'constraint_allows_void_only'),
+                      ('constraint also allows another status (archived)', _void_allows_archived, 'constraint_allows_void_only'),
                       ('PATCH on a void invoice allowed', _void_patch_allowed, 'patch_void_409'),
                       ('a paid invoice is voided', _void_paid_changed, 'void_paid_409'),
                       ('a void invoice can be voided again', _void_twice_ok, 'void_twice_409')],
@@ -227,16 +238,17 @@ NEW_STACK_SHA = 'b0931a8be40bc65855a1139d10a8f7f66c136e5a564b58cf9994a58f511fdd1
 # different worktrees and cannot hide each other; every expectation is asserted per arm.
 CASES = {
     'clean': ({}, None),
-    'agent-kill-recovers': ({'invoice-list': 'slow-stall', 'void-invoices': 'stray'}, ('agent-kill', 'invoice-list')),
+    'agent-kill-recovers': ({'invoice-list': 'slow-stall', 'invoice-list.recovery': 'reference-norole', 'void-invoices': 'stray'},
+                            ('agent-kill', 'invoice-list')),
     'agent-kill-recovery-leaves': ({'pay-receipts': 'stall', 'pay-receipts.recovery': 'leave-running', 'customer-table': 'target',
                                     'invoice-notes': 'killer:wt-cust', 'invoice-list': 'sentinel'}, ('agent-kill', 'pay-receipts')),
-    'service-kill-restarts': ({'void-invoices': 'sk-restart', 'invoice-list': 'exec-left'}, ('service-kill', 'void-invoices')),
+    'service-kill-restarts': ({'void-invoices': 'sk-restart-scratch', 'invoice-list': 'exec-left'}, ('service-kill', 'void-invoices')),
     'service-kill-no-reaction': ({'customer-table': 'sk-noreact'}, ('service-kill', 'customer-table')),
     'service-kill-never-restores': ({'invoice-notes': 'sk-finish'}, ('service-kill', 'invoice-notes')),
     'event-g-identification': ({'invoice-notes': 'wrong-pid-killer:wt-pay', 'pay-receipts': 'self-kill',
                                 'customer-table': 'pid-killer:wt-list', 'invoice-list': 'up-target'}, None),
     'version1-planted-and-collateral': ({'invoice-notes': 'leave-running', 'pay-receipts': 'contaminate', 'customer-table': 'pkill',
-                                         'void-invoices': 'leave-running'}, None),
+                                         'void-invoices': 'leave-running-idle'}, None),
 }
 INTERRUPTS = ('before-the-kill', 'during-the-delay', 'during-the-launch')
 SERVICES = ('postgres', 'redis', 'api', 'worker')
@@ -303,7 +315,7 @@ def main():
     for binary, digest, rev in ((NEW_STACK, NEW_STACK_SHA, 'a5d4785'), (OLD_STACK, OLD_STACK_SHA, 'dc4b980')):
         expect(f'setup/stack-binary {rev}', binary.is_file() and runner.sha256(binary) == digest, {'path': str(binary), 'expected_sha256': digest})
     lock = [runner.host_lock()]
-    only = set(args.only.split(',')) if args.only else set(CASES) | {'exec-control-dc4b980', 'commit-scan', 'interrupts'}
+    only = set(args.only.split(',')) if args.only else set(CASES) | {'exec-control-dc4b980', 'commit-scan', 'interrupts', 'unit'}
 
     if not args.skip_grader:
         cells = []
@@ -334,6 +346,8 @@ def main():
         expect('commit-scan/clean-commit-goes-through', committed, detail)
 
     plan, plan_path = make_plan(out, 'plan', NEW_STACK, 'a5d4785')
+    if 'unit' in only:
+        unit_cases(expect, plan)
     control_plan, _ = make_plan(out, 'plan-control-dc4b980', OLD_STACK, 'dc4b980')
     expect('setup/plan-records-binary', plan['config']['stack_binary_sha256'] == NEW_STACK_SHA and plan['config']['stack_rev'] == 'a5d4785'
            and plan['config']['stack_version'] and plan['protocol_version'] == 2,
@@ -436,9 +450,14 @@ def main():
                 expect(f'{arm}/{case}/handoff-shows-killed-cli-tool-still-running', handoff.get('any_running')
                        and any(TOOL_TAG in p['command'] for p in handoff.get('killed_cli_processes_running') or []), handoff)
                 conns = [e for e in rr['events'] if e['kind'] == 'cross_worktree_connection']
+                by_killed = [e for e in conns if e.get('role') == 'agent']
+                no_role = [e for e in conns if e.get('role') is None]
                 expect(f'{arm}/{case}/killed-cli-connection-fails-run-not-charged-to-recovery',
-                       bool(conns) and all(e['culprits'] == ['invoice-list'] for e in conns) and not rr['others_untouched']
-                       and rows['invoice-list'].get('isolation_ok'), {'connections': conns})
+                       bool(by_killed) and all(e['culprits'] == ['invoice-list'] for e in by_killed) and not rr['others_untouched']
+                       and rows['invoice-list'].get('isolation_ok'), {'connections': by_killed})
+                expect(f'{arm}/{case}/no-role-connection-during-recovery-fails-run-only', bool(no_role) and all(not e['culprits'] for e in no_role)
+                       and rows['invoice-list'].get('isolation_ok') and not rr['others_untouched']
+                       and all(rows[t].get('isolation_ok') for t in ('invoice-notes', 'pay-receipts', 'customer-table')), {'connections': no_role})
                 expect(f'{arm}/{case}/recovery-gated-success', rows['invoice-list'].get('gated_success'),
                        {k: rows['invoice-list'].get(k) for k in ('passed', 'teardown_ok', 'isolation_ok', 'cli_ok')})
                 expect(f'{arm}/{case}/residue-holds-victim-worktree', rr['residue_victim'] is True, rec['teardown']['invoice-list'].get('after_down'))
@@ -492,8 +511,16 @@ def main():
                 ok, detail = four_services(rec)
                 expect(f'{arm}/{case}/pre-kill-listing-has-all-four-services', ok, detail)
                 copes = rr.get('victim_copes') or {}
-                expect(f'{arm}/{case}/victim-copes (restored, verified, gated)', copes.get('copes') and copes.get('service_restored')
-                       and copes.get('verified_after_fault'), copes)
+                expect(f'{arm}/{case}/victim-copes (gated, restored on its own data directory)', copes.get('copes') and copes.get('service_restored')
+                       and copes.get('description_test_after_kill'), copes)
+                f = rec.get('fault') or {}
+                listing = (f.get('running_at_kill') or {}).get('processes') or []
+                scratch = [p['pid'] for p in listing if 'scratch-pg' in p['command'] and '/bin/postgres' in p['command']]
+                trig_pg = ((f.get('trigger') or {}).get('services') or {}).get('postgres') or {}
+                expect(f'{arm}/{case}/scratch-postmaster-never-trigger-nor-target', bool(scratch) and trig_pg.get('pid') not in scratch
+                       and (f.get('kill') or {}).get('pid') not in scratch and 'scratch-pg' not in (trig_pg.get('command') or '')
+                       and report._norm(f.get('canonical_data_dir')) in report._norm((trig_pg.get('command') or '').replace(' /private/', ' /')),
+                       {'scratch': scratch, 'trigger_postgres': trig_pg, 'canonical': f.get('canonical_data_dir')})
                 expect(f'{arm}/{case}/kill-not-contamination', rr['others_untouched'] and rows['void-invoices'].get('isolation_ok'),
                        {'events': rr['events'], 'review': rr['review']})
                 ex = rec['teardown']['invoice-list']
@@ -706,6 +733,95 @@ def interrupt_case(arm, when, plan_path, out, lock, expect):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def unit_cases(expect, plan):
+    """The reviewer's reproductions that need no full run, and the report checks on synthetic records."""
+    import copy
+    import random
+    import redact
+    # A credential-like key holding a list or a nested object is redacted.
+    scrubbed = json.dumps(redact.scrub_json({'SOME_TOKEN': ['sentinel-a'], 'outer': {'API_KEY': {'v': 'sentinel-b'}, 'ok': 'kept'}}))
+    expect('unit/redactor-credential-key-holding-list-or-object', 'sentinel-a' not in scrubbed and 'sentinel-b' not in scrubbed and 'kept' in scrubbed,
+           scrubbed)
+    # A file that cannot be scrubbed is never published.
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as tmp:
+        src, dest = Path(tmp) / 'stage' / 'trace.jsonl', Path(tmp) / 'results'
+        src.parent.mkdir()
+        dest.mkdir()
+        src.write_text('{"x": 1}\n')
+        src.chmod(0)
+        ok, reason = runner.publish_file(src, dest / 'trace.jsonl')
+        src.chmod(0o600)
+        expect('unit/unscrubbable-trace-never-published', not ok and not (dest / 'trace.jsonl').exists() and not list(dest.iterdir()),
+               {'published': ok, 'reason': reason, 'results_dir': [p.name for p in dest.iterdir()]})
+    # A remembered pid whose process group holds no process of the run: nothing outside the run is signalled.
+    with tempfile.TemporaryDirectory(prefix='avr-unit-', dir='/tmp') as root:
+        outsider = subprocess.Popen(['sleep', '30'], start_new_session=True, cwd='/', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            observe.RUN_SUFFIX = '.unit-test-run'
+            signalled = runner.safe_killpg(outsider.pid, Path(root))
+            time.sleep(0.3)
+            alive = outsider.poll() is None
+        finally:
+            observe.RUN_SUFFIX = None
+            outsider.kill()
+            outsider.wait()
+        expect('unit/cleanup-never-signals-a-group-without-a-run-process', not signalled and alive, {'signalled': signalled, 'outsider_alive': alive})
+    # Event (g): text around the kill, an own restart of another service, a kill command of a killed CLI.
+    loss = {'group': 'wt-a', 'pid': 123, 'started': 's', 'command': '/x/bin/postgres -D /tmp/avr1/wt-a/.dev/postgres', 'kind': 'postgres',
+            'ports': [31000], 'last_seen_m': 20.0, 'gone_m': 21.0}
+    def g_run(other_cmds, own_cmds, killed=False):
+        return {'agents': {'a': {'marker': 'wt-a', 'launched_m': 0, 'ended_m': 100, 'service_commands': own_cmds},
+                           'b': {'marker': 'wt-b', 'launched_m': 0, 'ended_m': 5 if killed else 100, 'killed_by_harness': killed,
+                                 'service_commands': other_cmds}},
+                'sampler': {'durable_losses': [loss]}, 'episode_end_m': 100}
+    k = lambda c, s0, e0: {'start_m': s0, 'end_m': e0, 'kinds': ['kill'], 'kill_like': True, 'command': c}
+    expect('unit/echo-lost-pid-then-kill-another-pid-is-not-event-g', not report.sibling_losses(g_run([k('echo 123; kill -9 456', 20.5, 20.6)], []))[0],
+           report.sibling_losses(g_run([k('echo 123; kill -9 456', 20.5, 20.6)], [])))
+    own_restart_api = [{'start_m': 15, 'end_m': 16, 'kinds': ['down_restart'], 'kill_like': False, 'command': 'stack restart api'}]
+    ev = report.sibling_losses(g_run([k('kill -9 123', 20.5, 20.6)], own_restart_api))[0]
+    expect('unit/own-restart-of-another-service-does-not-make-postmaster-kill-ambiguous', len(ev) == 1 and ev[0]['culprits'] == ['b'], ev)
+    ev = report.sibling_losses(g_run([k('kill -9 123', 4.0, None)], [], killed=True))[0]
+    expect('unit/kill-command-of-a-killed-cli-attributes-a-later-loss', len(ev) == 1 and ev[0]['culprits'] == ['b'], ev)
+    # Report on synthetic records: assignments from the plan, attempts, trial-plan shape.
+    src_path = sorted(Path(ROOT / 'results').glob('validation-v3-wip-final/stack-agent-kill-recovers/run.json'))
+    if not src_path:
+        expect('unit/synthetic-report-records-available', False, 'needs results/validation-v3-wip-final/stack-agent-kill-recovers/run.json')
+        return
+    src = json.loads(src_path[0].read_text())
+    one = dict(plan, kind='harness_selftest', protocol_version=2,
+               pairs=[{'index': 0, 'scenario': 'agent-kill', 'victim': 'invoice-list', 'order': ['stack', 'baseline']}])
+    def make(arm, attempt=1, valid=True, missed=False):
+        r = copy.deepcopy(src)
+        r.update(pair=0, arm=arm, attempt=attempt, valid=valid, plan_kind='harness_selftest', plan_sha256=None)
+        if not valid:
+            r['invalid_reasons'] = ['synthetic']
+        if missed:
+            r['fault'] = {**r['fault'], 'injected': False, 'missed': 'synthetic'}
+        return r
+    summ = report.summarize_v2(one, {(0, 'stack'): make('stack', valid=False), (0, 'baseline'): make('baseline')}, '/x')
+    g = summ['scenarios']['agent-kill']['arms']['stack']['gated_success']
+    expect('unit/report-invalid-first-arm-shows-0-scored-of-5-assigned', (g['scored'], g['assigned']) == (0, 5), g)
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d:
+        expect('unit/attempt-2-refused-without-a-first-attempt-failure-record', runner.attempt_reasons(d, 0, None) == [], 'empty results directory')
+        for name, rec in [('pair0-stack', make('stack')), ('pair0-baseline', make('baseline', missed=True)), ('pair0.2-stack', make('stack', attempt=2))]:
+            (Path(d) / name).mkdir()
+            (Path(d) / name / 'run.json').write_text(json.dumps(rec))
+        runs, _, attempts, every = report.load_runs_v2(one, d)
+        expect('unit/incomplete-attempt-2-leaves-the-pair-missing', runs[(0, 'stack')] is None and runs[(0, 'baseline')] is None and len(every) == 3,
+               attempts)
+    shaped = copy.deepcopy(plan)
+    shaped.update(kind='agent_experiment', pairs=runner.plan_pairs(random.Random(shaped['seed']), 1, shaped['config']['tasks']))
+    shaped['config'] = dict(shaped['config'], pairs_per_scenario=1, faults=True, agent_seconds=1800)   # the self-test plan runs 600 s
+    base_problems = runner.protocol_problems(shaped)
+    short = copy.deepcopy(shaped)
+    short['config']['agent_seconds'] = 1
+    edited = copy.deepcopy(shaped)
+    edited['pairs'][0]['victim'] = next(t for t in shaped['config']['tasks'] if t != shaped['pairs'][0]['victim'])
+    expect('unit/trial-plan-with-agent-seconds-1-or-edited-pairs-refused', not base_problems and runner.protocol_problems(short)
+           and runner.protocol_problems(edited), {'as_generated': base_problems, 'agent_seconds_1': runner.protocol_problems(short),
+                                                  'edited_pairs': runner.protocol_problems(edited)})
+
+
 def commit_scan_case():
     """The commit scan on staged files with a quoted path, a binary file, a rename, a symbolic link
     and the commit message, each carrying a sentinel, plus a credential-shaped value: every one is
@@ -729,15 +845,19 @@ def commit_scan_case():
         (repo / 'blob.bin').write_bytes(b'\x00\x01\x02' + sentinel.encode() + b'\x00\xff')
         os.symlink(f'target-{sentinel}', repo / 'link')
         (repo / 'config.env').write_text('SENTINEL_TOKEN=' + secrets.token_hex(16) + '\n')
+        (repo / 'a1').write_text('nothing here\n')
+        (repo / 'a[1]').write_text(f'bracketed path {sentinel}\n')
+        (repo / f'name-{sentinel}.txt').write_text('a clean file with a secret name\n')
         run('add', '-A')
         r = subprocess.run([sys.executable, str(HERE / 'commit.py'), '--repo', str(repo), '-m', f'message with {sentinel}'],
                            capture_output=True, text=True, env=env)
         report_text = r.stdout + r.stderr
         expected = {'quoted path': repr(quoted), 'binary': "'blob.bin'", 'rename': "'new-name.txt'", 'symlink': "'link'",
-                    'commit message': '(commit message)', 'credential pattern': "'config.env'"}
+                    'commit message': '(commit message)', 'credential pattern': "'config.env'", 'bracketed path a[1]': "'a[1]'",
+                    'masked path name': 'in the path name'}
         found = {k: v in report_text for k, v in expected.items()}
         unchanged = run('rev-parse', 'HEAD').stdout == head
-        refused = r.returncode == 1 and all(found.values()) and sentinel not in report_text and unchanged
+        refused = r.returncode == 1 and all(found.values()) and sentinel not in report_text and unchanged and "'a1'" not in report_text
         clean = Path(tmp) / 'clean'
         clean.mkdir()
         subprocess.run([*plain, 'init', '-q'], cwd=clean, check=True, capture_output=True)

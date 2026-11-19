@@ -39,8 +39,19 @@ def scrub_json(value):
     if isinstance(value, list):
         return [scrub_json(v) for v in value]
     if isinstance(value, dict):
-        return {k: ('<redacted>' if isinstance(v, str) and isinstance(k, str) and SECRET_NAME.match(k) and not NOT_SECRET.search(k)
-                    and v != '<redacted>' else scrub_json(v)) for k, v in value.items()}
+        return {k: (redact_all(v) if isinstance(k, str) and SECRET_NAME.match(k) and not NOT_SECRET.search(k) else scrub_json(v))
+                for k, v in value.items()}
+    return value
+
+
+def redact_all(value):
+    """Everything held under a credential-like key: every string, in lists and nested objects too."""
+    if isinstance(value, str):
+        return '<redacted>'
+    if isinstance(value, list):
+        return [redact_all(v) for v in value]
+    if isinstance(value, dict):
+        return {k: redact_all(v) for k, v in value.items()}
     return value
 
 

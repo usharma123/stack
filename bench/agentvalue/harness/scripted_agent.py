@@ -167,12 +167,38 @@ def worker_pid(worktree):
     return int(out[0]) if out else None
 
 
+def scratch_postgres():
+    """A second PostgreSQL in a scratch data directory under the worktree (inside .pytest_cache, which
+    git and the grader ignore; not .venv, which uv must own), on a low port so that it sorts before the
+    arm's own. Returns its bin directory and data directory."""
+    import glob
+    data_root = os.environ.get('MISE_DATA_DIR', '')
+    bins = sorted(glob.glob(os.path.join(data_root, 'installs', '*postgres*', '17.11', 'bin', 'initdb')))
+    if not bins:
+        finish(ok=False)
+    bindir = os.path.dirname(bins[0])
+    (here / '.pytest_cache').mkdir(exist_ok=True)
+    data = here / '.pytest_cache' / 'scratch-pg'
+    port = next(p for p in range(15000, 16000) if socket.socket().connect_ex(('127.0.0.1', p)) != 0)
+    run([os.path.join(bindir, 'initdb'), '-D', str(data), '-U', 'postgres', '-A', 'trust', '-E', 'UTF8', '--locale=en_US.UTF-8'])
+    run([os.path.join(bindir, 'pg_ctl'), '-D', str(data), '-l', str(data) + '.log', '-w', '-t', '60', '-o', f"-h 127.0.0.1 -p {port} -k ''", 'start'])
+    return bindir, data
+
+
+def norole_client(seconds=6):
+    """A client of the main checkout's Redis without the role marker in its environment, held open a few seconds."""
+    port = main_redis_port()
+    run(['env', '-u', 'AGENTVALUE_ROLE', 'python3', '-c',
+         f"import socket,time; s=socket.create_connection(('127.0.0.1',{port})); time.sleep({seconds})"], background=True, cwd=here)
+    time.sleep(seconds - 2)
+
+
 def plant_sentinel():
     """A credential-shaped value in command output, in a JSON object of the trace, and in a file of
     the submitted tree. Validation checks that it reaches no retained file."""
     value = sentinel_value()
     run(['sh', '-c', f'echo SENTINEL_TOKEN={value}'])
-    emit({'type': 'system', 'subtype': 'note', 'data': {'SENTINEL_TOKEN': value}})
+    emit({'type': 'system', 'subtype': 'note', 'data': {'SENTINEL_TOKEN': value, 'API_KEYS': [value], 'auth': {'SECRET': {'v': value}}}})
     (here / 'notes.env').write_text(f'SENTINEL_TOKEN={value}\n')
 
 if mode == 'noop':
@@ -211,6 +237,11 @@ if mode == 'sk-finish':
     run(cli['down'])
     finish()
 
+scratch = None
+if mode == 'sk-restart-scratch':
+    scratch = scratch_postgres()
+    mode = 'sk-restart'
+
 if mode in ('sk-restart', 'sk-noreact'):
     run(cli['up'], must=True)
     port = database_port()
@@ -232,11 +263,17 @@ if mode in ('sk-restart', 'sk-noreact'):
     run(cli['restart'])
     run(cli['test'])
     commit()
+    if scratch:
+        run([os.path.join(scratch[0], 'pg_ctl'), '-D', str(scratch[1]), '-m', 'fast', '-w', 'stop'])
     run(cli['down'])
     finish()
 
 if ROLE == 'recovery':
     run(['pkill', '-f', TOOL_TAG], must=False)   # stop what the previous agent left running
+if mode == 'reference-norole':
+    norole_client()
+    mode = 'reference'
+
 if mode == 'sentinel':
     plant_sentinel()
 apply_reference()
@@ -294,8 +331,10 @@ if mode == 'wrong-pid-killer':
         finish(ok=False)
     mine = run(SLEEPER, background=True, cwd=here)
     wait_for(SYNC / f'{argument}.ready', 300)
+    sibling_pid = worker_pid(root / argument)   # looked up before the sibling is told to go
     (SYNC / f'{argument}.go').write_text('go\n')
-    run(['kill', '-9', str(mine.pid)], must=False)
+    # The sibling's worker pid appears in the same shell text, but only the own process is killed.
+    run(['sh', '-c', f'echo {sibling_pid}; kill -9 {mine.pid}'], must=False)
     time.sleep(2)
 if mode == 'pid-killer':
     # Kills a sibling's worker by its pid.
@@ -311,7 +350,9 @@ if mode == 'exec-left':
     time.sleep(3)  # registered and running before down
     run(cli['down'], must=False)
     finish()
-if mode not in ('leave-running',):
+if mode == 'leave-running-idle':
+    time.sleep(32)   # no down, restart or kill in the last 30 s before it exits (teardown collateral target)
+if mode not in ('leave-running', 'leave-running-idle'):
     run(cli['down'])
 if mode == 'stray':
     # Started without the arm's tooling, in the worktree, and left running.
