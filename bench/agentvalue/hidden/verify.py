@@ -148,20 +148,63 @@ def wait_receipts(ident, count, timeout=10):
 
 
 class Monitor:
-    """Capture the write commands the API sends to Redis, so a delivered job can be replayed as-is."""
+    """Capture the exact arguments of every command sent to Redis (raw MONITOR protocol), so a job
+    the API queued can be replayed byte for byte, whatever key or format the submission uses."""
 
     def __init__(self):
-        self.commands, self.ready = [], threading.Event()
+        import socket
+        from urllib.parse import urlparse
+        url = urlparse(os.environ['REDIS_URL'])
+        self.sock = socket.create_connection((url.hostname, url.port or 6379), timeout=5)
+        self.sock.sendall(b'*1\r\n$7\r\nMONITOR\r\n')
+        self.buffer, self.commands = b'', []
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
-        self.ready.wait(5)
+        time.sleep(0.3)
 
     def run(self):
-        client = redis.Redis.from_url(os.environ['REDIS_URL'], decode_responses=True)
-        with client.monitor() as monitor:
-            self.ready.set()
-            for event in monitor.listen():
-                self.commands.append(event['command'])
+        self.sock.settimeout(None)
+        while True:
+            try:
+                chunk = self.sock.recv(65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.buffer += chunk
+            while b'\r\n' in self.buffer:
+                line, self.buffer = self.buffer.split(b'\r\n', 1)
+                if line.startswith(b'+') and b'"' in line:
+                    self.commands.append(parse_monitor(line.decode('latin-1')))
+
+    def close(self):
+        self.sock.close()
+
+
+def parse_monitor(line):
+    """Arguments of one MONITOR line: quoted strings with C-style escapes (\\" \\\\ \\n \\xHH)."""
+    args, i = [], line.index('"')
+    while i < len(line):
+        if line[i] != '"':
+            i += 1
+            continue
+        i += 1
+        out = bytearray()
+        while line[i] != '"':
+            if line[i] == '\\':
+                nxt = line[i + 1]
+                if nxt == 'x':
+                    out.append(int(line[i + 2:i + 4], 16))
+                    i += 4
+                    continue
+                out += {'n': b'\n', 'r': b'\r', 't': b'\t', 'a': b'\a', 'b': b'\b'}.get(nxt, nxt.encode('latin-1'))
+                i += 2
+                continue
+            out += line[i].encode('latin-1')
+            i += 1
+        args.append(bytes(out))
+        i += 1
+    return args
 
 
 WRITES = ('RPUSH', 'LPUSH', 'XADD', 'ZADD', 'SADD', 'LPUSHX', 'RPUSHX')
@@ -188,18 +231,15 @@ def pay_receipts():
         if [r[0] for r in wait_receipts(42, 1)] != [300]:
             return False
         time.sleep(0.5)
-        import shlex
-        replays = []
-        for command in list(monitor.commands):
-            parts = shlex.split(command)
-            if parts and parts[0].upper() in WRITES:
-                replays.append(parts)
+        monitor.close()
+        replays = [args for args in list(monitor.commands) if args and args[0].decode('latin-1').upper() in WRITES]
         if not replays:
             print('no queued job observed on Redis', file=sys.stderr)
             return False
+        raw = redis.Redis.from_url(os.environ['REDIS_URL'])  # bytes in, bytes out
         for _ in range(2):
-            for parts in replays:
-                R.execute_command(*parts)
+            for args in replays:
+                raw.execute_command(*args)
         time.sleep(4)
         got = [r[0] for r in receipts_for(42)]
         if got != [300]:

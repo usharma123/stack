@@ -1,0 +1,1467 @@
+{
+  "pair": 0,
+  "arm": "stack",
+  "root": "/tmp/avr0s-ig1ok2o_",
+  "started": 1795049732.231,
+  "steps": [
+    {
+      "name": "compile",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "compile"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049732.25,
+      "seconds": 1.1,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"compile\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":1095,\"data\":{\"bundles\":[],\"stack\":{\"tools\":{\"python\":{\"value\":\"3.13.16\",\"origin\":\"project\"},\"uv\":{\"value\":\"0.12.23\",\"origin\":\"project\"}},\"env\":{},\"services\":{\"postgres\":{\"value\":{\"preset\":\"postgres\",\"version\":\"17.11\"},\"origin\":\"project\"},\"redis\":{\"value\":{\"preset\":\"redis\",\"version\":\"7.4.7\"},\"origin\":\"project\"},\"api\":{\"value\":{\"run\":\"export IDENTITY_TOKEN=\\\"$STACK_IDENTITY_API\\\"; exec uv run --frozen python app.py\",\"identity\":{\"command\":\"python3 -c \\\"import os,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:'+os.environ['API_PORT']+'/identity',timeout=5).read().decode())\\\"\"},\"watch\":[\"app.py\",\"ledger/db.py\",\"ledger/cache.py\",\"ledger/jobs.py\",\"ledger/config.py\"],\"depends_on\":[\"postgres\",\"redis\"],\"setup\":\"uv run --frozen python migrate.py\"},\"origin\":\"project\"},\"worker\":{\"value\":{\"run\":\"export WORKER_HEALTH_PORT=\\\"$PORT\\\"; exec uv run --frozen python worker.py\",\"watch\":[\"worker.py\",\"ledger/db.py\",\"ledger/cache.py\",\"ledger/jobs.py\",\"ledger/config.py\"],\"depends_on\":[\"postgres\",\"redis\"]},\"origin\":\"project\"}},\"tasks\":{\"migrate\":{\"value\":{\"run\":\"uv run --frozen python migrate.py\",\"services\":[\"postgres\"]},\"origin\":\"project\"},\"seed\":{\"value\":{\"run\":\"uv run --frozen python seed.py\",\"services\":[\"postgres\",\"redis\"]},\"origin\":\"project\"},\"test\":{\"value\":{\"run\":\"uv run --frozen pytest -q\",\"services\":[\"postgres\",\"redis\",\"api\",\"worker\"]},\"origin\":\"project\"},\"smoke\":{\"value\":{\"run\":\"uv run --frozen python smoke.py\",\"services\":[\"postgres\",\"redis\",\"api\"]},\"origin\":\"project\"}},\"bin_paths\":[],\"overrides\":[]},\"init\":{\"postgres\":{\"value\":[\"seed\"],\"origin\":\"project\"}},\"ports\":{\"postgres\":23332,\"redis\":29483,\"api\":28272,\"worker\":23644},\"versions\":[{\"kind\":\"tool\",\"name\":\"python\",\"requested\":\"3.13.16\",\"resolved\":\"3.13.16\",\"origin\":\"project\",\"backend\":\"core:python\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:88b362e2e9754787c07f2847b717b127e60f77976e20847a0489f3043c925f2c\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:f326b7a386bf22def82e55dc3b95d2bef8b7c938b4c98ec32dd65433e7720b50\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:83621f7b2b1e5da63cae0b4c67612974547b14262676608e830e246cb832d07d\",\"change\":\"added\"}}},{\"kind\":\"tool\",\"name\":\"uv\",\"requested\":\"0.12.23\",\"resolved\":\"0.12.23\",\"origin\":\"project\",\"backend\":\"aqua:astral-sh/uv\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:6524bd338177ed50d035d39354e12545e993bbeba2ecbddf0480c5b3a81d313f\",\"change\":\"added\"}}},{\"kind\":\"service\",\"name\":\"postgres\",\"tool\":\"postgres\",\"requested\":\"17.11\",\"resolved\":\"17.11\",\"origin\":\"project\",\"backend\":\"conda:postgresql\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:65c13363a5e112b1023f3afe8ecae2d99eb08377087f2cb036a611fabb9ec010\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:5c6a27b5c33570c158b88bd0a7f30fafa66c5d825ad9e4471eb92526ba8a39fe\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:c7ca0f8a6e98eaec05c7c531fdc96139432adbc5f65540211745a836928331ee\",\"change\":\"added\"}}},{\"kind\":\"service\",\"name\":\"redis\",\"tool\":\"redis\",\"requested\":\"7.4.7\",\"resolved\":\"7.4.7\",\"origin\":\"project\",\"backend\":\"conda:redis-server\",\"artifacts\":{\"macos-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:8a7bc4793cab62363d54872a9ded8a1ac76cf87a33ec30baf5d34dc4c549041b\",\"change\":\"added\"},\"linux-x64\":{\"state\":\"verified\",\"checksum\":\"sha256:c49d1f8c19a5f045bf7526825429fd94c520e2081c1246734301aeb2006aa6b6\",\"change\":\"added\"},\"linux-arm64\":{\"state\":\"verified\",\"checksum\":\"sha256:ed53b59a1439f406a18a0023f7651ca1994c5e467b93d9f651a3f045c2bfc691\",\"change\":\"added\"}}}],\"lock_changed\":true,\"provider\":\"mise\",\"output\":\"/private/tmp/avr0s-ig1ok2o_/main/.config/mise/conf.d/stack.toml\",\"written\":true,\"skills\":[{\"tool\":\"python\",\"version\":\"3.13.16\",\"origin\":\"project\",\"status\":\"no_skill\"},{\"tool\":\"uv\",\"version\":\"0.12.23\",\"origin\":\"project\",\"status\":\"no_skill\"},{\"tool\":\"postgres\",\"version\":\"17.11\",\"origin\":\"project\",\"services\":[\"postgres\"],\"status\":\"no_skill\"},{\"tool\":\"redis\",\"version\":\"7.4.7\",\"origin\":\"project\",\"services\":[\"redis\"],\"status\":\"no_skill\"}]}}\n",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "init",
+        "-q"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049733.35,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "add",
+        "-A"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049733.363,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "Starting point"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049733.387,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_up",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "up",
+        "--ttl",
+        "4h",
+        "--timeout",
+        "5m"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049733.417,
+      "seconds": 2.74,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"up\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":2739,\"data\":{\"session\":{\"id\":\"65e84b0d1646\",\"started_at\":1795049735,\"lease\":{\"ttl_secs\":14400,\"renewed_at\":1795049735}},\"lease\":{\"kind\":\"ttl\",\"ttl_secs\":14400,\"renewed_at\":1795049735,\"expires_at\":1795064135,\"expired\":false},\"checks\":[{\"service\":\"postgres\",\"ready\":true,\"port\":23332,\"pid\":49823,\"identity\":\"instance\",\"checked_at\":1795049735},{\"service\":\"redis\",\"ready\":true,\"port\":29483,\"pid\":49824,\"identity\":\"instance\",\"checked_at\":1795049735},{\"service\":\"api\",\"ready\":true,\"port\":28272,\"pid\":50037,\"identity\":\"instance\",\"checked_at\":1795049735},{\"service\":\"worker\",\"ready\":true,\"port\":23644,\"pid\":50038,\"identity\":\"liveness\",\"checked_at\":1795049735}],\"steps\":[{\"step\":\"gc\",\"status\":\"ok\"},{\"step\":\"compile\",\"status\":\"ok\"},{\"step\":\"install\",\"status\":\"ok\",\"detail\":{\"artifacts\":{\"platform\":\"macos-arm64\",\"verified\":[\"python@3.13.16\",\"uv@0.12.23\",\"postgres@17.11\",\"redis@7.4.7\"],\"exempt\":[],\"unsupported\":[],\"missing\":[]},\"locked\":[\"python\",\"uv\",\"postgres\",\"redis\"],\"plain\":[],\"boundary\":\"mise checks the recorded checksum (and packslip signer) of artifacts it downloads; a release already installed on this machine is reported installed without being checked again\",\"skipped\":\"every pinned release is already installed\"}},{\"step\":\"stop_previous\",\"status\":\"ok\"},{\"step\":\"ports\",\"status\":\"ok\"},{\"step\":\"start\",\"status\":\"ok\"},{\"step\":\"verify\",\"status\":\"ok\"},{\"step\":\"init\",\"status\":\"ok\",\"detail\":{\"service\":\"postgres\",\"task\":\"seed\",\"exit_code\":0,\"secs\":0}}],\"init\":{\"postgres\":{\"status\":\"done\",\"ran\":[\"seed\"]}}}}\n",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_env",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "exec",
+        "--",
+        "env"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049736.161,
+      "seconds": 0.06,
+      "stdout": "AGENTVALUE_WT=main\nAI_AGENT=claude-code_2-1-327_agent\nAPI_PORT=28272\nAPI_URL=http://127.0.0.1:28272\nCLAUDECODE=1\nCLAUDE_AGENT_SDK_VERSION=0.3.321\nCLAUDE_CODE_CHILD_NOTES_DIR=/private/tmp/claude-501/-Users-utsavsharma--t3-worktrees-stack-bench-agent-value-91f22f7a971eac43/b77d1b52-36f7-42f2-a64c-8871587329e6/started\nCLAUDE_CODE_CHILD_SESSION=1\nCLAUDE_CODE_ENTRYPOINT=t3-code\nCLAUDE_CODE_EXECPATH=/Users/utsavsharma/.local/share/claude/versions/2.1.327\nCLAUDE_CODE_MESSAGING_SOCKET=/tmp/cc-socks/1901.sock\nCLAUDE_CODE_MESSAGING_TOKEN=<redacted>\nCLAUDE_CODE_SESSION_ATTENDED=0\nCLAUDE_CODE_SESSION_ID=b77d1b52-36f7-42f2-a64c-8871587329e6\nCLAUDE_EFFORT=high\nCLAUDE_PID=1901\nCOMMAND_MODE=unix2003\nCOREPACK_ENABLE_AUTO_PIN=0\nDATABASE_URL=postgresql://postgres@127.0.0.1:23332/postgres\nGIT_CONFIG_NOSYSTEM=1\nGIT_EDITOR=true\nHOME=/Users/utsavsharma\nHOMEBREW_CELLAR=/opt/homebrew/Cellar\nHOMEBREW_PREFIX=/opt/homebrew\nHOMEBREW_REPOSITORY=/opt/homebrew\nJAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home\nLANG=en_US.UTF-8\nLOGNAME=utsavsharma\nLaunchInstanceID=F6153A84-7B36-4B30-B1D7-D5B605F8AD8C\nMCP_CONNECTION_NONBLOCKING=0\nMISE_AUTO_ENV=false\nMISE_CACHE_DIR=/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-cache\nMISE_CEILING_PATHS=/private/tmp/avr0s-ig1ok2o_\nMISE_CONFIG_DIR=/private/tmp/avr0s-ig1ok2o_/main/.stack/provider-config\nMISE_DATA_DIR=/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data\nMISE_ENV=\nMISE_GLOBAL_CONFIG_FILE=/private/tmp/avr0s-ig1ok2o_/main/.stack/provider-config/global.toml\nMISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=\nMISE_OVERRIDE_CONFIG_FILENAMES=.config/mise/conf.d/stack.toml\nMISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none\nMISE_STATE_DIR=/tmp/avr0s-ig1ok2o_/m/mise/state\nMISE_SYSTEM_CONFIG_DIR=/private/tmp/avr0s-ig1ok2o_/main/.stack/provider-config\nMISE_SYSTEM_CONFIG_FILE=/private/tmp/avr0s-ig1ok2o_/main/.stack/provider-config/system.toml\nMISE_YES=1\nMallocNanoZone=0\nNO_COLOR=1\nNoDefaultCurrentDirectoryInExePath=1\nOLDPWD=/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness\nOSLogRateLimit=64\nPATH=/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/python/3.13.16/bin:/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin:/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/.mise-bins:/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/.mise-bins:/tmp/avr0s-ig1ok2o_/bin:/opt/anaconda3/condabin:/opt/homebrew/opt/python@3.12/libexec/bin:/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home/bin:/Users/utsavsharma/.local/bin:/Users/utsavsharma/.cargo/bin:/Users/utsavsharma/.bun/bin:/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Users/utsavsharma/.docker/bin\nPGDATABASE=postgres\nPGHOST=127.0.0.1\nPGPORT=23332\nPGUSER=postgres\nPITCHFORK_CONFIG_DIR=/tmp/avr0s-ig1ok2o_/m/pf/config\nPITCHFORK_LOGS_DIR=/tmp/avr0s-ig1ok2o_/m/pf/logs\nPITCHFORK_STATE_DIR=/tmp/avr0s-ig1ok2o_/m/pf/state\nPWD=/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue\nREDIS_URL=redis://127.0.0.1:29483\nSECURITYSESSIONID=186b4\nSHELL=/bin/zsh\nSHLVL=1\nSSH_AUTH_SOCK=<redacted>\nSTACK_CACHE_DIR=/tmp/avr0s-ig1ok2o_/m/stack/cache\nSTACK_DATA_DIR=/tmp/avr0s-ig1ok2o_/m/stack/data\nSTACK_IDENTITY_API=stack-54662603b6b298db801db9bc4924da2f\nSTACK_PROJECT=/private/tmp/avr0s-ig1ok2o_/main\nSTACK_SESSION=65e84b0d1646\nSTACK_STATE_DIR=/tmp/avr0s-ig1ok2o_/m/stack/state\nT3CODE_CLI_PATH=/Users/utsavsharma/.t3/bin/t3\nT3CODE_DESKTOP_HOST_SCOPE=f58c43035e27fe0ab61e0ff782d7c071\nT3CODE_DESKTOP_SHELL_DISCOVERY_PENDING=1\nT3CODE_THREAD_ID=mcp:fd1a7da2-4ea0-4d1d-9d3d-4ba1982f5345\nTMPDIR=/var/folders/tt/td9yj_dd3r9d84_b_rn9q6780000gn/T/\nUSER=utsavsharma\nUV_CACHE_DIR=/Users/utsavsharma/.cache/stack-agentvalue/warm/uv\nUV_PYTHON=3.13.16\nUV_PYTHON_PREFERENCE=only-system\nWORKER_PORT=23644\nWORKER_URL=http://127.0.0.1:23644\nXDG_CACHE_HOME=/tmp/avr0s-ig1ok2o_/m/xdg/cache\nXDG_CONFIG_HOME=/tmp/avr0s-ig1ok2o_/m/xdg/config\nXDG_DATA_HOME=/tmp/avr0s-ig1ok2o_/m/xdg/data\nXDG_STATE_HOME=/tmp/avr0s-ig1ok2o_/m/xdg/state\nXPC_FLAGS=0x0\nXPC_SERVICE_NAME=0\n_=/opt/homebrew/opt/python@3.12/libexec/bin/python3\n__CFBundleIdentifier=com.t3tools.t3code\n__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0\nnpm_config_cache=/tmp/avr0s-ig1ok2o_/m/npm/cache\nnpm_config_globalconfig=/tmp/avr0s-ig1ok2o_/m/npm/global-npmrc\nnpm_config_prefix=/tmp/avr0s-ig1ok2o_/m/npm/prefix\nnpm_config_userconfig=/tmp/avr0s-ig1ok2o_/m/npm/npmrc\n",
+      "stderr": ""
+    },
+    {
+      "name": "canary_plant",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "plant",
+        "9904e873b31b"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049736.222,
+      "seconds": 0.13,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"d1d86246907349bfaa52f1bb727de000c037ee21efee59ae8039a061cd026a65\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:9904e873b31b\"], \"redis_sha256\": \"60671985ff4dd482aa332ea3fc192afcf64ec610dcd00aab20895ea437d3775d\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "canary_before",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "fingerprint"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049738.857,
+      "seconds": 0.13,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"d1d86246907349bfaa52f1bb727de000c037ee21efee59ae8039a061cd026a65\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:9904e873b31b\"], \"redis_sha256\": \"60671985ff4dd482aa332ea3fc192afcf64ec610dcd00aab20895ea437d3775d\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/invoice-notes",
+        "/tmp/avr0s-ig1ok2o_/wt-notes"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049739.198,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/pay-receipts",
+        "/tmp/avr0s-ig1ok2o_/wt-pay"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049739.231,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/customer-table",
+        "/tmp/avr0s-ig1ok2o_/wt-cust"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049739.261,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "canary_after",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "fingerprint"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049745.322,
+      "seconds": 0.12,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"d1d86246907349bfaa52f1bb727de000c037ee21efee59ae8039a061cd026a65\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:9904e873b31b\"], \"redis_sha256\": \"60671985ff4dd482aa332ea3fc192afcf64ec610dcd00aab20895ea437d3775d\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "gc_reclaim",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "gc",
+        "--reclaim-data"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049779.274,
+      "seconds": 0.19,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"gc\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":182,\"data\":[{\"project\":\"/private/tmp/avr0s-ig1ok2o_/wt-pay\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 23219 released\"},{\"service\":\"redis\",\"outcome\":\"port 29091 released\"},{\"service\":\"api\",\"outcome\":\"port 25428 released\"},{\"service\":\"worker\",\"outcome\":\"port 25198 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/9fbd4183bf8e5c5f/postgres removed (40826803 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/9fbd4183bf8e5c5f/redis removed (775 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/9fbd4183bf8e5c5f removed\"}]},{\"project\":\"/private/tmp/avr0s-ig1ok2o_/wt-notes\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 22872 released\"},{\"service\":\"redis\",\"outcome\":\"port 25261 released\"},{\"service\":\"api\",\"outcome\":\"port 21652 released\"},{\"service\":\"worker\",\"outcome\":\"port 21255 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/c94952e0c57d1ef7/postgres removed (40810222 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/c94952e0c57d1ef7/redis removed (823 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/c94952e0c57d1ef7 removed\"}]},{\"project\":\"/private/tmp/avr0s-ig1ok2o_/wt-cust\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 21728 released\"},{\"service\":\"redis\",\"outcome\":\"port 22955 released\"},{\"service\":\"api\",\"outcome\":\"port 28375 released\"},{\"service\":\"worker\",\"outcome\":\"port 22012 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/90e73744d08ca534/postgres removed (40877925 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/90e73744d08ca534/redis removed (775 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/90e73744d08ca534 removed\"}]}]}\n",
+      "stderr": ""
+    },
+    {
+      "name": "ps_after_disposal",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "ps"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049779.756,
+      "seconds": 0.01,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"ps\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":4,\"data\":{\"checks\":\"liveness only: the recorded pid exists and the port accepts connections. Not proof that it is this checkout's instance; run `stack status` in the checkout for that\",\"checkouts\":[{\"path\":\"/private/tmp/avr0s-ig1ok2o_/main\",\"dir_exists\":true,\"dir\":\"present\",\"state\":\"running\",\"session\":{\"id\":\"65e84b0d1646\",\"started_at\":1795049735,\"launching\":false},\"lease\":{\"kind\":\"ttl\",\"ttl_secs\":14400,\"renewed_at\":1795049736,\"expires_at\":1795064136,\"expired\":false},\"services\":[{\"name\":\"postgres\",\"port\":23332,\"pid\":49823,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":\"/tmp/avr0s-ig1ok2o_/m/stack/state/data/78a6e87162ed0bc0/postgres\",\"data_bytes\":40902656},{\"name\":\"redis\",\"port\":29483,\"pid\":49824,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":\"/tmp/avr0s-ig1ok2o_/m/stack/state/data/78a6e87162ed0bc0/redis\",\"data_bytes\":16384},{\"name\":\"api\",\"port\":28272,\"pid\":50037,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":null,\"data_bytes\":null},{\"name\":\"worker\",\"port\":23644,\"pid\":50038,\"pid_alive\":true,\"port_accepting\":true,\"data_dir\":null,\"data_bytes\":null}],\"identity_tokens\":1,\"reclaimable\":false},{\"path\":\"/private/tmp/avr0s-ig1ok2o_/wt-cust\",\"dir_exists\":false,\"dir\":\"missing\",\"state\":\"reserved\",\"session\":null,\"lease\":null,\"services\":[],\"identity_tokens\":1,\"reclaimable\":true},{\"path\":\"/private/tmp/avr0s-ig1ok2o_/wt-notes\",\"dir_exists\":false,\"dir\":\"missing\",\"state\":\"reserved\",\"session\":null,\"lease\":null,\"services\":[],\"identity_tokens\":1,\"reclaimable\":true},{\"path\":\"/private/tmp/avr0s-ig1ok2o_/wt-pay\",\"dir_exists\":false,\"dir\":\"missing\",\"state\":\"reserved\",\"session\":null,\"lease\":null,\"services\":[],\"identity_tokens\":1,\"reclaimable\":true}],\"totals\":{\"checkouts\":4,\"running\":1,\"services\":4,\"services_live\":4,\"ports_reserved\":4,\"data_bytes\":40919040,\"reclaimable_bytes\":0}}}\n",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_down",
+      "argv": [
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+        "--json",
+        "down"
+      ],
+      "cwd": "/tmp/avr0s-ig1ok2o_/main",
+      "exit": 0,
+      "started": 1795049779.764,
+      "seconds": 0.09,
+      "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":84,\"data\":{\"stopped\":[{\"service\":\"api\",\"pid\":50037},{\"service\":\"postgres\",\"pid\":49823},{\"service\":\"redis\",\"pid\":49824},{\"service\":\"worker\",\"pid\":50038}],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/78a6e87162ed0bc0\"}}}\n",
+      "stderr": ""
+    }
+  ],
+  "agents": {
+    "invoice-notes": {
+      "worktree": "/tmp/avr0s-ig1ok2o_/wt-notes",
+      "marker": "wt-notes",
+      "started": 1795049739.325,
+      "pid": 50449,
+      "ended": 1795049744.175,
+      "seconds": 4.85,
+      "exit": 0,
+      "timed_out": false,
+      "left_running": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "note_default": true,
+          "create_with_note": true,
+          "patch_note": true,
+          "cache_after_patch": true,
+          "database_after_patch": true,
+          "other_invoice_untouched": true,
+          "migration_rerun_safe": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "451e4a147e11f62ae2a02e4624eac0668a138145 invoice-notes: reference solution"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_invoice_notes"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 7,
+        "bash_calls": 7,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": null,
+          "num_turns": null,
+          "duration_ms": null,
+          "duration_api_ms": null,
+          "total_cost_usd": null,
+          "usage": null,
+          "modelUsage": null
+        },
+        "model": null,
+        "unparsed_lines": 0,
+        "final_text": ""
+      }
+    },
+    "pay-receipts": {
+      "worktree": "/tmp/avr0s-ig1ok2o_/wt-pay",
+      "marker": "wt-pay",
+      "started": 1795049739.327,
+      "pid": 50451,
+      "ended": 1795049744.457,
+      "seconds": 5.13,
+      "exit": 0,
+      "timed_out": false,
+      "left_running": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "pay_marks_paid": true,
+          "cache_after_pay": true,
+          "receipt_recorded": true,
+          "duplicate_job_one_receipt": true,
+          "pay_twice_conflict": true,
+          "pay_unknown_404": true,
+          "existing_receipts_kept": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "493d7f87977cb933c14f25ab49814e939658646d pay-receipts: reference solution"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_one_receipt_per_invoice"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 7,
+        "bash_calls": 7,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": null,
+          "num_turns": null,
+          "duration_ms": null,
+          "duration_api_ms": null,
+          "total_cost_usd": null,
+          "usage": null,
+          "modelUsage": null
+        },
+        "model": null,
+        "unparsed_lines": 0,
+        "final_text": ""
+      }
+    },
+    "customer-table": {
+      "worktree": "/tmp/avr0s-ig1ok2o_/wt-cust",
+      "marker": "wt-cust",
+      "started": 1795049739.33,
+      "pid": 50452,
+      "ended": 1795049743.872,
+      "seconds": 4.54,
+      "exit": 0,
+      "timed_out": false,
+      "left_running": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "customers_deduplicated": true,
+          "customer_column_dropped": true,
+          "customer_fk": true,
+          "post_reuses_customer": true,
+          "post_new_customer": true,
+          "customer_invoices_endpoint": true,
+          "migration_rerun_safe": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "32a8ca7e898e444b46e1619c3d444cb7ba4ed952 customer-table: reference solution"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_customers_table"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 7,
+        "bash_calls": 7,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": null,
+          "num_turns": null,
+          "duration_ms": null,
+          "duration_api_ms": null,
+          "total_cost_usd": null,
+          "usage": null,
+          "modelUsage": null
+        },
+        "model": null,
+        "unparsed_lines": 0,
+        "final_text": ""
+      }
+    }
+  },
+  "stack_binary_sha256": "4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3",
+  "source_rev": "05c021187abdf4b8b25c4372ff96b86a20f88a0a",
+  "valid": true,
+  "invalid_reasons": [],
+  "start_commit": "2c9ce7a50be54235f994b9cd8a02f9a20c355684",
+  "bystander": {
+    "env": {
+      "API_URL": "http://127.0.0.1:28272",
+      "DATABASE_URL": "postgresql://postgres@127.0.0.1:23332/postgres",
+      "REDIS_URL": "redis://127.0.0.1:29483"
+    },
+    "fingerprint_before": {
+      "columns": [
+        [
+          "invoices",
+          "cents",
+          "integer"
+        ],
+        [
+          "invoices",
+          "customer",
+          "text"
+        ],
+        [
+          "invoices",
+          "id",
+          "integer"
+        ],
+        [
+          "invoices",
+          "status",
+          "text"
+        ],
+        [
+          "receipts",
+          "cents",
+          "integer"
+        ],
+        [
+          "receipts",
+          "id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "invoice_id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "issued_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "applied_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "version",
+          "text"
+        ]
+      ],
+      "migrations": [
+        "20261001_create_invoices",
+        "20261008_create_receipts"
+      ],
+      "invoices_sha256": "d1d86246907349bfaa52f1bb727de000c037ee21efee59ae8039a061cd026a65",
+      "receipts_sha256": "668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f",
+      "tuple_writes": [
+        161,
+        12,
+        0
+      ],
+      "redis_keys": [
+        "bystander:9904e873b31b"
+      ],
+      "redis_sha256": "60671985ff4dd482aa332ea3fc192afcf64ec610dcd00aab20895ea437d3775d"
+    },
+    "processes_before": [
+      {
+        "pid": 49822,
+        "started": "Wed Nov 18 19:55:33 2026",
+        "command": "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack __supervise /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/78a6e87162ed0bc0"
+      },
+      {
+        "pid": 49823,
+        "started": "Wed Nov 18 19:55:33 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr0s-ig1ok2o_/m/stack/state/data/78a6e87162ed0bc0/postgres -p 23332 -h 127.0.0.1 -k "
+      },
+      {
+        "pid": 49824,
+        "started": "Wed Nov 18 19:55:33 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:29483        "
+      },
+      {
+        "pid": 49913,
+        "started": "Wed Nov 18 19:55:34 2026",
+        "command": "postgres: checkpointer         "
+      },
+      {
+        "pid": 49914,
+        "started": "Wed Nov 18 19:55:34 2026",
+        "command": "postgres: background writer         "
+      },
+      {
+        "pid": 49917,
+        "started": "Wed Nov 18 19:55:34 2026",
+        "command": "postgres: walwriter         "
+      },
+      {
+        "pid": 49918,
+        "started": "Wed Nov 18 19:55:34 2026",
+        "command": "postgres: autovacuum launcher         "
+      },
+      {
+        "pid": 49919,
+        "started": "Wed Nov 18 19:55:34 2026",
+        "command": "postgres: logical replication launcher         "
+      },
+      {
+        "pid": 50037,
+        "started": "Wed Nov 18 19:55:35 2026",
+        "command": "uv run --frozen python app.py"
+      },
+      {
+        "pid": 50038,
+        "started": "Wed Nov 18 19:55:35 2026",
+        "command": "uv run --frozen python worker.py"
+      },
+      {
+        "pid": 50046,
+        "started": "Wed Nov 18 19:55:35 2026",
+        "command": "/private/tmp/avr0s-ig1ok2o_/main/.venv/bin/python worker.py"
+      },
+      {
+        "pid": 50047,
+        "started": "Wed Nov 18 19:55:35 2026",
+        "command": "/private/tmp/avr0s-ig1ok2o_/main/.venv/bin/python app.py"
+      }
+    ],
+    "fingerprint_after": {
+      "columns": [
+        [
+          "invoices",
+          "cents",
+          "integer"
+        ],
+        [
+          "invoices",
+          "customer",
+          "text"
+        ],
+        [
+          "invoices",
+          "id",
+          "integer"
+        ],
+        [
+          "invoices",
+          "status",
+          "text"
+        ],
+        [
+          "receipts",
+          "cents",
+          "integer"
+        ],
+        [
+          "receipts",
+          "id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "invoice_id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "issued_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "applied_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "version",
+          "text"
+        ]
+      ],
+      "migrations": [
+        "20261001_create_invoices",
+        "20261008_create_receipts"
+      ],
+      "invoices_sha256": "d1d86246907349bfaa52f1bb727de000c037ee21efee59ae8039a061cd026a65",
+      "receipts_sha256": "668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f",
+      "tuple_writes": [
+        161,
+        12,
+        0
+      ],
+      "redis_keys": [
+        "bystander:9904e873b31b"
+      ],
+      "redis_sha256": "60671985ff4dd482aa332ea3fc192afcf64ec610dcd00aab20895ea437d3775d"
+    },
+    "changed": [],
+    "processes_lost": [],
+    "foreign_migrations": []
+  },
+  "machine_state_bytes_before_agents": 81469440,
+  "machine_state_tree_before": {
+    "mise/config": 0,
+    "mise/state/trusted-configs": 0,
+    "mise/state/task-history/78a6e87162ed0bc0": 4096,
+    "mise/state/task-history": 4096,
+    "mise/state/tracked-configs": 0,
+    "mise/state/incomplete-installs": 0,
+    "mise/state": 4096,
+    "mise": 4096,
+    "pf/state": 0,
+    "pf": 0,
+    "stack/cache/resolve": 0,
+    "stack/cache/installed": 0,
+    "stack/cache/lock": 0,
+    "stack/cache/skills": 0,
+    "stack/cache/task-config": 0,
+    "stack/cache": 0,
+    "stack/state/init": 4096,
+    "stack/state/projects": 8192,
+    "stack/state/supervisors/78a6e87162ed0bc0": 49152,
+    "stack/state/supervisors": 49152,
+    "stack/state/sessions": 4096,
+    "stack/state/templates/postgres": 40456192,
+    "stack/state/templates": 40456192,
+    "stack/state/data/78a6e87162ed0bc0": 40927232,
+    "stack/state/data": 40927232,
+    "stack/state": 81465344,
+    "stack/data": 0,
+    "stack": 81465344,
+    "xdg/cache": 0,
+    "xdg/config": 0,
+    "xdg/state": 0,
+    "xdg/data": 0,
+    "xdg": 0,
+    ".": 81469440
+  },
+  "sampler": {
+    "samples": 6,
+    "errors": [],
+    "processes": {
+      "main": [
+        {
+          "pid": 49822,
+          "started": "Wed Nov 18 19:55:33 2026",
+          "first": 1795049739.3232691,
+          "command": "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack __supervise /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/78a6e87162ed0bc0",
+          "last": 1795049745.163436
+        },
+        {
+          "pid": 49823,
+          "started": "Wed Nov 18 19:55:33 2026",
+          "first": 1795049739.3232691,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr0s-ig1ok2o_/m/stack/state/data/78a6e87162ed0bc0/postgres -p 23332 -h 127.0.0.1 -k ",
+          "last": 1795049745.163436
+        },
+        {
+          "pid": 49824,
+          "started": "Wed Nov 18 19:55:33 2026",
+          "first": 1795049739.3232691,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/redis/7.4.7/bin/redis-server 127.0.0.1:29483        ",
+          "last": 1795049745.163436
+        },
+        {
+          "pid": 50037,
+          "started": "Wed Nov 18 19:55:35 2026",
+          "first": 1795049739.3232691,
+          "command": "uv run --frozen python app.py",
+          "last": 1795049745.163436
+        },
+        {
+          "pid": 50038,
+          "started": "Wed Nov 18 19:55:35 2026",
+          "first": 1795049739.3232691,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049745.163436
+        },
+        {
+          "pid": 50046,
+          "started": "Wed Nov 18 19:55:35 2026",
+          "first": 1795049739.3232691,
+          "command": "/private/tmp/avr0s-ig1ok2o_/main/.venv/bin/python worker.py",
+          "last": 1795049745.163436
+        },
+        {
+          "pid": 50047,
+          "started": "Wed Nov 18 19:55:35 2026",
+          "first": 1795049739.3232691,
+          "command": "/private/tmp/avr0s-ig1ok2o_/main/.venv/bin/python app.py",
+          "last": 1795049745.163436
+        }
+      ],
+      "wt-notes": [
+        {
+          "pid": 50449,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049739.3232691,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/scripted_agent.py reference",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50456,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "stack up --ttl 1h",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50499,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr0s-ig1ok2o_/m/stack/state/data/c94952e0c57d1ef7/postgres -p 22872 -h 127.0.0.1 -k ",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50549,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "uv run --frozen python migrate.py",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50555,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python migrate.py",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50664,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50681,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python app.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50684,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python worker.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50816,
+          "started": "Wed Nov 18 19:55:41 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python migrate.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50929,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen python app.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50933,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50943,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python app.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50947,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python worker.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50968,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "stack run test",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50982,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50987,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen pytest -q",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50990,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/python /private/tmp/avr0s-ig1ok2o_/wt-notes/.venv/bin/pytest -q",
+          "last": 1795049742.879791
+        }
+      ],
+      "wt-pay": [
+        {
+          "pid": 50451,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049739.3232691,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/scripted_agent.py reference",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50457,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "stack up --ttl 1h",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50502,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr0s-ig1ok2o_/m/stack/state/data/9fbd4183bf8e5c5f/postgres -p 23219 -h 127.0.0.1 -k ",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50542,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "uv run --frozen python migrate.py",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50551,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python migrate.py",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50665,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50682,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python worker.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50683,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python app.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50817,
+          "started": "Wed Nov 18 19:55:41 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python migrate.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50930,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen python app.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50932,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50942,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python app.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50945,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python worker.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50962,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "stack run test",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50978,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50981,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen pytest -q",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50984,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/python /private/tmp/avr0s-ig1ok2o_/wt-pay/.venv/bin/pytest -q",
+          "last": 1795049742.879791
+        }
+      ],
+      "wt-cust": [
+        {
+          "pid": 50452,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049739.3232691,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/scripted_agent.py reference",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50458,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "stack up --ttl 1h",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50496,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/postgres/17.11/bin/postgres -D /tmp/avr0s-ig1ok2o_/m/stack/state/data/90e73744d08ca534/postgres -p 21728 -h 127.0.0.1 -k ",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50550,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "uv run --frozen python migrate.py",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50554,
+          "started": "Wed Nov 18 19:55:39 2026",
+          "first": 1795049740.537314,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python migrate.py",
+          "last": 1795049740.537314
+        },
+        {
+          "pid": 50672,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50685,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python app.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50686,
+          "started": "Wed Nov 18 19:55:40 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python worker.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50815,
+          "started": "Wed Nov 18 19:55:41 2026",
+          "first": 1795049741.733173,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python migrate.py",
+          "last": 1795049741.733173
+        },
+        {
+          "pid": 50931,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen python app.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50934,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen python worker.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50944,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python app.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50946,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python worker.py",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50969,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "stack run test",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50983,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/opt/homebrew/bin/mise run --skip-deps --no-timings test --",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50988,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "uv run --frozen pytest -q",
+          "last": 1795049742.879791
+        },
+        {
+          "pid": 50989,
+          "started": "Wed Nov 18 19:55:42 2026",
+          "first": 1795049742.879791,
+          "command": "/private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/python /private/tmp/avr0s-ig1ok2o_/wt-cust/.venv/bin/pytest -q",
+          "last": 1795049742.879791
+        }
+      ]
+    },
+    "ports": {
+      "23332": [
+        "main"
+      ],
+      "29483": [
+        "main"
+      ],
+      "23644": [
+        "main"
+      ],
+      "28272": [
+        "main"
+      ],
+      "21728": [
+        "wt-cust"
+      ],
+      "22872": [
+        "wt-notes"
+      ],
+      "23219": [
+        "wt-pay"
+      ],
+      "25198": [
+        "wt-pay"
+      ],
+      "21255": [
+        "wt-notes"
+      ],
+      "22012": [
+        "wt-cust"
+      ],
+      "25428": [
+        "wt-pay"
+      ],
+      "21652": [
+        "wt-notes"
+      ],
+      "28375": [
+        "wt-cust"
+      ]
+    },
+    "cross_worktree_connections": []
+  },
+  "harness_reclaim_after_agents": null,
+  "worktree_databases": {
+    "invoice-notes": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_invoice_notes"
+      ],
+      "error": null,
+      "tables": [
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr0s-ig1ok2o_/m/stack/state/data/c94952e0c57d1ef7/postgres"
+    },
+    "pay-receipts": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_one_receipt_per_invoice"
+      ],
+      "error": null,
+      "tables": [
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr0s-ig1ok2o_/m/stack/state/data/9fbd4183bf8e5c5f/postgres"
+    },
+    "customer-table": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_customers_table"
+      ],
+      "error": null,
+      "tables": [
+        "customers",
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr0s-ig1ok2o_/m/stack/state/data/90e73744d08ca534/postgres"
+    }
+  },
+  "disposal": {
+    "steps": {
+      "invoice-notes": {
+        "log": [
+          {
+            "name": "down",
+            "argv": [
+              "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+              "--json",
+              "down"
+            ],
+            "cwd": "/tmp/avr0s-ig1ok2o_/wt-notes",
+            "exit": 0,
+            "started": 1795049779.032,
+            "seconds": 0.02,
+            "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":13,\"data\":{\"stopped\":[],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/c94952e0c57d1ef7\"}}}\n",
+            "stderr": ""
+          },
+          {
+            "name": "worktree_remove",
+            "argv": [
+              "git",
+              "-c",
+              "user.name=bench",
+              "-c",
+              "user.email=bench@example.invalid",
+              "-c",
+              "core.hooksPath=/dev/null",
+              "-c",
+              "init.defaultBranch=main",
+              "-c",
+              "commit.gpgsign=false",
+              "worktree",
+              "remove",
+              "--force",
+              "/tmp/avr0s-ig1ok2o_/wt-notes"
+            ],
+            "cwd": "/tmp/avr0s-ig1ok2o_/main",
+            "exit": 0,
+            "started": 1795049779.049,
+            "seconds": 0.07,
+            "stdout": "",
+            "stderr": ""
+          }
+        ]
+      },
+      "pay-receipts": {
+        "log": [
+          {
+            "name": "down",
+            "argv": [
+              "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+              "--json",
+              "down"
+            ],
+            "cwd": "/tmp/avr0s-ig1ok2o_/wt-pay",
+            "exit": 0,
+            "started": 1795049779.114,
+            "seconds": 0.02,
+            "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":13,\"data\":{\"stopped\":[],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/9fbd4183bf8e5c5f\"}}}\n",
+            "stderr": ""
+          },
+          {
+            "name": "worktree_remove",
+            "argv": [
+              "git",
+              "-c",
+              "user.name=bench",
+              "-c",
+              "user.email=bench@example.invalid",
+              "-c",
+              "core.hooksPath=/dev/null",
+              "-c",
+              "init.defaultBranch=main",
+              "-c",
+              "commit.gpgsign=false",
+              "worktree",
+              "remove",
+              "--force",
+              "/tmp/avr0s-ig1ok2o_/wt-pay"
+            ],
+            "cwd": "/tmp/avr0s-ig1ok2o_/main",
+            "exit": 0,
+            "started": 1795049779.131,
+            "seconds": 0.06,
+            "stdout": "",
+            "stderr": ""
+          }
+        ]
+      },
+      "customer-table": {
+        "log": [
+          {
+            "name": "down",
+            "argv": [
+              "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+              "--json",
+              "down"
+            ],
+            "cwd": "/tmp/avr0s-ig1ok2o_/wt-cust",
+            "exit": 0,
+            "started": 1795049779.194,
+            "seconds": 0.02,
+            "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"down\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":12,\"data\":{\"stopped\":[],\"confirmed\":true,\"supervisor\":{\"stopped\":true,\"state_dir\":\"/tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/90e73744d08ca534\"}}}\n",
+            "stderr": ""
+          },
+          {
+            "name": "worktree_remove",
+            "argv": [
+              "git",
+              "-c",
+              "user.name=bench",
+              "-c",
+              "user.email=bench@example.invalid",
+              "-c",
+              "core.hooksPath=/dev/null",
+              "-c",
+              "init.defaultBranch=main",
+              "-c",
+              "commit.gpgsign=false",
+              "worktree",
+              "remove",
+              "--force",
+              "/tmp/avr0s-ig1ok2o_/wt-cust"
+            ],
+            "cwd": "/tmp/avr0s-ig1ok2o_/main",
+            "exit": 0,
+            "started": 1795049779.211,
+            "seconds": 0.06,
+            "stdout": "",
+            "stderr": ""
+          }
+        ]
+      },
+      "gc": {
+        "name": "gc_reclaim",
+        "argv": [
+          "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/target/release/stack",
+          "--json",
+          "gc",
+          "--reclaim-data"
+        ],
+        "cwd": "/tmp/avr0s-ig1ok2o_/main",
+        "exit": 0,
+        "started": 1795049779.274,
+        "seconds": 0.19,
+        "stdout": "{\"ok\":true,\"passed\":true,\"command\":\"gc\",\"stack_version\":\"0.1.23\",\"schema\":1,\"duration_ms\":182,\"data\":[{\"project\":\"/private/tmp/avr0s-ig1ok2o_/wt-pay\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 23219 released\"},{\"service\":\"redis\",\"outcome\":\"port 29091 released\"},{\"service\":\"api\",\"outcome\":\"port 25428 released\"},{\"service\":\"worker\",\"outcome\":\"port 25198 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/9fbd4183bf8e5c5f/postgres removed (40826803 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/9fbd4183bf8e5c5f/redis removed (775 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/9fbd4183bf8e5c5f removed\"}]},{\"project\":\"/private/tmp/avr0s-ig1ok2o_/wt-notes\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 22872 released\"},{\"service\":\"redis\",\"outcome\":\"port 25261 released\"},{\"service\":\"api\",\"outcome\":\"port 21652 released\"},{\"service\":\"worker\",\"outcome\":\"port 21255 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/c94952e0c57d1ef7/postgres removed (40810222 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/c94952e0c57d1ef7/redis removed (823 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/c94952e0c57d1ef7 removed\"}]},{\"project\":\"/private/tmp/avr0s-ig1ok2o_/wt-cust\",\"reason\":\"project directory deleted\",\"stopped\":true,\"services\":[{\"service\":\"postgres\",\"outcome\":\"port 21728 released\"},{\"service\":\"redis\",\"outcome\":\"port 22955 released\"},{\"service\":\"api\",\"outcome\":\"port 28375 released\"},{\"service\":\"worker\",\"outcome\":\"port 22012 released\"},{\"service\":\"postgres\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/90e73744d08ca534/postgres removed (40877925 bytes)\"},{\"service\":\"redis\",\"outcome\":\"data in /tmp/avr0s-ig1ok2o_/m/stack/state/data/90e73744d08ca534/redis removed (775 bytes)\"},{\"service\":\"supervisor\",\"outcome\":\"Stack's supervisor records and logs in /tmp/avr0s-ig1ok2o_/m/stack/state/supervisors/90e73744d08ca534 removed\"}]}]}\n",
+        "stderr": ""
+      }
+    },
+    "processes_left": {},
+    "ports_still_listening": [],
+    "worktree_dirs_left": [],
+    "machine_state_bytes_after": 81518592,
+    "machine_state_tree_after": {
+      "mise/config": 0,
+      "mise/state/trusted-configs": 0,
+      "mise/state/task-history/c94952e0c57d1ef7": 12288,
+      "mise/state/task-history/90e73744d08ca534": 12288,
+      "mise/state/task-history/78a6e87162ed0bc0": 4096,
+      "mise/state/task-history/9fbd4183bf8e5c5f": 12288,
+      "mise/state/task-history": 40960,
+      "mise/state/tracked-configs": 0,
+      "mise/state/incomplete-installs": 0,
+      "mise/state": 40960,
+      "mise": 40960,
+      "pf/state": 0,
+      "pf": 0,
+      "stack/cache/resolve": 0,
+      "stack/cache/installed": 0,
+      "stack/cache/lock": 0,
+      "stack/cache/skills": 0,
+      "stack/cache/task-config": 0,
+      "stack/cache": 0,
+      "stack/state/init": 4096,
+      "stack/state/projects": 20480,
+      "stack/state/supervisors/78a6e87162ed0bc0": 49152,
+      "stack/state/supervisors": 49152,
+      "stack/state/sessions": 4096,
+      "stack/state/templates/postgres": 40456192,
+      "stack/state/templates": 40456192,
+      "stack/state/data/c94952e0c57d1ef7": 0,
+      "stack/state/data/90e73744d08ca534": 0,
+      "stack/state/data/78a6e87162ed0bc0": 40927232,
+      "stack/state/data/9fbd4183bf8e5c5f": 0,
+      "stack/state/data": 40927232,
+      "stack/state": 81477632,
+      "stack/data": 0,
+      "stack": 81477632,
+      "xdg/cache": 0,
+      "xdg/config": 0,
+      "xdg/state": 0,
+      "xdg/data": 0,
+      "xdg": 0,
+      ".": 81518592
+    },
+    "stack_records_left": [
+      "/private/tmp/avr0s-ig1ok2o_/wt-cust",
+      "/private/tmp/avr0s-ig1ok2o_/wt-notes",
+      "/private/tmp/avr0s-ig1ok2o_/wt-pay"
+    ],
+    "harness_reclaim": null
+  },
+  "final_scan": [],
+  "survivors_after_run": [],
+  "ended": 1795049780.324,
+  "seconds": 48.1,
+  "root_kept": false
+}

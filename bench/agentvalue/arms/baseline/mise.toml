@@ -1,0 +1,5 @@
+[tools]
+python = "3.13.16"
+uv = "0.12.23"
+"conda:postgresql" = "17.11"
+"conda:redis-server" = "7.4.7"

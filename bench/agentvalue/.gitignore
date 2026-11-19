@@ -1,0 +1,9 @@
+# Large or regenerable trial artifacts stay out of git; summaries, plans and reports are committed.
+results/**/trace.jsonl
+results/**/stderr.txt
+results/**/sampler.jsonl
+results/**/submitted-tree/
+results/**/grade-*/
+results/**/submission.patch
+__pycache__/
+results/selftest-1/

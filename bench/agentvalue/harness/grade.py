@@ -38,7 +38,7 @@ PG_BIN = INSTALLS / 'postgres/17.11/bin'
 REDIS_BIN = INSTALLS / 'redis/7.4.7/bin'
 PY_BIN = INSTALLS / 'python/3.13.16/bin'
 UV = INSTALLS / 'uv/0.12.23/uv-aarch64-apple-darwin/uv'
-GRADER_HOME = Path(os.environ.get('AGENTVALUE_GRADER_HOME', '/tmp/avg'))
+GRADER_HOME = Path(os.environ.get('AGENTVALUE_GRADER_HOME', Path.home() / '.cache/stack-agentvalue/grader'))
 GRADER_PY = GRADER_HOME / 'venv/bin/python'
 # Files the grader always takes from the starting code, never from a submission.
 PROTECTED = {'smoke.py', 'stack.toml', 'stack.lock', 'mise.toml', 'mise.lock', 'dev.py', 'README.md', 'AGENTS.md',

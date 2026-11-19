@@ -1,0 +1,42 @@
+[tools]
+python = "3.13.16"
+uv = "0.12.23"
+
+[services.postgres]
+preset = "postgres"
+version = "17.11"
+init = ["seed"]
+
+[services.redis]
+preset = "redis"
+version = "7.4.7"
+
+[services.api]
+run = '''export IDENTITY_TOKEN="$STACK_IDENTITY_API"; exec uv run --frozen python app.py'''
+setup = "uv run --frozen python migrate.py"
+depends_on = ["postgres", "redis"]
+watch = ["app.py", "ledger/db.py", "ledger/cache.py", "ledger/jobs.py", "ledger/config.py"]
+
+[services.api.identity]
+command = '''python3 -c "import os,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:'+os.environ['API_PORT']+'/identity',timeout=5).read().decode())"'''
+
+[services.worker]
+run = '''export WORKER_HEALTH_PORT="$PORT"; exec uv run --frozen python worker.py'''
+depends_on = ["postgres", "redis"]
+watch = ["worker.py", "ledger/db.py", "ledger/cache.py", "ledger/jobs.py", "ledger/config.py"]
+
+[tasks.migrate]
+run = "uv run --frozen python migrate.py"
+services = ["postgres"]
+
+[tasks.seed]
+run = "uv run --frozen python seed.py"
+services = ["postgres", "redis"]
+
+[tasks.test]
+run = "uv run --frozen pytest -q"
+services = ["postgres", "redis", "api", "worker"]
+
+[tasks.smoke]
+run = "uv run --frozen python smoke.py"
+services = ["postgres", "redis", "api"]
