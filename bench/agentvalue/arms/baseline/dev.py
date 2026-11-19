@@ -41,6 +41,8 @@ SEEDED = DEV / 'seeded'
 APPS = {'api': ['uv', 'run', '--frozen', 'python', 'app.py'], 'worker': ['uv', 'run', '--frozen', 'python', 'worker.py']}
 SERVICES = ['postgres', 'redis', 'api', 'worker']
 REGISTRY_DIR = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'ledger-dev'
+# The worktree's lifecycle lock lives outside .dev/, so `down --purge` can hold it while deleting .dev/.
+LOCK = REGISTRY_DIR / 'locks' / (hashlib.sha256(str(ROOT).encode()).hexdigest()[:16] + '.lock')
 
 
 def fail(message):
@@ -141,6 +143,37 @@ def alive(record):
     return bool(record) and process_start(record['pid']) == record['started']
 
 
+def cwd_of(pid):
+    out = subprocess.run(['lsof', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'], capture_output=True, text=True).stdout
+    return next((line[1:] for line in out.splitlines() if line.startswith('n')), '')
+
+
+def ours(pid):
+    """A process belongs to this worktree when its command line or working directory is inside it."""
+    out = subprocess.run(['ps', '-ww', '-p', str(pid), '-o', 'command='], capture_output=True, text=True).stdout
+    roots = (str(ROOT), '/private' + str(ROOT) if str(ROOT).startswith('/tmp/') else str(ROOT))
+    return any(r in out for r in roots) or any(cwd_of(pid).startswith(r) for r in roots)
+
+
+def group_members(pgid):
+    out = subprocess.run(['ps', '-ax', '-o', 'pid=,pgid='], capture_output=True, text=True).stdout
+    return [int(a) for a, b in (line.split() for line in out.splitlines() if len(line.split()) == 2) if int(b) == pgid]
+
+
+def adopt(record):
+    """Services this worktree started but never recorded (dev.py stopped after starting them)
+    are taken back from their own pid files, when the process is still ours."""
+    for name, pidfile in (('postgres', PGDATA / 'postmaster.pid'), ('redis', DEV / 'redis.pid')):
+        if name in record['services'] and alive(record['services'][name]):
+            continue
+        try:
+            pid = int(pidfile.read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            continue
+        if process_start(pid) and ours(pid) and record.get('ports'):
+            record['services'][name] = {'pid': pid, 'started': process_start(pid), 'port': record['ports'][name]}
+
+
 def state():
     return load(STATE, {'services': {}})
 
@@ -192,6 +225,14 @@ def start_app(name, ports, record):
     save(STATE, record)
 
 
+def identity_ok(ports, record):
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{ports["api"]}/identity', timeout=1) as response:
+            return response.read().decode() == record.get('identity')
+    except (OSError, ValueError, KeyError):
+        return False
+
+
 def wait_ready(ports, record, names):
     """The api must answer with this worktree's identity; the worker must answer on its health port."""
     deadline = time.monotonic() + 60
@@ -215,7 +256,7 @@ def wait_ready(ports, record, names):
 
 
 def migrate_and_seed(ports, new_database):
-    env = dict(os.environ, **environment(ports, ['postgres', 'redis']))
+    env = dict(os.environ, **environment(ports, ['postgres', 'redis']))  # seed.py also clears cached invoices
     if mise('uv', 'run', '--frozen', 'python', 'migrate.py', env=env).returncode != 0:
         fail('migrate.py failed. PostgreSQL and Redis keep running: fix the migration and run `python3 dev.py up` again')
     if new_database or not SEEDED.exists():
@@ -225,9 +266,18 @@ def migrate_and_seed(ports, new_database):
 
 
 def up():
-    with locked(DEV / 'lock'):
+    with locked(LOCK):
         record = state()
+        adopt(record)
         running = {name for name, entry in record['services'].items() if alive(entry)}
+        ports = record.get('ports') or {}
+        # A running app that does not answer is restarted, not trusted.
+        if 'api' in running and not identity_ok(ports, record):
+            stop_process('api', record['services']['api'])
+            running.discard('api')
+        if 'worker' in running and not listening(ports.get('worker', 0)):
+            stop_process('worker', record['services']['worker'])
+            running.discard('worker')
         if running == set(SERVICES):
             return print(json.dumps(summary(record), indent=2))
         # Anything recorded but dead is forgotten; whatever still runs is kept (a partial start resumes).
@@ -278,33 +328,34 @@ def current_env(need=('postgres', 'redis')):
 
 
 def stop_process(name, entry, timeout=10):
+    """Stop one recorded service. Only processes proven to be this worktree's are signalled: the
+    recorded process while its pid and start time match, and members of an app's process group
+    whose command line or working directory is inside this worktree. A port held by anything else
+    is reported as a conflict, never killed."""
     if name == 'postgres' and alive(entry):
         mise('pg_ctl', '-D', str(PGDATA), '-m', 'fast', '-w', 'stop', stdout=subprocess.DEVNULL)
-    elif alive(entry):
-        try:
-            os.kill(entry['pid'], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    if 'pgid' in entry:  # the app's whole process group: `mise x` -> `uv run` -> python
-        try:
-            os.killpg(entry['pgid'], signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and (alive(entry) or ('port' in entry and listening(entry['port']))):
-        time.sleep(0.05)
-    if alive(entry) or ('port' in entry and listening(entry['port'])):
-        for kill in ([lambda: os.killpg(entry['pgid'], signal.SIGKILL)] if 'pgid' in entry else []) + [lambda: os.kill(entry['pid'], signal.SIGKILL)]:
+    targets = lambda: ([entry['pid']] if alive(entry) else []) + \
+        [pid for pid in (group_members(entry['pgid']) if 'pgid' in entry else []) if pid != entry['pid'] and ours(pid)]
+    for sig, wait in ((signal.SIGTERM, timeout), (signal.SIGKILL, 2)):
+        for pid in targets():
             try:
-                kill()
-            except (ProcessLookupError, PermissionError):
+                os.kill(pid, sig)
+            except ProcessLookupError:
                 pass
-        time.sleep(0.5)
-    return not alive(entry) and not ('port' in entry and listening(entry['port']))
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and targets():
+            time.sleep(0.05)
+        if not targets():
+            break
+    if targets():
+        return False
+    if 'port' in entry and listening(entry['port']):
+        print(f'dev.py: note: port {entry["port"]} of {name} is now held by another program; left alone', file=sys.stderr)
+    return True
 
 
 def restart(names):
-    with locked(DEV / 'lock'):
+    with locked(LOCK):
         record = state()
         if not all(alive(record['services'].get(n)) for n in ('postgres', 'redis')):
             fail('postgres and redis are not running; run `python3 dev.py up`')
@@ -322,7 +373,7 @@ def restart(names):
 
 
 def down(purge):
-    with locked(DEV / 'lock'):
+    with locked(LOCK):
         record = state()
         stopped, left = [], []
         for name in ['worker', 'api', 'redis', 'postgres']:
@@ -332,9 +383,9 @@ def down(purge):
         if left:
             fail(f'could not stop {left}; check `python3 dev.py status`')
         save(STATE, {'services': {}, 'ports': record.get('ports'), 'identity': record.get('identity')})
-    if purge:
-        shutil.rmtree(DEV, ignore_errors=True)
-        release_ports()
+        if purge:
+            shutil.rmtree(DEV, ignore_errors=True)
+            release_ports()
     print(json.dumps({'stopped': stopped, 'confirmed': True, 'data': 'deleted' if purge else 'kept in .dev/'}))
 
 
@@ -359,7 +410,8 @@ def main():
     elif command == 'smoke':
         raise SystemExit(mise('uv', 'run', '--frozen', 'python', 'smoke.py', env=dict(os.environ, **current_env(('postgres', 'redis', 'api')))).returncode)
     elif command in {'migrate', 'seed'}:
-        raise SystemExit(mise('uv', 'run', '--frozen', 'python', f'{command}.py', env=dict(os.environ, **current_env())).returncode)
+        need = ('postgres',) if command == 'migrate' else ('postgres', 'redis')
+        raise SystemExit(mise('uv', 'run', '--frozen', 'python', f'{command}.py', env=dict(os.environ, **current_env(need))).returncode)
     elif command == 'restart':
         restart(rest)
     elif command == 'logs':

@@ -1,0 +1,12 @@
+{
+  "commits": [
+    "e8a4c15f0784deade44b1987411a87170828f8e1 pay-receipts: reference solution"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_one_receipt_per_invoice"
+  ]
+}

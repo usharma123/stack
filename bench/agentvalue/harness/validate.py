@@ -46,10 +46,35 @@ def _notes_bypass_cache(tree):
     _edit(tree / 'app.py', '            cache.put_invoice(invoice.to_json())\n', '')
 
 
+def _notes_read_db_write_cache(tree):
+    # Round-2 review counterexample: always read PostgreSQL, still write the result to Redis.
+    _edit(tree / 'app.py', """            if hit := cache.get_invoice(invoice_id):
+                return self.reply(hit)
+""", '')
+
+
+def _rerun_changes_data(tree):
+    # Round-2 review counterexample: a rerun with nothing pending changes an existing invoice.
+    text = (tree / 'migrate.py').read_text()
+    text = text.replace("    applied = {row[0]", "    ran = False\n    applied = {row[0]")
+    text = text.replace("        print(f'applied {path.stem}')", "        print(f'applied {path.stem}')\n        ran = True")
+    text = text.replace("print('migrations up to date')", "    if not ran:\n        conn.execute('UPDATE invoices SET cents = cents + 1 WHERE id = 41')\nprint('migrations up to date')")
+    (tree / 'migrate.py').write_text(text)
+
+
+def _cust_partial_unique(tree):
+    # Round-2 review counterexample: a unique index that leaves one name out.
+    _cust_no_unique(tree)
+    with open(tree / 'migrations/20261118_customers_table.sql', 'a') as f:
+        f.write("CREATE UNIQUE INDEX customers_name_partial ON customers (name) WHERE name <> 'Umbrella';\n")
+
+
 # (description, change to the reference, check that must fail; 'fresh_ok' means the fresh-database run)
 MUTANTS = {
     'invoice-notes': [('PATCH no longer invalidates the cache', lambda t: _edit(t / 'app.py', '            cache.forget_invoice(invoice_id)\n', ''), 'cache_after_patch'),
-                      ('reads bypass the cache entirely', _notes_bypass_cache, 'cache_after_patch')],
+                      ('reads bypass the cache entirely', _notes_bypass_cache, 'cache_after_patch'),
+                      ('reads skip the cache but still write it', _notes_read_db_write_cache, 'cache_after_patch'),
+                      ('a migration rerun changes existing data', _rerun_changes_data, 'migration_rerun_safe')],
     'pay-receipts': [('worker not idempotent (no unique index, no ON CONFLICT)', lambda t: (
                           (t / 'migrations/20261118_one_receipt_per_invoice.sql').unlink(),
                           shutil.copy2(ROOT / 'fixture/ledger/jobs.py', t / 'ledger/jobs.py')), 'duplicate_job_one_receipt'),
@@ -57,7 +82,8 @@ MUTANTS = {
     'customer-table': [('seed.py not updated for the new schema', lambda t: shutil.copy2(ROOT / 'fixture/seed.py', t / 'seed.py'), 'fresh_ok'),
                        ('migration deletes existing receipts', lambda t: open(t / 'migrations/20261118_customers_table.sql', 'a').write('DELETE FROM receipts;\n'),
                         'existing_preserved'),
-                       ('no unique constraint on customer name', _cust_no_unique, 'customers_deduplicated')],
+                       ('no unique constraint on customer name', _cust_no_unique, 'customers_deduplicated'),
+                       ('a partial unique index on customer name', _cust_partial_unique, 'customers_deduplicated')],
 }
 
 

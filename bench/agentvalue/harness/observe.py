@@ -32,8 +32,13 @@ def group_of_marker(mark):
 
 
 def _out(argv):
-    """A command's stdout as text; process environments and file names need not be UTF-8."""
-    return subprocess.run(argv, capture_output=True).stdout.decode('utf-8', errors='replace')
+    """A command's stdout as text; process environments and file names need not be UTF-8. A failed
+    `ps` raises: an empty listing must never pass for "nothing running". (`lsof` exits 1 whenever
+    some file cannot be inspected, so its status is not used.)"""
+    result = subprocess.run(argv, capture_output=True)
+    if argv[0] == 'ps' and result.returncode not in (0, 1) or (argv[0] == 'ps' and '-ax' in ' '.join(argv) and not result.stdout):
+        raise RuntimeError(f'{argv[0]} failed ({result.returncode}): {result.stderr[-300:]!r}')
+    return result.stdout.decode('utf-8', errors='replace')
 
 
 def _process_table():
@@ -180,6 +185,7 @@ def tcp():
                 host, port = _split(name)
                 if port.isdigit() and host in LOOPBACK:
                     listeners[int(port)] = pid
+                    listeners.setdefault('by_endpoint', {})[(host, int(port))] = pid
             elif state == 'ESTABLISHED' and '->' in name:
                 local, remote = name.split('->')
                 host, port = _split(remote)
@@ -226,6 +232,7 @@ class Sampler(threading.Thread):
         rows = legacy.process_table()
         marks = markers()
         listeners, connections = tcp()
+        endpoints = listeners.pop('by_endpoint', {})
         # Processes with sockets but no marker or path in their command line (redis, postgres
         # children, supervisors) are resolved once through their open files, cached by identity.
         unknown = [pid for pid in set(listeners.values()) | {c[0] for c in connections}
@@ -255,7 +262,11 @@ class Sampler(threading.Thread):
                 continue
             if rows.get(pid, {}).get('command', '').startswith(self.ignore_clients):
                 continue
-            server = port_owner.get(int(remote))
+            # The listener must be on the address the client reached (or a wildcard): an IPv4
+            # connection never reaches an IPv6-only listener on the same port.
+            server_pid = endpoints.get((host, int(remote))) or endpoints.get(('*', int(remote))) or \
+                endpoints.get(('0.0.0.0', int(remote))) or endpoints.get(('[::]', int(remote)) if host == '[::1]' else None)
+            server = owner.get(server_pid)
             if server and server != client:
                 events.append({'t': now, 'client': client, 'client_pid': pid, 'client_cmd': rows.get(pid, {}).get('command', '')[:200],
                                'server': server, 'port': int(remote)})

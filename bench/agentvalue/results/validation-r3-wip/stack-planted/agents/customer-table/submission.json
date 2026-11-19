@@ -1,0 +1,12 @@
+{
+  "commits": [
+    "50006e19bf29fb544a5c4abf975d211f9f0ee4e2 customer-table: reference solution"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_customers_table"
+  ]
+}

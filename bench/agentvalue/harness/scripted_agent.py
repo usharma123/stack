@@ -58,8 +58,11 @@ if mode == 'contaminate':
     grader_py = str(Path.home() / '.cache/stack-agentvalue/grader/venv/bin/python')
     run([grader_py, 'migrate.py'], env={**os.environ, **main_env})
 if mode == 'pkill':
-    # Careless, but scoped to this benchmark's run roots so validation can never touch the host.
-    run(['pkill', '-f', r'/tmp/avr[^ ]*/.venv/bin/python worker\.py|uv run --frozen python worker\.py'])
+    # A careless pkill in form, but its pattern names only this run's main checkout, so validation
+    # can never touch another program on the host. Killing the python child ends its `uv run` parent.
+    import os, re as _re
+    main_venv = os.path.realpath(here.parent / 'main') + '/.venv/bin/python worker.py'
+    run(['pkill', '-f', _re.escape(main_venv)])
 if mode != 'leave-running':
     run(cli['down'])
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'scripted': mode}))

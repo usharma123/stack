@@ -25,7 +25,9 @@ def load_runs(plan, results, plan_sha=None):
         for arm in pair['order']:
             path = Path(results) / f"pair{pair['index']}-{arm}" / 'run.json'
             run = json.loads(path.read_text()) if path.exists() else None
-            if run is not None and plan_sha and run.get('plan_sha256') != plan_sha:
+            mismatch = run is not None and (run.get('pair') != pair['index'] or run.get('arm') != arm
+                                            or run.get('model') != plan['config']['model'] or run.get('plan_kind') != plan['kind'])
+            if run is not None and ((plan_sha and run.get('plan_sha256') != plan_sha) or mismatch):
                 foreign[f"pair{pair['index']}-{arm}"] = run.get('plan_sha256')
                 run = None
             runs[(pair['index'], arm)] = run
@@ -43,7 +45,9 @@ def contamination(run):
         culprits = [t for t, m in own.items() if version in m]
         events.append({'kind': 'migration_in_main', 'detail': version, 'culprits': culprits})
     # Write counters move with statistics flushes and catalog activity: diagnostic, never a gate.
-    explained = {'migrations', 'columns'} if by.get('foreign_migrations') else set()
+    # A foreign migration explains the ledger entry; schema or data changes stay a separate event,
+    # unattributed, so a second agent's independent change is not pinned on the migration's owner.
+    explained = {'migrations'} if by.get('foreign_migrations') else set()
     other_changes = [c for c in by.get('changed') or [] if c not in explained | {'tuple_writes'}]
     if other_changes:
         events.append({'kind': 'main_state_changed', 'detail': other_changes, 'culprits': []})
@@ -100,7 +104,8 @@ def agent_rows(plan, runs):
                 rows.append({**row, 'status': 'scored', 'passed': passed, 'teardown_ok': teardown_ok, 'isolation_ok': isolation_ok,
                              'cli_ok': cli_ok, 'gated_success': passed and teardown_ok and isolation_ok and cli_ok, 'used_own_db': used_own_db,
                              'committed': compliance.get('committed'), 'ran_tests': compliance.get('ran_tests'),
-                             'arm_down_recovered': not ((run.get('recovery') or {}).get(task) or {}).get('left_after_arm_down'),
+                             'arm_down_recovered': ((run.get('recovery') or {}).get(task) or {}).get('down_exit') == 0
+                                                   and not ((run.get('recovery') or {}).get(task) or {}).get('left_after_arm_down'),
                              'unexplained_migrations': db.get('unexplained') or [],
                              'timed_out': bool(a.get('timed_out')), 'agent_exit': a.get('exit'), 'seconds': a.get('seconds'),
                              'cost_usd': result.get('total_cost_usd'), 'turns': result.get('num_turns'),
@@ -143,6 +148,8 @@ def bootstrap_pairs(plan, rows, key, reps=10000, seed=7):
             diffs.append(means['stack'] - means['baseline'])
     if not diffs:
         return {'pairs': 0}
+    if len(diffs) < 3:  # an interval from one or two pairs would be meaningless
+        return {'pairs': len(diffs), 'per_pair': [round(d, 3) for d in diffs], 'mean_diff': round(sum(diffs) / len(diffs), 3), 'ci95': None}
     rng = random.Random(seed)
     boots = sorted(sum(rng.choice(diffs) for _ in diffs) / len(diffs) for _ in range(reps))
     return {'pairs': len(diffs), 'per_pair': [round(d, 3) for d in diffs], 'mean_diff': round(sum(diffs) / len(diffs), 3),
@@ -167,7 +174,7 @@ def summarize(plan, runs, foreign=None):
             'teardown_ok': rate(mine, 'teardown_ok'), 'isolation_ok': rate(mine, 'isolation_ok'), 'used_own_db': rate(mine, 'used_own_db'),
             'timed_out': rate(mine, 'timed_out'),
             'episodes_all_gated_success': sum(1 for v in episodes.values() if len(v) == len(plan['config']['tasks']) and all(v)),
-            'episodes': len(episodes),
+            'episodes': len(episodes), 'episodes_assigned': len(plan['pairs']),
             'seconds_to_verified_result': describe([r['seconds'] for r in success]),
             'seconds_all': describe([r['seconds'] for r in scored]),
             'cost_usd': describe([r['cost_usd'] for r in scored]), 'turns': describe([r['turns'] for r in scored]),
@@ -186,8 +193,9 @@ def summarize(plan, runs, foreign=None):
         for pair in plan['pairs']:
             s = next((r for r in rows if r['pair'] == pair['index'] and r['arm'] == 'stack' and r['task'] == task), None)
             b = next((r for r in rows if r['pair'] == pair['index'] and r['arm'] == 'baseline' and r['task'] == task), None)
-            if s and b and s['status'] == b['status'] == 'scored' and s['gated_success'] != b['gated_success']:
-                discordant.setdefault(task, []).append({'pair': pair['index'], 'stack': s['gated_success'], 'baseline': b['gated_success']})
+            if s and b and s['status'] == b['status'] == 'scored' and (s['gated_success'] != b['gated_success'] or s['passed'] != b['passed']):
+                discordant.setdefault(task, []).append({'pair': pair['index'], 'stack_gated': s['gated_success'], 'baseline_gated': b['gated_success'],
+                                                        'stack_passed': s['passed'], 'baseline_passed': b['passed']})
     runs_meta = {f'pair{k[0]}-{k[1]}': None if v is None else {
         'valid': v.get('valid'), 'invalid_reasons': v.get('invalid_reasons'), 'seconds': v.get('seconds'),
         'stack_binary_sha256': v.get('stack_binary_sha256'), 'source_rev': v.get('source_rev'),
@@ -224,7 +232,7 @@ def markdown(summary):
                            ('Cost USD (CLI-reported, list)', 'cost_usd', stat), ('Turns', 'turns', stat), ('Tool calls', 'tool_calls', stat),
                            ('Tool errors', 'tool_errors', stat), ('Environment errors in tool output', 'env_errors', stat)]:
         lines.append(f'| {label} | {fn(a[key])} | {fn(b[key])} |')
-    lines.append(f"| Episodes with all agents gated-successful | {a['episodes_all_gated_success']}/{a['episodes']} | {b['episodes_all_gated_success']}/{b['episodes']} |")
+    lines.append(f"| Episodes with all agents gated-successful (of scored; assigned) | {a['episodes_all_gated_success']}/{a['episodes']}; {a['episodes_assigned']} | {b['episodes_all_gated_success']}/{b['episodes']}; {b['episodes_assigned']} |")
     lines.append(f"| Broad kill commands | {a['kill_commands_total']} | {b['kill_commands_total']} |")
     lines.append(f"| Benchmark-file access in traces | {a['benchmark_access_total']} | {b['benchmark_access_total']} |")
     lines.append(f"| Not run / invalid agent slots | {a['not_run']} / {a['invalid']} | {b['not_run']} / {b['invalid']} |")

@@ -86,7 +86,12 @@ def run(argv, cwd, env, timeout=180, log=None, name=''):
         code = proc.returncode
     except subprocess.TimeoutExpired:
         stop_group(proc)
-        out, err = proc.communicate()
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:  # a child that left the group still holds the pipes
+            for stream in (proc.stdout, proc.stderr):
+                stream.close()
+            out, err = '', ''
         code, err = 'timeout', (err or '') + '\ntimeout'
     entry = {'step': name, 'argv': [str(a) for a in argv], 'exit': code, 'seconds': round(time.monotonic() - started, 2),
              'stdout': out[-4000:], 'stderr': err[-4000:]}
@@ -157,20 +162,26 @@ class Services:
 
 
 def stop_group(proc):
-    if proc.poll() is not None:
-        return
+    """Stop a process's whole group, even when the leader already exited and members remain."""
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.1)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
     try:
         proc.wait(5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait(5)
+        pass
 
 
 def listening(port):
@@ -292,9 +303,11 @@ def grade(task_id, submitted_tree, out_dir):
         upgrade_tree = prepare_tree(Path(submitted_tree), tmp / 'upgrade-tree', starting)
         (tmp / 'fresh').mkdir()
         (tmp / 'upgrade').mkdir()
-        f = fresh(fresh_tree, starting, tmp / 'fresh')
-        u = upgrade(task_id, upgrade_tree, starting, tmp / 'upgrade')
-        cleanup = reclaim_under(tmp)
+        try:
+            f = fresh(fresh_tree, starting, tmp / 'fresh')
+            u = upgrade(task_id, upgrade_tree, starting, tmp / 'upgrade')
+        finally:
+            cleanup = reclaim_under(tmp)
     checks = u.get('checks', {})
     missing = [c for c in task['required_checks'] if c not in checks]
     failed = [c for c in task['required_checks'] if checks.get(c) is not True]

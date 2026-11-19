@@ -155,6 +155,11 @@ def machine_env(root, bin_dir, marker=None):
                 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'PITCHFORK_STATE_DIR']:
         Path(env[key]).mkdir(parents=True, exist_ok=True)
     env.pop('CI', None)  # agents behave as on a developer machine
+    # Nothing an agent or a service needs is a credential from the host: the agent CLI signs in from
+    # its own keychain and config. Drop every credential-like variable, and the host harness's own.
+    for key in list(env):
+        if redact.SECRET_KEY.match(f'{key}=x') or key.startswith(('CLAUDE', 'ANTHROPIC_', 'T3', 'CODEX_', 'AI_AGENT', 'OTEL_', 'MCP_', 'GIT_EDITOR', 'OLDPWD')):
+            del env[key]
     if marker:
         env['AGENTVALUE_WT'] = marker
     return env
@@ -238,6 +243,8 @@ def read_migrations(data_dir, workdir, token=''):
                                           env=env, capture_output=True, text=True)
             canary = canary if canary.stdout.strip() not in ('', '0') else in_customers
         missing_table = q.returncode != 0 and 'schema_migrations' in q.stderr and 'does not exist' in q.stderr
+        if tables.returncode != 0 or (canary.returncode != 0 and 'invoices' not in canary.stderr):
+            return {'exists': True, 'error': f'query failed: {tables.stderr[-200:]} {canary.stderr[-200:]}'}
         return {'exists': True, 'versions': q.stdout.split() if q.returncode == 0 else ([] if missing_table else None),
                 'error': q.stderr[-300:] if q.returncode and not missing_table else None,
                 'tables': tables.stdout.split(), 'has_main_canary': canary.stdout.strip() not in ('', '0')}
@@ -254,7 +261,7 @@ def owned_paths(arm, main, env, checkouts):
         try:
             listed = json.loads(r.stdout)['data']['checkouts']
         except (ValueError, KeyError):
-            listed = []
+            raise RuntimeError(f'stack ps failed while attributing processes: {r.stdout[-300:]} {r.stderr[-300:]}')
         by_path = {os.path.realpath(p): n for n, p in checkouts.items()}
         for checkout in listed:
             name = by_path.get(os.path.realpath(checkout['path']))
@@ -274,7 +281,7 @@ def stack_data_dirs(arm, main, env):
     try:
         data = json.loads(r.stdout)['data']
     except (ValueError, KeyError):
-        return {'error': r.stdout[-500:] + r.stderr[-500:]}
+        raise RuntimeError(f'stack ps failed while locating databases: {r.stdout[-300:]} {r.stderr[-300:]}')
     dirs = {}
     for checkout in data.get('checkouts', []):
         for service in checkout.get('services', []):
@@ -321,7 +328,7 @@ def trace_metrics(path):
                     if block.get('name') == 'Bash':
                         metrics['bash_calls'] += 1
                         command = (block.get('input') or {}).get('command', '')
-                        metrics['bash_commands'].append(command[:500])
+                        metrics['bash_commands'].append(command)  # full text: compliance scans it
                         if KILL.search(command):
                             metrics['kill_commands'].append(command[:500])
                     pending[block.get('id')] = block.get('name')
@@ -482,6 +489,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             groups = groups_of([names[task]])  # fresh: the agent may have created its state just now
             left = observe.attributed(groups, exclude={proc.pid})[names[task]]
             listeners, _ = observe.tcp()
+            listeners.pop('by_endpoint', None)
             cli_own = [p for p in left if p['command'].startswith(helpers or ('\0',))]
             left = [p for p in left if p not in cli_own]
             left_pids = {p['pid'] for p in left}
@@ -530,11 +538,11 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
 
         # Bystander integrity.
         after = json.loads(sh([grade.GRADER_PY, HERE / 'canary.py', 'fingerprint'], main, genv, log=steps, name='canary_after')['stdout'] or 'null')
-        if after is None:
-            invalid('could not read the bystander fingerprint after the agents')
         alive = {(p['pid'], p['started']) for p in observe.attributed(groups_of(['main']))['main']}
         lost = [p for p in record['bystander']['processes_before'] if (p['pid'], p['started']) not in alive]
-        changed = sorted(k for k in before if (after or {}).get(k) != before[k])
+        if after is None and not lost:
+            invalid('could not read the bystander fingerprint after the agents, with its services still running')
+        changed = sorted(k for k in before if (after or {}).get(k) != before[k]) if after is not None else ['unreadable']
         record['bystander'].update(fingerprint_after=after, changed=changed, processes_lost=lost)
 
         # Each submission, captured before anything touches the worktrees.
@@ -548,7 +556,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             log = []
             sh(arm.down(), path, env_main, log=log, name='arm_down')
             remaining = observe.attributed({names[task]: disposal_groups[names[task]]})[names[task]]
-            recovery[task] = {'agent_left': len(record['agents'][task]['left_running']), 'down': log,
+            recovery[task] = {'agent_left': len(record['agents'][task]['left_running']), 'down': log, 'down_exit': log[-1]['exit'],
                               'left_after_arm_down': [{k: p[k] for k in ['pid', 'command']} for p in remaining]}
             if remaining:
                 recovery[task]['harness_reclaim'] = observe.reclaim(remaining, root)
@@ -595,6 +603,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             removal['gc'] = sh([arm.stack, '--json', 'gc', '--reclaim-data'], main, env_main, log=steps, name='gc_reclaim')
         left = observe.attributed(disposal_groups)
         listeners, _ = observe.tcp()
+        listeners.pop('by_endpoint', None)
         agent_ports = {int(p) for p, marks in record['sampler']['ports'].items() if set(marks) - {'main'}}
         data_paths = [p for n, paths in disposal_groups.items() for p in paths if '/state/data/' in p]
         data_left = {p: du(p) for p in data_paths if Path(p).exists() and any(Path(p).iterdir())}
@@ -661,7 +670,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                                    'ran_tests': any(re.search(r'\b(stack run test|dev\.py test|pytest)\b', c) for c in commands)}
         # Retained traces and logs may contain the host environment if an agent printed it.
         for path in out_dir.rglob('*'):
-            if path.is_file() and path.suffix in {'.jsonl', '.txt', '.json'} and 'submitted-tree' not in path.parts:
+            if path.is_file() and path.suffix in {'.jsonl', '.txt', '.json', '.patch'} and 'submitted-tree' not in path.parts:
                 redact.scrub_file(path)
         (out_dir / 'run.json').write_text(json.dumps(redact.scrub_json(record), indent=2, default=str))
         if not keep_root and record['valid']:
@@ -738,7 +747,8 @@ def cli_failures(record):
     bad = []
     for task, a in record.get('agents', {}).items():
         result = (a.get('trace_metrics') or {}).get('result') or {}
-        if not a.get('timed_out') and (a.get('exit') not in (0, None) or result.get('is_error') or not result):
+        budget_stop = 'budget' in str(result.get('subtype') or '') or 'max_budget' in str(result.get('subtype') or '')
+        if not a.get('timed_out') and not budget_stop and (a.get('exit') not in (0, None) or result.get('is_error') or not result):
             bad.append(task)
     return bad
 
@@ -775,6 +785,8 @@ def cmd_pair(args):
 
 def cmd_arm(args):
     plan = load_plan(args.plan)
+    if plan['kind'] != 'harness_selftest':
+        raise SystemExit('`arm` runs only self-test plans; experiment plans run through `pair`')
     lock = host_lock()
     override = None
     if args.scripted:

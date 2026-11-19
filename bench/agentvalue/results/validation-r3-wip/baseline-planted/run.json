@@ -1,0 +1,1546 @@
+{
+  "pair": 0,
+  "arm": "baseline",
+  "root": "/tmp/avr0b-lap7iin7",
+  "run_id": "avr0b-lap7iin7",
+  "started": 1795052675.546,
+  "steps": [
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "init",
+        "-q"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.564,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "user.name",
+        "agent"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.574,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "user.email",
+        "agent@example.invalid"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.581,
+      "seconds": 0.0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "core.hooksPath",
+        "/dev/null"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.586,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "config",
+        "commit.gpgsign",
+        "false"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.592,
+      "seconds": 0.01,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "add",
+        "-A"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.598,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "git",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "Starting point"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.619,
+      "seconds": 0.02,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_up",
+      "argv": [
+        "python3",
+        "dev.py",
+        "up"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052675.644,
+      "seconds": 2.9,
+      "stdout": "applied 20261001_create_invoices\napplied 20261008_create_receipts\nmigrations up to date\nseeded demo data\n{\n  \"worktree\": \"/private/tmp/avr0b-lap7iin7/main\",\n  \"services\": {\n    \"postgres\": {\n      \"pid\": 19556,\n      \"started\": \"Wed Nov 18 20:44:36 2026\",\n      \"port\": 31690,\n      \"running\": true\n    },\n    \"redis\": {\n      \"pid\": 19565,\n      \"started\": \"Wed Nov 18 20:44:36 2026\",\n      \"port\": 31691,\n      \"running\": true\n    },\n    \"api\": {\n      \"pid\": 19613,\n      \"started\": \"Wed Nov 18 20:44:38 2026\",\n      \"pgid\": 19613,\n      \"port\": 31692,\n      \"running\": true\n    },\n    \"worker\": {\n      \"pid\": 19615,\n      \"started\": \"Wed Nov 18 20:44:38 2026\",\n      \"pgid\": 19615,\n      \"port\": 31693,\n      \"running\": true\n    }\n  },\n  \"env\": {\n    \"DATABASE_URL\": \"postgresql://postgres@127.0.0.1:31690/postgres\",\n    \"REDIS_URL\": \"redis://127.0.0.1:31691/0\",\n    \"API_URL\": \"http://127.0.0.1:31692\",\n    \"API_PORT\": \"31692\"\n  }\n}\n",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_env",
+      "argv": [
+        "python3",
+        "dev.py",
+        "exec",
+        "sh",
+        "-c",
+        "printf \"DATABASE_URL=%s\nREDIS_URL=%s\nAPI_URL=%s\n\" \"$DATABASE_URL\" \"$REDIS_URL\" \"$API_URL\""
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052678.548,
+      "seconds": 0.09,
+      "stdout": "DATABASE_URL=postgresql://postgres@127.0.0.1:31690/postgres\nREDIS_URL=redis://127.0.0.1:31691/0\nAPI_URL=http://127.0.0.1:31692\n",
+      "stderr": ""
+    },
+    {
+      "name": "canary_plant",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "plant",
+        "f43ef6beeb36"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052678.642,
+      "seconds": 0.11,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"bbd9135d7bd316a8afd99c302763ea98b6afc2e0acf5a11b7ac00fbf4f266436\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:f43ef6beeb36\"], \"redis_sha256\": \"cc5b54c40112fbffa2e7b084ee0d8f680e45fe94ad32e67859d4bac517af52d1\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "canary_before",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "fingerprint"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052681.254,
+      "seconds": 0.14,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\"], \"invoices_sha256\": \"bbd9135d7bd316a8afd99c302763ea98b6afc2e0acf5a11b7ac00fbf4f266436\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [161, 12, 0], \"redis_keys\": [\"bystander:f43ef6beeb36\"], \"redis_sha256\": \"cc5b54c40112fbffa2e7b084ee0d8f680e45fe94ad32e67859d4bac517af52d1\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/invoice-notes",
+        "/tmp/avr0b-lap7iin7/wt-notes"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052681.63,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/pay-receipts",
+        "/tmp/avr0b-lap7iin7/wt-pay"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052681.663,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "worktree_add",
+      "argv": [
+        "git",
+        "-c",
+        "user.name=bench",
+        "-c",
+        "user.email=bench@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "commit.gpgsign=false",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature/customer-table",
+        "/tmp/avr0b-lap7iin7/wt-cust"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052681.694,
+      "seconds": 0.03,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "canary_after",
+      "argv": [
+        "/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python",
+        "/Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/canary.py",
+        "fingerprint"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052688.814,
+      "seconds": 0.11,
+      "stdout": "{\"columns\": [[\"invoices\", \"cents\", \"integer\"], [\"invoices\", \"customer\", \"text\"], [\"invoices\", \"id\", \"integer\"], [\"invoices\", \"status\", \"text\"], [\"receipts\", \"cents\", \"integer\"], [\"receipts\", \"id\", \"integer\"], [\"receipts\", \"invoice_id\", \"integer\"], [\"receipts\", \"issued_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"applied_at\", \"timestamp with time zone\"], [\"schema_migrations\", \"version\", \"text\"]], \"migrations\": [\"20261001_create_invoices\", \"20261008_create_receipts\", \"20261118_one_receipt_per_invoice\"], \"invoices_sha256\": \"bbd9135d7bd316a8afd99c302763ea98b6afc2e0acf5a11b7ac00fbf4f266436\", \"receipts_sha256\": \"668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f\", \"tuple_writes\": [166, 12, 0], \"redis_keys\": [\"bystander:f43ef6beeb36\"], \"redis_sha256\": \"cc5b54c40112fbffa2e7b084ee0d8f680e45fe94ad32e67859d4bac517af52d1\"}\n",
+      "stderr": ""
+    },
+    {
+      "name": "bystander_down",
+      "argv": [
+        "python3",
+        "dev.py",
+        "down"
+      ],
+      "cwd": "/tmp/avr0b-lap7iin7/main",
+      "exit": 0,
+      "started": 1795052730.501,
+      "seconds": 1.28,
+      "stdout": "{\"stopped\": [\"worker\", \"api\", \"redis\", \"postgres\"], \"confirmed\": true, \"data\": \"kept in .dev/\"}\n",
+      "stderr": ""
+    }
+  ],
+  "agents": {
+    "invoice-notes": {
+      "worktree": "/tmp/avr0b-lap7iin7/wt-notes",
+      "marker": "wt-notes",
+      "started": 1795052681.74,
+      "pid": 19935,
+      "ended": 1795052687.292,
+      "seconds": 5.26,
+      "exit": 0,
+      "timed_out": false,
+      "observed_after_exit_s": 0.29,
+      "left_running": [
+        {
+          "pid": 20031,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-postgresql/17.11/bin/postgres -D /private/tmp/avr0b-lap7iin7/wt-notes/.dev/postgres -h 127.0.0.1 -p 38770 -k ",
+          "marker": "wt-notes.avr0b-lap7iin7"
+        },
+        {
+          "pid": 20034,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "postgres: checkpointer         ",
+          "marker": null
+        },
+        {
+          "pid": 20039,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "postgres: background writer         ",
+          "marker": null
+        },
+        {
+          "pid": 20045,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "postgres: walwriter         ",
+          "marker": null
+        },
+        {
+          "pid": 20048,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "postgres: autovacuum launcher         ",
+          "marker": null
+        },
+        {
+          "pid": 20051,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "postgres: logical replication launcher         ",
+          "marker": null
+        },
+        {
+          "pid": 20059,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-redis-server/7.4.7/bin/redis-server 127.0.0.1:38771            ",
+          "marker": null
+        },
+        {
+          "pid": 20450,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python app.py",
+          "marker": "wt-notes.avr0b-lap7iin7"
+        },
+        {
+          "pid": 20454,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "marker": "wt-notes.avr0b-lap7iin7"
+        },
+        {
+          "pid": 20468,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python app.py",
+          "marker": "wt-notes.avr0b-lap7iin7"
+        },
+        {
+          "pid": 20469,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python worker.py",
+          "marker": "wt-notes.avr0b-lap7iin7"
+        }
+      ],
+      "cli_helpers_left": [],
+      "left_listening": [
+        38770,
+        38771,
+        38772,
+        38773
+      ],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "existing_api_intact": true,
+          "note_default": true,
+          "create_with_note": true,
+          "patch_note": true,
+          "cache_after_patch": true,
+          "database_after_patch": true,
+          "other_invoice_untouched": true,
+          "migration_rerun_safe": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "5ca1e85addb0213e43a9c1ce3edb897078a7639e invoice-notes: reference solution"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_invoice_notes"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 6,
+        "bash_calls": 6,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": null,
+          "duration_ms": null,
+          "duration_api_ms": null,
+          "total_cost_usd": null,
+          "usage": null,
+          "modelUsage": null
+        },
+        "model": null,
+        "unparsed_lines": 0,
+        "final_text": ""
+      },
+      "compliance": {
+        "committed": true,
+        "ran_tests": true
+      }
+    },
+    "pay-receipts": {
+      "worktree": "/tmp/avr0b-lap7iin7/wt-pay",
+      "marker": "wt-pay",
+      "started": 1795052681.742,
+      "pid": 19936,
+      "ended": 1795052688.794,
+      "seconds": 6.77,
+      "exit": 0,
+      "timed_out": false,
+      "observed_after_exit_s": 0.29,
+      "left_running": [],
+      "cli_helpers_left": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "existing_api_intact": true,
+          "pay_marks_paid": true,
+          "cache_after_pay": true,
+          "receipt_recorded": true,
+          "duplicate_job_one_receipt": true,
+          "pay_twice_conflict": true,
+          "pay_unknown_404": true,
+          "existing_receipts_kept": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "e8a4c15f0784deade44b1987411a87170828f8e1 pay-receipts: reference solution"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_one_receipt_per_invoice"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 9,
+        "bash_calls": 9,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [],
+        "benchmark_access": [
+          "{\"command\": \"/Users/utsavsharma/.cache/stack-agentvalue/grader/venv/bin/python migrate.py\"}"
+        ],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": null,
+          "duration_ms": null,
+          "duration_api_ms": null,
+          "total_cost_usd": null,
+          "usage": null,
+          "modelUsage": null
+        },
+        "model": null,
+        "unparsed_lines": 0,
+        "final_text": ""
+      },
+      "compliance": {
+        "committed": true,
+        "ran_tests": true
+      }
+    },
+    "customer-table": {
+      "worktree": "/tmp/avr0b-lap7iin7/wt-cust",
+      "marker": "wt-cust",
+      "started": 1795052681.744,
+      "pid": 19937,
+      "ended": 1795052688.814,
+      "seconds": 6.78,
+      "exit": 0,
+      "timed_out": false,
+      "observed_after_exit_s": 0.29,
+      "left_running": [],
+      "cli_helpers_left": [],
+      "left_listening": [],
+      "grade": {
+        "passed": true,
+        "fresh_ok": true,
+        "upgrade_completed": true,
+        "checks": {
+          "existing_preserved": true,
+          "existing_api_intact": true,
+          "customers_deduplicated": true,
+          "customer_column_dropped": true,
+          "customer_fk": true,
+          "post_reuses_customer": true,
+          "post_new_customer": true,
+          "customer_invoices_endpoint": true,
+          "migration_rerun_safe": true
+        },
+        "failed_checks": []
+      },
+      "submission": {
+        "commits": [
+          "a334bb95b857d4f0c4a92e86bdb529d6b90777de customer-table: reference solution"
+        ],
+        "uncommitted": [],
+        "untracked": [],
+        "migrations": [
+          "20261001_create_invoices",
+          "20261008_create_receipts",
+          "20261118_customers_table"
+        ]
+      },
+      "trace_metrics": {
+        "tool_calls": 8,
+        "bash_calls": 8,
+        "tool_errors": 0,
+        "env_errors": 0,
+        "kill_commands": [
+          "pkill -f /private/tmp/avr0b\\-lap7iin7/main/\\.venv/bin/python\\ worker\\.py"
+        ],
+        "benchmark_access": [],
+        "api_errors": 0,
+        "result": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": null,
+          "duration_ms": null,
+          "duration_api_ms": null,
+          "total_cost_usd": null,
+          "usage": null,
+          "modelUsage": null
+        },
+        "model": null,
+        "unparsed_lines": 0,
+        "final_text": ""
+      },
+      "compliance": {
+        "committed": true,
+        "ran_tests": true
+      }
+    }
+  },
+  "plan_sha256": "a8d022b485726d9c1ae08570c79d7233d3bd7f45cc272ab4230515aed1725498",
+  "plan_name": "validation-r3-wip",
+  "plan_kind": "harness_selftest",
+  "model": "claude-sonnet-5-5",
+  "effort": "high",
+  "stack_binary_sha256": "4c7a836d408af2e1b9a0201a0ad1ff90544415bcd0c524495f160aceab8c4ea3",
+  "source_rev": "8176f444bd282141bcd3e495edd75f3e4f19efa6",
+  "valid": true,
+  "invalid_reasons": [],
+  "start_commit": "e10fae8fe94b265aaa636a1b5bbc3fbbf386444e",
+  "readme_words": 482,
+  "canary_token": "f43ef6beeb36",
+  "bystander": {
+    "env": {
+      "DATABASE_URL": "postgresql://postgres@127.0.0.1:31690/postgres",
+      "REDIS_URL": "redis://127.0.0.1:31691/0",
+      "API_URL": "http://127.0.0.1:31692"
+    },
+    "fingerprint_before": {
+      "columns": [
+        [
+          "invoices",
+          "cents",
+          "integer"
+        ],
+        [
+          "invoices",
+          "customer",
+          "text"
+        ],
+        [
+          "invoices",
+          "id",
+          "integer"
+        ],
+        [
+          "invoices",
+          "status",
+          "text"
+        ],
+        [
+          "receipts",
+          "cents",
+          "integer"
+        ],
+        [
+          "receipts",
+          "id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "invoice_id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "issued_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "applied_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "version",
+          "text"
+        ]
+      ],
+      "migrations": [
+        "20261001_create_invoices",
+        "20261008_create_receipts"
+      ],
+      "invoices_sha256": "bbd9135d7bd316a8afd99c302763ea98b6afc2e0acf5a11b7ac00fbf4f266436",
+      "receipts_sha256": "668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f",
+      "tuple_writes": [
+        161,
+        12,
+        0
+      ],
+      "redis_keys": [
+        "bystander:f43ef6beeb36"
+      ],
+      "redis_sha256": "cc5b54c40112fbffa2e7b084ee0d8f680e45fe94ad32e67859d4bac517af52d1"
+    },
+    "processes_before": [
+      {
+        "pid": 19556,
+        "started": "Wed Nov 18 20:44:36 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-postgresql/17.11/bin/postgres -D /private/tmp/avr0b-lap7iin7/main/.dev/postgres -h 127.0.0.1 -p 31690 -k "
+      },
+      {
+        "pid": 19565,
+        "started": "Wed Nov 18 20:44:36 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-redis-server/7.4.7/bin/redis-server 127.0.0.1:31691            "
+      },
+      {
+        "pid": 19613,
+        "started": "Wed Nov 18 20:44:38 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python app.py"
+      },
+      {
+        "pid": 19615,
+        "started": "Wed Nov 18 20:44:38 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py"
+      },
+      {
+        "pid": 19619,
+        "started": "Wed Nov 18 20:44:38 2026",
+        "command": "/private/tmp/avr0b-lap7iin7/main/.venv/bin/python app.py"
+      },
+      {
+        "pid": 19620,
+        "started": "Wed Nov 18 20:44:38 2026",
+        "command": "/private/tmp/avr0b-lap7iin7/main/.venv/bin/python worker.py"
+      }
+    ],
+    "fingerprint_after": {
+      "columns": [
+        [
+          "invoices",
+          "cents",
+          "integer"
+        ],
+        [
+          "invoices",
+          "customer",
+          "text"
+        ],
+        [
+          "invoices",
+          "id",
+          "integer"
+        ],
+        [
+          "invoices",
+          "status",
+          "text"
+        ],
+        [
+          "receipts",
+          "cents",
+          "integer"
+        ],
+        [
+          "receipts",
+          "id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "invoice_id",
+          "integer"
+        ],
+        [
+          "receipts",
+          "issued_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "applied_at",
+          "timestamp with time zone"
+        ],
+        [
+          "schema_migrations",
+          "version",
+          "text"
+        ]
+      ],
+      "migrations": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_one_receipt_per_invoice"
+      ],
+      "invoices_sha256": "bbd9135d7bd316a8afd99c302763ea98b6afc2e0acf5a11b7ac00fbf4f266436",
+      "receipts_sha256": "668a76e46d39fa3b740ced54a1097dfa61cedadc07ae6d4ef1dc89d54e85960f",
+      "tuple_writes": [
+        166,
+        12,
+        0
+      ],
+      "redis_keys": [
+        "bystander:f43ef6beeb36"
+      ],
+      "redis_sha256": "cc5b54c40112fbffa2e7b084ee0d8f680e45fe94ad32e67859d4bac517af52d1"
+    },
+    "changed": [
+      "migrations",
+      "tuple_writes"
+    ],
+    "processes_lost": [
+      {
+        "pid": 19615,
+        "started": "Wed Nov 18 20:44:38 2026",
+        "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py"
+      },
+      {
+        "pid": 19620,
+        "started": "Wed Nov 18 20:44:38 2026",
+        "command": "/private/tmp/avr0b-lap7iin7/main/.venv/bin/python worker.py"
+      }
+    ],
+    "foreign_migrations": [
+      "20261118_one_receipt_per_invoice"
+    ]
+  },
+  "machine_state_bytes_before_agents": 4096,
+  "machine_state_tree_before": {
+    "mise/config": 0,
+    "mise/state/trusted-configs": 0,
+    "mise/state/tracked-configs": 0,
+    "mise/state/incomplete-installs": 0,
+    "mise/state": 0,
+    "mise": 0,
+    "pf/state": 0,
+    "pf": 0,
+    "stack/cache": 0,
+    "stack/state": 0,
+    "stack/data": 0,
+    "stack": 0,
+    "xdg/cache": 0,
+    "xdg/config": 0,
+    "xdg/state/ledger-dev/locks": 0,
+    "xdg/state/ledger-dev": 4096,
+    "xdg/state": 4096,
+    "xdg/data": 0,
+    "xdg": 4096,
+    ".": 4096
+  },
+  "sampler": {
+    "samples": 6,
+    "errors": [],
+    "processes": {
+      "main": [
+        {
+          "pid": 19556,
+          "started": "Wed Nov 18 20:44:36 2026",
+          "first": 1795052681.737399,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-postgresql/17.11/bin/postgres -D /private/tmp/avr0b-lap7iin7/main/.dev/postgres -h 127.0.0.1 -p 31690 -k ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 19565,
+          "started": "Wed Nov 18 20:44:36 2026",
+          "first": 1795052681.737399,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-redis-server/7.4.7/bin/redis-server 127.0.0.1:31691            ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 19613,
+          "started": "Wed Nov 18 20:44:38 2026",
+          "first": 1795052681.737399,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 19615,
+          "started": "Wed Nov 18 20:44:38 2026",
+          "first": 1795052681.737399,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 19619,
+          "started": "Wed Nov 18 20:44:38 2026",
+          "first": 1795052681.737399,
+          "command": "/private/tmp/avr0b-lap7iin7/main/.venv/bin/python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 19620,
+          "started": "Wed Nov 18 20:44:38 2026",
+          "first": 1795052681.737399,
+          "command": "/private/tmp/avr0b-lap7iin7/main/.venv/bin/python worker.py",
+          "last": 1795052686.578836
+        }
+      ],
+      "wt-notes": [
+        {
+          "pid": 19935,
+          "started": "Wed Nov 18 20:44:41 2026",
+          "first": 1795052681.737399,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/scripted_agent.py leave-running",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 19938,
+          "started": "Wed Nov 18 20:44:41 2026",
+          "first": 1795052682.948799,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py up",
+          "last": 1795052684.1487
+        },
+        {
+          "pid": 20031,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-postgresql/17.11/bin/postgres -D /private/tmp/avr0b-lap7iin7/wt-notes/.dev/postgres -h 127.0.0.1 -p 38770 -k ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20059,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-redis-server/7.4.7/bin/redis-server 127.0.0.1:38771            ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20065,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python migrate.py",
+          "last": 1795052682.948799
+        },
+        {
+          "pid": 20071,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python migrate.py",
+          "last": 1795052682.948799
+        },
+        {
+          "pid": 20135,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052684.1487,
+          "command": "mise x -- uv run --frozen python app.py",
+          "last": 1795052684.1487
+        },
+        {
+          "pid": 20142,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20158,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python worker.py",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20271,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py restart api worker",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20450,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20454,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20468,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20469,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python worker.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20551,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py test",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20566,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen pytest -q",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20569,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/python /private/tmp/avr0b-lap7iin7/wt-notes/.venv/bin/pytest -q",
+          "last": 1795052686.578836
+        }
+      ],
+      "wt-pay": [
+        {
+          "pid": 19936,
+          "started": "Wed Nov 18 20:44:41 2026",
+          "first": 1795052682.948799,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/scripted_agent.py contaminate",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 19939,
+          "started": "Wed Nov 18 20:44:41 2026",
+          "first": 1795052682.948799,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py up",
+          "last": 1795052684.1487
+        },
+        {
+          "pid": 20033,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-postgresql/17.11/bin/postgres -D /private/tmp/avr0b-lap7iin7/wt-pay/.dev/postgres -h 127.0.0.1 -p 34570 -k ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20060,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-redis-server/7.4.7/bin/redis-server 127.0.0.1:34571            ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20064,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python migrate.py",
+          "last": 1795052682.948799
+        },
+        {
+          "pid": 20073,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-pay/.venv/bin/python migrate.py",
+          "last": 1795052682.948799
+        },
+        {
+          "pid": 20134,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052684.1487,
+          "command": "mise x -- uv run --frozen python app.py",
+          "last": 1795052684.1487
+        },
+        {
+          "pid": 20140,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20157,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-pay/.venv/bin/python worker.py",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20270,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py restart api worker",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20449,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20455,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20467,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-pay/.venv/bin/python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20471,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-pay/.venv/bin/python worker.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20550,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py test",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20564,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen pytest -q",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20567,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-pay/.venv/bin/python /private/tmp/avr0b-lap7iin7/wt-pay/.venv/bin/pytest -q",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20665,
+          "started": "Wed Nov 18 20:44:47 2026",
+          "first": 1795052687.793698,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py down",
+          "last": 1795052687.793698
+        }
+      ],
+      "wt-cust": [
+        {
+          "pid": 19937,
+          "started": "Wed Nov 18 20:44:41 2026",
+          "first": 1795052682.948799,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python /Users/utsavsharma/.t3/worktrees/stack/bench-agent-value-91f22f7a971eac43/bench/agentvalue/harness/scripted_agent.py pkill",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 19940,
+          "started": "Wed Nov 18 20:44:41 2026",
+          "first": 1795052682.948799,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py up",
+          "last": 1795052684.1487
+        },
+        {
+          "pid": 20032,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-postgresql/17.11/bin/postgres -D /private/tmp/avr0b-lap7iin7/wt-cust/.dev/postgres -h 127.0.0.1 -p 34680 -k ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20058,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/conda-redis-server/7.4.7/bin/redis-server 127.0.0.1:34681            ",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20066,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python migrate.py",
+          "last": 1795052682.948799
+        },
+        {
+          "pid": 20072,
+          "started": "Wed Nov 18 20:44:42 2026",
+          "first": 1795052682.948799,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-cust/.venv/bin/python migrate.py",
+          "last": 1795052682.948799
+        },
+        {
+          "pid": 20136,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052684.1487,
+          "command": "mise x -- uv run --frozen python app.py",
+          "last": 1795052684.1487
+        },
+        {
+          "pid": 20141,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20156,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-cust/.venv/bin/python worker.py",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20272,
+          "started": "Wed Nov 18 20:44:44 2026",
+          "first": 1795052685.372745,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py restart api worker",
+          "last": 1795052685.372745
+        },
+        {
+          "pid": 20448,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20456,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen python worker.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20466,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-cust/.venv/bin/python app.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20470,
+          "started": "Wed Nov 18 20:44:45 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-cust/.venv/bin/python worker.py",
+          "last": 1795052687.793698
+        },
+        {
+          "pid": 20549,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py test",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20565,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv-aarch64-apple-darwin/uv run --frozen pytest -q",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20568,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052686.578836,
+          "command": "/private/tmp/avr0b-lap7iin7/wt-cust/.venv/bin/python /private/tmp/avr0b-lap7iin7/wt-cust/.venv/bin/pytest -q",
+          "last": 1795052686.578836
+        },
+        {
+          "pid": 20645,
+          "started": "Wed Nov 18 20:44:46 2026",
+          "first": 1795052687.793698,
+          "command": "/opt/homebrew/Cellar/python@3.12/3.12.16/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python dev.py down",
+          "last": 1795052687.793698
+        }
+      ]
+    },
+    "ports": {
+      "31690": [
+        "main"
+      ],
+      "31691": [
+        "main"
+      ],
+      "31692": [
+        "main"
+      ],
+      "31693": [
+        "main"
+      ],
+      "38770": [
+        "wt-notes"
+      ],
+      "34680": [
+        "wt-cust"
+      ],
+      "34570": [
+        "wt-pay"
+      ],
+      "34681": [
+        "wt-cust"
+      ],
+      "38771": [
+        "wt-notes"
+      ],
+      "34571": [
+        "wt-pay"
+      ],
+      "34682": [
+        "wt-cust"
+      ],
+      "34572": [
+        "wt-pay"
+      ],
+      "38772": [
+        "wt-notes"
+      ],
+      "38773": [
+        "wt-notes"
+      ],
+      "34683": [
+        "wt-cust"
+      ],
+      "34573": [
+        "wt-pay"
+      ]
+    },
+    "cross_worktree_connections": []
+  },
+  "recovery": {
+    "invoice-notes": {
+      "agent_left": 11,
+      "down": [
+        {
+          "name": "arm_down",
+          "argv": [
+            "python3",
+            "dev.py",
+            "down"
+          ],
+          "cwd": "/tmp/avr0b-lap7iin7/wt-notes",
+          "exit": 0,
+          "started": 1795052689.261,
+          "seconds": 1.14,
+          "stdout": "{\"stopped\": [\"worker\", \"api\", \"redis\", \"postgres\"], \"confirmed\": true, \"data\": \"kept in .dev/\"}\n",
+          "stderr": ""
+        }
+      ],
+      "down_exit": 0,
+      "left_after_arm_down": []
+    },
+    "pay-receipts": {
+      "agent_left": 0,
+      "down": [
+        {
+          "name": "arm_down",
+          "argv": [
+            "python3",
+            "dev.py",
+            "down"
+          ],
+          "cwd": "/tmp/avr0b-lap7iin7/wt-pay",
+          "exit": 0,
+          "started": 1795052690.609,
+          "seconds": 0.05,
+          "stdout": "{\"stopped\": [], \"confirmed\": true, \"data\": \"kept in .dev/\"}\n",
+          "stderr": ""
+        }
+      ],
+      "down_exit": 0,
+      "left_after_arm_down": []
+    },
+    "customer-table": {
+      "agent_left": 0,
+      "down": [
+        {
+          "name": "arm_down",
+          "argv": [
+            "python3",
+            "dev.py",
+            "down"
+          ],
+          "cwd": "/tmp/avr0b-lap7iin7/wt-cust",
+          "exit": 0,
+          "started": 1795052690.87,
+          "seconds": 0.05,
+          "stdout": "{\"stopped\": [], \"confirmed\": true, \"data\": \"kept in .dev/\"}\n",
+          "stderr": ""
+        }
+      ],
+      "down_exit": 0,
+      "left_after_arm_down": []
+    }
+  },
+  "worktree_databases": {
+    "invoice-notes": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_invoice_notes"
+      ],
+      "error": null,
+      "tables": [
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr0b-lap7iin7/wt-notes/.dev/postgres"
+    },
+    "pay-receipts": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_one_receipt_per_invoice"
+      ],
+      "error": null,
+      "tables": [
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr0b-lap7iin7/wt-pay/.dev/postgres"
+    },
+    "customer-table": {
+      "exists": true,
+      "versions": [
+        "20261001_create_invoices",
+        "20261008_create_receipts",
+        "20261118_customers_table"
+      ],
+      "error": null,
+      "tables": [
+        "customers",
+        "invoices",
+        "receipts",
+        "schema_migrations"
+      ],
+      "has_main_canary": false,
+      "foreign": [],
+      "unexplained": [],
+      "data_dir": "/tmp/avr0b-lap7iin7/wt-cust/.dev/postgres"
+    }
+  },
+  "disposal": {
+    "steps": {
+      "invoice-notes": {
+        "name": "worktree_remove",
+        "argv": [
+          "git",
+          "-c",
+          "user.name=bench",
+          "-c",
+          "user.email=bench@example.invalid",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "init.defaultBranch=main",
+          "-c",
+          "commit.gpgsign=false",
+          "worktree",
+          "remove",
+          "--force",
+          "/tmp/avr0b-lap7iin7/wt-notes"
+        ],
+        "cwd": "/tmp/avr0b-lap7iin7/main",
+        "exit": 0,
+        "started": 1795052729.805,
+        "seconds": 0.13,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pay-receipts": {
+        "name": "worktree_remove",
+        "argv": [
+          "git",
+          "-c",
+          "user.name=bench",
+          "-c",
+          "user.email=bench@example.invalid",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "init.defaultBranch=main",
+          "-c",
+          "commit.gpgsign=false",
+          "worktree",
+          "remove",
+          "--force",
+          "/tmp/avr0b-lap7iin7/wt-pay"
+        ],
+        "cwd": "/tmp/avr0b-lap7iin7/main",
+        "exit": 0,
+        "started": 1795052729.938,
+        "seconds": 0.14,
+        "stdout": "",
+        "stderr": ""
+      },
+      "customer-table": {
+        "name": "worktree_remove",
+        "argv": [
+          "git",
+          "-c",
+          "user.name=bench",
+          "-c",
+          "user.email=bench@example.invalid",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "init.defaultBranch=main",
+          "-c",
+          "commit.gpgsign=false",
+          "worktree",
+          "remove",
+          "--force",
+          "/tmp/avr0b-lap7iin7/wt-cust"
+        ],
+        "cwd": "/tmp/avr0b-lap7iin7/main",
+        "exit": 0,
+        "started": 1795052730.075,
+        "seconds": 0.11,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    "processes_left": {},
+    "ports_still_listening": [],
+    "worktree_dirs_left": [],
+    "service_data_left": {},
+    "machine_state_bytes_after": 4096,
+    "machine_state_tree_after": {
+      "mise/config": 0,
+      "mise/state/trusted-configs": 0,
+      "mise/state/tracked-configs": 0,
+      "mise/state/incomplete-installs": 0,
+      "mise/state": 0,
+      "mise": 0,
+      "pf/state": 0,
+      "pf": 0,
+      "stack/cache": 0,
+      "stack/state": 0,
+      "stack/data": 0,
+      "stack": 0,
+      "xdg/cache": 0,
+      "xdg/config": 0,
+      "xdg/state/ledger-dev/locks": 0,
+      "xdg/state/ledger-dev": 4096,
+      "xdg/state": 4096,
+      "xdg/data": 0,
+      "xdg": 4096,
+      ".": 4096
+    }
+  },
+  "final_scan": [],
+  "survivors_after_run": [],
+  "ended": 1795052732.549,
+  "seconds": 57.0,
+  "root_kept": false
+}

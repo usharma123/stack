@@ -10,7 +10,10 @@ from pathlib import Path
 import re
 import sys
 
-SECRET_KEY = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|COOKIE|CREDENTIAL|SESSION_KEY)[A-Za-z0-9_]*)=("[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', re.I)
+KEYWORDS = r'(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|COOKIE|CREDENTIAL|SESSION_KEY)'
+SECRET_KEY = re.compile(r'\b([A-Za-z0-9_]*' + KEYWORDS + r'[A-Za-z0-9_]*)=("[^"]*"|\'[^\']*\'|[^\s"\'\\]+)', re.I)
+# JSON and escaped JSON: "SOME_TOKEN": "value"  or  \"SOME_TOKEN\": \"value\"
+SECRET_JSON = re.compile(r'(\\?"[A-Za-z0-9_]*' + KEYWORDS + r'[A-Za-z0-9_]*\\?"\s*:\s*)(\\?")((?:[^"\\]|\\(?!"))*)(\\?")', re.I)
 MISE_DIFF = re.compile(r'\b(__MISE_[A-Z_]*)=[^\s"\'\\]+')
 
 
@@ -18,6 +21,7 @@ def scrub(text):
     if not isinstance(text, str):
         return text
     text = SECRET_KEY.sub(lambda m: f'{m[1]}=<redacted>', text)
+    text = SECRET_JSON.sub(lambda m: f'{m[1]}{m[2]}<redacted>{m[4]}', text)
     return MISE_DIFF.sub(lambda m: f'{m[1]}=<redacted>', text)
 
 

@@ -72,6 +72,10 @@ def existing_preserved():
     if receipts != [(2, 5000), (43, 450)]:
         print(f'pre-existing receipts changed: {receipts}', file=sys.stderr)
         return False
+    stored = dict(sql('SELECT id, status FROM invoices WHERE id IN (1, 2, 3, 41, 42, 43, 44)'))
+    if stored != {k: v for k, v in STATUS.items()}:
+        print(f'pre-existing statuses changed in the database: {stored}', file=sys.stderr)
+        return False
     return True
 
 
@@ -117,9 +121,10 @@ def schema_fingerprint():
     constraints = sql("SELECT conrelid::regclass::text, pg_get_constraintdef(oid) FROM pg_constraint "
                       "WHERE connamespace = 'public'::regnamespace ORDER BY 1, 2")
     indexes = sql("SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1")
-    counts = [(t, sql(f'SELECT count(*) FROM "{t}"')[0][0]) for (t,) in
-              sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1")]
-    return columns, constraints, indexes, counts
+    contents = [(t, sql(f'SELECT count(*), md5(coalesce(string_agg(x::text, \',\' ORDER BY x::text), \'\')) FROM "{t}" x')[0])
+                for (t,) in sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' "
+                                "AND table_name <> 'schema_migrations' ORDER BY 1")]
+    return columns, constraints, indexes, contents
 
 
 # ---------------------------------------------------------------- invoice-notes
@@ -150,9 +155,19 @@ def invoice_notes():
         body = call('GET', '/invoices/42')[1]
         if not (state.get('patched') and body.get('note') == 'call first' and body.get('cents') == 333):
             return False
-        # The read path must still use the cache: some Redis value now holds the patched invoice.
-        cached = [R.get(k) for k in R.scan_iter('*') if R.type(k) == 'string']
-        return any(v and 'call first' in v for v in cached)
+        # The read path must still use the cache: change the stored amount behind the API's back;
+        # a read answered from the cache still shows the patched value, a database read would not.
+        with psycopg.connect(DB) as conn:
+            conn.execute('UPDATE invoices SET cents = 4242 WHERE id = 42')
+        try:
+            hit = call('GET', '/invoices/42')[1]
+        finally:
+            with psycopg.connect(DB) as conn:
+                conn.execute('UPDATE invoices SET cents = 333 WHERE id = 42')
+        if hit.get('cents') != 333:
+            print(f'GET after a database-only change returned {hit}: the read did not come from the cache', file=sys.stderr)
+            return False
+        return True
     check('cache_after_patch', cache_after_patch)
 
     def database_after_patch():
@@ -310,7 +325,8 @@ def pay_receipts():
         def pay_marks_paid():
             call('GET', '/invoices/41')  # warm the cache
             (status, _), writes = writes_during(lambda: call('POST', '/invoices/41/pay'))
-            state['paid'] = status is not None and 200 <= status < 300
+            stored = sql('SELECT status FROM invoices WHERE id = 41')
+            state['paid'] = status is not None and 200 <= status < 300 and stored == [('paid',)]
             state['enqueued'] = writes
             return state['paid']
         check('pay_marks_paid', pay_marks_paid)
@@ -338,9 +354,13 @@ def pay_receipts():
                 for args in state['enqueued']:
                     raw.execute_command(*replayable(args))
                     keys.add(args[1])
+            # The README's contract: jobs go on a Redis list. Delivery is checked by the list draining.
+            lists = [k for k in keys if raw.type(k) == b'list']
+            if not lists or len(lists) != len(keys):
+                print(f'jobs were not queued on a Redis list: {keys}', file=sys.stderr)
+                return False
             worker.start()
             deadline = time.monotonic() + 10
-            lists = [k for k in keys if raw.type(k) == b'list']
             while time.monotonic() < deadline and any(raw.llen(k) for k in lists):
                 time.sleep(0.2)
             if any(raw.llen(k) for k in lists):
@@ -378,7 +398,8 @@ def customer_table():
         names = [row[0] for row in sql('SELECT name FROM customers')]
         expected = {'Acme Corp', 'Globex', 'Zoë Café', 'Ünïcode GmbH', 'Umbrella'}
         unique = sql("SELECT 1 FROM pg_index x JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = x.indkey[0] "
-                     "WHERE x.indrelid = 'customers'::regclass AND x.indisunique AND x.indnatts = 1 AND a.attname = 'name'")
+                     "WHERE x.indrelid = 'customers'::regclass AND x.indisunique AND x.indnatts = 1 AND a.attname = 'name' "
+                     "AND x.indpred IS NULL")
         return expected <= set(names) and len(names) == len(set(names)) and bool(unique)
     check('customers_deduplicated', deduplicated)
     check('customer_column_dropped', lambda: not sql("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' "
