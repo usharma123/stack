@@ -167,7 +167,7 @@ these steps:
 4. **Agents.** Start the 1 s sampler, then launch all agents. When an agent exits, or is stopped at
    its budget, record at once everything still attributed to its worktree.
 5. **Checks.** After the last agent:
-   - stop the sampler;
+   - wait 5 s for processes an agent signalled at the end to finish exiting, then stop the sampler;
    - check the bystander;
    - stop what the agents left;
    - capture each submission;

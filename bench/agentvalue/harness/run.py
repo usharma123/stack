@@ -388,6 +388,7 @@ def cli_paths(argv0):
     return tuple(p for p in paths if p and p.startswith('/'))
 
 
+SETTLE_SECONDS = 5
 CORE_SERVICE = re.compile(r'(/bin/postgres |redis-server|python (app|worker)\.py|uv run|__supervise)')
 
 
@@ -531,6 +532,9 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             if 'left_running' not in record['agents'][task]:
                 raise RuntimeError(f'no exit observation for {task}')
 
+        # A process an agent signalled last may still be shutting down (the worker finishes its
+        # current one-second queue wait on SIGTERM). Let it settle before anything is compared.
+        time.sleep(SETTLE_SECONDS)
         sampler.stop()
         record['sampler'] = sampler.summary()
         if record['sampler']['errors']:
