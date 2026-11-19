@@ -628,7 +628,8 @@ fn main() -> ExitCode {
                 }
                 println!("stopped {} service(s); confirmed", r.stopped.len());
                 for w in &r.warnings {
-                    eprintln!("warning: {w}");
+                    // Not `eprintln!`: a closed stderr must not abort a stop that is already done.
+                    let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("warning: {w}\n"));
                 }
                 for record in &r.removed_unreadable {
                     println!("removed unreadable session record {}", record.display());
