@@ -1,0 +1,12 @@
+{
+  "commits": [
+    "61f92d8ead01889d6a1b38bb0b369f29d7a18f9b invoice-notes: reference solution"
+  ],
+  "uncommitted": [],
+  "untracked": [],
+  "migrations": [
+    "20261001_create_invoices",
+    "20261008_create_receipts",
+    "20261118_invoice_notes"
+  ]
+}

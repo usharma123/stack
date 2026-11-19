@@ -1,0 +1,43 @@
+PASS grader/invoice-notes/starting-code-fails {"passed": false, "fresh_ok": true, "failed_checks": ["note_default", "create_with_note", "cache_after_patch", "database_after_patch", "other_invoice_untouched", "migration_rerun_safe"]}
+PASS grader/invoice-notes/reference-passes {"passed": true, "fresh_ok": true, "failed_checks": []}
+PASS grader/invoice-notes/mutant-fails (PATCH no longer invalidates the cache) {"passed": false, "fresh_ok": true, "failed_checks": ["cache_after_patch"]}
+PASS grader/invoice-notes/mutant-fails (reads bypass the cache entirely) {"passed": false, "fresh_ok": true, "failed_checks": ["cache_after_patch"]}
+PASS grader/invoice-notes/mutant-fails (reads skip the cache but still write it) {"passed": false, "fresh_ok": true, "failed_checks": ["cache_after_patch"]}
+PASS grader/invoice-notes/mutant-fails (a migration rerun changes existing data) {"passed": false, "fresh_ok": true, "failed_checks": ["migration_rerun_safe"]}
+PASS grader/pay-receipts/starting-code-fails {"passed": false, "fresh_ok": true, "failed_checks": ["pay_marks_paid", "cache_after_pay", "receipt_recorded", "duplicate_job_one_receipt", "pay_twice_conflict"]}
+PASS grader/pay-receipts/reference-passes {"passed": true, "fresh_ok": true, "failed_checks": []}
+PASS grader/pay-receipts/mutant-fails (worker not idempotent (no unique index, no ON CONFLICT)) {"passed": false, "fresh_ok": true, "failed_checks": ["duplicate_job_one_receipt", "pay_twice_conflict"]}
+PASS grader/pay-receipts/mutant-fails (receipt written by the request, worker a no-op) {"passed": false, "fresh_ok": true, "failed_checks": ["receipt_recorded"]}
+PASS grader/customer-table/starting-code-fails {"passed": false, "fresh_ok": true, "failed_checks": ["customers_deduplicated", "customer_column_dropped", "customer_fk", "post_reuses_customer", "post_new_customer", "customer_invoices_endpoint", "migration_rerun_safe"]}
+PASS grader/customer-table/reference-passes {"passed": true, "fresh_ok": true, "failed_checks": []}
+PASS grader/customer-table/mutant-fails (seed.py not updated for the new schema) {"passed": false, "fresh_ok": false, "failed_checks": []}
+PASS grader/customer-table/mutant-fails (migration deletes existing receipts) {"passed": false, "fresh_ok": true, "failed_checks": ["existing_preserved", "existing_api_intact"]}
+PASS grader/customer-table/mutant-fails (no unique constraint on customer name) {"passed": false, "fresh_ok": true, "failed_checks": ["customers_deduplicated"]}
+PASS grader/customer-table/mutant-fails (a partial unique index on customer name) {"passed": false, "fresh_ok": true, "failed_checks": ["customers_deduplicated"]}
+PASS baseline/reference/run-valid []
+PASS baseline/reference/all-gated-success [["invoice-notes", true, true, true], ["pay-receipts", true, true, true], ["customer-table", true, true, true]]
+PASS baseline/reference/used-own-db [true, true, true]
+PASS baseline/reference/no-contamination []
+PASS baseline/reference/disposal-clean {"processes_left": {}, "ports_still_listening": [], "worktree_dirs_left": [], "service_data_left": {}}
+PASS baseline/reference/compliance (committed, ran tests, clean CLI exit) [["invoice-notes", true, true, true], ["pay-receipts", true, true, true], ["customer-table", true, true, true]]
+PASS baseline/planted/run-valid []
+PASS baseline/planted/leftover-detected (incl. postgres and redis) ["postgres", "postgres:", "python", "redis-server", "uv"]
+PASS baseline/planted/contamination-attributed [{"kind": "migration_in_main", "detail": "20261118_one_receipt_per_invoice", "culprits": ["pay-receipts"]}, {"kind": "main_process_killed", "detail": ["/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv", "/private/tmp/avr0b-n2lep398/main/.venv/bin/python worker.py"], "culprits": ["customer-table"]}]
+PASS baseline/planted/collateral-kill-detected [{"kind": "main_process_killed", "detail": ["/Users/utsavsharma/.cache/stack-agentvalue/warm/mise-data/installs/uv/0.12.23/uv", "/private/tmp/avr0b-n2lep398/main/.venv/bin/python worker.py"], "culprits": ["customer-table"]}]
+PASS baseline/planted/arm-down-recovers-dirty-checkout {"agent_left": 11, "left_after_arm_down": []}
+PASS baseline/planted/clean-agents-unaffected [["invoice-notes", false], ["pay-receipts", true], ["customer-table", true]]
+PASS baseline/planted/nothing-survives []
+PASS stack/reference/run-valid []
+PASS stack/reference/all-gated-success [["invoice-notes", true, true, true], ["pay-receipts", true, true, true], ["customer-table", true, true, true]]
+PASS stack/reference/used-own-db [true, true, true]
+PASS stack/reference/no-contamination []
+PASS stack/reference/disposal-clean {"processes_left": {}, "ports_still_listening": [], "worktree_dirs_left": [], "service_data_left": {}}
+PASS stack/reference/compliance (committed, ran tests, clean CLI exit) [["invoice-notes", true, true, true], ["pay-receipts", true, true, true], ["customer-table", true, true, true]]
+PASS stack/planted/run-valid []
+PASS stack/planted/leftover-detected (incl. postgres and redis) ["58b536426b4c548c", "postgres", "postgres:", "python", "redis-server", "uv"]
+PASS stack/planted/contamination-attributed [{"kind": "migration_in_main", "detail": "20261118_one_receipt_per_invoice", "culprits": ["pay-receipts"]}, {"kind": "main_process_killed", "detail": ["uv run --frozen python worker.py", "/private/tmp/avr0s-lflp_bhm/main/.venv/bin/python worker.py"], "culprits": ["customer-table"]}]
+PASS stack/planted/collateral-kill-detected [{"kind": "main_process_killed", "detail": ["uv run --frozen python worker.py", "/private/tmp/avr0s-lflp_bhm/main/.venv/bin/python worker.py"], "culprits": ["customer-table"]}]
+PASS stack/planted/arm-down-recovers-dirty-checkout {"agent_left": 12, "left_after_arm_down": []}
+PASS stack/planted/clean-agents-unaffected [["invoice-notes", false], ["pay-receipts", true], ["customer-table", true]]
+PASS stack/planted/nothing-survives []
+{"ok": true, "failures": []}
