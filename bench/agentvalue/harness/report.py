@@ -280,10 +280,14 @@ def slot_key(run, task):
 UNPARSEABLE = re.compile(r'\$\(|`|\$\{|\$[A-Za-z_]|<\(|>\(')
 
 
+COMPOUND_WORDS = {'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', 'for', 'select', '!', '{', '}'}
+
+
 def simple_commands(command):
-    """A shell command split into simple commands (argument lists) on `;`, `&&`, `||`, `|` and
-    newlines, each followed by the operator that ends it. None when the text uses a form the harness
-    does not interpret (command substitution, variables, process substitution) or cannot tokenise."""
+    """A shell command split into simple commands: each {'argv', 'before', 'after'} with the operator on
+    either side (`;`, `&&`, `||`, `|`, `&`, newline as `;`), plus whether the text is a compound form
+    (if/while/case..., a subshell or a group). None when the text uses a form the harness does not
+    interpret (command substitution, variables, process substitution) or cannot tokenise."""
     if UNPARSEABLE.search(command):
         return None
     try:
@@ -292,23 +296,26 @@ def simple_commands(command):
         tokens = list(lexer)
     except ValueError:
         return None
-    out, current = [], []
+    out, current, before = [], [], None
     for tok in tokens:
         if tok in (';', '&&', '||', '|', '&', ';;', '|&'):
             if current:
-                out.append((current, tok))
-            current = []
+                out.append({'argv': current, 'before': before, 'after': tok})
+            current, before = [], tok
         elif set(tok) <= set(';&|'):
             return None
         else:
             current.append(tok)
     if current:
-        out.append((current, None))
+        out.append({'argv': current, 'before': before, 'after': None})
+    compound = any(c['argv'][0] in COMPOUND_WORDS or any('(' in t or ')' in t for t in c['argv']) for c in out)
+    for c in out:
+        c['compound'] = compound
     return out
 
 
 def _strip_wrappers(argv):
-    """Drop leading `sudo`/`command`/`exec`/`env VAR=…`/`timeout N` wrappers."""
+    """Drop leading `sudo`/`command`/`exec`/`nohup`/`env VAR=…`/`timeout N` wrappers."""
     while argv:
         head = Path(argv[0]).name
         if head in ('sudo', 'command', 'exec', 'nohup'):
@@ -324,65 +331,113 @@ def _strip_wrappers(argv):
     return argv
 
 
-def _pattern_operand(argv):
-    flags, j = set(), 1
-    while j < len(argv):
-        arg = argv[j]
-        if arg.startswith('-') and len(arg) > 1:
-            flags.add(arg)
-            if arg in ('-u', '-U', '-g', '-G', '-P', '-t', '-s'):
-                j += 1
-            j += 1
+KILL_FLAGS = {'-9', '-KILL', '-TERM', '-15'}
+
+
+def _kill_operands(argv):
+    """(modelled, operands) for `kill [-9|-KILL|-TERM|-15|-s NAME] pid...`; any other flag is unmodelled."""
+    modelled, operands, i = True, [], 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '-s' and i + 1 < len(argv):
+            i += 2
             continue
-        return flags, arg
-    return flags, None
+        if arg in KILL_FLAGS:
+            i += 1
+            continue
+        if arg.startswith('-'):
+            modelled = False
+            i += 1
+            continue
+        operands.append(arg)
+        if not arg.isdigit():
+            modelled = False
+        i += 1
+    return modelled, operands
+
+
+def _pattern_args(argv, allowed):
+    """(modelled, flags, pattern) for pkill/killall: flags outside `allowed` are unmodelled."""
+    flags, pattern = [], None
+    for arg in argv[1:]:
+        if arg.startswith('-') and pattern is None:
+            flags.append(arg)
+        elif pattern is None:
+            pattern = arg
+        else:
+            return False, flags, pattern       # more operands than modelled
+    return all(f in allowed for f in flags), flags, pattern
+
+
+def _match(pattern, text):
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
+        return pattern in text
+
+
+GATE = ('pid', 'pattern', 'port')
 
 
 def identifies(command, loss):
-    """Whether a command identifies the lost process: its pid is an operand of a `kill` invocation;
-    a `pkill`/`killall` pattern matches its command line (or, without -f, its program name); or it
-    kills by a port the process listened on (`lsof -t -i :PORT | xargs kill`, `fuser -k PORT/tcp`).
-    Returns 'pid', 'pattern', 'port', None, or 'unparseable' for a form the harness does not interpret."""
+    """Whether a command explains the loss of a process. Returns 'pid', 'pattern' or 'port' only for a
+    plain, unconditional, modelled invocation: `kill [-9|-KILL|-TERM|-15|-s NAME] pid...` naming its pid;
+    `pkill [-9] [-f] pattern` matching it; `killall name` naming it; `lsof -t -i :PORT | xargs kill` or
+    `fuser -k PORT/tcp` on a port it listened on — as a simple command not behind `&&`/`||`, not in a
+    pipeline (other than the lsof form) and not inside a compound form or subshell. 'review' when a
+    form the harness does not model could explain it; None otherwise."""
     full = loss.get('command') or ''
     name = Path(full.split()[0]).name if full.split() else ''
-    parsed = simple_commands(command)
-    if parsed is None:
-        return 'unparseable' if re.search(r'\b(kill|pkill|killall|fuser)\b', command) else None
     ports = [str(p) for p in loss.get('ports') or []]
-    for index, (raw_argv, op) in enumerate(parsed):
-        argv = _strip_wrappers(raw_argv)
+    parsed = simple_commands(command)
+    if parsed is None:   # substitution, variables...: a kill there could explain it, but is never gated
+        return 'review' if re.search(r'\b(kill|pkill|killall|fuser)\b', command) else None
+    verdict = None
+    for index, c in enumerate(parsed):
+        # Inside a compound form the keywords and parentheses are dropped for reading; such a kill is
+        # never plain, so it can at most be listed for review.
+        argv = [t.strip('(){}') for t in c['argv']]
+        while argv and (argv[0] in COMPOUND_WORDS or not argv[0]):
+            argv = argv[1:]
+        argv = _strip_wrappers([t for t in argv if t])
         if not argv:
             continue
         base = Path(argv[0]).name
+        plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and c['after'] != '|'
+        hit = None
         if base == 'kill':
-            operands = [a for a in argv[1:] if not a.startswith('-')]
+            modelled, operands = _kill_operands(argv)
             if str(loss['pid']) in operands:
-                return 'pid'
-        elif base in ('pkill', 'killall'):
-            flags, pattern = _pattern_operand(argv)
-            if pattern is None:
-                continue
-            try:
-                if base == 'killall':
-                    hit = re.search(pattern, name) if '-m' in flags else pattern == name
-                elif any('f' in f.lstrip('-') and not f.startswith('--') for f in flags):
-                    hit = re.search(pattern, full)
-                else:
-                    hit = re.search(pattern, name)
-            except re.error:
-                hit = False
-            if hit:
-                return 'pattern'
-        elif base == 'fuser' and any(f.startswith('-') and 'k' in f for f in argv[1:]):
+                hit = 'pid' if modelled and plain else 'review'
+        elif base == 'pkill':
+            modelled, flags, pattern = _pattern_args(argv, {'-9', '-f'})
+            if pattern is not None and _match(pattern, full if '-f' in flags else name):
+                hit = 'pattern' if modelled and plain else 'review'
+            elif not modelled and any(_match(a, full) for a in argv[1:] if not a.startswith('-')):
+                hit = 'review'
+        elif base == 'killall':
+            modelled, flags, pattern = _pattern_args(argv, set())
+            if pattern is not None and (pattern == name or (not modelled and _match(pattern, full))):
+                hit = 'pattern' if modelled and plain and pattern == name else 'review'
+        elif base == 'fuser' and any(a.startswith('-') and 'k' in a for a in argv[1:]):
             if any(re.fullmatch(rf'{p}(/tcp)?', a) for a in argv[1:] for p in ports):
-                return 'port'
-        elif base == 'lsof' and op == '|' and index + 1 < len(parsed):
-            nxt = _strip_wrappers(parsed[index + 1][0])
-            if nxt[:2] == ['xargs', 'kill'] or (nxt and Path(nxt[0]).name == 'xargs' and 'kill' in nxt[1:]):
+                only = all(a in ('-k',) or re.fullmatch(r'\d+(/tcp)?', a) for a in argv[1:])
+                hit = 'port' if only and plain else 'review'
+        elif base == 'lsof' and c['after'] == '|' and index + 1 < len(parsed):
+            nxt = parsed[index + 1]
+            nargv = _strip_wrappers(nxt['argv'])
+            if nargv and Path(nargv[0]).name == 'xargs' and 'kill' in nargv[1:]:
                 text = ' '.join(argv[1:])
-                if any(re.search(rf'(?:^|\s)-i\s*(?:tcp)?:?{p}\b|:{p}\b', text) for p in ports):
-                    return 'port'
-    return None
+                if any(re.search(rf'(?:^|\s)-t?i\s*(?:tcp)?:?{p}\b|:{p}\b', text) for p in ports):
+                    lsof_ok = all(re.fullmatch(r'-t|-i|-ti|-it|-sTCP:LISTEN|(?:tcp)?:?\d+|-i(?:tcp)?:\d+|-ti:\d+|-ti(?:tcp)?:\d+', a) for a in argv[1:])
+                    xargs_ok = nargv[1:] in (['kill'], ['kill', '-9'], ['kill', '-KILL'], ['kill', '-TERM'])
+                    pipe_plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and nxt['after'] != '|'
+                    hit = 'port' if lsof_ok and xargs_ok and pipe_plain else 'review'
+        if hit in GATE:
+            return hit
+        if hit == 'review':
+            verdict = 'review'
+    return verdict
 
 
 RESTART_NAMES = {'postgres': 'postgres', 'redis': 'redis', 'api': 'api', 'worker': 'worker', 'supervisor': None}
@@ -395,8 +450,8 @@ def stops_service(command, loss):
     if parsed is None:
         return bool(re.search(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart)\b', command))
     kind = loss.get('kind')
-    for raw_argv, _ in parsed:
-        argv = _strip_wrappers(raw_argv)
+    for c in parsed:
+        argv = _strip_wrappers(c['argv'])
         words = [Path(a).name for a in argv]
         if 'stack' in words[:1] or 'dev.py' in words[:3]:
             rest = argv[words.index('dev.py') + 1:] if 'dev.py' in words else argv[1:]
@@ -457,20 +512,23 @@ def sibling_losses(run):
                 if not c.get('kill_like') or not _overlaps(c, a, lo, hi, episode_end):
                     continue
                 verdict = identifies(c['command'], loss)
-                if verdict in ('pid', 'pattern', 'port'):
+                if verdict in GATE and c.get('end_m') is None and a.get('killed_by_harness'):
+                    verdict = 'review'      # a command of a killed CLI with no result: never gated
+                if verdict in GATE:
                     culprits.add(k)
-                elif verdict == 'unparseable':
+                elif verdict == 'review':
                     unparseable.add(k)
         own = [(k, c) for k, a in agents.items() if a.get('marker') == group for c in a.get('service_commands') or []
                if _overlaps(c, a, last - OWN_WINDOW_S, gone, episode_end) and
-               (stops_service(c['command'], loss) or ('kill' in c.get('kinds', []) and identifies(c['command'], loss) in ('pid', 'pattern', 'port')))]
+               (stops_service(c['command'], loss) or ('kill' in c.get('kinds', []) and identifies(c['command'], loss) in GATE))]
         if culprits and not own:
             events.append({'kind': 'sibling_service_lost', 'detail': f"{group}: {item['command'][:80]} (pid {loss['pid']})",
                            'culprits': sorted(culprits), 'loss': item})
         elif culprits:
             review.append({**item, 'reason': 'ambiguous: its own session stopped or killed it just before', 'kill_by': sorted(culprits)})
         elif unparseable:
-            review.append({**item, 'reason': 'a kill command the harness does not interpret ran at the time', 'kill_by': sorted(unparseable)})
+            review.append({**item, 'reason': 'a kill the harness does not gate (conditional, unmodelled, or of a killed CLI) could explain it',
+                           'kill_by': sorted(unparseable)})
         elif own:
             not_events.append({**item, 'reason': 'its own session stopped or restarted it', 'command_by': own[-1][0]})
         else:
@@ -498,6 +556,21 @@ def connection_events(run):
 SLOW_EXIT_WINDOW_S = 30.0
 
 
+def service_kind_of(command):
+    """The service a durable process is, from its command line (as observe.service_kind)."""
+    if re.search(r'/bin/postgres\s+(?:.*\s)?-D\s+\S+', command):
+        return 'postgres'
+    if re.search(r'(?:^|/)redis-server(?:\s|$)', command):
+        return 'redis'
+    if re.search(r'\bpython3?\s+app\.py\b', command):
+        return 'api'
+    if re.search(r'\bpython3?\s+worker\.py\b', command):
+        return 'worker'
+    if '__supervise' in command:
+        return 'supervisor'
+    return None
+
+
 def teardown_collateral(run):
     """Teardown collateral: a durable service of another worktree not yet torn down, or of the main
     checkout, in the harness's listing just before worktree X's teardown procedure and gone from its
@@ -508,15 +581,28 @@ def teardown_collateral(run):
     events, review = [], []
     end = run.get('episode_end_m')
     agents = run.get('agents') or {}
-    stopping = {a.get('marker') for a in agents.values() for c in a.get('service_commands') or []
-                if end is not None and c.get('start_m') is not None and end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= end
-                and ({'down_restart', 'kill'} & set(c.get('kinds') or []))}
+
+    def own_slow_exit(v):
+        # Only a command of the lost process's own worktree, in the 30 s before the episode ended,
+        # that targeted that very process: the arm's down, a restart covering its service, or a kill
+        # identifying it. Any other recent command excuses nothing.
+        loss = {'pid': v['pid'], 'command': v['command'], 'kind': service_kind_of(v['command']), 'ports': v.get('ports') or []}
+        for a in agents.values():
+            if a.get('marker') != v['group']:
+                continue
+            for c in a.get('service_commands') or []:
+                if end is None or c.get('start_m') is None or not (end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= end):
+                    continue
+                if stops_service(c['command'], loss) or ('kill' in (c.get('kinds') or []) and identifies(c['command'], loss) in GATE):
+                    return c['command'][:120]
+        return None
     for task, t in (run.get('teardown') or {}).items():
         for v in t.get('collateral') or []:
             detail = f"{v['group']}: {v['command'][:80]} (pid {v['pid']}) lost while {SHORT_OF.get(task, task)} was torn down"
-            if v['group'] in stopping:
+            excuse = own_slow_exit(v)
+            if excuse:
                 review.append({'worktree': v['group'], 'pid': v['pid'], 'command': v['command'][:160],
-                               'reason': f'{detail}; its own session stopped services in the 30 s before the episode ended'})
+                               'reason': f'{detail}; its own session targeted it in the 30 s before the episode ended ({excuse})'})
             else:
                 events.append({'kind': 'teardown_collateral', 'detail': detail, 'culprits': ['arm']})
     by = run.get('bystander') or {}
@@ -561,7 +647,7 @@ def load_runs_v2(plan, results, plan_sha=None):
     plan. Attempt 2 counts only when attempt 1's own records show a missed fault or an invalid run;
     once it has started it governs: if it is invalid, missed or incomplete, the pair is missing.
     Returns (runs used, foreign records, attempts listed, every eligible record)."""
-    runs, foreign, attempts, every = {}, {}, {}, []
+    runs, foreign, attempts, every, governing, partial = {}, {}, {}, [], {}, []
     for pair in plan['pairs']:
         found = {}
         for attempt in (1, 2):
@@ -581,12 +667,22 @@ def load_runs_v2(plan, results, plan_sha=None):
                 got[arm] = run
             if got:
                 found[attempt] = got
-        eligible_retry = 2 in found and 1 in found and any(_failed(r) for r in found[1].values())
-        if 2 in found and not eligible_retry:
-            for arm in found[2]:
+        started_2 = (Path(results) / f"pair{pair['index']}.2-STARTED.json").exists()
+        attempt_1_failed = 1 in found and any(_failed(r) for r in found[1].values())
+        eligible_retry = (2 in found or started_2) and attempt_1_failed
+        if (2 in found or started_2) and not eligible_retry:
+            for arm in found.get(2, {}):
                 foreign[Path(run_dir(results, pair['index'], arm, 2)).name] = 'attempt 2 without a missed fault or invalid run in attempt 1'
-            found.pop(2)
-        use = 2 if 2 in found else 1
+            found.pop(2, None)
+            started_2 = False
+        use = 2 if (2 in found or started_2) else 1
+        governing[pair['index']] = use
+        for attempt in (1, 2):   # sessions of a run that left no record: launched, spend unknown
+            for arm in pair['order']:
+                adir = Path(run_dir(results, pair['index'], arm, attempt))
+                if adir.is_dir() and not (adir / 'run.json').exists() and (attempt == 1 or use == 2):
+                    for session in sorted(d.name for d in (adir / 'agents').iterdir()) if (adir / 'agents').is_dir() else []:
+                        partial.append({'run': adir.name, 'session': session, 'cost_usd': None, 'valid_run': False})
         listing = []
         for a, got in sorted(found.items()):
             every += list(got.values())
@@ -600,12 +696,15 @@ def load_runs_v2(plan, results, plan_sha=None):
         attempts[pair['index']] = listing
         chosen = found.get(use) or {}
         governs_missing = use == 2 and (len(chosen) < len(pair['order']) or any(_failed(r) for r in chosen.values()))
+        if use == 2 and not chosen:
+            listing.append({'attempt': 2, 'arms': [], 'used': True, 'complete': False, 'excluded_because': None,
+                            'dirs': [], 'note': 'started (recorded) but left no run record'})
         for arm in pair['order']:
             run = None if governs_missing and use == 2 and (arm not in chosen or len(chosen) < len(pair['order'])) else chosen.get(arm)
             if run is not None:
                 run['_attempt'] = use
             runs[(pair['index'], arm)] = run
-    return runs, foreign, attempts, every
+    return runs, foreign, attempts, every, governing, partial
 
 
 def _norm(path):
@@ -637,14 +736,14 @@ def victim_copes(run, row):
             'description_test_after_kill': bool(tested)}
 
 
-def rows_v2(plan, runs, results):
+def rows_v2(plan, runs, results, governing=None):
     """One row per slot (five per run) and one per run. In agent-kill the victim's slot is the
     recovery session. Every row carries the planned victim, invalid and not-run rows included."""
     rows, run_rows, sessions = [], [], []
     for pair in plan['pairs']:
         for arm in pair['order']:
             run = runs.get((pair['index'], arm))
-            attempt = (run or {}).get('_attempt', 1)
+            attempt = (run or {}).get('_attempt') or (governing or {}).get(pair['index'], 1)
             base = {'pair': pair['index'], 'arm': arm, 'scenario': pair.get('scenario'), 'victim': pair.get('victim'),
                     'position': pair['order'].index(arm), 'attempt': attempt}
             where = run_dir(results, pair['index'], arm, attempt)
@@ -818,10 +917,10 @@ def all_sessions(records):
     return out
 
 
-def summarize_v2(plan, runs, results, foreign=None, attempts=None, every=None):
-    rows, run_rows, sessions = rows_v2(plan, runs, results)
+def summarize_v2(plan, runs, results, foreign=None, attempts=None, every=None, governing=None, partial=None):
+    rows, run_rows, sessions = rows_v2(plan, runs, results, governing)
     scenarios = sorted({p.get('scenario') for p in plan['pairs']}, key=lambda s: (s is None, s or ''))
-    launched = all_sessions(every if every is not None else [r for r in runs.values() if r])
+    launched = all_sessions(every if every is not None else [r for r in runs.values() if r]) + list(partial or [])
     costs = [s['cost_usd'] for s in launched if s['cost_usd'] is not None]
     highest = max(costs) if costs else None
     out = {'plan': plan['name'], 'kind': plan['kind'], 'protocol_version': 2,
@@ -1152,8 +1251,8 @@ def main():
     plan = json.loads(raw)
     import hashlib
     if plan.get('protocol_version') == 2:
-        runs, foreign, attempts, every = load_runs_v2(plan, args.results, hashlib.sha256(raw).hexdigest())
-        summary = summarize_v2(plan, runs, args.results, foreign, attempts, every)
+        runs, foreign, attempts, every, governing, partial = load_runs_v2(plan, args.results, hashlib.sha256(raw).hexdigest())
+        summary = summarize_v2(plan, runs, args.results, foreign, attempts, every, governing, partial)
         text = markdown_v2(summary)
     else:  # version 1 plans and results keep their own report
         runs, foreign = load_runs(plan, args.results, hashlib.sha256(raw).hexdigest())

@@ -60,12 +60,29 @@ def host_values(environ=None):
     return sorted(found, key=lambda item: -len(item[1]))
 
 
+JSON_ESCAPE = re.compile(r'\\u([0-9a-fA-F]{4})|\\(["\\/bfnrt])')
+ESCAPES = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
+
+
+def json_decoded(text):
+    r"""JSON string escapes decoded (\uXXXX, \n, \", \\, \/ ...), wherever they appear."""
+    def one(m):
+        if m.group(1):
+            try:
+                return chr(int(m.group(1), 16))
+            except ValueError:
+                return m.group(0)
+        return ESCAPES[m.group(2)]
+    return JSON_ESCAPE.sub(one, text)
+
+
 def variants(text):
-    """The text as written, and with line breaks, line continuations and JSON escapes removed, so a
-    value split across lines or escaped in a JSON string is still found (host values only)."""
+    r"""The text as written; with line breaks and line continuations removed; with JSON escapes
+    decoded; and both. So a value split across lines or escaped in a JSON string is still found
+    (host values only; credential patterns run on every variant too)."""
     joined = re.sub(r'\\\r?\n|\r?\n|\r', '', text)
-    unescaped = joined.replace('\\/', '/').replace('\\n', '').replace('\\"', '"')
-    return {text, joined, unescaped}
+    decoded = json_decoded(text)
+    return {text, joined, decoded, re.sub(r'\r?\n|\r', '', decoded), json_decoded(joined)}
 
 
 def scanner(environ=None):
@@ -73,7 +90,7 @@ def scanner(environ=None):
     combined = re.compile('|'.join(f'(?P<v{i}>{re.escape(v)})' for i, (_, v) in enumerate(values))) if values else None
 
     def scan(text):
-        hits = [name for name, pattern in PATTERNS.items() if pattern.search(text)]
+        hits = [name for name, pattern in PATTERNS.items() if any(pattern.search(v) for v in variants(text))]
         if combined:
             for variant in variants(text):
                 for match in combined.finditer(variant):

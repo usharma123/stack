@@ -40,6 +40,12 @@ PY_BIN = INSTALLS / 'python/3.13.16/bin'
 UV = INSTALLS / 'uv/0.12.23/uv-aarch64-apple-darwin/uv'
 GRADER_HOME = Path(os.environ.get('AGENTVALUE_GRADER_HOME', Path.home() / '.cache/stack-agentvalue/grader'))
 GRADER_PY = GRADER_HOME / 'venv/bin/python'
+import threading
+_LOCAL = threading.local()   # per thread (validation grades in parallel): the current grading run's token
+
+
+def grade_token():
+    return getattr(_LOCAL, 'token', None)
 # Files the grader always takes from the starting code, never from a submission.
 PROTECTED = {'smoke.py', 'stack.toml', 'stack.lock', 'mise.toml', 'mise.lock', 'dev.py', 'README.md', 'AGENTS.md',
              '.gitignore', 'pyproject.toml', 'uv.lock'}
@@ -56,6 +62,8 @@ def base_env(extra=None):
     env = {'PATH': os.pathsep.join([str(PY_BIN), str(UV.parent), str(PG_BIN), '/usr/bin', '/bin', '/usr/sbin', '/sbin']),
            'HOME': os.environ['HOME'], 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8', 'TZ': 'UTC',
            'UV_CACHE_DIR': str(GRADER_HOME / 'uv-cache'), 'UV_PYTHON': str(PY_BIN / 'python3'), 'NO_COLOR': '1'}
+    if grade_token():
+        env['AGENTVALUE_GRADE'] = grade_token()
     env.update(extra or {})
     return env
 
@@ -127,7 +135,7 @@ class Services:
             raise Step('postgres did not start')
         redis_log = open(self.dir / 'redis.log', 'wb')
         self.redis = subprocess.Popen([str(REDIS_BIN / 'redis-server'), '--bind', '127.0.0.1', '--port', str(self.redis_port),
-                                       '--save', '', '--appendonly', 'no', '--dir', str(self.dir)],
+                                       '--save', '', '--appendonly', 'no', '--dir', str(self.dir)], env=base_env(),
                                       stdout=redis_log, stderr=redis_log, stdin=subprocess.DEVNULL, start_new_session=True)
         deadline = time.monotonic() + 20
         while not listening(self.redis_port):
@@ -286,8 +294,10 @@ def reclaim_under(path):
     left = observe.legacy.owned_processes(path)
     if not left:
         return {'left': [], 'survivors': []}
-    result = observe.reclaim(left, path)
-    return {'left': [{k: p[k] for k in ['pid', 'command']} for p in left], 'survivors': result['survivors']}
+    # Only processes tied to this grading run (its token, or a service on its directories) are signalled.
+    result = observe.reclaim(left, path, grade_token=grade_token())
+    return {'left': [{k: p[k] for k in ['pid', 'command']} for p in left], 'survivors': result['survivors'],
+            'seen_not_signalled': result['seen_not_signalled']}
 
 
 def grade(task_id, submitted_tree, out_dir):
@@ -298,6 +308,7 @@ def grade(task_id, submitted_tree, out_dir):
     task = TASKS[task_id]
     with tempfile.TemporaryDirectory(prefix='avg-', dir='/tmp') as tmp:
         tmp = Path(tmp)
+        _LOCAL.token = tmp.name
         starting = prepare_tree(FIXTURE, tmp / 'starting')
         fresh_tree = prepare_tree(Path(submitted_tree), tmp / 'fresh-tree', starting)
         upgrade_tree = prepare_tree(Path(submitted_tree), tmp / 'upgrade-tree', starting)

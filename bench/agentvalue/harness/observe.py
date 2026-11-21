@@ -18,6 +18,8 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import arms as legacy  # bench/arms.py: process_table, same_process, reclaim, owns
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import redact  # command lines are scrubbed before they are kept or written anywhere
 
 MARKER = re.compile(r'(?:^|\s)AGENTVALUE_WT=([A-Za-z0-9_.-]+)')
 ROLE = re.compile(r'(?:^|\s)AGENTVALUE_ROLE=(agent|recovery)(?=\s|$)')
@@ -256,24 +258,41 @@ def norm_path(path):
     return path[len('/private'):] if path.startswith('/private/') else path
 
 
-def ready_services(group, groups, owner, listeners, rows, pg_data_dir=None):
-    """The four services of `group` that run and listen: kind -> {pid, started, command, port}. The
-    postmaster must be on `pg_data_dir`, the arm's own data directory for that worktree (a second
-    PostgreSQL elsewhere never qualifies); every process must belong to the group (marker, command
-    or open files) and listen on a TCP port. Never by port number."""
-    paths = groups.get(group) or []
+def ready_services(group, groups, owner, listeners, rows, recorded=None):
+    """The four services of `group` that run and listen as the arm's own: kind -> {pid, started,
+    command, port}. `recorded` is what the arm recorded for that worktree: {'data_dir': ..., 'ports':
+    {'postgres': p, 'redis': p, 'api': p, 'worker': p}}. Each must listen on its recorded port, have
+    the matching command class and belong to the worktree (marker, command or open files); the
+    postmaster must also be on the recorded data directory. A scratch service elsewhere never counts."""
+    recorded = recorded or {}
+    ports, paths = recorded.get('ports') or {}, groups.get(group) or []
     found = {}
-    for port, pid in sorted(listeners.items()):
+    for kind in SERVICES:
+        port = ports.get(kind)
+        pid = listeners.get(port) if port else None
         row = rows.get(pid)
-        if row is None or owner.get(pid) != group:
+        if row is None or owner.get(pid) != group or service_kind(row['command']) != kind:
             continue
-        kind = service_kind(row['command'])
-        if kind not in SERVICES or kind in found:
-            continue
-        if kind == 'postgres' and (not pg_data_dir or norm_path(postmaster_data_dir(row['command'])) != norm_path(pg_data_dir)
+        if kind == 'postgres' and (norm_path(postmaster_data_dir(row['command'])) != norm_path(recorded.get('data_dir'))
                                    or not under_any(paths, postmaster_data_dir(row['command']) or '')):
             continue
-        found[kind] = {'pid': pid, 'started': row['started'], 'command': row['command'][:300], 'port': port}
+        found[kind] = {'pid': pid, 'started': row['started'], 'command': redact.scrub(row['command'])[:300], 'port': port}
+    return found
+
+
+def listening_ports(pids):
+    """pid -> set of TCP ports it listens on now (one lsof call)."""
+    if not pids:
+        return {}
+    out = _out(['lsof', '-nP', '-w', '-a', '-p', ','.join(str(p) for p in pids), '-iTCP', '-sTCP:LISTEN', '-Fpn'])
+    found, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith('p') and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith('n') and pid is not None:
+            port = line.rpartition(':')[2]
+            if port.isdigit():
+                found.setdefault(pid, set()).add(int(port))
     return found
 
 
@@ -300,6 +319,7 @@ class Sampler(threading.Thread):
         self.losses = []        # durable processes gone between two samples
         self.postmasters = {}   # (group, pid, started) -> (first m seen listening, data directory)
         self.data_dirs = {}     # group -> data directories of every PostgreSQL and Redis seen running for it
+        self.pg_dirs = {}       # group -> data directories of every PostgreSQL seen running for it
         self.redis_cwd = {}     # (pid, started) -> working directory
         self.times = []         # (begun_m, stamped_m) of every sample
         self.groups, self.resolved = groups(), {}
@@ -326,6 +346,7 @@ class Sampler(threading.Thread):
         begun = round(time.monotonic() - self.t0, 3)
         self.groups = self.groups_fn()
         rows = legacy.process_table()
+        record_lineage(rows)
         marks, roles = marks_and_roles()
         listeners, connections = tcp()
         endpoints = listeners.pop('by_endpoint', {})
@@ -349,7 +370,7 @@ class Sampler(threading.Thread):
             if mark:
                 owner[pid] = mark
                 key = (mark, pid, row['started'])
-                entry = self.seen.setdefault(key, {'first': now, 'first_m': mono, 'command': row['command'][:300]})
+                entry = self.seen.setdefault(key, {'first': now, 'first_m': mono, 'command': redact.scrub(row['command'])[:300]})
                 entry['last'] = now
                 entry['last_m'] = mono
         ports_of = {}
@@ -361,7 +382,7 @@ class Sampler(threading.Thread):
         alive = {(pid, row['started']) for pid, row in rows.items() if not exiting(row)}
         for key, (group, command, seen_m, ports) in self.durable_prev.items():
             if key not in alive:
-                self.losses.append({'group': group, 'pid': key[0], 'started': key[1], 'command': command[:1000],
+                self.losses.append({'group': group, 'pid': key[0], 'started': key[1], 'command': redact.scrub(command)[:1000],
                                     'kind': service_kind(command), 'ports': ports, 'last_seen_m': seen_m, 'gone_m': mono})
         current = {(pid, rows[pid]['started']): (group, rows[pid]['command'], mono, sorted(ports_of.get(pid, [])))
                    for pid, group in owner.items() if DURABLE.search(rows[pid]['command'])}
@@ -376,6 +397,7 @@ class Sampler(threading.Thread):
             kind = service_kind(rows[pid]['command'])
             if kind == 'postgres':
                 self.data_dirs.setdefault(group, set()).add(postmaster_data_dir(rows[pid]['command']))
+                self.pg_dirs.setdefault(group, set()).add(postmaster_data_dir(rows[pid]['command']))
             elif kind == 'redis':
                 key = (pid, rows[pid]['started'])
                 if key not in self.redis_cwd:
@@ -403,7 +425,7 @@ class Sampler(threading.Thread):
             server = owner.get(server_pid)
             if server and server != client:
                 events.append({'t': now, 'm': mono, 'client': client, 'client_pid': pid, 'client_started': rows.get(pid, {}).get('started'),
-                               'client_role': roles.get(pid), 'client_cmd': rows.get(pid, {}).get('command', '')[:200],
+                               'client_role': roles.get(pid), 'client_cmd': redact.scrub(rows.get(pid, {}).get('command', ''))[:200],
                                'server': server, 'port': int(remote)})
         self.cross.extend(events)
         self.samples += 1
@@ -434,7 +456,8 @@ class Sampler(threading.Thread):
                 'first_m': stamps[0] if stamps else None, 'last_m': stamps[-1] if stamps else None,
                 'postmasters_listening': [{'group': g, 'pid': pid, 'started': st, 'first_listen_m': m, 'data_dir': d}
                                           for (g, pid, st), (m, d) in self.postmasters.items()],
-                'service_data_dirs': {g: sorted(d for d in dirs if d) for g, dirs in self.data_dirs.items()}}
+                'service_data_dirs': {g: sorted(d for d in dirs if d) for g, dirs in self.data_dirs.items()},
+                'postgres_data_dirs': {g: sorted(d for d in dirs if d) for g, dirs in self.pg_dirs.items()}}
 
 
 def role_of(pid):
@@ -469,14 +492,90 @@ def _same(row):
     return now is not None and now['started'] == row['started'] and now['command'].rstrip() == row['command'].rstrip()
 
 
+# Lineage (PROTOCOL.md, "What the harness may signal"): processes the harness launched, and their
+# descendants as the sampler saw them, by (pid, start time).
+LINEAGE = {'launched': set(), 'seen': set()}
+GRADE_MARK = re.compile(r'(?:^|\s)AGENTVALUE_GRADE=([A-Za-z0-9_.-]+)')
+
+
+def _environment(pid):
+    try:
+        return _out(['ps', '-ww', '-E', '-p', str(pid), '-o', 'command='])
+    except RuntimeError:
+        return ''
+
+
+def _cwd(pid):
+    out = _out(['lsof', '-nP', '-w', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'])
+    return next((l[1:] for l in out.splitlines() if l.startswith('n/')), None)
+
+
+def tie(row, root, table=None, grade_token=None, _memo=None):
+    """Why a process may be signalled, or None. Only a process positively tied to the run qualifies:
+    'marker' (it carries the run's marker, or the grader's token), 'lineage' (it is, or descends from,
+    a process the harness launched, or from a tied process), or 'service' (an arm's service, by its
+    command class together with a data or state directory of the run: a postmaster on a data
+    directory under the root, a redis-server whose working directory is under it, Stack's supervisor
+    on a state directory under it, the app or worker interpreter of a venv under it). A process that
+    merely has a run file open, or whose command mentions a run path, gets None."""
+    memo = {} if _memo is None else _memo
+    pid = row['pid']
+    if pid in memo:
+        return memo[pid]
+    memo[pid] = None   # guards against cycles
+    env = _environment(pid)
+    mark = MARKER.search(env)
+    reason = None
+    if mark and group_of_marker(mark[1]) is not None:
+        reason = 'marker'
+    elif grade_token and any(m == grade_token for m in GRADE_MARK.findall(env)):
+        reason = 'marker'
+    elif (pid, row.get('started')) in LINEAGE['launched'] or (pid, row.get('started')) in LINEAGE['seen']:
+        reason = 'lineage'
+    else:
+        command, roots = row.get('command', ''), [str(root)]
+        kind = service_kind(command)
+        if kind == 'postgres' and under_any(roots, postmaster_data_dir(command) or ''):
+            reason = 'service'
+        elif kind == 'redis' and under_any(roots, _cwd(pid) or ''):
+            reason = 'service'
+        elif kind == 'supervisor' and (m := re.search(r'__supervise\s+(\S+)', command)) and under_any(roots, m[1]):
+            reason = 'service'
+        elif kind in ('api', 'worker') and '/.venv/bin/' in command.split()[0] and under_any(roots, command.split()[0]):
+            reason = 'service'
+        if reason is None:
+            table = table if table is not None else legacy.process_table()
+            parent = table.get(row.get('ppid') if row.get('ppid') is not None else table.get(pid, {}).get('ppid'))
+            if parent and parent['pid'] > 1 and parent['pid'] != os.getpid() and tie(parent, root, table, grade_token, memo):
+                reason = 'lineage'
+    memo[pid] = reason
+    return reason
+
+
+def record_lineage(rows):
+    """Add to LINEAGE['seen'] every process in `rows` (a process table) that descends from a launched
+    or already-seen process. Called on every sample, so a daemon is caught before it is reparented."""
+    known = LINEAGE['launched'] | LINEAGE['seen']
+    children = {}
+    for pid, row in rows.items():
+        children.setdefault(row['ppid'], []).append(pid)
+    stack = [pid for pid, row in rows.items() if (pid, row['started']) in known]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            key = (child, rows[child]['started'])
+            if key not in LINEAGE['seen'] and key not in LINEAGE['launched']:
+                LINEAGE['seen'].add(key)
+                stack.append(child)
+
+
 def _owned(pid, root):
-    if RUN_SUFFIX and group_of_marker(markers().get(pid)) is not None:
-        return True
-    return legacy.owns(root, pid)
+    """Kept for callers that ask whether a pid belongs to the run: now the positive tie only."""
+    identity = legacy.process_identity(pid)
+    return identity is not None and tie({'pid': pid, **identity}, root) is not None
 
 
-def _signal(row, signum, root):
-    if not _same(row) or not _owned(row['pid'], root):
+def _signal(row, signum, root, grade_token=None):
+    if not _same(row) or tie(row, root, grade_token=grade_token) is None:
         return False
     try:
         os.kill(row['pid'], signum)
@@ -485,21 +584,29 @@ def _signal(row, signum, root):
         return False
 
 
-def reclaim(rows, root, grace=5):
+def reclaim(rows, root, grace=5, grade_token=None):
     """Stop exactly these processes: SIGTERM, a grace period, then SIGKILL. Before every signal the
-    start time, command line and ownership by `root` are checked again, so a reused PID gets nothing."""
-    result = {'terminated': [], 'killed': [], 'not_signalled': [], 'survivors': []}
+    start time and command line are checked again and the process must be positively tied to the run
+    (see `tie`); one that is not is listed under 'seen_not_signalled' and never signalled.
+    'survivors' are run-tied processes still alive; outsiders never make a survivor."""
+    result = {'terminated': [], 'killed': [], 'not_signalled': [], 'seen_not_signalled': [], 'survivors': []}
+    table = legacy.process_table()
+    ties = {row['pid']: tie(row, root, table, grade_token) for row in rows}
     for row in rows:
-        (result['terminated'] if _signal(row, signal.SIGTERM, root) else result['not_signalled']).append(row['pid'])
+        if ties[row['pid']] is None:
+            result['seen_not_signalled'].append({'pid': row['pid'], 'command': redact.scrub(row.get('command', ''))[:200],
+                                                 'reason': row.get('reason', 'listed')})
+            continue
+        (result['terminated'] if _signal(row, signal.SIGTERM, root, grade_token) else result['not_signalled']).append(row['pid'])
     signalled = [row for row in rows if row['pid'] in result['terminated']]
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline and any(_same(row) for row in signalled):
         time.sleep(0.1)
     for row in signalled:
-        if _signal(row, signal.SIGKILL, root):
+        if _signal(row, signal.SIGKILL, root, grade_token):
             result['killed'].append(row['pid'])
     time.sleep(0.2)
-    result['survivors'] = [row['pid'] for row in rows if _same(row)]
+    result['survivors'] = [row['pid'] for row in rows if ties[row['pid']] is not None and _same(row)]
     return result
 
 

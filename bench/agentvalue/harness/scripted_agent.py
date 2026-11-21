@@ -182,7 +182,26 @@ def scratch_postgres():
     port = next(p for p in range(15000, 16000) if socket.socket().connect_ex(('127.0.0.1', p)) != 0)
     run([os.path.join(bindir, 'initdb'), '-D', str(data), '-U', 'postgres', '-A', 'trust', '-E', 'UTF8', '--locale=en_US.UTF-8'])
     run([os.path.join(bindir, 'pg_ctl'), '-D', str(data), '-l', str(data) + '.log', '-w', '-t', '60', '-o', f"-h 127.0.0.1 -p {port} -k ''", 'start'])
+    # A scratch Redis and a scratch API-like listener in the same worktree, on low ports too.
+    redis_bins = sorted(glob.glob(os.path.join(data_root, 'installs', '*redis*', '7.4.7', 'bin', 'redis-server')))
+    free = [p for p in range(port + 1, 16000) if socket.socket().connect_ex(('127.0.0.1', p)) != 0][:2]
+    scratch_dir = here / '.pytest_cache' / 'scratch'
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    extra = []
+    if redis_bins:
+        extra.append(run([redis_bins[0], '--bind', '127.0.0.1', '--port', str(free[0]), '--save', '', '--dir', str(scratch_dir)],
+                         background=True, cwd=scratch_dir))
+    (scratch_dir / 'app.py').write_text('import http.server, sys\n'
+                                        'http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), http.server.BaseHTTPRequestHandler).serve_forever()\n')
+    # A non-framework interpreter (mise's), so that its command reads `python3 app.py PORT`: the API's command class.
+    py = sorted(glob.glob(os.path.join(data_root, 'installs', 'python', '3.13*', 'bin', 'python3')))
+    extra.append(run([py[0] if py else 'python3', 'app.py', str(free[1])], background=True, cwd=scratch_dir))
+    time.sleep(1)
+    SCRATCH_PROCS.extend(extra)
     return bindir, data
+
+
+SCRATCH_PROCS = []
 
 
 def norole_client(seconds=6):
@@ -200,6 +219,11 @@ def plant_sentinel():
     run(['sh', '-c', f'echo SENTINEL_TOKEN={value}'])
     emit({'type': 'system', 'subtype': 'note', 'data': {'SENTINEL_TOKEN': value, 'API_KEYS': [value], 'auth': {'SECRET': {'v': value}}}})
     (here / 'notes.env').write_text(f'SENTINEL_TOKEN={value}\n')
+    (here / f'SENTINEL_TOKEN={value}.txt').write_text('a file whose name carries the value\n')
+    run(['sh', '-c', f'echo "Authorization: Bearer {value}"'])
+    # A process whose command line carries the value, alive long enough for the sampler to list it.
+    run(['python3', '-c', 'import time; time.sleep(4)', f'SENTINEL_TOKEN={value}'], background=True, cwd=here)
+    time.sleep(3)
 
 if mode == 'noop':
     finish()
@@ -265,6 +289,9 @@ if mode in ('sk-restart', 'sk-noreact'):
     commit()
     if scratch:
         run([os.path.join(scratch[0], 'pg_ctl'), '-D', str(scratch[1]), '-m', 'fast', '-w', 'stop'])
+        for proc in SCRATCH_PROCS:   # its own scratch Redis and API, by pid
+            run(['kill', str(proc.pid)], must=False)
+            proc.wait(10)
     run(cli['down'])
     finish()
 

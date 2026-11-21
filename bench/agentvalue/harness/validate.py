@@ -33,6 +33,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -127,6 +128,19 @@ def _void_allows_archived(tree):
                                        "ALTER TABLE invoices ADD CONSTRAINT invoices_status_check CHECK (status IN ('open', 'paid', 'void', 'archived'));\n")
 
 
+def _void_disjunction(tree):
+    # The reviewer's round 3 counterexample: the allowlist OR any long string.
+    (tree / VOID_MIGRATION).write_text("ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_status_check;\n"
+                                       "ALTER TABLE invoices ADD CONSTRAINT invoices_status_check "
+                                       "CHECK (status IN ('open', 'paid', 'void') OR length(status) > 10);\n")
+
+
+def _void_redundant_nonempty(tree):
+    # A correct alternative: the exact allowlist plus a redundant `status <> ''` constraint.
+    with open(tree / VOID_MIGRATION, 'a') as f:
+        f.write("ALTER TABLE invoices ADD CONSTRAINT invoices_status_nonempty CHECK (status <> '');\n")
+
+
 def _void_never_caches_void(tree):
     # A correct alternative: a void invoice is never put in the cache (reads of it go to PostgreSQL).
     _edit(tree / 'app.py', """            cache.put_invoice(invoice.to_json())
@@ -202,13 +216,15 @@ MUTANTS = {
                       ('constraint dropped and not re-added', _void_constraint_dropped, 'constraint_allows_void_only'),
                       ('constraint also allows another status (refunded)', _void_allows_refunded, 'constraint_allows_void_only'),
                       ('constraint also allows another status (archived)', _void_allows_archived, 'constraint_allows_void_only'),
+                      ('constraint allowlist OR length(status) > 10', _void_disjunction, 'constraint_allows_void_only'),
                       ('PATCH on a void invoice allowed', _void_patch_allowed, 'patch_void_409'),
                       ('a paid invoice is voided', _void_paid_changed, 'void_paid_409'),
                       ('a void invoice can be voided again', _void_twice_ok, 'void_twice_409')],
 }
 
 # Correct alternatives to the reference: each must pass.
-ALTERNATIVES = {'void-invoices': [('a void invoice is never cached', _void_never_caches_void)]}
+ALTERNATIVES = {'void-invoices': [('a void invoice is never cached', _void_never_caches_void),
+                                   ("the allowlist plus a redundant status <> '' constraint", _void_redundant_nonempty)]}
 
 
 def _edit(path, old, new):
@@ -276,8 +292,10 @@ def sentinel_for(rec):
 
 
 def files_containing(directory, value):
+    """Retained files whose content or path name carries the value."""
     needle = value.encode()
-    return [str(p.relative_to(directory)) for p in Path(directory).rglob('*') if p.is_file() and not p.is_symlink() and needle in p.read_bytes()]
+    return [str(p.relative_to(directory)) for p in Path(directory).rglob('*')
+            if value in str(p.relative_to(directory)) or (p.is_file() and not p.is_symlink() and needle in p.read_bytes())]
 
 
 def four_services(rec):
@@ -315,7 +333,7 @@ def main():
     for binary, digest, rev in ((NEW_STACK, NEW_STACK_SHA, 'a5d4785'), (OLD_STACK, OLD_STACK_SHA, 'dc4b980')):
         expect(f'setup/stack-binary {rev}', binary.is_file() and runner.sha256(binary) == digest, {'path': str(binary), 'expected_sha256': digest})
     lock = [runner.host_lock()]
-    only = set(args.only.split(',')) if args.only else set(CASES) | {'exec-control-dc4b980', 'commit-scan', 'interrupts', 'unit'}
+    only = set(args.only.split(',')) if args.only else set(CASES) | {'exec-control-dc4b980', 'commit-scan', 'interrupts', 'unit', 'publication-failure'}
 
     if not args.skip_grader:
         cells = []
@@ -361,16 +379,49 @@ def main():
            runner.protocol_problems(old_trial))
     timings = {}
 
-    def run_case(arm, case, the_plan=plan, down_override=None):
+    def run_case(arm, case, the_plan=plan, down_override=None, outsider=False, env=None, expect_valid=True):
         modes, fault = CASES.get(case, ({'invoice-list': 'exec-left'}, None))
         t = time.monotonic()
-        rec = runner.run_arm(the_plan, 0, arm, out / f'{arm}-{case}', agent_override=runner.scripted_override(
-            ','.join(f'{k}={v}' for k, v in modes.items())), fault={'scenario': fault[0], 'victim': fault[1]} if fault else {},
-            down_override=down_override)
+        roots, watcher = [], None
+        original_mkdtemp = runner.tempfile.mkdtemp
+        def mkdtemp(*a, **k):
+            path = original_mkdtemp(*a, **k)
+            if Path(path).name.startswith('avr') and not roots:
+                roots.append(path)
+            return path
+        runner.tempfile.mkdtemp = mkdtemp
+        if outsider:   # an operator's `tail -f` on a staged trace: outside the run, no marker
+            def start_tail():
+                deadline = time.monotonic() + 120
+                while time.monotonic() < deadline:
+                    target = Path(roots[0]) / 'stage' / 'invoice-notes' / 'trace.jsonl' if roots else None
+                    if target and target.exists():
+                        outsiders.append(subprocess.Popen(['/usr/bin/tail', '-f', str(target)], cwd='/', env={'PATH': '/usr/bin:/bin'},
+                                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+                        return
+                    time.sleep(0.2)
+            watcher = threading.Thread(target=start_tail, daemon=True)
+            watcher.start()
+        saved_env = {k: os.environ.get(k) for k in (env or {})}
+        os.environ.update(env or {})
+        try:
+            rec = runner.run_arm(the_plan, 0, arm, out / f'{arm}-{case}', agent_override=runner.scripted_override(
+                ','.join(f'{k}={v}' for k, v in modes.items())), fault={'scenario': fault[0], 'victim': fault[1]} if fault else {},
+                down_override=down_override)
+        finally:
+            runner.tempfile.mkdtemp = original_mkdtemp
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            if watcher:
+                watcher.join(5)
         timings[f'{arm}-{case}'] = round(time.monotonic() - t, 1)
         rows, run_row = gates(the_plan, arm, rec, out / f'{arm}-{case}')
-        expect(f'{arm}/{case}/run-valid', rec['valid'], rec['invalid_reasons'])
-        expect(f'{arm}/{case}/nothing-survives', not rec.get('survivors_after_run') and not rec.get('final_scan'),
+        if expect_valid:
+            expect(f'{arm}/{case}/run-valid', rec['valid'], rec['invalid_reasons'])
+        expect(f'{arm}/{case}/nothing-of-the-run-survives', not rec.get('survivors_after_run') and not rec.get('final_scan'),
                {'survivors': rec.get('survivors_after_run'), 'final_scan': rec.get('final_scan')})
         return rec, rows, run_row
 
@@ -396,7 +447,16 @@ def main():
         tasks = plan['config']['tasks']
         try:
             if 'clean' in only:
-                rec, rows, rr = run_case(arm, 'clean')
+                outsiders = []
+                rec, rows, rr = run_case(arm, 'clean', outsider=True)
+                tail_alive = bool(outsiders) and outsiders[0].poll() is None
+                listed = [p for p in (rec.get('seen_not_signalled') or []) + (rec.get('final_scan_seen_not_signalled') or [])
+                          if 'tail' in p['command']]
+                for proc in outsiders:
+                    proc.kill()
+                    proc.wait()
+                expect(f'{arm}/clean/outsider-with-a-run-file-open-survives-and-is-listed', tail_alive and listed and rec['valid'],
+                       {'tail_started': bool(outsiders), 'tail_alive_after_run': tail_alive, 'listed': listed})
                 ok, detail = gated(rows, tasks)
                 expect(f'{arm}/clean/every-slot-gated-success', ok, detail)
                 expect(f'{arm}/clean/used-own-db', all(rows[t].get('used_own_db') for t in tasks), [rows[t].get('used_own_db') for t in tasks])
@@ -521,6 +581,21 @@ def main():
                        and (f.get('kill') or {}).get('pid') not in scratch and 'scratch-pg' not in (trig_pg.get('command') or '')
                        and report._norm(f.get('canonical_data_dir')) in report._norm((trig_pg.get('command') or '').replace(' /private/', ' /')),
                        {'scratch': scratch, 'trigger_postgres': trig_pg, 'canonical': f.get('canonical_data_dir')})
+                trig = (f.get('trigger') or {}).get('services') or {}
+                scratch_other = {k: [p['pid'] for p in listing if '.pytest_cache/scratch' in p['command'] or
+                                     (k == 'redis' and 'redis-server' in p['command'] and p['pid'] != (trig.get('redis') or {}).get('pid'))]
+                                 for k in ('redis', 'api')}
+                scratch_api = [p['pid'] for p in listing if re.search(r'\bpython3?\s+app\.py\s+\d+', p['command'])]
+                expect(f'{arm}/{case}/scratch-redis-and-api-never-trigger-nor-target',
+                       (trig.get('redis') or {}).get('port') == (f.get('recorded_ports') or {}).get('redis')
+                       and (trig.get('api') or {}).get('port') == (f.get('recorded_ports') or {}).get('api')
+                       and (trig.get('api') or {}).get('pid') not in scratch_api and bool(scratch_api)
+                       and len([p for p in listing if 'redis-server' in p['command']]) >= 2,
+                       {'trigger': {k: (v.get('pid'), v.get('port')) for k, v in trig.items()}, 'recorded_ports': f.get('recorded_ports'),
+                        'scratch_api': scratch_api, 'redis_in_listing': [p['pid'] for p in listing if 'redis-server' in p['command']]})
+                dirs = (rec['worktree_databases'].get('void-invoices') or {}).get('data_dirs') or {}
+                expect(f'{arm}/{case}/isolation-reads-every-seen-postgres-data-directory', len(dirs) >= 2
+                       and any('scratch-pg' in d and r.get('exists') for d, r in dirs.items()), {d: {k: r.get(k) for k in ('exists', 'versions', 'error')} for d, r in dirs.items()})
                 expect(f'{arm}/{case}/kill-not-contamination', rr['others_untouched'] and rows['void-invoices'].get('isolation_ok'),
                        {'events': rr['events'], 'review': rr['review']})
                 ex = rec['teardown']['invoice-list']
@@ -633,6 +708,20 @@ def main():
             expect(f'{arm}/version1-planted-and-collateral/expectations-evaluated', False, repr(error))
 
         try:
+            try:
+                if 'publication-failure' in only:
+                    case = 'publication-failure'
+                    rec, rows, rr = run_case(arm, case, env={'AGENTVALUE_SELFTEST_UNREADABLE_CAPTURE': '1'}, expect_valid=False)
+                    expect(f'{arm}/{case}/run-record-written-and-invalid', (out / f'{arm}-{case}' / 'run.json').exists()
+                           and any('publication failed' in r for r in rec.get('invalid_reasons') or []) and rec.get('publication_error'),
+                           {'invalid': rec.get('invalid_reasons'), 'publication_error': rec.get('publication_error')})
+                    expect(f'{arm}/{case}/cleanup-ran-before-publication', 'survivors_after_run' in rec and not rec.get('survivors_after_run'),
+                           {'survivors': rec.get('survivors_after_run')})
+                    if rec.get('root') and Path(rec['root']).exists():
+                        shutil.rmtree(rec['root'], ignore_errors=True)
+            except Exception as error:
+                expect(f'{arm}/publication-failure/expectations-evaluated', False, repr(error))
+
             if 'interrupts' in only:
                 for when in INTERRUPTS:
                     interrupt_case(arm, when, plan_path, out, lock, expect)
@@ -780,8 +869,45 @@ def unit_cases(expect, plan):
     own_restart_api = [{'start_m': 15, 'end_m': 16, 'kinds': ['down_restart'], 'kill_like': False, 'command': 'stack restart api'}]
     ev = report.sibling_losses(g_run([k('kill -9 123', 20.5, 20.6)], own_restart_api))[0]
     expect('unit/own-restart-of-another-service-does-not-make-postmaster-kill-ambiguous', len(ev) == 1 and ev[0]['culprits'] == ['b'], ev)
-    ev = report.sibling_losses(g_run([k('kill -9 123', 4.0, None)], [], killed=True))[0]
-    expect('unit/kill-command-of-a-killed-cli-attributes-a-later-loss', len(ev) == 1 and ev[0]['culprits'] == ['b'], ev)
+    ev, rv, _ = report.sibling_losses(g_run([k('kill -9 123', 4.0, None)], [], killed=True))
+    expect('unit/kill-command-of-a-killed-cli-with-no-result-is-review-not-gated', not ev and any(r['pid'] == 123 for r in rv), {'events': ev, 'review': rv})
+    ev, rv, _ = report.sibling_losses(g_run([k('false && kill -9 123', 20.5, 20.6)], []))
+    expect('unit/conditional-kill-is-review-not-event-g', not ev and any(r['pid'] == 123 for r in rv), {'events': ev, 'review': rv})
+    ev, rv, _ = report.sibling_losses(g_run([k('kill -s 123 456', 20.5, 20.6)], []))
+    expect('unit/numeric-signal-argument-is-not-a-pid', not ev, {'events': ev, 'review': rv})
+    ev, rv, _ = report.sibling_losses(g_run([k('pkill -x postgres', 20.5, 20.6)], []))
+    expect('unit/unmodelled-pkill-flag-is-review-not-event-g', not ev and any(r['pid'] == 123 for r in rv), {'events': ev, 'review': rv})
+    # Teardown collateral: a recent own command that did not target the lost process excuses nothing.
+    coll = {'teardown': {'invoice-notes': {'collateral': [{'group': 'wt-void', 'pid': 777, 'started': 's',
+                                                           'command': '/tmp/avr1/wt-void/.venv/bin/python worker.py'}]}},
+            'episode_end_m': 100, 'bystander': {},
+            'agents': {'v': {'marker': 'wt-void', 'service_commands': [
+                {'start_m': 90, 'end_m': 91, 'kinds': ['down_restart'], 'kill_like': False, 'command': 'stack restart api'}]}}}
+    ev, rv = report.teardown_collateral(coll)
+    expect('unit/slow-exit-excuse-needs-a-command-targeting-that-process', len(ev) == 1 and not rv, {'events': ev, 'review': rv})
+    coll['agents']['v']['service_commands'][0]['command'] = 'stack restart worker'
+    ev, rv = report.teardown_collateral(coll)
+    expect('unit/slow-exit-excuse-applies-to-its-own-targeted-service', not ev and len(rv) == 1, {'events': ev, 'review': rv})
+    # Publishing never writes through a link or over a file of the submission.
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as tmp:
+        tree, outside, dest = Path(tmp) / 'tree', Path(tmp) / 'outside.txt', Path(tmp) / 'results'
+        tree.mkdir()
+        outside.write_text('outside the run, must stay\n')
+        (tree / 'app.py').write_text('SECRET_' + 'TOKEN=' + 'abcdefghijklmnopqrstuvwx\n')   # split: the commit scan would refuse the whole literal
+        os.symlink(outside, tree / '.app.py.scrubbed')
+        (tree / '.app.py.publishing').write_text('a file of the submission, must stay\n')
+        left_out = []
+        (Path(tmp) / 'scrub').mkdir()
+        runner.publish_tree(tree, dest, left_out, scratch=Path(tmp) / 'scrub')
+        expect('unit/publishing-never-follows-a-link-or-overwrites-a-submission-file',
+               outside.read_text() == 'outside the run, must stay\n' and (tree / '.app.py.publishing').read_text().startswith('a file of the submission')
+               and (tree / '.app.py.scrubbed').is_symlink() and 'abcdefghij' not in (dest / 'app.py').read_text()
+               and any(x['reason'].startswith('symbolic link') for x in left_out),
+               {'left_out': left_out, 'published': sorted(str(x.relative_to(dest)) for x in dest.rglob('*'))})
+    import redact as _redact
+    text = _redact.scrub('curl -H "Authorization: Bearer abcdefghijklmnop12345" -H "authorization: Basic dXNlcjpwYXNz" api; token Bearer zyxwvutsrq987')
+    expect('unit/redactor-authorization-headers-and-bearer-tokens', 'abcdefghijklmnop12345' not in text and 'dXNlcjpwYXNz' not in text
+           and 'zyxwvutsrq987' not in text, text)
     # Report on synthetic records: assignments from the plan, attempts, trial-plan shape.
     src_path = sorted(Path(ROOT / 'results').glob('validation-v3-wip-final/stack-agent-kill-recovers/run.json'))
     if not src_path:
@@ -806,9 +932,22 @@ def unit_cases(expect, plan):
         for name, rec in [('pair0-stack', make('stack')), ('pair0-baseline', make('baseline', missed=True)), ('pair0.2-stack', make('stack', attempt=2))]:
             (Path(d) / name).mkdir()
             (Path(d) / name / 'run.json').write_text(json.dumps(rec))
-        runs, _, attempts, every = report.load_runs_v2(one, d)
+        runs, _, attempts, every, _, _ = report.load_runs_v2(one, d)
         expect('unit/incomplete-attempt-2-leaves-the-pair-missing', runs[(0, 'stack')] is None and runs[(0, 'baseline')] is None and len(every) == 3,
                attempts)
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d:
+        for name, rec in [('pair0-stack', make('stack')), ('pair0-baseline', make('baseline', missed=True))]:
+            (Path(d) / name).mkdir()
+            (Path(d) / name / 'run.json').write_text(json.dumps(rec))
+        (Path(d) / 'pair0.2-STARTED.json').write_text(json.dumps({'pair': 0, 'attempt': 2}))
+        (Path(d) / 'pair0.2-stack' / 'agents' / 'invoice-list').mkdir(parents=True)   # launched, then died without a record
+        runs, _, attempts, every, governing, partial = report.load_runs_v2(one, d)
+        summ = report.summarize_v2(one, runs, d, {}, attempts, every, governing, partial)
+        missing = [r for r in summ['rows'] if r['status'] == 'not_run']
+        expect('unit/started-marker-makes-attempt-2-govern-without-a-record', runs[(0, 'stack')] is None and governing.get(0) == 2
+               and missing and all(r['attempt'] == 2 for r in missing) and any(p['run'] == 'pair0.2-stack' for p in partial)
+               and summ['cost']['sessions_launched'] == sum(len(r.get('agents') or {}) for r in every) + len(partial),
+               {'governing': governing, 'partial': partial, 'cost': summ['cost']})
     shaped = copy.deepcopy(plan)
     shaped.update(kind='agent_experiment', pairs=runner.plan_pairs(random.Random(shaped['seed']), 1, shaped['config']['tasks']))
     shaped['config'] = dict(shaped['config'], pairs_per_scenario=1, faults=True, agent_seconds=1800)   # the self-test plan runs 600 s
@@ -817,6 +956,13 @@ def unit_cases(expect, plan):
     short['config']['agent_seconds'] = 1
     edited = copy.deepcopy(shaped)
     edited['pairs'][0]['victim'] = next(t for t in shaped['config']['tasks'] if t != shaped['pairs'][0]['victim'])
+    two = copy.deepcopy(shaped)
+    two['config']['pairs_per_scenario'] = 2
+    two['pairs'] = runner.plan_pairs(random.Random(two['seed']), 2, two['config']['tasks'])
+    half = copy.deepcopy(shaped)
+    half['config']['sample_interval'] = 0.5
+    expect('unit/trial-plan-needs-1-or-5-pairs-per-scenario-and-1s-samples', runner.protocol_problems(two) and runner.protocol_problems(half),
+           {'two_pairs': runner.protocol_problems(two), 'half_second': runner.protocol_problems(half)})
     expect('unit/trial-plan-with-agent-seconds-1-or-edited-pairs-refused', not base_problems and runner.protocol_problems(short)
            and runner.protocol_problems(edited), {'as_generated': base_problems, 'agent_seconds_1': runner.protocol_problems(short),
                                                   'edited_pairs': runner.protocol_problems(edited)})
@@ -848,13 +994,14 @@ def commit_scan_case():
         (repo / 'a1').write_text('nothing here\n')
         (repo / 'a[1]').write_text(f'bracketed path {sentinel}\n')
         (repo / f'name-{sentinel}.txt').write_text('a clean file with a secret name\n')
+        (repo / 'escaped.json').write_text('{"v": "' + '\\u%04x' % ord(sentinel[0]) + sentinel[1:] + '"}\n')   # first character JSON-escaped
         run('add', '-A')
         r = subprocess.run([sys.executable, str(HERE / 'commit.py'), '--repo', str(repo), '-m', f'message with {sentinel}'],
                            capture_output=True, text=True, env=env)
         report_text = r.stdout + r.stderr
         expected = {'quoted path': repr(quoted), 'binary': "'blob.bin'", 'rename': "'new-name.txt'", 'symlink': "'link'",
                     'commit message': '(commit message)', 'credential pattern': "'config.env'", 'bracketed path a[1]': "'a[1]'",
-                    'masked path name': 'in the path name'}
+                    'masked path name': 'in the path name', 'json-escaped value': "'escaped.json'"}
         found = {k: v in report_text for k, v in expected.items()}
         unchanged = run('rev-parse', 'HEAD').stdout == head
         refused = r.returncode == 1 and all(found.values()) and sentinel not in report_text and unchanged and "'a1'" not in report_text
@@ -863,12 +1010,18 @@ def commit_scan_case():
         subprocess.run([*plain, 'init', '-q'], cwd=clean, check=True, capture_output=True)
         (clean / 'README.txt').write_text('nothing secret here\n')
         subprocess.run(['git', 'add', '-A'], cwd=clean, check=True)
+        # A hook that would add a file between the scan and the commit: commit.py runs no hooks.
+        hook = clean / '.git' / 'hooks' / 'pre-commit'
+        hook.write_text(f'#!/bin/sh\necho "{sentinel}" > sneaked.txt\ngit add sneaked.txt\n')
+        hook.chmod(0o755)
         c = subprocess.run([sys.executable, str(HERE / 'commit.py'), '--repo', str(clean), '-m', 'clean commit'], capture_output=True, text=True,
                            env={**env, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.invalid', 'GIT_COMMITTER_NAME': 't',
                                 'GIT_COMMITTER_EMAIL': 't@example.invalid'})
-        committed = c.returncode == 0 and subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=clean, capture_output=True).returncode == 0
+        tree_files = subprocess.run(['git', 'ls-tree', '-r', '--name-only', 'HEAD'], cwd=clean, capture_output=True, text=True).stdout.split()
+        committed = c.returncode == 0 and tree_files == ['README.txt'] and 'root-commit' in c.stdout
     return refused, committed, {'exit': r.returncode, 'found': found, 'value_printed': sentinel in report_text, 'head_unchanged': unchanged,
-                                'clean_commit_exit': c.returncode, 'clean_stderr': c.stderr[-300:]}
+                                'clean_commit_exit': c.returncode, 'clean_stderr': c.stderr[-300:], 'clean_stdout': c.stdout[-200:],
+                                'committed_files': tree_files}
 
 
 def trace_times_ok(agent_dir):

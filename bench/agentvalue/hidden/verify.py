@@ -725,21 +725,98 @@ def void_invoices():
         return status == 200 and stored(42) == ('Umbrella', 300, 'void')
     check('patch_void_409', patch_void)
 
+    def split_top(text, word):
+        """Split `text` on a top-level SQL keyword (outside parentheses and quotes)."""
+        parts, depth, quote, start, i = [], 0, False, 0, 0
+        upper = text.upper()
+        while i < len(text):
+            ch = text[i]
+            if ch == "'":
+                quote = not quote
+            elif not quote and ch == '(':
+                depth += 1
+            elif not quote and ch == ')':
+                depth -= 1
+            elif not quote and depth == 0 and upper.startswith(f' {word} ', i):
+                parts.append(text[start:i])
+                i += len(word) + 2
+                start = i
+                continue
+            i += 1
+        parts.append(text[start:])
+        return parts
+
+    def unwrap(text):
+        text = text.strip()
+        while text.startswith('(') and text.endswith(')'):
+            depth, closed_early = 0, False
+            for i, ch in enumerate(text):
+                depth += ch == '('
+                depth -= ch == ')'
+                if depth == 0 and i < len(text) - 1:
+                    closed_early = True
+                    break
+            if closed_early:
+                break
+            text = text[1:-1].strip()
+        return text
+
+    STATUS = r"\(?status\)?(?:::(?:text|character varying))?"
+    LITERAL = r"'((?:[^']|'')*)'(?:::(?:text|character varying))?"
+
+    def read_term(term):
+        """('allow', set) for an exact allowlist; ('keeps', predicate) for a recognised redundant term;
+        None for anything else (a disjunction, a function of status, another column...)."""
+        import re as _re
+        term = unwrap(term)
+        if len(split_top(term, 'OR')) > 1:
+            return None
+        m = _re.fullmatch(STATUS + r"\s*=\s*ANY\s*\(\(?ARRAY\[(.*)\]\)?(?:::(?:text|character varying)\[\])?\)", term)
+        if m:
+            items = [i.strip() for i in m.group(1).split(',')]
+            values = [_re.fullmatch(LITERAL, i) for i in items]
+            return ('allow', {v.group(1).replace("''", "'") for v in values}) if all(values) else None
+        m = _re.fullmatch(STATUS + r"\s*=\s*" + LITERAL, term)
+        if m:
+            return ('allow', {m.group(1).replace("''", "'")})
+        m = _re.fullmatch(STATUS + r"\s*<>\s*" + LITERAL, term)
+        if m:
+            other = m.group(1).replace("''", "'")
+            return ('keeps', lambda v, other=other: v != other)
+        if _re.fullmatch(STATUS + r"\s+IS\s+NOT\s+NULL", term, _re.I):
+            return ('keeps', lambda v: True)
+        m = _re.fullmatch(r"(?:char_)?length\(" + STATUS + r"\)\s*(>=|>|<=|<|<>|=)\s*(\d+)", term)
+        if m:
+            op, n = m.group(1), int(m.group(2))
+            ops = {'>=': lambda a: a >= n, '>': lambda a: a > n, '<=': lambda a: a <= n, '<': lambda a: a < n,
+                   '<>': lambda a: a != n, '=': lambda a: a == n}
+            return ('keeps', lambda v, f=ops[op]: f(len(v)))
+        return None
+
     def allowed_statuses():
-        """The status set the schema allows, read from the schema itself: the CHECK constraints on
-        invoices that mention status, else the column's enum labels, else the values of a lookup
-        table it references. None when the set cannot be determined from the schema."""
+        """The status set the schema allows, read from the schema and closed in structure: every CHECK
+        constraint that mentions status is a conjunction of recognised terms, at least one of them an
+        exact allowlist (as pg_get_constraintdef prints IN / = ANY(ARRAY[...])); a redundant term
+        (status <> '', IS NOT NULL, a length bound) must keep every allowed value. Any unrecognised
+        term (a disjunction, another function of status) makes the set undetermined (None). Without
+        check constraints: the column's enum labels, or the values of a lookup table it references."""
         import re as _re
         checks = [d for (d,) in sql("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'invoices'::regclass "
                                     "AND contype = 'c'") if _re.search(r'\bstatus\b', d)]
         if checks:
-            sets = []
+            allow, keeps = [], []
             for d in checks:
-                literals = _re.findall(r"'((?:[^']|'')*)'", d)
-                if not literals or not _re.search(r'=\s*ANY|\bIN\b|=', d) or _re.search(r'<>|!=|NOT\s|LIKE|~', d, _re.I):
-                    return None
-                sets.append({x.replace("''", "'") for x in literals})
-            return set.intersection(*sets)
+                body = unwrap(_re.sub(r'^CHECK\s*', '', d.strip()).replace(' NOT VALID', ''))
+                for term in split_top(body, 'AND'):
+                    read = read_term(term)
+                    if read is None:
+                        print(f'unrecognised term in a status constraint: {term.strip()[:120]}', file=sys.stderr)
+                        return None
+                    (allow if read[0] == 'allow' else keeps).append(read[1])
+            if not allow:
+                return None
+            allowed = set.intersection(*allow)
+            return {v for v in allowed if all(k(v) for k in keeps)}
         labels = sql("SELECT e.enumlabel FROM pg_attribute a JOIN pg_enum e ON e.enumtypid = a.atttypid "
                      "WHERE a.attrelid = 'invoices'::regclass AND a.attname = 'status'")
         if labels:
@@ -753,8 +830,8 @@ def void_invoices():
         return None
 
     def constraint():
-        # The allowed set read from the schema must be exactly the three statuses; then the whole status
-        # domain is tried inside transactions that are rolled back.
+        # Closed in structure (the allowed set read from the schema is exactly the three statuses) and
+        # under probes of many kinds of value, inside transactions that are rolled back.
         allowed = allowed_statuses()
         if allowed != {'open', 'paid', 'void'}:
             print(f'status set allowed by the schema: {allowed}', file=sys.stderr)
@@ -772,9 +849,11 @@ def void_invoices():
                 except psycopg.Error as error:
                     return type(error).__name__
         expected, results = {}, {}
-        for value, verdict in [('open', 'accepted'), ('paid', 'accepted'), ('void', 'accepted'), ('refunded', 'rejected'),
-                               ('cancelled', 'rejected'), ('closed', 'rejected'), ('bogus', 'rejected'), ('Void', 'rejected'),
-                               ('', 'rejected'), ('voided', 'rejected'), ('draft', 'rejected')]:
+        probes = [('open', 'accepted'), ('paid', 'accepted'), ('void', 'accepted')] + [(v, 'rejected') for v in [
+            'refunded', 'archived', 'cancelled', 'closed', 'bogus', 'voided', 'draft', '', ' ', 'Void', 'VOID', 'Open', 'PAID',
+            ' open', 'open ', 'void\n', '\tpaid', 'ópen', 'vöid', 'void\u200b', 'x' * 9, 'x' * 11, 'longer than ten', 'y' * 50,
+            'z' * 300, 'openpaid', 'void void', "o'pen", '0', 'null']]
+        for value, verdict in probes:
             results[f'update {value!r}'] = attempt('UPDATE invoices SET status = %s WHERE id = 44', (value,))
             results[f'insert {value!r}'] = attempt("INSERT INTO invoices (customer, cents, status) VALUES ('Check', 1, %s)", (value,))
             expected[f'update {value!r}'] = expected[f'insert {value!r}'] = verdict

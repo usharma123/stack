@@ -15,6 +15,9 @@ SECRET_KEY = re.compile(r'\b([A-Za-z0-9_]*' + KEYWORDS + r'[A-Za-z0-9_]*)=("[^"]
 # JSON and escaped JSON: "SOME_TOKEN": "value"  or  \"SOME_TOKEN\": \"value\"
 SECRET_JSON = re.compile(r'(\\?"[A-Za-z0-9_]*' + KEYWORDS + r'[A-Za-z0-9_]*\\?"\s*:\s*)(\\?")((?:[^"\\]|\\(?!"))*)(\\?")', re.I)
 MISE_DIFF = re.compile(r'\b(__MISE_[A-Z_]*)=[^\s"\'\\]+')
+# HTTP credentials in any text: an Authorization header (any scheme) and a bearer token on its own.
+AUTH_HEADER = re.compile(r'((?:Proxy-)?Authorization\s*[:=]\s*)(?:(Bearer|Basic|Token|Digest|Negotiate)\s+)?([^\s"\'\\,;]+)', re.I)
+BEARER = re.compile(r'\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})', re.I)
 
 
 def scrub(text):
@@ -22,6 +25,8 @@ def scrub(text):
         return text
     text = SECRET_KEY.sub(lambda m: f'{m[1]}=<redacted>', text)
     text = SECRET_JSON.sub(lambda m: f'{m[1]}{m[2]}<redacted>{m[4]}', text)
+    text = AUTH_HEADER.sub(lambda m: f"{m[1]}{(m[2] + ' ') if m[2] else ''}<redacted>", text)
+    text = BEARER.sub(lambda m: f'{m[1]}<redacted>', text)
     return MISE_DIFF.sub(lambda m: f'{m[1]}=<redacted>', text)
 
 
