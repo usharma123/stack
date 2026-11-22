@@ -489,7 +489,8 @@ def trace_metrics(path):
 # line to the arrival of its result (PROTOCOL.md, Version 2, event (g)).
 DOWN_RESTART = re.compile(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart)\b')
 UP = re.compile(r'\b(?:stack|dev\.py)\b[^\n;&|]*\bup\b')
-SERVICE_STOP = re.compile(r'\bpg_ctl\b[^\n;&|]*\bstop\b|\bredis-cli\b[^\n;&|]*\bshutdown\b')   # direct stops of a service
+# Direct stops of a service. Redis command names are case-insensitive (`SHUTDOWN NOSAVE`).
+SERVICE_STOP = re.compile(r'\bpg_ctl\b[^\n;&|]*\bstop\b|\bredis-cli\b[^\n;&|]*\b(?i:shutdown)\b')
 ANY_KILL = re.compile(r'\b(?:kill|pkill|killall|fuser|pgrep)\b|xargs\s+kill')
 TESTS = re.compile(r'\bstack\s+(?:--json\s+)?run\s+test\b|\bdev\.py\s+test\b|\b(?:stack\s+(?:--json\s+)?exec|dev\.py\s+exec)\b[^\n]*\bpytest\b')
 ARRIVALS = 'trace.arrivals.tsv'
@@ -590,8 +591,9 @@ def service_commands(trace, arrivals, launched_m):
         if c['name'] != 'Bash':
             continue
         command = c['command']
+        joined = report.join_continuations(command)   # a command split over lines with `\` is one command
         kinds = [k for k, rx in (('kill', ANY_KILL), ('down_restart', DOWN_RESTART), ('service_stop', SERVICE_STOP), ('up', UP), ('test', TESTS))
-                 if rx.search(command)]
+                 if rx.search(joined)]
         if not kinds:
             continue
         # The structured reading is taken from the original text, before redaction, and each of its

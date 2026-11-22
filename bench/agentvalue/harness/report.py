@@ -284,11 +284,17 @@ UNPARSEABLE = re.compile(r'\$\(|`|\$\{|\$[A-Za-z_]|<\(|>\(')
 COMPOUND_WORDS = {'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', 'for', 'select', '!', '{', '}'}
 
 
+def join_continuations(text):
+    """Shell line continuations joined: a backslash at the end of a line continues the command."""
+    return re.sub(r'\\\r?\n', ' ', text)
+
+
 def simple_commands(command):
     """A shell command split into simple commands: each {'argv', 'before', 'after'} with the operator on
     either side (`;`, `&&`, `||`, `|`, `&`, newline as `;`), plus whether the text is a compound form
     (if/while/case..., a subshell or a group). None when the text uses a form the harness does not
     interpret (command substitution, variables, process substitution) or cannot tokenise."""
+    command = join_continuations(command)
     if UNPARSEABLE.search(command):
         return None
     try:
@@ -501,6 +507,8 @@ def _fact(token, position, base, survivors, previous):
         return '<redacted>', True
     if Path(token).name == 'dev.py':
         return 'dev.py', False
+    if base == 'redis-cli' and token.lower() == 'shutdown':
+        return 'shutdown', False     # Redis command names are case-insensitive (`SHUTDOWN NOSAVE`)
     if token in FACT_WORDS or token in KNOWN_FLAGS:
         return token, False
     if token.startswith('-') and len(token) > 1 and (_signal(token[1:]) is not None and not token[1:].isdigit() or FLAG_FORMS.fullmatch(token)):
@@ -520,7 +528,7 @@ def _fact(token, position, base, survivors, previous):
 UNPARSED_WORDS = re.compile(r'(?<![\w.-])(kill|pkill|killall|fuser|xargs|lsof|stack|dev\.py|pg_ctl|redis-cli|down|restart|stop|shutdown)(?![\w.-])')
 UNPARSED_KILL_TARGETS = re.compile(r'(?<![\w.-])kill((?:\s+-[A-Za-z0-9]+)*)((?:\s+\d{1,7})+)(?![\w.-])')
 UNPARSED_PORTS = re.compile(r'(?::|(?<![\w-])-p\s+|(?<![\w-])--port[ =])(\d{1,5})(?!\d)')
-SERVICE_STOP_TEXT = re.compile(r'\bpg_ctl\b[^\n;&|]*\bstop\b|\bredis-cli\b[^\n;&|]*\bshutdown\b')
+SERVICE_STOP_TEXT = re.compile(r'\bpg_ctl\b[^\n;&|]*\bstop\b|\bredis-cli\b[^\n;&|]*\b(?i:shutdown)\b')
 
 
 def read_command(text, scrubbed=None):
@@ -531,6 +539,7 @@ def read_command(text, scrubbed=None):
     which modelled words occur, the numbers directly after a kill word, and port forms (`:N`, `-p N`,
     `--port N`); such a reading is uncertain (review-only at most). `scrubbed` is the scrubbed command
     text: a free-text pattern is kept only if it survives there."""
+    text = join_continuations(text)
     parsed = simple_commands(text)
     reading = {'parsed': None, 'uncertain': False}
     if parsed is None:

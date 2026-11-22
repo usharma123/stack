@@ -1376,6 +1376,22 @@ def unit_cases(expect, plan, plan_path=None):
            len(own93) == 1 and 'service_stop' in own93[0]['kinds'] and set(roles93) == {'a', 'b'} and roles93['a'] == 'own command: excuses it'
            and roles93['b'].startswith('counted') and rows93[0]['disposition'] == 'review',
            {'own': own93, 'candidates': roles93, 'disposition': rows93[0]['disposition']})
+    # Round 10 item 1: a Redis stop written in upper case, or split over lines, is captured and listed.
+    redis_loss = {'group': 'wt-a', 'pid': 123, 'started': stamp(T0 + 1), 'command': '/x/bin/redis-server 127.0.0.1:12345',
+                  'kind': 'redis', 'ports': [12345], 'last_seen_m': 20.0, 'gone_m': 21.0}
+    forms10 = {'upper': 'redis-cli -p 12345 SHUTDOWN NOSAVE', 'continued': 'redis-cli -p 12345 \\\n  shutdown',
+               'lower': 'redis-cli -p 12345 shutdown'}
+    seen10 = {}
+    for name10, text10 in forms10.items():
+        own10 = capture9(text10, start=19.0, end=20.4)
+        rows10 = report.ledger_rows(run4(capture9('kill -9 123'), own10, the_loss=redis_loss), 'p0.a1.stack/', 'R', {})
+        seen10[name10] = {'captured': len(own10) == 1 and 'service_stop' in own10[0]['kinds'],
+                          'candidates': {c['session']: c['reason'] for c in rows10[0]['candidates']},
+                          'disposition': rows10[0]['disposition']}
+    expect('unit/redis-stop-in-upper-case-or-continued-is-captured-and-listed-beside-a-sibling-kill',
+           all(v['captured'] and set(v['candidates']) == {'a', 'b'} and v['candidates']['a'] == 'own command: excuses it'
+               and v['candidates']['b'].startswith('counted') and v['disposition'] == 'review' for v in seen10.values()),
+           seen10)
     # Round 9 item 4: a pattern operand is kept exactly as written.
     c94 = capture9('pkill -f /tmp/worktree-a/worker')
     loss_a94 = dict(loss4, command='python3 /tmp/worktree-a/worker.py')
