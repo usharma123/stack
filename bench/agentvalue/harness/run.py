@@ -597,7 +597,7 @@ def service_commands(trace, arrivals, launched_m):
         found.append({'start_m': None if c['start'] is None else round(launched_m + c['start'], 3),
                       'end_m': None if c['end'] is None else round(launched_m + c['end'], 3), 'is_error': c['is_error'],
                       'kinds': kinds, 'kill_like': bool(KILL.search(command)), 'line': c['line'],
-                      'reading': report.map_reading(report.read_command(command), redact.scrub),
+                      'reading': report.read_command(command, scrubbed=redact.scrub(command)),
                       'command': redact.scrub(command)})
     return found
 
@@ -1417,6 +1417,9 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             # Gone between the previous worktree's teardown and this one (a slow exit, say): listed for review.
             entry['lost_before_this_teardown'] = [v for k, v in (previous_after or {}).items() if k not in listing_before
                                                   and (v['group'] == 'main' or v['group'] not in torn)]
+            # Every loss in the two listings, the worktree's own included (the ledger's inventory).
+            entry['listing_lost'] = [v for k, v in listing_before.items() if k not in listing_after]
+            entry['lost_between_all'] = [v for k, v in (previous_after or {}).items() if k not in listing_before]
             previous_after = listing_after
             window['end_m'] = clock()
             windows.append(window)

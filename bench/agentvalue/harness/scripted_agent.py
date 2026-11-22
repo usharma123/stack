@@ -230,6 +230,9 @@ def plant_sentinel():
     partial = f'Authorization: <redacted>, response="{value}"'
     run(['sh', '-c', f"echo '{partial}'; echo \"curl -H '{partial}'\""])
     emit({'type': 'system', 'subtype': 'note', 'data': {'line': partial, 'Authorization': f'<redacted>, response="{value}"'}})
+    # A credential split across two shell arguments, in a command with a kill (round 8): its stored
+    # reading must carry no part of it. Signal 0 to a pid that cannot exist: nothing is signalled.
+    run(['sh', '-c', f"printf '%s %s\\n' 'Cookie:' 'session={value}'; kill -0 2147483646"], must=False)
     # A plain prefix with a lone quote before a Digest header; a quoted --header argument in a command.
     run(['sh', '-c', f"echo 'debug: read 5\" buffer; Authorization: Digest username=\"local\", response=\"{value}\"'"])
     run(['sh', '-c', f"echo curl --header 'X-API-" + f"Key: {value}' http://local; true"])

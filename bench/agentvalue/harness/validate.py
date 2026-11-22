@@ -656,6 +656,13 @@ def _main(state):
                 planted = (out / f'{arm}-{case}' / 'agents' / 'invoice-list' / 'submitted-tree' / 'notes.env').exists()
                 expect(f'{arm}/{case}/sentinel-absent-from-every-retained-file (completed run)', planted and not hits,
                        {'planted_file_retained': planted, 'files_with_sentinel': hits})
+                # Round 8 item 1: the stored readings and the report's ledger rows carry no part of it either.
+                readings = [c.get('reading') for a in rec['agents'].values() for c in a.get('service_commands') or []]
+                ledger8 = report.ledger_rows(rec, 'p0.a1.' + arm + '/', str(out / f'{arm}-{case}'), {})
+                expect(f'{arm}/{case}/sentinel-absent-from-readings-and-ledger-rows',
+                       readings and value not in json.dumps(readings) and value not in json.dumps(ledger8, default=str)
+                       and any('Cookie' in (c.get('command') or '') for a in rec['agents'].values() for c in a.get('service_commands') or []),
+                       {'readings': len(readings), 'ledger_rows': len(ledger8)})
         except Exception as error:  # an invalid or interrupted run: its expectations fail, the validation goes on
             expect(f'{arm}/agent-kill-recovery-leaves/expectations-evaluated', False, repr(error))
 
@@ -1011,6 +1018,7 @@ def unit_cases(expect, plan, plan_path=None):
     import copy
     import random
     import redact
+    _redact_scrub = redact.scrub
     # A credential-like key holding a list or a nested object is redacted.
     scrubbed = json.dumps(redact.scrub_json({'SOME_TOKEN': ['sentinel-a'], 'outer': {'API_KEY': {'v': 'sentinel-b'}, 'ok': 'kept'}}))
     expect('unit/redactor-credential-key-holding-list-or-object', 'sentinel-a' not in scrubbed and 'sentinel-b' not in scrubbed and 'kept' in scrubbed,
@@ -1196,7 +1204,7 @@ def unit_cases(expect, plan, plan_path=None):
     ledger7 = report.ledger_rows(run37, prefix7, 'R/pair0-stack', {})
     by_pid = {r['pid']: r for r in ledger7}
     full = all(k in r for r in ledger7 for k in ('id', 'pid', 'started', 'command', 'worktree', 'lost_between_m', 'candidates', 'automatic_outcome', 'reason'))
-    cand_ok = all(all(k in c for k in ('session', 'trace', 'line', 'issued_m', 'returned_m', 'result', 'reading', 'command', 'automatic'))
+    cand_ok = all(all(k in c for k in ('session', 'trace', 'line', 'issued_m', 'returned_m', 'result', 'reading', 'command', 'reason'))
                   for r in ledger7 for c in r['candidates'])
     expect('unit/ledger-row-per-loss-blamed-excused-review-unexplained-with-candidates',
            full and cand_ok and {by_pid[p]['disposition'] for p in by_pid} == {'blamed', 'excused', 'review', 'unexplained'}
@@ -1231,6 +1239,104 @@ def unit_cases(expect, plan, plan_path=None):
     md7 = '\n'.join(report.markdown_ledger({'ledger': ledger7, 'adjudication': {'note': 'n', 'overrides': [], 'side_by_side': []}}))
     expect('unit/ledger-markdown-untruncated', long_cmd in md7 and all(r['id'] in md7 for r in ledger7) and 'kill -9 123' in md7,
            {'length': len(md7)})
+    # Round 8 item 1: the reading keeps structured facts only; the kill is still scored.
+    V8 = 'SYNTH' + 'ETIC-r8-value'   # split: the commit scan would refuse the whole literal
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d8:
+        original8 = f"printf '%s %s' 'Cookie:' 'session={V8}'; kill -9 123"
+        trace8, arrivals8 = Path(d8) / 'trace.jsonl', Path(d8) / 'arrivals.tsv'
+        trace8.write_text(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                                                                                   'input': {'command': original8}}]}}) + '\n'
+                          + json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 't1', 'content': '',
+                                                                                 'is_error': False}]}}) + '\n')
+        arrivals8.write_text('line\tseconds\n1\t20.5\n2\t20.6\n')
+        captured8 = runner.service_commands(trace8, arrivals8, 0.0)
+    run18 = run4(captured8, [])
+    ev, rv, _ = report.sibling_losses(run18)
+    rows18 = report.ledger_rows(run18, 'p0.a1.stack/', 'R', {})
+    expect('unit/reading-keeps-facts-only-split-credential-absent-kill-still-scored',
+           len(captured8) == 1 and 'session' not in json.dumps(captured8[0]['reading']) and V8 not in json.dumps(captured8)
+           and V8 not in json.dumps(rows18, default=str) and len(ev) == 1 and ev[0]['culprits'] == ['b'],
+           {'reading': captured8[0]['reading'] if captured8 else None, 'events': ev})
+    lost_pattern = report.read_command(f"pkill -f 'Cookie: sid={V8}'", _redact_scrub(f"pkill -f 'Cookie: sid={V8}'"))
+    run18b = run4([dict(K4(f"pkill -f 'Cookie: <redacted>'"), reading=lost_pattern)], [])
+    ev, rv, _ = report.sibling_losses(run18b)
+    expect('unit/pattern-lost-to-redaction-is-replaced-and-review-only', lost_pattern['uncertain'] and V8 not in json.dumps(lost_pattern)
+           and not ev and any(r['pid'] == 123 and 'kill_by' in r for r in rv), {'reading': lost_pattern, 'events': ev, 'review': rv})
+    # Round 8 item 3: a plain `kill 123` (no -9) by another session gates event (g), and the ledger shows it;
+    # a command the rule ignores is still listed, with its reason.
+    plain8 = {'start_m': 20.5, 'end_m': 20.6, 'is_error': False, 'kinds': ['kill'], 'command': 'kill 123', 'line': 4}
+    other8 = {'start_m': 20.5, 'end_m': 20.6, 'is_error': False, 'kinds': ['kill'], 'command': 'kill 999', 'line': 5}
+    run38 = run4([plain8, other8], [])
+    ev, rv, _ = report.sibling_losses(run38)
+    rows38 = report.ledger_rows(run38, 'p0.a1.stack/', 'R', {})
+    reasons38 = {c['command']: c['reason'] for c in rows38[0]['candidates']}
+    expect('unit/plain-kill-by-another-session-gates-and-ledger-lists-every-candidate',
+           len(ev) == 1 and ev[0]['culprits'] == ['b'] and rows38[0]['disposition'] == 'blamed'
+           and reasons38.get('kill 123', '').startswith('counted') and reasons38.get('kill 999', '').startswith('not counted'),
+           {'events': ev, 'candidates': reasons38})
+    # Round 8 item 2: one inventory, every phase, the main checkout included; between-teardowns has the gap's bounds.
+    S8 = lambda group, pid, last, gone: {'group': group, 'pid': pid, 'started': stamp(T0 + 1), 'command': f'/tmp/avr1/{group}/.venv/bin/python worker.py',
+                                         'kind': 'worker', 'ports': [], 'last_seen_m': last, 'gone_m': gone}
+    W8 = [{'task': 'invoice-notes', 'group': 'wt-notes', 'start_m': 30.0, 'end_m': 40.0}, {'task': 'pay-receipts', 'group': 'wt-pay', 'start_m': 45.0, 'end_m': 55.0}]
+    run28 = {'clock': {'started_wall': T0}, 'episode_end_m': 20.0, 'teardown_windows': W8,
+             'sampler': {'durable_losses': [S8('wt-cust', 601, 21.0, 22.0), S8('wt-cust', 602, 25.0, 26.0), S8('wt-void', 603, 60.0, 61.0),
+                                            S8('main', 604, 10.0, 11.0), S8('wt-void', 605, 62.0, 63.0)]},
+             'teardown': {'invoice-notes': {'listing_lost': [], 'lost_between_all': []},
+                          'pay-receipts': {'listing_lost': [], 'lost_between_all': [dict(S8('wt-list', 606, 0, 0), started=stamp(T0 + 2))]},
+                          'void-invoices': {'harness_reclaim': {'terminated': [605]}}},
+             'agents': {'b': {'marker': 'wt-b', 'launched_m': 0, 'ended_m': 19, 'service_commands': [dict(other8, start_m=18.0, end_m=18.1)]}}}
+    rows28 = {r['pid']: r for r in report.ledger(run28)}
+    expect('unit/ledger-inventory-covers-every-phase-and-the-main-checkout',
+           set(rows28) == {601, 602, 603, 604, 605, 606} and len(rows28) == report.inventory_size(run28)
+           and rows28[601]['phase'] == 'gap-before-teardown' and rows28[602]['phase'] == 'gap-before-teardown'
+           and rows28[603]['phase'] == 'removal-and-after' and rows28[603]['disposition'] == 'own-teardown'
+           and rows28[604]['disposition'] == 'main-checkout' and rows28[605]['disposition'] == 'harness-stop'
+           and rows28[606]['phase'] == 'between-teardowns' and rows28[606]['lost_between_m'] == [40.0, 45.0]
+           and any(c['command'] == 'kill 999' for c in rows28[601]['candidates']),
+           {p: {k: r.get(k) for k in ('phase', 'disposition', 'lost_between_m')} for p, r in rows28.items()})
+    post8 = {'clock': {'started_wall': T0}, 'episode_end_m': 20.0, 'sampler': {'durable_losses': [S8('wt-cust', 607, 21.0, 22.0)]}, 'agents': {}}
+    expect('unit/post-episode-loss-without-teardown-windows-has-a-row', [r['phase'] for r in report.ledger(post8)] == ['gap-before-teardown'],
+           report.ledger(post8))
+    # Round 8 item 5: duplicate decisions and duplicate ledger ids are refused.
+    refused8 = []
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d85:
+        (Path(d85) / 'adjudication.json').write_text('{"x": {"decision": "review", "reason": "a"}, "x": {"decision": "review", "reason": "b"}}')
+        try:
+            report.load_adjudication(d85)
+            refused8.append(False)
+        except ValueError:
+            refused8.append(True)
+    twins = {'clock': {'started_wall': T0}, 'episode_end_m': 100, 'agents': {},
+             'sampler': {'durable_losses': [dict(S8('wt-a', 700, 10, 11), started='odd start'), dict(S8('wt-a', 700, 12, 13), started='odd  start')]}}
+    try:
+        report.ledger_rows(twins, 'p0.a1.stack/', 'R', {})
+        refused8.append(False)
+    except ValueError:
+        refused8.append(True)
+    expect('unit/duplicate-decision-and-duplicate-ledger-id-refused', refused8 == [True, True], refused8)
+    # Round 8 item 4: an override never changes the automatic outcome (service-kill, the victim's isolation).
+    src8 = sorted(Path(ROOT / 'results').glob('validation-v9-wip-final/stack-service-kill-restarts/run.json'))
+    if not src8:
+        expect('unit/override-leaves-every-automatic-figure-unchanged', False, 'needs results/validation-v9-wip-final/stack-service-kill-restarts/run.json')
+    else:
+        rec8 = json.loads(src8[0].read_text())
+        rec8['_attempt'] = 1
+        plan8 = {'pairs': [{'index': 0, 'scenario': 'service-kill', 'victim': 'void-invoices', 'order': ['stack']}], 'config': plan['config']}
+        rows8 = report.ledger_rows(rec8, 'p0.a1.stack/', 'R', {})
+        target = next((r for r in rows8 if r['phase'] == 'episode' and r['worktree'] != 'main'), None)
+        auto_keys = ('others_untouched_automatic', 'episode_success_automatic', 'victim_copes_automatic', 'victim_gated_automatic')
+        with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d84, tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d84b:
+            slots_a, runs_a, _ = report.rows_v2(plan8, {(0, 'stack'): copy.deepcopy(rec8)}, d84)
+            (Path(d84b) / 'adjudication.json').write_text(json.dumps({target['id']: {'decision': 'blamed:void-invoices', 'reason': 'stand-in override'}}))
+            slots_b, runs_b, _ = report.rows_v2(plan8, {(0, 'stack'): copy.deepcopy(rec8)}, d84b)
+        va = next(r for r in slots_a if r['task'] == 'void-invoices')
+        vb = next(r for r in slots_b if r['task'] == 'void-invoices')
+        same_auto = all(runs_a[0][k] == runs_b[0][k] for k in auto_keys) and all(
+            a[k] == b[k] for a, b in zip(slots_a, slots_b) for k in ('isolation_ok_automatic', 'gated_success_automatic'))
+        expect('unit/override-leaves-every-automatic-figure-unchanged',
+               target is not None and same_auto and va['isolation_ok'] and not vb['isolation_ok'] and runs_b[0]['overrides'],
+               {'override': target and target['id'], 'automatic': {k: (runs_a[0][k], runs_b[0][k]) for k in auto_keys},
+                'victim_isolation': (va['isolation_ok'], vb['isolation_ok'])})
     # Round 4 item 7: suspension measured from the two clocks; AC power before each arm.
     expect('unit/suspension-0.4s-passes-0.6s-invalidates-wall-step-irrelevant',
            runner.suspension((100.0, 200.0), (110.0, 210.4))[1] is False and runner.suspension((100.0, 200.0), (110.0, 210.6))[1] is True
