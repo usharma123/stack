@@ -706,6 +706,25 @@ pass.
   a decision that appears twice is refused. Decisions apply the
   rules of this protocol to the row's evidence. They are not blind to the arm, which is why both
   outcomes are published. A loss the 1 s sampler never saw is in no ledger; that stays a limit.
+- **Which rows are decided by hand (fixed after the pilot, before the main run).** The pilot's
+  ledger had 211 rows for four runs, 184 of them `review` because the command reader could not tell
+  that an agent's own final `down` had run. Reading every row by hand would bury the ones that
+  matter, so the rows that get a decision are named here, before any main-run result exists:
+  1. every row with a kill candidate from another session, whatever the automatic rule made of it;
+  2. every row the automatic rule blamed on a session;
+  3. every row in a teardown, between-teardowns or removal phase whose disposition is anything
+     other than `own-teardown`, `exempt` or `harness-stop`, and every such row that an own command
+     excused, because a misread own stop can change the teardown-collateral gate with no sibling
+     kill involved.
+  Each of these is read against the trace and gets a decision and a reason in `adjudication.json`,
+  also when the decision confirms the automatic disposition. Every other row (an episode-phase loss
+  whose only candidates are its own session's commands or other sessions' `down` and `restart`)
+  keeps its automatic disposition and is reported as counts by reason. Both outcomes are published.
+- **What is reported for each `agent-kill` pair (fixed after the pilot).** When the kill fell in
+  the victim's session, the command outstanding at the kill and whether it went on running, what
+  was running in the worktree at the handoff, and whether the recovery session inherited a
+  committed or an uncommitted change. Recovery time and tool calls compare those actual handoffs.
+  They are not a measure of recovery from one common state, or from a crash earlier in the task.
 - Planted validation cases are never mixed into trial results. Where a planted case separates the
   arms by construction (the `exec` case above), the report says it is a planted case.
 
@@ -756,6 +775,7 @@ the machine that ran the trials. Rows added after the rewrite carry current hash
 | `bbb9701` | **Changes after review round 9, before any trial.** A number is kept in a stored reading only where a modelled command takes a target; an unparsed command keeps only modelled words and the numbers directly after them. A pattern is kept exactly as written. Direct service stops are captured as evidence. Automatic blame needs a terminating signal. A bystander loss found only by the before-and-after comparison has a ledger row. A sampler-only loss straddling a phase boundary goes to review | Review round 9 (GPT-6.2 Sol, at `04c52bb`). None was decided after seeing a trial |
 | `1bf7b67` | The code for review round 9, and the clarifications made while writing it, before any trial. (1) A main-checkout loss found only by a before-and-after comparison has its own phase, `bystander-comparison`, because its two observations span several phases; it accepts `not-an-event` or `review`. (2) An own `pg_ctl stop` or `redis-cli shutdown` targets that kind of service in its own worktree without matching the data directory, since a reading keeps no paths. (3) A non-terminating signal inside text the harness cannot parse is not detected; such a command is review-only anyway. (4) The phase-boundary rule sends to review the common case of a service stopped by an agent's last command, last seen just before the episode ended and gone just after; in the validation records this moved rows from excused or unexplained to review and changed no gate. (5) The all-digit case is validated through capture in a unit case, not through the planted sentinel agent | Review round 9's findings and the implementer's report. None was decided after seeing a trial |
 | `8310279` | **Review round 10, the last pass before the pilot.** One finding fixed, by the orchestrator: a Redis stop written in upper case (`SHUTDOWN NOSAVE`) or split over lines with a backslash was not captured, so an owner's own stop could be missing from a loss row while a sibling's coincident kill took the blame. Redis command names are now read case-insensitively and line continuations are joined before a command is read, with a unit case for both forms. Five further findings are **not fixed** and are stated under "Accepted for the pilot": the reviewer classed four as visible in the ledger and one as needing an off-task host secret. **Stopping rule applied:** after ten passes that each found narrower forms of the same classes, the orchestrating thread directed, and the orchestrator agrees, that round 10 is the last pre-pilot pass; only findings unsafe on this host, or that an ordinary agent doing the five tasks would hit and that would change a score without showing in the ledger, are fixed. The reviewer's next involvement is the pilot's results and the final report | Review round 10 (GPT-6.2 Sol, at `733c169`). None was decided after seeing a trial |
+| `PILOT2` | **After the pilot, before the main run.** The pilot (`pilot-2`: 4 runs, 22 sessions, all valid, both arms at the ceiling on every gate, no kill command by any session, mean US$0.097 per session) changed no scoring code. Two things are fixed in the Analysis section before any main-run result exists: which ledger rows are decided by hand, and what is reported for each `agent-kill` pair. Three limits found by the pilot are stated under "Accepted for the pilot". The reviewer read the pilot's records, found no mis-scored gate, missed fault or unexpected host value, and asked that hand decisions cover teardown-phase rows as well as sibling kills; that is in the rule. Seeds follow version 1's convention: 20261122 for the pilot, 1122 for the main run | The pilot's purpose was to shake out the harness. The validated harness code is unchanged since `6e8db35`; only this document differs |
 
 ### Accepted for the pilot
 
@@ -786,6 +806,21 @@ These review points are not fixed. Each one limits what the results can claim:
 - **(Version 2) System binaries hide their marker.** macOS does not show the environment of
   binaries under `/usr/bin` and `/bin`, so such a process is attributed by working directory and
   open files only.
+- **(Version 2) Found by the pilot, carried as limits.** No scoring code was changed after the
+  pilot:
+  - The command reader misreads redirections and quoted parentheses. `stack down 2>&1 | tail -8`
+    is read as sent to the background, a commit message containing parentheses marks its whole
+    command block as a compound form, and `pkill -f worker.py 2>/dev/null` keeps `2>/dev/null` as an
+    operand. An agent's own final `down` then reads "may have stopped it" (review) instead of
+    excusing the loss, and a sibling's kill written with a redirection goes to review instead of
+    gating. The direction is under-gating, it shows in the ledger, and the rows named in the
+    Analysis section are decided by hand.
+  - In `agent-kill` the trigger comes late for a task whose agent writes code first and starts
+    services last. In the pilot the kill fell about 25 s into sessions that last about 28 s, and in
+    one arm the killed CLI's last shell command, issued 0.085 s earlier, went on running and
+    stopped the services. The rule is the same in both arms, but a pair's outcome can turn on a
+    sub-second race at the end of the task. The fault point is not moved.
+  - Sessions last 24 to 52 s, so the 3 s delay after the trigger is a large share of some tasks.
 - **(Version 2) Left open by the last pre-pilot review pass (round 10).** Each of these shows in the
   adjudication ledger or needs a host secret an agent has no task reason to hold:
   - A direct `pg_ctl stop` or `redis-cli shutdown` is matched to that kind of service in the
