@@ -335,17 +335,33 @@ def _strip_wrappers(argv):
 KILL_FLAGS = {'-9', '-KILL', '-TERM', '-15'}
 
 
+TERMINATING = {'TERM', 'KILL', 'INT', 'HUP', 'QUIT', '15', '9', '2', '1', '3'}
+ALL_SIGNALS = TERMINATING | {'STOP', 'CONT', 'TSTP', 'USR1', 'USR2', 'WINCH', 'ALRM', 'CHLD', 'TTIN', 'TTOU', 'PIPE', 'INFO', 'URG', 'IO',
+                             'PROF', 'VTALRM', 'XCPU', 'XFSZ', 'SYS', 'TRAP', 'ABRT', 'EMT', 'FPE', 'BUS', 'SEGV', 'ILL'}
+
+
+def _signal(text):
+    """A signal name or number as written (`KILL`, `SIGKILL`, `9`), normalised; None if it is not one."""
+    name = text.upper()
+    name = name[3:] if name.startswith('SIG') else name
+    return name if name in ALL_SIGNALS or name.isdigit() else None
+
+
 def _kill_operands(argv):
-    """(modelled, operands) for `kill [-9|-KILL|-TERM|-15|-s NAME] pid...`; any other flag is unmodelled."""
-    modelled, operands, i = True, [], 1
+    """(modelled, operands) for `kill [-SIGNAL|-s SIGNAL] pid...`: 'null' for signal 0 (signals
+    nothing); 'signal' for a non-terminating or unmodelled signal (automatic blame and the own-command
+    excuse need the default, TERM, KILL, INT, HUP or QUIT); False for any other unmodelled flag."""
+    modelled, operands, i, nonterminating = True, [], 1, False
     while i < len(argv):
         arg = argv[i]
-        if arg == '-0' or (arg == '-s' and i + 1 < len(argv) and argv[i + 1] in ('0', 'SIG0')):
+        if arg == '-0' or (arg in ('-s', '-n') and i + 1 < len(argv) and argv[i + 1] in ('0', 'SIG0')):
             return 'null', []          # signal 0 delivers nothing: ignored as a culprit and as an own command
-        if arg == '-s' and i + 1 < len(argv):
+        if arg in ('-s', '-n') and i + 1 < len(argv):
+            nonterminating = nonterminating or _signal(argv[i + 1]) not in TERMINATING
             i += 2
             continue
-        if arg in KILL_FLAGS:
+        if arg.startswith('-') and len(arg) > 1 and _signal(arg[1:]) is not None:
+            nonterminating = nonterminating or _signal(arg[1:]) not in TERMINATING
             i += 1
             continue
         if arg.startswith('-'):
@@ -356,7 +372,17 @@ def _kill_operands(argv):
         if not arg.isdigit():
             modelled = False
         i += 1
+    if nonterminating:
+        return 'signal', operands
     return modelled, operands
+
+
+PATTERN_SIGNAL_FLAGS = {f'-{p}{n}' for n in ('TERM', 'KILL', 'INT', 'HUP', 'QUIT') for p in ('', 'SIG')} | {'-15', '-9', '-2', '-1', '-3'}
+
+
+def _nonterminating_flag(flags):
+    """Whether a pkill/killall flag names a signal other than a terminating one."""
+    return any(f.startswith('-') and len(f) > 1 and _signal(f[1:]) is not None and _signal(f[1:]) not in TERMINATING for f in flags)
 
 
 def _pattern_args(argv, allowed):
@@ -412,8 +438,11 @@ def xargs_kill(argv):
     rest = argv[i:]
     if not rest or Path(rest[0]).name != 'kill':
         return None
-    if _kill_operands(rest)[0] == 'null':
+    form = _kill_operands(rest)[0]
+    if form == 'null':
         return None            # signal 0 signals nothing, also at the end of a pipeline
+    if form == 'signal':
+        return 'signal'        # a non-terminating signal: listed, never counted
     return i == 1 and rest[1:] in ([], ['-9'], ['-KILL'], ['-TERM'], ['-15'])
 
 
@@ -457,40 +486,60 @@ def _modelled(parsed, index):
     return False
 
 
-def _fact(token, base, scrubbed):
-    """A token of a modelled command as a structured fact, or a placeholder: the command word, numbers,
-    signals, known option flags, ports and the arms' service words only. A `pkill`/`killall` pattern
-    is kept only if it also survives in the scrubbed command text. Returns (fact, uncertain)."""
-    name = Path(token).name
-    if name in FACT_WORDS:
-        return name, False
-    if PORT_FORMS.fullmatch(token) or token in KNOWN_FLAGS or FLAG_FORMS.fullmatch(token):
+def _fact(token, position, base, survivors, previous):
+    """A token of a modelled command as a structured fact, or a placeholder. Only the executable word
+    is normalised (to its name). A `pkill`/`killall` pattern is kept exactly as written, and only if
+    the scrubbed command text, read the same way, has the same token; otherwise it is replaced and the
+    reading is uncertain. A number is kept only where the command takes a target: a pid (`kill`), a
+    port (`fuser`, `lsof`, `-p`/`--port`) or a signal. Otherwise: known option flags, port forms, signal
+    names and the arms' service words. Returns (fact, uncertain)."""
+    if position == 0:
+        return Path(token).name, False
+    if base in ('pkill', 'killall') and not token.startswith('-'):
+        if survivors is not None and token in survivors:
+            return token, False
+        return '<redacted>', True
+    if Path(token).name == 'dev.py':
+        return 'dev.py', False
+    if token in FACT_WORDS or token in KNOWN_FLAGS:
         return token, False
-    bare = token[3:] if token.startswith('SIG') else token
-    if bare in SIGNAL_NAMES:
+    if token.startswith('-') and len(token) > 1 and (_signal(token[1:]) is not None and not token[1:].isdigit() or FLAG_FORMS.fullmatch(token)):
+        return token, False
+    if token.isdigit():
+        targets = base in ('kill', 'fuser', 'lsof') or previous in ('-p', '--port')
+        return (token, False) if targets else ('<redacted>', False)
+    if PORT_FORMS.fullmatch(token):
+        return token, False                 # `:N`, `tcp:N`, `N/tcp`
+    if _signal(token) is not None and (base == 'kill' or previous in ('-s', '-n')):
         return token, False
     if token.startswith('-'):
         return '-<flag>', False          # an unknown option: still a flag (unmodelled), none of its text
-    if base in ('pkill', 'killall'):
-        if scrubbed is not None and token in scrubbed:   # `scrubbed`: the scrubbed text's own tokens
-            return token, False
-        return '<redacted>', True
     return '<redacted>', False
+
+
+UNPARSED_WORDS = re.compile(r'(?<![\w.-])(kill|pkill|killall|fuser|xargs|lsof|stack|dev\.py|pg_ctl|redis-cli|down|restart|stop|shutdown)(?![\w.-])')
+UNPARSED_KILL_TARGETS = re.compile(r'(?<![\w.-])kill((?:\s+-[A-Za-z0-9]+)*)((?:\s+\d{1,7})+)(?![\w.-])')
+UNPARSED_PORTS = re.compile(r'(?::|(?<![\w-])-p\s+|(?<![\w-])--port[ =])(\d{1,5})(?!\d)')
+SERVICE_STOP_TEXT = re.compile(r'\bpg_ctl\b[^\n;&|]*\bstop\b|\bredis-cli\b[^\n;&|]*\bshutdown\b')
 
 
 def read_command(text, scrubbed=None):
     """The structured reading of a command, taken from its original text when it is captured (before
     redaction, PROTOCOL.md "Validity"). It holds structured facts only: for each simple command the
     harness models, its words reduced to facts (`_fact`); any other simple command as a placeholder
-    that keeps its place in the statement and none of its words. For text the harness does not
-    interpret: whether it has a kill word or a down/restart, and the numbers and ports it names.
-    `scrubbed` is the scrubbed command text: a free-text pattern is kept only if it survives there.
-    The reporter classifies from this reading; an uncertain reading is review-only at most."""
+    that keeps its place in the statement and none of its words. For text the harness cannot parse:
+    which modelled words occur, the numbers directly after a kill word, and port forms (`:N`, `-p N`,
+    `--port N`); such a reading is uncertain (review-only at most). `scrubbed` is the scrubbed command
+    text: a free-text pattern is kept only if it survives there."""
     parsed = simple_commands(text)
     reading = {'parsed': None, 'uncertain': False}
     if parsed is None:
-        reading['unparsed'] = {'kill_word': bool(KILL_WORD.search(text)), 'down_restart': bool(DOWN_RESTART_TEXT.search(text)),
-                               'numbers': sorted(set(re.findall(r'\b\d+\b', text))), 'ports': sorted(set(re.findall(r':(\d+)\b', text)))}
+        targets = sorted({n for m in UNPARSED_KILL_TARGETS.finditer(text) for n in m[2].split()})
+        ports = sorted({p for p in UNPARSED_PORTS.findall(text) if int(p) <= 65535})
+        reading['uncertain'] = True
+        reading['unparsed'] = {'words': sorted(set(UNPARSED_WORDS.findall(text))), 'kill_word': bool(KILL_WORD.search(text)),
+                               'down_restart': bool(DOWN_RESTART_TEXT.search(text) or SERVICE_STOP_TEXT.search(text)),
+                               'numbers': targets, 'ports': ports}
         return reading
     # An operand survives redaction when the scrubbed text, read the same way, has the same token
     # (shell quoting and escapes are decoded on both sides).
@@ -504,7 +553,7 @@ def read_command(text, scrubbed=None):
         if _modelled(parsed, index):
             argv = _clean_argv(c['argv'])
             base = Path(argv[0]).name
-            facts = [_fact(t, base, survivors) for t in argv]
+            facts = [_fact(t, i, base, survivors, argv[i - 1] if i else None) for i, t in enumerate(argv)]
             clause['argv'] = [f for f, _ in facts]
             clause['uncertain'] = any(u for _, u in facts)
             reading['uncertain'] = reading['uncertain'] or clause['uncertain']
@@ -556,22 +605,24 @@ def identifies(command, loss):
         hit = None
         if base == 'kill':
             modelled, operands = _kill_operands(argv)
-            if modelled != 'null' and str(loss['pid']) in operands:
+            if modelled == 'signal' and str(loss['pid']) in operands:
+                hit = 'signal'          # a non-terminating or unmodelled signal: listed, never counted
+            elif modelled != 'null' and str(loss['pid']) in operands:
                 hit = 'pid' if modelled and plain and len(operands) == 1 else 'review'
         elif base == 'pkill':
-            modelled, flags, pattern = _pattern_args(argv, {'-9', '-f'})
+            modelled, flags, pattern = _pattern_args(argv, {'-f'} | PATTERN_SIGNAL_FLAGS)
             if pattern == '<redacted>':
                 hit = 'review'          # its pattern did not survive redaction: it could match, never gated
             elif pattern is not None and _match(pattern, full if '-f' in flags else name):
-                hit = 'pattern' if modelled and plain else 'review'
+                hit = 'signal' if _nonterminating_flag(flags) else 'pattern' if modelled and plain else 'review'
             elif not modelled and any(_match(a, full) for a in argv[1:] if not a.startswith('-')):
                 hit = 'review'
         elif base == 'killall':
-            modelled, flags, pattern = _pattern_args(argv, set())
+            modelled, flags, pattern = _pattern_args(argv, PATTERN_SIGNAL_FLAGS)
             if pattern == '<redacted>':
                 hit = 'review'
             elif pattern is not None and (pattern == name or (not modelled and _match(pattern, full))):
-                hit = 'pattern' if modelled and plain and pattern == name else 'review'
+                hit = 'signal' if _nonterminating_flag(flags) else 'pattern' if modelled and plain and pattern == name else 'review'
         elif base == 'fuser' and any(a.startswith('-') and 'k' in a for a in argv[1:]):
             if any(re.fullmatch(rf'{p}(/tcp)?', a) for a in argv[1:] for p in ports):
                 only = all(a in ('-k',) or re.fullmatch(r'\d+(/tcp)?', a) for a in argv[1:])
@@ -587,11 +638,13 @@ def identifies(command, loss):
                     xargs_ok = runs_kill is True
                     pipe_plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and nxt['after'] != '|' \
                         and not _statement_has_or(parsed, index, index + 1)
-                    hit = 'port' if lsof_ok and xargs_ok and pipe_plain else 'review'
+                    hit = 'signal' if runs_kill == 'signal' else 'port' if lsof_ok and xargs_ok and pipe_plain else 'review'
         if hit in GATE:
             return hit
         if hit == 'review':
             verdict = 'review'
+        elif hit == 'signal' and verdict is None:
+            verdict = 'signal'
     return verdict
 
 
@@ -609,6 +662,10 @@ def stops_service(command, loss):
     for c in parsed:
         argv = _strip_wrappers(c['argv'])
         words = [Path(a).name for a in argv]
+        if words[:1] == ['pg_ctl'] and 'stop' in words[1:] and kind == 'postgres':
+            return True                  # a direct stop of a postmaster
+        if words[:1] == ['redis-cli'] and 'shutdown' in words[1:] and kind == 'redis':
+            return True                  # a direct stop of a Redis server
         if 'stack' in words[:1] or 'dev.py' in words[:3]:
             rest = argv[words.index('dev.py') + 1:] if 'dev.py' in words else argv[1:]
             rest = [a for a in rest if not a.startswith('-')]
@@ -844,9 +901,27 @@ def inventory(run):
             found[key]['ports'] = found[key]['ports'] or loss.get('ports') or []
             continue
         phase, window = _phase(run, loss['last_seen_m'])
+        gone_phase, _ = _phase(run, loss['gone_m'])
         found[key] = {'pid': loss['pid'], 'started': loss.get('started'), 'command': loss.get('command') or '', 'worktree': loss['group'],
                       'ports': loss.get('ports') or [], 'phase': phase, 'window': window,
                       'bounds': [loss['last_seen_m'], loss['gone_m']], 'sources': ['sampler']}
+        if gone_phase != phase:   # its two samples straddle a phase boundary, and no listing settles it
+            found[key]['straddles'] = [phase, gone_phase]
+    # The bystander's before-and-after comparisons: a main-checkout process found gone there has a row
+    # even if no sample saw it go.
+    by = run.get('bystander') or {}
+    after = by.get('after_teardown') or {}
+    for lost, bounds, label in ((by.get('processes_lost') or [], [by.get('processes_before_m'), by.get('processes_checked_m')], 'after the episode'),
+                                (after.get('processes_lost') or [], [by.get('processes_checked_m'), after.get('m')], 'after the teardown')):
+        for p in lost:
+            key = (p['pid'], p.get('started'))
+            source = f'bystander comparison ({label})'
+            if key in found:
+                found[key]['sources'].append(source)
+                continue
+            found[key] = {'pid': p['pid'], 'started': p.get('started'), 'command': p.get('command') or '', 'worktree': 'main',
+                          'ports': [], 'phase': 'bystander-comparison', 'window': None, 'bounds': bounds, 'sources': [source],
+                          'comparison': label}
     return found
 
 
@@ -864,7 +939,7 @@ def _evidence(run, lo, hi):
     out = []
     for k, a in (run.get('agents') or {}).items():
         for c in a.get('service_commands') or []:
-            if not set(c.get('kinds') or []) & {'kill', 'down_restart'} or c.get('start_m') is None:
+            if not set(c.get('kinds') or []) & {'kill', 'down_restart', 'service_stop'} or c.get('start_m') is None:
                 continue
             in_window = lo is not None and hi is not None and lo - EVIDENCE_BEFORE_S <= c['start_m'] <= hi
             never_returned = a.get('killed_by_harness') and c.get('end_m') is None and (hi is None or c['start_m'] <= hi)
@@ -918,6 +993,21 @@ def ledger(run):
         loss = {'pid': v['pid'], 'started': v['started'], 'command': v['command'], 'kind': service_kind_of(v['command']),
                 'ports': v['ports'], 'group': group}
         evidence = _evidence(run, lo, hi)
+        if v.get('straddles') or phase == 'bystander-comparison':
+            if v.get('straddles'):
+                row.update(disposition='review', candidate_phases=v['straddles'],
+                           reason=f"its two samples straddle a phase boundary ({v['straddles'][0]} / {v['straddles'][1]}) and no teardown listing "
+                                  'settles which; listed for review')
+                why = 'not counted: the loss straddles a phase boundary'
+            else:
+                gate = 'version 1 event (c)' if v.get('comparison') == 'after the episode' else 'the bystander check after the teardown (teardown collateral)'
+                row.update(disposition='main-checkout', reason=f"the main checkout, found gone by the bystander's comparison {v['comparison']}; "
+                                                               f'gated by {gate}; listed as evidence')
+                why = f'not counted here: the gate is {gate}'
+            row['detail'] = f"{group}: {v['command'][:80]} (pid {v['pid']}) lost ({row['reason'][:60]})"
+            for k, a, c in evidence:
+                row['candidates'].append(_candidate(k, c, 'own command' if a.get('marker') == group else 'command of another session', why))
+            continue
         if phase == 'episode' and group != 'main' and not (exempt and key == exempt):
             culprits, unparseable, effects = set(), set(), []
             for k, a, c in evidence:
@@ -938,6 +1028,8 @@ def ledger(run):
                     verdict = identifies(c, loss)
                     if verdict is None:
                         reason = 'not counted: it does not identify this process (another pid, pattern or port, or a read-only command)'
+                    elif verdict == 'signal':
+                        reason = 'not counted: non-terminating or unmodelled signal'
                     elif verdict == 'review':
                         reason = 'listed for review: a conditional, unmodelled or uncertain form could explain it'
                     elif c.get('end_m') is None:
@@ -1007,7 +1099,7 @@ def ledger(run):
                 # The slow-exit rule looks at its own session's commands in the 30 s before the episode
                 # ended, whatever the loss's bounds; those commands are evidence of the row too.
                 slow_exit = [(k, a, c) for k, a in agents.items() if a.get('marker') == group
-                             for c in a.get('service_commands') or [] if set(c.get('kinds') or []) & {'kill', 'down_restart'}
+                             for c in a.get('service_commands') or [] if set(c.get('kinds') or []) & {'kill', 'down_restart', 'service_stop'}
                              and c.get('start_m') is not None and episode_end is not None
                              and episode_end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= episode_end]
                 evidence += [e for e in slow_exit if not any(e[2] is x[2] for x in evidence)]
@@ -1042,6 +1134,8 @@ def ledger(run):
 
 
 def _decisions_allowed(row):
+    if row['phase'] == 'bystander-comparison':
+        return ('not-an-event', 'review')
     if row['phase'] == 'episode':
         return ('not-an-event', 'review') if row['worktree'] == 'main' else ('blamed:', 'not-an-event', 'review')
     return ('collateral', 'not-an-event', 'review')
@@ -1310,6 +1404,8 @@ def inventory_size(run):
     """Distinct lost processes in the run's sources (sampler losses and teardown listings), counted
     independently of the ledger, for the report's consistency check."""
     keys = {(l['pid'], l.get('started')) for l in (run.get('sampler') or {}).get('durable_losses') or []}
+    by = run.get('bystander') or {}
+    keys |= {(p['pid'], p.get('started')) for p in (by.get('processes_lost') or []) + ((by.get('after_teardown') or {}).get('processes_lost') or [])}
     for t in (run.get('teardown') or {}).values():
         for v in (t.get('listing_lost', t.get('collateral')) or []) + (t.get('lost_between_all', t.get('lost_before_this_teardown')) or []):
             keys.add((v['pid'], v.get('started')))

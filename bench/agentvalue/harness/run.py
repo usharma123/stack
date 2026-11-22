@@ -489,6 +489,7 @@ def trace_metrics(path):
 # line to the arrival of its result (PROTOCOL.md, Version 2, event (g)).
 DOWN_RESTART = re.compile(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart)\b')
 UP = re.compile(r'\b(?:stack|dev\.py)\b[^\n;&|]*\bup\b')
+SERVICE_STOP = re.compile(r'\bpg_ctl\b[^\n;&|]*\bstop\b|\bredis-cli\b[^\n;&|]*\bshutdown\b')   # direct stops of a service
 ANY_KILL = re.compile(r'\b(?:kill|pkill|killall|fuser|pgrep)\b|xargs\s+kill')
 TESTS = re.compile(r'\bstack\s+(?:--json\s+)?run\s+test\b|\bdev\.py\s+test\b|\b(?:stack\s+(?:--json\s+)?exec|dev\.py\s+exec)\b[^\n]*\bpytest\b')
 ARRIVALS = 'trace.arrivals.tsv'
@@ -589,7 +590,8 @@ def service_commands(trace, arrivals, launched_m):
         if c['name'] != 'Bash':
             continue
         command = c['command']
-        kinds = [k for k, rx in (('kill', ANY_KILL), ('down_restart', DOWN_RESTART), ('up', UP), ('test', TESTS)) if rx.search(command)]
+        kinds = [k for k, rx in (('kill', ANY_KILL), ('down_restart', DOWN_RESTART), ('service_stop', SERVICE_STOP), ('up', UP), ('test', TESTS))
+                 if rx.search(command)]
         if not kinds:
             continue
         # The structured reading is taken from the original text, before redaction, and each of its
@@ -1150,7 +1152,8 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         groups_of = lambda names: owned_paths(arm, main, env_main, {n: (main if n == 'main' else root / n) for n in names})
         durable = lambda rows: [r for r in rows if CORE_SERVICE.search(r['command'])]
         bystander_procs = durable(observe.attributed(groups_of(['main']))['main'])
-        record['bystander'] = {'addresses': addresses, 'fingerprint_before': before, 'processes_before': rows_of(bystander_procs)}
+        record['bystander'] = {'addresses': addresses, 'fingerprint_before': before, 'processes_before': rows_of(bystander_procs),
+                               'processes_before_m': clock()}
 
         # Worktrees, as an orchestrator creates them. Each agent works in one.
         worktrees = {}
@@ -1328,7 +1331,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         if after is None and not lost:
             invalid('could not read the bystander fingerprint after the agents, with its services still running')
         changed = sorted(k for k in before if (after or {}).get(k) != before[k]) if after is not None else ['unreadable']
-        record['bystander'].update(fingerprint_after=after, changed=changed, processes_lost=lost)
+        record['bystander'].update(fingerprint_after=after, changed=changed, processes_lost=lost, processes_checked_m=clock())
 
         # Each submission (the worktree's final tree), captured before anything touches the worktrees.
         captures = stage / 'capture'
