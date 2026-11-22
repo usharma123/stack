@@ -769,8 +769,17 @@ def void_invoices():
         None for anything else (a disjunction, a function of status, another column...)."""
         import re as _re
         term = unwrap(term)
-        if len(split_top(term, 'OR')) > 1:
-            return None
+        alternatives = split_top(term, 'OR')
+        if len(alternatives) > 1:
+            # A disjunction made only of exact-value terms (equalities, IN / = ANY lists) is the union of
+            # their values; any other alternative (a length test, a pattern) leaves the set open.
+            union = set()
+            for alternative in alternatives:
+                read = read_term(alternative)
+                if read is None or read[0] != 'allow':
+                    return None
+                union |= read[1]
+            return ('allow', union)
         m = _re.fullmatch(STATUS + r"\s*=\s*ANY\s*\(\(?ARRAY\[(.*)\]\)?(?:::(?:text|character varying)\[\])?\)", term)
         if m:
             items = [i.strip() for i in m.group(1).split(',')]

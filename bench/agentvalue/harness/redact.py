@@ -15,21 +15,50 @@ SECRET_KEY = re.compile(r'\b([A-Za-z0-9_]*' + KEYWORDS + r'[A-Za-z0-9_]*)=("[^"]
 # JSON and escaped JSON: "SOME_TOKEN": "value"  or  \"SOME_TOKEN\": \"value\"
 SECRET_JSON = re.compile(r'(\\?"[A-Za-z0-9_]*' + KEYWORDS + r'[A-Za-z0-9_]*\\?"\s*:\s*)(\\?")((?:[^"\\]|\\(?!"))*)(\\?")', re.I)
 MISE_DIFF = re.compile(r'\b(__MISE_[A-Z_]*)=[^\s"\'\\]+')
-# HTTP credentials in any text: an Authorization header (any scheme) and a bearer token on its own.
-AUTH_HEADER = re.compile(r'((?:Proxy-)?Authorization\s*[:=]\s*)(?:(Bearer|Basic|Token|Digest|Negotiate)\s+)?([^\s"\'\\,;]+)', re.I)
-BEARER = re.compile(r'\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})', re.I)
+# Credential-bearing HTTP headers: the whole value is redacted (any scheme, every parameter of a
+# Digest header), header names case-insensitive, in four forms: `-H 'Name: value'`, `-H "Name: value"`
+# (also JSON-escaped, `-H \"Name: value\"`), JSON `"Name": "value"`, and a bare `Name: value` line.
+HEADER_NAMES = r'(?:Proxy-Authorization|Authorization|X-API-Key|X-Auth-Token|Set-Cookie|Cookie)'
+HEADER_SQ = re.compile(r"(-H\s*'\s*" + HEADER_NAMES + r"\s*:\s*)[^']*(')", re.I)
+HEADER_DQ = re.compile(r'(-H\s*"\s*' + HEADER_NAMES + r'\s*:\s*)(?:[^"\\]|\\.)*(")', re.I)
+HEADER_EDQ = re.compile(r'(-H\s*\\"\s*' + HEADER_NAMES + r'\s*:\s*)(?:[^"\\]|\\(?!")[\s\S])*(\\")', re.I)
+HEADER_JSON = re.compile(r'("' + HEADER_NAMES + r'"\s*:\s*")((?:[^"\\]|\\.)*)(")', re.I)
+HEADER_EJSON = re.compile(r'(\\"' + HEADER_NAMES + r'\\"\s*:\s*\\")((?:[^"\\]|\\(?!")[\s\S])*)(\\")', re.I)
+# A bare header: to the end of its value. In plain text that is the end of the line; in JSON-encoded
+# text (a line that starts like JSON) it is also a literal \n or \r escape or an unescaped quote.
+HEADER_BARE = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?![ \t]*<redacted>)[ \t]*([^\r\n]+)', re.I)
+HEADER_BARE_JSON = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?![ \t]*<redacted>)[ \t]*((?:\\(?![nr])[\s\S]|[^\\\r\n"])+)', re.I)
+BEARER = re.compile(r'\b(Bearer\s+)(?!<redacted>)([A-Za-z0-9._~+/=-]{8,})', re.I)
 
 
 def scrub(text):
     if not isinstance(text, str):
         return text
+    stripped = text.strip()
+    if stripped[:1] in ('{', '[', '"') and len(stripped) > 1:
+        # Text that is itself JSON (a command's JSON output, a JSON-encoded string): scrubbed as parsed
+        # JSON, recursively, so escaped and doubly encoded values are read exactly.
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list, str)) and parsed != stripped:
+            new = json.dumps(scrub_json(parsed), ensure_ascii=False)
+            return new if new != json.dumps(parsed, ensure_ascii=False) else text
     text = SECRET_KEY.sub(lambda m: f'{m[1]}=<redacted>', text)
     text = SECRET_JSON.sub(lambda m: f'{m[1]}{m[2]}<redacted>{m[4]}', text)
-    text = AUTH_HEADER.sub(lambda m: f"{m[1]}{(m[2] + ' ') if m[2] else ''}<redacted>", text)
+    text = HEADER_SQ.sub(lambda m: f'{m[1]}<redacted>{m[2]}', text)
+    text = HEADER_EDQ.sub(lambda m: f'{m[1]}<redacted>{m[2]}', text)
+    text = HEADER_DQ.sub(lambda m: f'{m[1]}<redacted>{m[2]}', text)
+    text = HEADER_EJSON.sub(lambda m: f'{m[1]}<redacted>{m[3]}', text)
+    text = HEADER_JSON.sub(lambda m: f'{m[1]}<redacted>{m[3]}', text)
+    bare = HEADER_BARE_JSON if text.lstrip().startswith(('{', '[')) or '\\"' in text else HEADER_BARE
+    text = bare.sub(lambda m: f'{m[1]} <redacted>', text)
     text = BEARER.sub(lambda m: f'{m[1]}<redacted>', text)
     return MISE_DIFF.sub(lambda m: f'{m[1]}=<redacted>', text)
 
 
+HEADER_KEY = re.compile(r'^\s*' + HEADER_NAMES + r'\s*$', re.I)
 SECRET_NAME = re.compile(r'^[A-Za-z0-9_.-]*' + KEYWORDS + r'[A-Za-z0-9_.-]*$', re.I)
 # Keys that look credential-like but are counters or names (token counts in usage, the CLI's own
 # identity tokens count), never a secret value.
@@ -44,8 +73,8 @@ def scrub_json(value):
     if isinstance(value, list):
         return [scrub_json(v) for v in value]
     if isinstance(value, dict):
-        return {k: (redact_all(v) if isinstance(k, str) and SECRET_NAME.match(k) and not NOT_SECRET.search(k) else scrub_json(v))
-                for k, v in value.items()}
+        return {k: (redact_all(v) if isinstance(k, str) and ((SECRET_NAME.match(k) and not NOT_SECRET.search(k)) or HEADER_KEY.match(k))
+                    else scrub_json(v)) for k, v in value.items()}
     return value
 
 

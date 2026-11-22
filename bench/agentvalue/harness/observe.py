@@ -613,6 +613,15 @@ def reclaim(rows, root, grace=5, grade_token=None):
 def run_processes(root):
     """Every live process of this run: under its root (command, cwd, open file) or carrying its marker."""
     found = {p['pid']: p for p in legacy.owned_processes(root)}
+    # Recorded lineage seeds discovery too: live identities (pid + start time) the harness launched
+    # or the sampler saw descending from them.
+    known = LINEAGE['launched'] | LINEAGE['seen']
+    if known:
+        table = legacy.process_table()
+        for pid, started in known:
+            row = table.get(pid)
+            if row is not None and row['started'] == started and pid != os.getpid():
+                found.setdefault(pid, dict(row, reason='lineage'))
     if RUN_SUFFIX:
         rows = legacy.process_table()
         ancestors, pid = set(), os.getpid()

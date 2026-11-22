@@ -16,6 +16,7 @@ Every commit goes through commit.py, which scans every staged blob in full with 
 Exits 1 with file and line for every hit, naming the pattern or the variable, never the value.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -64,8 +65,22 @@ JSON_ESCAPE = re.compile(r'\\u([0-9a-fA-F]{4})|\\(["\\/bfnrt])')
 ESCAPES = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
 
 
+JSON_STRING = re.compile(r'"(?:[^"\\\r\n]|\\.)*"')
+SURROGATE_PAIR = re.compile(r'\\u(d[89ab][0-9a-f]{2})\\u(d[c-f][0-9a-f]{2})', re.I)
+
+
 def json_decoded(text):
-    r"""JSON string escapes decoded (\uXXXX, \n, \", \\, \/ ...), wherever they appear."""
+    r"""JSON string escapes decoded as a conforming decoder does: every JSON string literal in the text
+    is decoded with json.loads (surrogate pairs combined into one character); escapes outside a
+    well-formed literal are decoded one by one, pairs combined first."""
+    def literal(m):
+        try:
+            return '"' + json.loads(m.group(0)) + '"'
+        except ValueError:
+            return m.group(0)
+    text = JSON_STRING.sub(literal, text)
+    text = SURROGATE_PAIR.sub(lambda m: chr(0x10000 + ((int(m.group(1), 16) - 0xD800) << 10) + (int(m.group(2), 16) - 0xDC00)), text)
+
     def one(m):
         if m.group(1):
             try:

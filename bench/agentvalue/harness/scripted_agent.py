@@ -221,6 +221,13 @@ def plant_sentinel():
     (here / 'notes.env').write_text(f'SENTINEL_TOKEN={value}\n')
     (here / f'SENTINEL_TOKEN={value}.txt').write_text('a file whose name carries the value\n')
     run(['sh', '-c', f'echo "Authorization: Bearer {value}"'])
+    # Credential-bearing headers, in output, in a trace command and in a process command line that the
+    # sampler records (a connection to the main checkout's Redis: its client command line is logged).
+    digest = f'Authorization: Digest username="u", realm="r", response="{value}", qop=auth'
+    run(['sh', '-c', f'echo "X-API-Key: {value}"; echo \'{digest}\'; echo "Set-Cookie: sid={value}"; echo "X-Auth-' + f'Token: {value}"'])
+    port = main_redis_port()
+    run(['python3', '-c', f"import socket,time; s=socket.create_connection(('127.0.0.1',{port})); time.sleep(5)",
+         f'X-API-Key: {value}', f'Cookie: sid={value}', digest], background=True, cwd=here)
     # A process whose command line carries the value, alive long enough for the sampler to list it.
     run(['python3', '-c', 'import time; time.sleep(4)', f'SENTINEL_TOKEN={value}'], background=True, cwd=here)
     time.sleep(3)

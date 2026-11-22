@@ -339,8 +339,18 @@ def capture(worktree, start_commit, out_dir, env):
 
 # ------------------------------------------------------------------ worktree databases
 
-def read_migrations(data_dir, workdir, token=''):
-    """Start a private postgres on a worktree's data directory and read schema_migrations."""
+def under_root(path, root):
+    """Whether `path`, resolved, lies under the run's root (also resolved)."""
+    real, base = os.path.realpath(path), os.path.realpath(root)
+    return real == base or real.startswith(base.rstrip('/') + '/')
+
+
+def read_migrations(data_dir, workdir, token='', root=None):
+    """Start a private postgres on a worktree's data directory and read schema_migrations. With
+    `root`, a directory that does not resolve under the run's root is never touched: it is
+    recorded as seen outside the run (no worktree's database lives there)."""
+    if root is not None and not under_root(data_dir, root):
+        return {'exists': None, 'outside_run_root': True, 'resolved': os.path.realpath(data_dir), 'touched': False}
     data_dir = Path(data_dir)
     if not (data_dir / 'PG_VERSION').exists():
         return {'exists': False}
@@ -615,6 +625,13 @@ def stop_tree(proc, grace=10):
         proc.wait(10)
 
 
+def split_tied(rows, root):
+    """(counted, listed): the rows tied to the run (observe.tie) and the rest, which are only listed."""
+    table = observe.legacy.process_table()
+    counted = [p for p in rows if observe.tie(p, root, table)]
+    return counted, [p for p in rows if p not in counted]
+
+
 def safe_killpg(pgid, root):
     """SIGKILL a process group only after confirming that a current member of it is positively tied to
     this run (observe.tie: marker, lineage or verified service). Returns whether it was signalled."""
@@ -645,7 +662,29 @@ CORE_SERVICE = re.compile(r'(/bin/postgres |redis-server|python (app|worker)\.py
 LATE_S = 1.0   # a kill or a recovery launch later than planned by more than this is flagged
 
 
-SLEEP_DRIFT_S = 5.0   # wall time minus monotonic time above this means the host slept during the run
+SUSPEND_TOLERANCE_S = 0.5   # half the 1 s lateness tolerance of the fault timing (PROTOCOL.md, Validity)
+
+
+def clock_pair():
+    """(uptime, monotonic-raw) read back to back through clock_gettime: the uptime clock (the run
+    clock, which stops while the host sleeps) and the monotonic clock that keeps counting in sleep."""
+    return time.clock_gettime(time.CLOCK_UPTIME_RAW), time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+
+
+def suspension(start, end, tolerance=SUSPEND_TOLERANCE_S):
+    """(seconds suspended, invalid?) from two clock_pair() readings: the growth of the
+    sleep-inclusive clock minus the growth of the uptime clock, compared unrounded."""
+    suspended = (end[1] - start[1]) - (end[0] - start[0])
+    return suspended, suspended > tolerance
+
+
+def power_check(reader=None):
+    """(ok, reason): an arm may start only when the power source reads as AC power; battery power
+    or an unreadable source refuses."""
+    source = (reader or power_source)()
+    if source == 'AC Power':
+        return True, None
+    return False, ('the host is on battery power' if source == 'Battery Power' else f'the power source cannot be read as AC power ({source!r})')
 
 
 def power_source():
@@ -938,7 +977,8 @@ def stop_rows(rows, root, groups, name, grace=10):
         return {(p['pid'], p['started']) for p in placed.get(name, [])}
 
     def send(row, signum, here):
-        if (row['pid'], row['started']) not in here or not observe._same(row):
+        # Placement, identity and the run tie, immediately before every signal (SIGKILL included).
+        if (row['pid'], row['started']) not in here or not observe._same(row) or observe.tie(row, root) is None:
             return False
         try:
             os.kill(row['pid'], signum)
@@ -1015,6 +1055,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
     observe.RUN_SUFFIX = f'.{run_id}'
     observe.LINEAGE['launched'].clear()
     observe.LINEAGE['seen'].clear()
+    clocks_start = clock_pair()
     t0 = time.monotonic()
     clock = lambda: round(time.monotonic() - t0, 3)
     record = {'protocol_version': PROTOCOL_VERSION, 'pair': pair_index, 'attempt': plan.get('_attempt', 1), 'arm': arm_name,
@@ -1132,7 +1173,10 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             # Everything attributed to the worktree at the agent's exit, the CLI's own helpers included
             # (listed separately: the version 1 at-exit gate does not count them).
             groups = groups_of([names[task]])
-            left = observe.attributed(groups, exclude={proc.pid})[names[task]]
+            attributed_rows = observe.attributed(groups, exclude={proc.pid})[names[task]]
+            # Counted: attributed to the worktree AND tied to the run (marker, lineage, verified service).
+            # A process that only has a worktree file open (an operator's `tail -f`) is listed, not counted.
+            left, not_counted = split_tied(attributed_rows, root)
             listeners, _ = observe.tcp()
             listeners.pop('by_endpoint', None)
             helpers = cli_paths(cli) if cli and not agent_override else ()
@@ -1145,6 +1189,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                     timed_out=timed_out, observed_after_exit_s=round(time.monotonic() - ended_mono, 2),
                     left_running=rows_of(left, ('pid', 'started', 'command', 'marker')),
                     cli_helpers_left=rows_of(cli_own, ('pid', 'command')),
+                    seen_not_counted=rows_of(not_counted, ('pid', 'started', 'command')),
                     left_listening=sorted(port for port, pid in listeners.items() if pid in left_pids))
 
         def launch(task, role):
@@ -1287,22 +1332,26 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             service_dirs = {task: {'postgres': str(path / '.dev/postgres'), 'redis': str(path / '.dev/redis')} for task, path in worktrees.items()}
 
         def observation(name):
-            rows = observe.attributed({name: teardown_groups[name]})[name]   # raises if a listing fails: unknown inventory
+            attributed_rows = observe.attributed({name: teardown_groups[name]})[name]   # raises if a listing fails: unknown inventory
+            rows, not_counted = split_tied(attributed_rows, root)                        # only run-tied processes count
             listeners, _ = observe.tcp()
             listeners.pop('by_endpoint', None)
             pids = {p['pid'] for p in rows}
             helpers = cli_paths(cli) if cli and not agent_override else ()
             return rows, {'m': clock(), 'processes': rows_of(rows, ('pid', 'started', 'command', 'marker')),
                           'ports': sorted(port for port, pid in listeners.items() if pid in pids),
-                          'of_which_cli_helpers': [p['pid'] for p in rows if helpers and p['command'].startswith(helpers)]}
+                          'of_which_cli_helpers': [p['pid'] for p in rows if helpers and p['command'].startswith(helpers)],
+                          'seen_not_counted': rows_of(not_counted, ('pid', 'started', 'command'))}
 
         main_group = groups_of(['main'])['main']
 
         def durable_listing():
             """Durable service processes of every worktree and the main checkout, by pid and start time."""
             rows = observe.attributed({**teardown_groups, 'main': main_group})
+            table = observe.legacy.process_table()
             return {(p['pid'], p['started']): {'group': g, 'pid': p['pid'], 'started': p['started'], 'command': p['command'][:200]}
-                    for g, found in rows.items() for p in found if observe.DURABLE.search(p['command'])}
+                    for g, found in rows.items() for p in found
+                    if observe.DURABLE.search(p['command']) and observe.tie(p, root, table)}
 
         teardown, leftovers, windows, torn = {}, {}, [], set()
         previous_after = None
@@ -1380,7 +1429,10 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                               key=lambda d: (observe.norm_path(d) != observe.norm_path(recorded or ''), d))
                 per_dir, versions, canary_found = {}, set(), False
                 for data_dir in dirs:
-                    result = read_migrations(data_dir, Path(tmp), canary)
+                    result = read_migrations(data_dir, Path(tmp), canary, root=root)
+                    if result.get('outside_run_root'):
+                        per_dir[str(data_dir)] = result      # seen outside the run: recorded, never touched
+                        continue
                     if not result.get('exists'):
                         # Deleted before the check (an agent's purge, say): the accepted limit, listed.
                         result['note'] = 'not present at the check' if Path(data_dir).exists() is False else 'no database in it'
@@ -1427,10 +1479,11 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             checked = sorted(set(service_dirs[task].values()) | seen_dirs)
             teardown[task]['data_dirs_checked'] = {'arm_records': service_dirs[task], 'seen_running': sorted(seen_dirs)}
             data_left = {p: du(p) for p in checked if Path(p).is_dir() and any(Path(p).iterdir())}
-            found = left.get(names[task]) or []
+            found, not_counted = split_tied(left.get(names[task]) or [], root)
             entry = teardown[task]
             entry['after_removal'] = {'m': clock(), 'worktree_dir_exists': path.exists(), 'service_data_left': data_left,
-                                      'processes': rows_of(found, ('pid', 'started', 'command'))}
+                                      'processes': rows_of(found, ('pid', 'started', 'command')),
+                                      'seen_not_counted': rows_of(not_counted, ('pid', 'started', 'command'))}
             if found:  # found at the post-removal scan and reclaimed: still residue of this worktree
                 entry['after_removal']['harness_reclaim'] = observe.reclaim(found, root)
             entry['residue_ok'] = not entry['after_down']['processes'] and not entry['after_down']['ports'] \
@@ -1440,7 +1493,8 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         agent_ports = {int(p) for p, marks in sampler.summary()['ports'].items() if set(marks) - {'main'}}
         record['disposal'] = {
             'steps': removal,
-            'processes_left': {m: rows_of(rows, ('pid', 'command')) for m, rows in left.items() if rows},
+            'processes_left': {m: rows_of(split_tied(rows, root)[0], ('pid', 'command')) for m, rows in left.items() if split_tied(rows, root)[0]},
+            'seen_not_counted': {m: rows_of(split_tied(rows, root)[1], ('pid', 'command')) for m, rows in left.items() if split_tied(rows, root)[1]},
             'ports_still_listening': sorted(p for p in agent_ports if p in listeners),
             'worktree_dirs_left': [str(p) for p in worktrees.values() if p.exists()],
             'service_data_left': {t: teardown[t]['after_removal']['service_data_left'] for t in worktrees if teardown[t]['after_removal']['service_data_left']},
@@ -1598,13 +1652,17 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                 invalid('a session started after cleanup had begun')
             record['ended'] = now()
             record['seconds'] = round(record['ended'] - record['started'], 1)
-            # The host must stay awake: macOS stops the monotonic clock during sleep, so wall time running
-            # ahead of it means every interval of this run (the kill point included) is wrong.
-            drift = round(record['ended'] - record['started'] - clock(), 1)
-            record['clock']['wall_minus_monotonic_s'] = drift
+            # Suspension, measured directly: the uptime clock (the run clock) stops while the host sleeps,
+            # the raw monotonic clock does not. Above 0.5 s the kill point and every interval are unreliable.
+            clocks_end = clock_pair()
+            suspended, too_long = suspension(clocks_start, clocks_end)
+            record['clock'].update(uptime_growth_s=round(clocks_end[0] - clocks_start[0], 6),
+                                   monotonic_raw_growth_s=round(clocks_end[1] - clocks_start[1], 6),
+                                   suspended_s=round(suspended, 6),
+                                   wall_minus_monotonic_s=round(record['ended'] - record['started'] - clock(), 3))   # diagnostic only
             record['machine']['power_source_at_end'] = power_source()
-            if abs(drift) > SLEEP_DRIFT_S:
-                invalid(f'the host slept or its clock jumped during the run: wall time and the run clock differ by {drift} s')
+            if too_long:
+                invalid(f'the host was suspended for {suspended:.3f} s during the run')
             # Every retained file is scrubbed, submitted trees and patches included; the changed ones are listed.
             changed = []
             for path in sorted(out_dir.rglob('*')):
@@ -1778,6 +1836,15 @@ def check_plan(plan):
     return problems + protocol_problems(plan)
 
 
+def marker_matches(path, plan_sha, index):
+    """Whether a rerun marker names this plan digest, this pair and attempt 2."""
+    try:
+        content = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(content, dict) and content.get('plan_sha256') == plan_sha and content.get('pair') == index and content.get('attempt') == 2
+
+
 def run_dir_name(index, attempt, arm):
     return f'pair{index}-{arm}' if attempt == 1 else f'pair{index}.{attempt}-{arm}'
 
@@ -1840,8 +1907,6 @@ def cmd_pair(args):
         raise SystemExit('refusing to run: ' + '; '.join(problems))
     if args.attempt not in (1, 2):
         raise SystemExit('a pair has at most two attempts')
-    if power_source() == 'Battery Power':
-        raise SystemExit('refusing to run: the host is on battery power; trials run on AC power only (PROTOCOL.md, Validity)')
     lock = host_lock()
     pair = plan['pairs'][args.index]
     results = Path(args.results)
@@ -1854,7 +1919,10 @@ def cmd_pair(args):
         # before writing a run record.
         marker = results / f'pair{args.index}.2-STARTED.json'
         if marker.exists():
-            raise SystemExit(f'{marker} exists: attempt 2 of pair {args.index} has already been started')
+            if marker_matches(marker, plan['_sha256'], args.index):
+                raise SystemExit(f'{marker} exists: attempt 2 of pair {args.index} has already been started')
+            raise SystemExit(f'{marker} exists but does not name this plan digest, pair {args.index} and attempt 2: '
+                             'it belongs to something else; move it aside before rerunning')
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(fd, 'w') as handle:
             handle.write(json.dumps({'pair': args.index, 'attempt': 2, 'started': now(), 'plan_sha256': plan['_sha256'],
@@ -1870,6 +1938,9 @@ def cmd_pair(args):
         problems = check_plan(plan)  # before each arm
         if problems:
             raise SystemExit('refusing to run: ' + '; '.join(problems))
+        ok, reason = power_check()   # before each arm: AC power only (PROTOCOL.md, Validity)
+        if not ok:
+            raise SystemExit(f'refusing to run {arm_name}: {reason}; trials run on AC power only')
         out = results / run_dir_name(args.index, args.attempt, arm_name)
         print(f'pair {args.index} attempt {args.attempt}: running {arm_name} -> {out}', flush=True)
         record = run_arm(plan, args.index, arm_name, out)
@@ -1914,7 +1985,11 @@ def cmd_arm(args):
     lock.close()
 
 
+INTERRUPTED = {'signal': None}   # the outside signal that interrupted a run (validate.py stops on it)
+
+
 def interrupt(signum, frame):
+    INTERRUPTED['signal'] = signum
     raise KeyboardInterrupt(f'signal {signum}')
 
 

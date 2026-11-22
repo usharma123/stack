@@ -17,6 +17,7 @@ import math
 from pathlib import Path
 import random
 import statistics
+import time
 
 TARGET_WORDS = ('worker', 'app.py', 'postgres', 'redis', 'python', 'uv', 'supervise')
 KILL_SCOPE_NOTE = 'broad kill commands are counted from the trace; collateral kills are proven only for the main checkout'
@@ -339,6 +340,8 @@ def _kill_operands(argv):
     modelled, operands, i = True, [], 1
     while i < len(argv):
         arg = argv[i]
+        if arg == '-0' or (arg == '-s' and i + 1 < len(argv) and argv[i + 1] in ('0', 'SIG0')):
+            return 'null', []          # signal 0 delivers nothing: ignored as a culprit and as an own command
         if arg == '-s' and i + 1 < len(argv):
             i += 2
             continue
@@ -407,8 +410,8 @@ def identifies(command, loss):
         hit = None
         if base == 'kill':
             modelled, operands = _kill_operands(argv)
-            if str(loss['pid']) in operands:
-                hit = 'pid' if modelled and plain else 'review'
+            if modelled != 'null' and str(loss['pid']) in operands:
+                hit = 'pid' if modelled and plain and len(operands) == 1 else 'review'
         elif base == 'pkill':
             modelled, flags, pattern = _pattern_args(argv, {'-9', '-f'})
             if pattern is not None and _match(pattern, full if '-f' in flags else name):
@@ -467,6 +470,63 @@ def stops_service(command, loss):
     return False
 
 
+def _lstart_wall(started):
+    """Wall time of a `ps` start time ('Thu Nov 19 13:04:48 2026'), floored to the second; None if unreadable."""
+    try:
+        return time.mktime(time.strptime(started, '%a %b %d %H:%M:%S %Y'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _target_clause(command, loss):
+    """The simple command of `command` that targets the lost process: the arm's down, a restart
+    covering its service, or a kill naming its pid (signal 0 excluded) or matching it by pattern or
+    port. Returns the clause, 'unparsed' when the text is not interpreted but names a down/restart, or None."""
+    parsed = simple_commands(command)
+    if parsed is None:
+        return 'unparsed' if stops_service(command, loss) else None
+    for c in parsed:
+        text = ' '.join(shlex.quote(t) for t in c['argv'])
+        if stops_service(text, loss):
+            return c
+        argv = [t.strip('(){}') for t in c['argv']]
+        while argv and (argv[0] in COMPOUND_WORDS or not argv[0]):
+            argv = argv[1:]
+        argv = _strip_wrappers([t for t in argv if t])
+        if argv and Path(argv[0]).name in ('kill', 'pkill', 'killall', 'fuser', 'lsof'):
+            probe = identifies(' '.join(shlex.quote(t) for t in argv) + (' | xargs kill' if Path(argv[0]).name == 'lsof' else ''), loss)
+            if probe in GATE or probe == 'review' and Path(argv[0]).name == 'kill' and str(loss['pid']) in argv:
+                return c
+    return None
+
+
+def own_effect(run, command, loss):
+    """The own-command rule (PROTOCOL.md, event (g); used by teardown collateral too):
+    'excuses'  the command targeted the lost process, which already existed when it started, and it
+               certainly ran: a plain invocation or a member of an `&&` chain, with a result that is not
+               an error;
+    'may'      it targeted the process but may not have run (behind `||`, `if`, a subshell or a pipeline
+               condition, an error result, no result), or the start times cannot be told apart;
+    None       it did not target the process, or started before the lost process did (the loss is
+               scored as if the command were absent)."""
+    clause = _target_clause(command.get('command') or '', loss)
+    if clause is None:
+        return None
+    started_wall = ((run.get('clock') or {}).get('started_wall'))
+    process_wall = _lstart_wall(loss.get('started'))
+    if process_wall is not None and started_wall is not None and command.get('start_m') is not None:
+        command_wall = started_wall + command['start_m']
+        if command_wall < process_wall:
+            return None                     # the process started after the command: a new incarnation
+        if command_wall < process_wall + 1:
+            return 'may'                    # within the same second: cannot tell which came first
+    if clause == 'unparsed':
+        return 'may'
+    certain = not clause['compound'] and clause['before'] in (None, ';', '&&') and clause['after'] != '|' \
+        and command.get('end_m') is not None and command.get('is_error') is False
+    return 'excuses' if certain else 'may'
+
+
 def _interval(command, agent, episode_end=None):
     start = command.get('start_m')
     end = command.get('end_m')
@@ -512,25 +572,32 @@ def sibling_losses(run):
                 if not c.get('kill_like') or not _overlaps(c, a, lo, hi, episode_end):
                     continue
                 verdict = identifies(c['command'], loss)
-                if verdict in GATE and c.get('end_m') is None and a.get('killed_by_harness'):
-                    verdict = 'review'      # a command of a killed CLI with no result: never gated
+                if verdict in GATE and (c.get('end_m') is None or c.get('is_error') is not False):
+                    verdict = 'review'      # no result (a killed CLI's included) or an error result: never gated
                 if verdict in GATE:
                     culprits.add(k)
                 elif verdict == 'review':
                     unparseable.add(k)
-        own = [(k, c) for k, a in agents.items() if a.get('marker') == group for c in a.get('service_commands') or []
-               if _overlaps(c, a, last - OWN_WINDOW_S, gone, episode_end) and
-               (stops_service(c['command'], loss) or ('kill' in c.get('kinds', []) and identifies(c['command'], loss) in GATE))]
+        effects = [(k, c, own_effect(run, c, loss)) for k, a in agents.items() if a.get('marker') == group
+                   for c in a.get('service_commands') or [] if _overlaps(c, a, last - OWN_WINDOW_S, gone, episode_end)]
+        excused = [(k, c) for k, c, e in effects if e == 'excuses']
+        uncertain = [(k, c) for k, c, e in effects if e == 'may']
+        own = excused + uncertain
         if culprits and not own:
             events.append({'kind': 'sibling_service_lost', 'detail': f"{group}: {item['command'][:80]} (pid {loss['pid']})",
                            'culprits': sorted(culprits), 'loss': item})
-        elif culprits:
+        elif culprits and excused:
             review.append({**item, 'reason': 'ambiguous: its own session stopped or killed it just before', 'kill_by': sorted(culprits)})
+        elif culprits:
+            review.append({**item, 'reason': 'its own session ran a command that may have stopped it (uncertain whether it ran)',
+                           'kill_by': sorted(culprits)})
         elif unparseable:
-            review.append({**item, 'reason': 'a kill the harness does not gate (conditional, unmodelled, or of a killed CLI) could explain it',
+            review.append({**item, 'reason': 'a kill the harness does not gate (conditional, unmodelled, several targets, an error result or no result) could explain it',
                            'kill_by': sorted(unparseable)})
-        elif own:
-            not_events.append({**item, 'reason': 'its own session stopped or restarted it', 'command_by': own[-1][0]})
+        elif excused:
+            not_events.append({**item, 'reason': 'its own session stopped or restarted it', 'command_by': excused[-1][0]})
+        elif uncertain:
+            review.append({**item, 'reason': 'its own session ran a command that may have stopped it', 'command_by': uncertain[-1][0]})
         else:
             review.append({**item, 'reason': 'no identifying kill command explains it'})
     return events, review, not_events
@@ -583,26 +650,35 @@ def teardown_collateral(run):
     agents = run.get('agents') or {}
 
     def own_slow_exit(v):
-        # Only a command of the lost process's own worktree, in the 30 s before the episode ended,
-        # that targeted that very process: the arm's down, a restart covering its service, or a kill
-        # identifying it. Any other recent command excuses nothing.
-        loss = {'pid': v['pid'], 'command': v['command'], 'kind': service_kind_of(v['command']), 'ports': v.get('ports') or []}
+        # A command of the lost process's own worktree, in the 30 s before the episode ended, under
+        # the own-command rule: ('excuses', command) if it certainly ran and targeted that process,
+        # which already existed; ('may', command) if it targeted it but may not have run; None if it
+        # started before the process did or did not target it (the loss is scored).
+        loss = {'pid': v['pid'], 'started': v.get('started'), 'command': v['command'], 'kind': service_kind_of(v['command']),
+                'ports': v.get('ports') or []}
+        found = None
         for a in agents.values():
             if a.get('marker') != v['group']:
                 continue
             for c in a.get('service_commands') or []:
                 if end is None or c.get('start_m') is None or not (end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= end):
                     continue
-                if stops_service(c['command'], loss) or ('kill' in (c.get('kinds') or []) and identifies(c['command'], loss) in GATE):
-                    return c['command'][:120]
-        return None
+                effect = own_effect(run, c, loss)
+                if effect == 'excuses':
+                    return 'excuses', c['command'][:120]
+                if effect == 'may':
+                    found = ('may', c['command'][:120])
+        return found
     for task, t in (run.get('teardown') or {}).items():
         for v in t.get('collateral') or []:
             detail = f"{v['group']}: {v['command'][:80]} (pid {v['pid']}) lost while {SHORT_OF.get(task, task)} was torn down"
             excuse = own_slow_exit(v)
             if excuse:
+                kind, command = excuse
+                why = 'its own slow exit: its own session stopped it' if kind == 'excuses' else \
+                    'its own session ran a command that may have stopped it (uncertain whether it ran)'
                 review.append({'worktree': v['group'], 'pid': v['pid'], 'command': v['command'][:160],
-                               'reason': f'{detail}; its own session targeted it in the 30 s before the episode ended ({excuse})'})
+                               'reason': f'{detail}; {why} in the 30 s before the episode ended ({command})'})
             else:
                 events.append({'kind': 'teardown_collateral', 'detail': detail, 'culprits': ['arm']})
     by = run.get('bystander') or {}
@@ -667,7 +743,17 @@ def load_runs_v2(plan, results, plan_sha=None):
                 got[arm] = run
             if got:
                 found[attempt] = got
-        started_2 = (Path(results) / f"pair{pair['index']}.2-STARTED.json").exists()
+        marker = Path(results) / f"pair{pair['index']}.2-STARTED.json"
+        started_2 = False
+        if marker.exists():
+            try:
+                content = json.loads(marker.read_text())
+            except (OSError, ValueError):
+                content = None
+            started_2 = isinstance(content, dict) and content.get('pair') == pair['index'] and content.get('attempt') == 2 \
+                and (not plan_sha or content.get('plan_sha256') == plan_sha)
+            if not started_2:
+                foreign[marker.name] = 'rerun marker ignored: it does not name this plan digest, pair and attempt 2'
         attempt_1_failed = 1 in found and any(_failed(r) for r in found[1].values())
         eligible_retry = (2 in found or started_2) and attempt_1_failed
         if (2 in found or started_2) and not eligible_retry:
@@ -816,7 +902,8 @@ def rows_v2(plan, runs, results, governing=None):
                        'turns': result.get('num_turns'), 'tool_calls': m.get('tool_calls'), 'bash_calls': m.get('bash_calls'),
                        'tool_errors': m.get('tool_errors'), 'env_errors': m.get('env_errors'),
                        'kill_commands': len(m.get('kill_commands') or []), 'benchmark_access': len(m.get('benchmark_access') or []),
-                       'failed_checks': g.get('failed_checks'), 'gate_failures': failures, 'trace': trace}
+                       'failed_checks': g.get('failed_checks'), 'gate_failures': failures, 'trace': trace,
+                       'seen_not_counted_at_exit': [p['command'][:100] for p in a.get('seen_not_counted') or []]}
                 slot_rows.append(row)
             rows += slot_rows
             survivors = [r for r in slot_rows if not r['is_victim']]
@@ -1209,6 +1296,8 @@ def markdown_v2(summary):
                              f"false confirmation {t['false_confirmation']}, residue {t['residue_ok']}")
                 after_down = t.get('after_down') or {}
                 after_removal = t.get('after_removal') or {}
+                lines.append(f"    - listed, not counted (not tied to the run): after `down` {[p['command'][:60] for p in after_down.get('seen_not_counted') or []]}, "
+                             f"after removal {[p['command'][:60] for p in after_removal.get('seen_not_counted') or []]}")
                 lines.append(f"    - observation after `down`: processes {[p['command'][:60] for p in after_down.get('processes') or []]}, "
                              f"ports {after_down.get('ports')}; after removal: worktree directory left {after_removal.get('worktree_dir_exists')}, "
                              f"service data left {after_removal.get('service_data_left')}, processes {[p['command'][:60] for p in after_removal.get('processes') or []]}")

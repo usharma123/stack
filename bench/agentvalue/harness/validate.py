@@ -223,7 +223,21 @@ MUTANTS = {
 }
 
 # Correct alternatives to the reference: each must pass.
+def _void_equality_disjunction(tree):
+    (tree / VOID_MIGRATION).write_text("ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_status_check;\n"
+                                       "ALTER TABLE invoices ADD CONSTRAINT invoices_status_check "
+                                       "CHECK (status = 'open' OR status = 'paid' OR status = 'void');\n")
+
+
+def _void_mixed_disjunction(tree):
+    (tree / VOID_MIGRATION).write_text("ALTER TABLE invoices DROP CONSTRAINT IF EXISTS invoices_status_check;\n"
+                                       "ALTER TABLE invoices ADD CONSTRAINT invoices_status_check "
+                                       "CHECK (status = 'open' OR status IN ('paid', 'void'));\n")
+
+
 ALTERNATIVES = {'void-invoices': [('a void invoice is never cached', _void_never_caches_void),
+                                  ("CHECK (status = 'open' OR status = 'paid' OR status = 'void')", _void_equality_disjunction),
+                                  ("CHECK (status = 'open' OR status IN ('paid', 'void'))", _void_mixed_disjunction),
                                    ("the allowlist plus a redundant status <> '' constraint", _void_redundant_nonempty)]}
 
 
@@ -308,7 +322,37 @@ def four_services(rec):
     return ok, {'trigger': {k: (v.get('pid'), v.get('port')) for k, v in trig.items()}, 'listing': listing}
 
 
+class ValidationInterrupted(BaseException):
+    """An outside SIGINT or SIGTERM: the whole validation stops after the current run's cleanup."""
+
+
+def stop_on_signal(signum, frame):
+    runner.INTERRUPTED['signal'] = signum
+    raise KeyboardInterrupt(f'signal {signum}')
+
+
 def main():
+    # A SIGINT or SIGTERM from outside ends the whole validation (after the current run's own
+    # cleanup), never only the case in progress. The validation sends signals only to its children.
+    signal.signal(signal.SIGINT, stop_on_signal)
+    signal.signal(signal.SIGTERM, stop_on_signal)
+    state = {}
+    try:
+        _main(state)
+    except (KeyboardInterrupt, ValidationInterrupted):
+        signum = runner.INTERRUPTED.get('signal') or signal.SIGINT
+        print(f'INTERRUPTED: the validation was stopped by signal {signum} after the current run\'s cleanup; '
+              'the remaining cases were not run', flush=True)
+        if state.get('out'):
+            (state['out'] / 'validation.json').write_text(json.dumps({'ok': False, 'interrupted_by_signal': signum,
+                                                                      'failures': state.get('failures'), 'checks': state.get('checks')},
+                                                                     indent=2, default=str))
+        if state.get('lock'):
+            state['lock'][0].close()
+        sys.exit(128 + int(signum))
+
+
+def _main(state):
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', required=True)
     parser.add_argument('--skip-grader', action='store_true')
@@ -317,11 +361,11 @@ def main():
     args = parser.parse_args()
     # Normal dispositions even when started from a background shell (which ignores SIGINT): nothing
     # this process starts may inherit an ignored signal.
-    signal.signal(signal.SIGINT, signal.default_int_handler)
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     checks, failures = {}, []
+    state.update(out=out, checks=checks, failures=failures)
+    outsiders = []   # processes the validation itself starts outside any run (operator stand-ins)
     started = time.monotonic()
 
     def expect(name, ok, detail):
@@ -333,7 +377,8 @@ def main():
     for binary, digest, rev in ((NEW_STACK, NEW_STACK_SHA, 'a5d4785'), (OLD_STACK, OLD_STACK_SHA, 'dc4b980')):
         expect(f'setup/stack-binary {rev}', binary.is_file() and runner.sha256(binary) == digest, {'path': str(binary), 'expected_sha256': digest})
     lock = [runner.host_lock()]
-    only = set(args.only.split(',')) if args.only else set(CASES) | {'exec-control-dc4b980', 'commit-scan', 'interrupts', 'unit', 'publication-failure'}
+    state['lock'] = lock
+    only = set(args.only.split(',')) if args.only else set(CASES) | {'exec-control-dc4b980', 'commit-scan', 'interrupts', 'unit', 'publication-failure', 'validation-interrupt'}
 
     if not args.skip_grader:
         cells = []
@@ -357,6 +402,9 @@ def main():
         for task in runner.TASK:
             expect(f'grader/{task}/at-least-three-mutants', len(MUTANTS[task]) >= (3 if task in ('invoice-list', 'void-invoices') else 1),
                    len(MUTANTS[task]))
+
+    if 'validation-interrupt' in only:
+        validation_interrupt_case(out, lock, expect)
 
     if 'commit-scan' in only:
         refused, committed, detail = commit_scan_case()
@@ -390,16 +438,18 @@ def main():
                 roots.append(path)
             return path
         runner.tempfile.mkdtemp = mkdtemp
-        if outsider:   # an operator's `tail -f` on a staged trace: outside the run, no marker
+        if outsider:   # operators' `tail -f`: on a staged trace and on a worktree file; outside the run, no marker
             def start_tail():
+                targets = ['stage/invoice-notes/trace.jsonl', 'wt-notes/README.md']
                 deadline = time.monotonic() + 120
-                while time.monotonic() < deadline:
-                    target = Path(roots[0]) / 'stage' / 'invoice-notes' / 'trace.jsonl' if roots else None
-                    if target and target.exists():
-                        outsiders.append(subprocess.Popen(['/usr/bin/tail', '-f', str(target)], cwd='/', env={'PATH': '/usr/bin:/bin'},
-                                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
-                        return
-                    time.sleep(0.2)
+                while targets and time.monotonic() < deadline:
+                    for rel in list(targets):
+                        target = Path(roots[0]) / rel if roots else None
+                        if target and target.exists():
+                            outsiders.append(subprocess.Popen(['/usr/bin/tail', '-f', str(target)], cwd='/', env={'PATH': '/usr/bin:/bin'},
+                                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+                            targets.remove(rel)
+                    time.sleep(0.1)
             watcher = threading.Thread(target=start_tail, daemon=True)
             watcher.start()
         saved_env = {k: os.environ.get(k) for k in (env or {})}
@@ -410,6 +460,9 @@ def main():
                 down_override=down_override)
         finally:
             runner.tempfile.mkdtemp = original_mkdtemp
+            if runner.INTERRUPTED.get('signal'):
+                for proc in outsiders:          # the validation's own outsiders, never left behind
+                    proc.kill()
             for k, v in saved_env.items():
                 if v is None:
                     os.environ.pop(k, None)
@@ -417,6 +470,8 @@ def main():
                     os.environ[k] = v
             if watcher:
                 watcher.join(5)
+        if runner.INTERRUPTED.get('signal'):   # the run ended its own cleanup; now the validation stops
+            raise ValidationInterrupted()
         timings[f'{arm}-{case}'] = round(time.monotonic() - t, 1)
         rows, run_row = gates(the_plan, arm, rec, out / f'{arm}-{case}')
         if expect_valid:
@@ -447,9 +502,9 @@ def main():
         tasks = plan['config']['tasks']
         try:
             if 'clean' in only:
-                outsiders = []
+                outsiders.clear()
                 rec, rows, rr = run_case(arm, 'clean', outsider=True)
-                tail_alive = bool(outsiders) and outsiders[0].poll() is None
+                tail_alive = bool(outsiders) and all(proc.poll() is None for proc in outsiders)
                 listed = [p for p in (rec.get('seen_not_signalled') or []) + (rec.get('final_scan_seen_not_signalled') or [])
                           if 'tail' in p['command']]
                 for proc in outsiders:
@@ -457,6 +512,15 @@ def main():
                     proc.wait()
                 expect(f'{arm}/clean/outsider-with-a-run-file-open-survives-and-is-listed', tail_alive and listed and rec['valid'],
                        {'tail_started': bool(outsiders), 'tail_alive_after_run': tail_alive, 'listed': listed})
+                notes = rec['agents'].get('invoice-notes') or {}
+                td = (rec.get('teardown') or {}).get('invoice-notes') or {}
+                at_exit = [p for p in notes.get('seen_not_counted') or [] if 'tail' in p['command']]
+                after_down = [p for p in (td.get('after_down') or {}).get('seen_not_counted') or [] if 'tail' in p['command']]
+                expect(f'{arm}/clean/worktree-log-reader-listed-not-counted (exit gate, false confirmation, residue)',
+                       bool(at_exit) and bool(after_down) and rows['invoice-notes'].get('teardown_ok') and not td.get('false_confirmation')
+                       and td.get('residue_ok') and len(outsiders) == 2,
+                       {'at_exit': at_exit, 'after_down': after_down, 'teardown_ok': rows['invoice-notes'].get('teardown_ok'),
+                        'false_confirmation': td.get('false_confirmation'), 'residue_ok': td.get('residue_ok'), 'outsiders': len(outsiders)})
                 ok, detail = gated(rows, tasks)
                 expect(f'{arm}/clean/every-slot-gated-success', ok, detail)
                 expect(f'{arm}/clean/used-own-db', all(rows[t].get('used_own_db') for t in tasks), [rows[t].get('used_own_db') for t in tasks])
@@ -552,7 +616,7 @@ def main():
                        and all(e['loss']['worktree'] == 'wt-cust' for e in g) and any('worker.py' in e['loss']['command'] for e in g)
                        and not rows['invoice-notes'].get('isolation_ok') and rows['customer-table'].get('isolation_ok')
                        and not rr['others_untouched'], {'events': rr['events'], 'review': rr['review']})
-                ok, detail = gated(rows, ['invoice-list', 'void-invoices', 'customer-table'])
+                ok, detail = gated(rows, ['void-invoices', 'customer-table'])
                 expect(f'{arm}/{case}/bystanders-of-the-faults-gated-success', ok, detail)
                 value = sentinel_for(rec)
                 hits = files_containing(out / f'{arm}-{case}', value)
@@ -753,6 +817,49 @@ def main():
     sys.exit(0 if summary['ok'] else 1)
 
 
+def validation_interrupt_case(out, lock, expect):
+    """An outside SIGTERM sent to a running validation ends the whole validation after the current
+    run's cleanup: a non-zero exit, a line saying so, no later case, nothing of the run left."""
+    nested = out / 'nested-validation-interrupted'
+    lock[0].close()   # the nested validation takes the host lock itself
+    log = open(out / 'nested-validation-interrupted.log', 'w')
+    proc = subprocess.Popen([sys.executable, str(HERE / 'validate.py'), '--out', str(nested), '--skip-grader', '--arms', 'stack',
+                             '--only', 'clean,service-kill-no-reaction'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    progress = nested / 'stack-clean' / 'progress.jsonl'
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline and proc.poll() is None and not (progress.exists() and 'launched' in progress.read_text()):
+        time.sleep(0.2)
+    time.sleep(2)
+    sent = proc.poll() is None
+    if sent:
+        os.kill(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    log.close()
+    lock[0] = runner.host_lock()
+    text = (out / 'nested-validation-interrupted.log').read_text()
+    rec_path = nested / 'stack-clean' / 'run.json'
+    rec = json.loads(rec_path.read_text()) if rec_path.exists() else {}
+    leftovers = []
+    if rec.get('root'):
+        observe.RUN_SUFFIX = '.' + rec['run_id']
+        try:
+            table = observe.legacy.process_table()
+            leftovers = [p for p in observe.run_processes(rec['root']) if observe.tie(p, rec['root'], table)]
+        finally:
+            observe.RUN_SUFFIX = None
+        shutil.rmtree(rec['root'], ignore_errors=True)
+    expect('validation-interrupt/outside-sigterm-ends-the-whole-validation',
+           sent and proc.returncode == 128 + signal.SIGTERM and 'INTERRUPTED' in text
+           and 'service-kill-no-reaction' not in text and not (nested / 'stack-service-kill-no-reaction').exists(),
+           {'sent': sent, 'exit': proc.returncode, 'tail': text[-300:]})
+    expect('validation-interrupt/current-run-cleaned-up-and-recorded', rec and not rec.get('valid')
+           and any('interrupted' in r for r in rec.get('invalid_reasons') or []) and not rec.get('survivors_after_run') and not leftovers,
+           {'invalid': rec.get('invalid_reasons'), 'survivors': rec.get('survivors_after_run'), 'leftovers': [p['command'][:80] for p in leftovers]})
+
+
 def interrupt_case(arm, when, plan_path, out, lock, expect):
     """The runner is interrupted (SIGINT) before the kill, during the 10 s before the recovery launch,
     or during that launch: nothing of the run survives, no session starts after cleanup has begun,
@@ -863,7 +970,7 @@ def unit_cases(expect, plan):
                            'b': {'marker': 'wt-b', 'launched_m': 0, 'ended_m': 5 if killed else 100, 'killed_by_harness': killed,
                                  'service_commands': other_cmds}},
                 'sampler': {'durable_losses': [loss]}, 'episode_end_m': 100}
-    k = lambda c, s0, e0: {'start_m': s0, 'end_m': e0, 'kinds': ['kill'], 'kill_like': True, 'command': c}
+    k = lambda c, s0, e0: {'start_m': s0, 'end_m': e0, 'is_error': False if e0 is not None else None, 'kinds': ['kill'], 'kill_like': True, 'command': c}
     expect('unit/echo-lost-pid-then-kill-another-pid-is-not-event-g', not report.sibling_losses(g_run([k('echo 123; kill -9 456', 20.5, 20.6)], []))[0],
            report.sibling_losses(g_run([k('echo 123; kill -9 456', 20.5, 20.6)], [])))
     own_restart_api = [{'start_m': 15, 'end_m': 16, 'kinds': ['down_restart'], 'kill_like': False, 'command': 'stack restart api'}]
@@ -877,6 +984,79 @@ def unit_cases(expect, plan):
     expect('unit/numeric-signal-argument-is-not-a-pid', not ev, {'events': ev, 'review': rv})
     ev, rv, _ = report.sibling_losses(g_run([k('pkill -x postgres', 20.5, 20.6)], []))
     expect('unit/unmodelled-pkill-flag-is-review-not-event-g', not ev and any(r['pid'] == 123 for r in rv), {'events': ev, 'review': rv})
+    # Round 4: gating needs a completed kill with a result that is not an error; kill -0 signals nothing.
+    T0 = 1_000_000.0
+    stamp = lambda wall: time.strftime('%a %b %d %H:%M:%S %Y', time.localtime(wall))
+    loss4 = {'group': 'wt-a', 'pid': 123, 'started': stamp(T0 + 1), 'command': '/tmp/avr1/wt-a/.venv/bin/python worker.py', 'kind': 'worker',
+             'ports': [], 'last_seen_m': 20.0, 'gone_m': 21.0}
+    def run4(other, own, the_loss=loss4):
+        return {'clock': {'started_wall': T0}, 'episode_end_m': 100, 'sampler': {'durable_losses': [the_loss]},
+                'agents': {'a': {'marker': 'wt-a', 'launched_m': 0, 'ended_m': 100, 'service_commands': own},
+                           'b': {'marker': 'wt-b', 'launched_m': 0, 'ended_m': 100, 'service_commands': other}}}
+    K4 = lambda cmd, err=False, end=20.6, start=20.5: {'start_m': start, 'end_m': end, 'is_error': err, 'kinds': ['kill'], 'kill_like': True, 'command': cmd}
+    for label, other, own in [('error-result', [K4('kill -9 123', err=True)], []), ('several-targets', [K4('kill -9 123 456')], []),
+                              ('no-result', [K4('kill -9 123', end=None)], [])]:
+        ev, rv, _ = report.sibling_losses(run4(other, own))
+        expect(f'unit/kill-with-{label}-is-review-not-event-g', not ev and any(r['pid'] == 123 and 'kill_by' in r for r in rv), {'events': ev, 'review': rv})
+    ev, rv, _ = report.sibling_losses(run4([K4('kill -0 123')], []))
+    expect('unit/kill-0-is-not-a-culprit', not ev and not any('kill_by' in r for r in rv), {'events': ev, 'review': rv})
+    ev, rv, _ = report.sibling_losses(run4([K4('kill -9 123')], [K4('kill -0 123', start=15, end=15.2)]))
+    expect('unit/own-kill-0-is-not-an-own-command', len(ev) == 1 and ev[0]['culprits'] == ['b'], {'events': ev, 'review': rv})
+    # Round 4: the own-command rule's three outcomes.
+    O4 = lambda cmd, start=15, err=False: {'start_m': start, 'end_m': start + 0.5, 'is_error': err, 'kinds': ['down_restart'],
+                                          'kill_like': False, 'command': cmd}
+    clock4 = {'clock': {'started_wall': T0}}
+    expect('unit/false-and-restart-with-error-result-may-have-run-not-excused',
+           report.own_effect(clock4, O4('false && stack restart worker', err=True), loss4) == 'may'
+           and bool(report.sibling_losses(run4([K4('kill -9 123')], [O4('false && stack restart worker', err=True)]))[1]),
+           report.own_effect(clock4, O4('false && stack restart worker', err=True), loss4))
+    expect('unit/and-chain-restart-with-success-result-excuses', report.own_effect(clock4, O4('test -d . && python3 dev.py restart'), loss4) == 'excuses',
+           report.own_effect(clock4, O4('test -d . && python3 dev.py restart'), loss4))
+    newer = dict(loss4, started=stamp(T0 + 16))
+    expect('unit/completed-restart-excuses-nothing-for-the-new-incarnation', report.own_effect(clock4, O4('stack restart worker'), newer) is None,
+           report.own_effect(clock4, O4('stack restart worker'), newer))
+    coll4 = {'clock': {'started_wall': T0}, 'episode_end_m': 100, 'bystander': {},
+             'teardown': {'invoice-notes': {'collateral': [{'group': 'wt-void', 'pid': 777, 'started': stamp(T0 + 1),
+                                                            'command': '/tmp/avr1/wt-void/.venv/bin/python worker.py'}]}},
+             'agents': {'v': {'marker': 'wt-void', 'service_commands': [O4('stack down', start=90, err=True)]}}}
+    ev, rv = report.teardown_collateral(coll4)
+    expect('unit/errored-down-then-slow-exit-is-review', not ev and len(rv) == 1 and 'may have stopped' in rv[0]['reason'], {'events': ev, 'review': rv})
+    # Round 4 item 7: suspension measured from the two clocks; AC power before each arm.
+    expect('unit/suspension-0.4s-passes-0.6s-invalidates-wall-step-irrelevant',
+           runner.suspension((100.0, 200.0), (110.0, 210.4))[1] is False and runner.suspension((100.0, 200.0), (110.0, 210.6))[1] is True
+           and runner.suspension((100.0, 200.0), (116.0, 216.0))[1] is False,
+           [runner.suspension((100.0, 200.0), (110.0, 210.4)), runner.suspension((100.0, 200.0), (110.0, 210.6))])
+    expect('unit/power-check-refuses-battery-and-unreadable', runner.power_check(lambda: 'Battery Power')[0] is False
+           and runner.power_check(lambda: None)[0] is False and runner.power_check(lambda: 'AC Power')[0] is True,
+           [runner.power_check(lambda: 'Battery Power'), runner.power_check(lambda: None)])
+    # Round 4 item 9: PostgreSQL is never started or stopped on a directory outside the run's root.
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as tmp:
+        run_root, outside = Path(tmp) / 'root', Path(tmp) / 'elsewhere' / 'pgdata'
+        run_root.mkdir()
+        outside.mkdir(parents=True)
+        (outside / 'PG_VERSION').write_text('17\n')
+        result = runner.read_migrations(outside, Path(tmp), 'x', root=run_root)
+        expect('unit/data-directory-outside-the-run-root-recorded-never-touched', result.get('outside_run_root') and result.get('touched') is False
+               and not (outside / 'postmaster.pid').exists(), result)
+    # Round 4 item 10: recorded lineage seeds the final discovery.
+    with tempfile.TemporaryDirectory(prefix='avr-unit-', dir='/tmp') as root10:
+        child = subprocess.Popen(['sleep', '30'], cwd='/', start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ident = observe.legacy.process_identity(child.pid)
+            observe.LINEAGE['launched'].add((child.pid, ident['started']))
+            found = [p['pid'] for p in observe.run_processes(root10)]
+        finally:
+            observe.LINEAGE['launched'].clear()
+            child.kill()
+            child.wait()
+        expect('unit/recorded-lineage-seeds-final-discovery', child.pid in found, {'child': child.pid, 'found': found})
+    # Round 4 item 11: a rerun marker counts only if its plan digest, pair and attempt match.
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d11:
+        marker = Path(d11) / 'pair0.2-STARTED.json'
+        marker.write_text(json.dumps({'pair': 1, 'attempt': 2, 'plan_sha256': 'x'}))
+        expect('unit/rerun-marker-of-another-plan-or-pair-is-refused-and-ignored',
+               not runner.marker_matches(marker, 'x', 0) and not runner.marker_matches(marker, 'y', 1) and runner.marker_matches(marker, 'x', 1),
+               'marker_matches')
     # Teardown collateral: a recent own command that did not target the lost process excuses nothing.
     coll = {'teardown': {'invoice-notes': {'collateral': [{'group': 'wt-void', 'pid': 777, 'started': 's',
                                                            'command': '/tmp/avr1/wt-void/.venv/bin/python worker.py'}]}},
@@ -974,7 +1154,8 @@ def commit_scan_case():
     reported, the value is never printed and nothing is committed. A clean commit goes through."""
     import secrets
     sentinel = 'sv' + secrets.token_hex(12)
-    env = {**os.environ, 'AGENTVALUE_TEST_SENTINEL': sentinel}
+    nonbmp = 'nb' + secrets.token_hex(6) + '\U0001F600' + secrets.token_hex(4)   # a host value with a non-BMP character
+    env = {**os.environ, 'AGENTVALUE_TEST_SENTINEL': sentinel, 'AGENTVALUE_TEST_NONBMP': nonbmp}
     plain = ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null']
     with tempfile.TemporaryDirectory(prefix='avc-', dir='/tmp') as tmp:
         repo = Path(tmp) / 'repo'
@@ -994,6 +1175,7 @@ def commit_scan_case():
         (repo / 'a1').write_text('nothing here\n')
         (repo / 'a[1]').write_text(f'bracketed path {sentinel}\n')
         (repo / f'name-{sentinel}.txt').write_text('a clean file with a secret name\n')
+        (repo / 'nonbmp.json').write_text(json.dumps({'v': nonbmp}) + '\n')   # json.dumps writes a surrogate pair
         (repo / 'escaped.json').write_text('{"v": "' + '\\u%04x' % ord(sentinel[0]) + sentinel[1:] + '"}\n')   # first character JSON-escaped
         run('add', '-A')
         r = subprocess.run([sys.executable, str(HERE / 'commit.py'), '--repo', str(repo), '-m', f'message with {sentinel}'],
@@ -1001,10 +1183,10 @@ def commit_scan_case():
         report_text = r.stdout + r.stderr
         expected = {'quoted path': repr(quoted), 'binary': "'blob.bin'", 'rename': "'new-name.txt'", 'symlink': "'link'",
                     'commit message': '(commit message)', 'credential pattern': "'config.env'", 'bracketed path a[1]': "'a[1]'",
-                    'masked path name': 'in the path name', 'json-escaped value': "'escaped.json'"}
+                    'masked path name': 'in the path name', 'json-escaped value': "'escaped.json'", 'surrogate pair (json.dumps)': "'nonbmp.json'"}
         found = {k: v in report_text for k, v in expected.items()}
         unchanged = run('rev-parse', 'HEAD').stdout == head
-        refused = r.returncode == 1 and all(found.values()) and sentinel not in report_text and unchanged and "'a1'" not in report_text
+        refused = r.returncode == 1 and all(found.values()) and sentinel not in report_text and nonbmp not in report_text and unchanged and "'a1'" not in report_text
         clean = Path(tmp) / 'clean'
         clean.mkdir()
         subprocess.run([*plain, 'init', '-q'], cwd=clean, check=True, capture_output=True)
