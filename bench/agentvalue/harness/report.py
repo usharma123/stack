@@ -412,7 +412,46 @@ def xargs_kill(argv):
     rest = argv[i:]
     if not rest or Path(rest[0]).name != 'kill':
         return None
+    if _kill_operands(rest)[0] == 'null':
+        return None            # signal 0 signals nothing, also at the end of a pipeline
     return i == 1 and rest[1:] in ([], ['-9'], ['-KILL'], ['-TERM'], ['-15'])
+
+
+DOWN_RESTART_TEXT = re.compile(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart)\b')
+KILL_WORD = re.compile(r'\b(kill|pkill|killall|fuser)\b')
+
+
+def read_command(text):
+    """The structured reading of a command, taken from its original text when it is captured (before
+    redaction, PROTOCOL.md "Validity"): its simple commands with their operators and place in the
+    statement, or, for text the harness does not interpret, the facts the rules use (a kill word, a
+    down/restart, the numbers and ports it names). The reporter classifies from this reading."""
+    parsed = simple_commands(text)
+    reading = {'parsed': parsed}
+    if parsed is None:
+        reading['unparsed'] = {'kill_word': bool(KILL_WORD.search(text)), 'down_restart': bool(DOWN_RESTART_TEXT.search(text)),
+                               'numbers': sorted(set(re.findall(r'\b\d+\b', text))), 'ports': sorted(set(re.findall(r':(\d+)\b', text)))}
+    return reading
+
+
+def map_reading(reading, function):
+    """The reading with `function` (a scrubber) applied to every string token in it."""
+    out = dict(reading)
+    if reading.get('parsed') is not None:
+        out['parsed'] = [dict(c, argv=[function(t) for t in c['argv']]) for c in reading['parsed']]
+    return out
+
+
+def _reading(command):
+    """A reading from a stored service command (its captured reading, else its text: old records and
+    fixtures), from a reading itself, or from command text."""
+    if isinstance(command, dict):
+        if 'parsed' in command:
+            return command
+        if command.get('reading'):
+            return command['reading']
+        command = command.get('command') or ''
+    return read_command(command)
 
 
 def identifies(command, loss):
@@ -425,9 +464,10 @@ def identifies(command, loss):
     full = loss.get('command') or ''
     name = Path(full.split()[0]).name if full.split() else ''
     ports = [str(p) for p in loss.get('ports') or []]
-    parsed = simple_commands(command)
+    reading = _reading(command)
+    parsed = reading['parsed']
     if parsed is None:   # substitution, variables...: a kill there could explain it, but is never gated
-        return 'review' if re.search(r'\b(kill|pkill|killall|fuser)\b', command) else None
+        return 'review' if reading['unparsed']['kill_word'] else None
     verdict = None
     for index, c in enumerate(parsed):
         # Inside a compound form the keywords and parentheses are dropped for reading; such a kill is
@@ -484,9 +524,10 @@ RESTART_NAMES = {'postgres': 'postgres', 'redis': 'redis', 'api': 'api', 'worker
 def stops_service(command, loss):
     """An own command that makes a loss ambiguous: the arm's `down` always; a `restart` only when it
     covers the lost service (no service named = all of them; a named list must include it)."""
-    parsed = simple_commands(command)
+    reading = _reading(command)
+    parsed = reading['parsed']
     if parsed is None:
-        return bool(re.search(r'\b(?:stack|dev\.py)\b[^\n;&|]*\b(?:down|restart)\b', command))
+        return reading['unparsed']['down_restart']
     kind = loss.get('kind')
     for c in parsed:
         argv = _strip_wrappers(c['argv'])
@@ -514,24 +555,28 @@ def _lstart_wall(started):
 
 
 def _target_clause(command, loss):
-    """The part of `command` that targets the lost process, as (parsed, first, last): the simple
-    commands from `first` to `last` (one, or an `lsof … | xargs kill` pipeline). It is the arm's down, a
-    restart covering its service, or a kill naming its pid (signal 0 excluded) or matching it by
-    pattern or port. A port form counts only when the pipeline itself kills: `lsof`, `pgrep`, `ps`,
-    `ss`, `netstat` on their own stop nothing and never target anything. Returns 'unparsed' when the
-    text is not interpreted but names a down/restart or a kill of that pid or port, or None."""
-    parsed = simple_commands(command)
+    """The part of `command` that targets the lost process, as (parsed, first, last, sure): the simple
+    commands from `first` to `last` (one, or an `lsof … | xargs kill` pipeline), and whether the reading
+    is certain (`sure` is False for a form only listed for review, which can never excuse). It is the
+    arm's down, a restart covering its service, or a kill naming its pid (signal 0 excluded, also
+    through a pipeline) or matching it by pattern or port. A port form counts only when the pipeline
+    itself kills: `lsof`, `pgrep`, `ps`, `ss`, `netstat` on their own stop nothing and never target
+    anything. Returns 'unparsed' when the text is not interpreted but names a down/restart or a kill of
+    that pid or port, or None."""
+    reading = _reading(command)
+    parsed = reading['parsed']
     if parsed is None:
-        if stops_service(command, loss):
+        if stops_service(reading, loss):
             return 'unparsed'
-        names = [rf'\b{loss["pid"]}\b'] + [rf':{p}\b' for p in loss.get('ports') or []]
-        if re.search(r'\bkill\b', command) and any(re.search(n, command) for n in names):
+        facts = reading['unparsed']
+        named = str(loss['pid']) in facts['numbers'] or any(str(p) in facts['ports'] for p in loss.get('ports') or [])
+        if facts['kill_word'] and named:
             return 'unparsed'           # e.g. `kill $(lsof -ti :P)`: a kill of it the harness does not read
         return None
     for index, c in enumerate(parsed):
         text = ' '.join(shlex.quote(t) for t in c['argv'])
         if stops_service(text, loss):
-            return parsed, index, index
+            return parsed, index, index, True
         argv = [t.strip('(){}') for t in c['argv']]
         while argv and (argv[0] in COMPOUND_WORDS or not argv[0]):
             argv = argv[1:]
@@ -540,13 +585,14 @@ def _target_clause(command, loss):
         if base in ('kill', 'pkill', 'killall', 'fuser'):
             probe = identifies(' '.join(shlex.quote(t) for t in argv), loss)
             if probe in GATE or probe == 'review' and base == 'kill' and str(loss['pid']) in argv:
-                return parsed, index, index
+                return parsed, index, index, probe in GATE
         elif base == 'lsof' and c['after'] == '|' and index + 1 < len(parsed):
             nxt = _strip_wrappers(parsed[index + 1]['argv'])
             if nxt and Path(nxt[0]).name == 'xargs' and xargs_kill(nxt) is not None:
                 pipeline = ' '.join(shlex.quote(t) for t in argv) + ' | ' + ' '.join(shlex.quote(t) for t in nxt)
-                if identifies(pipeline, loss) in GATE + ('review',):
-                    return parsed, index, index + 1
+                probe = identifies(pipeline, loss)
+                if probe in GATE + ('review',):
+                    return parsed, index, index + 1, probe in GATE
     return None
 
 
@@ -581,7 +627,7 @@ def own_effect(run, command, loss):
     None       it did not target the process (a read-only command such as `lsof`, `pgrep` or `ps` never
                does), or started before the lost process did (the loss is scored as if the command
                were absent)."""
-    target = _target_clause(command.get('command') or '', loss)
+    target = _target_clause(command, loss)
     if target is None:
         return None
     started_wall = ((run.get('clock') or {}).get('started_wall'))
@@ -594,7 +640,9 @@ def own_effect(run, command, loss):
             return 'may'                    # within the same second: cannot tell which came first
     if target == 'unparsed':
         return 'may'
-    certain = certainly_ran(*target) and command.get('end_m') is not None and command.get('is_error') is False
+    parsed, first, last, sure = target
+    # A reading only listed for review (an unmodelled form) is "may have run" at most, never an excuse.
+    certain = sure and certainly_ran(parsed, first, last) and command.get('end_m') is not None and command.get('is_error') is False
     return 'excuses' if certain else 'may'
 
 
@@ -616,34 +664,54 @@ def _overlaps(command, agent, lo, hi, episode_end=None):
     return start is not None and start <= hi and end >= lo
 
 
-def existed_when_returned(run, command, loss):
-    """Whether the lost process already existed when the kill command returned: its start time (1 s
-    resolution) is before the second in which the command's result arrived. True when either time is
-    not recorded (the kill is then judged on its text alone, as before)."""
+def existed_when_issued(run, command, loss):
+    """Whether the lost process already existed when the kill command was issued: its start time (1 s
+    resolution) is before the second in which the command's trace line arrived. True when either
+    time is not recorded (the kill is then judged on its text alone, as before)."""
     started_wall = (run.get('clock') or {}).get('started_wall')
     process_wall = _lstart_wall(loss.get('started'))
-    if started_wall is None or process_wall is None or command.get('end_m') is None:
+    if started_wall is None or process_wall is None or command.get('start_m') is None:
         return True
-    return process_wall < int(started_wall + command['end_m'])
+    return process_wall < int(started_wall + command['start_m'])
 
 
-def sibling_losses(run):
-    """Event (g) per the amended protocol. Returns (events, review, not_events)."""
+def _start_key(started):
+    wall = _lstart_wall(started)
+    return str(int(wall)) if wall is not None else re.sub(r'\s+', '_', str(started))
+
+
+def _candidate(key, c, role, automatic):
+    """One candidate command of a ledger row, untruncated, with its trace location (relative to the run)."""
+    return {'session': key, 'role': role, 'trace': f'agents/{key}/trace.jsonl', 'line': c.get('line'),
+            'issued_m': c.get('start_m'), 'returned_m': c.get('end_m'),
+            'result': 'error' if c.get('is_error') is True else 'ok' if c.get('is_error') is False else 'none',
+            'reading': c.get('reading'), 'command': c.get('command'), 'automatic': automatic}
+
+
+def episode_ledger(run):
+    """One adjudication row per durable service process lost during the episode (PROTOCOL.md,
+    "Adjudication ledger"), with its automatic disposition under event (g): 'blamed' (culprits named),
+    'review', 'excused', 'unexplained', or 'exempt' (the injected postmaster), and every candidate
+    command: kills by other sessions overlapping the loss, and its own session's commands in the 10 s
+    before. Losses of the main checkout are version 1 event (c), not event (g), and are not rows."""
     agents = run.get('agents') or {}
     fault = run.get('fault') or {}
     kill = fault.get('kill') or {}
     exempt = (kill.get('pid'), kill.get('started')) if fault.get('injected') and run.get('scenario') == 'service-kill' else None
     episode_end = run.get('episode_end_m')
-    events, review, not_events = [], [], []
+    rows = []
     for loss in (run.get('sampler') or {}).get('durable_losses') or []:
         group, last, gone = loss['group'], loss['last_seen_m'], loss['gone_m']
-        item = {'worktree': group, 'pid': loss['pid'], 'command': (loss.get('command') or '')[:160], 'last_seen_m': last, 'gone_m': gone}
         if group == 'main':
             continue                               # the bystander: version 1 event (c), and teardown collateral
         if episode_end is not None and last >= episode_end:
             continue                               # after the episode: teardown collateral decides
+        row = {'phase': 'episode', 'key': f"{group}/{loss['pid']}/{_start_key(loss.get('started'))}", 'worktree': group,
+               'pid': loss['pid'], 'started': loss.get('started'), 'command': loss.get('command') or '',
+               'lost_between_m': [last, gone], 'candidates': [], 'culprits': []}
+        rows.append(row)
         if exempt and (loss['pid'], loss['started']) == exempt:
-            not_events.append({**item, 'reason': 'the injected postmaster'})
+            row.update(disposition='exempt', reason='the injected postmaster')
             continue
         lo, hi = last - WIDEN_S, gone + WIDEN_S
         culprits, unparseable = set(), set()
@@ -653,38 +721,97 @@ def sibling_losses(run):
             for c in a.get('service_commands') or []:
                 if not c.get('kill_like') or not _overlaps(c, a, lo, hi, episode_end):
                     continue
-                verdict = identifies(c['command'], loss)
+                verdict = identifies(c, loss)
+                why = f'identifies it ({verdict})' if verdict in GATE else 'could explain it, not gated' if verdict == 'review' else 'does not identify it'
                 if verdict in GATE and (c.get('end_m') is None or c.get('is_error') is not False):
-                    verdict = 'review'      # no result (a killed CLI's included) or an error result: never gated
-                if verdict in GATE and not existed_when_returned(run, c, loss):
-                    verdict = 'review'      # it started in the second the result arrived, or later: not shown signalled
+                    verdict, why = 'review', 'identifies it, but no result or an error result: never gated'
+                if verdict in GATE and not existed_when_issued(run, c, loss):
+                    verdict, why = 'review', 'identifies it, but it started in the second the kill was issued or later'
                 if verdict in GATE:
                     culprits.add(k)
                 elif verdict == 'review':
                     unparseable.add(k)
-        effects = [(k, c, own_effect(run, c, loss)) for k, a in agents.items() if a.get('marker') == group
-                   for c in a.get('service_commands') or [] if _overlaps(c, a, last - OWN_WINDOW_S, gone, episode_end)]
+                row['candidates'].append(_candidate(k, c, 'kill by another session', why))
+        effects = []
+        for k, a in agents.items():
+            if a.get('marker') != group:
+                continue
+            for c in a.get('service_commands') or []:
+                if not _overlaps(c, a, last - OWN_WINDOW_S, gone, episode_end):
+                    continue
+                effect = own_effect(run, c, loss)
+                effects.append((k, c, effect))
+                if effect or set(c.get('kinds') or []) & {'kill', 'down_restart'}:
+                    row['candidates'].append(_candidate(k, c, 'own command', {'excuses': 'excuses it', 'may': 'may have stopped it',
+                                                                               None: 'excuses nothing'}[effect]))
         excused = [(k, c) for k, c, e in effects if e == 'excuses']
         uncertain = [(k, c) for k, c, e in effects if e == 'may']
         own = excused + uncertain
         if culprits and not own:
-            events.append({'kind': 'sibling_service_lost', 'detail': f"{group}: {item['command'][:80]} (pid {loss['pid']})",
-                           'culprits': sorted(culprits), 'loss': item})
+            row.update(disposition='blamed', culprits=sorted(culprits), reason='a kill by another session identifies it')
         elif culprits and excused:
-            review.append({**item, 'reason': 'ambiguous: its own session stopped or killed it just before', 'kill_by': sorted(culprits)})
+            row.update(disposition='review', reason='ambiguous: its own session stopped or killed it just before', kill_by=sorted(culprits))
         elif culprits:
-            review.append({**item, 'reason': 'its own session ran a command that may have stopped it (uncertain whether it ran)',
-                           'kill_by': sorted(culprits)})
+            row.update(disposition='review', reason='its own session ran a command that may have stopped it (uncertain whether it ran)',
+                       kill_by=sorted(culprits))
         elif unparseable:
-            review.append({**item, 'reason': 'a kill the harness does not gate (conditional, unmodelled, several targets, an error result, no result, '
-                                     'or a match that started as it returned or later) could explain it',
-                           'kill_by': sorted(unparseable)})
+            row.update(disposition='review', reason='a kill the harness does not gate (conditional, unmodelled, several targets, an error result, '
+                       'no result, or a match that started in the second it was issued or later) could explain it', kill_by=sorted(unparseable))
         elif excused:
-            not_events.append({**item, 'reason': 'its own session stopped or restarted it', 'command_by': excused[-1][0]})
+            row.update(disposition='excused', reason='its own session stopped or restarted it', command_by=excused[-1][0])
         elif uncertain:
-            review.append({**item, 'reason': 'its own session ran a command that may have stopped it', 'command_by': uncertain[-1][0]})
+            row.update(disposition='review', reason='its own session ran a command that may have stopped it', command_by=uncertain[-1][0])
         else:
-            review.append({**item, 'reason': 'no identifying kill command explains it'})
+            row.update(disposition='unexplained', reason='no identifying kill command explains it')
+    return rows
+
+
+DECISIONS = {'episode': ('blamed:', 'not-an-event', 'review'), 'teardown': ('collateral', 'not-an-event', 'review'),
+             'between-teardowns': ('collateral', 'not-an-event', 'review')}
+
+
+def check_decision(row, decision, sessions):
+    """An adjudication decision must fit the row's phase; `blamed:<session>` must name a session of the run."""
+    text = (decision or {}).get('decision') if isinstance(decision, dict) else None
+    allowed = DECISIONS[row['phase']]
+    if not isinstance(text, str) or not (text in allowed or (text.startswith('blamed:') and 'blamed:' in allowed)):
+        raise ValueError(f"adjudication for {row.get('id', row['key'])}: decision {text!r} is not one of {allowed} for a {row['phase']} row")
+    if text.startswith('blamed:') and text[len('blamed:'):] not in sessions:
+        raise ValueError(f"adjudication for {row.get('id', row['key'])}: {text!r} names no session of the run")
+    if not isinstance(decision.get('reason'), str) or not decision['reason'].strip():
+        raise ValueError(f"adjudication for {row.get('id', row['key'])}: a decision needs a reason")
+    return text
+
+
+def _item(row):
+    return {'worktree': row['worktree'], 'pid': row['pid'], 'command': row['command'][:160],
+            'last_seen_m': row['lost_between_m'][0], 'gone_m': row['lost_between_m'][1]}
+
+
+def sibling_losses(run, decisions=None, prefix=''):
+    """Event (g) per the amended protocol, from the episode ledger; with `decisions` (row id ->
+    {decision, reason}) the adjudicated outcome. Returns (events, review, not_events)."""
+    events, review, not_events = [], [], []
+    for row in episode_ledger(run):
+        item = _item(row)
+        decided = (decisions or {}).get(prefix + row['key'])
+        if decided is not None:
+            text = check_decision(row, decided, set(run.get('agents') or {}))
+            if text.startswith('blamed:'):
+                events.append({'kind': 'sibling_service_lost', 'detail': f"{row['worktree']}: {row['command'][:80]} (pid {row['pid']})",
+                               'culprits': [text[len('blamed:'):]], 'loss': item, 'adjudicated': decided['reason']})
+            elif text == 'not-an-event':
+                not_events.append({**item, 'reason': f"adjudicated: {decided['reason']}"})
+            else:
+                review.append({**item, 'reason': f"adjudicated as undecided: {decided['reason']}"})
+            continue
+        if row['disposition'] == 'blamed':
+            events.append({'kind': 'sibling_service_lost', 'detail': f"{row['worktree']}: {row['command'][:80]} (pid {row['pid']})",
+                           'culprits': row['culprits'], 'loss': item})
+        elif row['disposition'] in ('excused', 'exempt'):
+            not_events.append({**item, 'reason': row['reason'], **({'command_by': row['command_by']} if 'command_by' in row else {})})
+        else:
+            review.append({**item, 'reason': row['reason'], **{k: row[k] for k in ('kill_by', 'command_by') if k in row}})
     return events, review, not_events
 
 
@@ -723,49 +850,80 @@ def service_kind_of(command):
     return None
 
 
-def teardown_collateral(run):
+def teardown_ledger(run):
+    """One adjudication row per durable service process lost during the teardown (PROTOCOL.md,
+    "Teardown collateral" and "Adjudication ledger"): 'collateral' when no own command of its worktree
+    explains it, 'review' for its own slow exit (its session stopped it, or may have, in the 30 s before
+    the episode ended) and for a loss between two teardowns. Candidates: that session's commands."""
+    rows = []
+    end = run.get('episode_end_m')
+    agents = run.get('agents') or {}
+    for task, t in (run.get('teardown') or {}).items():
+        for phase, lost in (('teardown', t.get('collateral') or []), ('between-teardowns', t.get('lost_before_this_teardown') or [])):
+            for v in lost:
+                row = {'phase': phase, 'key': f"{phase}/{task}/{v['group']}/{v['pid']}/{_start_key(v.get('started'))}",
+                       'worktree': v['group'], 'pid': v['pid'], 'started': v.get('started'), 'command': v['command'],
+                       'torn_down': task, 'lost_between_m': None, 'candidates': [], 'culprits': []}
+                rows.append(row)
+                window = next((w for w in run.get('teardown_windows') or [] if w.get('task') == task), None)
+                if window:
+                    row['lost_between_m'] = [window.get('start_m'), window.get('end_m')]
+                detail = f"{v['group']}: {v['command'][:80]} (pid {v['pid']}) lost while {SHORT_OF.get(task, task)} was torn down"
+                if phase == 'between-teardowns':
+                    row.update(disposition='review', reason=f'lost between two teardowns (before {task}); not attributed', detail=detail)
+                    continue
+                loss = {'pid': v['pid'], 'started': v.get('started'), 'command': v['command'], 'kind': service_kind_of(v['command']),
+                        'ports': v.get('ports') or []}
+                found = None
+                for k, a in agents.items():
+                    if a.get('marker') != v['group']:
+                        continue
+                    for c in a.get('service_commands') or []:
+                        if end is None or c.get('start_m') is None or not (end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= end):
+                            continue
+                        effect = own_effect(run, c, loss)
+                        if effect or set(c.get('kinds') or []) & {'kill', 'down_restart'}:
+                            row['candidates'].append(_candidate(k, c, 'own command', {'excuses': 'excuses it', 'may': 'may have stopped it',
+                                                                                       None: 'excuses nothing'}[effect]))
+                        if effect == 'excuses' and (found is None or found[0] != 'excuses'):
+                            found = ('excuses', c['command'][:120])
+                        elif effect == 'may' and found is None:
+                            found = ('may', c['command'][:120])
+                if found:
+                    kind, command = found
+                    why = 'its own slow exit: its own session stopped it' if kind == 'excuses' else \
+                        'its own session ran a command that may have stopped it (uncertain whether it ran)'
+                    row.update(disposition='review', reason=f'{detail}; {why} in the 30 s before the episode ended ({command})', detail=detail)
+                else:
+                    row.update(disposition='collateral', culprits=['arm'], reason=detail, detail=detail)
+    return rows
+
+
+def teardown_collateral(run, decisions=None, prefix=''):
     """Teardown collateral: a durable service of another worktree not yet torn down, or of the main
     checkout, in the harness's listing just before worktree X's teardown procedure and gone from its
     listing just after; or the bystander changed at the post-teardown check. Attributed to the arm.
     Listed for review instead: a loss in a worktree whose own session ran its arm's down, a restart
     or a kill in the 30 s before the episode ended (a slow exit of its own). A bystander already
-    unreadable at the end of the episode is an episode observation."""
+    unreadable at the end of the episode is an episode observation. With `decisions`, each ledger
+    row's adjudicated outcome. (Losses between two teardowns are listed by the caller.)"""
     events, review = [], []
-    end = run.get('episode_end_m')
-    agents = run.get('agents') or {}
-
-    def own_slow_exit(v):
-        # A command of the lost process's own worktree, in the 30 s before the episode ended, under
-        # the own-command rule: ('excuses', command) if it certainly ran and targeted that process,
-        # which already existed; ('may', command) if it targeted it but may not have run; None if it
-        # started before the process did or did not target it (the loss is scored).
-        loss = {'pid': v['pid'], 'started': v.get('started'), 'command': v['command'], 'kind': service_kind_of(v['command']),
-                'ports': v.get('ports') or []}
-        found = None
-        for a in agents.values():
-            if a.get('marker') != v['group']:
-                continue
-            for c in a.get('service_commands') or []:
-                if end is None or c.get('start_m') is None or not (end - SLOW_EXIT_WINDOW_S <= c['start_m'] <= end):
-                    continue
-                effect = own_effect(run, c, loss)
-                if effect == 'excuses':
-                    return 'excuses', c['command'][:120]
-                if effect == 'may':
-                    found = ('may', c['command'][:120])
-        return found
-    for task, t in (run.get('teardown') or {}).items():
-        for v in t.get('collateral') or []:
-            detail = f"{v['group']}: {v['command'][:80]} (pid {v['pid']}) lost while {SHORT_OF.get(task, task)} was torn down"
-            excuse = own_slow_exit(v)
-            if excuse:
-                kind, command = excuse
-                why = 'its own slow exit: its own session stopped it' if kind == 'excuses' else \
-                    'its own session ran a command that may have stopped it (uncertain whether it ran)'
-                review.append({'worktree': v['group'], 'pid': v['pid'], 'command': v['command'][:160],
-                               'reason': f'{detail}; {why} in the 30 s before the episode ended ({command})'})
-            else:
-                events.append({'kind': 'teardown_collateral', 'detail': detail, 'culprits': ['arm']})
+    for row in teardown_ledger(run):
+        if row['phase'] != 'teardown':
+            continue
+        decided = (decisions or {}).get(prefix + row['key'])
+        if decided is not None:
+            text = check_decision(row, decided, set(run.get('agents') or {}))
+            if text == 'collateral':
+                events.append({'kind': 'teardown_collateral', 'detail': row['detail'], 'culprits': ['arm'], 'adjudicated': decided['reason']})
+            elif text == 'review':
+                review.append({'worktree': row['worktree'], 'pid': row['pid'], 'command': row['command'][:160],
+                               'reason': f"adjudicated as undecided: {decided['reason']}"})
+            continue
+        if row['disposition'] == 'collateral':
+            events.append({'kind': 'teardown_collateral', 'detail': row['detail'], 'culprits': ['arm']})
+        else:
+            review.append({'worktree': row['worktree'], 'pid': row['pid'], 'command': row['command'][:160], 'reason': row['reason']})
     by = run.get('bystander') or {}
     after = by.get('after_teardown') or {}
     readable_at_end = by.get('fingerprint_after') is not None
@@ -779,9 +937,10 @@ SHORT_OF = {'invoice-notes': 'wt-notes', 'pay-receipts': 'wt-pay', 'customer-tab
             'void-invoices': 'wt-void'}
 
 
-def contamination_v2(run):
+def contamination_v2(run, decisions=None, prefix=''):
     """Every event of the run: version 1 (a)-(e) with culprits named by session, (f) by role, (g),
-    and teardown collateral. Returns (events, review, not_events)."""
+    and teardown collateral; with `decisions`, (g) and collateral as adjudicated. Returns (events,
+    review, not_events)."""
     events = []
     for e in contamination(run):
         e = dict(e)
@@ -790,8 +949,8 @@ def contamination_v2(run):
         if e['kind'] == 'main_data_in_worktree':
             e['culprits'] = [slot_key(run, c) for c in e['culprits']]
         events.append(e)
-    g_events, review, not_events = sibling_losses(run)
-    collateral, collateral_review = teardown_collateral(run)
+    g_events, review, not_events = sibling_losses(run, decisions, prefix)
+    collateral, collateral_review = teardown_collateral(run, decisions, prefix)
     return events + connection_events(run) + g_events + collateral, review + collateral_review, not_events
 
 
@@ -909,10 +1068,63 @@ def victim_copes(run, row):
             'description_test_after_kill': bool(tested)}
 
 
+def load_adjudication(results):
+    """`adjudication.json` beside the results, written by hand: {row id: {decision, reason}}. Missing:
+    no row is adjudicated."""
+    path = Path(results) / 'adjudication.json'
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or not all(isinstance(v, dict) for v in data.values()):
+        raise ValueError(f'{path}: expected {{row id: {{"decision": ..., "reason": ...}}}}')
+    return data
+
+
+def _between_teardowns(run, decisions, prefix):
+    """(events, review) for losses between two teardowns: review unless adjudicated."""
+    events, review = [], []
+    for row in teardown_ledger(run):
+        if row['phase'] != 'between-teardowns':
+            continue
+        decided = (decisions or {}).get(prefix + row['key'])
+        text = check_decision(row, decided, set(run.get('agents') or {})) if decided is not None else None
+        if text == 'collateral':
+            events.append({'kind': 'teardown_collateral', 'detail': row['detail'], 'culprits': ['arm'], 'adjudicated': decided['reason']})
+        elif text != 'not-an-event':
+            review.append({'worktree': row['worktree'], 'pid': row['pid'], 'command': row['command'][:160],
+                           'reason': f"adjudicated as undecided: {decided['reason']}" if text else row['reason']})
+    return events, review
+
+
+def ledger_rows(run, prefix, where, decisions):
+    """The run's adjudication ledger: every lost durable service process, untruncated, each with its
+    stable id, automatic disposition, the decision if one was recorded, and the adjudicated outcome."""
+    out = []
+    for row in episode_ledger(run) + teardown_ledger(run):
+        row = dict(row, id=prefix + row['key'])
+        row['candidates'] = [dict(c, trace=f"{where}/{c['trace']}") for c in row['candidates']]
+        automatic = f"blamed ({', '.join(row['culprits'])})" if row['disposition'] == 'blamed' else row['disposition']
+        decided = decisions.get(row['id'])
+        row['automatic_outcome'] = automatic
+        if decided is not None:
+            text = check_decision(row, decided, set(run.get('agents') or {}))
+            row['decision'] = {'decision': text, 'reason': decided['reason']}
+            row['adjudicated_outcome'] = f"blamed ({text[len('blamed:'):]})" if text.startswith('blamed:') else text
+        else:
+            row['decision'] = None
+            row['adjudicated_outcome'] = automatic
+        out.append(row)
+    return out
+
+
 def rows_v2(plan, runs, results, governing=None):
     """One row per slot (five per run) and one per run. In agent-kill the victim's slot is the
-    recovery session. Every row carries the planned victim, invalid and not-run rows included."""
+    recovery session. Every row carries the planned victim, invalid and not-run rows included. The
+    isolation and collateral gates come from the adjudicated outcome (`adjudication.json`; without
+    it, the automatic one); the automatic outcome is carried beside it."""
     rows, run_rows, sessions = [], [], []
+    decisions = load_adjudication(results)
+    seen_ids = set()
     for pair in plan['pairs']:
         for arm in pair['order']:
             run = runs.get((pair['index'], arm))
@@ -929,8 +1141,15 @@ def rows_v2(plan, runs, results, governing=None):
                 run_rows.append({**base, 'status': status, 'reasons': reasons, 'record': f'{where}/run.json'})
                 rows += [{**base, 'task': t, 'is_victim': t == pair.get('victim'), 'status': status} for t in plan['config']['tasks']]
                 continue
-            events, review, not_events = contamination_v2(run)
+            prefix = f"p{pair['index']}.a{attempt}.{arm}/"
+            ledger = ledger_rows(run, prefix, where, decisions)
+            seen_ids |= {r['id'] for r in ledger}
+            events, review, not_events = contamination_v2(run, decisions, prefix)
+            extra_events, extra_review = _between_teardowns(run, decisions, prefix)
+            events, review = events + extra_events, review + extra_review
+            auto_events = contamination_v2(run)[0]
             unattributed = [e for e in events if not e['culprits'] and not e.get('run_level_only')]
+            auto_unattributed = [e for e in auto_events if not e['culprits'] and not e.get('run_level_only')]
             fault = run.get('fault') or {}
             teardown = run.get('teardown') or {}
             for key, a in (run.get('agents') or {}).items():
@@ -951,6 +1170,7 @@ def rows_v2(plan, runs, results, governing=None):
                 teardown_ok = not a.get('left_running') and not a.get('left_listening')
                 culprit_of = [e for e in events if key in e['culprits']]
                 isolation_ok = not culprit_of and not unattributed
+                isolation_ok_automatic = not [e for e in auto_events if key in e['culprits']] and not auto_unattributed
                 cli_ok = a.get('exit') == 0 and result.get('subtype') == 'success' and not result.get('is_error')
                 t = teardown.get(task) or {}
                 db = (run.get('worktree_databases') or {}).get(task) or {}
@@ -974,6 +1194,8 @@ def rows_v2(plan, runs, results, governing=None):
                        'is_victim': task == run.get('victim'),
                        'passed': passed, 'teardown_ok': teardown_ok, 'isolation_ok': isolation_ok, 'cli_ok': cli_ok,
                        'gated_success': passed and teardown_ok and isolation_ok and cli_ok,
+                       'isolation_ok_automatic': isolation_ok_automatic,
+                       'gated_success_automatic': passed and teardown_ok and isolation_ok_automatic and cli_ok,
                        'used_own_db': bool(db.get('exists')) and bool(own_new & set(db.get('versions') or [])),
                        'residue_ok': t.get('residue_ok'), 'false_confirmation': t.get('false_confirmation'),
                        'down_first_status': t.get('down_first_status'), 'down_exit_first': t.get('down_exit_first'), 'down_exit': t.get('down_exit'),
@@ -1000,14 +1222,13 @@ def rows_v2(plan, runs, results, governing=None):
             others_untouched = not events
             residue_all = all(r.get('residue_ok') for r in slot_rows)
             episode = residue_all and others_untouched and all(r['gated_success'] for r in slot_rows)
+            episode_automatic = residue_all and not auto_events and all(r['gated_success_automatic'] for r in slot_rows)
             if run.get('scenario') == 'service-kill':
                 episode = episode and bool(copes and copes['copes'])
+                episode_automatic = episode_automatic and bool(copes and copes['copes'])
             if run.get('scenario') and not injected:
-                episode = None   # a missed fault has no episode result
+                episode = episode_automatic = None   # a missed fault has no episode result
             killed = next((dict(a, key=k) for k, a in (run.get('agents') or {}).items() if a.get('killed_by_harness')), None)
-            review = review + [{'worktree': v['group'], 'pid': v['pid'], 'command': v['command'][:160],
-                                'reason': f'lost between two teardowns (before {task_name}); not attributed'}
-                               for task_name, t in teardown.items() for v in t.get('lost_before_this_teardown') or []]
             run_rows.append({**base, 'status': 'scored', 'record': f'{where}/run.json', 'start_commit': run.get('start_commit'),
                              'injected': injected if run.get('scenario') else None, 'missed': fault.get('missed'),
                              'kill_after_launch_s': (fault.get('kill') or {}).get('seconds_after_launch'),
@@ -1024,6 +1245,9 @@ def rows_v2(plan, runs, results, governing=None):
                              'killed_session': {'key': killed['key'], 'trace': f"{where}/agents/{killed['key']}/trace.jsonl",
                                                 'seconds': killed.get('seconds')} if killed else None,
                              'others_untouched': others_untouched, 'events': events, 'review': review, 'not_events': len(not_events),
+                             'others_untouched_automatic': not auto_events, 'episode_success_automatic': episode_automatic,
+                             'ledger': ledger, 'overrides': [{'id': r['id'], 'automatic': r['automatic_outcome'], 'adjudicated': r['adjudicated_outcome'],
+                                                              'reason': r['decision']['reason']} for r in ledger if r['decision']],
                              'residue_all': residue_all, 'residue_victim': victim.get('residue_ok') if victim else None,
                              'episode_success': episode, 'victim_copes': copes,
                              'survivors_gated': sum(1 for r in survivors if r['gated_success']), 'survivors': len(survivors),
@@ -1038,6 +1262,9 @@ def rows_v2(plan, runs, results, governing=None):
                                                                                             'follow_up_seconds', 'down_exit', 'clean_after_procedure',
                                                                                             'false_confirmation', 'residue_ok', 'after_down', 'after_removal')}
                                           for t in plan['config']['tasks']}})
+    unknown = sorted(set(decisions) - seen_ids)
+    if unknown:
+        raise ValueError(f'adjudication.json names rows that are in no ledger: {unknown}')
     return rows, run_rows, sessions
 
 
@@ -1267,6 +1494,21 @@ def summarize_v2(plan, runs, results, foreign=None, attempts=None, every=None, g
                                   for r in sruns if r['status'] == 'scored' and not r['others_untouched']],
             'review': [{'pair': r['pair'], 'arm': r['arm'], 'losses': r['review']} for r in sruns if r.get('review')],
         }
+    ledger = [row for r in run_rows for row in r.get('ledger') or []]
+    overrides = [o for r in run_rows for o in r.get('overrides') or []]
+    decided = Path(results, 'adjudication.json').exists()
+    out['ledger'] = ledger
+    out['adjudication'] = {
+        'file': 'adjudication.json' if decided else None, 'rows': len(ledger), 'decided': len(overrides), 'overrides': overrides,
+        'note': (f'{len(overrides)} of {len(ledger)} ledger rows adjudicated; gates use the adjudicated outcome' if overrides else
+                 'no row was adjudicated: the adjudicated outcome is the automatic one'),
+        'side_by_side': [{'pair': r['pair'], 'arm': r['arm'], 'attempt': r['attempt'],
+                          'others_untouched': {'automatic': r.get('others_untouched_automatic'), 'adjudicated': r.get('others_untouched')},
+                          'episode_success': {'automatic': r.get('episode_success_automatic'), 'adjudicated': r.get('episode_success')},
+                          'slots': {x['task']: {'isolation_ok': {'automatic': x.get('isolation_ok_automatic'), 'adjudicated': x.get('isolation_ok')},
+                                                'gated_success': {'automatic': x.get('gated_success_automatic'), 'adjudicated': x.get('gated_success')}}
+                                    for x in rows if x['pair'] == r['pair'] and x['arm'] == r['arm'] and x.get('status') == 'scored'}}
+                         for r in run_rows if r['status'] == 'scored']}
     return out
 
 
@@ -1412,9 +1654,51 @@ def markdown_v2(summary):
                 lines.append(f"- pair {f['pair']} {f['arm']}: **others untouched** — {f['record']}: "
                              + '; '.join(f"{e['kind']} ({e['detail']}) culprits {e['culprits']}" for e in f['events']))
         if sc['review']:
-            lines += ['', 'Service losses listed for review (not gating): ' + json.dumps(sc['review'], default=str)[:3000]]
+            lines += ['', 'Service losses listed for review (not gating), in full; each lost process has its row in the adjudication ledger below:', '']
+            for group in sc['review']:
+                for loss in group['losses']:
+                    lines.append(f"- pair {group['pair']} {group['arm']}: {json.dumps(loss, default=str)}")
         lines.append('')
+    lines += markdown_ledger(summary)
     return '\n'.join(lines) + '\n'
+
+
+def _fence(text):
+    return ['~~~~', str(text).replace('~~~~', '~ ~ ~ ~'), '~~~~']
+
+
+def markdown_ledger(summary):
+    """The adjudication section and the untruncated ledger (PROTOCOL.md, "Adjudication ledger")."""
+    adj = summary.get('adjudication') or {}
+    lines = ['## Adjudication', '', adj.get('note', ''), '']
+    if adj.get('overrides'):
+        lines += ['| Row | Automatic | Adjudicated | Reason |', '|---|---|---|---|']
+        lines += [f"| `{o['id']}` | {o['automatic']} | {o['adjudicated']} | {o['reason']} |" for o in adj['overrides']]
+        lines.append('')
+    lines += ['Automatic and adjudicated outcomes, side by side:', '',
+              '| Pair | Arm | Attempt | Others untouched (auto / adjudicated) | Episode success (auto / adjudicated) | Slots whose isolation differs |',
+              '|---|---|---|---|---|---|']
+    for r in adj.get('side_by_side') or []:
+        differs = [t for t, v in r['slots'].items() if v['isolation_ok']['automatic'] != v['isolation_ok']['adjudicated']]
+        lines.append(f"| {r['pair']} | {r['arm']} | {r['attempt']} | {r['others_untouched']['automatic']} / {r['others_untouched']['adjudicated']} | "
+                     f"{r['episode_success']['automatic']} / {r['episode_success']['adjudicated']} | {', '.join(differs) or '–'} |")
+    lines += ['', '## Adjudication ledger', '',
+              f"One row per durable service process lost in a scored run ({len(summary.get('ledger') or [])} rows). Nothing here is truncated.", '']
+    for row in summary.get('ledger') or []:
+        lines += [f"### `{row['id']}`", '',
+                  f"- phase {row['phase']}, worktree {row['worktree']}, pid {row['pid']}, started {row['started']}, "
+                  f"lost between {row['lost_between_m']} (run clock)" + (f", while {row['torn_down']} was torn down" if row.get('torn_down') else ''),
+                  f"- automatic: **{row['automatic_outcome']}** — {row['reason']}",
+                  f"- adjudicated: **{row['adjudicated_outcome']}**" + (f" — {row['decision']['reason']}" if row.get('decision') else ' (no decision recorded)'),
+                  '- lost process command:', ''] + _fence(row['command']) + ['']
+        if not row['candidates']:
+            lines += ['- candidate commands: none', '']
+        for c in row['candidates']:
+            lines += [f"- candidate: session `{c['session']}` ({c['role']}), trace {c['trace']} line {c['line']}, issued {c['issued_m']}, "
+                      f"returned {c['returned_m']}, result {c['result']}; automatic: {c['automatic']}", '  command (scrubbed):', '']
+            lines += _fence(c['command']) + ['', '  reading:', '']
+            lines += _fence(json.dumps(c['reading'], default=str)) + ['']
+    return lines
 
 
 def main():

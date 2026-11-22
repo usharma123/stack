@@ -22,6 +22,7 @@ Exit status 0 only if every expectation holds. `--only` and `--arms` are for dev
 validation runs everything.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -321,6 +322,36 @@ def four_services(rec):
     listing = (f.get('running_at_kill') or {}).get('services') or {}
     ok = set(trig) == set(SERVICES) and all(listing.get(k) for k in SERVICES) and all(trig[k]['pid'] in listing.get(k, []) for k in trig)
     return ok, {'trigger': {k: (v.get('pid'), v.get('port')) for k, v in trig.items()}, 'listing': listing}
+
+
+def forward_and_wait(proc, grace=900):
+    """Pass the signal that stopped this validation on to a nested process and wait for it to finish
+    its own cleanup; a further signal meanwhile is passed on again, never left behind."""
+    deadline = time.monotonic() + grace
+    while proc.poll() is None and time.monotonic() < deadline:
+        try:
+            os.kill(proc.pid, runner.INTERRUPTED.get('signal') or signal.SIGTERM)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(max(1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            break
+        except (KeyboardInterrupt, ValidationInterrupted):
+            continue
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+
+
+@contextlib.contextmanager
+def forwarding(proc):
+    """While a nested process runs: if this validation is interrupted, forward and wait, then stop."""
+    try:
+        yield
+    except BaseException:
+        forward_and_wait(proc)
+        raise
 
 
 class ValidationInterrupted(BaseException):
@@ -865,20 +896,21 @@ def validation_interrupt_case(out, lock, expect, during='episode'):
     log = open(out / f'nested-validation-interrupted{suffix}.log', 'w')
     proc = subprocess.Popen([sys.executable, str(HERE / 'validate.py'), '--out', str(nested), '--skip-grader', '--arms', 'stack',
                              '--only', 'clean,service-kill-no-reaction'], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    progress = nested / 'stack-clean' / 'progress.jsonl'
-    point, poll = ('launched', 0.2) if during == 'episode' else ('shutdown_begin', 0.02)
-    deadline = time.monotonic() + (300 if during == 'episode' else 1200)
-    while time.monotonic() < deadline and proc.poll() is None and not (progress.exists() and point in progress.read_text()):
-        time.sleep(poll)
-    if during == 'episode':
-        time.sleep(2)
-    sent = proc.poll() is None
-    if sent:
-        os.kill(proc.pid, signal.SIGTERM)
-    try:
-        proc.wait(600)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    with forwarding(proc):   # an interrupt of this validation reaches the nested process, which is waited for
+        progress = nested / 'stack-clean' / 'progress.jsonl'
+        point, poll = ('launched', 0.2) if during == 'episode' else ('shutdown_begin', 0.02)
+        deadline = time.monotonic() + (300 if during == 'episode' else 1200)
+        while time.monotonic() < deadline and proc.poll() is None and not (progress.exists() and point in progress.read_text()):
+            time.sleep(poll)
+        if during == 'episode':
+            time.sleep(2)
+        sent = proc.poll() is None
+        if sent:
+            os.kill(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     log.close()
     lock[0] = runner.host_lock()
     text = (out / f'nested-validation-interrupted{suffix}.log').read_text()
@@ -918,23 +950,24 @@ def interrupt_case(arm, when, plan_path, out, lock, expect):
     lock[0].close()   # the runner takes the host lock itself
     log = open(out / f'{arm}-{case}.log', 'w')
     proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, env=env)
-    progress = run_out / 'progress.jsonl'
-    wanted = {'before-the-kill': ('launched', 1.0), 'during-the-delay': ('kill', 3.0), 'during-the-launch': ('recovery_launch_begin', 1.5)}[when]
-    deadline = time.monotonic() + 300
-    seen = []
-    while time.monotonic() < deadline and proc.poll() is None:
-        seen = [json.loads(l)['event'] for l in progress.read_text().splitlines()] if progress.exists() else []
-        if wanted[0] in seen:
-            break
-        time.sleep(0.1)
-    time.sleep(wanted[1])
-    seen_at_signal = [json.loads(l)['event'] for l in progress.read_text().splitlines()] if progress.exists() else []
-    if proc.poll() is None:
-        os.kill(proc.pid, signal.SIGINT)
-    try:
-        proc.wait(600)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    with forwarding(proc):   # an interrupt of this validation reaches the nested process, which is waited for
+        progress = run_out / 'progress.jsonl'
+        wanted = {'before-the-kill': ('launched', 1.0), 'during-the-delay': ('kill', 3.0), 'during-the-launch': ('recovery_launch_begin', 1.5)}[when]
+        deadline = time.monotonic() + 300
+        seen = []
+        while time.monotonic() < deadline and proc.poll() is None:
+            seen = [json.loads(l)['event'] for l in progress.read_text().splitlines()] if progress.exists() else []
+            if wanted[0] in seen:
+                break
+            time.sleep(0.1)
+        time.sleep(wanted[1])
+        seen_at_signal = [json.loads(l)['event'] for l in progress.read_text().splitlines()] if progress.exists() else []
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGINT)
+        try:
+            proc.wait(600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     log.close()
     lock[0] = runner.host_lock()
     rec = json.loads((run_out / 'run.json').read_text()) if (run_out / 'run.json').exists() else {}
@@ -1112,6 +1145,92 @@ def unit_cases(expect, plan, plan_path=None):
     expect('unit/statement-with-or-never-proves-a-member-ran (own may, culprit review)',
            or6 == {'false && stack restart worker || true': 'may', 'stack restart worker || true': 'may'}
            and not ev and any(r['pid'] == 123 and 'kill_by' in r for r in rv), {'own_effect': or6, 'events': ev, 'review': rv})
+    # Round 7 item 4: blame needs the lost process to have existed when the kill was issued.
+    pk7 = K4('pkill -f worker.py', start=20.0, end=22.1)
+    loss_c7 = dict(loss4, group='wt-c', pid=126, started=stamp(T0 + 21), command='/tmp/avr1/wt-c/.venv/bin/python worker.py',
+                   last_seen_m=21.0, gone_m=21.9)
+    run7 = run4([pk7], [])
+    run7['sampler']['durable_losses'] = [dict(loss4, last_seen_m=20.5, gone_m=21.5), loss_c7]
+    ev, rv, _ = report.sibling_losses(run7)
+    expect('unit/broad-kill-blamed-only-for-processes-that-existed-when-it-was-issued',
+           [e['loss']['pid'] for e in ev] == [123] and any(r['pid'] == 126 and 'kill_by' in r for r in rv), {'events': ev, 'review': rv})
+    # Round 7 item 5: signal 0 stays a non-signal through a pipeline; a review-only reading never excuses.
+    eff7 = {cmd: report.own_effect(clock4, R5(cmd), listener) for cmd in
+            ('lsof -ti :6001 | xargs kill -0', 'lsof -ti :6001 | xargs kill -s 0', 'lsof -ti :6001 | xargs kill -USR1', 'kill -USR1 123')}
+    ev, rv, _ = report.sibling_losses(run4([K4('lsof -ti :6001 | xargs kill -0')], [], the_loss=listener))
+    expect('unit/signal-0-through-a-pipeline-is-no-kill-and-review-only-never-excuses',
+           eff7 == {'lsof -ti :6001 | xargs kill -0': None, 'lsof -ti :6001 | xargs kill -s 0': None,
+                    'lsof -ti :6001 | xargs kill -USR1': 'may', 'kill -USR1 123': 'may'}
+           and not ev and not any('kill_by' in r for r in rv), {'own_effect': eff7, 'events': ev, 'review': rv})
+    # Round 7 item 2: the kill is read from the original command at capture, so redaction cannot erase it.
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d7:
+        A7 = 'Author' + 'ization'
+        original = f'echo "{A7}: Bearer abcdefgh12345678"; kill -9 123'
+        trace7, arrivals7 = Path(d7) / 'trace.jsonl', Path(d7) / 'arrivals.tsv'
+        trace7.write_text(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                                                                                   'input': {'command': original}}]}}) + '\n'
+                          + json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 't1', 'content': '',
+                                                                                 'is_error': False}]}}) + '\n')
+        arrivals7.write_text('line\tseconds\n1\t20.5\n2\t20.6\n')
+        captured = runner.service_commands(trace7, arrivals7, 0.0)
+    run27 = run4(captured, [])
+    ev, rv, _ = report.sibling_losses(run27)
+    text_only = [{k: v for k, v in c.items() if k != 'reading'} for c in captured]
+    ev_text, _, _ = report.sibling_losses(run4(text_only, []))
+    expect('unit/kill-erased-by-redaction-still-scored-from-the-captured-reading',
+           len(captured) == 1 and 'kill -9 123' not in captured[0]['command'] and 'abcdefgh' not in json.dumps(captured)
+           and captured[0].get('line') == 1 and len(ev) == 1 and ev[0]['culprits'] == ['b'] and not ev_text,
+           {'captured': captured, 'events': ev, 'events_from_scrubbed_text_alone': ev_text})
+    # Round 7 item 3: the adjudication ledger: one full row per lost process; decisions drive the gate.
+    l7 = lambda group, pid, cmd: {'group': group, 'pid': pid, 'started': stamp(T0 + 1), 'command': cmd, 'kind': report.service_kind_of(cmd),
+                                  'ports': [], 'last_seen_m': 20.0, 'gone_m': 21.0}
+    long_cmd = '/tmp/avr1/wt-e/.venv/bin/python worker.py ' + 'x' * 5000
+    run37 = {'clock': {'started_wall': T0}, 'episode_end_m': 100,
+             'sampler': {'durable_losses': [l7('wt-a', 123, '/tmp/avr1/wt-a/.venv/bin/python worker.py'), l7('wt-c', 300, '/tmp/avr1/wt-c/.venv/bin/python worker.py'),
+                                            l7('wt-d', 400, '/tmp/avr1/wt-d/.venv/bin/python worker.py'), l7('wt-e', 500, long_cmd)]},
+             'agents': {'a': {'marker': 'wt-a', 'launched_m': 0, 'ended_m': 100, 'service_commands': []},
+                        'b': {'marker': 'wt-b', 'launched_m': 0, 'ended_m': 100,
+                              'service_commands': [dict(K4('kill -9 123'), line=7), dict(K4('false && kill -9 400'), line=9)]},
+                        'c': {'marker': 'wt-c', 'launched_m': 0, 'ended_m': 100, 'service_commands': [dict(O4('stack restart worker'), line=3)]}}}
+    prefix7 = 'p0.a1.stack/'
+    ledger7 = report.ledger_rows(run37, prefix7, 'R/pair0-stack', {})
+    by_pid = {r['pid']: r for r in ledger7}
+    full = all(k in r for r in ledger7 for k in ('id', 'pid', 'started', 'command', 'worktree', 'lost_between_m', 'candidates', 'automatic_outcome', 'reason'))
+    cand_ok = all(all(k in c for k in ('session', 'trace', 'line', 'issued_m', 'returned_m', 'result', 'reading', 'command', 'automatic'))
+                  for r in ledger7 for c in r['candidates'])
+    expect('unit/ledger-row-per-loss-blamed-excused-review-unexplained-with-candidates',
+           full and cand_ok and {by_pid[p]['disposition'] for p in by_pid} == {'blamed', 'excused', 'review', 'unexplained'}
+           and by_pid[123]['disposition'] == 'blamed' and by_pid[300]['disposition'] == 'excused' and by_pid[400]['disposition'] == 'review'
+           and by_pid[500]['disposition'] == 'unexplained' and by_pid[123]['candidates'][0]['trace'] == 'R/pair0-stack/agents/b/trace.jsonl'
+           and by_pid[123]['candidates'][0]['line'] == 7 and by_pid[500]['command'] == long_cmd,
+           [{k: r[k] for k in ('id', 'disposition', 'reason')} | {'candidates': len(r['candidates'])} for r in ledger7])
+    decisions7 = {by_pid[123]['id']: {'decision': 'not-an-event', 'reason': 'its own agent stopped it (trace line 4)'},
+                  by_pid[500]['id']: {'decision': 'blamed:b', 'reason': 'b killed it by a form the classifier does not read'}}
+    ev_auto, _, _ = report.sibling_losses(run37)
+    ev_adj, _, _ = report.sibling_losses(run37, decisions7, prefix7)
+    overrides7 = [r for r in report.ledger_rows(run37, prefix7, 'R', decisions7) if r['decision']]
+    expect('unit/adjudication-override-changes-the-gate-and-is-listed',
+           [e['loss']['pid'] for e in ev_auto] == [123] and [(e['loss']['pid'], e['culprits']) for e in ev_adj] == [(500, ['b'])]
+           and {(r['pid'], r['automatic_outcome'], r['adjudicated_outcome']) for r in overrides7} == {(123, 'blamed (b)', 'not-an-event'), (500, 'unexplained', 'blamed (b)')},
+           {'automatic': ev_auto, 'adjudicated': ev_adj, 'overrides': [(r['id'], r['automatic_outcome'], r['adjudicated_outcome']) for r in overrides7]})
+    refused7 = []
+    for bad in ({'decision': 'collateral', 'reason': 'x'}, {'decision': 'blamed:nobody', 'reason': 'x'}, {'decision': 'not-an-event'}):
+        try:
+            report.sibling_losses(run37, {by_pid[123]['id']: bad}, prefix7)
+            refused7.append(False)
+        except ValueError:
+            refused7.append(True)
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d73:
+        (Path(d73) / 'adjudication.json').write_text(json.dumps({'p9.a1.stack/wt-a/1/2': {'decision': 'review', 'reason': 'x'}}))
+        try:
+            report.rows_v2({'pairs': [{'index': 0, 'order': ['stack']}], 'config': {'tasks': []}}, {(0, 'stack'): None}, d73)
+            refused7.append(False)
+        except ValueError:
+            refused7.append(True)
+    expect('unit/adjudication-unknown-row-or-decision-refused', refused7 == [True, True, True, True], refused7)
+    md7 = '\n'.join(report.markdown_ledger({'ledger': ledger7, 'adjudication': {'note': 'n', 'overrides': [], 'side_by_side': []}}))
+    expect('unit/ledger-markdown-untruncated', long_cmd in md7 and all(r['id'] in md7 for r in ledger7) and 'kill -9 123' in md7,
+           {'length': len(md7)})
     # Round 4 item 7: suspension measured from the two clocks; AC power before each arm.
     expect('unit/suspension-0.4s-passes-0.6s-invalidates-wall-step-irrelevant',
            runner.suspension((100.0, 200.0), (110.0, 210.4))[1] is False and runner.suspension((100.0, 200.0), (110.0, 210.6))[1] is True
@@ -1264,6 +1383,36 @@ def unit_cases(expect, plan, plan_path=None):
                bool(stop6) and rec6.get('never_started') is True and rec6.get('invalid_reasons') == [f'not started: interrupted by signal {int(signal.SIGTERM)}']
                and bool(reasons6) and retry6 is None,
                {'stop': stop6, 'record': rec6, 'attempt_reasons': reasons6, 'retry': retry6})
+    # Round 7 item 6: an interrupt of the validation is forwarded to a nested process, which is waited for.
+    with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d76:
+        ready, got = Path(d76) / 'ready', Path(d76) / 'got-signal'
+        child = subprocess.Popen([sys.executable, '-c', 'import signal, sys, time, pathlib\n'
+                                  'def stop(n, f):\n    time.sleep(1); pathlib.Path(sys.argv[2]).write_text(str(n)); sys.exit(0)\n'
+                                  'signal.signal(signal.SIGTERM, stop)\npathlib.Path(sys.argv[1]).write_text("ok")\ntime.sleep(60)\n',
+                                  str(ready), str(got)], start_new_session=True)
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        def alarm(signum, frame):
+            raise KeyboardInterrupt('stand-in for an outside SIGTERM')
+        previous = signal.signal(signal.SIGALRM, alarm)
+        stopped = False
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.3)
+            with forwarding(child):
+                child.wait(30)
+        except KeyboardInterrupt:
+            stopped = True
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        forwarded = got.read_text() if got.exists() else None
+        exited = child.returncode
+    expect('unit/interrupted-validation-forwards-to-its-nested-process-and-waits', stopped and forwarded == str(int(signal.SIGTERM)) and exited == 0,
+           {'stopped': stopped, 'signal_seen_by_child': forwarded, 'child_exit': exited})
     # Round 4 item 11: a rerun marker counts only if its plan digest, pair and attempt match.
     with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d11:
         marker = Path(d11) / 'pair0.2-STARTED.json'
@@ -1309,6 +1458,13 @@ def unit_cases(expect, plan, plan_path=None):
              json.dumps({'command': f'echo {A5}: <redacted>, response="{V5}"'})]
     outs = [_redact.scrub(m) for m in mixed] + [_redact.scrub_text(mixed[4])]
     expect('unit/partly-redacted-header-is-redacted-in-full', not any(V5 in o for o in outs) and all('<redacted>' in o for o in outs), outs)
+    # Round 7 item 1: no guess from quote parity; a quoted --header argument is redacted inside its quotes only.
+    plain7 = f'debug: read 5" buffer; {A5}: Digest username="local", response="{V5}"'
+    curl7 = "curl --header 'X-API-" + f"Key: {V5}' http://local; kill -9 123"
+    outs7 = [_redact.scrub(plain7), _redact.scrub_text(plain7), _redact.scrub(curl7), _redact.scrub(curl7.replace("--header '", "--header='")),
+             _redact.scrub(curl7.replace("'", '"'))]
+    expect('unit/header-redaction-without-quote-guessing-and-header-argument-in-its-quotes',
+           not any(V5 in o for o in outs7) and all(o.endswith('; kill -9 123') for o in outs7[2:]), outs7)
     # Round 6 item 2: a header's extent is decided on its own line, whatever other lines look like.
     multi = 'echo {\\"a\\": 1}\n' + f'{A5}: Digest username="u", realm="r", response="{V5}", qop=auth\nnext line'
     outs6 = [_redact.scrub(multi), _redact.scrub_text(multi), _redact.scrub(json.dumps({'content': multi}))]

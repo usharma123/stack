@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT.parent))
 import grade
 import observe
 import redact
+import report  # the command reading the reporter classifies from
 
 TASKS = json.loads((ROOT / 'tasks.json').read_text())['tasks']
 TASK = {t['id']: t for t in TASKS}
@@ -591,9 +592,13 @@ def service_commands(trace, arrivals, launched_m):
         kinds = [k for k, rx in (('kill', ANY_KILL), ('down_restart', DOWN_RESTART), ('up', UP), ('test', TESTS)) if rx.search(command)]
         if not kinds:
             continue
+        # The structured reading is taken from the original text, before redaction, and each of its
+        # strings is scrubbed on its own: redaction can never erase the evidence a score depends on.
         found.append({'start_m': None if c['start'] is None else round(launched_m + c['start'], 3),
                       'end_m': None if c['end'] is None else round(launched_m + c['end'], 3), 'is_error': c['is_error'],
-                      'kinds': kinds, 'kill_like': bool(KILL.search(command)), 'command': redact.scrub(command)[:2000]})
+                      'kinds': kinds, 'kill_like': bool(KILL.search(command)), 'line': c['line'],
+                      'reading': report.map_reading(report.read_command(command), redact.scrub),
+                      'command': redact.scrub(command)})
     return found
 
 

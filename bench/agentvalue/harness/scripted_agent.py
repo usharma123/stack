@@ -230,6 +230,9 @@ def plant_sentinel():
     partial = f'Authorization: <redacted>, response="{value}"'
     run(['sh', '-c', f"echo '{partial}'; echo \"curl -H '{partial}'\""])
     emit({'type': 'system', 'subtype': 'note', 'data': {'line': partial, 'Authorization': f'<redacted>, response="{value}"'}})
+    # A plain prefix with a lone quote before a Digest header; a quoted --header argument in a command.
+    run(['sh', '-c', f"echo 'debug: read 5\" buffer; Authorization: Digest username=\"local\", response=\"{value}\"'"])
+    run(['sh', '-c', f"echo curl --header 'X-API-" + f"Key: {value}' http://local; true"])
     # A bare Digest header on its own line, after a line that carries an escaped quote.
     run(['printf', '%s\\n%s\\n', 'echo {\\"a\\": 1}', digest])
     port = main_redis_port()
