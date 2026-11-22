@@ -602,7 +602,12 @@ pass.
   that argument only, so the rest of the command stays readable.
 - Kill commands and own commands are read from the original command text when it is captured,
   before redaction, and the structured reading (form, targets, place in the statement) is stored
-  beside the scrubbed text. Redaction cannot remove the evidence a score depends on.
+  beside the scrubbed text. Redaction cannot remove the evidence a score depends on. The reading
+  holds structured facts only: the words of kill, stop and restart commands the harness models,
+  numbers, signals, option flags, ports and the arms' service names. Any other command is kept as a
+  placeholder for its place in the statement, with none of its words. A free-text operand of a
+  modelled command (a `pkill` pattern) is kept only if it also survives in the scrubbed command
+  text; otherwise it is replaced and the reading is uncertain.
 - An agent's trace is written to a staging file under the run's root. It is scrubbed there, and
   only the scrubbed file is moved into the results directory, also when a run is interrupted or
   invalid; a trace that cannot be scrubbed is not published, and the record says so. Submissions
@@ -675,15 +680,24 @@ pass.
   behaviour, its instructions and its documented teardown procedure. A difference between the arms
   is a difference between those workflows on this host. It cannot be assigned to the Stack binary
   alone.
-- **Adjudication ledger.** For every durable service process lost in a trial, whatever the
-  automatic disposition (blamed, sent to review, excused, unexplained), the report carries one row,
-  untruncated: the lost pid, its start time, worktree and the two samples it was lost between; and
-  every candidate command, kills by other sessions and own commands alike, with its session, trace
-  file and line, the times it was issued and returned, its result status, the structured reading
-  and the automatic reason. The orchestrator records a decision and a reason for each row in
+- **Adjudication ledger.** For every durable service process the harness saw disappear at any
+  point of a trial run, from the first sample to the last observation after removal, the report
+  carries one row, untruncated: the lost pid, its start time, worktree (the main checkout included),
+  the phase (episode, the gap before the first teardown, a worktree's teardown, between two
+  teardowns, removal and after) and the two observations it was lost between. The sampler's losses
+  and the teardown listings are reconciled by pid and start time, so no observed loss falls between
+  them. Every row has a disposition, also the expected ones (a worktree's own services at its own
+  teardown, the injected postmaster, the harness stopping the main checkout). Collecting evidence is
+  separate from scoring: a row lists every kill, stop and restart command of any session issued from
+  30 s before the process was last seen until it was found gone, and every such command of a killed
+  CLI that never returned, each with its session, trace file and line, the times it was issued and
+  returned, its result status, the structured reading, and the reason the automatic rule did or did
+  not count it. The orchestrator records a decision and a reason for each row in
   `adjudication.json` beside the results; a row without one keeps the automatic disposition. The
   isolation and collateral gates are derived from the decisions. The report shows the automatic and
-  the adjudicated outcome side by side and lists every override with its reason. Decisions apply the
+  the adjudicated outcome side by side and lists every override with its reason. The automatic
+  outcome is computed from automatic dispositions only, so an override never changes it. A row id or
+  a decision that appears twice is refused. Decisions apply the
   rules of this protocol to the row's evidence. They are not blind to the arm, which is why both
   outcomes are published. A loss the 1 s sampler never saw is in no ledger; that stays a limit.
 - Planted validation cases are never mixed into trial results. Where a planted case separates the
@@ -731,6 +745,7 @@ the machine that ran the trials. Rows added after the rewrite carry current hash
 | `dfe58c6` | The code for review round 6, and the clarifications made while writing it, before any trial. (1) A header inside a JSON string on its line ends at that string's end; anywhere else it runs to the end of the line. (2) The existence check for a blamed kill applies to pid forms too; when a record lacks the lost process's start time or the run clock, the kill is judged on its text alone (trial records always carry both). (3) No member of a statement containing `||` certainly ran, the first included, because the block's result can hide its failure. (4) A signal that stops `pair` before any arm ran writes no record: attempt 1 can simply be started again | Review round 6's findings and the implementer's report. None was decided after seeing a trial |
 | `ad0d7e3` | **Changes after review round 7, before any trial.** An adjudication ledger: every lost service process gets an untruncated row with every candidate command, its trace location, times and result; decisions go in `adjudication.json`, the gates derive from them, and the automatic and adjudicated outcomes are both published. Kill and own commands are read before redaction and stored as structured evidence. The redactor no longer guesses JSON context from quotes: plain text is redacted to the end of the line, JSON is parsed, and a quoted `-H`/`--header` argument is redacted inside its quotes. A broad kill is blamed only for processes that existed when it was issued (not when it returned). Signal 0 stays a non-signal through a pipeline | Review round 7 (GPT-6.2 Sol, at `9de0545`): one redaction leak an ordinary tool result could trigger, and two ways a mis-scored loss could go unseen (redaction erasing a kill; the report showing only a count of excused losses). These met the stop rule I had set for the pilot. None was decided after seeing a trial |
 | `e649c55` | The code for review round 7, and the clarifications made while writing it, before any trial. (1) Ledger rows cover event (g), teardown collateral and losses between two teardowns; a loss of a main-checkout process during the episode is version 1's event (c) and the bystander fingerprint check stays automatic, so neither is a ledger row. (2) The injected postmaster of `service-kill` has a row with the disposition `exempt`. (3) Allowed decisions: `blamed:<session>`, `not-an-event` or `review` for an episode row; `collateral`, `not-an-event` or `review` for a teardown row; each needs a reason, and an unknown row or decision is refused. (4) A loss between two teardowns, which used to go straight to review, can be decided `collateral` and then gates. (5) A row lists the own commands that are a kill, a `down` or `restart`, or that a rule found relevant; `up` and test runs are left out. (6) The stored command text is no longer cut at 2,000 characters. (7) An interrupted validation forwards the signal to a nested process and waits for it | Review round 7's findings and the implementer's report. None was decided after seeing a trial |
+| `ROUND8DOC` | **Changes after review round 8, before any trial.** The ledger covers every observed loss in every phase of a run, the main checkout included, with expected losses given their own dispositions; evidence collection is separated from scoring, so a row lists every kill, stop and restart of any session in a fixed window with the reason it was or was not counted. The stored reading of a command holds structured facts only, never the words of other commands. The automatic outcome is computed from automatic dispositions only. Duplicate row ids and decisions are refused | Review round 8 (GPT-6.2 Sol, at `4b007bb`): a credential split across two shell arguments survived in the stored reading; an observed loss could fall between the episode and teardown ledgers; a plain kill could be missing from a row's candidates; an override changed the automatic column. These met the stop rule for the pilot. None was decided after seeing a trial |
 
 ### Accepted for the pilot
 
