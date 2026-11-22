@@ -230,6 +230,8 @@ def plant_sentinel():
     partial = f'Authorization: <redacted>, response="{value}"'
     run(['sh', '-c', f"echo '{partial}'; echo \"curl -H '{partial}'\""])
     emit({'type': 'system', 'subtype': 'note', 'data': {'line': partial, 'Authorization': f'<redacted>, response="{value}"'}})
+    # A bare Digest header on its own line, after a line that carries an escaped quote.
+    run(['printf', '%s\\n%s\\n', 'echo {\\"a\\": 1}', digest])
     port = main_redis_port()
     run(['python3', '-c', f"import socket,time; s=socket.create_connection(('127.0.0.1',{port})); time.sleep(5)",
          f'X-API-Key: {value}', f'Cookie: sid={value}', digest], background=True, cwd=here)

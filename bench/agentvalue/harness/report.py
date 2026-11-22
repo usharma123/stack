@@ -380,6 +380,39 @@ def _match(pattern, text):
 
 
 GATE = ('pid', 'pattern', 'port')
+CHAIN_OPS = ('&&', '||', '|', '|&')
+XARGS_VALUE_FLAGS = {'-n', '-I', '-J', '-L', '-P', '-s', '-E', '-R', '-S', '-d'}
+
+
+def _statement_bounds(parsed, first, last=None):
+    """(start, end): the statement (simple commands joined by `&&`, `||` or a pipe) holding first..last."""
+    last = first if last is None else last
+    start = first
+    while start > 0 and parsed[start]['before'] in CHAIN_OPS:
+        start -= 1
+    end = last
+    while end + 1 < len(parsed) and parsed[end]['after'] in CHAIN_OPS:
+        end += 1
+    return start, end
+
+
+def _statement_has_or(parsed, first, last=None):
+    """Whether the statement holding first..last contains `||`, which can mask a failure."""
+    start, end = _statement_bounds(parsed, first, last)
+    return any(parsed[i]['after'] == '||' for i in range(start, end))
+
+
+def xargs_kill(argv):
+    """For an `xargs` invocation: None when the command it runs (its first non-option operand) is not
+    `kill`; True when it is a modelled kill (`kill`, `kill -9|-KILL|-TERM|-15`); False for another
+    form of kill (listed for review, never gated)."""
+    i = 1
+    while i < len(argv) and argv[i].startswith('-'):
+        i += 2 if argv[i] in XARGS_VALUE_FLAGS else 1
+    rest = argv[i:]
+    if not rest or Path(rest[0]).name != 'kill':
+        return None
+    return i == 1 and rest[1:] in ([], ['-9'], ['-KILL'], ['-TERM'], ['-15'])
 
 
 def identifies(command, loss):
@@ -406,7 +439,7 @@ def identifies(command, loss):
         if not argv:
             continue
         base = Path(argv[0]).name
-        plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and c['after'] != '|'
+        plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and c['after'] != '|' and not _statement_has_or(parsed, index)
         hit = None
         if base == 'kill':
             modelled, operands = _kill_operands(argv)
@@ -429,12 +462,14 @@ def identifies(command, loss):
         elif base == 'lsof' and c['after'] == '|' and index + 1 < len(parsed):
             nxt = parsed[index + 1]
             nargv = _strip_wrappers(nxt['argv'])
-            if nargv and Path(nargv[0]).name == 'xargs' and 'kill' in nargv[1:]:
+            runs_kill = xargs_kill(nargv) if nargv and Path(nargv[0]).name == 'xargs' else None
+            if runs_kill is not None:      # xargs is a kill only when the command it runs is `kill`
                 text = ' '.join(argv[1:])
                 if any(re.search(rf'(?:^|\s)-t?i\s*(?:tcp)?:?{p}\b|:{p}\b', text) for p in ports):
                     lsof_ok = all(re.fullmatch(r'-t|-i|-ti|-it|-sTCP:LISTEN|(?:tcp)?:?\d+|-i(?:tcp)?:\d+|-ti:\d+|-ti(?:tcp)?:\d+', a) for a in argv[1:])
-                    xargs_ok = nargv[1:] in (['kill'], ['kill', '-9'], ['kill', '-KILL'], ['kill', '-TERM'])
-                    pipe_plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and nxt['after'] != '|'
+                    xargs_ok = runs_kill is True
+                    pipe_plain = not c['compound'] and c['before'] not in ('&&', '||', '|') and nxt['after'] != '|' \
+                        and not _statement_has_or(parsed, index, index + 1)
                     hit = 'port' if lsof_ok and xargs_ok and pipe_plain else 'review'
         if hit in GATE:
             return hit
@@ -508,14 +543,11 @@ def _target_clause(command, loss):
                 return parsed, index, index
         elif base == 'lsof' and c['after'] == '|' and index + 1 < len(parsed):
             nxt = _strip_wrappers(parsed[index + 1]['argv'])
-            if nxt and Path(nxt[0]).name == 'xargs' and 'kill' in nxt[1:]:
+            if nxt and Path(nxt[0]).name == 'xargs' and xargs_kill(nxt) is not None:
                 pipeline = ' '.join(shlex.quote(t) for t in argv) + ' | ' + ' '.join(shlex.quote(t) for t in nxt)
                 if identifies(pipeline, loss) in GATE + ('review',):
                     return parsed, index, index + 1
     return None
-
-
-CHAIN_OPS = ('&&', '||', '|', '|&')
 
 
 def certainly_ran(parsed, first, last):
@@ -529,12 +561,9 @@ def certainly_ran(parsed, first, last):
         return False
     if parsed[first]['before'] in ('|', '|&') or parsed[last]['after'] in ('|', '|&', '&'):
         return False
-    start = first
-    while start > 0 and parsed[start]['before'] in CHAIN_OPS:
-        start -= 1
-    end = last
-    while end + 1 < len(parsed) and parsed[end]['after'] in CHAIN_OPS:
-        end += 1
+    if _statement_has_or(parsed, first, last):
+        return False      # `||` can mask a failure: the block's result proves nothing for any member
+    start, end = _statement_bounds(parsed, first, last)
     if first == start:
         return True
     if any(parsed[i]['before'] != '&&' for i in range(start + 1, first + 1)):
@@ -587,6 +616,17 @@ def _overlaps(command, agent, lo, hi, episode_end=None):
     return start is not None and start <= hi and end >= lo
 
 
+def existed_when_returned(run, command, loss):
+    """Whether the lost process already existed when the kill command returned: its start time (1 s
+    resolution) is before the second in which the command's result arrived. True when either time is
+    not recorded (the kill is then judged on its text alone, as before)."""
+    started_wall = (run.get('clock') or {}).get('started_wall')
+    process_wall = _lstart_wall(loss.get('started'))
+    if started_wall is None or process_wall is None or command.get('end_m') is None:
+        return True
+    return process_wall < int(started_wall + command['end_m'])
+
+
 def sibling_losses(run):
     """Event (g) per the amended protocol. Returns (events, review, not_events)."""
     agents = run.get('agents') or {}
@@ -616,6 +656,8 @@ def sibling_losses(run):
                 verdict = identifies(c['command'], loss)
                 if verdict in GATE and (c.get('end_m') is None or c.get('is_error') is not False):
                     verdict = 'review'      # no result (a killed CLI's included) or an error result: never gated
+                if verdict in GATE and not existed_when_returned(run, c, loss):
+                    verdict = 'review'      # it started in the second the result arrived, or later: not shown signalled
                 if verdict in GATE:
                     culprits.add(k)
                 elif verdict == 'review':
@@ -634,7 +676,8 @@ def sibling_losses(run):
             review.append({**item, 'reason': 'its own session ran a command that may have stopped it (uncertain whether it ran)',
                            'kill_by': sorted(culprits)})
         elif unparseable:
-            review.append({**item, 'reason': 'a kill the harness does not gate (conditional, unmodelled, several targets, an error result or no result) could explain it',
+            review.append({**item, 'reason': 'a kill the harness does not gate (conditional, unmodelled, several targets, an error result, no result, '
+                                     'or a match that started as it returned or later) could explain it',
                            'kill_by': sorted(unparseable)})
         elif excused:
             not_events.append({**item, 'reason': 'its own session stopped or restarted it', 'command_by': excused[-1][0]})

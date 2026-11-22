@@ -1091,6 +1091,27 @@ def unit_cases(expect, plan, plan_path=None):
     ev, rv, _ = report.sibling_losses(run4([K4('cd x && kill -9 123\ntrue')], []))
     expect('unit/kill-as-chain-member-in-a-longer-block-is-review-not-event-g', not ev and any(r['pid'] == 123 and 'kill_by' in r for r in rv),
            {'events': ev, 'review': rv})
+    # Round 6 item 3: a broad kill is blamed only for matching processes that existed when it returned.
+    pk = K4('pkill -f worker.py', start=19.9, end=20.0)
+    loss_b6 = dict(loss4, last_seen_m=19.5, gone_m=20.5)
+    loss_c6 = dict(loss4, group='wt-c', pid=125, started=stamp(T0 + 20.1), command='/tmp/avr1/wt-c/.venv/bin/python worker.py',
+                   last_seen_m=20.2, gone_m=20.6)
+    run6 = run4([pk], [])
+    run6['sampler']['durable_losses'] = [loss_b6, loss_c6]
+    ev, rv, _ = report.sibling_losses(run6)
+    expect('unit/broad-kill-blamed-only-for-processes-that-existed-when-it-returned',
+           [e['loss']['pid'] for e in ev] == [123] and ev[0]['culprits'] == ['b'] and any(r['pid'] == 125 and 'kill_by' in r for r in rv),
+           {'events': ev, 'review': rv})
+    # Round 6 item 4: xargs is a kill only when it runs one; a statement containing || proves nothing.
+    eff6 = {cmd: report.own_effect(clock4, R5(cmd), listener) for cmd in ('lsof -ti :6001 | xargs echo kill', 'lsof -ti :6001 | xargs kill')}
+    ev, rv, _ = report.sibling_losses(run4([K4('lsof -ti :6001 | xargs echo kill')], [], the_loss=listener))
+    expect('unit/xargs-running-echo-is-no-kill-own-or-culprit', eff6 == {'lsof -ti :6001 | xargs echo kill': None, 'lsof -ti :6001 | xargs kill': 'excuses'}
+           and not ev and not any('kill_by' in r for r in rv), {'own_effect': eff6, 'events': ev, 'review': rv})
+    or6 = {cmd: report.own_effect(clock4, O4(cmd), loss4) for cmd in ('false && stack restart worker || true', 'stack restart worker || true')}
+    ev, rv, _ = report.sibling_losses(run4([K4('kill -9 123 || true')], []))
+    expect('unit/statement-with-or-never-proves-a-member-ran (own may, culprit review)',
+           or6 == {'false && stack restart worker || true': 'may', 'stack restart worker || true': 'may'}
+           and not ev and any(r['pid'] == 123 and 'kill_by' in r for r in rv), {'own_effect': or6, 'events': ev, 'review': rv})
     # Round 4 item 7: suspension measured from the two clocks; AC power before each arm.
     expect('unit/suspension-0.4s-passes-0.6s-invalidates-wall-step-irrelevant',
            runner.suspension((100.0, 200.0), (110.0, 210.4))[1] is False and runner.suspension((100.0, 200.0), (110.0, 210.6))[1] is True
@@ -1159,6 +1180,12 @@ def unit_cases(expect, plan, plan_path=None):
         observe.RUN_SUFFIX = None
     expect('unit/marked-process-attributed-to-its-marker-only', owner_b_only is None and owner_all == 'wt-a',
            {'asked_for_b_only': owner_b_only, 'all_groups': owner_all})
+    # Round 6 item 1: with no readable marker, the working directory decides before any open file.
+    p6 = observe.Paths({1: {'/tmp/avr-x/wt-a', '/tmp/avr-x/wt-b/README.md'}, 2: {'/', '/tmp/avr-x/wt-b/README.md'}})
+    p6.cwd = {1: '/tmp/avr-x/wt-a', 2: '/'}
+    g6 = {'wt-b': ['/tmp/avr-x/wt-b'], 'wt-a': ['/tmp/avr-x/wt-a']}   # B searched first
+    o6 = [observe.owner_of(1, 'python3 x.py', {}, p6, g6), observe.owner_of(2, 'python3 x.py', {}, p6, g6)]
+    expect('unit/markerless-process-attributed-by-working-directory-before-open-files', o6 == ['wt-a', 'wt-b'], o6)
     # Round 5 item 5: a power refusal never consumes a rerun or strands a pair (planted power reader,
     # a stand-in arm runner; the validation already holds the host lock).
     if plan_path:
@@ -1213,6 +1240,30 @@ def unit_cases(expect, plan, plan_path=None):
         expect('unit/never-started-record-is-no-session-and-shown-superseded',
                len(sessions5) == 3 and any(a['attempt'] == 1 and not a['used'] and 'never started' in (a['excluded_because'] or '') for a in listing5),
                {'sessions': sessions5, 'attempts': listing5})
+        # Round 6 item 5: a signal held during a valid first arm's cleanup stops `pair` between the arms;
+        # the missing arm is recorded as never started, so attempt 2 is allowed.
+        with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d6:
+            results5 = Path(d6)
+            def signalled_arm(the_plan, index, arm_name, out_dir):
+                rec6 = fake_arm(the_plan, index, arm_name, out_dir)
+                runner.INTERRUPTED['signal'] = signal.SIGTERM   # as the cleanup's hold-off handler records it
+                return rec6
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    runner.cmd_pair(args5(1), power_reader=readings('AC Power'), arm_runner=signalled_arm, lock_held=True)
+                stop6 = None
+            except SystemExit as stop:
+                stop6 = str(stop)
+            finally:
+                runner.INTERRUPTED['signal'] = None
+            missing6 = results5 / runner.run_dir_name(0, 1, pair5['order'][1]) / 'run.json'
+            rec6 = json.loads(missing6.read_text()) if missing6.exists() else {}
+            reasons6 = runner.attempt_reasons(results5, 0, plan['_sha256'])
+            retry6 = refused(2, readings('AC Power', 'AC Power'))
+        expect('unit/signal-between-the-arms-records-never-started-then-attempt-2-allowed',
+               bool(stop6) and rec6.get('never_started') is True and rec6.get('invalid_reasons') == [f'not started: interrupted by signal {int(signal.SIGTERM)}']
+               and bool(reasons6) and retry6 is None,
+               {'stop': stop6, 'record': rec6, 'attempt_reasons': reasons6, 'retry': retry6})
     # Round 4 item 11: a rerun marker counts only if its plan digest, pair and attempt match.
     with tempfile.TemporaryDirectory(prefix='avu-', dir='/tmp') as d11:
         marker = Path(d11) / 'pair0.2-STARTED.json'
@@ -1258,6 +1309,11 @@ def unit_cases(expect, plan, plan_path=None):
              json.dumps({'command': f'echo {A5}: <redacted>, response="{V5}"'})]
     outs = [_redact.scrub(m) for m in mixed] + [_redact.scrub_text(mixed[4])]
     expect('unit/partly-redacted-header-is-redacted-in-full', not any(V5 in o for o in outs) and all('<redacted>' in o for o in outs), outs)
+    # Round 6 item 2: a header's extent is decided on its own line, whatever other lines look like.
+    multi = 'echo {\\"a\\": 1}\n' + f'{A5}: Digest username="u", realm="r", response="{V5}", qop=auth\nnext line'
+    outs6 = [_redact.scrub(multi), _redact.scrub_text(multi), _redact.scrub(json.dumps({'content': multi}))]
+    expect('unit/digest-line-after-a-line-with-an-escaped-quote-redacted-to-its-end', not any(V5 in o or 'qop' in o for o in outs6)
+           and all('next line' in o for o in outs6), outs6)
     # Report on synthetic records: assignments from the plan, attempts, trial-plan shape.
     src_path = sorted(Path(ROOT / 'results').glob('validation-v3-wip-final/stack-agent-kill-recovers/run.json'))
     if not src_path:

@@ -1925,6 +1925,45 @@ def never_started_record(plan, pair, attempt, arm_name, reason):
             'valid': False, 'never_started': True, 'invalid_reasons': [f'not started: {reason}'], 'refused': now(), 'agents': {}}
 
 
+def _pair_arms(args, plan, pair, results, power_reader, arm_runner, never_started, ran):
+    """The arms of one attempt, in order (cmd_pair); `ran` collects the arms that ran."""
+    for position, arm_name in enumerate(pair['order']):
+        if position > 0:
+            problems = check_plan(plan)  # before each arm
+            if problems:
+                raise SystemExit('refusing to run: ' + '; '.join(problems))
+            ok, reason = power_check(power_reader)   # before each arm: AC power only (PROTOCOL.md, Validity)
+            if not ok:
+                # After the first arm ran: recorded as an invalid run that never started, so the pair
+                # is rerun whole instead of being stranded.
+                written = never_started(pair['order'][position:], reason)
+                raise SystemExit(f'refusing to run {arm_name}: {reason}; trials run on AC power only. '
+                                 f'Recorded {written} as invalid runs that never started: the pair is rerun whole')
+        out = results / run_dir_name(args.index, args.attempt, arm_name)
+        print(f'pair {args.index} attempt {args.attempt}: running {arm_name} -> {out}', flush=True)
+        record = (arm_runner or run_arm)(plan, args.index, arm_name, out)
+        ran.append(arm_name)
+        if INTERRUPTED.get('signal'):   # a signal held off during the run's cleanup: stop after it, no next arm
+            written = never_started(pair['order'][position + 1:], f'interrupted by signal {INTERRUPTED["signal"]}')
+            raise SystemExit(f'stopping: signal {INTERRUPTED["signal"]} arrived during {out}; no further arm is started; '
+                             f'recorded as never started: {written}')
+        summary = {t: {'passed': (a.get('grade') or {}).get('passed'), 'seconds': a.get('seconds'), 'killed': a.get('killed_by_harness', False),
+                       'left': len(a.get('left_running') or []), 'cost': ((a.get('trace_metrics') or {}).get('result') or {}).get('total_cost_usd')}
+                   for t, a in record['agents'].items()}
+        failures = cli_failures(record)
+        fault = record.get('fault') or {}
+        print(json.dumps({'arm': arm_name, 'valid': record['valid'], 'invalid': record['invalid_reasons'], 'cli_failures': failures,
+                          'scenario': record.get('scenario'), 'victim': record.get('victim'), 'injected': fault.get('injected'),
+                          'missed': fault.get('missed'), 'bystander_changed': record.get('bystander', {}).get('changed'),
+                          'residue_ok': {t: e.get('residue_ok') for t, e in (record.get('teardown') or {}).items()},
+                          'agents': summary}, indent=2), flush=True)
+        # Stop rules (PROTOCOL.md, Validity): an invalid run or two CLI failures stop the experiment.
+        if not record['valid']:
+            raise SystemExit(f'stopping: run {out} is invalid: {record["invalid_reasons"]}')
+        if len(failures) >= 2:
+            raise SystemExit(f'stopping: {len(failures)} agent CLI failures in {out}: {failures}')
+
+
 def cmd_pair(args, power_reader=None, arm_runner=None, lock_held=False):
     """Run one attempt of one pair. Every check that can refuse (plan, attempt reasons, existing run
     directories, power for the first arm) comes before the attempt-2 marker is written, so a refusal
@@ -1967,40 +2006,28 @@ def cmd_pair(args, power_reader=None, arm_runner=None, lock_held=False):
             handle.flush()
             os.fsync(handle.fileno())
     plan['_attempt'] = args.attempt
-    for position, arm_name in enumerate(pair['order']):
-        if position > 0:
-            problems = check_plan(plan)  # before each arm
-            if problems:
-                raise SystemExit('refusing to run: ' + '; '.join(problems))
-            ok, reason = power_check(power_reader)   # before each arm: AC power only (PROTOCOL.md, Validity)
-            if not ok:
-                # After the first arm ran: recorded as an invalid run that never started, so the pair
-                # is rerun whole instead of being stranded.
-                out = results / run_dir_name(args.index, args.attempt, arm_name)
-                out.mkdir(parents=True, exist_ok=False)
-                (out / 'run.json').write_text(json.dumps(never_started_record(plan, pair, args.attempt, arm_name, reason), indent=2))
-                raise SystemExit(f'refusing to run {arm_name}: {reason}; trials run on AC power only. '
-                                 f'Recorded {out} as an invalid run that never started: the pair is rerun whole')
-        out = results / run_dir_name(args.index, args.attempt, arm_name)
-        print(f'pair {args.index} attempt {args.attempt}: running {arm_name} -> {out}', flush=True)
-        record = (arm_runner or run_arm)(plan, args.index, arm_name, out)
-        if INTERRUPTED.get('signal'):   # a signal held off during the run's cleanup: stop after it, no next arm
-            raise SystemExit(f'stopping: signal {INTERRUPTED["signal"]} arrived during {out}; no further arm is started')
-        summary = {t: {'passed': (a.get('grade') or {}).get('passed'), 'seconds': a.get('seconds'), 'killed': a.get('killed_by_harness', False),
-                       'left': len(a.get('left_running') or []), 'cost': ((a.get('trace_metrics') or {}).get('result') or {}).get('total_cost_usd')}
-                   for t, a in record['agents'].items()}
-        failures = cli_failures(record)
-        fault = record.get('fault') or {}
-        print(json.dumps({'arm': arm_name, 'valid': record['valid'], 'invalid': record['invalid_reasons'], 'cli_failures': failures,
-                          'scenario': record.get('scenario'), 'victim': record.get('victim'), 'injected': fault.get('injected'),
-                          'missed': fault.get('missed'), 'bystander_changed': record.get('bystander', {}).get('changed'),
-                          'residue_ok': {t: e.get('residue_ok') for t, e in (record.get('teardown') or {}).items()},
-                          'agents': summary}, indent=2), flush=True)
-        # Stop rules (PROTOCOL.md, Validity): an invalid run or two CLI failures stop the experiment.
-        if not record['valid']:
-            raise SystemExit(f'stopping: run {out} is invalid: {record["invalid_reasons"]}')
-        if len(failures) >= 2:
-            raise SystemExit(f'stopping: {len(failures)} agent CLI failures in {out}: {failures}')
+
+    def never_started(arm_names, reason):
+        """Record each arm that will not run as an invalid run that never started (PROTOCOL.md,
+        Validity), so the pair is rerun whole instead of being stranded. Returns the directories."""
+        written = []
+        for name in arm_names:
+            out = results / run_dir_name(args.index, args.attempt, name)
+            if out.exists():
+                continue
+            out.mkdir(parents=True)
+            (out / 'run.json').write_text(json.dumps(never_started_record(plan, pair, args.attempt, name, reason), indent=2))
+            written.append(str(out))
+        return written
+
+    ran = []
+    try:
+        _pair_arms(args, plan, pair, results, power_reader, arm_runner, never_started, ran)
+    except KeyboardInterrupt:
+        # A signal outside a run (between the arms): the arms not run are recorded as never started.
+        signum = INTERRUPTED.get('signal')
+        written = never_started([a for a in pair['order'] if a not in ran], f'interrupted by signal {signum}') if ran else []
+        raise SystemExit(f'stopping: interrupted by signal {signum} between the arms; recorded as never started: {written}')
     if lock is not None:
         lock.close()
 

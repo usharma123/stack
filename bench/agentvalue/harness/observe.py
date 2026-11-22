@@ -134,24 +134,36 @@ def markers():
     return marks_and_roles()[0]
 
 
+class Paths(dict):
+    """pid -> open paths; `.cwd` maps pid -> its working directory."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.cwd = {}
+
+
 def open_paths(pids=None):
-    """pid -> paths the process has open, its working directory included (lsof)."""
-    argv = ['lsof', '-nP', '-w', '-Fpn'] + (['-p', ','.join(str(p) for p in pids)] if pids else ['-u', str(os.getuid())])
+    """pid -> paths the process has open, its working directory included (lsof); the working
+    directory is also kept apart in `.cwd`."""
+    argv = ['lsof', '-nP', '-w', '-Ffpn'] + (['-p', ','.join(str(p) for p in pids)] if pids else ['-u', str(os.getuid())])
     if pids is not None and not pids:
-        return {}
+        return Paths()
     out = _out(argv)
-    paths, pid = {}, None
+    paths, pid, fd = Paths(), None, None
     for line in out.splitlines():
         if line.startswith('p'):
-            pid = int(line[1:])
+            pid, fd = int(line[1:]), None
+        elif line.startswith('f'):
+            fd = line[1:]
         elif line.startswith('n/') and pid is not None:
             paths.setdefault(pid, set()).add(line[1:])
+            if fd == 'cwd':
+                paths.cwd[pid] = line[1:]
     return paths
 
 
 def owner_of(pid, command, marks, paths, groups):
-    """The group a process belongs to: its marker, else its command line or any open path under a
-    group's paths. `groups` maps name -> list of paths (the worktree, plus any per-checkout state
+    """The group a process belongs to: its marker; with no readable marker, its working directory;
+    else its command line or any open path under a group's paths. `groups` maps name -> list of paths (the worktree, plus any per-checkout state
     directories the arm keeps elsewhere)."""
     mark = group_of_marker(marks.get(pid))
     if mark in groups:
@@ -160,6 +172,12 @@ def owner_of(pid, command, marks, paths, groups):
         # A process carrying the run's marker of another group (a worktree not asked about, or the
         # main checkout) is that group's only, whatever files of this group it has open.
         return None
+    # No readable marker: the working directory decides before the command line or any open file.
+    cwd = getattr(paths, 'cwd', {}).get(pid)
+    if cwd:
+        for name, roots in groups.items():
+            if any(legacy._under(legacy._roots(root), cwd) for root in roots):
+                return name
     texts = [command] + sorted(paths.get(pid, ()))
     for name, roots in groups.items():
         for root in roots:

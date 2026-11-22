@@ -24,15 +24,39 @@ HEADER_DQ = re.compile(r'(-H\s*"\s*' + HEADER_NAMES + r'\s*:\s*)(?:[^"\\]|\\.)*(
 HEADER_EDQ = re.compile(r'(-H\s*\\"\s*' + HEADER_NAMES + r'\s*:\s*)(?:[^"\\]|\\(?!")[\s\S])*(\\")', re.I)
 HEADER_JSON = re.compile(r'("' + HEADER_NAMES + r'"\s*:\s*")((?:[^"\\]|\\.)*)(")', re.I)
 HEADER_EJSON = re.compile(r'(\\"' + HEADER_NAMES + r'\\"\s*:\s*\\")((?:[^"\\]|\\(?!")[\s\S])*)(\\")', re.I)
-# A bare header: to the end of its value. In plain text that is the end of the line; in JSON-encoded
-# text (a line that starts like JSON) it is also a literal \n or \r escape or an unescaped quote.
 # A header counts as already scrubbed only when `<redacted>` is its entire value: followed by the end
 # of the value (end of text or line, a closing quote, or a JSON \n / \r escape). A value that was
 # redacted only in part (`<redacted>, response="..."`) is redacted in full.
 DONE = r'[ \t]*<redacted>[ \t]*(?:\Z|[\r\n\'"]|\\["nr])'
-HEADER_BARE = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?!' + DONE + r')[ \t]*([^\r\n]+)', re.I)
-HEADER_BARE_JSON = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?!' + DONE + r')[ \t]*((?:\\(?![nr])[\s\S]|[^\\\r\n"])+)', re.I)
 BEARER = re.compile(r'\b(Bearer\s+)(?!<redacted>)([A-Za-z0-9._~+/=-]{8,})', re.I)
+
+
+HEADER_START = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?!' + DONE + r')[ \t]*', re.I)
+UNESCAPED_QUOTE = re.compile(r'(?<!\\)(?:\\\\)*"')
+JSON_VALUE = re.compile(r'(?:\\(?![nr])[\s\S]|[^\\\r\n"])*')
+LINE_VALUE = re.compile(r'[^\r\n]*')
+
+
+def _bare_headers(line):
+    """Redact every bare credential header on one line. Its extent is decided on that line alone:
+    inside a JSON string literal of the line (an odd number of unescaped quotes before it) the value
+    ends at a \\n / \\r escape or an unescaped quote; anywhere else it runs to the end of the line,
+    quoted Digest parameters included, whatever other lines look like."""
+    out, i = [], 0
+    while True:
+        m = HEADER_START.search(line, i)
+        if not m:
+            out.append(line[i:])
+            return ''.join(out)
+        inside = len(UNESCAPED_QUOTE.findall(line, 0, m.start())) % 2 == 1
+        value = (JSON_VALUE if inside else LINE_VALUE).match(line, m.end())
+        if value.end() == m.end():          # nothing after the name
+            out.append(line[i:m.end()])
+        else:
+            out.append(line[i:m.start()] + m[1] + ' <redacted>')
+        i = max(value.end(), m.end())
+        if i == m.start():
+            i += 1
 
 
 def scrub(text):
@@ -56,8 +80,7 @@ def scrub(text):
     text = HEADER_DQ.sub(lambda m: f'{m[1]}<redacted>{m[2]}', text)
     text = HEADER_EJSON.sub(lambda m: f'{m[1]}<redacted>{m[3]}', text)
     text = HEADER_JSON.sub(lambda m: f'{m[1]}<redacted>{m[3]}', text)
-    bare = HEADER_BARE_JSON if text.lstrip().startswith(('{', '[')) or '\\"' in text else HEADER_BARE
-    text = bare.sub(lambda m: f'{m[1]} <redacted>', text)
+    text = ''.join(_bare_headers(line) for line in re.split(r'(\r\n|\n|\r)', text))
     text = BEARER.sub(lambda m: f'{m[1]}<redacted>', text)
     return MISE_DIFF.sub(lambda m: f'{m[1]}=<redacted>', text)
 
