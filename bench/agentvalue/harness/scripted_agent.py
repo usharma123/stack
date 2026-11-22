@@ -29,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -225,6 +226,10 @@ def plant_sentinel():
     # sampler records (a connection to the main checkout's Redis: its client command line is logged).
     digest = f'Authorization: Digest username="u", realm="r", response="{value}", qop=auth'
     run(['sh', '-c', f'echo "X-API-Key: {value}"; echo \'{digest}\'; echo "Set-Cookie: sid={value}"; echo "X-Auth-' + f'Token: {value}"'])
+    # A header value that something else redacted only in part: bare, -H and JSON forms.
+    partial = f'Authorization: <redacted>, response="{value}"'
+    run(['sh', '-c', f"echo '{partial}'; echo \"curl -H '{partial}'\""])
+    emit({'type': 'system', 'subtype': 'note', 'data': {'line': partial, 'Authorization': f'<redacted>, response="{value}"'}})
     port = main_redis_port()
     run(['python3', '-c', f"import socket,time; s=socket.create_connection(('127.0.0.1',{port})); time.sleep(5)",
          f'X-API-Key: {value}', f'Cookie: sid={value}', digest], background=True, cwd=here)
@@ -310,6 +315,14 @@ if mode == 'reference-norole':
 
 if mode == 'sentinel':
     plant_sentinel()
+if mode == 'marked-reader':
+    # A process carrying this worktree's marker that follows a sibling's file, working directory
+    # outside every worktree: attributed to this worktree only, never to the sibling.
+    if not re.fullmatch(r'wt-[a-z]+', argument):
+        finish(ok=False)
+    # Not /usr/bin/tail: the environment of a platform binary cannot be read, so its marker would not show.
+    run([sys.executable, '-c', 'import sys, time; f = open(sys.argv[1]); time.sleep(3600)', str(root / argument / 'README.md')],
+        background=True, cwd='/')
 apply_reference()
 run(cli['up'])
 run(cli['migrate'])
@@ -388,6 +401,15 @@ if mode == 'leave-running-idle':
     time.sleep(32)   # no down, restart or kill in the last 30 s before it exits (teardown collateral target)
 if mode not in ('leave-running', 'leave-running-idle'):
     run(cli['down'])
+if mode == 'orphan':
+    # A detached command started with a clean environment (no marker), its working directory in the
+    # worktree, reparented at once (its shell exits immediately, so no sample sees its parent): only
+    # its placement ties it to the run.
+    # Its own session (not stopped with the agent's process group); a single backgrounded command, so
+    # the shell exits at once and no shell carrying the marker stays as its parent.
+    run(['sh', '-c', f'env -i {shlex.quote(sys.executable)} -m http.server --bind 127.0.0.1 0 >/dev/null 2>&1 &'],
+        background=True, cwd=here)
+    time.sleep(1)
 if mode == 'stray':
     # Started without the arm's tooling, in the worktree, and left running.
     run(SLEEPER, background=True, cwd=here)

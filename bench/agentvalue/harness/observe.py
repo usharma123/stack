@@ -27,6 +27,9 @@ OBSERVE_TIMEOUT = 60  # every observation subprocess is bounded, so a join on an
 # Markers are "<group>.<run id>", so a process from another run (or an unrelated program) never
 # counts as this run's. Set by the runner before anything is observed.
 RUN_SUFFIX = None
+# Wall time at which the run began (set with RUN_SUFFIX): a process whose working directory is inside
+# the run's root and that started at or after it is placed in the run (the 'placement' tie).
+RUN_STARTED_WALL = None
 
 
 def group_of_marker(mark):
@@ -153,6 +156,10 @@ def owner_of(pid, command, marks, paths, groups):
     mark = group_of_marker(marks.get(pid))
     if mark in groups:
         return mark
+    if mark is not None:
+        # A process carrying the run's marker of another group (a worktree not asked about, or the
+        # main checkout) is that group's only, whatever files of this group it has open.
+        return None
     texts = [command] + sorted(paths.get(pid, ()))
     for name, roots in groups.items():
         for root in roots:
@@ -516,7 +523,8 @@ def tie(row, root, table=None, grade_token=None, _memo=None):
     a process the harness launched, or from a tied process), or 'service' (an arm's service, by its
     command class together with a data or state directory of the run: a postmaster on a data
     directory under the root, a redis-server whose working directory is under it, Stack's supervisor
-    on a state directory under it, the app or worker interpreter of a venv under it). A process that
+    on a state directory under it, the app or worker interpreter of a venv under it), or 'placement'
+    (its working directory is inside the root and it started after the run began). A process that
     merely has a run file open, or whose command mentions a run path, gets None."""
     memo = {} if _memo is None else _memo
     pid = row['pid']
@@ -543,6 +551,8 @@ def tie(row, root, table=None, grade_token=None, _memo=None):
             reason = 'service'
         elif kind in ('api', 'worker') and '/.venv/bin/' in command.split()[0] and under_any(roots, command.split()[0]):
             reason = 'service'
+        if reason is None and placed(row, root):
+            reason = 'placement'
         if reason is None:
             table = table if table is not None else legacy.process_table()
             parent = table.get(row.get('ppid') if row.get('ppid') is not None else table.get(pid, {}).get('ppid'))
@@ -550,6 +560,34 @@ def tie(row, root, table=None, grade_token=None, _memo=None):
                 reason = 'lineage'
     memo[pid] = reason
     return reason
+
+
+def started_wall(started):
+    """Wall time of a `ps` start time ('Thu Nov 19 13:04:48 2026'), to the second; None if unreadable."""
+    try:
+        return time.mktime(time.strptime(started, '%a %b %d %H:%M:%S %Y'))
+    except (TypeError, ValueError):
+        return None
+
+
+def placed(row, root):
+    """Placement in the run: the process's working directory, resolved, is inside the run's root, and
+    it started at or after the run began. `ps` start times have 1 s resolution, so a process started
+    in the same second as the run counts as after it."""
+    if RUN_STARTED_WALL is None:
+        return False
+    began = started_wall(row.get('started'))
+    if began is None or began < int(RUN_STARTED_WALL):
+        return False
+    try:
+        cwd = _cwd(row['pid'])
+    except RuntimeError:
+        return False
+    if not cwd:
+        return False
+    resolved = os.path.realpath(cwd)
+    roots = {norm_path(os.path.realpath(str(root))), norm_path(str(root))}
+    return any(norm_path(resolved) == r or norm_path(resolved).startswith(r + '/') for r in roots)
 
 
 def record_lineage(rows):

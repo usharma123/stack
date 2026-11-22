@@ -26,8 +26,12 @@ HEADER_JSON = re.compile(r'("' + HEADER_NAMES + r'"\s*:\s*")((?:[^"\\]|\\.)*)(")
 HEADER_EJSON = re.compile(r'(\\"' + HEADER_NAMES + r'\\"\s*:\s*\\")((?:[^"\\]|\\(?!")[\s\S])*)(\\")', re.I)
 # A bare header: to the end of its value. In plain text that is the end of the line; in JSON-encoded
 # text (a line that starts like JSON) it is also a literal \n or \r escape or an unescaped quote.
-HEADER_BARE = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?![ \t]*<redacted>)[ \t]*([^\r\n]+)', re.I)
-HEADER_BARE_JSON = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?![ \t]*<redacted>)[ \t]*((?:\\(?![nr])[\s\S]|[^\\\r\n"])+)', re.I)
+# A header counts as already scrubbed only when `<redacted>` is its entire value: followed by the end
+# of the value (end of text or line, a closing quote, or a JSON \n / \r escape). A value that was
+# redacted only in part (`<redacted>, response="..."`) is redacted in full.
+DONE = r'[ \t]*<redacted>[ \t]*(?:\Z|[\r\n\'"]|\\["nr])'
+HEADER_BARE = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?!' + DONE + r')[ \t]*([^\r\n]+)', re.I)
+HEADER_BARE_JSON = re.compile(r'(\b' + HEADER_NAMES + r'\s*:)(?!' + DONE + r')[ \t]*((?:\\(?![nr])[\s\S]|[^\\\r\n"])+)', re.I)
 BEARER = re.compile(r'\b(Bearer\s+)(?!<redacted>)([A-Za-z0-9._~+/=-]{8,})', re.I)
 
 

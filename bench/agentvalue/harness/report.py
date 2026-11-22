@@ -479,38 +479,81 @@ def _lstart_wall(started):
 
 
 def _target_clause(command, loss):
-    """The simple command of `command` that targets the lost process: the arm's down, a restart
-    covering its service, or a kill naming its pid (signal 0 excluded) or matching it by pattern or
-    port. Returns the clause, 'unparsed' when the text is not interpreted but names a down/restart, or None."""
+    """The part of `command` that targets the lost process, as (parsed, first, last): the simple
+    commands from `first` to `last` (one, or an `lsof … | xargs kill` pipeline). It is the arm's down, a
+    restart covering its service, or a kill naming its pid (signal 0 excluded) or matching it by
+    pattern or port. A port form counts only when the pipeline itself kills: `lsof`, `pgrep`, `ps`,
+    `ss`, `netstat` on their own stop nothing and never target anything. Returns 'unparsed' when the
+    text is not interpreted but names a down/restart or a kill of that pid or port, or None."""
     parsed = simple_commands(command)
     if parsed is None:
-        return 'unparsed' if stops_service(command, loss) else None
-    for c in parsed:
+        if stops_service(command, loss):
+            return 'unparsed'
+        names = [rf'\b{loss["pid"]}\b'] + [rf':{p}\b' for p in loss.get('ports') or []]
+        if re.search(r'\bkill\b', command) and any(re.search(n, command) for n in names):
+            return 'unparsed'           # e.g. `kill $(lsof -ti :P)`: a kill of it the harness does not read
+        return None
+    for index, c in enumerate(parsed):
         text = ' '.join(shlex.quote(t) for t in c['argv'])
         if stops_service(text, loss):
-            return c
+            return parsed, index, index
         argv = [t.strip('(){}') for t in c['argv']]
         while argv and (argv[0] in COMPOUND_WORDS or not argv[0]):
             argv = argv[1:]
         argv = _strip_wrappers([t for t in argv if t])
-        if argv and Path(argv[0]).name in ('kill', 'pkill', 'killall', 'fuser', 'lsof'):
-            probe = identifies(' '.join(shlex.quote(t) for t in argv) + (' | xargs kill' if Path(argv[0]).name == 'lsof' else ''), loss)
-            if probe in GATE or probe == 'review' and Path(argv[0]).name == 'kill' and str(loss['pid']) in argv:
-                return c
+        base = Path(argv[0]).name if argv else ''
+        if base in ('kill', 'pkill', 'killall', 'fuser'):
+            probe = identifies(' '.join(shlex.quote(t) for t in argv), loss)
+            if probe in GATE or probe == 'review' and base == 'kill' and str(loss['pid']) in argv:
+                return parsed, index, index
+        elif base == 'lsof' and c['after'] == '|' and index + 1 < len(parsed):
+            nxt = _strip_wrappers(parsed[index + 1]['argv'])
+            if nxt and Path(nxt[0]).name == 'xargs' and 'kill' in nxt[1:]:
+                pipeline = ' '.join(shlex.quote(t) for t in argv) + ' | ' + ' '.join(shlex.quote(t) for t in nxt)
+                if identifies(pipeline, loss) in GATE + ('review',):
+                    return parsed, index, index + 1
     return None
+
+
+CHAIN_OPS = ('&&', '||', '|', '|&')
+
+
+def certainly_ran(parsed, first, last):
+    """Whether the simple commands `first`..`last` (one command, or a pipeline treated as one) certainly
+    ran, given that the whole command's result is not an error: a statement of its own (top level,
+    not behind `&&`, `||`, `if`, a subshell or a pipeline, not sent to the background), the first
+    member of a chain included; or a later member of an `&&`-only chain that is the last statement
+    of the command, so that the command's result is the chain's. A chain member inside a longer block
+    may have run: the block's result does not show it."""
+    if parsed[first]['compound']:
+        return False
+    if parsed[first]['before'] in ('|', '|&') or parsed[last]['after'] in ('|', '|&', '&'):
+        return False
+    start = first
+    while start > 0 and parsed[start]['before'] in CHAIN_OPS:
+        start -= 1
+    end = last
+    while end + 1 < len(parsed) and parsed[end]['after'] in CHAIN_OPS:
+        end += 1
+    if first == start:
+        return True
+    if any(parsed[i]['before'] != '&&' for i in range(start + 1, first + 1)):
+        return False
+    return end == len(parsed) - 1
 
 
 def own_effect(run, command, loss):
     """The own-command rule (PROTOCOL.md, event (g); used by teardown collateral too):
     'excuses'  the command targeted the lost process, which already existed when it started, and it
-               certainly ran: a plain invocation or a member of an `&&` chain, with a result that is not
-               an error;
+               certainly ran (`certainly_ran`) with a result that is not an error;
     'may'      it targeted the process but may not have run (behind `||`, `if`, a subshell or a pipeline
-               condition, an error result, no result), or the start times cannot be told apart;
-    None       it did not target the process, or started before the lost process did (the loss is
-               scored as if the command were absent)."""
-    clause = _target_clause(command.get('command') or '', loss)
-    if clause is None:
+               condition, a chain member inside a longer block, an error result, no result), or the
+               start times cannot be told apart;
+    None       it did not target the process (a read-only command such as `lsof`, `pgrep` or `ps` never
+               does), or started before the lost process did (the loss is scored as if the command
+               were absent)."""
+    target = _target_clause(command.get('command') or '', loss)
+    if target is None:
         return None
     started_wall = ((run.get('clock') or {}).get('started_wall'))
     process_wall = _lstart_wall(loss.get('started'))
@@ -520,10 +563,9 @@ def own_effect(run, command, loss):
             return None                     # the process started after the command: a new incarnation
         if command_wall < process_wall + 1:
             return 'may'                    # within the same second: cannot tell which came first
-    if clause == 'unparsed':
+    if target == 'unparsed':
         return 'may'
-    certain = not clause['compound'] and clause['before'] in (None, ';', '&&') and clause['after'] != '|' \
-        and command.get('end_m') is not None and command.get('is_error') is False
+    certain = certainly_ran(*target) and command.get('end_m') is not None and command.get('is_error') is False
     return 'excuses' if certain else 'may'
 
 
@@ -771,13 +813,15 @@ def load_runs_v2(plan, results, plan_sha=None):
                         partial.append({'run': adir.name, 'session': session, 'cost_usd': None, 'valid_run': False})
         listing = []
         for a, got in sorted(found.items()):
-            every += list(got.values())
+            every += [r for r in got.values() if not r.get('never_started')]   # a refused arm launched no session
             complete = len(got) == len(pair['order'])
             why = None
             if a == 1 and use == 2:
-                why = '; '.join(f"{arm}: " + ('invalid' if not r.get('valid') else f"fault missed ({(r.get('fault') or {}).get('missed')})"
+                why = '; '.join(f"{arm}: " + ('never started (' + '; '.join(r.get('invalid_reasons') or []) + ')' if r.get('never_started')
+                                              else 'invalid' if not r.get('valid') else f"fault missed ({(r.get('fault') or {}).get('missed')})"
                                               if (r.get('fault') or {}).get('missed') else 'superseded') for arm, r in got.items())
             listing.append({'attempt': a, 'arms': sorted(got), 'used': a == use, 'complete': complete, 'excluded_because': why,
+                            'never_started': sorted(arm for arm, r in got.items() if r.get('never_started')),
                             'dirs': [Path(run_dir(results, pair['index'], arm, a)).name for arm in got]})
         attempts[pair['index']] = listing
         chosen = found.get(use) or {}

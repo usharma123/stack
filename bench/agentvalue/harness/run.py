@@ -628,8 +628,8 @@ def stop_tree(proc, grace=10):
 def split_tied(rows, root):
     """(counted, listed): the rows tied to the run (observe.tie) and the rest, which are only listed."""
     table = observe.legacy.process_table()
-    counted = [p for p in rows if observe.tie(p, root, table)]
-    return counted, [p for p in rows if p not in counted]
+    ties = [(p, observe.tie(p, root, table)) for p in rows]
+    return [dict(p, tie=why) for p, why in ties if why], [p for p, why in ties if not why]   # counted rows carry why
 
 
 def safe_killpg(pgid, root):
@@ -1050,6 +1050,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
     load_before = os.getloadavg()[0]
+    observe.RUN_STARTED_WALL = time.time()   # before the root exists: everything placed in it starts after
     root = Path(tempfile.mkdtemp(prefix=f'avr{pair_index}{arm_name[0]}-', dir='/tmp'))
     run_id = root.name.replace('_', '-')
     observe.RUN_SUFFIX = f'.{run_id}'
@@ -1092,6 +1093,12 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
     # background shell does), so no agent or service inherits an ignored signal. Restored at the end.
     in_main = threading.current_thread() is threading.main_thread()
     saved_handlers = {}
+    held = []
+
+    def hold_off(signum, frame):
+        INTERRUPTED['signal'] = signum
+        held.append(signum)
+
     if in_main:
         for signum in (signal.SIGINT, signal.SIGTERM):
             saved_handlers[signum] = signal.signal(signum, interrupt)
@@ -1172,8 +1179,9 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                 return
             # Everything attributed to the worktree at the agent's exit, the CLI's own helpers included
             # (listed separately: the version 1 at-exit gate does not count them).
-            groups = groups_of([names[task]])
-            attributed_rows = observe.attributed(groups, exclude={proc.pid})[names[task]]
+            # Attribution is resolved against every group first (a process with another worktree's
+            # marker is that worktree's, whatever files of this one it has open), then filtered.
+            attributed_rows = observe.attributed(groups_of(all_names), exclude={proc.pid})[names[task]]
             # Counted: attributed to the worktree AND tied to the run (marker, lineage, verified service).
             # A process that only has a worktree file open (an operator's `tail -f`) is listed, not counted.
             left, not_counted = split_tied(attributed_rows, root)
@@ -1187,7 +1195,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                 record['agents'][key].update(
                     ended=now(), ended_m=round(ended_mono - t0, 3), seconds=round(ended_mono - started_mono, 2), exit=proc.returncode,
                     timed_out=timed_out, observed_after_exit_s=round(time.monotonic() - ended_mono, 2),
-                    left_running=rows_of(left, ('pid', 'started', 'command', 'marker')),
+                    left_running=rows_of(left, ('pid', 'started', 'command', 'marker', 'tie')),
                     cli_helpers_left=rows_of(cli_own, ('pid', 'command')),
                     seen_not_counted=rows_of(not_counted, ('pid', 'started', 'command')),
                     left_listening=sorted(port for port, pid in listeners.items() if pid in left_pids))
@@ -1332,13 +1340,15 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             service_dirs = {task: {'postgres': str(path / '.dev/postgres'), 'redis': str(path / '.dev/redis')} for task, path in worktrees.items()}
 
         def observation(name):
-            attributed_rows = observe.attributed({name: teardown_groups[name]})[name]   # raises if a listing fails: unknown inventory
+            # Resolved against every group and the main checkout, then this worktree's rows; raises if a
+            # listing fails (unknown inventory).
+            attributed_rows = observe.attributed({**teardown_groups, 'main': main_group})[name]
             rows, not_counted = split_tied(attributed_rows, root)                        # only run-tied processes count
             listeners, _ = observe.tcp()
             listeners.pop('by_endpoint', None)
             pids = {p['pid'] for p in rows}
             helpers = cli_paths(cli) if cli and not agent_override else ()
-            return rows, {'m': clock(), 'processes': rows_of(rows, ('pid', 'started', 'command', 'marker')),
+            return rows, {'m': clock(), 'processes': rows_of(rows, ('pid', 'started', 'command', 'marker', 'tie')),
                           'ports': sorted(port for port, pid in listeners.items() if pid in pids),
                           'of_which_cli_helpers': [p['pid'] for p in rows if helpers and p['command'].startswith(helpers)],
                           'seen_not_counted': rows_of(not_counted, ('pid', 'started', 'command'))}
@@ -1473,7 +1483,8 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             teardown[task]['procedure'].append(removal[task])
         if arm.name == 'stack':
             removal['gc'] = sh([arm.stack, '--json', 'gc', '--reclaim-data'], main, env_main, log=steps, name='gc_reclaim')
-        left = observe.attributed(teardown_groups)
+        left = observe.attributed({**teardown_groups, 'main': main_group})   # resolved over every group first
+        left.pop('main', None)
         for task, path in worktrees.items():
             seen_dirs = set((sampler.summary().get('service_data_dirs') or {}).get(names[task]) or [])
             checked = sorted(set(service_dirs[task].values()) | seen_dirs)
@@ -1541,8 +1552,10 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
         try:
             # Shutdown: first nothing may start a session, then cleanup, then the check that nothing is left.
             if in_main:   # cleanup is not interrupted; the previous handlers come back at the very end
+                # A signal now is held, not dropped: recorded in INTERRUPTED (the caller stops after the
+                # run returns) and in the record, without raising into the cleanup.
                 for signum in (signal.SIGINT, signal.SIGTERM):
-                    signal.signal(signum, signal.SIG_IGN)
+                    signal.signal(signum, hold_off)
             with launch_lock:
                 state['shutting_down'] = True
             record['shutdown_m'] = clock()
@@ -1684,6 +1697,8 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
             record['scrubbed_files'] = changed
             record['not_published'] = not_published
             shutil.rmtree(stage, ignore_errors=True)   # raw traces never outlive the run, kept root or not
+            if held:
+                record['signals_during_cleanup'] = held   # held off, not dropped: the caller stops after this run
             (out_dir / 'run.json').write_text(json.dumps(redact.scrub_json(record), indent=2, default=str))
             if not keep_root and record['valid']:
                 shutil.rmtree(root, ignore_errors=True)
@@ -1691,6 +1706,7 @@ def run_arm(plan, pair_index, arm_name, out_dir, agent_override=None, keep_root=
                                    'note': 'kept for inspection: worktrees and service data, no raw traces'} if root.exists() else False
             (out_dir / 'run.json').write_text(json.dumps(redact.scrub_json(record), indent=2, default=str))
             observe.RUN_SUFFIX = None
+            observe.RUN_STARTED_WALL = None
         finally:  # the caller's signal handlers come back whatever happened above
             for signum, handler in saved_handlers.items():
                 signal.signal(signum, handler if handler is not None else signal.SIG_DFL)
@@ -1900,29 +1916,50 @@ def cli_failures(record):
     return bad
 
 
-def cmd_pair(args):
+def never_started_record(plan, pair, attempt, arm_name, reason):
+    """The record of an arm refused before it started (PROTOCOL.md, Validity): an invalid run that
+    never started, so the pair is rerun whole. Only the identity of the planned run; no trial fields."""
+    return {'protocol_version': PROTOCOL_VERSION, 'pair': pair['index'], 'attempt': attempt, 'arm': arm_name,
+            'scenario': pair.get('scenario'), 'victim': pair.get('victim'), 'plan_sha256': plan.get('_sha256'),
+            'plan_name': plan.get('name'), 'plan_kind': plan.get('kind'), 'model': plan['config']['model'],
+            'valid': False, 'never_started': True, 'invalid_reasons': [f'not started: {reason}'], 'refused': now(), 'agents': {}}
+
+
+def cmd_pair(args, power_reader=None, arm_runner=None, lock_held=False):
+    """Run one attempt of one pair. Every check that can refuse (plan, attempt reasons, existing run
+    directories, power for the first arm) comes before the attempt-2 marker is written, so a refusal
+    never consumes the rerun. `power_reader`, `arm_runner` and `lock_held` are for validation only."""
     plan = load_plan(args.plan)
     problems = check_plan(plan)
     if problems:
         raise SystemExit('refusing to run: ' + '; '.join(problems))
     if args.attempt not in (1, 2):
         raise SystemExit('a pair has at most two attempts')
-    lock = host_lock()
+    lock = None if lock_held else host_lock()
     pair = plan['pairs'][args.index]
     results = Path(args.results)
+    marker = results / f'pair{args.index}.2-STARTED.json'
+    reasons = None
     if args.attempt == 2:
         reasons = attempt_reasons(results, args.index, plan['_sha256'])
         if not reasons:
             raise SystemExit(f'attempt 2 of pair {args.index} is allowed only after an invalid run or a missed fault in attempt 1')
-        print(f'pair {args.index}: attempt 2, because {reasons}', flush=True)
-        # Recorded before anything else: from now on attempt 2 governs this pair, even if it dies
-        # before writing a run record.
-        marker = results / f'pair{args.index}.2-STARTED.json'
         if marker.exists():
             if marker_matches(marker, plan['_sha256'], args.index):
                 raise SystemExit(f'{marker} exists: attempt 2 of pair {args.index} has already been started')
             raise SystemExit(f'{marker} exists but does not name this plan digest, pair {args.index} and attempt 2: '
                              'it belongs to something else; move it aside before rerunning')
+    for arm_name in pair['order']:
+        out = results / run_dir_name(args.index, args.attempt, arm_name)
+        if out.exists():
+            raise SystemExit(f'{out} exists; runs are never overwritten (rerun into a new results directory)')
+    ok, reason = power_check(power_reader)   # the first arm's power check, before anything is recorded
+    if not ok:
+        raise SystemExit(f'refusing to run {pair["order"][0]}: {reason}; trials run on AC power only')
+    if args.attempt == 2:
+        print(f'pair {args.index}: attempt 2, because {reasons}', flush=True)
+        # Recorded before any arm starts: from now on attempt 2 governs this pair, even if it dies
+        # before writing a run record.
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(fd, 'w') as handle:
             handle.write(json.dumps({'pair': args.index, 'attempt': 2, 'started': now(), 'plan_sha256': plan['_sha256'],
@@ -1930,20 +1967,25 @@ def cmd_pair(args):
             handle.flush()
             os.fsync(handle.fileno())
     plan['_attempt'] = args.attempt
-    for arm_name in pair['order']:
-        out = results / run_dir_name(args.index, args.attempt, arm_name)
-        if out.exists():
-            raise SystemExit(f'{out} exists; runs are never overwritten (rerun into a new results directory)')
-    for arm_name in pair['order']:
-        problems = check_plan(plan)  # before each arm
-        if problems:
-            raise SystemExit('refusing to run: ' + '; '.join(problems))
-        ok, reason = power_check()   # before each arm: AC power only (PROTOCOL.md, Validity)
-        if not ok:
-            raise SystemExit(f'refusing to run {arm_name}: {reason}; trials run on AC power only')
+    for position, arm_name in enumerate(pair['order']):
+        if position > 0:
+            problems = check_plan(plan)  # before each arm
+            if problems:
+                raise SystemExit('refusing to run: ' + '; '.join(problems))
+            ok, reason = power_check(power_reader)   # before each arm: AC power only (PROTOCOL.md, Validity)
+            if not ok:
+                # After the first arm ran: recorded as an invalid run that never started, so the pair
+                # is rerun whole instead of being stranded.
+                out = results / run_dir_name(args.index, args.attempt, arm_name)
+                out.mkdir(parents=True, exist_ok=False)
+                (out / 'run.json').write_text(json.dumps(never_started_record(plan, pair, args.attempt, arm_name, reason), indent=2))
+                raise SystemExit(f'refusing to run {arm_name}: {reason}; trials run on AC power only. '
+                                 f'Recorded {out} as an invalid run that never started: the pair is rerun whole')
         out = results / run_dir_name(args.index, args.attempt, arm_name)
         print(f'pair {args.index} attempt {args.attempt}: running {arm_name} -> {out}', flush=True)
-        record = run_arm(plan, args.index, arm_name, out)
+        record = (arm_runner or run_arm)(plan, args.index, arm_name, out)
+        if INTERRUPTED.get('signal'):   # a signal held off during the run's cleanup: stop after it, no next arm
+            raise SystemExit(f'stopping: signal {INTERRUPTED["signal"]} arrived during {out}; no further arm is started')
         summary = {t: {'passed': (a.get('grade') or {}).get('passed'), 'seconds': a.get('seconds'), 'killed': a.get('killed_by_harness', False),
                        'left': len(a.get('left_running') or []), 'cost': ((a.get('trace_metrics') or {}).get('result') or {}).get('total_cost_usd')}
                    for t, a in record['agents'].items()}
@@ -1959,7 +2001,8 @@ def cmd_pair(args):
             raise SystemExit(f'stopping: run {out} is invalid: {record["invalid_reasons"]}')
         if len(failures) >= 2:
             raise SystemExit(f'stopping: {len(failures)} agent CLI failures in {out}: {failures}')
-    lock.close()
+    if lock is not None:
+        lock.close()
 
 
 def scripted_override(spec):
