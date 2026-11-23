@@ -43,6 +43,12 @@ enum Cmd {
         /// A preset service, as NAME, NAME=PRESET and either with @VERSION (repeatable), e.g. --service postgres@17
         #[arg(long = "service", value_name = "NAME[=PRESET][@VERSION]")]
         services: Vec<String>,
+        /// Also add the tools and preset services this directory's files suggest
+        /// (.python-version, pyproject.toml, package.json, Cargo.toml, go.mod, .mise.toml,
+        /// .tool-versions, compose files, .env.example). Reads files only, never runs project
+        /// code; --tool and --service win over a detected entry of the same name
+        #[arg(long)]
+        detect: bool,
     },
     /// Resolve bundles, write stack.lock and the generated provider config
     Compile {
@@ -107,7 +113,8 @@ enum Cmd {
     },
     /// Start services, verify each one, and record a session
     Up {
-        /// Reclaim the session after this long without activity (e.g. 30m, 2h)
+        /// Reclaim the session after this long without activity (e.g. 30m, 2h). Without it or
+        /// --owner-pid, `[session] default_ttl` of stack.toml applies when set
         #[arg(long)]
         ttl: Option<String>,
         /// Reclaim the session when this process exits. Pass a long-lived process such as the
@@ -184,7 +191,8 @@ enum Cmd {
         /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
         #[arg(long)]
         up: bool,
-        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        /// With --up: the lease of a session `up` records (default: keep the current lease; a
+        /// session without one gets `[session] default_ttl` of stack.toml, else 30m)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
         /// Install pinned tools that are missing instead of failing with tools_not_installed
@@ -204,7 +212,8 @@ enum Cmd {
         /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
         #[arg(long)]
         up: bool,
-        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        /// With --up: the lease of a session `up` records (default: keep the current lease; a
+        /// session without one gets `[session] default_ttl` of stack.toml, else 30m)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
         /// Extra arguments, appended to the task's command
@@ -484,8 +493,11 @@ fn main() -> ExitCode {
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
-        Cmd::Init { tools, services } => stack::init::init(&root, tools, services).map(|r| {
+        Cmd::Init { tools, services, detect } => stack::init::init(&root, tools, services, *detect).map(|r| {
             emit(cli.json, &r, || {
+                for d in &r.detected {
+                    println!("detected {} {} = {} ({})", d.kind, d.name, d.value, d.source);
+                }
                 println!("wrote {}", r.path.display());
                 println!("next: {}", r.next.join(", then "));
             })
@@ -526,7 +538,7 @@ fn main() -> ExitCode {
             })
             .and_then(|(ttl_secs, owner_pid, timeout, labels)| {
                 let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone(), from_snapshot: from_snapshot.clone(), labels };
-                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, opts)
+                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid, fallback_ttl_secs: None }, timeout, opts)
             })
             .map(|r| {
                 emit(cli.json, &r, || {

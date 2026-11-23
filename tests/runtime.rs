@@ -1332,6 +1332,8 @@ fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing()
     let status: Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|_| panic!("CLI status: {}", String::from_utf8_lossy(&out.stderr)));
     let withheld = &status["data"]["checks"][0]["withheld"];
+    // Unverified: no endpoints, only what is withheld.
+    assert!(status["data"]["checks"][0].get("endpoints").is_none(), "CLI status: {status}");
     for var in ["DATABASE_URL", "PGHOST", "PGHOSTADDR", "PGPASSWORD"] {
         assert!(
             withheld.as_array().unwrap().contains(&json!(var)),
@@ -1838,7 +1840,10 @@ fn restart_changed_restarts_exactly_the_services_whose_watched_files_changed() {
 fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\nwatch=['main.py']\n");
     fs::write(fixture.dir.path().join("app/main.py"), "v1").unwrap();
-    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    let port = assigned_port(&fixture, "web");
+    supervise_listener(&fixture, port);
+    // What mise exports from the `[env]` compile rendered (the fake mise exports env.json).
+    fixture.set_env(&[("WEB_URL", format!("http://127.0.0.1:{port}")), ("WEB_PORT", port.to_string()), ("WEB_TOKEN", "t0ps3cr3t-value".into())]);
     let up = json_result(&fixture.ok(&["up", "--json"]));
     let before = up["data"]["checks"][0]["pid"].as_u64().unwrap();
     assert!(fixture.session()["services"]["web"]["started_at_ms"].is_u64(), "{up}");
@@ -1849,6 +1854,11 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let status = json_result(&fixture.ok(&["status", "--json"]));
     assert_eq!(status["data"]["checks"][0]["ready"], true);
     assert_eq!(status["data"]["checks"][0]["changed_since_start"], json!(["main.py"]), "{status}");
+    // A verified service lists the addresses commands get for it, in `status` as in `up`, and
+    // nothing else of its environment.
+    let endpoints = json!({ "WEB_PORT": port.to_string(), "WEB_URL": format!("http://127.0.0.1:{port}") });
+    assert_eq!(status["data"]["checks"][0]["endpoints"], endpoints, "{status}");
+    assert_eq!(up["data"]["checks"][0]["endpoints"], endpoints, "{up}");
     let out = fixture.ok(&["exec", "--", "true"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("stack restart web"));
 

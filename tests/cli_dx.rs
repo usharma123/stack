@@ -352,3 +352,40 @@ fn mcp_init_writes_a_project_in_dir_and_never_replaces_one() {
     assert_eq!(replies[1]["error"]["code"], "project_exists", "{}", replies[1]);
     assert_eq!(replies[2]["error"]["code"], "usage", "{}", replies[2]);
 }
+
+#[test]
+fn init_detect_adds_what_the_checkout_suggests_on_the_cli_and_over_mcp() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    let make = |name: &str| {
+        let dir = fixture.dir.path().join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(".python-version"), "3.12\n").unwrap();
+        fs::write(dir.join("uv.lock"), "").unwrap();
+        fs::write(dir.join("compose.yml"), "services:\n  db:\n    image: postgres:17\n").unwrap();
+        dir.canonicalize().unwrap()
+    };
+    let cli = make("cli");
+    let out = fixture.command_in(&cli, &["-C", cli.to_str().unwrap(), "init", "--detect", "--tool", "python=3.13", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["data"]["tools"], json!(["python", "uv"]), "{result}");
+    assert_eq!(result["data"]["services"], json!(["postgres"]), "{result}");
+    assert_eq!(
+        result["data"]["detected"],
+        json!([
+            { "kind": "tool", "name": "uv", "value": "latest", "source": "uv.lock" },
+            { "kind": "service", "name": "postgres", "value": "postgres@17", "source": "compose.yml" }
+        ]),
+        "{result}"
+    );
+    let written = fs::read_to_string(cli.join("stack.toml")).unwrap();
+    assert!(written.contains("python = \"3.13\"") && written.contains("version = \"17\""), "{written}");
+
+    let mcp = make("mcp");
+    let plain = make("plain");
+    let replies = fixture.mcp(&fixture.app(), &[("stack_init", json!({ "dir": mcp, "detect": true })), ("stack_init", json!({ "dir": plain }))]);
+    assert_eq!(replies[0]["data"]["tools"], json!(["python", "uv"]), "{}", replies[0]);
+    assert_eq!(replies[0]["data"]["detected"][0], json!({ "kind": "tool", "name": "python", "value": "3.12", "source": ".python-version" }), "{}", replies[0]);
+    // Without detect, the result is what it always was: no `detected` key.
+    assert!(replies[1]["data"].get("detected").is_none(), "{}", replies[1]);
+    assert_eq!(replies[1]["data"]["tools"], json!([]), "{}", replies[1]);
+}

@@ -164,7 +164,8 @@ run = "cargo build"
 ## Artifact lock settings
 
 `[lock]` (`platforms`, `artifacts`) belongs to the project's `stack.toml` only; a bundle that
-sets it is `bundle_invalid`. Bundles cannot weaken or widen a project's artifact policy. See
+sets it is `bundle_invalid`. So does `[session]` (`default_ttl`, the lease a session gets when
+the command starting it names none; see [leases](commands.md#leases)). Bundles cannot weaken or widen a project's artifact policy. See
 [Artifact checksums](commands.md#artifact-checksums).
 
 See [commands](commands.md) for compile options and [guarantees](guarantees.md) for locking and conflict rules.

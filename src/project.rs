@@ -116,6 +116,9 @@ pub struct Report {
     /// `[lock]` of the project.
     #[serde(skip)]
     pub artifact_policy: artifacts::Policy,
+    /// `[session] default_ttl` of the project, in seconds.
+    #[serde(skip)]
+    pub default_ttl_secs: Option<u64>,
 }
 
 impl Report {
@@ -468,6 +471,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         written: opts.write,
         skills: None,
         provider_skills: None,
+        default_ttl_secs: project.default_ttl_secs()?,
         skills_dir: project.skills.map(|s| s.dir),
     })
 }

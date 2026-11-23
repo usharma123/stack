@@ -250,6 +250,10 @@ pub struct Check {
     /// Connection variables poisoned or removed for commands because the service is not verified.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<String>,
+    /// The connection variables a verified service gives commands, as they get them (see
+    /// [`endpoints`]). Empty unless `ready`: an unverified service's are `withheld`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, String>,
     /// Files under the service's `watch` paths modified after it started: the process may be
     /// running older code. Reported, not a verification failure.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -339,6 +343,7 @@ fn verify_some(
             reason: None,
             reason_code: None,
             withheld: Vec::new(),
+            endpoints: BTreeMap::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
             checked_at: now(),
@@ -355,6 +360,7 @@ fn verify_some(
             Ok(identity) => {
                 check.ready = true;
                 check.identity = Some(identity);
+                check.endpoints = port.map(|port| endpoints(name, service, port, env)).unwrap_or_default();
             }
             Err((code, reason)) => {
                 check.reason = Some(reason);
@@ -643,6 +649,29 @@ fn binding_vars(
     out
 }
 
+/// The connection variables of a verified service, as `env` (the provider's environment, which
+/// commands get) holds them: its preset's (`DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`,
+/// `PGDATABASE`; `REDIS_URL`; `NATS_URL`, ...) or `<NAME>_URL` and `<NAME>_PORT` of a service
+/// without one, the names Stack renders for it (see [`mise::service_urls`]). Only addresses:
+/// a variable that names a key, token, secret or password is left out (SpiceDB's preshared
+/// key), and a password inside a URL is masked.
+fn endpoints(name: &str, service: &Service, port: u16, env: &IndexMap<String, String>) -> BTreeMap<String, String> {
+    mise::service_urls(name, service.preset.as_deref(), port, &IndexMap::new())
+        .into_iter()
+        .filter(|(key, _)| !["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|word| key.contains(word)))
+        .filter_map(|(key, _)| Some((key.clone(), mask_url_password(env.get(&key)?))))
+        .collect()
+}
+
+/// `value` with the password of a URL's user information, if it has one, replaced by `***`.
+fn mask_url_password(value: &str) -> String {
+    let Some((scheme, rest)) = value.split_once("://") else { return value.to_string() };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else { return value.to_string() };
+    let Some(colon) = rest[..at].find(':') else { return value.to_string() };
+    format!("{scheme}://{}:***{}", &rest[..colon], &rest[at..])
+}
+
 /// The caller's environment, which commands inherit beneath the provider's. Used only to find
 /// and poison connection variables; commands inherit the raw values of everything else. Unix
 /// allows any bytes, so this must not panic like `std::env::vars`: a key that is not Unicode
@@ -890,6 +919,26 @@ impl Steps {
 pub struct LeaseOptions {
     pub ttl_secs: Option<u64>,
     pub owner_pid: Option<u32>,
+    /// The TTL when neither field above is set and the project's `[session] default_ttl` is
+    /// not either: `None` gives a session that lives until `stack down` (`stack up`), `exec
+    /// --up` and `run --up` give [`DEFAULT_PREPARED_TTL`] so a one-shot call never leaves a
+    /// session behind forever.
+    pub fallback_ttl_secs: Option<u64>,
+}
+
+/// The TTL `exec --up` and `run --up` give a session they start with no lease named, when the
+/// project sets no `[session] default_ttl`: 30 minutes.
+pub const DEFAULT_PREPARED_TTL: u64 = 30 * 60;
+
+impl LeaseOptions {
+    /// The lease to record: as given, else a TTL from the project's `[session] default_ttl`,
+    /// else the fallback.
+    pub fn resolve(&self, default_ttl_secs: Option<u64>) -> (Option<u64>, Option<u32>) {
+        if self.ttl_secs.is_some() || self.owner_pid.is_some() {
+            return (self.ttl_secs, self.owner_pid);
+        }
+        (default_ttl_secs.or(self.fallback_ttl_secs), None)
+    }
 }
 
 /// Largest owner PID a lease accepts. `pid_t` is a signed 32-bit integer on supported
@@ -1176,11 +1225,8 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     // The labels this checkout's session had, with those given now added or replacing them.
     let mut labels = previous.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
     labels.extend(opts.labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let lease = (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
-        ttl_secs: lease.ttl_secs,
-        owner_pid: lease.owner_pid,
-        renewed_at: stamp,
-    });
+    let (ttl_secs, owner_pid) = lease.resolve(report.default_ttl_secs);
+    let lease = (ttl_secs.is_some() || owner_pid.is_some()).then_some(Lease { ttl_secs, owner_pid, renewed_at: stamp });
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
         // Ownership is recorded before anything starts. If start or verification fails, or the
@@ -2062,6 +2108,7 @@ fn not_verified_in_time(report: &Report, name: &str) -> Check {
         reason: Some("not verified before the deadline: the supervisor still reported it starting".into()),
         reason_code: Some(ReasonCode::NotRunning),
         withheld: Vec::new(),
+        endpoints: BTreeMap::new(),
         changed_since_start: Vec::new(),
         watch_incomplete: false,
         checked_at: now(),
@@ -3854,6 +3901,7 @@ fn not_launched(report: &Report) -> Vec<Check> {
             reason: Some(NO_LAUNCH_RECORD_HERE.into()),
             reason_code: Some(ReasonCode::NotLaunched),
             withheld: Vec::new(),
+            endpoints: BTreeMap::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
             checked_at: now(),
@@ -5896,6 +5944,7 @@ fn verify_session(
         if let Some((code, reason)) = reason.map(|(code, why)| (code, String::from(why))).or(process) {
             check.ready = false;
             check.identity = None;
+            check.endpoints.clear();
             check.reason = Some(reason);
             check.reason_code = Some(code);
             check.withheld = binding_vars(
@@ -6718,6 +6767,95 @@ mod tests {
     }
 
     #[test]
+    fn endpoints_list_a_verified_services_own_addresses_as_commands_get_them() {
+        let preset = |p: &str| Service { preset: Some(p.into()), ..Service::default() };
+        // The provider's environment, as compile renders it, beside unrelated variables.
+        let mut env: IndexMap<String, String> = IndexMap::new();
+        for (name, svc, port, ports) in [
+            ("postgres", Some("postgres"), 41000, vec![]),
+            ("cache", Some("redis"), 41001, vec![]),
+            ("crdb", Some("cockroachdb"), 41002, vec![("crdb.http", 41012)]),
+            ("nats", Some("nats"), 41003, vec![("nats.monitor", 41013)]),
+            ("authz", Some("spicedb"), 41004, vec![("authz.http", 41014), ("authz.metrics", 41024)]),
+            ("api-gw", None, 41005, vec![]),
+        ] {
+            let ports: IndexMap<String, u16> = ports.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            env.extend(mise::service_urls(name, svc, port, &ports));
+        }
+        env.insert("PATH".into(), "/usr/bin".into());
+        env.insert("API_TOKEN".into(), "hunter2-hunter2".into());
+        env.insert("PGPASSWORD".into(), "sekret".into());
+        let pairs = |m: BTreeMap<String, String>| m.into_iter().collect::<Vec<_>>();
+        let owned = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+
+        assert_eq!(
+            pairs(endpoints("postgres", &preset("postgres"), 41000, &env)),
+            owned(&[
+                ("DATABASE_URL", "postgresql://postgres@127.0.0.1:41000/postgres"),
+                ("PGDATABASE", "postgres"),
+                ("PGHOST", "127.0.0.1"),
+                ("PGPORT", "41000"),
+                ("PGUSER", "postgres"),
+            ])
+        );
+        assert_eq!(pairs(endpoints("cache", &preset("redis"), 41001, &env)), owned(&[("REDIS_URL", "redis://127.0.0.1:41001")]));
+        let crdb = endpoints("crdb", &preset("cockroachdb"), 41002, &env);
+        assert_eq!(crdb["COCKROACH_URL"], "postgresql://root@127.0.0.1:41002/defaultdb?sslmode=disable");
+        assert_eq!(crdb["CRDB_HTTP_PORT"], "41012");
+        let nats = endpoints("nats", &preset("nats"), 41003, &env);
+        assert_eq!((nats["NATS_URL"].as_str(), nats["NATS_MONITOR_PORT"].as_str()), ("nats://127.0.0.1:41003", "41013"));
+        // SpiceDB's preshared key is a credential, not an address: never listed.
+        let spicedb = endpoints("authz", &preset("spicedb"), 41004, &env);
+        assert_eq!(spicedb.keys().collect::<Vec<_>>(), ["SPICEDB_ENDPOINT", "SPICEDB_HTTP_PORT", "SPICEDB_METRICS_PORT"]);
+        assert!(!spicedb.values().any(|v| v.contains("mise-dev-key")), "{spicedb:?}");
+        let custom = Service { run: Some("serve".into()), ..Service::default() };
+        assert_eq!(
+            pairs(endpoints("api-gw", &custom, 41005, &env)),
+            owned(&[("API_GW_PORT", "41005"), ("API_GW_URL", "http://127.0.0.1:41005")])
+        );
+
+        // What commands get wins: a project's [env] value, with any password in it masked. A
+        // variable commands do not get is not listed.
+        env.insert("DATABASE_URL".into(), "postgresql://app:s3cret@127.0.0.1:41000/app?sslmode=disable".into());
+        env.shift_remove("PGUSER");
+        let pg = endpoints("postgres", &preset("postgres"), 41000, &env);
+        assert_eq!(pg["DATABASE_URL"], "postgresql://app:***@127.0.0.1:41000/app?sslmode=disable");
+        assert!(!pg.contains_key("PGUSER") && !pg.contains_key("PGPASSWORD"), "{pg:?}");
+        assert!(!pg.values().any(|v| v.contains("s3cret") || v.contains("sekret")), "{pg:?}");
+    }
+
+    #[test]
+    fn url_passwords_are_masked_and_nothing_else_changes() {
+        for (value, masked) in [
+            ("postgresql://u:p@h:5432/db", "postgresql://u:***@h:5432/db"),
+            ("redis://:pw@127.0.0.1:6379", "redis://:***@127.0.0.1:6379"),
+            ("postgresql://u:p:q@h/db", "postgresql://u:***@h/db"),
+            ("postgresql://u@h/db", "postgresql://u@h/db"),
+            ("http://127.0.0.1:8080/a:b@c", "http://127.0.0.1:8080/a:b@c"),
+            ("127.0.0.1:50051", "127.0.0.1:50051"),
+            ("41000", "41000"),
+        ] {
+            assert_eq!(mask_url_password(value), masked, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_lease_comes_from_the_command_then_the_project_then_the_fallback() {
+        let given = LeaseOptions { ttl_secs: Some(60), owner_pid: None, fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL) };
+        assert_eq!(given.resolve(Some(7200)), (Some(60), None));
+        let owned = LeaseOptions { ttl_secs: None, owner_pid: Some(42), fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL) };
+        assert_eq!(owned.resolve(Some(7200)), (None, Some(42)), "an owner is a lease: no TTL is added");
+        // `stack up` with nothing named: the project's default, else a session until `down`.
+        let up = LeaseOptions::default();
+        assert_eq!(up.resolve(Some(7200)), (Some(7200), None));
+        assert_eq!(up.resolve(None), (None, None));
+        // `exec --up` / `run --up`: the project's default, else 30 minutes.
+        let prepared = LeaseOptions { fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL), ..LeaseOptions::default() };
+        assert_eq!(prepared.resolve(Some(7200)), (Some(7200), None));
+        assert_eq!(prepared.resolve(None), (Some(1800), None));
+    }
+
+    #[test]
     fn binding_vars_cover_preset_and_port_references() {
         let map = |pairs: &[(&str, &str)]| -> IndexMap<String, String> {
             pairs
@@ -6907,6 +7045,7 @@ mod tests {
             reason: None,
             reason_code: None,
             withheld: Vec::new(),
+            endpoints: BTreeMap::new(),
             changed_since_start: Vec::new(),
             watch_incomplete: false,
             checked_at: 0,

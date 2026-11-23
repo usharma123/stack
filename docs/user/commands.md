@@ -2,7 +2,7 @@
 
 | Command | Does |
 |---|---|
-| `stack init [--tool NAME[=VERSION]]... [--service NAME[=PRESET][@VERSION]]...` | Write a starting `stack.toml` (never replaces one) |
+| `stack init [--tool NAME[=VERSION]]... [--service NAME[=PRESET][@VERSION]]... [--detect]` | Write a starting `stack.toml` (never replaces one) |
 | `stack compile [--update \| --locked] [--reassign-ports]` | Resolve bundles and versions, write `stack.lock`, assign ports, write mise config |
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
@@ -93,6 +93,27 @@ compile.
 stack init --tool python=3.13 --tool uv --service postgres@17 --service cache=redis
 ```
 
+`--detect` also adds what the directory's own files suggest, and lists each under `detected`
+(`kind` `tool` or `service`, `name`, `value`, `source`) in the `--json` result:
+
+| Files | Adds |
+|---|---|
+| `.python-version`, `pyproject.toml` (`requires-python`), `requirements.txt` | `python`: the version a version file names, or the `major.minor` a lower bound such as `>=3.12` names, else `latest` |
+| `uv.lock`, or `[tool.uv]` in `pyproject.toml` | `uv` |
+| `.nvmrc`, `.node-version`, `package.json` | `node`, at the version file's number when it is one (`20`, `22.11`) |
+| `pnpm-lock.yaml`; `bun.lock` or `bun.lockb` | `pnpm`; `bun` |
+| `rust-toolchain.toml` (a numeric `channel`), `rust-toolchain`, `Cargo.toml` | `rust` |
+| `go.mod` | `go`, at its `go` directive |
+| `.mise.toml` (or `mise.toml`) `[tools]`, `.tool-versions` | each plain pin (not `system`, a template or a backend such as `npm:`) |
+| `compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml` | a preset service for each `image:` of Postgres (and pgvector, PostGIS), Redis (and Valkey), CockroachDB, NATS or SpiceDB, at the image tag's major version when it starts with one |
+| `.env.example`, `.env.sample` | `postgres`, `redis` or `nats` for a `DATABASE_URL`, `REDIS_URL` or `NATS_URL` with that scheme |
+
+A version file wins over a manifest, and a found version over none. `--tool` and `--service`
+win over a detected entry of the same name, which is then not listed. Detection only reads
+files at the top of the directory: it never runs project code, reads at most 256 KiB of a file
+(a larger one counts as present, unread), and ignores a link that leads out of the directory.
+Without `--detect` nothing is read and the result has no `detected` key.
+
 ## compile
 
 Resolves bundles and version requests, records exact versions and [artifact
@@ -141,7 +162,9 @@ as usual.
   your work. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
   own parent and uses the nearest ancestor whose command name (or `argv[0]`) is `<name>`, for
   example `ancestor:claude` from a hook Claude Code runs. With no match it fails with
-  `owner_not_found`, listing the ancestors it saw, and starts nothing. See [leases](#leases).
+  `owner_not_found`, listing the ancestors it saw, and starts nothing. With neither flag, a
+  project's `[session] default_ttl` (in `stack.toml`, e.g. `default_ttl = "30m"`) is the TTL;
+  without that, the session lives until `stack down`. See [leases](#leases).
 - **Timeout.** The default is 10 minutes, covering downloads, installs and readiness. On
   expiry you get `timed_out` (exit 124). Services may still be starting: check `status`, retry
   `up`, or run `down` before fixing a service that will never become ready. A service whose
@@ -249,6 +272,18 @@ Checking counts as using the session: `status` renews a lease that has not expir
 `exec`. An expired lease is reported, not revived, and so is the lease of a session that is
 stale or did not finish starting. The result carries a [`lease`](#leases) object.
 
+### Endpoints
+
+A service that verifies lists, under `endpoints`, the connection variables commands get for it,
+with the values they get (in `up`'s and `restart`'s checks too): Postgres's `DATABASE_URL`,
+`PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE`; Redis's `REDIS_URL`; CockroachDB's
+`COCKROACH_URL`, `COCKROACH_HOST` and `CRDB_HTTP_PORT`; NATS's `NATS_URL`, `NATS_MONITOR_PORT`
+and `NATS_MONITORING_URL`; SpiceDB's `SPICEDB_ENDPOINT`, `SPICEDB_HTTP_PORT` and
+`SPICEDB_METRICS_PORT`; and `<NAME>_URL` and `<NAME>_PORT` of a service of your own. A project's
+`[env]` value for one of them is what is listed. Only addresses appear: SpiceDB's preshared key
+is left out, and a password inside a URL is shown as `***`. A service that does not verify has
+no `endpoints`; what it would have had is under `withheld`.
+
 ### Reason codes
 
 A service that is not ready has a `reason` for people and a `reason_code` to branch on:
@@ -337,7 +372,8 @@ neither mark, and `[env]` cannot set it.
 - `--up` runs `stack up` first when there is no session, or it is stale (the configuration
   changed), expired, incomplete or has a service that does not verify. Otherwise it does
   nothing. The session keeps its lease (a TTL, or an owner still alive) unless `--ttl` gives
-  it a new one. `up` gets what is left of `--timeout`, at most its usual 10 minutes. What it
+  it a new one. A session it starts without a lease to keep gets the project's `[session]
+  default_ttl`, else 30 minutes, so a one-shot call never leaves services running forever. `up` gets what is left of `--timeout`, at most its usual 10 minutes. What it
   did is listed under `prepared` in the `--json` result (`step` `up`, with the `reason`), and
   on stderr otherwise; nothing appears when it did not run.
 - `--install` installs pinned tools that are missing, as `stack install` would, instead of
@@ -581,6 +617,22 @@ with `no_lease`, whose hint says how to give it one.
 | `expired`, `expired_reason` | The lease ran out, and why; `gc` or the next `up` anywhere reclaims the session |
 
 `status` keeps `lease_expired`, the reason with what to do about it, beside it.
+
+Which lease a session gets, when the command starting it names none:
+
+```toml
+# stack.toml (project only; a bundle that sets it is bundle_invalid)
+[session]
+default_ttl = "30m"
+```
+
+| Started by | `--ttl` or `--owner-pid` given | Otherwise |
+|---|---|---|
+| `up` | That lease | `default_ttl`, else none (lives until `stack down`) |
+| `exec --up`, `run --up` | `--ttl` replaces the lease | The session's own lease when it has one (a TTL, or an owner still alive), else `default_ttl`, else 30 minutes |
+
+`default_ttl` takes a duration as `--ttl` does (`90s`, `30m`, `2h`, `1d`); anything else, or
+zero, makes every command that reads `stack.toml` fail with `manifest_invalid`.
 
 ## gc
 

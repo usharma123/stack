@@ -613,6 +613,56 @@ fn exec_up_starts_the_stack_only_when_needed_and_keeps_the_lease() {
 }
 
 #[test]
+fn exec_up_and_run_up_never_start_a_session_that_lives_forever() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.t]\nrun='true'\n");
+    // No --ttl and no [session] default_ttl: 30 minutes, not a session until `stack down`.
+    let result = json_result(&fixture.ok(&["--json", "exec", "--up", "--", "true"]));
+    assert_eq!(result["data"]["prepared"][0]["step"], "up", "{result}");
+    assert_eq!(result["data"]["prepared"][0]["lease"]["kind"], "ttl", "{result}");
+    assert_eq!(result["data"]["prepared"][0]["lease"]["ttl_secs"], 1800, "{result}");
+    assert_eq!(saved_session(&fixture)["lease"]["ttl_secs"], 1800);
+    fixture.ok(&["down"]);
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "t", "up": true }))]);
+    assert_eq!(results[0]["data"]["prepared"][0]["lease"]["ttl_secs"], 1800, "{}", results[0]);
+    fixture.ok(&["down"]);
+
+    // `stack up` alone still records no lease; a stale session without one gets the default
+    // when `run --up` starts it again.
+    fixture.ok(&["up"]);
+    assert!(saved_session(&fixture).get("lease").map_or(true, Value::is_null), "{}", saved_session(&fixture));
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
+    let result = json_result(&fixture.ok(&["--json", "run", "--up", "t"]));
+    assert!(result["data"]["prepared"][0]["reason"].as_str().unwrap().contains("configuration changed"), "{result}");
+    assert_eq!(saved_session(&fixture)["lease"]["ttl_secs"], 1800, "{result}");
+    fixture.ok(&["down"]);
+
+    // [session] default_ttl: what `up` with no lease named, and `exec --up`, record.
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[session]\ndefault_ttl='10m'\n").unwrap();
+    let up = json_result(&fixture.ok(&["--json", "up"]));
+    assert_eq!((up["data"]["lease"]["kind"].as_str(), up["data"]["lease"]["ttl_secs"].as_u64()), (Some("ttl"), Some(600)), "{up}");
+    fixture.ok(&["down"]);
+    let up = json_result(&fixture.ok(&["--json", "up", "--ttl", "1h"]));
+    assert_eq!(up["data"]["lease"]["ttl_secs"], 3600, "--ttl wins: {up}");
+    fixture.ok(&["down"]);
+    let pid = std::process::id().to_string();
+    let up = json_result(&fixture.ok(&["--json", "up", "--owner-pid", &pid]));
+    assert_eq!(up["data"]["lease"]["kind"], "owner_pid", "an owner is a lease; no TTL is added: {up}");
+    fixture.ok(&["down"]);
+    let result = json_result(&fixture.ok(&["--json", "exec", "--up", "--", "true"]));
+    assert_eq!(result["data"]["prepared"][0]["lease"]["ttl_secs"], 600, "{result}");
+    let results = fixture.mcp(&[("stack_up", json!({}))]);
+    assert_eq!(results[0]["data"]["lease"]["ttl_secs"], 600, "{}", results[0]);
+    fixture.ok(&["down"]);
+
+    // An invalid default is refused before anything starts.
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[session]\ndefault_ttl='soon'\n").unwrap();
+    let out = fixture.command(&["--json", "exec", "--up", "--", "true"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "manifest_invalid", "{error}");
+    assert!(error["message"].as_str().unwrap().contains("default_ttl"), "{error}");
+}
+
+#[test]
 fn exec_install_installs_missing_pins_instead_of_failing() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.8.2'\n");
     let out = fixture.command(&["--json", "exec", "--", "true"]).output().unwrap();

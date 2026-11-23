@@ -35,7 +35,7 @@ act machine-wide and need no `dir`, as does `stack_errors`.
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
-| `stack_init` | Writes a starting `stack.toml` (`tools`, `services`), like `stack init` |
+| `stack_init` | Writes a starting `stack.toml` (`tools`, `services`, and `detect: true` to add what the checkout's files suggest), like `stack init` |
 | `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapshot_list`, `stack_snapshot_rm` | Save a checkout's Postgres and Redis data and restore it in any checkout of the project, like `stack snapshot` ([service data](data.md)) |
 | `stack_errors` | Lists every [error code](errors.md): its meaning, default hint, `retryable` and `next` (CLI: `stack errors`) |
 | `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
@@ -68,13 +68,16 @@ To save a round-trip, `stack exec --up -- <command>` and `stack run --up <task>`
 stack first when it needs it (no session, a stale or expired one, or a service that does not
 verify), and `stack exec --install` installs missing pinned tools instead of failing with
 `tools_not_installed`. Over MCP these are `up`, `ttl` and `install` on `stack_exec` and
-`stack_run`; what ran is listed under `prepared`.
+`stack_run`; what ran is listed under `prepared`. A session `--up` starts without a lease to
+keep gets the project's `[session] default_ttl`, else a 30-minute TTL, so a one-shot call never
+leaves services running forever; pass `--ttl` for a longer one.
 
 A few things that are easy to get wrong:
 
 - **Read connection details from the environment.** `DATABASE_URL`, `REDIS_URL`,
   `<NAME>_PORT` and, for your own services, `<NAME>_URL` (`http://127.0.0.1:<port>`) are set
-  for every command. Ports differ per checkout, so never hardcode one.
+  for every command. Ports differ per checkout, so never hardcode one. `status` and `up` list a
+  verified service's variables and values under `endpoints` in its check.
 - **Declare `depends_on` for a service that holds connections to another**, such as an API to
   Postgres. Then a restart or recovery of Postgres restarts the API too; without it, the API
   keeps its dead connection while every check still passes.

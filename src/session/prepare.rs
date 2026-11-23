@@ -2,8 +2,8 @@
 //! (`--up`, `--install`), which the caller would otherwise run and retry after an error.
 
 use super::{
-    install, startup_deadline, startup_timed_out, status, up, up_within, Ctx, ExecPlan, LeaseOptions, StatusReport, UpReport,
-    DEFAULT_STARTUP_TIMEOUT,
+    install, startup_deadline, startup_timed_out, status, up, up_within, Ctx, ExecPlan, Lease, LeaseOptions, StatusReport, UpReport,
+    DEFAULT_PREPARED_TTL, DEFAULT_STARTUP_TIMEOUT,
 };
 use crate::error::{Result, StackError};
 use crate::ports;
@@ -81,7 +81,8 @@ pub struct Prepare {
     /// `--up`: start the stack first when there is no session, or it is stale, expired,
     /// incomplete or unhealthy.
     pub up: bool,
-    /// `--ttl` with `--up`: the lease of a session `up` records.
+    /// `--ttl` with `--up`: the lease of a session `up` records. Without it a session that has
+    /// no lease gets `[session] default_ttl`, else 30 minutes.
     pub ttl_secs: Option<u64>,
     /// `--install`: install pinned tools that are missing instead of failing.
     pub install: bool,
@@ -120,20 +121,29 @@ pub fn needs_up(report: &StatusReport) -> Option<String> {
         .map(|c| format!("{} is not verified: {}", c.service, c.reason.as_deref().unwrap_or("unknown")))
 }
 
+/// The lease `--up` asks `up` for: `ttl_secs` when given, else the session's (a TTL, or an
+/// owner still alive). A session that has neither gets the project's `[session] default_ttl`,
+/// else [`DEFAULT_PREPARED_TTL`], never a lease that lives until `stack down`.
+fn prepared_lease(ttl_secs: Option<u64>, previous: Option<&Lease>, alive: impl Fn(u32) -> bool) -> LeaseOptions {
+    match ttl_secs {
+        Some(ttl) => LeaseOptions { ttl_secs: Some(ttl), owner_pid: None, fallback_ttl_secs: None },
+        None => LeaseOptions {
+            ttl_secs: previous.and_then(|l| l.ttl_secs),
+            owner_pid: previous.and_then(|l| l.owner_pid).filter(|p| alive(*p)),
+            fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL),
+        },
+    }
+}
+
 /// `--up`: `status`, then `up` when it would fix what status found. The session's lease is
-/// kept (a TTL, or an owner still alive) unless `ttl_secs` gives a new one. Startup gets what
-/// is left of the caller's deadline, at most `up`'s default.
+/// kept (a TTL, or an owner still alive) unless `ttl_secs` gives a new one; a session without
+/// one gets a default TTL (see [`prepared_lease`]). Startup gets what is left of the caller's
+/// deadline, at most `up`'s default.
 fn up_if_needed(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Option<Value>> {
     let report = status(ctx)?;
     let Some(reason) = needs_up(&report) else { return Ok(None) };
     let previous = report.session.as_ref().and_then(|s| s.lease.as_ref());
-    let lease = match ttl_secs {
-        Some(ttl) => LeaseOptions { ttl_secs: Some(ttl), owner_pid: None },
-        None => LeaseOptions {
-            ttl_secs: previous.and_then(|l| l.ttl_secs),
-            owner_pid: previous.and_then(|l| l.owner_pid).filter(|p| pid_alive(*p)),
-        },
-    };
+    let lease = prepared_lease(ttl_secs, previous, pid_alive);
     let timeout = crate::process::remaining().map_or(DEFAULT_STARTUP_TIMEOUT, |r| r.min(DEFAULT_STARTUP_TIMEOUT));
     if timeout.is_zero() {
         return Err(StackError::new("timed_out", "no time is left to start the stack"));
@@ -159,4 +169,29 @@ fn install_if_missing(ctx: &Ctx) -> Result<Option<Value>> {
     let names: Vec<String> = missing.iter().map(|p| format!("{}@{}", p.tool, p.spec.version)).collect();
     let installed = install(ctx)?;
     Ok(Some(json!({ "step": "install", "missing": names, "warnings": installed.warnings })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_up_keeps_a_sessions_lease_and_gives_one_without_a_default_ttl() {
+        let lease = |ttl_secs, owner_pid| Lease { ttl_secs, owner_pid, renewed_at: 0 };
+        let resolved = |ttl: Option<u64>, previous: Option<&Lease>, project: Option<u64>| prepared_lease(ttl, previous, |pid| pid == 7).resolve(project);
+        // No session, or one without a lease: the project's default, else 30 minutes, never a
+        // session that outlives the call forever.
+        assert_eq!(resolved(None, None, None), (Some(DEFAULT_PREPARED_TTL), None));
+        assert_eq!(DEFAULT_PREPARED_TTL, 1800);
+        assert_eq!(resolved(None, None, Some(600)), (Some(600), None));
+        // An owner that exited leaves no lease to keep.
+        assert_eq!(resolved(None, Some(&lease(None, Some(8))), None), (Some(1800), None));
+        // A session's lease is kept, over the project's default.
+        assert_eq!(resolved(None, Some(&lease(Some(300), None)), Some(600)), (Some(300), None));
+        assert_eq!(resolved(None, Some(&lease(None, Some(7))), Some(600)), (None, Some(7)));
+        assert_eq!(resolved(None, Some(&lease(Some(300), Some(7))), None), (Some(300), Some(7)));
+        // --ttl replaces whatever the session had.
+        assert_eq!(resolved(Some(90), Some(&lease(Some(300), Some(7))), Some(600)), (Some(90), None));
+        assert_eq!(resolved(Some(90), None, None), (Some(90), None));
+    }
 }

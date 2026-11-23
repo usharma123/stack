@@ -347,10 +347,11 @@ fn tool_definitions() -> Value {
             "Return the SKILL.md text of a pinned tool's agent skill (CLI: stack skill), one that stack_inspect lists under `skills` as available. Use it to learn how to use that tool at the pinned release; read it, do not run it. Returns {tool, version, name, entrypoint, bytes, text}, text at most 64 KiB. Fails with skill_not_found, or usage listing the names when the tool ships several and name is omitted.",
             schema(json!({ "tool": { "type": "string", "description": "Tool name as listed under `skills`, e.g. \"fnox\"" }, "name": { "type": "string", "description": "Skill name, needed only when the tool ships several" } }), &["tool"])),
         tool("stack_init", "Write a starting stack.toml", annotations("Write a starting stack.toml", false, Some(false), false, false),
-            "Write a starting stack.toml in dir with the tools and preset services named (CLI: stack init). Use it when a checkout has none (manifest_missing), then call stack_compile. It never replaces an existing file (project_exists). Returns {path, tools, services, next}.",
+            "Write a starting stack.toml in dir with the tools and preset services named (CLI: stack init). Use it when a checkout has none (manifest_missing), then call stack_compile. It never replaces an existing file (project_exists). Returns {path, tools, services, next}, and detected with detect.",
             schema(json!({
                 "tools": { "type": "array", "items": { "type": "string" }, "description": "Tools as NAME or NAME=VERSION, e.g. \"python=3.13\" (no version: latest, pinned at the first compile)" },
-                "services": { "type": "array", "items": { "type": "string" }, "description": "Preset services as NAME, NAME=PRESET, either with @VERSION, e.g. \"postgres@17\" or \"cache=redis\"" }
+                "services": { "type": "array", "items": { "type": "string" }, "description": "Preset services as NAME, NAME=PRESET, either with @VERSION, e.g. \"postgres@17\" or \"cache=redis\"" },
+                "detect": { "type": "boolean", "description": "Also add the tools and preset services the checkout's files suggest (version files, pyproject.toml, package.json, Cargo.toml, go.mod, .mise.toml, .tool-versions, compose files, .env.example), listed under detected. Reads files only; tools and services given here win over a detected entry of the same name" }
             }), &[])),
         tool("stack_compile", "Compile stack.lock", annotations("Compile stack.lock", false, Some(false), true, true),
             "Resolve bundles and exact tool and service versions, then write stack.lock and the generated provider config. Use it after editing stack.toml, or when another tool fails with lock_outdated. Pins are kept unless their request changed; update re-resolves everything; locked only checks; reassign_ports gives fresh ports after port_conflict. Returns versions, ports and warnings.",
@@ -362,7 +363,7 @@ fn tool_definitions() -> Value {
         tool("stack_up", "Start services", annotations("Start services", false, Some(false), true, true),
             "Start every service and verify each one, recording a session. Use it before work that needs services. Safe to repeat: a service already running with unchanged configuration is kept, not restarted (after editing code it loaded, use stack_restart). It uses stack.lock as it is; a stale lock fails with lock_outdated. On timed_out, what was launched stays recorded. Returns {session, checks, steps}.",
             schema(json!({
-                "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_status, stack_exec, stack_run and stack_renew extend it)" },
+                "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_status, stack_exec, stack_run and stack_renew extend it). Without ttl or an owner, [session] default_ttl of stack.toml applies when set" },
                 "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
                 "owner_ancestor": { "type": "string", "description": "Lease: tie the session to the nearest ancestor of this stack server with this command name, e.g. \"claude\" (CLI: --owner-pid ancestor:<name>); owner_not_found lists the ancestors when none matches" },
                 "reassign_ports": { "type": "boolean", "description": "On port_conflict with another program, give this checkout's conflicting ports new numbers and continue; data.reassigned_ports lists old and new. A pinned port is never moved" },
@@ -426,7 +427,7 @@ fn tool_definitions() -> Value {
                 "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs; or give `timeout`" },
                 "timeout": duration_schema("Time the whole call may take, planning included, before the command is killed"),
                 "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
-                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease)" },
+                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease; a session without one gets [session] default_ttl of stack.toml, else 30m)" },
                 "install": { "type": "boolean", "description": "Install pinned tools that are missing (as stack_install would) instead of failing with tools_not_installed; data.prepared lists them" }
             }), &["command"])),
         tool("stack_run", "Run a task", annotations("Run a task", false, None, false, true),
@@ -437,7 +438,7 @@ fn tool_definitions() -> Value {
                 "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before the task is killed and the call fails with timed_out (default 600); or give `timeout`" },
                 "timeout": duration_schema("Time the whole call may take, planning included, before the task is killed"),
                 "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
-                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease)" }
+                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease; a session without one gets [session] default_ttl of stack.toml, else 30m)" }
             }), &["task"])),
         tool("stack_renew", "Renew the lease", annotations("Renew the lease", false, Some(false), true, false),
             "Renew this checkout's session lease so stack_gc does not reclaim it. Use it during long work under a ttl lease with no other stack calls (stack_exec and stack_run also renew). Returns the session.",
@@ -592,7 +593,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         "stack_skill" => skill(args, ctx).map(to_value),
         "stack_init" => {
             let strings = |key: &str| -> Vec<String> { args[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect() };
-            crate::init::init(&ctx.root, &strings("tools"), &strings("services")).map(to_value)
+            crate::init::init(&ctx.root, &strings("tools"), &strings("services"), args["detect"] == true).map(to_value)
         }
         "stack_compile" => {
             let mode = if args["update"] == true {
@@ -630,6 +631,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 LeaseOptions {
                     ttl_secs,
                     owner_pid,
+                    fallback_ttl_secs: None,
                 },
                 timeout,
                 session::UpOptions {

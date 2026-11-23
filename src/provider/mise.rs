@@ -519,24 +519,29 @@ fn loopback_urls(stack: &Composed, ports: &IndexMap<String, u16>) -> Vec<(String
     let mut out = Vec::new();
     for (name, e) in &stack.services {
         let Some(port) = ports.get(name) else { continue };
-        match e.value.preset.as_deref() {
-            Some(preset) => {
-                // The preset's further ports, reserved as `<service>.<role>` (see `secondary_roles`).
-                let secondary: crate::supervisor::Secondary = crate::supervisor::secondary_roles(preset)
-                    .iter()
-                    .filter_map(|role| Some((role.to_string(), *ports.get(&format!("{name}.{role}"))?)))
-                    .collect();
-                out.extend(crate::supervisor::preset_exports(preset, *port, &secondary).into_iter().map(|(k, v)| (k.to_string(), v)))
-            }
-            None if !name.starts_with(|c: char| c.is_ascii_digit()) => {
-                let base: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
-                out.push((format!("{base}_URL"), format!("http://127.0.0.1:{port}")));
-                out.push((format!("{base}_PORT"), port.to_string()));
-            }
-            None => {}
-        }
+        out.extend(service_urls(name, e.value.preset.as_deref(), *port, ports));
     }
     out
+}
+
+/// [`loopback_urls`] of one service on `port`; `ports` holds the preset's further ports, as
+/// `<service>.<role>`.
+pub fn service_urls(name: &str, preset: Option<&str>, port: u16, ports: &IndexMap<String, u16>) -> Vec<(String, String)> {
+    match preset {
+        Some(preset) => {
+            // The preset's further ports, reserved as `<service>.<role>` (see `secondary_roles`).
+            let secondary: crate::supervisor::Secondary = crate::supervisor::secondary_roles(preset)
+                .iter()
+                .filter_map(|role| Some((role.to_string(), *ports.get(&format!("{name}.{role}"))?)))
+                .collect();
+            crate::supervisor::preset_exports(preset, port, &secondary).into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+        }
+        None if !name.starts_with(|c: char| c.is_ascii_digit()) => {
+            let base: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+            vec![(format!("{base}_URL"), format!("http://127.0.0.1:{port}")), (format!("{base}_PORT"), port.to_string())]
+        }
+        None => Vec::new(),
+    }
 }
 
 fn put(t: &mut Table, key: &str, value: Option<Value>) {
