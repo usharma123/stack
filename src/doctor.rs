@@ -116,7 +116,7 @@ fn stack_release(root: &Path) -> Check {
     let mut notes = vec![format!("{} at {}", crate::lock::writer(), me.as_ref().map_or("?".into(), |p| p.display().to_string()))];
     let on_path = std::env::var("PATH").ok().and_then(|path| crate::session::which_in(Some(&path), "stack")).and_then(|p| p.canonicalize().ok());
     match on_path {
-        Some(found) if Some(&found) != me.as_ref() => {
+        Some(found) if !same_install(&found, me.as_deref()) => {
             let mut command = Command::new(&found);
             command.arg("--version");
             let version = crate::process::capture(&mut command, std::time::Duration::from_secs(5), 4096)
@@ -143,6 +143,33 @@ fn stack_release(root: &Path) -> Check {
     }
 }
 
+/// Whether `on_path` launches `me`: either the exact same path, or the npm package wrapper
+/// `<pkg>/bin/stack.cjs` launching `<pkg>/binaries/<platform>/stack` in the same package.
+fn same_install(on_path: &Path, me: Option<&Path>) -> bool {
+    let Some(me) = me else { return false };
+    if on_path == me {
+        return true;
+    }
+    if on_path.file_name().and_then(|n| n.to_str()) != Some("stack.cjs") {
+        return false;
+    }
+    let Some(bin_dir) = on_path.parent() else { return false };
+    if bin_dir.file_name().and_then(|n| n.to_str()) != Some("bin") {
+        return false;
+    }
+    let Some(pkg_root) = bin_dir.parent() else { return false };
+    let Ok(rel) = me.strip_prefix(pkg_root) else { return false };
+    let parts: Vec<_> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+    matches!(
+        parts.as_slice(),
+        [
+            Some("binaries"),
+            Some("darwin-x64" | "darwin-arm64" | "linux-x64" | "linux-arm64"),
+            Some("stack")
+        ]
+    )
+}
+
 fn writable(state: &Path) -> Check {
     let probe = std::fs::create_dir_all(state).and_then(|_| tempfile::tempfile_in(state).map(drop));
     let ok = probe.is_ok();
@@ -154,6 +181,26 @@ fn writable(state: &Path) -> Check {
             Err(e) => format!("{}: {e}", state.display()),
         },
         hint: (!ok).then_some("set STACK_STATE_DIR to a writable directory"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npm_wrapper_matches_its_packaged_binary_only() {
+        let pkg = Path::new("/opt/homebrew/lib/node_modules/@ushawarma/stack");
+        let wrapper = pkg.join("bin/stack.cjs");
+        let packaged = pkg.join("binaries/darwin-arm64/stack");
+        let other = Path::new("/Users/dev/stack/target/release/stack");
+        let other_pkg = Path::new("/tmp/other/binaries/darwin-arm64/stack");
+
+        assert!(same_install(&packaged, Some(&packaged)));
+        assert!(same_install(&wrapper, Some(&packaged)));
+        assert!(!same_install(&wrapper, Some(other)));
+        assert!(!same_install(&wrapper, Some(other_pkg)));
+        assert!(!same_install(&wrapper, None));
     }
 }
 
