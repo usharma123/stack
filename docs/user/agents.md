@@ -242,7 +242,7 @@ refused, not split. `null` counts as omitted.
 `stack_up` takes `no_init`, `reinit` (a list of services) and `from_snapshot`, like the CLI's
 `--no-init`, `--reinit` and `--from-snapshot` (see [service data](data.md)); `no_init` and
 `reinit` cannot be given together. `stack_down` takes `purge: true`, like the CLI's
-`--purge`. `stack_ps` takes `no_size`, like the CLI's `--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
+`--purge`. `stack_up` takes `labels` (an object of strings, like `--label K=V`). `stack_ps` takes `no_size`, `project` (`dir`'s project), `state`, `labels` and `worktrees`, like the CLI's `--no-size`, `--project`, `--state`, `--label` and `--worktrees`. `stack_status`, `stack_logs` and `stack_down` take `project` (every checkout of `dir`'s project) and `labels`, and `stack_status` also `all`: a [fleet selection](commands.md#fleet-selections), which needs no `dir` unless `project` is set. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
 `dir` when it is given.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that

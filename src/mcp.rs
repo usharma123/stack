@@ -71,6 +71,33 @@ fn machine_wide_schema(props: Value, required: &[&str], dir: &str) -> Value {
 /// Tools that act machine-wide: they need no checkout.
 const MACHINE_WIDE: &[&str] = &["stack_gc", "stack_ps", "stack_mv", "stack_errors"];
 
+/// Tools that act on one checkout, or on several given `project`, `all` or `labels`.
+const FLEET: &[&str] = &["stack_status", "stack_logs", "stack_down"];
+
+/// Whether a call needs no checkout: a machine-wide tool, or a fleet call that selects
+/// checkouts by `all` or `labels` without `project` (which is `dir`'s project).
+fn machine_wide(name: &str, args: &Value) -> bool {
+    MACHINE_WIDE.contains(&name)
+        || (FLEET.contains(&name)
+            && args["project"] != true
+            && (args["all"] == true || args["labels"].as_object().is_some_and(|m| !m.is_empty())))
+}
+
+/// `labels` of a tool that takes them: label keys to string values.
+fn labels_schema(what: &str) -> Value {
+    json!({ "type": "object", "additionalProperties": { "type": "string" }, "description": what })
+}
+
+/// The fleet selection of `stack_status`, `stack_logs` and `stack_down`.
+fn fleet_props(mut props: Value, verb: &str, all: bool) -> Value {
+    props["project"] = json!({ "type": "boolean", "description": format!("{verb} every checkout of dir's project (its repository's worktrees with Stack records), not only dir; the result is {{checkouts: [...]}} per checkout") });
+    props["labels"] = labels_schema(&format!("{verb} only checkouts whose session has every one of these labels (stack_up labels); dir is not needed unless project is set"));
+    if all {
+        props["all"] = json!({ "type": "boolean", "description": format!("{verb} every checkout Stack has records for on this machine (narrowed by labels); dir is not needed") });
+    }
+    props
+}
+
 /// `dir` of a machine-wide tool that only reports it.
 const REPORTED_DIR: &str = "Optional absolute path of a checkout, reported back as `project`; this tool acts machine-wide either way";
 
@@ -94,6 +121,9 @@ const CONFLICTS: &[(&str, &str, &str)] = &[
     ("stack_run", "timeout", "timeout_secs"),
     ("stack_gc", "dry_run", "stop_orphans"),
     ("stack_up", "no_init", "reinit"),
+    ("stack_status", "all", "project"),
+    ("stack_down", "forget_unrecorded", "project"),
+    ("stack_down", "forget_unrecorded", "labels"),
 ];
 
 /// Arguments of one tool that mean something only with another, as on the command line.
@@ -155,6 +185,7 @@ fn validate(name: &str, args: &Value) -> Result<serde_json::Map<String, Value>> 
     let given = |key: &str| match args.get(key) {
         Some(Value::Bool(b)) => *b,
         Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(map)) => !map.is_empty(),
         Some(Value::Null) | None => false,
         Some(_) => true,
     };
@@ -213,6 +244,13 @@ fn check_value(value: &Value, property: &Value) -> std::result::Result<(), Strin
             }
             for item in items {
                 check_value(item, &property["items"]).map_err(|why| format!("item {item}: {why}"))?;
+            }
+            Ok(())
+        }
+        "object" => {
+            let map = value.as_object().ok_or_else(|| format!("must be an object, not {}", shown(value)))?;
+            for (key, item) in map {
+                check_value(item, &property["additionalProperties"]).map_err(|why| format!("key {key:?}: {why}"))?;
             }
             Ok(())
         }
@@ -332,7 +370,8 @@ fn tool_definitions() -> Value {
                 "timeout": duration_schema("Time the whole startup may take"),
                 "no_init": { "type": "boolean", "description": "Run no init task (a service's init = [...], run once per data directory after services verify), even pending ones" },
                 "reinit": { "type": "array", "items": { "type": "string" }, "description": "Services whose init tasks run again from the first, whatever was recorded" },
-                "from_snapshot": { "type": "string", "description": "Before the first start, fill each data directory that does not exist yet from this snapshot (stack_snapshot_save); its init counts as done" }
+                "from_snapshot": { "type": "string", "description": "Before the first start, fill each data directory that does not exist yet from this snapshot (stack_snapshot_save); its init counts as done" },
+                "labels": labels_schema("Labels to record on the session, e.g. {\"agent\": \"claude\", \"task\": \"api-42\"} (keys: 1-64 letters, digits, - _ . /; values: up to 256 characters). Added to the labels the session has; stack_ps, stack_status, stack_logs and stack_down select checkouts by them")
             }), &[])),
         tool("stack_snapshot_save", "Save a data snapshot", annotations("Save a data snapshot", false, Some(false), false, false),
             "Save this checkout's postgres and redis data as a named snapshot that every checkout (worktree) of the project can restore. Use it after migrating and seeding, so new worktrees can start from it. Running services are stopped for the copy, then started and verified again. Returns {name, services, restarted, steps}.",
@@ -363,20 +402,20 @@ fn tool_definitions() -> Value {
             }), &[])),
         tool("stack_logs", "Show service logs", annotations("Show service logs", true, None, true, false),
             "Return the last lines services wrote, as the supervisor kept them; it never follows. Use it when a check fails or a service misbehaves. since_start, since and grep narrow the lines. With service, returns {service, lines, truncated, started_at, since_start}; without, every service's: {services: {<name>: {lines, ...}}, errors}, errors naming services whose output could not be read.",
-            schema(json!({
+            schema(fleet_props(json!({
                 "service": { "type": "string", "description": "Service name from the stack; omitted means every service" },
                 "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100); with grep, matching lines" },
                 "since_start": { "type": "boolean", "description": "Only the current process's output, not earlier runs'" },
                 "since": { "type": "string", "description": "Only output written in this last span, e.g. \"10m\"" },
                 "grep": { "type": "string", "description": "Only lines containing this text (a plain substring, not a regex)" },
                 "ignore_case": { "type": "boolean", "description": "Match grep ignoring case" }
-            }), &[])),
+            }), "Read", false), &[])),
         tool("stack_env", "Show the command environment", annotations("Show the command environment", true, None, true, false),
             "Return the environment stack_exec would give a command now. Use it to see which variables a command gets, or to hand them to a tool Stack cannot wrap; prefer stack_exec, which verifies on every call. Returns {env, unset, withheld, skipped}: withheld lists each unverified service and the variables removed for it; MISE_* variables are skipped.",
             schema(json!({}), &[])),
         tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
             "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service down gives ok: true, data.healthy false and data.checks saying why; data.started false: nothing here is started. changed_since_start lists edited `watch` files; nothing reloads them, so call stack_restart. data.commands: commands Stack started here, still running.",
-            schema(json!({}), &[])),
+            schema(fleet_props(json!({}), "Check", true), &[])),
         tool("stack_exec", "Run a command", annotations("Run a command", false, None, false, true),
             "Run one command, an argv list without a shell, with the stack's tools and env, capturing its output. Use it for anything that is not a stack.toml task; for shell syntax pass [\"sh\", \"-c\", \"...\"]. Endpoints of unverified services are withheld; require or require_all refuse to run instead. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
             schema(json!({
@@ -407,11 +446,11 @@ fn tool_definitions() -> Value {
             }), &[])),
         tool("stack_down", "Stop services", annotations("Stop services", false, Some(true), true, false),
             "Stop every service of this checkout; confirmed only once their processes are gone and no command Stack started here (stack_exec, stack_run) still runs, else stop_unconfirmed lists those. Use it before you finish or remove the checkout. Their supervisor goes too if Stack started it and nothing else uses it (data.supervisor). Data kept unless purge is set. Returns {stopped, confirmed, supervisor}.",
-            schema(json!({
+            schema(fleet_props(json!({
                 "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
                 "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" },
                 "forget_unrecorded": { "type": "boolean", "description": "First forget registered commands whose process was never recorded and whose Stack process is gone (a stop_unconfirmed detail of kind registry says so); check they no longer run. Nothing else is forgotten" }
-            }), &[])),
+            }), "Stop", false), &[])),
         tool("stack_gc", "Reclaim stale sessions", annotations("Reclaim stale sessions", false, Some(true), true, false),
             "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. dry_run only reports. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
             machine_wide_schema(json!({
@@ -421,7 +460,13 @@ fn tool_definitions() -> Value {
             }), &[], REPORTED_DIR)),
         tool("stack_ps", "List checkouts", annotations("List checkouts", true, None, true, false),
             "List every checkout Stack has records for on this machine, with its session, lease and services (port, pid, liveness, data size) and totals. Use it to see what runs where, or to find leftovers of deleted checkouts (reclaimable marks what stack_gc would reclaim). Liveness is not identity verification; use stack_status for that. Read-only; takes no lock and needs no dir.",
-            machine_wide_schema(json!({ "no_size": { "type": "boolean", "description": "Skip measuring data directories, which can be slow" } }), &[], REPORTED_DIR)),
+            machine_wide_schema(json!({
+                "no_size": { "type": "boolean", "description": "Skip measuring data directories, which can be slow" },
+                "project": { "type": "boolean", "description": "Only checkouts of dir's project: the worktrees of its repository at the same subdirectory (needs dir)" },
+                "state": { "type": "string", "description": "Only checkouts in this state: running, partial, stopped, launching, recorded, reserved, unreadable or unstarted" },
+                "labels": labels_schema("Only checkouts whose session has every one of these labels (stack_up labels)"),
+                "worktrees": { "type": "boolean", "description": "Also list worktrees of dir's repository that have a stack.toml and nothing of Stack's recorded yet, as state unstarted" }
+            }), &[], "Optional absolute path of a checkout: the project for `project` and the repository for `worktrees`, reported back as `project`; without those this tool lists machine-wide")),
         tool("stack_mv", "Move a checkout's records", annotations("Move a checkout's records", false, Some(false), false, false),
             "Carry a checkout's session record, port reservations, identity tokens and recorded service data from its old path to its new one. Use it after a checkout was moved or renamed on disk, so it keeps its ports and data. Refuses, changing nothing, while anything recorded for the old path may run (mv_services_running), when the new path has a session, or when data cannot be moved.",
             machine_wide_schema(json!({
@@ -479,7 +524,7 @@ fn project(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option
         }
         None => match roots {
             Some([only]) => only.clone(),
-            _ if MACHINE_WIDE.contains(&name) => return Ok(None),
+            _ if machine_wide(name, args) => return Ok(None),
             Some(several) if several.len() > 1 => {
                 let shown: Vec<String> = several.iter().map(|r| r.display().to_string()).collect();
                 return Err(StackError::new("usage", format!("{name}: `dir` is required: the client exposes {} roots, so none can be chosen", several.len()))
@@ -502,7 +547,7 @@ fn project(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option
 /// on one checkout. Arguments that fail validation need nothing; the call reports them.
 fn needs_roots(params: &Value) -> bool {
     let name = params["name"].as_str().unwrap_or_default();
-    validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").map_or(true, Value::is_null) && !MACHINE_WIDE.contains(&name))
+    validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").map_or(true, Value::is_null) && !machine_wide(name, &Value::Object(args)))
 }
 
 /// The checkout a call will act on, for running calls on one checkout one at a time; `None`
@@ -592,6 +637,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                     no_init: args["no_init"] == true,
                     reinit: strings(args, "reinit")?,
                     from_snapshot: args["from_snapshot"].as_str().map(String::from),
+                    labels: crate::labels::from_json(&args["labels"])?,
                 },
             )
             .map(to_value)
@@ -617,6 +663,10 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 grep: args["grep"].as_str().map(String::from),
                 ignore_case: args["ignore_case"] == true,
             };
+            let fleet = fleet_filter(args, ctx)?;
+            if fleet.active() {
+                return crate::fleet::logs(&ctx.state, &ctx.cache, &fleet, &q).map(to_value);
+            }
             crate::logs::fetch(ctx, &q).map(to_value)
         }
         "stack_restart" => {
@@ -636,16 +686,37 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
                 session::restart(ctx, &services, timeout).map(to_value)
             }
         }
-        "stack_status" => session::status(ctx).map(to_value),
+        "stack_status" => match fleet_filter(args, ctx)? {
+            fleet if fleet.active() => crate::fleet::status(&ctx.state, &ctx.cache, &fleet).map(to_value),
+            _ => session::status(ctx).map(to_value),
+        },
         "stack_env" => crate::shell::plan(ctx).map(to_value),
         "stack_renew" => {
             let ttl_secs = args["ttl"].as_str().map(parse_duration).transpose()?;
             session::renew_with(ctx, ttl_secs).map(to_value)
         }
-        "stack_down" => session::down_forgetting(ctx, args["stop_supervisor"] != false, args["purge"] == true, args["forget_unrecorded"] == true).map(to_value),
+        "stack_down" => match fleet_filter(args, ctx)? {
+            fleet if fleet.active() => crate::fleet::down(&ctx.state, &ctx.cache, &fleet, args["stop_supervisor"] != false, args["purge"] == true).map(to_value),
+            _ => session::down_forgetting(ctx, args["stop_supervisor"] != false, args["purge"] == true, args["forget_unrecorded"] == true).map(to_value),
+        },
         "stack_gc" if args["dry_run"] == true => session::gc_plan(&ctx.state, args["reclaim_data"] == true).map(to_value),
         "stack_gc" => session::gc_checked(&ctx.state, args["reclaim_data"] == true, args["stop_orphans"] == true).map(to_value),
-        "stack_ps" => crate::fleet::ps(&ctx.state, args["no_size"] != true).map(to_value),
+        "stack_ps" => {
+            let given = (!ctx.root.as_os_str().is_empty()).then(|| ctx.root.clone());
+            let project = match (args["project"] == true, &given) {
+                (false, _) => None,
+                (true, Some(root)) => Some(root.clone()),
+                (true, None) => return Err(StackError::new("usage", "stack_ps: `project` needs `dir`").hint("pass `dir` as the absolute path of a checkout of the project")),
+            };
+            let opts = crate::fleet::PsOptions {
+                project,
+                state: args["state"].as_str().map(String::from),
+                labels: crate::labels::from_json(&args["labels"])?,
+                worktrees: args["worktrees"] == true,
+                cwd: given,
+            };
+            crate::fleet::ps_with(&ctx.state, args["no_size"] != true, &opts).map(to_value)
+        }
         "stack_mv" => {
             // Never resolved against the server's working directory, like `dir`.
             let path = |key: &str| {
@@ -666,6 +737,19 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
             format!("no tool named '{name}'"),
         )),
     }
+}
+
+/// The fleet selection a `stack_status`, `stack_logs` or `stack_down` call makes: none (one
+/// checkout, as before) unless it gives `project`, `all` or `labels`.
+fn fleet_filter(args: &Value, ctx: &Ctx) -> Result<crate::fleet::FleetFilter> {
+    let project = match args["project"] == true {
+        false => None,
+        true if ctx.root.as_os_str().is_empty() => {
+            return Err(StackError::new("usage", "`project` needs `dir`").hint("pass `dir` as the absolute path of a checkout of the project"))
+        }
+        true => Some(ctx.root.clone()),
+    };
+    Ok(crate::fleet::FleetFilter { project, labels: crate::labels::from_json(&args["labels"])?, all: args["all"] == true })
 }
 
 /// One skill's text, from the same discovery `stack_inspect` runs, never a provider's.
@@ -946,6 +1030,7 @@ mod tests {
                 Some("string") => assert!(property["pattern"].is_null() || property["pattern"] == SECRET_NAME_PATTERN, "{property}"),
                 Some("boolean" | "integer") => {}
                 Some("array") => walk(&property["items"]),
+                Some("object") => assert_eq!(property["additionalProperties"], json!({ "type": "string" }), "{property}"),
                 other => panic!("unchecked property type {other:?}: {property}"),
             }
         }
@@ -1077,6 +1162,46 @@ mod tests {
         for name in ["stack_up", "stack_down", "stack_compile", "stack_install"] {
             assert_eq!(annotation(name, "idempotentHint"), true, "{name}");
         }
+    }
+
+    #[test]
+    fn labels_are_an_object_of_strings_checked_before_anything_runs() {
+        assert!(validate("stack_up", &json!({ "labels": { "agent": "claude" } })).is_ok());
+        let e = validate("stack_up", &json!({ "labels": { "agent": 1 } })).unwrap_err();
+        assert!(e.message.contains("`labels` key \"agent\": must be a string"), "{}", e.message);
+        assert!(validate("stack_up", &json!({ "labels": ["agent=claude"] })).unwrap_err().message.contains("must be an object"));
+        // A key the CLI's --label would refuse is refused the same way, before any project is opened.
+        let called = call(&json!({ "name": "stack_up", "arguments": { "dir": "/", "labels": { "bad key": "v" } } }), None);
+        assert_eq!(called["structuredContent"]["error"]["code"], "usage", "{called}");
+        assert!(called["structuredContent"]["error"]["hint"].as_str().unwrap().contains("KEY=VALUE"), "{called}");
+        for (tool, args) in [("stack_ps", json!({ "labels": { "a": "b" } })), ("stack_status", json!({ "labels": { "a": "b" } })), ("stack_logs", json!({ "labels": {} })), ("stack_down", json!({ "labels": { "a": "b" } }))] {
+            assert!(validate(tool, &args).is_ok(), "{tool}");
+        }
+    }
+
+    #[test]
+    fn fleet_calls_by_label_or_all_need_no_checkout_and_by_project_need_one() {
+        let needs = |name: &str, args: Value| needs_roots(&json!({ "name": name, "arguments": args }));
+        assert!(needs("stack_status", json!({})));
+        assert!(!needs("stack_status", json!({ "all": true })));
+        assert!(!needs("stack_status", json!({ "labels": { "agent": "claude" } })));
+        assert!(needs("stack_status", json!({ "labels": {} })), "an empty selection selects nothing");
+        assert!(needs("stack_down", json!({ "project": true, "labels": { "a": "b" } })), "project is dir's project");
+        assert!(!needs("stack_logs", json!({ "labels": { "a": "b" } })));
+        assert!(needs("stack_logs", json!({ "project": true })));
+        assert!(!needs("stack_ps", json!({ "project": true })), "ps stays machine-wide; project then asks for dir");
+        assert_eq!(project("stack_down", &json!({ "labels": { "a": "b" } }), None).unwrap(), None);
+        assert_eq!(project("stack_down", &json!({ "project": true }), None).unwrap_err().code, "usage");
+        assert!(validate("stack_status", &json!({ "all": true, "project": true })).unwrap_err().message.contains("cannot be given together"));
+        assert!(validate("stack_down", &json!({ "forget_unrecorded": true, "labels": { "a": "b" } })).is_err());
+        // Without a selection a fleet tool acts on one checkout, as before.
+        let ctx = ctx(None);
+        assert!(!fleet_filter(&json!({}), &ctx).unwrap().active());
+        assert_eq!(fleet_filter(&json!({ "project": true }), &ctx).unwrap_err().code, "usage");
+        let called = call(&json!({ "name": "stack_ps", "arguments": { "project": true } }), None);
+        assert!(called["structuredContent"]["error"]["message"].as_str().unwrap().contains("`project` needs `dir`"), "{called}");
+        let called = call(&json!({ "name": "stack_ps", "arguments": { "state": "happy" } }), None);
+        assert_eq!(called["structuredContent"]["error"]["code"], "usage", "{called}");
     }
 
     #[test]

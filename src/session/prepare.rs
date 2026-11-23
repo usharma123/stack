@@ -26,6 +26,9 @@ pub struct UpOptions {
     /// `--from-snapshot <name>`: fill data directories that do not exist yet from this
     /// snapshot before the first start (see [`crate::snapshot`]).
     pub from_snapshot: Option<String>,
+    /// `--label KEY=VALUE`: labels to record on the session, added to (or replacing keys of)
+    /// those it already has; none given keeps them as they are (see [`crate::labels`]).
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// A port `up --reassign-ports` moved.

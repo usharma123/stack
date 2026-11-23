@@ -103,7 +103,11 @@ impl Call {
 pub fn passed(command: &str, data: &Value) -> bool {
     match command {
         "exec" | "run" => data["exit_code"] == 0,
+        // A fleet status (`--project`, `--all`, `--label`) says whether it passed.
+        "status" if data["passed"].is_boolean() => data["passed"] == true,
         "status" => data["healthy"] == true || data["started"] == false,
+        // A fleet down counts the checkouts that failed; one checkout's down fails as an error.
+        "down" => data["failed"].as_u64().map_or(true, |failed| failed == 0),
         _ => true,
     }
 }
@@ -153,5 +157,16 @@ mod tests {
         assert_eq!(call.success(json!({ "healthy": false, "started": false }))["passed"], true);
         assert_eq!(call.success(json!({ "healthy": false, "started": true }))["passed"], false);
         assert_eq!(call.success(json!({ "healthy": true, "started": true }))["passed"], true);
+    }
+
+    #[test]
+    fn a_fleet_status_or_down_passes_only_when_every_checkout_did() {
+        let status = Call::new("status");
+        assert_eq!(status.success(json!({ "checkouts": [], "total": 2, "running": 2, "healthy": 1, "passed": false }))["passed"], false);
+        assert_eq!(status.success(json!({ "checkouts": [], "total": 2, "running": 1, "healthy": 1, "passed": true }))["passed"], true);
+        let down = Call::new("down");
+        assert_eq!(down.success(json!({ "checkouts": [], "confirmed": 1, "failed": 1 }))["passed"], false);
+        assert_eq!(down.success(json!({ "checkouts": [], "confirmed": 2, "failed": 0 }))["passed"], true);
+        assert_eq!(down.success(json!({ "stopped": [], "confirmed": true }))["passed"], true, "one checkout's down is unchanged");
     }
 }

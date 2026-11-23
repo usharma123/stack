@@ -7,19 +7,19 @@
 | `stack inspect [--all-skills]` | Show the composed stack without writing anything |
 | `stack skill <tool> [--name N]` | Print a pinned tool's [agent skill](skills.md) |
 | `stack install` | Install the locked tools and service binaries; start nothing |
-| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME]` | Start services, verify them, run pending [init tasks](data.md), record a session |
-| `stack status` | Verify every service now (exit 1 if any fails in a started checkout) and renew the lease |
+| `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME] [--label K=V]...` | Start services, verify them, run pending [init tasks](data.md), record a session |
+| `stack status [--project[=PATH] \| --all] [--label K=V]...` | Verify every service now (exit 1 if any fails in a started checkout) and renew the lease; with a [fleet selection](#fleet-selections), of every matching checkout |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
 | `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
-| `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow]` | Show services' recent output (default 100 lines each) |
+| `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow \| --project[=PATH] \| --label K=V]` | Show services' recent output (default 100 lines each) |
 | `stack env [--shell bash\|zsh\|fish]` | Print the environment `exec` would give a command, for `eval` |
 | `stack hook direnv` | Print an `.envrc` snippet that loads `stack env` |
-| `stack down [--keep-supervisor] [--purge]` | Stop services and confirm they are gone; the checkout's supervisor exits with them (for services an older Stack started under Pitchfork, its supervisor is stopped if Stack started it and nothing else uses it); `--purge` also removes their data |
+| `stack down [--keep-supervisor] [--purge] [--project[=PATH]] [--label K=V]...` | Stop services and confirm they are gone; the checkout's supervisor exits with them (for services an older Stack started under Pitchfork, its supervisor is stopped if Stack started it and nothing else uses it); `--purge` also removes their data |
 | `stack renew [--ttl D]` | Renew this session's lease, or set its TTL |
 | `stack snapshot save\|restore\|list\|rm [NAME]` | Save and restore service data, shared by every checkout of the project ([data](data.md)) |
 | `stack gc [--reclaim-data] [--stop-orphans] [--dry-run \| --watch [--interval 60s]]` | Reclaim expired sessions and what deleted checkouts left, machine-wide |
-| `stack ps [--no-size]` | List every checkout Stack has records for on this machine (read-only) |
+| `stack ps [--no-size] [--project[=PATH]] [--state S] [--label K=V]... [--worktrees]` | List every checkout Stack has records for on this machine (read-only), or those selected |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
 | `stack setup [--force]` | Get mise, unless one is already on `PATH` |
@@ -687,6 +687,40 @@ be another program). `ps` never checks identity; `stack status` in the checkout 
 no lock, so it never waits behind a running `up`, and it needs no `stack.toml`. Measuring data
 directories walks them, which can be slow for large databases: `--no-size` skips it
 (`data_bytes` is then `null`).
+
+Each checkout also says, where it can be read cheaply from files (no `git` is run per
+checkout): `project_id` (one id for every worktree of a repository at the same subdirectory,
+the identity [snapshots](data.md) share), `branch` and `head` (the 7-character commit) from its
+Git directory, its session's `labels` (`up --label`), `commands` (commands Stack started there
+still running, from the command registry), and `watch_changed` (live services whose `watch`
+files in its `stack.toml` changed since they started: `stack restart --changed` restarts them).
+A live service of a session gets an `endpoint`: its preset's connection URL
+(`postgresql://postgres@127.0.0.1:<port>/postgres`, `redis://127.0.0.1:<port>`, ...) or
+`http://127.0.0.1:<port>` for a custom service. Fields with nothing to say are left out.
+
+Selections narrow the list (all must hold): `--project[=PATH]` lists the checkouts of the
+project of the current checkout (or of `PATH`), `--state S` those in state `S`, and
+`--label K=V` (repeatable) those whose session has every label given. `--worktrees` also lists
+the repository's worktrees that have a `stack.toml` and nothing of Stack's recorded yet, as
+state `unstarted` (one `git worktree list` for the repository). `totals` count what is listed.
+
+## Fleet selections
+
+`status`, `logs` and `down` act on one checkout unless given a selection: `--project[=PATH]`
+(every checkout of the current checkout's project, or of `PATH`'s, with Stack records),
+`--label K=V` (repeatable: checkouts whose session has every label), and for `status` also
+`--all` (every checkout with records). Only checkouts whose directory is still there are acted
+on, one after another, each under its own lock. Labels are set by `stack up --label K=V`, kept
+while the session lives (a later `up --label` adds or replaces keys) and gone after `down`.
+
+- `stack status --project` returns `{checkouts: [{path, branch, labels, status | error}],
+  total, running, healthy, passed}` and exits 0 only when every started checkout is healthy and
+  every status could be told (1 otherwise).
+- `stack logs --label agent=claude` returns `{checkouts: [{path, branch, labels, logs | error}]}`;
+  for people each line is prefixed `[<branch or directory>:<service>]`. Not with `--follow`.
+- `stack down --project [--purge]` returns `{checkouts: [{path, branch, labels, down | error}],
+  confirmed, failed}` and exits 1 when any checkout's stop failed or was not confirmed; one
+  failing does not keep the others from stopping. Not with `--forget-unrecorded`.
 
 ## mv
 

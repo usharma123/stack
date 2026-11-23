@@ -1,18 +1,23 @@
-//! Machine-wide views and maintenance across checkouts: `ps` lists what Stack knows about, and
-//! `mv` follows a checkout that was moved.
+//! Machine-wide views and maintenance across checkouts: `ps` lists what Stack knows about,
+//! `mv` follows a checkout that was moved, and the fleet forms of `status`, `logs` and `down`
+//! act on every checkout a selection matches (one project's worktrees, a label, or all).
 //!
 //! Everything here reads the same machine state the lifecycle writes (`sessions/`, `ports.json`,
 //! `identities.json`, `data.json`). `ps` only reads it, without any lock: every state file is
 //! replaced atomically, so a read sees one version or the other, and `ps` never waits behind
-//! `up`.
+//! `up`. What `ps` adds about each checkout (its project, branch and commit, registered
+//! commands, changed `watch` files) is read from files too, never by running `git` per checkout.
 
 use crate::checkout;
 use crate::datadirs::{self, Found};
 use crate::error::{io_error, Result, StackError};
+use crate::gitdir::{self, GitDirs};
 use crate::identity;
+use crate::labels::{self, Labels};
 use crate::lease::LeaseSummary;
+use crate::manifest::{self, ProjectManifest};
 use crate::ports;
-use crate::session::{self, Session};
+use crate::session::{self, Ctx, DownReport, Session, StatusReport};
 use crate::state::{now, pid_alive, project_key, project_lock, write_json, FileLock};
 use indexmap::IndexMap;
 use serde::Serialize;
@@ -26,6 +31,9 @@ use std::time::Duration;
 /// What `ps` checks per service. Stated in every report so nobody reads it as verification.
 const PS_CHECKS: &str = "liveness only: the recorded pid exists and the port accepts connections. \
     Not proof that it is this checkout's instance; run `stack status` in the checkout for that";
+
+/// Every `state` a checkout can be listed in, as `ps --state` accepts them.
+pub const STATES: &[&str] = &["running", "partial", "stopped", "launching", "recorded", "reserved", "unreadable", "unstarted"];
 
 #[derive(Debug, Serialize)]
 pub struct PsReport {
@@ -42,8 +50,9 @@ pub struct Checkout {
     /// `present`, `missing`, or `replaced` (another directory now has this path).
     pub dir: &'static str,
     /// `running` (every service live), `partial`, `stopped`, `launching`, `recorded` (a session
-    /// without services), `reserved` (ports, tokens or data recorded, no session), or
-    /// `unreadable` (a session record that cannot be read).
+    /// without services), `reserved` (ports, tokens or data recorded, no session),
+    /// `unreadable` (a session record that cannot be read), or `unstarted` (`ps --worktrees`: a
+    /// worktree of the project with a stack.toml and nothing of Stack's recorded yet).
     pub state: &'static str,
     pub session: Option<SessionSummary>,
     pub lease: Option<LeaseSummary>,
@@ -56,6 +65,35 @@ pub struct Checkout {
     /// Why its session record cannot be read (state `unreadable`): run `stack down` in it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<String>,
+    /// The project it is a checkout of, as snapshots share them: one id for every worktree of a
+    /// repository at the same subdirectory (see [`crate::snapshot::project_id`]). Absent when
+    /// the directory is gone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// The branch its worktree has checked out; absent when detached or not in Git.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The commit `HEAD` names, abbreviated to 7 characters, when it can be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// The session's labels (`stack up --label`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Commands Stack started here (`exec`, `run`, MCP) still running, from the command
+    /// registry alone (see [`crate::commands`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub commands: usize,
+    /// Live services whose `watch` files (as this checkout's stack.toml lists them) changed
+    /// since they started: `stack restart --changed` restarts them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_changed: Vec<String>,
+    /// Port reservations of this checkout, for the totals.
+    #[serde(skip)]
+    ports_reserved: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +121,11 @@ pub struct ServiceRow {
     pub data_dir: Option<String>,
     /// Bytes `data_dir` occupies on disk; null when it is not recorded, missing, or `--no-size`.
     pub data_bytes: Option<u64>,
+    /// Where to reach a live service of a session: its preset's connection URL (such as
+    /// `postgresql://postgres@127.0.0.1:<port>/postgres` or `redis://127.0.0.1:<port>`), or
+    /// `http://127.0.0.1:<port>` for a custom service. Liveness only, like the rest of the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -98,42 +141,89 @@ pub struct Totals {
     pub reclaimable_bytes: u64,
 }
 
+/// Which checkouts `ps` lists. The default lists every checkout Stack has records for, as
+/// `ps` always has.
+#[derive(Debug, Clone, Default)]
+pub struct PsOptions {
+    /// Only checkouts of this directory's project (see [`Checkout::project_id`]): the worktrees
+    /// of its repository at the same subdirectory, or the directory alone outside Git.
+    pub project: Option<PathBuf>,
+    /// Only checkouts in this state (one of [`STATES`]).
+    pub state: Option<String>,
+    /// Only checkouts whose session has every one of these labels.
+    pub labels: Labels,
+    /// Also list worktrees of the repository (of `project`, else of `cwd`) that have a
+    /// stack.toml and nothing of Stack's recorded yet, as `unstarted`.
+    pub worktrees: bool,
+    /// The caller's checkout: where `worktrees` finds the repository without `project`.
+    pub cwd: Option<PathBuf>,
+}
+
+impl PsOptions {
+    fn check(&self) -> Result<()> {
+        match self.state.as_deref() {
+            Some(state) if !STATES.contains(&state) => Err(StackError::new("usage", format!("unknown checkout state {state:?}"))
+                .hint(format!("give one of: {}", STATES.join(", ")))),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Every checkout with a session record, port reservations, identity tokens or recorded data.
 pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
-    let mut sessions: BTreeMap<PathBuf, Session> = BTreeMap::new();
-    let (indexed, unreadable) = indexed_sessions(state)?;
-    for session in indexed {
-        sessions.insert(session.project.clone(), session);
-    }
-    let reservations = ports::all(state)?;
-    let tokens = identity::holders(state)?;
-    let data = datadirs::entries(state)?;
-    let mut paths: Vec<PathBuf> = sessions.keys().cloned().collect();
-    paths.extend(reservations.iter().map(|r| r.project.clone()));
-    paths.extend(tokens.iter().map(|(p, _)| p.clone()));
-    paths.extend(data.iter().map(|e| e.project.clone()));
-    paths.extend(unreadable.keys().cloned());
-    paths.sort();
-    paths.dedup();
+    ps_with(state, sizes, &PsOptions::default())
+}
 
-    let mut totals = Totals { ports_reserved: reservations.len(), ..Totals::default() };
-    let mut checkouts = Vec::new();
-    for path in paths {
-        let session = sessions.get(&path);
-        let reserved: Vec<&ports::Reservation> = reservations.iter().filter(|r| r.project == path).collect();
-        let recorded: Vec<&datadirs::Entry> = data.iter().filter(|e| e.project == path).collect();
-        let dir_exists = path.exists();
-        let dir = match (dir_exists, session) {
+/// What Stack recorded on this machine, read once without a lock.
+struct Records {
+    sessions: BTreeMap<PathBuf, Session>,
+    unreadable: IndexMap<PathBuf, String>,
+    reservations: Vec<ports::Reservation>,
+    tokens: Vec<(PathBuf, String)>,
+    data: Vec<datadirs::Entry>,
+}
+
+impl Records {
+    fn read(state: &Path) -> Result<Self> {
+        let (indexed, unreadable) = indexed_sessions(state)?;
+        let sessions = indexed.into_iter().map(|s| (s.project.clone(), s)).collect();
+        Ok(Self { sessions, unreadable, reservations: ports::all(state)?, tokens: identity::holders(state)?, data: datadirs::entries(state)? })
+    }
+
+    /// Every checkout path anything is recorded for, sorted.
+    fn paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.sessions.keys().cloned().collect();
+        paths.extend(self.reservations.iter().map(|r| r.project.clone()));
+        paths.extend(self.tokens.iter().map(|(p, _)| p.clone()));
+        paths.extend(self.data.iter().map(|e| e.project.clone()));
+        paths.extend(self.unreadable.keys().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// `present`, `missing`, or `replaced`, as `ps` reports a checkout's directory.
+    fn dir(&self, path: &Path) -> &'static str {
+        let recorded: Vec<&datadirs::Entry> = self.data.iter().filter(|e| e.project == path).collect();
+        match (path.exists(), self.sessions.get(path)) {
             (false, _) => "missing",
             (true, Some(s)) if session::checkout_gone(s).is_some() => "replaced",
             // Only data recorded for a checkout token the directory there now does not have.
             (true, None) if !recorded.is_empty() && {
-                let here = crate::checkout::token(&path);
+                let here = crate::checkout::token(path);
                 recorded.iter().all(|e| here.as_deref() != Some(e.checkout.as_str()))
             } => "replaced",
             _ => "present",
-        };
-        let size = |dir: &str| if sizes { disk_usage(Path::new(dir)) } else { None };
+        }
+    }
+
+    /// One checkout as `ps` lists it, its data not yet measured.
+    fn checkout(&self, state: &Path, path: PathBuf, git: Option<&GitDirs>, project_id: Option<String>) -> Checkout {
+        let session = self.sessions.get(&path);
+        let reserved: Vec<&ports::Reservation> = self.reservations.iter().filter(|r| r.project == path).collect();
+        let recorded: Vec<&datadirs::Entry> = self.data.iter().filter(|e| e.project == path).collect();
+        let dir_exists = path.exists();
+        let dir = self.dir(&path);
         let mut rows: IndexMap<String, ServiceRow> = IndexMap::new();
         if let Some(s) = session {
             for (name, record) in &s.services {
@@ -146,6 +236,7 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
                     port_accepting: false,
                     data_dir: record.data_dir.clone(),
                     data_bytes: None,
+                    endpoint: None,
                 });
             }
         }
@@ -163,17 +254,15 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
             let row = rows.entry(e.service.clone()).or_insert_with(|| ServiceRow::empty(&e.service, None));
             row.data_dir = Some(e.dir.to_string_lossy().into_owned());
         }
-        let services: Vec<ServiceRow> = rows
+        let mut services: Vec<ServiceRow> = rows
             .into_values()
             .map(|mut row| {
                 row.port_accepting = row.port.is_some_and(accepting);
-                row.data_bytes = row.data_dir.as_deref().and_then(size);
                 row
             })
             .collect();
-        let live = |row: &ServiceRow| row.pid_alive.unwrap_or(row.port_accepting);
-        let live_count = services.iter().filter(|r| live(r)).count();
-        let unreadable_record = unreadable.get(&path).cloned();
+        let live_count = services.iter().filter(|r| r.live()).count();
+        let unreadable_record = self.unreadable.get(&path).cloned();
         let state_name = match session {
             None if unreadable_record.is_some() => "unreadable",
             None => "reserved",
@@ -183,39 +272,195 @@ pub fn ps(state: &Path, sizes: bool) -> Result<PsReport> {
             Some(_) if live_count > 0 => "partial",
             Some(_) => "stopped",
         };
-        // As `gc` decides: a missing directory with no session left (an unreadable one is left).
-        let reclaimable = !dir_exists && session.is_none() && unreadable_record.is_none();
-        let bytes: u64 = services.iter().filter_map(|r| r.data_bytes).sum();
-        totals.checkouts += 1;
-        totals.running += usize::from(state_name == "running");
-        if session.is_some() {
-            totals.services += services.len();
-            totals.services_live += live_count;
+        // Where to reach live services, and which changed under them: from this checkout's own
+        // stack.toml, read only when a session has a live service.
+        let mut watch_changed = Vec::new();
+        if let Some(s) = session.filter(|_| dir_exists && live_count > 0) {
+            let manifest = manifest::read_project(&path).ok();
+            for row in services.iter_mut().filter(|r| r.live()) {
+                row.endpoint = row.port.and_then(|port| endpoint(manifest.as_ref(), &row.name, row.data_dir.as_deref(), port));
+                let started = s.services.get(&row.name).and_then(|r| r.started_at_ms);
+                let watch = manifest.as_ref().map(|m| watch_of(m, &row.name)).unwrap_or_default();
+                if let (false, Some(started)) = (watch.is_empty(), started) {
+                    if !session::changed_since(&path, &watch, started).0.is_empty() {
+                        watch_changed.push(row.name.clone());
+                    }
+                }
+            }
         }
-        totals.data_bytes += bytes;
-        if reclaimable {
-            totals.reclaimable_bytes += bytes;
-        }
-        checkouts.push(Checkout {
+        let head = git.map(gitdir::head).unwrap_or_default();
+        let commands = if dir_exists { crate::commands::listed(state, &path).map_or(0, |(c, _)| c.len()) } else { 0 };
+        Checkout {
             dir_exists,
             dir,
             state: state_name,
             session: session.map(|s| SessionSummary { id: s.id.clone(), started_at: s.started_at, launching: s.launching }),
             lease: session.map(|s| LeaseSummary::of(s.lease.as_ref())),
             services,
-            identity_tokens: tokens.iter().filter(|(p, _)| *p == path).count(),
-            reclaimable,
+            identity_tokens: self.tokens.iter().filter(|(p, _)| *p == path).count(),
+            // As `gc` decides: a missing directory with no session left (an unreadable one is left).
+            reclaimable: !dir_exists && session.is_none() && unreadable_record.is_none(),
             unreadable: unreadable_record,
+            project_id,
+            branch: head.branch,
+            head: head.commit,
+            labels: session.map(|s| s.labels.clone()).unwrap_or_default(),
+            commands,
+            watch_changed,
+            ports_reserved: reserved.len(),
             path,
-        });
+        }
+    }
+}
+
+/// [`ps`], listing only the checkouts `opts` selects (see [`PsOptions`]).
+pub fn ps_with(state: &Path, sizes: bool, opts: &PsOptions) -> Result<PsReport> {
+    opts.check()?;
+    let records = Records::read(state)?;
+    let scope = opts.project.as_deref().map(|p| crate::snapshot::project_id_offline(p).id);
+    let paths = records.paths();
+    let mut checkouts = Vec::new();
+    for path in &paths {
+        // Selections that need no liveness check are made first.
+        let session = records.sessions.get(path);
+        if !opts.labels.is_empty() && !session.is_some_and(|s| labels::matches(&s.labels, &opts.labels)) {
+            continue;
+        }
+        let git = path.exists().then(|| gitdir::locate(path)).flatten();
+        let project_id = path.exists().then(|| crate::snapshot::project_id_of(path, git.as_ref()).id);
+        if scope.is_some() && project_id != scope {
+            continue;
+        }
+        let mut checkout = records.checkout(state, path.clone(), git.as_ref(), project_id);
+        if opts.state.as_deref().is_some_and(|s| s != checkout.state) {
+            continue;
+        }
+        if sizes {
+            for row in &mut checkout.services {
+                row.data_bytes = row.data_dir.as_deref().and_then(|d| disk_usage(Path::new(d)));
+            }
+        }
+        checkouts.push(checkout);
+    }
+    let unstarted_wanted = opts.worktrees && opts.labels.is_empty() && opts.state.as_deref().map_or(true, |s| s == "unstarted");
+    if unstarted_wanted {
+        if let Some(base) = opts.project.as_deref().or(opts.cwd.as_deref()) {
+            for path in unstarted_worktrees(base, &paths) {
+                let git = gitdir::locate(&path);
+                let project_id = crate::snapshot::project_id_of(&path, git.as_ref()).id;
+                if scope.as_ref().is_some_and(|s| *s != project_id) {
+                    continue;
+                }
+                checkouts.push(Checkout::unstarted(state, path, git.as_ref(), project_id));
+            }
+        }
+    }
+    checkouts.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut totals = Totals::default();
+    for c in &checkouts {
+        let bytes: u64 = c.services.iter().filter_map(|r| r.data_bytes).sum();
+        totals.checkouts += 1;
+        totals.running += usize::from(c.state == "running");
+        if c.session.is_some() {
+            totals.services += c.services.len();
+            totals.services_live += c.services.iter().filter(|r| r.live()).count();
+        }
+        totals.ports_reserved += c.ports_reserved;
+        totals.data_bytes += bytes;
+        if c.reclaimable {
+            totals.reclaimable_bytes += bytes;
+        }
     }
     Ok(PsReport { checks: PS_CHECKS, checkouts, totals })
 }
 
+/// Worktrees of the repository holding `base` that have a stack.toml where `base` has its
+/// project (the same subdirectory) and that nothing in `recorded` names: one `git worktree
+/// list` for the repository, and nothing at all outside Git.
+fn unstarted_worktrees(base: &Path, recorded: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(dirs) = gitdir::locate(base) else { return Vec::new() };
+    let Ok(sub) = base.strip_prefix(&dirs.toplevel) else { return Vec::new() };
+    let mut out = Vec::new();
+    for worktree in gitdir::worktrees(base).into_iter().filter(|w| !w.bare) {
+        let Ok(top) = worktree.path.canonicalize() else { continue };
+        let path = if sub.as_os_str().is_empty() { top } else { top.join(sub) };
+        if path.join(manifest::PROJECT_FILE).is_file() && !recorded.contains(&path) && !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+impl Checkout {
+    fn unstarted(state: &Path, path: PathBuf, git: Option<&GitDirs>, project_id: String) -> Self {
+        let head = git.map(gitdir::head).unwrap_or_default();
+        Checkout {
+            dir_exists: true,
+            dir: "present",
+            state: "unstarted",
+            session: None,
+            lease: None,
+            services: Vec::new(),
+            identity_tokens: 0,
+            reclaimable: false,
+            unreadable: None,
+            project_id: Some(project_id),
+            branch: head.branch,
+            head: head.commit,
+            labels: BTreeMap::new(),
+            commands: crate::commands::listed(state, &path).map_or(0, |(c, _)| c.len()),
+            watch_changed: Vec::new(),
+            ports_reserved: 0,
+            path,
+        }
+    }
+}
+
 impl ServiceRow {
     fn empty(name: &str, port: Option<u16>) -> Self {
-        Self { name: name.to_string(), port, reserved_port: None, pid: None, pid_alive: None, port_accepting: false, data_dir: None, data_bytes: None }
+        Self { name: name.to_string(), port, reserved_port: None, pid: None, pid_alive: None, port_accepting: false, data_dir: None, data_bytes: None, endpoint: None }
     }
+
+    /// Its pid is alive, or without a recorded pid its port accepts connections.
+    fn live(&self) -> bool {
+        self.pid_alive.unwrap_or(self.port_accepting)
+    }
+}
+
+/// The service table of `name` in a project's stack.toml: its override, else its definition.
+fn service_of<'a>(manifest: &'a ProjectManifest, name: &str) -> impl Iterator<Item = &'a manifest::Service> {
+    manifest.overrides.services.get(name).into_iter().chain(manifest.services.get(name))
+}
+
+/// The `watch` paths stack.toml gives `name` (empty for a service a bundle defines).
+fn watch_of(manifest: &ProjectManifest, name: &str) -> Vec<String> {
+    service_of(manifest, name).map(|s| s.watch.clone()).find(|w| !w.is_empty()).unwrap_or_default()
+}
+
+/// Where to reach the live service `name` on `port`: its preset's connection URL, the preset
+/// told by stack.toml or else by the version file its data directory holds (every preset keeps
+/// data, so a running one has it); `http://` for anything else, which is a custom service.
+fn endpoint(manifest: Option<&ProjectManifest>, name: &str, data_dir: Option<&str>, port: u16) -> Option<String> {
+    let defined = manifest.into_iter().flat_map(|m| service_of(m, name)).find(|s| s.preset.is_some() || s.run.is_some());
+    let preset = match defined {
+        Some(s) => s.preset.clone(),
+        None => data_dir
+            .and_then(|d| fs::read_to_string(Path::new(d).join(crate::supervisor::VERSION_FILE)).ok())
+            .and_then(|text| text.trim().split(':').next().map(String::from))
+            .filter(|p| !p.is_empty()),
+    };
+    match preset {
+        None => Some(format!("http://127.0.0.1:{port}")),
+        Some(preset) => preset_endpoint(&preset, port),
+    }
+}
+
+/// A preset's connection URL on `port`, as the preset exports it (its `*_URL`, else its
+/// `*_ENDPOINT`); `None` for a preset Stack does not know.
+fn preset_endpoint(preset: &str, port: u16) -> Option<String> {
+    let exports = crate::supervisor::preset_exports(preset, port, &crate::supervisor::Secondary::new());
+    let by_suffix = |suffix: &str| exports.iter().find(|(k, _)| k.ends_with(suffix)).map(|(_, v)| v.clone());
+    by_suffix("_URL").or_else(|| by_suffix("_ENDPOINT"))
 }
 
 /// The session index: each readable record. A file another command removes between listing and
@@ -333,10 +578,25 @@ pub fn print_ps(report: &PsReport) {
                 (kind, None) => format!("  lease {kind}"),
             });
         }
+        match (&c.branch, &c.head) {
+            (Some(branch), Some(head)) => line.push_str(&format!("  branch {branch} @ {head}")),
+            (Some(branch), None) => line.push_str(&format!("  branch {branch}")),
+            (None, Some(head)) => line.push_str(&format!("  detached @ {head}")),
+            (None, None) => {}
+        }
+        if !c.labels.is_empty() {
+            line.push_str(&format!("  labels {}", labels::shown(&c.labels)));
+        }
+        if c.commands > 0 {
+            line.push_str(&format!("  {} command(s) running", c.commands));
+        }
         if c.reclaimable {
             line.push_str("  reclaimable by `stack gc`");
         }
         println!("{line}");
+        if !c.watch_changed.is_empty() {
+            println!("  watch changed: {} (run `stack restart --changed` in it)", c.watch_changed.join(", "));
+        }
         for r in &c.services {
             let live = match (r.pid_alive, r.port_accepting) {
                 (Some(true), true) => "pid alive, port open",
@@ -351,6 +611,9 @@ pub fn print_ps(report: &PsReport) {
             let mut row = format!("  {:<name_w$}  port {port:<port_w$}  pid {pid:<pid_w$}  {live:<22}", r.name);
             if let Some(reserved) = r.reserved_port {
                 row.push_str(&format!("  reserved {reserved}"));
+            }
+            if let Some(endpoint) = &r.endpoint {
+                row.push_str(&format!("  {endpoint}"));
             }
             if let Some(dir) = &r.data_dir {
                 let size = r.data_bytes.map(human_bytes).unwrap_or_else(|| "-".into());
@@ -371,6 +634,265 @@ pub fn print_ps(report: &PsReport) {
         human_bytes(t.reclaimable_bytes)
     );
     println!("liveness only; run `stack status` in a checkout to verify its services");
+}
+
+// ---- fleet status, logs and down ------------------------------------------------------------
+
+/// Which checkouts a fleet `status`, `logs` or `down` acts on: those of one project, those with
+/// labels, or (`all`) every checkout Stack has records for; only ones whose directory is still
+/// there and still the one recorded. Several criteria must all hold.
+#[derive(Debug, Clone, Default)]
+pub struct FleetFilter {
+    /// Checkouts of this directory's project (see [`Checkout::project_id`]).
+    pub project: Option<PathBuf>,
+    /// Checkouts whose session has every one of these labels.
+    pub labels: Labels,
+    /// Every checkout (narrowed by `labels` when also given).
+    pub all: bool,
+}
+
+impl FleetFilter {
+    /// Whether a fleet selection was asked for at all: otherwise the command acts on one checkout.
+    pub fn active(&self) -> bool {
+        self.all || self.project.is_some() || !self.labels.is_empty()
+    }
+}
+
+/// A checkout a fleet command acted on.
+#[derive(Debug, Clone, Serialize)]
+pub struct Target {
+    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: Labels,
+}
+
+impl Target {
+    /// Its branch, else its directory's name: how people tell checkouts of one project apart.
+    pub fn name(&self) -> String {
+        self.branch.clone().unwrap_or_else(|| self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned()))
+    }
+}
+
+/// The checkouts `filter` selects, in path order. `manifest`: only those with a stack.toml (the
+/// commands that compile the project).
+pub fn select(state: &Path, filter: &FleetFilter, manifest: bool) -> Result<Vec<Target>> {
+    let records = Records::read(state)?;
+    let scope = filter.project.as_deref().map(|p| crate::snapshot::project_id_offline(p).id);
+    let mut out = Vec::new();
+    for path in records.paths() {
+        if records.dir(&path) != "present" || (manifest && !path.join(manifest::PROJECT_FILE).is_file()) {
+            continue;
+        }
+        let labels = records.sessions.get(&path).map(|s| s.labels.clone()).unwrap_or_default();
+        if !labels::matches(&labels, &filter.labels) {
+            continue;
+        }
+        let git = gitdir::locate(&path);
+        if scope.as_ref().is_some_and(|s| *s != crate::snapshot::project_id_of(&path, git.as_ref()).id) {
+            continue;
+        }
+        let branch = git.as_ref().and_then(|g| gitdir::head(g).branch);
+        out.push(Target { path, branch, labels });
+    }
+    Ok(out)
+}
+
+fn ctx_for(state: &Path, cache: &Path, target: &Target) -> Ctx {
+    Ctx { root: target.path.clone(), cache: cache.to_path_buf(), state: state.to_path_buf() }
+}
+
+/// One checkout's `status` in a fleet status.
+#[derive(Debug, Serialize)]
+pub struct FleetStatusEntry {
+    #[serde(flatten)]
+    pub checkout: Target,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatusReport>,
+    /// Why its status could not be told (its stack.toml no longer compiles, say).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<StackError>,
+}
+
+/// `stack status --project | --all | --label`.
+#[derive(Debug, Serialize)]
+pub struct FleetStatusReport {
+    pub checkouts: Vec<FleetStatusEntry>,
+    /// Checkouts checked.
+    pub total: usize,
+    /// Checkouts with anything started (`started` in their status).
+    pub running: usize,
+    /// Started checkouts whose every service verified.
+    pub healthy: usize,
+    /// Every started checkout is healthy and every status could be told: `stack status` exits
+    /// 0 exactly then.
+    pub passed: bool,
+}
+
+/// `status` of every checkout `filter` selects, one after another (each under its own lock).
+pub fn status(state: &Path, cache: &Path, filter: &FleetFilter) -> Result<FleetStatusReport> {
+    let mut checkouts = Vec::new();
+    for target in select(state, filter, true)? {
+        let (status, error) = match session::status(&ctx_for(state, cache, &target)) {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        checkouts.push(FleetStatusEntry { checkout: target, status, error });
+    }
+    let started: Vec<&StatusReport> = checkouts.iter().filter_map(|c| c.status.as_ref()).filter(|s| s.started).collect();
+    let healthy = started.iter().filter(|s| s.healthy).count();
+    Ok(FleetStatusReport {
+        total: checkouts.len(),
+        running: started.len(),
+        healthy,
+        passed: healthy == started.len() && checkouts.iter().all(|c| c.error.is_none()),
+        checkouts,
+    })
+}
+
+/// One checkout's logs in a fleet `logs`.
+#[derive(Debug, Serialize)]
+pub struct FleetLogsEntry {
+    #[serde(flatten)]
+    pub checkout: Target,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<crate::logs::Logs>,
+    /// Why its logs could not be read (nothing launched there yet, say).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<StackError>,
+}
+
+/// `stack logs --project | --label`.
+#[derive(Debug, Serialize)]
+pub struct FleetLogsReport {
+    pub checkouts: Vec<FleetLogsEntry>,
+}
+
+/// What `q` selects of every checkout `filter` selects. A service name `q` gives that a checkout
+/// does not define is that checkout's error, not the whole call's.
+pub fn logs(state: &Path, cache: &Path, filter: &FleetFilter, q: &crate::logs::Query) -> Result<FleetLogsReport> {
+    let mut checkouts = Vec::new();
+    for target in select(state, filter, true)? {
+        let (logs, error) = match crate::logs::fetch(&ctx_for(state, cache, &target), q) {
+            Ok(l) => (Some(l), None),
+            Err(e) => (None, Some(e)),
+        };
+        checkouts.push(FleetLogsEntry { checkout: target, logs, error });
+    }
+    Ok(FleetLogsReport { checkouts })
+}
+
+/// One checkout's `down` in a fleet down.
+#[derive(Debug, Serialize)]
+pub struct FleetDownEntry {
+    #[serde(flatten)]
+    pub checkout: Target,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down: Option<DownReport>,
+    /// Why it could not be stopped, or its stop not confirmed (`stop_unconfirmed` and its details).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<StackError>,
+}
+
+/// `stack down --project | --label`.
+#[derive(Debug, Serialize)]
+pub struct FleetDownReport {
+    pub checkouts: Vec<FleetDownEntry>,
+    /// Checkouts whose stop was confirmed.
+    pub confirmed: usize,
+    /// Checkouts that failed or were not confirmed: `stack down` exits 1 when any did.
+    pub failed: usize,
+}
+
+/// `down` of every checkout `filter` selects, one after another; one that fails does not keep
+/// the others from stopping.
+pub fn down(state: &Path, cache: &Path, filter: &FleetFilter, stop_supervisor: bool, purge: bool) -> Result<FleetDownReport> {
+    let mut checkouts = Vec::new();
+    for target in select(state, filter, false)? {
+        let (down, error) = match session::down_forgetting(&ctx_for(state, cache, &target), stop_supervisor, purge, false) {
+            Ok(r) => (Some(r), None),
+            Err(e) => (None, Some(e)),
+        };
+        checkouts.push(FleetDownEntry { checkout: target, down, error });
+    }
+    let confirmed = checkouts.iter().filter(|c| c.down.as_ref().is_some_and(|d| d.confirmed)).count();
+    Ok(FleetDownReport { failed: checkouts.len() - confirmed, confirmed, checkouts })
+}
+
+/// A fleet status for people: a line per checkout, and one per service that did not verify.
+pub fn print_fleet_status(r: &FleetStatusReport) {
+    if r.checkouts.is_empty() {
+        println!("no checkout matches");
+        return;
+    }
+    for c in &r.checkouts {
+        let what = match (&c.status, &c.error) {
+            (_, Some(e)) => format!("error[{}]: {}", e.code, e.message),
+            (Some(s), _) if !s.started => "not started".to_string(),
+            (Some(s), _) if s.healthy => format!("healthy{}", s.session.as_ref().map(|s| format!("  session {}", s.id)).unwrap_or_default()),
+            (Some(s), _) => format!("NOT HEALTHY{}", if s.stale { " (stale: compiled configuration changed)" } else { "" }),
+            (None, None) => unreachable!("a status or an error"),
+        };
+        println!("{}  [{}]  {what}", c.checkout.path.display(), c.checkout.name());
+        for check in c.status.iter().filter(|s| s.started).flat_map(|s| &s.checks) {
+            if let Some(reason) = &check.reason {
+                println!("  {:<12} NOT READY  {reason}", check.service);
+            }
+        }
+    }
+    println!("{} checkout(s): {} started, {} healthy", r.total, r.running, r.healthy);
+}
+
+/// Fleet logs for people: each line prefixed `[<branch or directory>:<service>]`; what could
+/// not be read on stderr. Fails when stdout does.
+pub fn print_fleet_logs(r: &FleetLogsReport) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for c in &r.checkouts {
+        let name = c.checkout.name();
+        if let Some(e) = &c.error {
+            eprintln!("# {} [{name}]: error[{}]: {}", c.checkout.path.display(), e.code, e.message);
+        }
+        let services: Vec<(&str, &[String])> = match &c.logs {
+            Some(crate::logs::Logs::One(l)) => vec![(l.service.as_str(), l.lines.as_slice())],
+            Some(crate::logs::Logs::Many(m)) => {
+                for (service, e) in &m.errors {
+                    eprintln!("# {} [{name}:{service}]: error[{}]: {}", c.checkout.path.display(), e.code, e.message);
+                }
+                m.services.iter().map(|(s, l)| (s.as_str(), l.lines.as_slice())).collect()
+            }
+            None => Vec::new(),
+        };
+        for (service, lines) in services {
+            for line in lines {
+                writeln!(out, "[{name}:{service}] {line}")?;
+            }
+        }
+    }
+    out.flush()
+}
+
+/// A fleet down for people: a line per checkout and a total.
+pub fn print_fleet_down(r: &FleetDownReport) {
+    if r.checkouts.is_empty() {
+        println!("no checkout matches");
+        return;
+    }
+    for c in &r.checkouts {
+        let what = match (&c.down, &c.error) {
+            (_, Some(e)) => format!("error[{}]: {}", e.code, e.message),
+            (Some(d), _) => format!("stopped {} service(s); {}", d.stopped.len(), if d.confirmed { "confirmed" } else { "NOT confirmed" }),
+            (None, None) => unreachable!("a report or an error"),
+        };
+        println!("{}  [{}]  {what}", c.checkout.path.display(), c.checkout.name());
+        if let Some(purge) = c.down.as_ref().and_then(|d| d.purge.as_ref()) {
+            for d in &purge.data {
+                println!("  {} {}: {}", if d.kept { "kept" } else { "data" }, d.service, d.outcome);
+            }
+        }
+    }
+    println!("{} checkout(s) stopped and confirmed, {} failed", r.confirmed, r.failed);
 }
 
 // ---- mv ------------------------------------------------------------------------------------
@@ -865,5 +1387,211 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    fn git(at: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(at)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A session record of `root` with `services` (name, port, pid, started_at_ms) and `labels`.
+    fn record(state: &Path, root: &Path, services: &[(&str, u16, Option<u32>, Option<u64>)], labels: &[(&str, &str)]) {
+        let session = Session {
+            id: format!("s-{}", root.file_name().unwrap().to_string_lossy()),
+            project: root.to_path_buf(),
+            started_at: 1,
+            services: services
+                .iter()
+                .map(|(name, port, pid, started)| {
+                    (name.to_string(), session::ServiceRecord { port: *port, pid: *pid, data_dir: None, identity: session::Identity::Liveness, verified_at: 1, started_at_ms: *started, provider_id: None })
+                })
+                .collect(),
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..Session::default()
+        };
+        session::save_at(state, root, &session).unwrap();
+    }
+
+    /// A repository `repo` (stack.toml committed) with a worktree `wt` on branch `feature`, and a
+    /// directory `lone` outside Git; all canonical.
+    fn checkouts(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let top = dir.canonicalize().unwrap();
+        let repo = top.join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        fs::write(repo.join(".gitignore"), ".stack/\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "x"]);
+        let wt = top.join("wt");
+        git(&repo, &["worktree", "add", "-q", "-b", "feature", wt.to_str().unwrap()]);
+        let lone = top.join("lone");
+        fs::create_dir(&lone).unwrap();
+        fs::write(lone.join("stack.toml"), "").unwrap();
+        (repo, wt, lone)
+    }
+
+    fn paths(report: &PsReport) -> Vec<&Path> {
+        report.checkouts.iter().map(|c| c.path.as_path()).collect()
+    }
+
+    #[test]
+    fn ps_selects_by_project_state_and_labels_and_says_where_each_checkout_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let (repo, wt, lone) = checkouts(dir.path());
+        let sha = git(&repo, &["rev-parse", "HEAD"]);
+        record(&state, &repo, &[], &[("agent", "claude"), ("task", "a")]);
+        record(&state, &wt, &[("web", 1, None, None)], &[("agent", "codex")]);
+        record(&state, &lone, &[], &[("agent", "claude")]);
+
+        // Without options: everything, as before, and each checkout says where it is.
+        let all = ps(&state, false).unwrap();
+        assert_eq!(paths(&all), vec![lone.as_path(), repo.as_path(), wt.as_path()]);
+        let row = |r: &PsReport, p: &Path| r.checkouts.iter().find(|c| c.path == p).unwrap().clone_view();
+        let (r, w, l) = (row(&all, &repo), row(&all, &wt), row(&all, &lone));
+        assert_eq!((r.0.as_deref(), r.1.as_deref()), (Some("main"), Some(&sha[..7])));
+        assert_eq!((w.0.as_deref(), w.1.as_deref()), (Some("feature"), Some(&sha[..7])));
+        assert_eq!((l.0, l.1), (None, None), "outside Git");
+        assert_eq!(r.2, w.2, "one project for a repository's worktrees");
+        assert_ne!(r.2, l.2);
+        assert_eq!(r.2.as_deref(), Some(crate::snapshot::project_id(&repo).id.as_str()), "the identity snapshots share");
+        assert_eq!(all.totals.checkouts, 3);
+
+        let with = |opts: PsOptions| ps_with(&state, false, &opts).unwrap();
+        let labels = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Labels>();
+        // By project: the repository's worktrees, from either of them.
+        for from in [&repo, &wt] {
+            assert_eq!(paths(&with(PsOptions { project: Some(from.clone()), ..Default::default() })), vec![repo.as_path(), wt.as_path()]);
+        }
+        assert_eq!(paths(&with(PsOptions { project: Some(lone.clone()), ..Default::default() })), vec![lone.as_path()]);
+        // By state: a session without services is `recorded`; one whose service is gone `stopped`.
+        assert_eq!(paths(&with(PsOptions { state: Some("stopped".into()), ..Default::default() })), vec![wt.as_path()]);
+        assert_eq!(paths(&with(PsOptions { state: Some("recorded".into()), ..Default::default() })), vec![lone.as_path(), repo.as_path()]);
+        assert!(with(PsOptions { state: Some("running".into()), ..Default::default() }).checkouts.is_empty());
+        let e = ps_with(&state, false, &PsOptions { state: Some("happy".into()), ..Default::default() }).unwrap_err();
+        assert_eq!(e.code, "usage");
+        assert!(e.hint.unwrap().contains("unstarted"));
+        // By labels: every pair must match; combined with a project, both must hold.
+        assert_eq!(paths(&with(PsOptions { labels: labels(&[("agent", "claude")]), ..Default::default() })), vec![lone.as_path(), repo.as_path()]);
+        assert_eq!(paths(&with(PsOptions { labels: labels(&[("agent", "claude"), ("task", "a")]), ..Default::default() })), vec![repo.as_path()]);
+        assert!(with(PsOptions { labels: labels(&[("agent", "nobody")]), ..Default::default() }).checkouts.is_empty());
+        let both = with(PsOptions { project: Some(repo.clone()), labels: labels(&[("agent", "claude")]), ..Default::default() });
+        assert_eq!(paths(&both), vec![repo.as_path()]);
+        assert_eq!(both.checkouts[0].labels, labels(&[("agent", "claude"), ("task", "a")]));
+        // Totals count what is listed.
+        assert_eq!(both.totals.checkouts, 1);
+
+        // The fleet commands select the same way, only directories still there.
+        let select = |filter: FleetFilter| select(&state, &filter, false).unwrap().into_iter().map(|t| t.path).collect::<Vec<_>>();
+        assert_eq!(select(FleetFilter { project: Some(wt.clone()), ..Default::default() }), vec![repo.clone(), wt.clone()]);
+        assert_eq!(select(FleetFilter { labels: labels(&[("agent", "codex")]), ..Default::default() }), vec![wt.clone()]);
+        assert_eq!(select(FleetFilter { all: true, ..Default::default() }).len(), 3);
+        let targets = super::select(&state, &FleetFilter { project: Some(repo.clone()), ..Default::default() }, false).unwrap();
+        assert_eq!(targets.iter().map(Target::name).collect::<Vec<_>>(), vec!["main", "feature"]);
+        assert_eq!(Target { path: lone.clone(), branch: None, labels: Labels::new() }.name(), "lone");
+        assert!(!FleetFilter::default().active());
+        fs::remove_dir_all(&lone).unwrap();
+        assert_eq!(select(FleetFilter { all: true, ..Default::default() }), vec![repo.clone(), wt.clone()], "a deleted checkout is not acted on");
+    }
+
+    impl Checkout {
+        fn clone_view(&self) -> (Option<String>, Option<String>, Option<String>) {
+            (self.branch.clone(), self.head.clone(), self.project_id.clone())
+        }
+    }
+
+    #[test]
+    fn ps_worktrees_adds_the_projects_worktrees_nothing_is_recorded_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let (repo, wt, _lone) = checkouts(dir.path());
+        // A third worktree with no stack.toml at all is not a checkout of the project.
+        let bare = dir.path().canonicalize().unwrap().join("nostack");
+        git(&repo, &["worktree", "add", "-q", "--detach", bare.to_str().unwrap()]);
+        fs::remove_file(bare.join("stack.toml")).unwrap();
+        record(&state, &repo, &[], &[]);
+
+        let without = ps_with(&state, false, &PsOptions { cwd: Some(repo.clone()), ..Default::default() }).unwrap();
+        assert_eq!(paths(&without), vec![repo.as_path()], "only with --worktrees");
+        let report = ps_with(&state, false, &PsOptions { worktrees: true, cwd: Some(repo.clone()), ..Default::default() }).unwrap();
+        assert_eq!(paths(&report), vec![repo.as_path(), wt.as_path()]);
+        let w = &report.checkouts[1];
+        assert_eq!((w.state, w.dir, w.dir_exists, w.branch.as_deref()), ("unstarted", "present", true, Some("feature")));
+        assert!(w.session.is_none() && w.services.is_empty() && !w.reclaimable);
+        assert_eq!(w.project_id, report.checkouts[0].project_id);
+        // Through --project from anywhere, and narrowed by state.
+        let by_project = ps_with(&state, false, &PsOptions { worktrees: true, project: Some(wt.clone()), state: Some("unstarted".into()), ..Default::default() }).unwrap();
+        assert_eq!(paths(&by_project), vec![wt.as_path()]);
+        let recorded = ps_with(&state, false, &PsOptions { worktrees: true, cwd: Some(repo.clone()), state: Some("recorded".into()), ..Default::default() }).unwrap();
+        assert_eq!(paths(&recorded), vec![repo.as_path()]);
+        // A label selection lists only sessions, which an unstarted worktree has none of.
+        let labelled = PsOptions { worktrees: true, cwd: Some(repo.clone()), labels: Labels::from([("a".into(), "b".into())]), ..Default::default() };
+        assert!(ps_with(&state, false, &labelled).unwrap().checkouts.is_empty());
+        // Once recorded, it is listed as what it is.
+        record(&state, &wt, &[], &[]);
+        let report = ps_with(&state, false, &PsOptions { worktrees: true, cwd: Some(repo.clone()), ..Default::default() }).unwrap();
+        assert_eq!(report.checkouts.iter().map(|c| c.state).collect::<Vec<_>>(), vec!["recorded", "recorded"]);
+    }
+
+    #[test]
+    fn ps_counts_running_commands_and_names_live_endpoints_and_changed_watch_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let root = dir.path().canonicalize().unwrap().join("app");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("stack.toml"), "[services.web]\nrun = 'serve'\nwatch = ['src']\n[services.db]\npreset = 'postgres'\n[services.cache]\npreset = 'redis'\n").unwrap();
+        fs::write(root.join("src/app.py"), "x").unwrap();
+        // Live services: this process's pid; ports something accepts on.
+        let listeners: Vec<std::net::TcpListener> = (0..3).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let port = |i: usize| listeners[i].local_addr().unwrap().port();
+        let me = Some(std::process::id());
+        record(&state, &root, &[("web", port(0), me, Some(1)), ("db", port(1), me, Some(u64::MAX)), ("cache", port(2), me, None)], &[]);
+
+        let report = ps(&state, false).unwrap();
+        let c = &report.checkouts[0];
+        assert_eq!(c.state, "running");
+        let endpoint = |name: &str| c.services.iter().find(|r| r.name == name).unwrap().endpoint.clone();
+        assert_eq!(endpoint("web"), Some(format!("http://127.0.0.1:{}", port(0))));
+        assert_eq!(endpoint("db"), Some(format!("postgresql://postgres@127.0.0.1:{}/postgres", port(1))));
+        assert_eq!(endpoint("cache"), Some(format!("redis://127.0.0.1:{}", port(2))));
+        // `web` started long before src/app.py changed; `db` watches nothing.
+        assert_eq!(c.watch_changed, vec!["web".to_string()]);
+        assert_eq!(c.commands, 0);
+        let json = serde_json::to_value(c).unwrap();
+        assert!(json.get("commands").is_none() && json.get("labels").is_none(), "empty enrichments are left out: {json}");
+
+        // A command Stack registered for the checkout, while its process (this one) runs.
+        let registration = crate::commands::register(&state, &root, crate::commands::StartedBy::Exec, Path::new("/bin/sleep")).unwrap();
+        assert_eq!(ps(&state, false).unwrap().checkouts[0].commands, 1);
+        drop(registration);
+
+        // A service that is not live has no endpoint.
+        drop(listeners);
+        record(&state, &root, &[("web", 1, None, Some(1))], &[]);
+        let c = &ps(&state, false).unwrap().checkouts[0];
+        assert_eq!((c.state, c.services[0].endpoint.as_deref()), ("stopped", None));
+        assert!(c.watch_changed.is_empty(), "only live services are checked");
+    }
+
+    #[test]
+    fn endpoints_follow_the_preset_from_stack_toml_or_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest: ProjectManifest = toml::from_str("[services.q]\npreset = 'nats'\n[override.services.db]\npreset = 'cockroachdb'\n[services.db]\nrun = 'x'\n").unwrap();
+        assert_eq!(endpoint(Some(&manifest), "q", None, 4222).as_deref(), Some("nats://127.0.0.1:4222"));
+        assert_eq!(endpoint(Some(&manifest), "db", None, 26257).as_deref(), Some("postgresql://root@127.0.0.1:26257/defaultdb?sslmode=disable"), "the override wins");
+        // A service a bundle defines: its data directory says which preset it is.
+        fs::write(dir.path().join(crate::supervisor::VERSION_FILE), "redis:7").unwrap();
+        assert_eq!(endpoint(Some(&manifest), "cache", dir.path().to_str(), 6379).as_deref(), Some("redis://127.0.0.1:6379"));
+        assert_eq!(endpoint(None, "web", None, 8080).as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(preset_endpoint("spicedb", 50051).as_deref(), Some("127.0.0.1:50051"));
+        assert_eq!(preset_endpoint("nope", 1), None);
     }
 }

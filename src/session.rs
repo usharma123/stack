@@ -33,6 +33,7 @@ use crate::tool::ToolSpec;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -137,6 +138,11 @@ pub struct Session {
     /// Older records and filesystems without birth times retain device/inode checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir_created: Option<std::time::SystemTime>,
+    /// `stack up --label KEY=VALUE`: what the caller said this session is for, which `ps`,
+    /// `status`, `logs` and `down` select checkouts by (see [`crate::labels`]). Kept across
+    /// `up`s of the same checkout; a later `up --label` adds or replaces keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// The supervisor that runs a session's services: Stack's own (`supervisor: "stack"`, its
@@ -969,11 +975,14 @@ struct SessionView<'a> {
     started_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     lease: Option<&'a Lease>,
+    /// The labels `up --label` recorded, so the caller sees what the session now carries.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    labels: &'a BTreeMap<String, String>,
 }
 
 impl<'a> SessionView<'a> {
     fn of(session: &'a Session) -> Self {
-        Self { id: &session.id, started_at: session.started_at, lease: session.lease.as_ref() }
+        Self { id: &session.id, started_at: session.started_at, lease: session.lease.as_ref(), labels: &session.labels }
     }
 }
 
@@ -1164,6 +1173,9 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
 
     let stamp = now();
     let launched_at = now_ms();
+    // The labels this checkout's session had, with those given now added or replacing them.
+    let mut labels = previous.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
+    labels.extend(opts.labels.iter().map(|(k, v)| (k.clone(), v.clone())));
     let lease = (lease.ttl_secs.is_some() || lease.owner_pid.is_some()).then_some(Lease {
         ttl_secs: lease.ttl_secs,
         owner_pid: lease.owner_pid,
@@ -1205,6 +1217,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 provider: provider.clone(),
                 project_dir_id,
                 project_dir_created,
+                labels: labels.clone(),
             };
             // Written once, with what the supervisor already shows (one synced write fewer).
             observe(&mut launch, &before);
@@ -1305,6 +1318,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         provider: if report.stack.services.is_empty() { None } else { provider },
         project_dir_id,
         project_dir_created,
+        labels,
     };
     // The same verified instance found running again changes only when it was last verified
     // and renewed: the durable record before this one describes it as well, so this one is not
@@ -5922,7 +5936,7 @@ const WATCH_SCAN_LIMIT: usize = 20_000;
 /// found, and whether the scan stopped at WATCH_SCAN_LIMIT entries before seeing everything.
 /// Directories are walked recursively, skipping hidden entries and common build and
 /// dependency directories, and never following symbolic links into directories.
-fn changed_since(root: &Path, watch: &[String], started_at_ms: u64) -> (Vec<String>, bool) {
+pub(crate) fn changed_since(root: &Path, watch: &[String], started_at_ms: u64) -> (Vec<String>, bool) {
     let modified_after = |meta: &fs::Metadata| {
         meta.modified()
             .ok()

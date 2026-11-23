@@ -1580,7 +1580,7 @@ fn mcp_rejects_malformed_arguments_before_any_work() {
         ("stack_logs", json!({ "grep": 5 }), "`grep` must be a string", ""),
         ("stack_inspect", json!({ "all_skills": 1 }), "`all_skills` must be true or false", ""),
         ("stack_skill", json!({ "tool": "jq", "name": 3 }), "`name` must be a string", ""),
-        ("stack_status", json!({ "verbose": true }), "unknown argument `verbose`", "stack_status accepts: dir"),
+        ("stack_status", json!({ "verbose": true }), "unknown argument `verbose`", "stack_status accepts: project, labels, all, dir"),
         ("stack_gc", json!({ "force": true }), "unknown argument `force`", ""),
         ("stack_down", json!({ "dir_": "x" }), "unknown argument `dir_`", "did you mean `dir`?"),
     ];
