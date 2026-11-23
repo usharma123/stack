@@ -361,7 +361,13 @@ enum Cmd {
         markdown: bool,
     },
     /// Serve the stack tools over MCP (stdio)
-    Mcp,
+    Mcp {
+        /// Which tools to offer: `full` (every tool) or `core` (stack_up, stack_status,
+        /// stack_run, stack_exec, stack_restart, stack_logs, stack_down and stack_ps), for
+        /// clients that pay for every tool definition in their context
+        #[arg(long, value_enum, default_value_t = mcp::Profile::Full)]
+        profile: mcp::Profile,
+    },
     /// Save, restore, list or remove snapshots of service data, shared by every checkout of
     /// the project
     Snapshot {
@@ -437,8 +443,8 @@ fn main() -> ExitCode {
         Err(e) => return usage_error(e),
     };
     update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
-    if let Cmd::Mcp = cli.cmd {
-        return match mcp::serve() {
+    if let Cmd::Mcp { profile } = cli.cmd {
+        return match mcp::serve(profile) {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from(contract::child_exit(None, Some(signal.into())))),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
@@ -793,7 +799,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Mcp | Cmd::Errors { .. } => unreachable!("handled above"),
+        Cmd::Mcp { .. } | Cmd::Errors { .. } => unreachable!("handled above"),
         Cmd::Snapshot { action } => snapshot(&ctx, cli.json, action),
     };
     // Without -C, a missing stack.toml says where the search looked.

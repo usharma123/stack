@@ -15,12 +15,21 @@ Any other MCP client: launch the command `stack` with the argument `mcp`.
 
 **Pass `dir` on every call.** One registered server is shared by every agent on the machine,
 whatever checkout it works in, so the server never acts on its own working directory. Each tool
-takes `dir`, the absolute path of the checkout. It may be left out only when the client
+takes `dir`, an absolute path. It may be left out only when the client
 supports MCP roots and exposes exactly one: the server asks for `roots/list` after
 `initialize` (and again on `notifications/roots/list_changed`) and uses that root. Otherwise a
-call without `dir`, or with a relative one, fails with a `usage` error. Every result carries
-the checkout it acted on as `project`, an absolute path. `stack_gc`, `stack_ps` and `stack_mv`
-act machine-wide and need no `dir`, as does `stack_errors`.
+call without `dir`, or with a relative one, fails with a `usage` error, and a `dir` that does
+not exist with `dir_not_found`.
+
+Like the CLI, the server finds the project from a subdirectory: when `dir` (or the one root)
+holds no `stack.toml`, the nearest one above it is used, searching no higher than the Git
+worktree root (or `$HOME` outside Git). When there is none, the call keeps `dir`, and tools that
+need a project fail with `manifest_missing`, saying where the search went. `stack_exec` given a
+subdirectory runs its command there, as `stack exec` does. `stack_init` never searches: it
+writes `stack.toml` in exactly `dir`, so calling it in a subdirectory starts a new project
+there. Every result carries the checkout it acted on as `project`, an absolute path: the
+directory whose `stack.toml` was found. `stack_gc`, `stack_ps` and `stack_mv`
+act machine-wide and need no `dir`, as does `stack_errors`; their `dir` is never searched.
 
 | Tool | Does |
 |---|---|
@@ -40,12 +49,25 @@ act machine-wide and need no `dir`, as does `stack_errors`.
 | `stack_errors` | Lists every [error code](errors.md): its meaning, default hint, `retryable` and `next` (CLI: `stack errors`) |
 | `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
 
-Each tool has a `title`, a short description that says when to use it, a description for
-every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
+Each tool has a short description that says when to use it, a one-line description for every
+argument whose name does not say it all, and the standard MCP annotations: a `title`, `readOnlyHint` for `stack_status`,
 `stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps`, `stack_env`,
 `stack_errors` and `stack_snapshot_list`, `destructiveHint` for `stack_down`, `stack_gc`, `stack_snapshot_restore`
 and `stack_snapshot_rm`, and `idempotentHint` for those that are
 safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
+
+Definitions are kept short, since a client may put every one in its model's context; what a
+result means is said once, in the server's instructions and on this page, not in every tool.
+Clients that pay for each tool can register only the daily loop:
+
+```sh
+claude mcp add stack -- stack mcp --profile core
+```
+
+`--profile core` offers `stack_up`, `stack_status`, `stack_run`, `stack_exec`,
+`stack_restart`, `stack_logs`, `stack_down` and `stack_ps`, without their `outputSchema`
+(results are the same envelope). Any other tool is `unknown_tool` there, with a hint that it
+needs the default `--profile full`.
 
 The server also offers this page as the resource `stack://guide`, takes `logging/setLevel`
 (it warns, for example, when a client's roots cannot be used), negotiates the protocol revision
@@ -115,14 +137,15 @@ A few things that are easy to get wrong:
   expected upstream.
 - **`stack logs <service> --since-start`** shows only the current process's output.
   `stack logs --grep error -i` searches every service's output at once.
-- **The CLI finds the project from a subdirectory**, up to the Git worktree root. `exec` runs
-  your command in the directory you called it from. Pass `-C` to be explicit. MCP `dir` is
-  never searched upward: it must be the directory that holds `stack.toml`.
+- **The CLI and MCP `dir` find the project from a subdirectory**, up to the Git worktree root.
+  `exec` (and `stack_exec`) runs your command in the directory you called it from. Pass `-C`
+  to be explicit; `-C` is never searched upward. `init` (and `stack_init`) writes in exactly
+  the directory given.
 
 ## Reading results
 
 With `--json`, every command prints one object on stdout. MCP returns the same object as
-`structuredContent`, and every tool's `outputSchema` describes it (`ok`, then `data` or
+`structuredContent`, and every tool's `outputSchema` (under the default `--profile full`) describes it (`ok`, then `data` or
 `error` with `code`, `message`, `hint` and `details`). `ok` says whether Stack did what you asked, not whether your command
 passed:
 

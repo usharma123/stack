@@ -1,5 +1,6 @@
 //! MCP server over stdio. Tools return the same `{ok, data | error}` envelope as `--json`.
 
+use crate::discover::Discovery;
 use crate::error::{Result, StackError};
 use crate::project::{self, default_cache_dir, Options};
 use crate::secrets::Grant;
@@ -20,23 +21,53 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
-/// What the server tells a client about using its tools, once, at initialization.
-const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root). Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one. The resource stack://guide is the full agent guide.";
+/// What the server tells a client about using its tools, once, at initialization. The
+/// envelope's meaning lives here and in `stack://guide`, not in every tool's `outputSchema`.
+const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root; the server's own working directory is never used). A `dir` below the checkout also works: the nearest stack.toml at or above it, up to the Git worktree root, is used, and every result names that checkout as `project`; stack_init alone writes stack.toml in exactly `dir`. Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Every result is the `--json` envelope: `ok` says whether Stack did what was asked; `passed` is also false when stack_exec or stack_run exited non-zero and when stack_status finds a started checkout unhealthy; on failure `error` carries `code`, `message`, `hint`, `retryable` (whether the same call can succeed unchanged), `next` (the operations that fix it) and `details`. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one. The resource stack://guide is the full agent guide.";
+
+/// Which tools a server offers: `full` (every tool, the default) or `core`, the daily loop
+/// only, for clients that pay for every tool definition in their context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Profile {
+    #[default]
+    Full,
+    Core,
+}
+
+/// The tools `--profile core` offers.
+const CORE: &[&str] = &["stack_up", "stack_status", "stack_run", "stack_exec", "stack_restart", "stack_logs", "stack_down", "stack_ps"];
+
+impl Profile {
+    fn offers(self, tool: &str) -> bool {
+        self == Profile::Full || CORE.contains(&tool)
+    }
+
+    /// [`INSTRUCTIONS`], and under `core` which tools are left out.
+    fn instructions(self) -> String {
+        match self {
+            Profile::Full => INSTRUCTIONS.to_string(),
+            Profile::Core => format!(
+                "{INSTRUCTIONS} This server runs `--profile core` and offers only {}; the other tools need the default `stack mcp --profile full`.",
+                CORE.join(", ")
+            ),
+        }
+    }
+}
 
 fn startup_timeout_schema() -> Value {
-    json!({ "type": "integer", "minimum": 1, "description": "Seconds the whole startup may take (default 600); or give `timeout`" })
+    json!({ "type": "integer", "minimum": 1, "description": "Seconds allowed (600)" })
 }
 
 /// `timeout`: the same bound as `timeout_secs`, as a duration string like the CLI's `--timeout`.
 fn duration_schema(what: &str) -> Value {
-    json!({ "type": "string", "description": format!("{what}, as a duration such as \"90s\", \"5m\" or \"1h\" (default 10m). Same as timeout_secs; give one or neither") })
+    json!({ "type": "string", "description": format!("{what}, e.g. \"5m\"") })
 }
 
-/// Serve the tools over stdio until the client closes stdin. Requests run concurrently (see
-/// [`server`]); every response and notification is written as one line.
-pub fn serve() -> std::io::Result<()> {
+/// Serve the tools of `profile` over stdio until the client closes stdin. Requests run
+/// concurrently (see [`server`]); every response and notification is written as one line.
+pub fn serve(profile: Profile) -> std::io::Result<()> {
     crate::commands::serving_mcp();
-    server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
+    server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), profile)
 }
 
 fn send(out: &mut impl Write, v: Value) -> std::io::Result<()> {
@@ -53,16 +84,23 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 }
 
 /// `dir` of a tool that acts on one checkout.
-const DIR_DESCRIPTION: &str = "Absolute path of the checkout (the directory with stack.toml). Pass it on every call: it may be omitted only when the client exposes exactly one MCP root, which is then used. The server's own working directory is never used";
+const DIR_DESCRIPTION: &str = "Absolute path";
+
+/// `dir` of `stack_init`, which is never searched upward.
+const INIT_DIR: &str = "Absolute dir to write it in";
 
 fn schema(props: Value, required: &[&str]) -> Value {
     let mut p = props;
     p["dir"] = json!({ "type": "string", "description": DIR_DESCRIPTION });
-    json!({ "type": "object", "properties": p, "required": required, "additionalProperties": false })
+    let mut schema = json!({ "type": "object", "properties": p, "additionalProperties": false });
+    if !required.is_empty() {
+        schema["required"] = json!(required);
+    }
+    schema
 }
 
-/// The schema of a machine-wide tool, whose `dir` is optional and says only what `dir` does.
-fn machine_wide_schema(props: Value, required: &[&str], dir: &str) -> Value {
+/// The schema of a tool whose `dir` means something other than the checkout to search from.
+fn dir_schema(props: Value, required: &[&str], dir: &str) -> Value {
     let mut schema = schema(props, required);
     schema["properties"]["dir"]["description"] = json!(dir);
     schema
@@ -90,16 +128,16 @@ fn labels_schema(what: &str) -> Value {
 
 /// The fleet selection of `stack_status`, `stack_logs` and `stack_down`.
 fn fleet_props(mut props: Value, verb: &str, all: bool) -> Value {
-    props["project"] = json!({ "type": "boolean", "description": format!("{verb} every checkout of dir's project (its repository's worktrees with Stack records), not only dir; the result is {{checkouts: [...]}} per checkout") });
-    props["labels"] = labels_schema(&format!("{verb} only checkouts whose session has every one of these labels (stack_up labels); dir is not needed unless project is set"));
+    props["project"] = json!({ "type": "boolean", "description": format!("{verb} dir's project") });
+    props["labels"] = labels_schema("Match labels");
     if all {
-        props["all"] = json!({ "type": "boolean", "description": format!("{verb} every checkout Stack has records for on this machine (narrowed by labels); dir is not needed") });
+        props["all"] = json!({ "type": "boolean", "description": format!("{verb} all checkouts") });
     }
     props
 }
 
 /// `dir` of a machine-wide tool that only reports it.
-const REPORTED_DIR: &str = "Optional absolute path of a checkout, reported back as `project`; this tool acts machine-wide either way";
+const REPORTED_DIR: &str = "Only echoed as `project`";
 
 /// The one `pattern` the tool schemas use: a fnox secret name.
 const SECRET_NAME_PATTERN: &str = "^[A-Z_][A-Z0-9_]*$";
@@ -284,28 +322,29 @@ fn closest<'a>(given: &str, known: &[&'a str]) -> Option<&'a str> {
 }
 
 /// What every tool's `structuredContent` is: the `--json` envelope. `data` is the operation's
-/// result (see each command's documentation); `error` is set instead when `ok` is false.
+/// result (see each command's documentation); `error` is set instead when `ok` is false. The
+/// shape only: what each field means is in [`INSTRUCTIONS`] and `stack://guide`, said once
+/// rather than in every tool's definition.
 fn output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "ok": { "type": "boolean", "description": "Whether Stack did what was asked (for stack_exec and stack_run, check data.exit_code too; for stack_status, data.healthy and data.started)" },
-            "passed": { "type": "boolean", "description": "Whether what was asked for is in the wanted state: false when ok is false, when stack_exec or stack_run exited non-zero or by a signal, and when stack_status finds a service unhealthy in a started checkout (data.started false, nothing of the checkout started, passes)" },
-            "command": { "type": "string", "description": "The operation that answered: the tool's name without stack_" },
-            "stack_version": { "type": "string", "description": "The Stack release that answered" },
-            "schema": { "type": "integer", "description": "Version of the envelope and result shapes; raised only on an incompatible change" },
-            "duration_ms": { "type": "integer", "description": "How long the call took, in milliseconds" },
-            "data": { "description": "The operation's result, when ok is true" },
+            "ok": { "type": "boolean" },
+            "passed": { "type": "boolean" },
+            "command": { "type": "string" },
+            "stack_version": { "type": "string" },
+            "schema": { "type": "integer" },
+            "duration_ms": { "type": "integer" },
+            "data": {},
             "error": {
                 "type": "object",
-                "description": "Why Stack could not do it, when ok is false",
                 "properties": {
-                    "code": { "type": "string", "description": "Stable error code, such as usage, service_unavailable or timed_out" },
+                    "code": { "type": "string" },
                     "message": { "type": "string" },
-                    "hint": { "type": "string", "description": "What to do next: the site's own hint, or the code's default from stack_errors" },
-                    "retryable": { "type": "boolean", "description": "Whether repeating the same call unchanged can succeed" },
-                    "next": { "type": "array", "description": "Where the fix is unambiguous, the operations to run, in order: {command (CLI argv), tool (MCP tool name, or null), args (its arguments)}" },
-                    "details": { "type": "array", "description": "Specifics: affected services, captured output, progress records" },
+                    "hint": { "type": "string" },
+                    "retryable": { "type": "boolean" },
+                    "next": { "type": "array" },
+                    "details": { "type": "array" },
                 },
                 "required": ["code", "message"],
             },
@@ -314,11 +353,22 @@ fn output_schema() -> Value {
     })
 }
 
-/// The tools, each with its `inputSchema` and the [`output_schema`] its results follow.
+/// Every tool, each with its `inputSchema` and the [`output_schema`] its results follow.
 fn tools() -> Value {
+    tools_for(Profile::Full)
+}
+
+/// The tools `profile` offers, as `tools/list` lists them. `core` leaves out the
+/// [`output_schema`], which would be most of its size: its results are the same envelope.
+fn tools_for(profile: Profile) -> Value {
     let mut tools = tool_definitions();
-    for tool in tools.as_array_mut().into_iter().flatten() {
-        tool["outputSchema"] = output_schema();
+    if let Some(all) = tools.as_array_mut() {
+        all.retain(|t| profile.offers(t["name"].as_str().unwrap_or_default()));
+        if profile == Profile::Full {
+            for tool in all {
+                tool["outputSchema"] = output_schema();
+            }
+        }
     }
     tools
 }
@@ -333,166 +383,184 @@ fn annotations(title: &str, read_only: bool, destructive: Option<bool>, idempote
     a
 }
 
-/// One tool: its name, title (also in its annotations), description and input schema.
-fn tool(name: &str, title: &str, annotations: Value, description: &str, input: Value) -> Value {
-    json!({ "name": name, "title": title, "description": description, "annotations": annotations, "inputSchema": input })
+/// One tool: its name, description, annotations and input schema. Its title is in its
+/// annotations only, where clients look when a tool has no top-level `title`.
+fn tool(name: &str, annotations: Value, description: &str, input: Value) -> Value {
+    json!({ "name": name, "description": description, "annotations": annotations, "inputSchema": input })
+}
+
+/// `up` and `ttl` of `stack_exec` and `stack_run`.
+fn prepare_schemas(props: &mut Value) {
+    props["up"] = json!({ "type": "boolean", "description": "Run stack_up first if needed" });
+    props["ttl"] = json!({ "type": "string", "description": "With up: its lease, e.g. \"30m\"" });
 }
 
 fn tool_definitions() -> Value {
+    let mut exec = json!({
+        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "argv (no shell); use [\"sh\",\"-c\",...] for shell" },
+        "require": { "type": "array", "items": { "type": "string" }, "description": "Required services" },
+        "require_all": { "type": "boolean", "description": "Require all services" },
+        "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secrets (redacted, not ACL)" },
+        "timeout_secs": { "type": "integer", "minimum": 1, "description": "Timeout seconds (600)" },
+        "timeout": duration_schema("Duration"),
+        "install": { "type": "boolean", "description": "Install missing pins" }
+    });
+    prepare_schemas(&mut exec);
+    let mut run = json!({
+        "task": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" }, "description": "Extra args" },
+        "timeout_secs": { "type": "integer", "minimum": 1, "description": "Timeout seconds (600)" },
+        "timeout": duration_schema("Duration")
+    });
+    prepare_schemas(&mut run);
     json!([
-        tool("stack_inspect", "Inspect the stack", annotations("Inspect the stack", true, None, true, false),
-            "Show the composed stack without changing anything: bundles, tools, env, services, tasks, ports and where each value came from. Use it to learn what a checkout provides. Returns the report, including `skills`: the agent skills of the releases stack.lock pins, each available, no_skill, not_installed or unavailable (read one with stack_skill).",
-            schema(json!({ "all_skills": { "type": "boolean", "description": "Also list the skills of tools Stack adds for its own supervisor, under provider_skills. For people; an agent should not drive the supervisor" } }), &[])),
-        tool("stack_skill", "Read a tool's skill", annotations("Read a tool's skill", true, None, true, false),
-            "Return the SKILL.md text of a pinned tool's agent skill (CLI: stack skill), one that stack_inspect lists under `skills` as available. Use it to learn how to use that tool at the pinned release; read it, do not run it. Returns {tool, version, name, entrypoint, bytes, text}, text at most 64 KiB. Fails with skill_not_found, or usage listing the names when the tool ships several and name is omitted.",
-            schema(json!({ "tool": { "type": "string", "description": "Tool name as listed under `skills`, e.g. \"fnox\"" }, "name": { "type": "string", "description": "Skill name, needed only when the tool ships several" } }), &["tool"])),
-        tool("stack_init", "Write a starting stack.toml", annotations("Write a starting stack.toml", false, Some(false), false, false),
-            "Write a starting stack.toml in dir with the tools and preset services named (CLI: stack init). Use it when a checkout has none (manifest_missing), then call stack_compile. It never replaces an existing file (project_exists). Returns {path, tools, services, next}, and detected with detect.",
+        tool("stack_inspect", annotations("Inspect stack", true, None, true, false),
+            "Show tools, env, services, tasks, ports and `skills`. Use it to inspect a checkout.",
+            schema(json!({ "all_skills": { "type": "boolean", "description": "Include supervisor skills" } }), &[])),
+        tool("stack_skill", annotations("Read tool skill", true, None, true, false),
+            "Return SKILL.md of a tool in `skills`. Use it to learn a tool; read, never run.",
+            schema(json!({ "tool": { "type": "string", "description": "Tool name" }, "name": { "type": "string", "description": "Skill name" } }), &["tool"])),
+        tool("stack_init", annotations("Init stack.toml", false, Some(false), false, false),
+            "Write stack.toml in `dir` (never overwrites). Use it on manifest_missing, then stack_compile.",
+            dir_schema(json!({
+                "tools": { "type": "array", "items": { "type": "string" }, "description": "NAME[=VER]" },
+                "services": { "type": "array", "items": { "type": "string" }, "description": "Presets, e.g. postgres@17" },
+                "detect": { "type": "boolean", "description": "Detect from project files" }
+            }), &[], INIT_DIR)),
+        tool("stack_compile", annotations("Compile stack.lock", false, Some(false), true, true),
+            "Resolve versions and write stack.lock. Use it after editing stack.toml or on lock_outdated.",
             schema(json!({
-                "tools": { "type": "array", "items": { "type": "string" }, "description": "Tools as NAME or NAME=VERSION, e.g. \"python=3.13\" (no version: latest, pinned at the first compile)" },
-                "services": { "type": "array", "items": { "type": "string" }, "description": "Preset services as NAME, NAME=PRESET, either with @VERSION, e.g. \"postgres@17\" or \"cache=redis\"" },
-                "detect": { "type": "boolean", "description": "Also add the tools and preset services the checkout's files suggest (version files, pyproject.toml, package.json, Cargo.toml, go.mod, .mise.toml, .tool-versions, compose files, .env.example), listed under detected. Reads files only; tools and services given here win over a detected entry of the same name" }
+                "update": { "type": "boolean", "description": "Update pins" },
+                "locked": { "type": "boolean", "description": "Check only" },
+                "reassign_ports": { "type": "boolean", "description": "New ports" }
             }), &[])),
-        tool("stack_compile", "Compile stack.lock", annotations("Compile stack.lock", false, Some(false), true, true),
-            "Resolve bundles and exact tool and service versions, then write stack.lock and the generated provider config. Use it after editing stack.toml, or when another tool fails with lock_outdated. Pins are kept unless their request changed; update re-resolves everything; locked only checks; reassign_ports gives fresh ports after port_conflict. Returns versions, ports and warnings.",
+        tool("stack_up", annotations("Start services", false, Some(false), true, true),
+            "Start and verify services. Use it before work needing them; unchanged services are kept, not restarted (call stack_restart after edits).",
             schema(json!({
-                "update": { "type": "boolean", "description": "Re-resolve every request, moving pins to the newest matching releases" },
-                "locked": { "type": "boolean", "description": "Change nothing; fail with lock_outdated if stack.lock is missing or stale" },
-                "reassign_ports": { "type": "boolean", "description": "Give this checkout new ports (after port_conflict)" }
-            }), &[])),
-        tool("stack_up", "Start services", annotations("Start services", false, Some(false), true, true),
-            "Start every service and verify each one, recording a session. Use it before work that needs services. Safe to repeat: a service already running with unchanged configuration is kept, not restarted (after editing code it loaded, use stack_restart). It uses stack.lock as it is; a stale lock fails with lock_outdated. On timed_out, what was launched stays recorded. Returns {session, checks, steps}.",
-            schema(json!({
-                "ttl": { "type": "string", "description": "Lease: reclaim the session after this long without use, e.g. \"30m\" (stack_status, stack_exec, stack_run and stack_renew extend it). Without ttl or an owner, [session] default_ttl of stack.toml applies when set" },
-                "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease: reclaim the session when this long-lived process exits" },
-                "owner_ancestor": { "type": "string", "description": "Lease: tie the session to the nearest ancestor of this stack server with this command name, e.g. \"claude\" (CLI: --owner-pid ancestor:<name>); owner_not_found lists the ancestors when none matches" },
-                "reassign_ports": { "type": "boolean", "description": "On port_conflict with another program, give this checkout's conflicting ports new numbers and continue; data.reassigned_ports lists old and new. A pinned port is never moved" },
+                "ttl": { "type": "string", "description": "Idle lease TTL" },
+                "owner_pid": { "type": "integer", "minimum": 1, "maximum": session::MAX_OWNER_PID, "description": "Lease owner PID" },
+                "owner_ancestor": { "type": "string", "description": "Lease ancestor name" },
+                "reassign_ports": { "type": "boolean", "description": "Move conflicting ports" },
                 "timeout_secs": startup_timeout_schema(),
-                "timeout": duration_schema("Time the whole startup may take"),
-                "no_init": { "type": "boolean", "description": "Run no init task (a service's init = [...], run once per data directory after services verify), even pending ones" },
-                "reinit": { "type": "array", "items": { "type": "string" }, "description": "Services whose init tasks run again from the first, whatever was recorded" },
-                "from_snapshot": { "type": "string", "description": "Before the first start, fill each data directory that does not exist yet from this snapshot (stack_snapshot_save); its init counts as done" },
-                "labels": labels_schema("Labels to record on the session, e.g. {\"agent\": \"claude\", \"task\": \"api-42\"} (keys: 1-64 letters, digits, - _ . /; values: up to 256 characters). Added to the labels the session has; stack_ps, stack_status, stack_logs and stack_down select checkouts by them")
+                "timeout": duration_schema("Duration"),
+                "no_init": { "type": "boolean" },
+                "reinit": { "type": "array", "items": { "type": "string" }, "description": "Re-run init tasks" },
+                "from_snapshot": { "type": "string", "description": "Seed from snapshot" },
+                "labels": labels_schema("Session labels")
             }), &[])),
-        tool("stack_snapshot_save", "Save a data snapshot", annotations("Save a data snapshot", false, Some(false), false, false),
-            "Save this checkout's postgres and redis data as a named snapshot that every checkout (worktree) of the project can restore. Use it after migrating and seeding, so new worktrees can start from it. Running services are stopped for the copy, then started and verified again. Returns {name, services, restarted, steps}.",
+        tool("stack_snapshot_save", annotations("Save snapshot", false, Some(false), false, false),
+            "Save postgres/redis data for worktrees to restore. Use it after seeding.",
             schema(json!({
-                "name": { "type": "string", "description": "Snapshot name: letters, digits, '.', '_' or '-'" },
-                "services": { "type": "array", "items": { "type": "string" }, "description": "Only these services (default: every postgres and redis service)" },
-                "force": { "type": "boolean", "description": "Replace a snapshot of the same name" }
+                "name": { "type": "string", "description": "Snapshot name" },
+                "services": { "type": "array", "items": { "type": "string" } },
+                "force": { "type": "boolean" }
             }), &["name"])),
-        tool("stack_snapshot_restore", "Restore a data snapshot", annotations("Restore a data snapshot", false, Some(true), true, false),
-            "Replace this checkout's service data with a snapshot of the same service kind and major version. Use it to reset a database to a saved state; it discards the current data. Running services are stopped, the data swapped in one step, then started and verified again. Init counts as done for the init tasks the snapshot satisfied.",
-            schema(json!({ "name": { "type": "string", "description": "Snapshot name, as stack_snapshot_list shows it" } }), &["name"])),
-        tool("stack_snapshot_list", "List data snapshots", annotations("List data snapshots", true, None, true, false),
-            "List this project's snapshots. Use it to find a name for stack_snapshot_restore or stack_up's from_snapshot. Returns each snapshot's services with their kind, version and init state when saved, and the checkout it came from.",
+        tool("stack_snapshot_restore", annotations("Restore snapshot", false, Some(true), true, false),
+            "Replace checkout service data with a snapshot. Use it to reset DB state.",
+            schema(json!({ "name": { "type": "string" } }), &["name"])),
+        tool("stack_snapshot_list", annotations("List snapshots", true, None, true, false),
+            "List project snapshots. Use it to find one to restore.",
             schema(json!({}), &[])),
-        tool("stack_snapshot_rm", "Remove a data snapshot", annotations("Remove a data snapshot", false, Some(true), true, false),
-            "Remove one of this project's snapshots. Use it to free disk once a snapshot is no longer needed; every checkout of the project loses it. Fails with snapshot_not_found for an unknown name.",
-            schema(json!({ "name": { "type": "string", "description": "Snapshot name" } }), &["name"])),
-        tool("stack_install", "Install pinned tools", annotations("Install pinned tools", false, Some(false), true, true),
-            "Install the locked tools and service binaries without starting anything or recording a session. Use it to warm a checkout: stack_exec refuses to run while a pin is missing (tools_not_installed) unless given install. A missing or stale stack.lock fails with lock_outdated. Returns {versions, ports, steps}.",
+        tool("stack_snapshot_rm", annotations("Remove snapshot", false, Some(true), true, false),
+            "Delete a project snapshot. Use it to free disk.",
+            schema(json!({ "name": { "type": "string" } }), &["name"])),
+        tool("stack_install", annotations("Install tools", false, Some(false), true, true),
+            "Install locked tools without starting services. Use it on tools_not_installed.",
             schema(json!({}), &[])),
-        tool("stack_restart", "Restart services", annotations("Restart services", false, Some(false), false, false),
-            "Restart services of the running session (all when services is omitted) and verify the whole stack again. Use it after editing code a running service loaded, files under its `watch` included: watching only reports changes, it never reloads. changed: true restarts just the services whose watched files changed. Fails with session_stale after a configuration change (use stack_up).",
+        tool("stack_restart", annotations("Restart services", false, Some(false), false, false),
+            "Restart and verify services. Use it after code edits: `watch` only reports, it never reloads.",
             schema(json!({
-                "services": { "type": "array", "items": { "type": "string" }, "description": "Service names to restart; omitted or empty restarts every service. The others keep running and the session keeps its id" },
-                "changed": { "type": "boolean", "description": "Restart only the services whose watched files changed since they started (changed_since_start), and nothing when none did" },
+                "services": { "type": "array", "items": { "type": "string" } },
+                "changed": { "type": "boolean", "description": "Watched-changed only" },
                 "timeout_secs": startup_timeout_schema(),
-                "timeout": duration_schema("Time the whole restart may take")
+                "timeout": duration_schema("Duration")
             }), &[])),
-        tool("stack_logs", "Show service logs", annotations("Show service logs", true, None, true, false),
-            "Return the last lines services wrote, as the supervisor kept them; it never follows. Use it when a check fails or a service misbehaves. since_start, since and grep narrow the lines. With service, returns {service, lines, truncated, started_at, since_start}; without, every service's: {services: {<name>: {lines, ...}}, errors}, errors naming services whose output could not be read.",
+        tool("stack_logs", annotations("Service logs", true, None, true, false),
+            "Return recent service output. Use it when a check fails.",
             schema(fleet_props(json!({
-                "service": { "type": "string", "description": "Service name from the stack; omitted means every service" },
-                "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines from the end (default 100); with grep, matching lines" },
-                "since_start": { "type": "boolean", "description": "Only the current process's output, not earlier runs'" },
-                "since": { "type": "string", "description": "Only output written in this last span, e.g. \"10m\"" },
-                "grep": { "type": "string", "description": "Only lines containing this text (a plain substring, not a regex)" },
-                "ignore_case": { "type": "boolean", "description": "Match grep ignoring case" }
+                "service": { "type": "string" },
+                "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Lines (100)" },
+                "since_start": { "type": "boolean", "description": "Current run only" },
+                "since": { "type": "string", "description": "Span, e.g. 10m" },
+                "grep": { "type": "string", "description": "Substring" },
+                "ignore_case": { "type": "boolean" }
             }), "Read", false), &[])),
-        tool("stack_env", "Show the command environment", annotations("Show the command environment", true, None, true, false),
-            "Return the environment stack_exec would give a command now. Use it to see which variables a command gets, or to hand them to a tool Stack cannot wrap; prefer stack_exec, which verifies on every call. Returns {env, unset, withheld, skipped}: withheld lists each unverified service and the variables removed for it; MISE_* variables are skipped.",
+        tool("stack_env", annotations("Command env", true, None, true, false),
+            "Return stack_exec env. Use it for unwrapped tools; prefer stack_exec.",
             schema(json!({}), &[])),
-        tool("stack_status", "Check services", annotations("Check services", true, None, true, false),
-            "Verify every service now, renew an unexpired lease, and report session and lease state. Start here to diagnose. A service down gives ok: true, data.healthy false and data.checks saying why; data.started false: nothing here is started. changed_since_start lists edited `watch` files; nothing reloads them, so call stack_restart. data.commands: commands Stack started here, still running.",
+        tool("stack_status", annotations("Check services", true, None, true, false),
+            "Verify services and renew lease. Start here; edited `watch` files: nothing reloads them, so call stack_restart.",
             schema(fleet_props(json!({}), "Check", true), &[])),
-        tool("stack_exec", "Run a command", annotations("Run a command", false, None, false, true),
-            "Run one command, an argv list without a shell, with the stack's tools and env, capturing its output. Use it for anything that is not a stack.toml task; for shell syntax pass [\"sh\", \"-c\", \"...\"]. Endpoints of unverified services are withheld; require or require_all refuse to run instead. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
-            schema(json!({
-                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "argv, e.g. [\"pytest\", \"-q\"]; nothing is expanded. Use [\"sh\", \"-c\", \"...\"] for $VAR, pipes and globs" },
-                "require": { "type": "array", "items": { "type": "string" }, "description": "Services that must verify, or the command does not run (service_unavailable)" },
-                "require_all": { "type": "boolean", "description": "Every service must verify, or the command does not run" },
-                "secrets": { "type": "array", "items": { "type": "string", "pattern": SECRET_NAME_PATTERN }, "description": "fnox secret names to grant this command only, resolved through the stack's pinned fnox. No granted value appears literally in the parsed stdout or stderr strings (timed_out details included): it is replaced by [redacted:KEY], or [redacted] where naming the key could spell out a value. Key names are not secret and are listed under secrets. Values shorter than 8 bytes, or ones a marker could spell out, are refused (secret_unsupported). Values the command transforms (encoded, split, or matching only after JSON escaping) are not caught. A grant is injection and redaction, not access control: the command can run fnox itself to read ungranted secrets, which are not redacted" },
-                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, counted from the call with planning included, before the command is killed and the call fails with timed_out, its output so far in the error details (default 600). A call whose planning is cut short fails with timed_out before anything runs; or give `timeout`" },
-                "timeout": duration_schema("Time the whole call may take, planning included, before the command is killed"),
-                "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
-                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease; a session without one gets [session] default_ttl of stack.toml, else 30m)" },
-                "install": { "type": "boolean", "description": "Install pinned tools that are missing (as stack_install would) instead of failing with tools_not_installed; data.prepared lists them" }
-            }), &["command"])),
-        tool("stack_run", "Run a task", annotations("Run a task", false, None, false, true),
-            "Run a task declared in stack.toml ([tasks.<name>]) through mise once every service verifies, capturing output like stack_exec. Use it for the project's own tasks, such as tests; use stack_exec for commands that should run with services down. The task gets exactly the secrets it declares, redacted from its output. Returns {exit_code, stdout, stderr, checks}: it worked when ok and exit_code is 0.",
-            schema(json!({
-                "task": { "type": "string", "description": "Task name from [tasks.<name>]; unknown_task lists them" },
-                "args": { "type": "array", "items": { "type": "string" }, "description": "Appended to the task's command" },
-                "timeout_secs": { "type": "integer", "minimum": 1, "description": "Seconds the whole call may take, planning and installing missing pins included, before the task is killed and the call fails with timed_out (default 600); or give `timeout`" },
-                "timeout": duration_schema("Time the whole call may take, planning included, before the task is killed"),
-                "up": { "type": "boolean", "description": "Run stack_up first when there is no session, or it is stale, expired or a service does not verify; data.prepared says what ran. up gets what is left of the timeout, at most 10 minutes" },
-                "ttl": { "type": "string", "description": "With up: the lease of a session up records, e.g. \"30m\" (default: keep the current lease; a session without one gets [session] default_ttl of stack.toml, else 30m)" }
-            }), &["task"])),
-        tool("stack_renew", "Renew the lease", annotations("Renew the lease", false, Some(false), true, false),
-            "Renew this checkout's session lease so stack_gc does not reclaim it. Use it during long work under a ttl lease with no other stack calls (stack_exec and stack_run also renew). Returns the session.",
-            schema(json!({
-                "ttl": { "type": "string", "description": "Set the lease's TTL, e.g. \"30m\"; gives a session without a lease one" }
-            }), &[])),
-        tool("stack_down", "Stop services", annotations("Stop services", false, Some(true), true, false),
-            "Stop every service of this checkout; confirmed only once their processes are gone and no command Stack started here (stack_exec, stack_run) still runs, else stop_unconfirmed lists those. Use it before you finish or remove the checkout. Their supervisor goes too if Stack started it and nothing else uses it (data.supervisor). Data kept unless purge is set. Returns {stopped, confirmed, supervisor}.",
+        tool("stack_exec", annotations("Run command", false, None, false, true),
+            "Run argv (no shell) with stack env; unverified endpoints withheld. Use it outside tasks; check exit_code.",
+            schema(exec, &["command"])),
+        tool("stack_run", annotations("Run task", false, None, false, true),
+            "Run a stack.toml task with declared secrets once services verify. Use it for tests; check exit_code.",
+            schema(run, &["task"])),
+        tool("stack_renew", annotations("Renew lease", false, Some(false), true, false),
+            "Renew session lease. Use it during idle work.",
+            schema(json!({ "ttl": { "type": "string", "description": "New TTL" } }), &[])),
+        tool("stack_down", annotations("Stop services", false, Some(true), true, false),
+            "Stop services; stop_unconfirmed while a started command runs. Use it when finished; keeps data unless purge.",
             schema(fleet_props(json!({
-                "stop_supervisor": { "type": "boolean", "description": "Stop the supervisor when Stack started it and nothing else uses it (default true); false keeps it running" },
-                "purge": { "type": "boolean", "description": "Once every service is confirmed stopped, also remove the service data stack recorded for this checkout (only where gc --reclaim-data would: the recorded directory, no link followed, its marker this checkout's, its service confirmed stopped) and release its ports and identity tokens. data.purge says what was removed and what was kept, and why; complete is false when anything was kept" },
-                "forget_unrecorded": { "type": "boolean", "description": "First forget registered commands whose process was never recorded and whose Stack process is gone (a stop_unconfirmed detail of kind registry says so); check they no longer run. Nothing else is forgotten" }
+                "stop_supervisor": { "type": "boolean", "description": "Stop idle supervisor (true)" },
+                "purge": { "type": "boolean", "description": "Delete service data" },
+                "forget_unrecorded": { "type": "boolean", "description": "Forget dead unrecorded cmds" }
             }), "Stop", false), &[])),
-        tool("stack_gc", "Reclaim stale sessions", annotations("Reclaim stale sessions", false, Some(true), true, false),
-            "Reclaim, machine-wide, sessions whose lease expired and services of deleted checkouts. Use it for cleanup, not routine work: it stops other checkouts' expired sessions too. A deleted checkout with no record left gets its ports released and its data reported; reclaim_data removes that data. dry_run only reports. Fails with gc_incomplete if a stop could not be confirmed (records are then kept).",
-            machine_wide_schema(json!({
-                "reclaim_data": { "type": "boolean", "description": "Also remove the service data of deleted checkouts (default false: only reported)" },
-                "stop_orphans": { "type": "boolean", "description": "Also stop a deleted checkout's service where gc would offer recovery.stop, only when its supervisor id, pid, port and process start time all still match the record (for services an older Stack started under Pitchfork, which cannot compare and stop in one step; Stack's own supervisor stops a deleted checkout's services by recorded pid and start time without this flag)" },
-                "dry_run": { "type": "boolean", "description": "Change nothing and take no lock: report what would be reclaimed (would_reclaim: session, project, reason, action, services) and what deleted checkouts would release (deleted_checkouts: ports, and data with action remove_if_safe under reclaim_data, else report)" }
+        tool("stack_gc", annotations("Reclaim sessions", false, Some(true), true, false),
+            "Reclaim expired sessions and deleted checkouts machine-wide. Use it for cleanup only.",
+            dir_schema(json!({
+                "reclaim_data": { "type": "boolean", "description": "Delete their data" },
+                "stop_orphans": { "type": "boolean", "description": "Stop verified orphans" },
+                "dry_run": { "type": "boolean" }
             }), &[], REPORTED_DIR)),
-        tool("stack_ps", "List checkouts", annotations("List checkouts", true, None, true, false),
-            "List every checkout Stack has records for on this machine, with its session, lease and services (port, pid, liveness, data size) and totals. Use it to see what runs where, or to find leftovers of deleted checkouts (reclaimable marks what stack_gc would reclaim). Liveness is not identity verification; use stack_status for that. Read-only; takes no lock and needs no dir.",
-            machine_wide_schema(json!({
-                "no_size": { "type": "boolean", "description": "Skip measuring data directories, which can be slow" },
-                "project": { "type": "boolean", "description": "Only checkouts of dir's project: the worktrees of its repository at the same subdirectory (needs dir)" },
-                "state": { "type": "string", "description": "Only checkouts in this state: running, partial, stopped, launching, recorded, reserved, unreadable or unstarted" },
-                "labels": labels_schema("Only checkouts whose session has every one of these labels (stack_up labels)"),
-                "worktrees": { "type": "boolean", "description": "Also list worktrees of dir's repository that have a stack.toml and nothing of Stack's recorded yet, as state unstarted" }
-            }), &[], "Optional absolute path of a checkout: the project for `project` and the repository for `worktrees`, reported back as `project`; without those this tool lists machine-wide")),
-        tool("stack_mv", "Move a checkout's records", annotations("Move a checkout's records", false, Some(false), false, false),
-            "Carry a checkout's session record, port reservations, identity tokens and recorded service data from its old path to its new one. Use it after a checkout was moved or renamed on disk, so it keeps its ports and data. Refuses, changing nothing, while anything recorded for the old path may run (mv_services_running), when the new path has a session, or when data cannot be moved.",
-            machine_wide_schema(json!({
-                "from": { "type": "string", "description": "Where the checkout was: an absolute path, or relative to `dir`" },
-                "to": { "type": "string", "description": "Where it is now: an absolute path, or relative to `dir`" }
-            }), &["from", "to"], "Optional absolute path that relative `from` and `to` resolve against")),
-        tool("stack_doctor", "Check prerequisites", annotations("Check prerequisites", true, None, true, false),
-            "Check that the providers Stack needs (mise, git, tar) are installed and that the project compiles. Use it when setup-level errors appear, such as a missing provider. Returns a list of {name, ok, detail} checks; doctor_failed lists them all when one fails.",
+        tool("stack_ps", annotations("List checkouts", true, None, true, false),
+            "List checkouts machine-wide. Use it to see what runs where.",
+            dir_schema(json!({
+                "no_size": { "type": "boolean" },
+                "project": { "type": "boolean", "description": "Only dir's project" },
+                "state": { "type": "string", "description": "Filter by state" },
+                "labels": labels_schema("Match labels"),
+                "worktrees": { "type": "boolean", "description": "Include unstarted worktrees" }
+            }), &[], "Base dir for project/worktrees")),
+        tool("stack_mv", annotations("Move checkout", false, Some(false), false, false),
+            "Move checkout records, ports and data to a new path. Use it after moving one.",
+            dir_schema(json!({
+                "from": { "type": "string" },
+                "to": { "type": "string" }
+            }), &["from", "to"], "Base for relative from/to")),
+        tool("stack_doctor", annotations("Check setup", true, None, true, false),
+            "Check providers and project compile. Use it on setup errors.",
             schema(json!({}), &[])),
-        tool("stack_errors", "List error codes", annotations("List error codes", true, None, true, false),
-            "List every error code Stack can return. Use it to learn what a code means and what fixes it without the docs. Returns each code's meaning, default hint, whether retrying the same call unchanged can succeed (retryable), and the operations that fix it (next).",
-            machine_wide_schema(json!({}), &[], REPORTED_DIR)),
+        tool("stack_errors", annotations("List error codes", true, None, true, false),
+            "List error codes and fixes. Use it to inspect a code.",
+            dir_schema(json!({}), &[], REPORTED_DIR)),
     ])
 }
 
-/// Run one `tools/call`. `roots` are the client's MCP roots: `None` when it offers none.
+/// Run one `tools/call` with every tool offered. `roots` are the client's MCP roots: `None`
+/// when it offers none.
+#[cfg(test)]
 fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
+    call_in(Profile::Full, params, roots)
+}
+
+/// Run one `tools/call` on a server offering `profile`'s tools.
+fn call_in(profile: Profile, params: &Value, roots: Option<&[PathBuf]>) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
     let mut call = crate::contract::Call::new(name.strip_prefix("stack_").unwrap_or(name));
     let mut resolved = None;
-    let outcome = validate(name, &params["arguments"])
+    let outcome = offered(profile, name)
+        .and_then(|()| validate(name, &params["arguments"]))
         .and_then(|args| {
             let args = Value::Object(args);
-            resolved = project(name, &args, roots)?;
-            dispatch(name, &args, &ctx(resolved.as_deref()))
+            let found = locate(name, &args, roots)?;
+            resolved = found.as_ref().map(|d| d.root.clone());
+            let here = found.as_ref().map(|d| d.from.clone()).filter(|from| Some(from) != resolved.as_ref());
+            dispatch(name, &args, &ctx(resolved.as_deref()), here).map_err(|e| match &found {
+                Some(d) => explain(d, e),
+                None => e,
+            })
         })
         .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
     call.dir = resolved.clone();
@@ -509,11 +577,39 @@ fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
     })
 }
 
-/// The checkout a call acts on: its `dir`, which must be absolute, else the client's only root.
-/// Never the server's working directory: one server is shared by agents in many checkouts, so
-/// that directory says nothing about which one a call means. `None` for a machine-wide tool
-/// given neither.
+/// A tool `profile` leaves out is unknown to this server, with a hint saying where it is.
+fn offered(profile: Profile, name: &str) -> Result<()> {
+    // A name no profile has is left to `validate`, which names it unknown as a full server does.
+    if profile.offers(name) || !tools().as_array().into_iter().flatten().any(|t| t["name"] == name) {
+        return Ok(());
+    }
+    Err(StackError::new("unknown_tool", format!("no tool named '{name}' in this server's --profile core"))
+        .hint(format!("{name} is available under the default `--profile full`: register the server as `stack mcp` without `--profile core`")))
+}
+
+/// Say where an upward search for `stack.toml` looked, on a `manifest_missing` error.
+fn explain(found: &Discovery, mut e: StackError) -> StackError {
+    if found.found || e.code != "manifest_missing" || found.from == found.stop {
+        return e;
+    }
+    e.message = format!("no stack.toml in {} or any directory above it up to {}", found.from.display(), found.stop.display());
+    e.hint = Some("call stack_init with this `dir` to create one, or pass the `dir` of the checkout that holds stack.toml".into());
+    e
+}
+
+/// The checkout a call acts on: see [`locate`].
 fn project(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option<PathBuf>> {
+    Ok(locate(name, args, roots)?.map(|d| d.root))
+}
+
+/// The checkout a call acts on: its `dir`, which must be absolute, else the client's only root,
+/// then the nearest `stack.toml` at or above it up to the Git worktree root, as the CLI finds
+/// one from its working directory. Never the server's working directory: one server is shared
+/// by agents in many checkouts, so that directory says nothing about which one a call means.
+/// `stack_init` (which writes `stack.toml` in exactly `dir`) and machine-wide tools search
+/// nothing. `root` is the directory itself when no `stack.toml` was found, so the tool reports
+/// `manifest_missing` as usual. `None` for a machine-wide tool given neither.
+fn locate(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option<Discovery>> {
     let dir = match args["dir"].as_str() {
         Some(dir) => {
             let dir = Path::new(dir);
@@ -538,10 +634,15 @@ fn project(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option
             }
         },
     };
-    let root = dir
+    let start = dir
         .canonicalize()
         .map_err(|e| StackError::new("dir_not_found", format!("{}: {e}", dir.display())).hint("pass `dir` as the absolute path of an existing checkout"))?;
-    Ok(Some(root))
+    if name == "stack_init" || MACHINE_WIDE.contains(&name) {
+        let found = start.join(crate::manifest::PROJECT_FILE).is_file();
+        return Ok(Some(Discovery { root: start.clone(), found, from: start.clone(), stop: start }));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| h.canonicalize().ok());
+    Ok(Some(crate::discover::find(&start, home.as_deref())))
 }
 
 /// Whether a call needs the client's roots to find its checkout: it names no `dir` and acts
@@ -572,7 +673,9 @@ fn to_value<T: Serialize>(v: T) -> Value {
     serde_json::to_value(v).expect("report serializes")
 }
 
-fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
+/// `here` is the directory a call named below its checkout's root, where `stack_exec` runs its
+/// command, as the CLI's `exec` runs where it was called from.
+fn dispatch(name: &str, args: &Value, ctx: &Ctx, here: Option<PathBuf>) -> Result<Value> {
     let compile = |mode, write, reassign_ports| {
         project::compile(&Options {
             root: ctx.root.clone(),
@@ -732,7 +835,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx) -> Result<Value> {
         }
         "stack_doctor" => crate::doctor::run(&ctx.root, &ctx.cache, &ctx.state).map(to_value),
         "stack_errors" => Ok(crate::error::registry_json()),
-        "stack_exec" => exec(args, ctx),
+        "stack_exec" => exec(args, ctx, here),
         "stack_run" => run(args, ctx),
         _ => Err(StackError::new(
             "unknown_tool",
@@ -790,12 +893,17 @@ fn timeout_arg(args: &Value, default: Duration) -> Result<Duration> {
     }
 }
 
-fn exec(args: &Value, ctx: &Ctx) -> Result<Value> {
+fn exec(args: &Value, ctx: &Ctx, here: Option<PathBuf>) -> Result<Value> {
     let command = strings(args, "command")?;
     let secrets = strings(args, "secrets")?;
     let require = if args["require_all"] == true { Require::All } else { Require::Only(strings(args, "require")?) };
     let prepare = prepare(args, args["install"] == true)?;
-    captured(args, ctx, || session::plan_prepared(ctx, prepare, || session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true })))
+    captured(args, ctx, || session::plan_prepared(ctx, prepare, || {
+        session::plan_exec_with(ctx, &command, &require, &Grant { keys: secrets, captured: true }).map(|mut plan| {
+            plan.dir = here;
+            plan
+        })
+    }))
 }
 
 /// `up`, `ttl` and (`stack_exec` only) `install`, checked before anything runs.
@@ -1143,15 +1251,19 @@ mod tests {
             let description = tool["description"].as_str().unwrap();
             assert!(description.len() < 400, "{name}: description is {} bytes", description.len());
             assert!(description.contains("Use it") || description.contains("Start here"), "{name}: say when to use it");
-            assert!(tool["title"].is_string() && tool["annotations"]["title"] == tool["title"], "{name}");
+            assert!(tool["annotations"]["title"].is_string() && tool.get("title").is_none(), "{name}: the title is in the annotations, once");
             for hint in ["readOnlyHint", "idempotentHint", "openWorldHint"] {
                 assert!(tool["annotations"][hint].is_boolean(), "{name}: {hint}");
             }
             if tool["annotations"]["readOnlyHint"] == true {
                 assert!(tool["annotations"].get("destructiveHint").is_none(), "{name}: a read-only tool destroys nothing");
             }
+            // Only an argument whose name says it all goes without a description.
+            const SELF_EXPLANATORY: &[&str] = &["force", "dry_run", "from", "to", "task", "service", "services", "ignore_case", "no_size", "no_init", "name"];
             for (key, property) in tool["inputSchema"]["properties"].as_object().unwrap() {
-                assert!(property["description"].as_str().is_some_and(|d| !d.is_empty()), "{name}.{key} has no description");
+                let described = property["description"].as_str().is_some_and(|d| !d.is_empty());
+                assert!(described || SELF_EXPLANATORY.contains(&key.as_str()), "{name}.{key} has no description");
+                assert!(property["description"].as_str().map_or(0, str::len) <= 80, "{name}.{key}: one short line");
             }
         }
         let annotation = |name: &str, hint: &str| tools().as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["annotations"][hint].clone();
@@ -1213,6 +1325,105 @@ mod tests {
             let tool = tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap();
             assert_eq!(tool["inputSchema"]["properties"]["timeout_secs"]["minimum"], 1, "{tool}");
         }
+    }
+
+    /// The names of the tools `profile` lists.
+    fn names(profile: Profile) -> Vec<String> {
+        tools_for(profile).as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn tools_list_stays_small_and_keeps_every_tool() {
+        let size = |profile| json!({ "tools": tools_for(profile) }).to_string().len();
+        let (full, core) = (size(Profile::Full), size(Profile::Core));
+        assert!(full < 26_000, "full tools/list is {full} bytes");
+        assert!(core < 10_000, "core tools/list is {core} bytes");
+        let mut all = names(Profile::Full);
+        all.sort();
+        let mut expected = vec![
+            "stack_inspect", "stack_skill", "stack_init", "stack_compile", "stack_up", "stack_snapshot_save", "stack_snapshot_restore", "stack_snapshot_list",
+            "stack_snapshot_rm", "stack_install", "stack_restart", "stack_logs", "stack_env", "stack_status", "stack_exec", "stack_run", "stack_renew", "stack_down",
+            "stack_gc", "stack_ps", "stack_mv", "stack_doctor", "stack_errors",
+        ];
+        expected.sort();
+        assert_eq!(all, expected);
+        // The envelope keeps its whole shape, without the prose said once in the instructions.
+        let schema = output_schema();
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&schema["properties"]), ["ok", "passed", "command", "stack_version", "schema", "duration_ms", "data", "error"]);
+        assert_eq!(keys(&schema["properties"]["error"]["properties"]), ["code", "message", "hint", "retryable", "next", "details"]);
+        assert_eq!(schema["required"], json!(["ok", "passed", "command", "stack_version", "schema", "duration_ms"]));
+        assert!(!schema.to_string().contains("description"), "{schema}");
+        for word in ["`passed`", "`retryable`", "`next`", "`details`"] {
+            assert!(INSTRUCTIONS.contains(word), "the instructions explain {word}");
+        }
+    }
+
+    #[test]
+    fn the_core_profile_offers_the_daily_loop_and_names_the_rest_unknown() {
+        assert_eq!(names(Profile::Core), ["stack_up", "stack_restart", "stack_logs", "stack_status", "stack_exec", "stack_run", "stack_down", "stack_ps"]);
+        // The same definitions as the full profile, without the output schema.
+        let full = tools_for(Profile::Full);
+        for tool in tools_for(Profile::Core).as_array().unwrap() {
+            let mut same = full.as_array().unwrap().iter().find(|t| t["name"] == tool["name"]).unwrap().clone();
+            same.as_object_mut().unwrap().remove("outputSchema");
+            assert_eq!(*tool, same);
+        }
+        let refused = call_in(Profile::Core, &json!({ "name": "stack_inspect", "arguments": { "dir": "/does/not/exist" } }), None);
+        let error = &refused["structuredContent"]["error"];
+        assert_eq!((refused["isError"].clone(), error["code"].clone()), (json!(true), json!("unknown_tool")), "{refused}");
+        assert!(error["hint"].as_str().unwrap().contains("--profile full"), "{error}");
+        assert!(refused["structuredContent"].get("project").is_none(), "nothing was resolved: {refused}");
+        // A name no profile has is unknown as on a full server; core tools are checked as ever.
+        let unknown = call_in(Profile::Core, &json!({ "name": "stack_nope", "arguments": {} }), None);
+        assert_eq!(unknown["structuredContent"]["error"]["code"], "unknown_tool");
+        assert!(!unknown["structuredContent"]["error"]["hint"].as_str().unwrap_or_default().contains("--profile"), "{unknown}");
+        let relative = call_in(Profile::Core, &json!({ "name": "stack_status", "arguments": { "dir": "relative" } }), None);
+        assert_eq!(relative["structuredContent"]["error"]["code"], "usage", "{relative}");
+        assert!(Profile::Core.instructions().contains("--profile core") && !Profile::Full.instructions().contains("--profile core"));
+    }
+
+    #[test]
+    fn dir_finds_the_nearest_manifest_up_to_the_worktree_root_except_for_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        let repo = top.join("repo");
+        let deep = repo.join("src/deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        // Above the worktree root does not count: the call keeps its own `dir`.
+        std::fs::write(top.join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        assert_eq!(project("stack_status", &json!({ "dir": deep }), None).unwrap(), Some(deep.clone()));
+        let missing = call(&json!({ "name": "stack_inspect", "arguments": { "dir": deep } }), None);
+        let error = &missing["structuredContent"]["error"];
+        assert_eq!(error["code"], "manifest_missing", "{missing}");
+        assert!(error["message"].as_str().unwrap().contains(&format!("up to {}", repo.display())), "{error}");
+        assert!(error["hint"].as_str().unwrap().contains("stack_init"), "{error}");
+        assert_eq!(missing["structuredContent"]["project"], json!(deep));
+
+        std::fs::write(repo.join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        assert_eq!(project("stack_status", &json!({ "dir": deep }), None).unwrap(), Some(repo.clone()));
+        assert_eq!(project("stack_status", &json!({ "dir": repo }), None).unwrap(), Some(repo.clone()));
+        // A single root inside the checkout finds it too.
+        assert_eq!(project("stack_down", &json!({}), Some(std::slice::from_ref(&deep))).unwrap(), Some(repo.clone()));
+        let found = call(&json!({ "name": "stack_inspect", "arguments": { "dir": deep } }), None);
+        assert_eq!(found["structuredContent"]["ok"], true, "{found}");
+        assert_eq!(found["structuredContent"]["project"], json!(repo), "the envelope names the checkout found");
+        // The nearest wins.
+        std::fs::write(repo.join("src/stack.toml"), "").unwrap();
+        assert_eq!(project("stack_status", &json!({ "dir": deep }), None).unwrap(), Some(repo.join("src")));
+
+        // stack_init writes in exactly `dir`; machine-wide tools search nothing either.
+        assert_eq!(project("stack_init", &json!({ "dir": deep }), None).unwrap(), Some(deep.clone()));
+        assert_eq!(project("stack_mv", &json!({ "dir": deep, "from": "a", "to": "b" }), None).unwrap(), Some(deep.clone()));
+        let init = call(&json!({ "name": "stack_init", "arguments": { "dir": deep } }), None);
+        assert_eq!(init["structuredContent"]["ok"], true, "{init}");
+        assert_eq!(init["structuredContent"]["project"], json!(deep));
+        assert!(deep.join("stack.toml").is_file());
+
+        // Still absolute, still existing.
+        assert_eq!(project("stack_status", &json!({ "dir": "repo/src" }), None).unwrap_err().code, "usage");
+        assert_eq!(project("stack_status", &json!({ "dir": repo.join("nope") }), None).unwrap_err().code, "dir_not_found");
     }
 
     #[test]

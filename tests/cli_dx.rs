@@ -155,16 +155,41 @@ fn init_from_a_subdirectory_of_a_project_refuses_to_write_a_second_one() {
 }
 
 #[test]
-fn mcp_dir_means_exactly_that_directory_and_never_the_servers_own() {
+fn mcp_dir_finds_its_project_like_the_cli_and_never_uses_the_servers_own() {
     let fixture = Fixture::new("[bundle]\nname='test'\n");
     let app = fixture.app();
     let deep = app.join("src/deep");
+    fixture.ok(&["compile"]);
     // Started inside the checkout: the server's working directory still decides nothing.
-    let replies = fixture.mcp(&deep, &[("stack_inspect", json!({ "dir": app })), ("stack_inspect", json!({ "dir": deep })), ("stack_inspect", json!({}))]);
+    let replies = fixture.mcp(
+        &deep,
+        &[
+            ("stack_inspect", json!({ "dir": app })),
+            ("stack_inspect", json!({ "dir": deep })),
+            ("stack_inspect", json!({})),
+            ("stack_exec", json!({ "dir": deep, "command": ["sh", "-c", "pwd -P; echo $STACK_PROJECT"] })),
+            ("stack_init", json!({ "dir": deep })),
+        ],
+    );
     assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
-    assert_eq!(replies[1]["error"]["code"], "manifest_missing", "{}", replies[1]);
-    assert_eq!(replies[1]["project"], deep.to_str().unwrap());
+    // A directory inside the checkout finds its stack.toml, as the CLI does from there.
+    assert_eq!(replies[1]["ok"], true, "{}", replies[1]);
+    assert_eq!(replies[1]["project"], app.to_str().unwrap());
     assert_eq!(replies[2]["error"]["code"], "usage", "{}", replies[2]);
+    // The command runs where `dir` points, like `stack exec` from a subdirectory.
+    assert_eq!(replies[3]["data"]["stdout"], format!("{}\n{}\n", deep.display(), app.display()), "{}", replies[3]);
+    assert_eq!(replies[3]["project"], app.to_str().unwrap());
+    // stack_init means exactly `dir`: a new project inside this one, never this one's stack.toml.
+    assert_eq!(replies[4]["ok"], true, "{}", replies[4]);
+    assert_eq!(replies[4]["project"], deep.to_str().unwrap());
+    assert!(deep.join("stack.toml").is_file());
+    // With no stack.toml up to the worktree root, the error says where the search went.
+    fs::remove_file(deep.join("stack.toml")).unwrap();
+    fs::remove_file(app.join("stack.toml")).unwrap();
+    let replies = fixture.mcp(&app, &[("stack_inspect", json!({ "dir": deep }))]);
+    assert_eq!(replies[0]["error"]["code"], "manifest_missing", "{}", replies[0]);
+    assert_eq!(replies[0]["project"], deep.to_str().unwrap());
+    assert!(replies[0]["error"]["message"].as_str().unwrap().contains(&format!("up to {}", app.display())), "{}", replies[0]);
 }
 
 #[test]

@@ -14,7 +14,9 @@
 //! `notifications/roots/list_changed`) and holds calls that need the answer until it arrives,
 //! or [`ROOTS_WAIT`] passes. It never falls back to its own working directory.
 
-use super::{call, needs_roots, negotiate, project_key, tools, INSTRUCTIONS};
+#[cfg(test)]
+use super::call;
+use super::{call_in, needs_roots, negotiate, project_key, tools_for, Profile};
 use crate::process::Cancel;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -56,12 +58,13 @@ enum Event {
     Stop,
 }
 
-/// Serve until `input` ends, then let calls in flight finish and answer them.
-pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static) -> std::io::Result<()> {
-    serve_with(input, output, Arc::new(call))
+/// Serve `profile`'s tools until `input` ends, then let calls in flight finish and answer them.
+/// `tools/list` lists only the tools `profile` offers, and `tools/call` refuses the others.
+pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, profile: Profile) -> std::io::Result<()> {
+    serve_with(input, output, Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| call_in(profile, params, roots)), profile)
 }
 
-pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, caller: Caller) -> std::io::Result<()> {
+pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, caller: Caller, profile: Profile) -> std::io::Result<()> {
     let (events, received) = mpsc::channel();
     let lines = events.clone();
     std::thread::spawn(move || {
@@ -73,7 +76,7 @@ pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Writ
         }
         let _ = lines.send(Event::End);
     });
-    let mut server = Server::new(Arc::new(Out(Mutex::new(Box::new(output)))), caller, events);
+    let mut server = Server::new(Arc::new(Out(Mutex::new(Box::new(output)))), caller, events, profile);
     let result = loop {
         // A signal that would have ended the server was passed on to the command a call ran
         // instead: nothing more starts, and the server ends as the signal asked once the calls
@@ -177,6 +180,8 @@ struct Server {
     out: Arc<Out>,
     caller: Caller,
     events: mpsc::Sender<Event>,
+    /// The tools `tools/list` lists.
+    profile: Profile,
     /// The protocol revision `initialize` settled on.
     version: &'static str,
     client_roots: bool,
@@ -193,11 +198,12 @@ struct Server {
 }
 
 impl Server {
-    fn new(out: Arc<Out>, caller: Caller, events: mpsc::Sender<Event>) -> Self {
+    fn new(out: Arc<Out>, caller: Caller, events: mpsc::Sender<Event>, profile: Profile) -> Self {
         Server {
             out,
             caller,
             events,
+            profile,
             version: super::PROTOCOL_VERSIONS[0],
             client_roots: false,
             roots: Roots::Unsupported,
@@ -267,11 +273,11 @@ impl Server {
                     "protocolVersion": self.version,
                     "capabilities": { "tools": { "listChanged": false }, "resources": { "listChanged": false }, "logging": {} },
                     "serverInfo": { "name": "stack", "title": "Stack", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": INSTRUCTIONS,
+                    "instructions": self.profile.instructions(),
                 }));
             }
             "ping" => reply.ok(&id, json!({})),
-            "tools/list" => reply.ok(&id, json!({ "tools": tools() })),
+            "tools/list" => reply.ok(&id, json!({ "tools": tools_for(self.profile) })),
             "resources/list" => reply.ok(&id, json!({ "resources": [{
                 "uri": GUIDE_URI, "name": "guide", "title": "Stack agent guide", "mimeType": "text/markdown",
                 "description": "How a coding agent uses Stack: the tools, the loop, reading results, timeouts and arguments",
@@ -690,10 +696,14 @@ mod tests {
 
     impl Session {
         pub(super) fn start(caller: Caller) -> Self {
+            Self::start_with(caller, Profile::Full)
+        }
+
+        pub(super) fn start_with(caller: Caller, profile: Profile) -> Self {
             let (input, lines) = mpsc::channel();
             let (messages, output) = mpsc::channel();
             let feed = std::io::BufReader::new(Feed { lines, pending: Vec::new() });
-            let server = std::thread::spawn(move || serve_with(feed, Sink { buffer: Vec::new(), messages }, caller));
+            let server = std::thread::spawn(move || serve_with(feed, Sink { buffer: Vec::new(), messages }, caller, profile));
             Session { input: Some(input), output, server: Some(server) }
         }
 
@@ -978,6 +988,60 @@ mod tests {
         session.send(tool_call(2, "stack_down", json!({ "dir": "relative/checkout" })));
         let error = session.recv()["result"]["structuredContent"]["error"].clone();
         assert!(error["message"].as_str().unwrap().contains("must be an absolute path"), "{error}");
+        session.close();
+    }
+
+    #[test]
+    fn the_core_profile_lists_and_answers_only_its_tools() {
+        let session = Session::start_with(Arc::new(|params: &Value, roots: Option<&[PathBuf]>| call_in(Profile::Core, params, roots)), Profile::Core);
+        session.send(initialize("2025-06-18", json!({})));
+        let instructions = session.recv()["result"]["instructions"].as_str().unwrap().to_string();
+        assert!(instructions.contains("--profile core"), "{instructions}");
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let listed = session.recv();
+        let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["stack_up", "stack_restart", "stack_logs", "stack_status", "stack_exec", "stack_run", "stack_down", "stack_ps"]);
+        assert!(listed["result"].to_string().len() < 10_000, "{} bytes", listed["result"].to_string().len());
+        session.send(tool_call(2, "stack_doctor", json!({ "dir": "/" })));
+        let error = session.recv()["result"]["structuredContent"]["error"].clone();
+        assert_eq!(error["code"], "unknown_tool", "{error}");
+        assert!(error["hint"].as_str().unwrap().contains("--profile full"), "{error}");
+        // A core tool still refuses a relative `dir`.
+        session.send(tool_call(3, "stack_status", json!({ "dir": "relative" })));
+        assert_eq!(session.recv()["result"]["structuredContent"]["error"]["code"], "usage");
+        session.close();
+    }
+
+    #[test]
+    fn the_full_profile_lists_every_tool_with_its_output_schema() {
+        let session = Session::start(Arc::new(call));
+        session.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let listed = session.recv();
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 23);
+        assert!(tools.iter().all(|t| t["outputSchema"]["required"].is_array()), "{listed}");
+        assert!(listed["result"].to_string().len() < 26_000, "{} bytes", listed["result"].to_string().len());
+        session.close();
+    }
+
+    #[test]
+    fn a_root_inside_a_checkout_finds_its_stack_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        let deep = repo.join("src/deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("stack.toml"), "[env]\nA = 'b'\n").unwrap();
+        let session = Session::start(Arc::new(call));
+        session.send(initialize("2025-06-18", json!({ "roots": {} })));
+        session.recv();
+        session.send(tool_call(1, "stack_inspect", json!({})));
+        session.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        let ask = session.recv();
+        session.send(json!({ "jsonrpc": "2.0", "id": ask["id"], "result": { "roots": [{ "uri": format!("file://{}", deep.display()) }] } }));
+        let reply = session.recv();
+        assert_eq!(reply["result"]["structuredContent"]["ok"], true, "{reply}");
+        assert_eq!(reply["result"]["structuredContent"]["project"], json!(repo), "{reply}");
         session.close();
     }
 
