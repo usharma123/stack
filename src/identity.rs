@@ -23,10 +23,10 @@ struct Token {
     project: PathBuf,
     service: String,
     token: String,
-    /// The device of the filesystem the checkout was on (see [`crate::checkout::presence`]);
-    /// absent in tokens an earlier Stack assigned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    project_device: Option<u64>,
+    /// Where the checkout was (see [`crate::checkout::Recorded`]); absent in tokens an earlier
+    /// Stack assigned.
+    #[serde(flatten)]
+    project_at: crate::checkout::Recorded,
 }
 
 fn paths(state: &Path) -> (PathBuf, PathBuf) {
@@ -41,13 +41,15 @@ pub fn assign(state: &Path, project: &Path, services: &[String]) -> Result<Index
     let _guard = FileLock::acquire(&lock)?;
     let mut reg: Registry = read_json(&file)?;
     let before = reg.tokens.len();
-    reg.tokens.retain(|t| !crate::checkout::gone(&t.project, t.project_device) && (t.project != project || services.contains(&t.service)));
+    reg.tokens.retain(|t| !crate::checkout::gone(&t.project, &t.project_at) && (t.project != project || services.contains(&t.service)));
     let mut changed = reg.tokens.len() != before;
-    let device = crate::checkout::device(project);
-    for t in reg.tokens.iter_mut().filter(|t| t.project == project && t.project_device != device && device.is_some()) {
-        t.project_device = device;
-        changed = true;
+    // This checkout's tokens record where it is now (an earlier Stack's record, or one from
+    // another boot, completed).
+    let mut refresh = crate::checkout::Refresh::default();
+    for t in reg.tokens.iter_mut().filter(|t| t.project == project) {
+        changed |= refresh.apply(project, &mut t.project_at);
     }
+    let at = crate::checkout::Recorded::of(project);
     let mut out = IndexMap::new();
     for service in services {
         let existing = reg.tokens.iter().find(|t| t.project == project && t.service == *service);
@@ -55,7 +57,7 @@ pub fn assign(state: &Path, project: &Path, services: &[String]) -> Result<Index
             Some(t) => t.token.clone(),
             None => {
                 let token = random_token()?;
-                reg.tokens.push(Token { project: project.to_path_buf(), service: service.clone(), token: token.clone(), project_device: device });
+                reg.tokens.push(Token { project: project.to_path_buf(), service: service.clone(), token: token.clone(), project_at: at.clone() });
                 changed = true;
                 token
             }
@@ -114,10 +116,10 @@ pub fn rekey(state: &Path, old: &Path, new: &Path) -> Result<(usize, usize)> {
     reg.tokens.retain(|t| t.project != new);
     let replaced = before - reg.tokens.len();
     let mut moved = 0;
-    let device = crate::checkout::device(new);
+    let at = crate::checkout::Recorded::of(new);
     for t in reg.tokens.iter_mut().filter(|t| t.project == old) {
         t.project = new.to_path_buf();
-        t.project_device = device;
+        t.project_at = at.clone();
         moved += 1;
     }
     write_json(&file, &reg)?;

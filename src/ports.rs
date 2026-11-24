@@ -57,16 +57,16 @@ pub struct Reservation {
     pub port: u16,
     pub project: PathBuf,
     pub service: String,
-    /// The device of the filesystem the checkout was on (see [`crate::checkout::presence`]);
-    /// absent in reservations an earlier Stack made.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_device: Option<u64>,
+    /// Where the checkout was (`project_device`, `project_location`: see
+    /// [`crate::checkout::Recorded`]); absent in reservations an earlier Stack made.
+    #[serde(flatten)]
+    pub project_at: crate::checkout::Recorded,
 }
 
 impl Reservation {
     /// Its checkout is shown to be gone (see [`crate::checkout::gone`]).
     pub fn checkout_gone(&self) -> bool {
-        crate::checkout::gone(&self.project, self.project_device)
+        crate::checkout::gone(&self.project, &self.project_at)
     }
 }
 
@@ -175,7 +175,7 @@ fn assign_outside(
     // Only checkouts shown to be gone: one merely out of reach (its volume not mounted, a
     // lookup refused) keeps its ports for when it is back.
     reg.reservations.retain(|r| !r.checkout_gone());
-    let device = crate::checkout::device(project);
+    let at = crate::checkout::Recorded::of(project);
     reg.reservations.retain(|r| {
         r.project != project || (!reassign && requests.iter().any(|q| q.service == r.service))
     });
@@ -202,8 +202,12 @@ fn assign_outside(
         } else {
             find_free(&reg, project, &req.service, ephemeral)?
         };
+        let project_at = match reg.reservations.iter().find(|r| mine(r)) {
+            Some(previous) => at.clone().or_kept(&previous.project_at),
+            None => at.clone(),
+        };
         reg.reservations.retain(|r| !mine(r));
-        reg.reservations.push(Reservation { port, project: project.to_path_buf(), service: req.service.clone(), project_device: device });
+        reg.reservations.push(Reservation { port, project: project.to_path_buf(), service: req.service.clone(), project_at });
         out.insert(req.service.clone(), port);
     }
 
@@ -218,10 +222,10 @@ fn assign_outside(
 }
 
 /// What a registry reserves, whatever the order of its entries.
-fn reserved(reg: &Registry) -> Vec<(PathBuf, String, u16, Option<u64>)> {
-    let mut all: Vec<(PathBuf, String, u16, Option<u64>)> =
-        reg.reservations.iter().map(|r| (r.project.clone(), r.service.clone(), r.port, r.project_device)).collect();
-    all.sort_unstable();
+fn reserved(reg: &Registry) -> Vec<(PathBuf, String, u16, crate::checkout::Recorded)> {
+    let mut all: Vec<(PathBuf, String, u16, crate::checkout::Recorded)> =
+        reg.reservations.iter().map(|r| (r.project.clone(), r.service.clone(), r.port, r.project_at.clone())).collect();
+    all.sort_unstable_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
     all
 }
 
@@ -239,7 +243,7 @@ pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec
         let Some(old) = reg.reservations.iter().find(|r| mine(r)).map(|r| r.port) else { continue };
         let new = find_free(&reg, project, service, &ephemeral)?;
         reg.reservations.retain(|r| !mine(r));
-        reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone(), project_device: crate::checkout::device(project) });
+        reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone(), project_at: crate::checkout::Recorded::of(project) });
         moved.push((service.clone(), old, new));
     }
     write_json(&file, &reg)?;
@@ -248,7 +252,9 @@ pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec
 
 /// Release the reservations of projects shown to be gone (see [`crate::checkout::presence`]),
 /// except those `keep` holds on to (a project whose session record is still kept: its services
-/// may still listen there).
+/// may still listen there). The reservations of checkouts still there get where they are now
+/// (see [`crate::checkout::Refresh`]), so a record an earlier Stack kept, or one from another
+/// boot, can show the checkout's deletion later.
 /// Returns what was released. `assign` prunes gone projects too, but only when some project
 /// compiles; GC calls this so a removed checkout's ports come back without that.
 pub fn release_gone(state: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<Reservation>> {
@@ -258,10 +264,15 @@ pub fn release_gone(state: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<Re
     }
     let _guard = FileLock::acquire(&lock)?;
     let mut reg: Registry = read_json(&file)?;
-    let (gone, kept): (Vec<Reservation>, Vec<Reservation>) =
+    let (gone, mut kept): (Vec<Reservation>, Vec<Reservation>) =
         reg.reservations.into_iter().partition(|r| !keep(&r.project) && r.checkout_gone());
+    let mut refresh = crate::checkout::Refresh::default();
+    let mut refreshed = false;
+    for r in &mut kept {
+        refreshed |= refresh.apply(&r.project, &mut r.project_at);
+    }
     reg.reservations = kept;
-    if !gone.is_empty() {
+    if !gone.is_empty() || refreshed {
         write_json(&file, &reg)?;
     }
     Ok(gone)
@@ -312,10 +323,10 @@ pub fn rekey(state: &Path, old: &Path, new: &Path) -> Result<(usize, usize)> {
     reg.reservations.retain(|r| r.project != new);
     let replaced = before - reg.reservations.len();
     let mut moved = 0;
-    let device = crate::checkout::device(new);
+    let at = crate::checkout::Recorded::of(new);
     for r in reg.reservations.iter_mut().filter(|r| r.project == old) {
         r.project = new.to_path_buf();
-        r.project_device = device;
+        r.project_at = at.clone();
         moved += 1;
     }
     write_json(&file, &reg)?;
@@ -381,7 +392,7 @@ mod tests {
             reservations: ["db", "pinned"]
                 .iter()
                 .zip([40758, 40759])
-                .map(|(service, port)| Reservation { port, project: project.path().to_path_buf(), service: service.to_string(), project_device: None })
+                .map(|(service, port)| Reservation { port, project: project.path().to_path_buf(), service: service.to_string(), project_at: Default::default() })
                 .collect(),
         };
         write_json(&paths(state.path()).0, &old).unwrap();

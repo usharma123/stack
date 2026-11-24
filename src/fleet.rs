@@ -216,13 +216,11 @@ impl Records {
                 session::CheckoutState::Unavailable(_) => "unavailable",
             };
         }
-        let device = self
-            .reservations
-            .iter()
-            .filter(|r| r.project == path)
-            .find_map(|r| r.project_device)
-            .or_else(|| recorded.iter().find_map(|e| e.project_device));
-        let present = match crate::checkout::presence(path, device) {
+        // The fullest record kept: one with a location, else one with a device.
+        let mut kept: Vec<&crate::checkout::Recorded> = self.reservations.iter().filter(|r| r.project == path).map(|r| &r.project_at).chain(recorded.iter().map(|e| &e.project_at)).collect();
+        kept.sort_by_key(|at| (at.location.is_none(), at.device.is_none()));
+        let at = kept.first().copied().cloned().unwrap_or_default();
+        let present = match crate::checkout::presence(path, &at) {
             crate::checkout::Presence::Present => true,
             crate::checkout::Presence::Absent => false,
             crate::checkout::Presence::Unknown(_) => return "unavailable",
@@ -1106,7 +1104,7 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
                     supervisor: entry.supervisor.clone(),
                     location,
                     identity,
-                    project_device: crate::checkout::device(&new),
+                    project_at: crate::checkout::Recorded::of(&new),
                 },
             )?;
         }
@@ -1133,6 +1131,7 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
         session.project = new.clone();
         session.project_dir_id = session::dir_id(&new);
         session.project_dir_created = session::dir_created(&new);
+        session.project_location = crate::checkout::location(&new);
         for (entry, to) in &done {
             if let Some(record) = session.services.get_mut(&entry.service) {
                 record.data_dir = Some(to.to_string_lossy().into_owned());

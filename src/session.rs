@@ -138,6 +138,11 @@ pub struct Session {
     /// Older records and filesystems without birth times retain device/inode checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir_created: Option<std::time::SystemTime>,
+    /// The mount the project directory was on at launch (see [`crate::checkout::Location`]), so
+    /// a missing or replaced directory is told from that mount not being there right now.
+    /// Absent in records an earlier Stack kept, and where it could not be learned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_location: Option<crate::checkout::Location>,
     /// `stack up --label KEY=VALUE`: what the caller said this session is for, which `ps`,
     /// `status`, `logs` and `down` select checkouts by (see [`crate::labels`]). Kept across
     /// `up`s of the same checkout; a later `up --label` adds or replaces keys.
@@ -1312,6 +1317,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     let provider = (!report.stack.services.is_empty()).then(|| ProviderRecord::native(supervisor_dir(ctx)));
     let project_dir_id = dir_id(&ctx.root);
     let project_dir_created = dir_created(&ctx.root);
+    let project_location = crate::checkout::location(&ctx.root);
 
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
@@ -1453,6 +1459,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 provider: provider.clone(),
                 project_dir_id,
                 project_dir_created,
+                project_location: project_location.clone(),
                 labels: labels.clone(),
             };
             // Written once, with what the supervisor already shows (one synced write fewer).
@@ -1554,6 +1561,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         provider: if report.stack.services.is_empty() { None } else { provider },
         project_dir_id,
         project_dir_created,
+        project_location,
         labels,
     };
     // The same verified instance found running again changes only when it was last verified
@@ -1677,6 +1685,7 @@ fn claim_each(
     claimed: &mut Vec<crate::datadirs::Entry>,
 ) -> Result<()> {
     let token = token.to_string();
+    let project_at = crate::checkout::Recorded::of(&ctx.root);
     for daemon in statuses {
         let Some(dir) = daemon.data_dir.as_deref().map(PathBuf::from) else { continue };
         let running = matches!(daemon.status.as_str(), "running" | "starting") || daemon.pid.is_some_and(pid_alive);
@@ -1696,7 +1705,7 @@ fn claim_each(
             supervisor,
             location,
             identity,
-            project_device: crate::checkout::device(&ctx.root),
+            project_at: project_at.clone(),
         };
         if running || owner.as_deref() == Some(token.as_str()) {
             if owner.as_deref() == Some(token.as_str()) {
@@ -5184,6 +5193,8 @@ fn renew_in_status(ctx: &Ctx, session: &mut Session) -> Result<()> {
 pub struct GcEntry {
     pub project: PathBuf,
     pub reason: String,
+    /// Every service of the session was confirmed stopped. False for an entry `left_alone`,
+    /// where nothing was stopped (and that is no failure).
     pub stopped: bool,
     /// Whether the checkout is still there cannot be shown (`reason` says why): nothing of it was
     /// stopped, reclaimed or released, and nothing needs to be until it can.
@@ -5311,6 +5322,9 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         crate::provider::env_cache::forget(state, &reservation.project);
         note(&reservation.project, &reservation.service, format!("port {} released", reservation.port));
     }
+    // Data records of checkouts still there record where they are now (best effort: a record
+    // that cannot be completed now is judged as it is).
+    let _ = crate::datadirs::refresh_checkouts(state);
     let mut settled = Vec::new();
     for entry in crate::datadirs::entries(state)? {
         // Only a checkout shown to be gone: one out of reach for now (its volume not mounted, a
@@ -5335,12 +5349,12 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
     // A supervisor still running for it (every service stopped one by one, then the checkout
     // removed) is shut down first, under the checkout's lock, as `down` would.
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
-    for (dir, project, device) in supervisor::orphaned_dirs(state) {
+    for (dir, project, at) in supervisor::orphaned_dirs(state) {
         if recorded(&project) {
             continue;
         }
         let _guard = project_lock(state, &project)?;
-        if !crate::checkout::gone(&project, device) || recorded(&project) {
+        if !crate::checkout::gone(&project, &at) || recorded(&project) {
             continue;
         }
         match supervisor::shutdown(&dir) {
@@ -5488,16 +5502,20 @@ pub fn checkout_gone(session: &Session) -> Option<&'static str> {
 }
 
 /// Whether `session`'s checkout is still there (see [`CheckoutState`]). Deleted only when
-/// [`crate::checkout::presence`] can show it, judged by the filesystem the directory was on at
+/// [`crate::checkout::presence`] can show it, judged by the mount the directory was on at
 /// launch; replaced only when another directory is at the path on that same filesystem (or the
-/// birth time recorded no longer matches). A directory there on another filesystem is a mount
-/// point whose volume is not mounted, or the volume mounted again: unavailable, unless it is the
-/// very directory (same inode and birth time) under a renumbered device.
+/// birth time recorded no longer matches) and, once recorded, on the same mount. A directory
+/// there on another filesystem is a mount point whose volume is not mounted, or the volume
+/// mounted again: unavailable, unless it is the very directory (same inode and birth time) under
+/// a renumbered device. So is another directory whose mount is not the one recorded: the
+/// directory a checkout that was itself a mount point (a bind mount of the same filesystem
+/// included) leaves behind while that is not mounted.
 pub fn checkout_state(session: &Session) -> CheckoutState {
     use crate::checkout::Presence;
     let path = &session.project;
     let recorded = session.project_dir_id;
-    match crate::checkout::presence(path, recorded.map(|(dev, _)| dev)) {
+    let at = crate::checkout::Recorded { device: recorded.map(|(dev, _)| dev), location: session.project_location.clone() };
+    match crate::checkout::presence(path, &at) {
         Presence::Absent => return CheckoutState::Gone("project directory deleted"),
         Presence::Unknown(why) => return CheckoutState::Unavailable(why),
         Presence::Present => {}
@@ -5517,6 +5535,17 @@ pub fn checkout_state(session: &Session) -> CheckoutState {
         }
     }
     if project_replaced(session, path) {
+        if let Some(was) = &session.project_location {
+            let now = crate::checkout::location(path);
+            if !now.as_ref().is_some_and(|now| now.mount_root == was.mount_root && now.root == was.root) {
+                return CheckoutState::Unavailable(format!(
+                    "{} is another directory than when its session started, on another mount than the one it was on ({}): \
+                     the checkout may have been a mount point that is not mounted right now",
+                    path.display(),
+                    was.mount_root.display()
+                ));
+            }
+        }
         return CheckoutState::Gone("project directory replaced");
     }
     CheckoutState::Present
@@ -5715,10 +5744,13 @@ pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result
     let pass = gc_with(state, &GcOptions { stop_orphans, ..GcOptions::default() })?;
     let mut entries = pass.reclaimed;
     entries.extend(pass.unreadable);
+    // A checkout whose presence cannot be shown is left alone: nothing of it was stopped, so
+    // `stopped` is false, and `left_alone` says that is not a failure (Stack 0.1.24 and earlier
+    // reported `stopped: true` for these).
     entries.extend(pass.skipped.into_iter().filter(|s| s.skipped == "unavailable").map(|s| GcEntry {
         project: s.project,
         reason: format!("checkout unavailable: {}", s.reason),
-        stopped: true,
+        stopped: false,
         left_alone: true,
         ..GcEntry::default()
     }));
@@ -5726,7 +5758,7 @@ pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result
     // Postgres templates nothing can use any more (see `pgtemplate`): a cache, removed quietly;
     // `gc --dry-run` lists them.
     crate::pgtemplate::collect(state, false);
-    let failed = entries.iter().filter(|e| !e.stopped).count();
+    let failed = entries.iter().filter(|e| !e.stopped && !e.left_alone).count();
     if failed == 0 {
         return Ok(entries);
     }
@@ -7770,6 +7802,16 @@ mod native_records {
             assert_eq!(checkout_state(&reborn), CheckoutState::Gone("project directory replaced"), "same inode, another birth time");
         }
         assert_eq!(checkout_session_gone(&root, dev), None);
+        // Recorded on the mount it is on now: another directory there replaced it.
+        let location = crate::checkout::location(&root).unwrap();
+        let on = |location: crate::checkout::Location| Session { project_location: Some(location), ..at((dev, ino + 1)) };
+        assert_eq!(checkout_state(&on(location.clone())), CheckoutState::Gone("project directory replaced"));
+        // Recorded as itself a mount's root (a bind mount of the same filesystem at the path,
+        // say): another directory there now, on another mount, is what that leaves behind while
+        // it is not mounted.
+        let mounted = crate::checkout::Location { mount_root: root.canonicalize().unwrap(), root: [dev, ino], ..location };
+        let CheckoutState::Unavailable(why) = checkout_state(&on(mounted)) else { panic!("not unavailable") };
+        assert!(why.contains("on another mount"), "{why}");
     }
 
     fn checkout_session_gone(root: &Path, dev: u64) -> Option<&'static str> {
@@ -7787,26 +7829,33 @@ mod native_records {
         let root = tmp.path().join("vol").join("app");
         fs::create_dir_all(&root).unwrap();
         fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
-        let (dev, ino) = dir_id(&root).unwrap();
+        let (_, ino) = dir_id(&root).unwrap();
+        // Where the checkout was, as `up` records it while it is there.
+        let here = crate::checkout::Recorded::of(&root);
+        let location = here.location.clone().expect("a temporary directory's mount can be learned");
         crate::identity::assign(&state, &root, &["web".to_string()]).unwrap();
         ports::assign(&state, &root, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
-        let record = |device: u64| {
+        let record = |at: &crate::checkout::Recorded| {
             let session = Session {
                 id: "s1".into(),
                 project: root.clone(),
-                project_dir_id: Some((device, ino)),
+                project_dir_id: Some((at.device.unwrap(), ino)),
+                project_location: at.location.clone(),
                 lease: Some(Lease { ttl_secs: Some(1), owner_pid: None, owner: None, renewed_at: 1 }),
                 ..Session::default()
             };
             write_json(&index_path(&state, &root), &session).unwrap();
+            let recorded = serde_json::to_value(at).unwrap();
             let mut registry: serde_json::Value = read_json(&state.join("ports.json")).unwrap();
             for r in registry["reservations"].as_array_mut().unwrap() {
-                r["project_device"] = json!(device);
+                r["project_device"] = recorded["project_device"].clone();
+                r["project_location"] = recorded["project_location"].clone();
             }
             write_json(&state.join("ports.json"), &registry).unwrap();
             let mut tokens: serde_json::Value = read_json(&state.join("identities.json")).unwrap();
             for t in tokens["tokens"].as_array_mut().unwrap() {
-                t["project_device"] = json!(device);
+                t["project_device"] = recorded["project_device"].clone();
+                t["project_location"] = recorded["project_location"].clone();
             }
             write_json(&state.join("identities.json"), &tokens).unwrap();
             crate::datadirs::forget(&state, |_| true).unwrap();
@@ -7820,19 +7869,21 @@ mod native_records {
                     supervisor: None,
                     location: None,
                     identity: None,
-                    project_device: Some(device),
+                    project_at: at.clone(),
                 },
             )
             .unwrap();
         };
         fs::remove_dir_all(&root).unwrap();
-        let elsewhere = dev.wrapping_add(1);
-        record(elsewhere);
+        // As recorded on another filesystem, its volume not mounted now.
+        let device = here.device.unwrap().wrapping_add(1);
+        let elsewhere = crate::checkout::Recorded { device: Some(device), location: Some(crate::checkout::Location { root: [device, location.root[1]], ..location.clone() }) };
+        record(&elsewhere);
 
         let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
         assert!(pass.reclaimed.is_empty(), "{:?}", pass.reclaimed);
         assert_eq!(pass.skipped.iter().map(|s| (s.project.as_path(), s.skipped)).collect::<Vec<_>>(), [(root.as_path(), "unavailable")]);
-        assert!(pass.skipped[0].reason.contains("may not be mounted"), "{}", pass.skipped[0].reason);
+        assert!(pass.skipped[0].reason.contains("may not be there"), "{}", pass.skipped[0].reason);
         assert!(index_path(&state, &root).exists(), "the session record is kept");
         // Recorded for the checkout: released or removed only once it is shown gone.
         fs::remove_file(index_path(&state, &root)).unwrap();
@@ -7851,11 +7902,19 @@ mod native_records {
         // `stack gc` reports it, left alone, without failing.
         let entries = gc_checked(&state, true, false).unwrap();
         assert!(entries.iter().all(|e| e.project != root || e.left_alone), "nothing reclaimed for it");
+        assert!(entries.iter().filter(|e| e.left_alone).all(|e| !e.stopped), "nothing of it is claimed stopped");
+        // Recorded by an earlier Stack, with no location: never taken for deleted where a bind
+        // mount of the same filesystem would leave the same behind (Linux).
+        if crate::mounts::BINDS {
+            record(&crate::checkout::Recorded { device: here.device, location: None });
+            let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+            assert!(pass.reclaimed.is_empty() && pass.skipped.iter().any(|s| s.project == root && s.reason.contains("only the device")), "{:?}", pass.skipped);
+        }
 
         // Deleted from its own filesystem: the session goes once nothing of it runs, then its
         // ports and identities; its data, recorded before Stack could tell which directory it is,
         // is reported and kept.
-        record(dev);
+        record(&here);
         let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
         assert!(pass.skipped.is_empty(), "{:?}", pass.skipped);
         assert_eq!(pass.reclaimed.iter().map(|e| (e.project.as_path(), e.reason.as_str(), e.stopped)).collect::<Vec<_>>(), [(root.as_path(), "project directory deleted", true)]);
@@ -7890,7 +7949,7 @@ mod native_records {
             supervisor: Some(crate::datadirs::Supervisor { pitchfork: None, state_dir: sup, id: "pg".into() }),
             location,
             identity,
-            project_device: None,
+            project_at: Default::default(),
         };
         // As the kernel would answer with a bind mount at `mounted`.
         let mounted = fs::symlink_metadata(dir.join("mounted")).unwrap().ino();

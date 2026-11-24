@@ -6090,7 +6090,12 @@ fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
     let (port, data) = up_with_data(&fixture, &["--ttl", "30m"], 8192);
     // Another checkout, deleted while its session is still recorded.
     let gone = dir.canonicalize().unwrap().join("deleted");
-    let record = json!({ "id": "gone12345678", "project": gone, "lock_digest": "", "started_at": 1, "services": { "web": { "port": 1, "identity": "liveness", "verified_at": 1 } } });
+    // Recorded as `up` records it, with the directory and the mount it was on.
+    fs::create_dir(&gone).unwrap();
+    let (dev, ino) = stack::session::dir_id(&gone).unwrap();
+    let location = stack::checkout::location(&gone);
+    fs::remove_dir(&gone).unwrap();
+    let record = json!({ "id": "gone12345678", "project": gone, "lock_digest": "", "started_at": 1, "project_dir_id": [dev, ino], "project_location": location, "services": { "web": { "port": 1, "identity": "liveness", "verified_at": 1 } } });
     fs::write(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&gone))), record.to_string()).unwrap();
 
     let ps = |args: &[&str]| -> Value {

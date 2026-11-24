@@ -45,17 +45,17 @@ pub struct Entry {
     /// The directory at `location` (device, inode), once `up` saw it exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<[u64; 2]>,
-    /// The device of the filesystem the checkout (`project`) was on, so its data is reclaimed
-    /// only once the checkout is shown to be gone (see [`crate::checkout::presence`]); absent in
-    /// entries an earlier Stack recorded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_device: Option<u64>,
+    /// Where the checkout (`project`) was, so its data is reclaimed only once the checkout is
+    /// shown to be gone (see [`crate::checkout::Recorded`]); absent in entries an earlier Stack
+    /// recorded.
+    #[serde(flatten)]
+    pub project_at: crate::checkout::Recorded,
 }
 
 impl Entry {
     /// Its checkout is shown to be gone (see [`crate::checkout::gone`]).
     pub fn checkout_gone(&self) -> bool {
-        crate::checkout::gone(&self.project, self.project_device)
+        crate::checkout::gone(&self.project, &self.project_at)
     }
 }
 
@@ -106,6 +106,26 @@ pub fn record_all(state: &Path, entries: Vec<Entry>) -> Result<()> {
 /// Every recorded entry.
 pub fn entries(state: &Path) -> Result<Vec<Entry>> {
     Ok(read_json::<Ledger>(&paths(state).0)?.entries)
+}
+
+/// Record where each entry's checkout is now, for those still there (see
+/// [`crate::checkout::Refresh`]), under the ledger's lock; written only when one changed.
+pub fn refresh_checkouts(state: &Path) -> Result<()> {
+    let (file, lock) = paths(state);
+    if !file.exists() {
+        return Ok(());
+    }
+    let _guard = FileLock::acquire(&lock)?;
+    let mut ledger: Ledger = read_json(&file)?;
+    let mut refresh = crate::checkout::Refresh::default();
+    let mut changed = false;
+    for entry in &mut ledger.entries {
+        changed |= refresh.apply(&entry.project, &mut entry.project_at);
+    }
+    if changed {
+        write_json(&file, &ledger)?;
+    }
+    Ok(())
 }
 
 /// Drop the entries `gone` selects, under the ledger's lock.
@@ -932,7 +952,7 @@ mod tests {
     use super::*;
 
     fn entry(project: &str, service: &str, dir: &str, checkout: &str) -> Entry {
-        Entry { project: project.into(), service: service.into(), dir: dir.into(), checkout: checkout.into(), supervisor: None, location: None, identity: None, project_device: None }
+        Entry { project: project.into(), service: service.into(), dir: dir.into(), checkout: checkout.into(), supervisor: None, location: None, identity: None, project_at: Default::default() }
     }
 
     #[test]

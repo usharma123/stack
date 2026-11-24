@@ -1502,7 +1502,7 @@ mod tests {
             for name in &r.names {
                 let target = r.target(name);
                 let (location, identity) = datadirs::locate(&target);
-                let entry = datadirs::Entry { project: r.ctx.root.clone(), service: name.clone(), dir: target, checkout: token.clone(), supervisor: None, location, identity, project_device: None };
+                let entry = datadirs::Entry { project: r.ctx.root.clone(), service: name.clone(), dir: target, checkout: token.clone(), supervisor: None, location, identity, project_at: Default::default() };
                 datadirs::record(&r.ctx.state, entry).unwrap();
             }
             r

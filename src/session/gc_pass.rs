@@ -357,7 +357,7 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
     let mut found: Vec<(usize, Option<PlannedPort>, Option<PlannedData>)> = Vec::new();
     // Only checkouts shown to be gone; one whose presence cannot be shown is reported, as a pass
     // leaves its ports and data alone.
-    let mut gone = |project: &Path, device: Option<u64>| match crate::checkout::presence(project, device) {
+    let mut gone = |project: &Path, at: &crate::checkout::Recorded| match crate::checkout::presence(project, at) {
         crate::checkout::Presence::Absent => true,
         crate::checkout::Presence::Present => false,
         crate::checkout::Presence::Unknown(reason) => {
@@ -368,13 +368,13 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
         }
     };
     for r in ports {
-        if gone(&r.project, r.project_device) {
+        if gone(&r.project, &r.project_at) {
             found.push((entry(&r.project), Some(PlannedPort { service: r.service, port: r.port }), None));
         }
     }
     let action = if reclaim_data { "remove_if_safe" } else { "report" };
     for d in data {
-        if gone(&d.project, d.project_device) {
+        if gone(&d.project, &d.project_at) {
             found.push((entry(&d.project), None, Some(PlannedData { service: d.service, dir: d.dir, action })));
         }
     }

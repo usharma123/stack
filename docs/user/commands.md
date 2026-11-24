@@ -720,19 +720,40 @@ one a build holds is left out, as a pass would skip it.
 `gc` removes them without listing them in its result.
 
 A checkout counts as deleted only when that can be shown: its path is not found and the
-deepest directory above it that is there is on the filesystem the checkout was on (recorded
-with its session, port reservations, identity tokens, data records and supervisor). A lookup
-refused for permission or failing for I/O, a volume that is not mounted right now (its
-directory under `/Volumes` gone, or its mount point left empty), or a directory at the path on
-another filesystem, shows nothing: such a checkout is `unavailable`, and nothing of it is
-stopped, reclaimed, released or removed, not even an expired lease's services. `gc` lists it
-(`left_alone`, the reason after `checkout unavailable:`) without failing, `--dry-run` under
-`unavailable`, `ps` with directory `unavailable`, and `up`'s pass under `skipped`
-(`"skipped": "unavailable"`). Records an earlier Stack kept name no filesystem: for them the
-checkout's own parent directory must be there, readable and not empty (an unmounted mount
-point is left empty). After a reboot gives a filesystem another device number (removable or
-network volumes, btrfs subvolumes), a checkout deleted from it stays `unavailable` rather than
-being taken for deleted; one still there is still recognised by its inode and birth time.
+deepest directory above it that is there is on the very mount the checkout was on. With its
+session, port reservations, identity tokens, data records and supervisor, Stack records the
+filesystem's device and the mount: that mount's root (the highest directory above the checkout
+on it), which directory the root is (device, inode, and birth time where the filesystem keeps
+one) and, on Linux, the kernel's mount id with the boot and mount namespace it was read in
+(Linux mount ids are reused once a mount is gone; the unique id of Linux 6.8 and later is
+compared where both sides have it). The directory above the missing path must be on a mount
+rooted at the same place, at the same directory; on Linux it must also be the same mount, by
+id in the same boot and mount namespace, and by the root's birth time otherwise (with no birth
+time to go by, a checkout deleted across a restart stays `unavailable`). So a lookup refused for
+permission or failing for I/O, a volume that is not mounted right now (its directory under
+`/Volumes` gone, or its mount point left empty), a bind mount that is not mounted (on Linux,
+even one of a directory of the same filesystem, whose mount point has the same device), or a
+directory at the path on another filesystem, shows nothing: such a checkout is `unavailable`,
+and nothing of it is stopped, reclaimed, released or removed, not even an expired lease's
+services. The same holds for a checkout whose session recorded it as the root of its own mount
+when another directory is at its path on another mount: that is what the mount point looks like
+while it is not mounted, so it is `unavailable` rather than `replaced`. `gc` lists it
+(`left_alone`, with `stopped` false since nothing was stopped, the reason after `checkout
+unavailable:`) without failing (Stack 0.1.24 and earlier said `stopped: true` there),
+`--dry-run` under `unavailable`, `ps` with directory `unavailable`, and `up`'s pass under
+`skipped` (`"skipped": "unavailable"`). After a reboot gives a filesystem another device number
+(removable or network volumes, btrfs subvolumes), a checkout deleted from it stays
+`unavailable` rather than being taken for deleted; one still there is still recognised by its
+inode and birth time.
+
+Records an earlier Stack kept (0.1.24 and earlier) name no mount. While their checkout is there,
+`up` in it, any compile of it (identity tokens), and `gc` (port reservations and data records)
+record its mount. Once it is gone they decide nothing on their own: one with only a device is
+deleted only where every mount has a device of its own (macOS), never on Linux, where an unmounted
+bind mount of the same filesystem leaves the same behind; one with no device at all is never
+shown deleted, whatever its parent directory holds. Such a checkout stays `unavailable`, its
+reason saying so. To let Stack reclaim it, recreate the directory at that path, run `stack gc`
+(which records the mount the path is on now), and delete the directory again.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once, and its

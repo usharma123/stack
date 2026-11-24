@@ -35,11 +35,26 @@ pub fn at(dir: &OwnedFd, name: &CStr) -> io::Result<Option<Ids>> {
     imp::ids(dir.as_raw_fd(), name)
 }
 
-/// The mount at the absolute `path`, not following a link in its last component.
+/// The mount of what `path` resolves to (links followed, as `stat` follows them), from a
+/// descriptor opened on it (Linux `O_PATH`, which needs no permission on the object itself).
 pub fn of_path(path: &std::path::Path) -> io::Result<Option<Ids>> {
+    if !BINDS {
+        return Ok(None);
+    }
     let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))?;
-    imp::ids(libc::AT_FDCWD, &path)
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    // SAFETY: open with a NUL-terminated path; the descriptor returned is owned here.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor open just returned, owned by nothing else.
+    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    of(&fd)
 }
 
 /// This process's mount namespace (Linux: the namespace `/proc/self/ns/mnt` names), in which
@@ -146,7 +161,8 @@ mod tests {
         for name in [c"a", c"f", c"l"] {
             assert_eq!(at(&dir, name).unwrap(), own, "{name:?}");
         }
-        assert_eq!(of_path(&tmp.path().join("l")).unwrap(), own);
+        assert_eq!(of_path(&tmp.path().join("a")).unwrap(), own);
+        assert!(of_path(&tmp.path().join("l")).is_err() || !BINDS, "a dangling link resolves to nothing");
         if BINDS {
             assert!(own.is_some(), "Linux tells mounts apart");
             assert!(at(&dir, c"missing").is_err());
