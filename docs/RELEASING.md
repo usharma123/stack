@@ -70,6 +70,8 @@ provenance.
 
 1. Update the same version in `Cargo.toml`, the `stack` entry in `Cargo.lock`, and
    `npm/package.json`. Use a SemVer version, such as `0.1.1` or `0.2.0-beta.1`.
+   Optionally add curated release notes at `docs/releases/vX.Y.Z.md`; if omitted,
+   GitHub generates categorized notes from merged PRs via `.github/release.yml`.
 2. Merge the change into main and confirm `CI passed`.
 3. Create and push an annotated tag matching the version:
 
@@ -85,6 +87,13 @@ checks the artifact digest, then verifies the tarball's package name, version,
 source commit and all four binary checksums. It does not rebuild or repack.
 Eligible sources are main push runs and recovery runs manually dispatched on the
 exact release tag. PR runs and dispatches on other refs are excluded.
+
+After `publish` verifies the npm package, the separate `github-release` job
+(the only job granted `contents: write`, isolated from `publish`'s OIDC identity)
+re-verifies the exact same tarball, prepares `stack-X.Y.Z.tgz`, `SHA256SUMS`,
+and release notes via `scripts/release-notes.mjs` (using `docs/releases/vX.Y.Z.md`
+when present, else GitHub's generated release notes), and creates or updates the
+GitHub Release idempotently.
 
 It accepts only commits on `origin/main` in `usharma123/stack`, with a tag matching
 the Rust/npm version. Only the publish job receives `id-token: write`; selection
