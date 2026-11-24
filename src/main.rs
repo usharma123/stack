@@ -103,6 +103,11 @@ enum Cmd {
         /// Keep printing new lines until interrupted (polls the supervisor every second; not with --json)
         #[arg(short, long)]
         follow: bool,
+        /// Only output written after this position: the `cursor` a previous `--json` result
+        /// gave ("" to begin). Each line once, with `timestamps`, and a `gap` for output a
+        /// rotation took first; --tail caps the lines per read (`more` says there are more)
+        #[arg(long, value_name = "CURSOR", conflicts_with_all = ["follow", "project", "labels"])]
+        cursor: Option<String>,
         /// Logs of every checkout of this project (its repository's worktrees with Stack
         /// records), each line prefixed [<branch>:<service>]; --project=PATH names another
         #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true, conflicts_with = "follow")]
@@ -585,7 +590,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow, project, labels } => fleet_filter(&root, project.as_ref(), labels, false).and_then(|fleet| logs(
+        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow, cursor, project, labels } => fleet_filter(&root, project.as_ref(), labels, false).and_then(|fleet| logs(
             &ctx,
             cli.json,
             stack::logs::Query {
@@ -595,6 +600,7 @@ fn main() -> ExitCode {
                 since_secs: None,
                 grep: grep.clone(),
                 ignore_case: *ignore_case,
+                cursor: cursor.as_deref().map(stack::logs::Cursor::parse).transpose()?,
             },
             since.as_deref(),
             *follow,
@@ -877,7 +883,7 @@ fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>
     if follow {
         if as_json {
             return Err(StackError::new("usage", "--follow cannot be combined with --json")
-                .hint("run `stack logs --json` repeatedly, or `stack logs --follow` without --json"));
+                .hint("run `stack logs --json --cursor <cursor>` repeatedly, passing back the `cursor` each result gives, or `stack logs --follow` without --json"));
         }
         return stack::logs::follow(ctx, &q, Duration::from_secs(1)).map(|()| ExitCode::SUCCESS);
     }

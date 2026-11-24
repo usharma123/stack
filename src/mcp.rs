@@ -487,7 +487,8 @@ fn tool_definitions() -> Value {
                 "since_start": { "type": "boolean", "description": "Current run only" },
                 "since": { "type": "string", "description": "Span, e.g. 10m" },
                 "grep": { "type": "string", "description": "Substring" },
-                "ignore_case": { "type": "boolean" }
+                "ignore_case": { "type": "boolean" },
+                "cursor": { "type": "string", "description": "A result's cursor: only newer output (\"\" to begin)" }
             }), "Read", false), &[])),
         tool("stack_env", annotations("Command env", true, None, true, false),
             "Return stack_exec env. Use it for unwrapped tools; prefer stack_exec.",
@@ -792,8 +793,16 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx, here: Option<PathBuf>) -> Resul
                 since_secs: args["since"].as_str().map(parse_duration).transpose()?,
                 grep: args["grep"].as_str().map(String::from),
                 ignore_case: args["ignore_case"] == true,
+                cursor: match &args["cursor"] {
+                    Value::Null => None,
+                    Value::String(c) => Some(crate::logs::Cursor::parse(c)?),
+                    v => return Err(StackError::new("usage", format!("cursor {v} must be a string a previous stack_logs result gave"))),
+                },
             };
             let fleet = fleet_filter(args, ctx)?;
+            if fleet.active() && q.cursor.is_some() {
+                return Err(StackError::new("usage", "cursor reads one checkout's logs").hint("drop `cursor`, or drop project/labels/all"));
+            }
             if fleet.active() {
                 return crate::fleet::logs(&ctx.state, &ctx.cache, &fleet, &q).map(to_value);
             }

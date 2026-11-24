@@ -617,6 +617,50 @@ fn one_writer_rotates_a_services_log_and_keeps_the_older_file() {
     sup.shutdown();
 }
 
+#[test]
+fn a_cursor_reads_a_flooding_rotating_log_once_through_repeats_included() {
+    let sup = Supervisor::new();
+    // About 30 MB, one rotation: each line twice (the same text), numbered by pair.
+    sup.spec(json!({ "loud": sup.service(r#""$PY" -c 'import sys; [sys.stdout.write("%06d" % (i // 2) + "x" * 994 + "\n") for i in range(30000)]; sys.stdout.flush()'; echo done; exec sleep 600"#) }), false);
+    sup.start();
+    let log = sup.path().join("logs/loud.log");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // A cursor at the start of the first file, as soon as there is one.
+    let mut pos = loop {
+        assert!(Instant::now() < deadline, "no log");
+        if let Some(p) = stack::supervisor::tail(&sup.path(), "loud", 1, None).unwrap().2 {
+            // Already rotated (a slow machine): its first file is the older one.
+            use std::os::unix::fs::MetadataExt;
+            let first = fs::metadata(sup.path().join("logs/loud.log.1")).map_or((p.dev, p.ino), |m| (m.dev(), m.ino()));
+            break stack::supervisor::LogPos { dev: first.0, ino: first.1, offset: 0 };
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "the output never reached the log: {} lines", lines.len());
+        let read = stack::supervisor::read_after(&sup.path(), "loud", pos, 10_000, stack::supervisor::LOGS_LIMIT).unwrap();
+        assert_eq!(read.gap, None, "one rotation never loses a line");
+        assert!(read.records.iter().all(|r| r.at_ms > 0), "every line stamped");
+        lines.extend(read.records.into_iter().map(|r| r.line));
+        pos = read.pos.unwrap();
+        if lines.last().is_some_and(|l| l == "done") {
+            break;
+        }
+        if !read.more {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(sup.path().join("logs/loud.log.1").exists(), "it rotated");
+    assert_eq!(lines.len(), 30001);
+    for (i, line) in lines[..30000].iter().enumerate() {
+        assert!(line.starts_with(&format!("{:06}x", i / 2)) && line.len() == 1000, "line {i}: {}", &line[..12.min(line.len())]);
+    }
+    let text = fs::read_to_string(&log).unwrap() + &fs::read_to_string(sup.path().join("logs/loud.log.1")).unwrap();
+    assert!(!text.contains("[stack]"), "nothing was dropped while the writer kept up");
+    sup.shutdown();
+}
+
 /// What a service that logs meets when its supervisor dies: nobody reads its output, so a write
 /// fails (`SIGPIPE`, or `EPIPE` where it is ignored); one that does not ignore `SIGPIPE` exits.
 /// The next `up` starts it again (see docs/user/worktrees.md).

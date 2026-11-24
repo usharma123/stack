@@ -2803,6 +2803,26 @@ pub struct LogsReport {
     pub started_at: Option<u64>,
     /// Only lines since `started_at` were requested.
     pub since_start: bool,
+    /// Where this read got to in the service's log: passed back as `cursor`, the next read
+    /// returns only what was written since (see [`crate::logs::Cursor`]). Absent for output an
+    /// older Stack's provider kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// When the supervisor read each line (Unix ms; 0 for a line it did not stamp), on reads
+    /// given a cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamps: Option<Vec<u64>>,
+    /// Output a read from a cursor could not return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap: Option<supervisor::Gap>,
+    /// A read from a cursor stopped at its limit: read again from `cursor` for the rest.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
+    /// Each line's stamp, and the position in the log after the last line, for the caller.
+    #[serde(skip)]
+    pub stamps: Vec<u64>,
+    #[serde(skip)]
+    pub pos: Option<supervisor::LogPos>,
 }
 
 /// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
@@ -2839,7 +2859,7 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
         return Err(StackError::new("logs_failed", format!("no recorded start time for {service}"))
             .hint("sessions started before stack 0.1.18 lack one; `stack restart` records it"));
     }
-    let (lines, truncated) = match legacy {
+    let (stamps, lines, truncated, pos) = match legacy {
         // A session an older Stack started: Pitchfork kept its output, stamped in whole seconds.
         Some(provider) => {
             let since = match (since_start, started_at) {
@@ -2850,7 +2870,8 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
                 StackError::new("logs_failed", format!("no supervisor id was recorded for {service}")).hint("run `stack up`")
             })?;
             let out = mise::legacy_logs(provider.legacy().expect("legacy"), &provider.state_dir, &id, tail, since)?;
-            (out.stdout.lines().map(str::to_string).collect::<Vec<_>>(), out.stdout_truncated)
+            let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
+            (vec![0; lines.len()], lines, out.stdout_truncated, None)
         }
         // Stack's supervisor stamps each line in milliseconds: since the start is exact.
         None => {
@@ -2858,7 +2879,9 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
                 (true, Some(at)) => Some(since.map_or(at, |s| (s * 1000).max(at))),
                 _ => since.map(|s| s * 1000),
             };
-            supervisor::logs(&dir, service, tail, since_ms).map_err(|e| StackError::new("logs_failed", format!("cannot read {service}'s output: {e}")))?
+            let (records, truncated, pos) = supervisor::tail(&dir, service, tail, since_ms).map_err(|e| StackError::new("logs_failed", format!("cannot read {service}'s output: {e}")))?;
+            let (stamps, lines) = records.into_iter().map(|r| (r.at_ms, r.line)).unzip();
+            (stamps, lines, truncated, pos)
         }
     };
     let skip = lines.len().saturating_sub(tail);
@@ -2868,7 +2891,26 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
         truncated,
         started_at,
         since_start,
+        cursor: None,
+        timestamps: None,
+        gap: None,
+        more: false,
+        stamps: stamps[skip..].to_vec(),
+        pos,
     })
+}
+
+/// When Stack last started `service`'s current process (Unix ms), if recorded.
+pub fn started_ms(ctx: &Ctx, service: &str) -> Result<Option<u64>> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    Ok(load(ctx)?.as_ref().and_then(|s| s.services.get(service)).and_then(|r| r.started_at_ms))
+}
+
+/// Whether this checkout's services were started by an older Stack under Pitchfork, which
+/// keeps their output itself (no cursor reads it).
+pub fn legacy_logs(ctx: &Ctx) -> Result<bool> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    Ok(legacy_provider(load(ctx)?.as_ref()).is_some())
 }
 
 /// `unknown_service`, naming the services the project does define.

@@ -559,6 +559,13 @@ output (mise's answer when no release matches) is an error, not a version.
   and nothing after: no session, no stop, no start. It is locked like `up`.
 - **Logs.** A service's stdout and stderr are pipes to its supervisor; one thread per service
   writes its log and rotates it past 16 MiB to one older file, so rotation never races a writer.
+  Pumps hand it records (at most 64 KiB of line plus its stamp) through a queue bounded at 1 MiB
+  per service: a pump waits up to a second for room (backpressure on the service's pipe), then
+  drops and stops waiting until a record fits again; the supervisor's own lines never wait; every
+  drop is counted and noted in the log as a stamped `[stack]` record. A cursor (log file device
+  and inode, byte offset after the last whole record) lets `logs --cursor`, MCP `stack_logs`
+  and `logs --follow` read only what was written since, following one rotation and reporting a
+  `gap` for output rotated away or truncated, with no compile and no re-read window.
   The pipes end with the supervisor: a service that writes after its supervisor died gets
   `SIGPIPE` (or `EPIPE`) and may exit. `logs <service> --tail N` reads the supervisor's
   `logs/<service>.log` (and the one older rotated file), at most its last 1 MiB, never following. `--since-start` keeps lines

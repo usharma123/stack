@@ -16,7 +16,9 @@
 //!   that cleaned up after it), atomically.
 //! - `lock`, held exclusively by the live supervisor, so two never run for one checkout.
 //! - `logs/<service>.log`, each line of the service's output prefixed with when it was read
-//!   (Unix milliseconds), which `stack logs` reads.
+//!   (Unix milliseconds), which `stack logs` reads (see the section on reading logs). One writer
+//!   thread per service writes it, from a queue bounded in bytes ([`LogQueue`]): output that
+//!   finds no room waits briefly, then is dropped and the drop noted in the log.
 //!
 //! A command changes `spec.json` and sends the supervisor `SIGHUP` (bound to the pid and start
 //! time `state.json` records), or starts one when none runs, then waits until `state.json` says
@@ -1027,22 +1029,197 @@ pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
     found
 }
 
-/// The last `tail` lines `service` wrote, oldest first, keeping only lines read at or after
-/// `since` (Unix milliseconds) when given; and whether older output was left unread.
-pub fn logs(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::io::Result<(Vec<String>, bool)> {
-    let path = log_path(dir, service);
+// ---- reading logs ----------------------------------------------------------------------------
+//
+// A log is a sequence of records, each `<unix ms> <line>\n`, written whole by the service's one
+// writer (see [`write_log`]), which renames the file to `<service>.log.1` (replacing the one
+// before) once it passes [`LOG_ROTATE_BYTES`]. A reader names where it got to by a cursor
+// ([`LogPos`]): which file (device and inode, so a rotation or a recreated file is told apart
+// from more output) and the byte offset after the last whole record it read. Reading from a
+// cursor reads only what was written since: the rest of the rotated file if the cursor is in
+// it, then the current one, and says what it could not return ([`Gap`]). Only whole records are
+// returned: one still being written (no newline yet) is left for the next read, except at the
+// end of a rotated file, which no one writes again, where it is returned as it is.
+
+/// One line of a service's output: when the supervisor read it (Unix ms; 0 for a line that
+/// carries no stamp) and the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub at_ms: u64,
+    pub line: String,
+}
+
+impl Record {
+    fn parse(line: &str) -> Record {
+        match line.split_once(' ') {
+            Some((ms, rest)) if !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()) => Record { at_ms: ms.parse().unwrap_or(0), line: rest.to_string() },
+            _ => Record { at_ms: 0, line: line.to_string() },
+        }
+    }
+}
+
+/// Where a reader of one service's log got to: the file (device, inode) and the offset just past
+/// the last whole record read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPos {
+    pub dev: u64,
+    pub ino: u64,
+    pub offset: u64,
+}
+
+/// Output a read from a cursor could not return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gap {
+    /// The file the cursor is in is now shorter than the cursor (it was truncated): what it held
+    /// past the cut is gone, and it is read again from its start. (Stack's writer never
+    /// truncates; a file cut by hand and written past the cursor again cannot be told from one
+    /// that grew.)
+    Truncated,
+    /// The file the cursor was in is no longer kept (rotated out, or removed and recreated):
+    /// output between the cursor and the oldest file kept is gone.
+    Rotated,
+}
+
+/// What a read from a cursor returned.
+#[derive(Debug, Default)]
+pub struct LogRead {
+    pub records: Vec<Record>,
+    /// The cursor just past each record, for a caller that keeps only some of them.
+    pub ends: Vec<LogPos>,
+    /// The cursor after them; `None` when the service has no log yet.
+    pub pos: Option<LogPos>,
+    pub gap: Option<Gap>,
+    /// It stopped at a limit with whole records left: read again from `pos` for them.
+    pub more: bool,
+}
+
+/// A log file, open, with what it was when opened (from the descriptor, so a rotation after the
+/// open changes nothing read).
+struct Opened {
+    file: fs::File,
+    dev: u64,
+    ino: u64,
+    len: u64,
+}
+
+fn open_log(path: &Path) -> Option<Opened> {
+    use std::os::unix::fs::MetadataExt;
+    let file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    Some(Opened { dev: meta.dev(), ino: meta.ino(), len: meta.len(), file })
+}
+
+fn older_log(path: &Path) -> PathBuf {
     let mut older = path.as_os_str().to_owned();
     older.push(".1");
+    PathBuf::from(older)
+}
+
+/// Whole records of `log` from `offset`, at most `max_records` of them in at most `max_bytes`:
+/// the records, the offset after the last, and whether a limit stopped it with whole records
+/// left. `finished` (a rotated file) returns a trailing record without its newline too.
+/// Records with the offset just past each, the offset after the last, and whether a limit
+/// stopped the read with whole records left.
+type Chunk = (Vec<(Record, u64)>, u64, bool);
+
+fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u64, finished: bool) -> std::io::Result<Chunk> {
+    let available = log.len.saturating_sub(offset);
+    let want = available.min(max_bytes);
+    if want == 0 || max_records == 0 {
+        return Ok((Vec::new(), offset, available > 0 && max_records == 0));
+    }
+    log.file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut bytes = Vec::with_capacity(want as usize);
+    (&mut log.file).take(want).read_to_end(&mut bytes)?;
+    let mut records = Vec::new();
+    let mut consumed = 0;
+    while records.len() < max_records {
+        let rest = &bytes[consumed..];
+        let Some(end) = rest.iter().position(|b| *b == b'\n') else {
+            // A record still being written waits for its newline; at the end of a finished file,
+            // or one longer than the read allows (never written by Stack), it is taken as it is.
+            let complete = !rest.is_empty() && ((finished && want == available) || (consumed == 0 && want == max_bytes && want < available));
+            if complete {
+                consumed = bytes.len();
+                records.push((Record::parse(&String::from_utf8_lossy(rest)), offset + consumed as u64));
+            }
+            break;
+        };
+        consumed += end + 1;
+        records.push((Record::parse(&String::from_utf8_lossy(&rest[..end])), offset + consumed as u64));
+    }
+    let next = offset + consumed as u64;
+    let left = log.len - next;
+    // Stopped by a limit with a whole record beyond it (a partial one at the end is not "more").
+    let more = left > 0 && (records.len() == max_records || want < available);
+    Ok((records, next, more))
+}
+
+/// Records of `service`'s log written after `pos`, oldest first, at most `max_records` in at most
+/// `max_bytes` (see the section above).
+pub fn read_after(dir: &Path, service: &str, pos: LogPos, max_records: usize, max_bytes: u64) -> std::io::Result<LogRead> {
+    let path = log_path(dir, service);
+    let (current, older) = (open_log(&path), open_log(&older_log(&path)));
+    let named = |o: &Opened| o.dev == pos.dev && o.ino == pos.ino;
+    // The files to read, oldest first, with whether each is finished, and where to begin.
+    let (files, start, gap): (Vec<(Opened, bool)>, u64, Option<Gap>) = match (current, older) {
+        (Some(c), _) if named(&c) => {
+            let cut = c.len < pos.offset;
+            (vec![(c, false)], if cut { 0 } else { pos.offset }, cut.then_some(Gap::Truncated))
+        }
+        (c, Some(o)) if named(&o) => {
+            let cut = o.len < pos.offset;
+            let start = if cut { 0 } else { pos.offset };
+            (std::iter::once((o, true)).chain(c.map(|c| (c, false))).collect(), start, cut.then_some(Gap::Truncated))
+        }
+        (None, None) => return Ok(LogRead { pos: Some(pos), ..LogRead::default() }),
+        (c, o) => (o.map(|o| (o, true)).into_iter().chain(c.map(|c| (c, false))).collect(), 0, Some(Gap::Rotated)),
+    };
+    let mut read = LogRead { gap, ..LogRead::default() };
+    // Bytes in the files after each one: what is left when a limit stops the read there.
+    let lens: Vec<u64> = files.iter().map(|(log, _)| log.len).collect();
+    let mut budget = max_bytes;
+    for (i, (mut log, finished)) in files.into_iter().enumerate() {
+        let from = if i == 0 { start } else { 0 };
+        let (records, next, more) = records_from(&mut log, from, max_records - read.records.len(), budget, finished)?;
+        budget = budget.saturating_sub(next - from);
+        for (record, end) in records {
+            read.records.push(record);
+            read.ends.push(LogPos { dev: log.dev, ino: log.ino, offset: end });
+        }
+        read.pos = Some(LogPos { dev: log.dev, ino: log.ino, offset: next });
+        let later = lens[i + 1..].iter().sum::<u64>() > 0;
+        // On to the newer file only once this one is read to its end.
+        if more || next < log.len || budget == 0 || read.records.len() == max_records {
+            read.more = more || (later && (finished || next == log.len));
+            break;
+        }
+    }
+    Ok(read)
+}
+
+/// The last `tail` records `service` wrote, oldest first, keeping only those read at or after
+/// `since` (Unix milliseconds) when given; whether older output was left unread; and the cursor
+/// just past the last whole record of the current file (`None` when there is none yet).
+pub fn tail(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::io::Result<(Vec<Record>, bool, Option<LogPos>)> {
+    let path = log_path(dir, service);
     let mut chunks: Vec<(String, bool)> = Vec::new();
     let mut budget = LOGS_LIMIT;
-    for file in [path.clone(), PathBuf::from(older)] {
-        let Ok(mut f) = fs::File::open(&file) else { continue };
-        let len = f.metadata()?.len();
-        let start = len.saturating_sub(budget);
-        f.seek(std::io::SeekFrom::Start(start))?;
+    let mut pos = None;
+    for (n, file) in [path.clone(), older_log(&path)].into_iter().enumerate() {
+        let Some(mut log) = open_log(&file) else { continue };
+        let start = log.len.saturating_sub(budget);
+        log.file.seek(std::io::SeekFrom::Start(start))?;
         let mut bytes = Vec::new();
-        f.take(budget).read_to_end(&mut bytes)?;
+        (&mut log.file).take(budget).read_to_end(&mut bytes)?;
         budget -= bytes.len() as u64;
+        if n == 0 {
+            // The current file: a record still being written is left for the next read.
+            let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            bytes.truncate(whole);
+            pos = Some(LogPos { dev: log.dev, ino: log.ino, offset: start + whole as u64 });
+        }
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
         if start > 0 {
             // Begin at a whole line.
@@ -1054,21 +1231,19 @@ pub fn logs(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::
         }
     }
     let cut = chunks.last().is_some_and(|(_, cut)| *cut) || (budget == 0 && chunks.len() == 1);
-    let mut lines: Vec<String> = Vec::new();
+    let mut records: Vec<Record> = Vec::new();
     for (text, _) in chunks.iter().rev() {
-        for line in text.lines() {
-            let (secs, rest) = match line.split_once(' ') {
-                Some((s, rest)) if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() => (s.parse::<u64>().unwrap_or(0), rest),
-                _ => (0, line),
-            };
-            if since.map_or(true, |at| secs >= at) {
-                lines.push(rest.to_string());
-            }
-        }
+        records.extend(text.lines().map(Record::parse).filter(|r| since.map_or(true, |at| r.at_ms >= at)));
     }
-    let truncated = cut && lines.len() <= tail;
-    let skip = lines.len().saturating_sub(tail);
-    Ok((lines.split_off(skip), truncated))
+    let truncated = cut && records.len() <= tail;
+    let skip = records.len().saturating_sub(tail);
+    Ok((records.split_off(skip), truncated, pos))
+}
+
+/// [`tail`]'s lines alone, and whether older output was left unread.
+pub fn logs(dir: &Path, service: &str, lines: usize, since: Option<u64>) -> std::io::Result<(Vec<String>, bool)> {
+    let (records, truncated, _) = tail(dir, service, lines, since)?;
+    Ok((records.into_iter().map(|r| r.line).collect(), truncated))
 }
 
 // ---- the supervisor ------------------------------------------------------------------------
@@ -1632,7 +1807,7 @@ fn output_pipe() -> std::io::Result<(fs::File, fs::File)> {
     Ok(unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1])) })
 }
 
-fn spawn_service(name: &str, s: &ServiceSpec, log: std::sync::mpsc::Sender<Vec<u8>>) -> std::io::Result<Proc> {
+fn spawn_service(name: &str, s: &ServiceSpec, log: LogSender) -> std::io::Result<Proc> {
     use std::os::unix::process::CommandExt;
     let (program, args) = s.argv.split_first().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no command"))?;
     // Looked up on the service's PATH, not the supervisor's (which is empty).
@@ -1670,11 +1845,145 @@ fn spawn_service(name: &str, s: &ServiceSpec, log: std::sync::mpsc::Sender<Vec<u
     Ok(process)
 }
 
+/// Bytes of records one service's log queue holds at most; past it a pump waits (up to
+/// [`LOG_PUMP_WAIT`]) and the supervisor's own lines do not, and what does not fit is dropped and
+/// counted (see [`LogQueue`]).
+const LOG_QUEUE_BYTES: usize = 1024 * 1024;
+/// The longest record: a line longer than this is stored as several records.
+const LOG_RECORD_BYTES: usize = 64 * 1024;
+/// How long a pump waits for room in its service's queue before it drops a record: the
+/// service's own writes block meanwhile (its pipe fills), as they would on a slow terminal.
+const LOG_PUMP_WAIT: Duration = Duration::from_secs(1);
+
+/// One item of a [`LogQueue`]: a record, or how many records were dropped at that point.
+#[derive(Debug, PartialEq, Eq)]
+enum Queued {
+    Record(Vec<u8>),
+    Dropped { records: u64, bytes: u64 },
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: std::collections::VecDeque<Queued>,
+    /// Bytes of the records in `items`, at most the queue's capacity (a drop marker counts 0).
+    bytes: usize,
+    /// Live [`LogSender`]s: the writer ends once none is left and `items` is empty.
+    senders: usize,
+    /// Senders waiting for room now.
+    waiting: usize,
+}
+
+/// The records waiting for one service's log writer: at most `capacity` bytes, in chunks of at
+/// most [`LOG_RECORD_BYTES`] and a timestamp, so neither a flood of output nor a stalled disk
+/// grows the supervisor without bound. A record that finds no room within its wait is dropped,
+/// and the drop is queued in its place (consecutive drops merged), for the writer to note in
+/// the log: nothing is lost silently.
+struct LogQueue {
+    capacity: usize,
+    state: std::sync::Mutex<QueueState>,
+    /// Signalled when records are taken (room) and when records or the last sender's end
+    /// arrive (work).
+    room: std::sync::Condvar,
+    work: std::sync::Condvar,
+}
+
+impl LogQueue {
+    fn new(capacity: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { capacity, state: Default::default(), room: Default::default(), work: Default::default() })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue `record`, waiting up to `wait` for room; `false` when it was dropped.
+    fn push(&self, record: Vec<u8>, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        let mut state = self.lock();
+        // A record larger than the queue (never one of ours) is taken once the queue is empty.
+        while state.bytes > 0 && state.bytes + record.len() > self.capacity {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                let bytes = record.len() as u64;
+                match state.items.back_mut() {
+                    Some(Queued::Dropped { records: r, bytes: b }) => {
+                        *r += 1;
+                        *b += bytes;
+                    }
+                    _ => state.items.push_back(Queued::Dropped { records: 1, bytes }),
+                }
+                self.work.notify_one();
+                return false;
+            };
+            state.waiting += 1;
+            state = self.room.wait_timeout(state, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            state.waiting -= 1;
+        }
+        state.bytes += record.len();
+        state.items.push_back(Queued::Record(record));
+        self.work.notify_one();
+        true
+    }
+
+    /// The next item, waiting for one; `None` once every sender is gone and nothing is left.
+    fn pop(&self) -> Option<Queued> {
+        let mut state = self.lock();
+        loop {
+            if let Some(item) = state.items.pop_front() {
+                if let Queued::Record(r) = &item {
+                    state.bytes -= r.len();
+                    self.room.notify_all();
+                }
+                return Some(item);
+            }
+            if state.senders == 0 {
+                return None;
+            }
+            state = self.work.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Senders waiting for room now.
+    #[cfg(test)]
+    fn room_waiters(&self) -> usize {
+        self.lock().waiting
+    }
+
+    fn sender(self: &std::sync::Arc<Self>) -> LogSender {
+        self.lock().senders += 1;
+        LogSender(self.clone())
+    }
+}
+
+/// A producer of one service's log records: a pump, or the supervisor itself.
+struct LogSender(std::sync::Arc<LogQueue>);
+
+impl Clone for LogSender {
+    fn clone(&self) -> Self {
+        self.0.sender()
+    }
+}
+
+impl Drop for LogSender {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.senders -= 1;
+        if state.senders == 0 {
+            self.0.work.notify_all();
+        }
+    }
+}
+
+impl LogSender {
+    fn send(&self, record: Vec<u8>, wait: Duration) -> bool {
+        self.0.push(record, wait)
+    }
+}
+
 /// One writer per service log, for the supervisor's life: every process of the service (old
-/// generations still draining included) sends its lines here, so only one thread writes the
+/// generations still draining included) queues its records here, so only one thread writes the
 /// file and rotates it.
 struct LogWriters {
-    senders: IndexMap<String, std::sync::mpsc::Sender<Vec<u8>>>,
+    senders: IndexMap<String, LogSender>,
     done_tx: std::sync::mpsc::Sender<()>,
     done_rx: std::sync::mpsc::Receiver<()>,
     spawned: usize,
@@ -1688,27 +1997,29 @@ impl Default for LogWriters {
 }
 
 impl LogWriters {
-    fn sender(&mut self, dir: &Path, service: &str) -> std::sync::mpsc::Sender<Vec<u8>> {
+    fn sender(&mut self, dir: &Path, service: &str) -> LogSender {
         let done = self.done_tx.clone();
         let spawned = &mut self.spawned;
         self.senders
             .entry(service.to_string())
             .or_insert_with(|| {
-                let (send, receive) = std::sync::mpsc::channel::<Vec<u8>>();
+                let queue = LogQueue::new(LOG_QUEUE_BYTES);
+                let sender = queue.sender();
                 let path = log_path(dir, service);
                 *spawned += 1;
                 std::thread::spawn(move || {
-                    write_log(receive, &path);
+                    write_log(&queue, &path);
                     let _ = done.send(());
                 });
-                send
+                sender
             })
             .clone()
     }
 
-    /// A line of the supervisor's own about `service`, in its log.
+    /// A line of the supervisor's own about `service`, in its log. Never waits: the
+    /// supervisor's loop must stay responsive, so a full queue drops it (and counts it).
     fn line(&mut self, dir: &Path, service: &str, line: &str) {
-        let _ = self.sender(dir, service).send(format!("{} {line}\n", now_ms()).into_bytes());
+        self.sender(dir, service).send(format!("{} {line}\n", now_ms()).into_bytes(), Duration::ZERO);
     }
 
     /// Close the supervisor's senders and wait up to `bound` for every writer thread to finish
@@ -1729,14 +2040,18 @@ impl LogWriters {
     }
 }
 
-/// Copy a service's output to its log writer, each line prefixed with when it was read (Unix
-/// ms). Ends when every process of the service closed its output.
-fn pump(reader: fs::File, log: std::sync::mpsc::Sender<Vec<u8>>) {
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
+/// Copy a service's output to its log, one record per line: the line prefixed with when it was
+/// read (Unix ms) and a space. A line longer than [`LOG_RECORD_BYTES`] becomes several records,
+/// and output that ends without a newline (the process exited mid-line) is completed with one,
+/// so the log holds only whole records. Ends when every process of the service closed its
+/// output.
+fn pump(reader: fs::File, log: LogSender) {
+    let mut reader = std::io::BufReader::with_capacity(LOG_RECORD_BYTES, reader);
     let mut line = Vec::new();
+    let mut dropping = false;
     loop {
         line.clear();
-        match reader.by_ref().take(64 * 1024).read_until(b'\n', &mut line) {
+        match reader.by_ref().take(LOG_RECORD_BYTES as u64).read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
@@ -1745,28 +2060,67 @@ fn pump(reader: fs::File, log: std::sync::mpsc::Sender<Vec<u8>>) {
         }
         let mut out = format!("{} ", now_ms()).into_bytes();
         out.extend_from_slice(&line);
-        if log.send(out).is_err() {
-            return;
-        }
+        // A record that finds no room is counted by the queue. Once one is dropped the pump
+        // stops waiting until a record fits again, so a stalled writer blocks the service's
+        // output once, for the wait, not for every line.
+        dropping = !log.send(out, if dropping { Duration::ZERO } else { LOG_PUMP_WAIT });
     }
 }
 
-/// The only writer of one service's log: appends what pumps send, and rotates the file (one
-/// older file kept) once it passes [`LOG_ROTATE_BYTES`].
-fn write_log(receive: std::sync::mpsc::Receiver<Vec<u8>>, log: &Path) {
+/// The record noting `records` records (`bytes` bytes) the queue dropped at this point.
+fn dropped_note(records: u64, bytes: u64) -> Vec<u8> {
+    format!("{} [stack] {records} line(s) of output ({bytes} bytes) dropped: the log writer fell behind\n", now_ms()).into_bytes()
+}
+
+/// The only writer of one service's log: appends what the queue holds, notes what it dropped,
+/// and rotates the file (one older file kept) once it passes [`LOG_ROTATE_BYTES`]. A file that
+/// cannot be opened or written still has its queue drained, so no producer waits on it; what
+/// could not be written is counted and noted once a write succeeds again.
+fn write_log(queue: &LogQueue, log: &Path) {
     let open = |log: &Path| fs::OpenOptions::new().create(true).append(true).open(log);
     let mut file = open(log).ok();
-    for chunk in receive {
-        let Some(f) = file.as_mut() else {
-            file = open(log).ok();
-            continue;
+    // Records (and bytes) dropped by the queue or lost to a failed write, not yet noted.
+    let mut lost = (0u64, 0u64);
+    while let Some(item) = queue.pop() {
+        let chunk = match item {
+            Queued::Record(r) => r,
+            Queued::Dropped { records, bytes } => {
+                lost = (lost.0 + records, lost.1 + bytes);
+                continue;
+            }
         };
-        let _ = f.write_all(&chunk);
+        if file.is_none() {
+            file = open(log).ok();
+        }
+        let record_len = chunk.len() as u64;
+        let mut chunk = chunk;
+        if lost.0 > 0 {
+            let mut noted = dropped_note(lost.0, lost.1);
+            noted.extend_from_slice(&chunk);
+            chunk = noted;
+        }
+        let written = file.as_mut().is_some_and(|f| f.write_all(&chunk).is_ok());
+        if !written {
+            file = None;
+            lost = (lost.0 + 1, lost.1 + record_len);
+            continue;
+        }
+        lost = (0, 0);
+        let Some(f) = file.as_mut() else { continue };
         if f.metadata().is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
             let mut older = log.as_os_str().to_owned();
             older.push(".1");
             let _ = fs::rename(log, PathBuf::from(older));
             file = open(log).ok();
+        }
+    }
+    // Drops after the last record: noted before the writer ends.
+    if lost.0 > 0 {
+        if file.is_none() {
+            file = open(log).ok();
+        }
+        if let Some(f) = file.as_mut() {
+            let _ = f.write_all(&dropped_note(lost.0, lost.1));
         }
     }
 }
@@ -2494,5 +2848,198 @@ mod tests {
         assert_eq!(logs(dir.path(), "db", 2, None).unwrap(), (vec!["three".to_string(), "stray".to_string()], false));
         assert_eq!(logs(dir.path(), "db", 10, Some(200)).unwrap().0, vec!["two", "three"]);
         assert!(logs(dir.path(), "none", 10, None).unwrap().0.is_empty());
+    }
+
+    fn items(q: &LogQueue) -> Vec<Queued> {
+        let mut out = Vec::new();
+        let mut state = q.lock();
+        while let Some(item) = state.items.pop_front() {
+            out.push(item);
+        }
+        state.bytes = 0;
+        out
+    }
+
+    #[test]
+    fn a_log_queue_holds_bounded_bytes_and_counts_what_it_drops() {
+        let q = LogQueue::new(10);
+        let s = q.sender();
+        assert!(s.send(b"aaaaaa".to_vec(), Duration::ZERO));
+        // No room: dropped at once (the supervisor's own lines never wait), and counted.
+        assert!(!s.send(b"bbbbbb".to_vec(), Duration::ZERO));
+        assert!(s.send(b"ccc".to_vec(), Duration::ZERO), "a record that fits is taken");
+        assert!(!s.send(b"dd".to_vec(), Duration::ZERO));
+        assert!(!s.send(b"eee".to_vec(), Duration::ZERO), "consecutive drops are one marker");
+        assert!(s.send(b"f".to_vec(), Duration::ZERO));
+        assert_eq!(q.lock().bytes, 10, "never more than the capacity");
+        assert_eq!(
+            items(&q),
+            [
+                Queued::Record(b"aaaaaa".to_vec()),
+                Queued::Dropped { records: 1, bytes: 6 },
+                Queued::Record(b"ccc".to_vec()),
+                Queued::Dropped { records: 2, bytes: 5 },
+                Queued::Record(b"f".to_vec()),
+            ]
+        );
+        // The writer's end: once every sender is gone and nothing is left.
+        let other = s.clone();
+        drop(s);
+        assert!(other.send(b"g".to_vec(), Duration::ZERO));
+        drop(other);
+        assert_eq!(q.pop(), Some(Queued::Record(b"g".to_vec())));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn a_waiting_pump_gets_room_as_the_writer_drains() {
+        let q = LogQueue::new(10);
+        let s = q.sender();
+        assert!(s.send(vec![b'x'; 8], Duration::ZERO));
+        let waiting = {
+            let s = s.clone();
+            std::thread::spawn(move || s.send(vec![b'y'; 8], Duration::from_secs(30)))
+        };
+        // The pump waits (backpressure) rather than dropping while the writer catches up.
+        while q.room_waiters() == 0 {
+            std::thread::yield_now();
+        }
+        assert_eq!(q.pop(), Some(Queued::Record(vec![b'x'; 8])));
+        assert!(waiting.join().unwrap(), "taken once there was room");
+        assert_eq!(q.pop(), Some(Queued::Record(vec![b'y'; 8])));
+        // Past its wait it drops instead, so a stalled writer never stalls the pump for longer.
+        assert!(s.send(vec![b'z'; 8], Duration::ZERO));
+        let started = Instant::now();
+        assert!(!s.send(vec![b'w'; 8], Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_writer_notes_dropped_output_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.log");
+        let q = LogQueue::new(32);
+        let s = q.sender();
+        assert!(s.send(b"1 first\n".to_vec(), Duration::ZERO));
+        assert!(s.send(b"1 ................\n".to_vec(), Duration::ZERO));
+        assert!(!s.send(b"2 lost one\n".to_vec(), Duration::ZERO));
+        drop(s);
+        write_log(&q, &path);
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "1 first");
+        assert!(lines[2].ends_with(" [stack] 1 line(s) of output (11 bytes) dropped: the log writer fell behind"), "{text}");
+        assert!(lines[2].split(' ').next().unwrap().parse::<u64>().is_ok(), "the note is a stamped record: {text}");
+    }
+
+    #[test]
+    fn a_long_line_is_stored_as_bounded_records_and_a_last_partial_line_completed() {
+        let (reader, mut writer) = output_pipe().unwrap();
+        let q = LogQueue::new(LOG_QUEUE_BYTES);
+        let pumping = {
+            let s = q.sender();
+            std::thread::spawn(move || pump(reader, s))
+        };
+        let long = vec![b'a'; LOG_RECORD_BYTES + 10];
+        writer.write_all(&long).unwrap();
+        writer.write_all(b"\nend without newline").unwrap();
+        drop(writer);
+        pumping.join().unwrap();
+        let records: Vec<Vec<u8>> = std::iter::from_fn(|| q.pop()).map(|i| match i {
+            Queued::Record(r) => r,
+            other => panic!("{other:?}"),
+        }).collect();
+        assert_eq!(records.len(), 3, "the long line in two records, then the partial one");
+        assert!(records.iter().all(|r| r.len() <= LOG_RECORD_BYTES + 20 && r.ends_with(b"\n")));
+        let body = |r: &[u8]| r.splitn(2, |b| *b == b' ').nth(1).unwrap().to_vec();
+        assert_eq!(body(&records[0]).len(), LOG_RECORD_BYTES + 1);
+        assert_eq!(body(&records[1]), b"aaaaaaaaaa\n");
+        assert_eq!(body(&records[2]), b"end without newline\n");
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn lines(read: &LogRead) -> Vec<(u64, &str)> {
+        read.records.iter().map(|r| (r.at_ms, r.line.as_str())).collect()
+    }
+
+    #[test]
+    fn a_cursor_returns_each_record_once_with_its_stamp_repeats_included() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        append(&path, "100 same\n200 same\n300 part");
+        // A tail leaves a record still being written for the next read.
+        let (records, _, pos) = tail(dir.path(), "db", 10, None).unwrap();
+        assert_eq!(records.iter().map(|r| (r.at_ms, r.line.as_str())).collect::<Vec<_>>(), [(100, "same"), (200, "same")]);
+        let pos = pos.unwrap();
+        assert_eq!(pos.offset, 18);
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert!(read.records.is_empty() && read.pos == Some(pos) && read.gap.is_none() && !read.more);
+        append(&path, "ial\n400 same\nunstamped\n");
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert_eq!(lines(&read), [(300, "partial"), (400, "same"), (0, "unstamped")]);
+        // Nothing new: nothing read again.
+        let again = read_after(dir.path(), "db", read.pos.unwrap(), 100, LOGS_LIMIT).unwrap();
+        assert!(again.records.is_empty() && again.pos == read.pos);
+        // Limits: a record count and a byte count, each resumed from where it stopped.
+        append(&path, "500 a\n600 b\n700 c\n");
+        let first = read_after(dir.path(), "db", read.pos.unwrap(), 2, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&first), first.more), (vec![(500, "a"), (600, "b")], true));
+        let rest = read_after(dir.path(), "db", first.pos.unwrap(), 2, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&rest), rest.more), (vec![(700, "c")], false));
+        let bytes = read_after(dir.path(), "db", read.pos.unwrap(), 100, 8).unwrap();
+        assert_eq!((lines(&bytes), bytes.more), (vec![(500, "a")], true));
+    }
+
+    #[test]
+    fn a_cursor_follows_a_rotation_and_reports_what_it_could_not_return() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        let older = older_log(&path);
+        append(&path, "100 a\n");
+        let (_, _, pos) = tail(dir.path(), "db", 10, None).unwrap();
+        let pos = pos.unwrap();
+        // Rotated once: the rest of the old file, then the new one.
+        append(&path, "200 b\n");
+        fs::rename(&path, &older).unwrap();
+        append(&path, "300 c\n");
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(200, "b"), (300, "c")], None));
+        let at_c = read.pos.unwrap();
+        // A limit inside the rotated file resumes in it.
+        let one = read_after(dir.path(), "db", pos, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&one), one.more), (vec![(200, "b")], true));
+        let next = read_after(dir.path(), "db", one.pos.unwrap(), 1, LOGS_LIMIT).unwrap();
+        assert_eq!(lines(&next), [(300, "c")]);
+        // Rotated twice since: what was between is gone, and said so.
+        fs::rename(&path, &older).unwrap();
+        append(&path, "400 d\n");
+        fs::rename(&path, &older).unwrap();
+        append(&path, "500 e\n");
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(400, "d"), (500, "e")], Some(Gap::Rotated)));
+        // A rotated file cut mid-record (a crash) gives that record as it is.
+        let cursor = read.pos.unwrap();
+        append(&path, "600 cut");
+        fs::rename(&path, &older).unwrap();
+        append(&path, "700 f\n");
+        let read = read_after(dir.path(), "db", cursor, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(600, "cut"), (700, "f")], None));
+        // Truncated under the cursor: read again from its start.
+        let cursor = read.pos.unwrap();
+        fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+        append(&path, "8 g\n");
+        let read = read_after(dir.path(), "db", cursor, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(8, "g")], Some(Gap::Truncated)));
+        // No log at all: nothing, and the cursor kept.
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&older).unwrap();
+        let read = read_after(dir.path(), "db", at_c, 100, LOGS_LIMIT).unwrap();
+        assert!(read.records.is_empty() && read.pos == Some(at_c) && read.gap.is_none());
     }
 }

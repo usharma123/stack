@@ -404,12 +404,34 @@ single-service result.
 - `--since 10m` keeps only output from the last 10 minutes.
 - `--grep TEXT` keeps lines containing `TEXT` (a plain substring, not a regex); `-i` ignores
   case. `--tail` then counts matching lines, out of the last 10000.
-- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. Stack
-  reads the log again every second. Not with `--json`, and not over MCP.
+- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. Every
+  second Stack reads what each log gained since the last read (and nothing else: no window is
+  read again and nothing is compiled), so every line is printed once, repeated lines included;
+  output a rotation or truncation took before it was read is said on stderr. Not with `--json`;
+  use `--cursor` there.
+- `--cursor CURSOR` (with `--json`; MCP `stack_logs` takes `cursor`) reads only what was written
+  after the position a previous result gave. Every result carries `cursor` (one per service, and
+  one for all of them in a several-service result); pass it back, or `""` to begin. A cursor read
+  returns each line once, repeated lines included, adds `timestamps` (when the supervisor read
+  each line, Unix milliseconds, 0 for a line it did not stamp), caps the lines per read at
+  `--tail` (`more: true` says to read again), and reports `gap: "rotated"` or `gap: "truncated"`
+  when output was lost between the cursor and what is kept. It compiles nothing and reads only
+  the new bytes (at most 1 MiB per read). The cursor names the log file (device and inode) and
+  the byte offset after the last whole line read, so a rotation is followed into the new file.
+  A line still being written is left for the next read. A cursor of several services reads those
+  services, a service with no log yet included (its output appears once it has some); a service
+  added to the project since needs a new cursor. Services an older Stack started under Pitchfork
+  have no cursor reads until the next `up`.
 
 The output is read from `logs/<service>.log` in the checkout's supervisor directory (see
 [worktrees](worktrees.md#services-and-the-supervisor)); no process is started for it. Each log is
-rotated at 16 MiB, one older file kept; at most the last 1 MiB is read. For services an older
+rotated at 16 MiB, one older file kept; at most the last 1 MiB is read. Each line is one record,
+stamped with the millisecond the supervisor read it; a line longer than 64 KiB is stored as
+several records, and output that ends without a newline is completed with one. The supervisor
+holds at most 1 MiB of each service's output it has not written yet: a service's output waits
+for room for up to a second (its writes block meanwhile, as on a slow terminal), then is
+dropped, and the log says so (`[stack] N line(s) of output (B bytes) dropped`); the supervisor's
+own lines never wait. For services an older
 Stack started under Pitchfork, `logs` asks Pitchfork (`pitchfork logs`) until the next `up`.
 `unknown_service` lists the project's services; `logs_failed` means the output could not be read
 (or the service never started in this checkout).
