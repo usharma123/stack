@@ -3429,8 +3429,7 @@ fn a_declared_readiness_check_holds_the_start_until_it_passes() {
     let env = fs::read(fixture.dir.path().join("env.json")).unwrap();
     let no_shell = fixture.dir.path().join("no-shell");
     fs::create_dir(&no_shell).unwrap();
-    let python_dir = Path::new(&python::python()).parent().unwrap().to_path_buf();
-    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": format!("{}:{}", no_shell.display(), python_dir.display()) }).to_string()).unwrap();
+    fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": no_shell }).to_string()).unwrap();
     let result = json_result(&fixture.command(&["up", "--timeout", "5s", "--json"]).output().unwrap());
     assert_eq!(result["error"]["code"], "timed_out", "{result}");
     let hint = result["error"]["hint"].as_str().unwrap();
@@ -6702,7 +6701,23 @@ fn a_snapshot_is_never_restored_under_a_server_a_dead_supervisor_left_running() 
     fixture.ok(&["snapshot", "save", "base"]);
     fs::write(data.join("rows"), "after").unwrap();
     let server = fixture.session()["services"]["web"]["pid"].as_u64().unwrap() as u32;
+    // On Linux, PR_SET_PDEATHSIG delivers the service's stop signal when the supervisor dies;
+    // let the stand-in ignore that one signal so this test exercises a server that survived.
+    #[cfg(target_os = "linux")]
+    let keep = {
+        let p = fixture.dir.path().join("ignore-one-signal");
+        fs::write(&p, "").unwrap();
+        p
+    };
     fixture.kill_supervisor();
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while keep.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(&keep);
+    }
     fixture.remove_session_records();
     let out = fixture.command(&["snapshot", "restore", "base", "--json"]).output().unwrap();
     assert!(!out.status.success(), "{}", json_result(&out));

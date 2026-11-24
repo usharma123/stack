@@ -19,6 +19,11 @@ const LISTENER: &str = r#"import os, signal, socket, struct, sys, threading
 kind, port, data = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 record = os.path.join(os.environ["REVIEW_FIXTURE"], "%s-%d" % (kind, port))
 def stop(*_):
+    try:
+        os.remove(os.path.join(os.environ["REVIEW_FIXTURE"], "ignore-one-signal"))
+        return
+    except FileNotFoundError:
+        pass
     try: os.remove(record)
     except FileNotFoundError: pass
     os._exit(0)

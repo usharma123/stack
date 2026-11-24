@@ -1239,8 +1239,11 @@ fn forget_unrecorded_removes_only_unrecorded_entries() {
     let holder = reaper.pid(pid_in(&pidfile));
     let file = registry(&fixture, &fixture.path("app"));
     let mut entries: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
     entries.as_array_mut().unwrap().push(json!({ "id": "lost", "started_by": "exec", "program": "lost", "registered_at_ms": 0,
-        "coordinator": { "pid": 1, "started": 1, "boot": stack::procinfo::boot_id() } }));
+        "coordinator": { "pid": dead_pid, "started": u64::MAX, "boot": stack::procinfo::boot_id() } }));
     fs::write(&file, entries.to_string()).unwrap();
     let (_, status) = fixture.json(&["status"]);
     naming(&status["data"]["commands"], holder);
