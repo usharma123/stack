@@ -715,11 +715,10 @@ fn dir_at(path: &Path) -> Option<[u64; 2]> {
 }
 
 /// Remove the directory at `path` if it is `identity`: a copy this restore made, never
-/// anything else. Never across a mount inside it.
+/// anything else (checked on the directory held open, reached with no link followed). Never
+/// across a mount inside it.
 fn discard(path: &Path, identity: [u64; 2]) {
-    if dir_at(path) == Some(identity) {
-        let _ = datadirs::remove_tree(path);
-    }
+    let _ = datadirs::remove_tree(path, identity);
 }
 
 fn rename(from: &Path, to: &Path) -> std::result::Result<(), String> {
@@ -981,7 +980,7 @@ fn commit(state: &Path, root: &Path, journal: &Journal, how: &[&str]) -> Result<
     for swap in &journal.swaps {
         let Some(old) = swap.old else { continue };
         let Some(at) = [&swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(old)) else { continue };
-        if let Err(e) = datadirs::remove_tree(at) {
+        if let Err(e) = datadirs::remove_tree(at, old) {
             kept.push(json!({ "service": swap.service, "old_data_kept": at, "why": e.to_string() }));
         }
     }

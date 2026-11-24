@@ -7902,6 +7902,9 @@ mod native_records {
                 let bind = st.st_ino as u64 == self.0;
                 Ok(if bind { crate::datadirs::imp_boundary::Mount { id: Some(real.id.unwrap_or(0) + 1000), ..real } } else { real })
             }
+            fn entry_mount(&self, fd: &std::os::fd::OwnedFd, name: &std::ffi::CStr, st: &libc::stat) -> std::io::Result<crate::datadirs::imp_boundary::Mount> {
+                crate::datadirs::imp_boundary::Kernel.entry_mount(fd, name, st)
+            }
         }
         let (outcome, done) = reclaim_data_with(&entry, true, |held| held.remove_within(Some(MARKER_SUFFIX), &Bind(mounted)));
         assert!(outcome.contains("could not be removed") && outcome.contains("mounted inside it is a mount point"), "{outcome}");

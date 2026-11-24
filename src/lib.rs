@@ -24,6 +24,7 @@ pub mod lock;
 pub mod logs;
 pub mod manifest;
 pub mod mcp;
+pub mod mounts;
 pub mod oci;
 pub mod pgtemplate;
 pub mod ports;
