@@ -158,8 +158,13 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
   then records each swap, and each data directory, held open and checked as `up` recorded it
   and on its parent's mount, is exchanged with its copy in one step
   (`renameatx_np`/`renameat2`; two renames where the filesystem has no exchange). The old data
-  is kept until every service's copy is in place; only then are the init markers written (in
-  one write), the record bound to the new directories and the old data removed.
+  is kept until every service's copy is in place; only then, once the checkout is shown to be
+  the one that restored and each copy and record to be as the restore left them, are the init
+  markers written (in one write), the record bound to the new directories and the old data
+  removed. Otherwise the journal and the old data stay (`restore_incomplete`, the services that
+  no longer match listed as `manual_recovery`). The snapshot is read again under the store's
+  lock once its services are stopped: one replaced meanwhile (a `save --force` from another
+  checkout) is refused with `snapshot_failed` before anything is replaced.
 - **A failed restore says what it changed.** A swap that fails puts back every service it
   replaced, judged by which directory is where: the error (`snapshot_failed`) lists each
   service as `unchanged` or `rolled_back`, and nothing is recorded as restored. A service that
@@ -171,7 +176,10 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
 - **An interrupted restore is finished before anything else touches the data.** The next
   `snapshot save`, `snapshot restore` or `up` of the checkout (its `recover_restore` step)
   undoes a restore interrupted before every copy was in place, and records one interrupted
-  after, provided its services are confirmed stopped.
+  after, provided every service its journal names is confirmed stopped, whichever services
+  the command named: `snapshot save` and `restore` stop those too, and a journaled service
+  `stack.toml` no longer defines must already be shown not to run (`stop_unconfirmed`
+  otherwise). `restart` refuses with `restore_incomplete` while such a journal exists.
 - **Saving publishes whole.** `save` builds the snapshot in a staging directory of the store
   and writes its `meta.json` last. `save --force` then exchanges it with the published
   snapshot in one step where the filesystem can (`renameatx_np`/`renameat2`; the step reports
@@ -179,7 +187,10 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
   renamed aside (`.old-<name>-…`) first (`publish: rename`). If Stack is interrupted between the
   two renames, `snapshot list`, `restore` and `up --from-snapshot` read the generation set
   aside, and the next snapshot operation moves it back before it removes any staging directory.
-  A staging directory whose owning process still runs is never removed.
+  A generation counts only when its `meta.json` parses and names it, so damaged metadata at the
+  name never hides, or has removed, a valid generation set aside; a read or rename that fails
+  is reported, with what was set aside kept. A staging directory whose owning process still
+  runs is never removed.
 - **Compatibility.** A snapshot records each service's preset and the exact release
   `stack.lock` pinned. Restoring into a different preset or major version fails with
   `snapshot_incompatible` before anything stops.
@@ -297,7 +308,7 @@ Stack's state directory, or on a filesystem that cannot clone, is made by `initd
 | `snapshot_incompatible` | The snapshot's preset or major version differs from this checkout's |
 | `snapshot_unsupported` | A service that is not a postgres or redis preset, or data holding links or special files |
 | `snapshot_failed` | The supervisor reports no data directory, Stack has no record of it for this checkout, it is not the recorded directory or lacks this checkout's marker, or a service has no data yet (run `stack up`); or a restore failed and every service was put back (details list each as `unchanged` or `rolled_back`) |
-| `restore_incomplete` | A restore could not put every service back, could not be recorded, or was interrupted and cannot be undone; details list each service (`manual_recovery` with `old_data`), its services stay stopped, and `up` refuses until it is resolved |
+| `restore_incomplete` | A restore could not put every service back, could not be recorded, or was interrupted and cannot be undone; details list each service (`manual_recovery` with `old_data`), its services stay stopped, and `up` and `restart` refuse until it is resolved |
 | `stop_unconfirmed` | A service could not be confirmed stopped; nothing was copied |
 
 [All docs](../README.md)
