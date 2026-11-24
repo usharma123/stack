@@ -1889,6 +1889,35 @@ mod tests {
         assert_eq!(check_same(&chosen, &now, &[]).unwrap_err().code, "stop_unconfirmed");
     }
 
+    /// SnapshotAtomicity's RestoreSwap/RestoreSwap2 interleaved with CommandKilled: a restore
+    /// killed between the two renames of a swap where the filesystem has no exchange (its data
+    /// directory set aside, the copy not yet in place) is undone by the next recovery from
+    /// where each directory is, with nothing lost and nothing recorded as restored.
+    #[test]
+    fn a_restore_killed_between_the_two_renames_of_a_swap_is_undone_from_where_each_directory_is() {
+        datadirs::NO_EXCHANGE.with(|c| c.set(true));
+        let r = Restore::new(&["db", "cache"], true);
+        let before = r.identities();
+        inject(None, None, Some(1), false);
+        assert!(r.run().is_err());
+        inject(None, None, None, false);
+        // The first rename of the cache's swap, as `Held::swap_in` makes it, then the kill.
+        let journal = r.journal().unwrap();
+        assert_eq!(journal.phase, "swapping");
+        let cache = journal.swaps.iter().find(|s| s.service == "cache").unwrap();
+        fs::rename(&cache.target, &cache.aside).unwrap();
+        assert_eq!(r.contents(), ["new-db", "-"]);
+        assert_eq!(refuse_pending(&r.ctx.state, &r.ctx.root, "restart").unwrap_err().code, "restore_incomplete");
+        let recovered = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
+        assert_eq!(recovered["interrupted_restore"], "rolled_back", "{recovered}");
+        let outcomes: Vec<&str> = recovered["services"].as_array().unwrap().iter().map(|s| s["outcome"].as_str().unwrap()).collect();
+        assert_eq!(outcomes, ["rolled_back", "rolled_back"]);
+        assert_eq!(r.contents(), ["old-db", "old-cache"]);
+        assert_eq!(r.identities(), before);
+        assert!(r.leftovers().is_empty() && r.journal().is_none() && r.markers().is_empty(), "{:?}", r.leftovers());
+    }
+
     #[test]
     fn undoing_a_swap_reads_where_each_directory_is() {
         let dir = tempfile::tempdir().unwrap();

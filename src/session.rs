@@ -8152,4 +8152,91 @@ mod native_records {
         let gone = crate::datadirs::Supervisor { state_dir: empty.path().into(), ..record };
         assert!(service_stopped(&gone).is_ok());
     }
+
+    /// Supervisor records Stack cannot read: one a newer Stack wrote, and one damaged in place.
+    fn unreadable_states() -> [(&'static str, Vec<u8>); 2] {
+        [("newer", br#"{"schema_version": 99, "services": {}}"#.to_vec()), ("damaged", b"{\"services\": {".to_vec())]
+    }
+
+    /// The data-removal check of `down --purge` and `gc --reclaim-data` (SessionLifecycle's
+    /// RmCheck): a supervisor record that cannot be read is never taken for one saying the
+    /// service stopped, so the data is kept, with its record, and nothing is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_data_record_whose_supervisor_record_cannot_be_read_is_never_confirmed_stopped() {
+        for (kind, bytes) in unreadable_states() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sup = tmp.path().join("supervisor");
+            fs::create_dir_all(&sup).unwrap();
+            fs::write(sup.join("state.json"), &bytes).unwrap();
+            let dir = tmp.path().join("data/pg");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("rows"), b"keep").unwrap();
+            fs::write(data_marker(&dir), json!({ "checkout": "t-unread" }).to_string()).unwrap();
+            let (location, identity) = crate::datadirs::locate(&dir);
+            let record = crate::datadirs::Supervisor { pitchfork: None, state_dir: sup.clone(), id: "pg".into() };
+            let why = service_stopped(&record).unwrap_err();
+            assert!(why.contains("could not be confirmed stopped") && why.contains("cannot be read"), "{kind}: {why}");
+            let entry = crate::datadirs::Entry {
+                project: tmp.path().join("gone"),
+                service: "pg".into(),
+                dir: dir.clone(),
+                checkout: "t-unread".into(),
+                supervisor: Some(record),
+                location,
+                identity,
+                project_at: Default::default(),
+            };
+            let (outcome, done) = reclaim_data_with(&entry, true, |_| panic!("{kind}: data removed on an unreadable record"));
+            assert!(outcome.contains("data kept") && !done, "{kind}: {outcome}");
+            assert_eq!(fs::read(dir.join("rows")).unwrap(), b"keep", "{kind}");
+            assert_eq!(fs::read(sup.join("state.json")).unwrap(), bytes, "{kind}: the record was written over");
+        }
+    }
+
+    /// GC of a deleted checkout (SessionLifecycle's GcGone): while its supervisor record cannot
+    /// be read, nothing is taken for stopped and the session record is kept, as is the
+    /// supervisor's; once the record reads as nothing running, the session is reclaimed.
+    #[test]
+    fn a_deleted_checkouts_session_is_kept_while_its_supervisor_record_cannot_be_read() {
+        for (kind, bytes) in unreadable_states() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join("state");
+            let root = tmp.path().join("vol").join("app");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
+            let here = crate::checkout::Recorded::of(&root);
+            assert!(here.location.is_some(), "a temporary directory's mount can be learned");
+            let sup = supervisor::dir(&state, &root);
+            fs::create_dir_all(&sup).unwrap();
+            fs::write(sup.join("state.json"), &bytes).unwrap();
+            let session = Session {
+                id: "s1".into(),
+                project: root.clone(),
+                project_dir_id: dir_id(&root),
+                project_dir_created: dir_created(&root),
+                project_location: here.location.clone(),
+                provider: Some(ProviderRecord::native(sup.clone())),
+                services: [("web".to_string(), ServiceRecord { port: 0, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 1, started_at_ms: None, provider_id: None })].into_iter().collect(),
+                ..Session::default()
+            };
+            write_json(&index_path(&state, &root), &session).unwrap();
+            fs::remove_dir_all(&root).unwrap();
+            assert_eq!(checkout_state(&session), CheckoutState::Gone("project directory deleted"), "{kind}");
+
+            let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+            let entry = pass.reclaimed.iter().find(|e| e.project == root).unwrap_or_else(|| panic!("{kind}: {pass:?}"));
+            assert!(!entry.stopped && entry.error.as_deref().is_some_and(|e| e.contains("cannot be read")), "{kind}: {entry:?}");
+            assert!(index_path(&state, &root).exists(), "{kind}: the session record is kept");
+            assert_eq!(gc_checked(&state, true, false).unwrap_err().code, "gc_incomplete", "{kind}");
+            assert!(index_path(&state, &root).exists(), "{kind}");
+            assert_eq!(fs::read(sup.join("state.json")).unwrap(), bytes, "{kind}: the record was written over or forgotten");
+
+            // As the release that wrote it would leave it: nothing runs, so it is reclaimed.
+            fs::write(sup.join("state.json"), serde_json::to_vec(&supervisor::State::default()).unwrap()).unwrap();
+            let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+            assert!(pass.reclaimed.iter().any(|e| e.project == root && e.stopped), "{kind}: {pass:?}");
+            assert!(!index_path(&state, &root).exists(), "{kind}");
+        }
+    }
 }
