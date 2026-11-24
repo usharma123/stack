@@ -149,7 +149,10 @@ fn store_lock(state: &Path, project: &ProjectId) -> Result<FileLock> {
 // between the two renames leaves the name empty and the old generation in `.old-*`. Readers
 // that take no lock (`list`, the checks before an operation) then read that old generation
 // in place, and the next operation under the lock moves it back ([`recover_store`]) before it
-// removes any staging directory.
+// removes any staging directory. A generation counts only when its `meta.json` parses and
+// names it: one at the name that does not is no generation, and never hides, or has removed,
+// a valid one set aside. A read or rename that fails stops the operation with what was set
+// aside left in place.
 
 /// A staging directory of the store, by its name.
 #[derive(Debug, PartialEq, Eq)]
@@ -179,81 +182,123 @@ impl Staging {
     }
 }
 
-/// `meta.json` of the snapshot directory `dir`, if it parses and names `name`.
-fn valid_meta(dir: &Path, name: &str) -> Option<Meta> {
-    let meta: Meta = serde_json::from_str(&fs::read_to_string(dir.join(META)).ok()?).ok()?;
-    (meta.name == name).then_some(meta)
+/// `meta.json` of the snapshot directory `dir`: `Some` when it parses and names `name`, `None`
+/// when there is none or it is not a generation of `name` (metadata that does not parse, or
+/// describes another snapshot). An error when it cannot be read: a generation is never judged
+/// invalid, or valid, on a read that failed.
+fn meta_at(dir: &Path, name: &str) -> Result<Option<Meta>> {
+    use std::io::ErrorKind;
+    let path = dir.join(META);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(serde_json::from_str::<Meta>(&text).ok().filter(|m| m.name == name)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory | ErrorKind::InvalidData) => Ok(None),
+        Err(e) => Err(io_error(path.display(), e)),
+    }
 }
 
 /// The store's staging directories, by name.
-fn staging(base: &Path) -> Vec<(PathBuf, Staging)> {
-    fs::read_dir(base)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| Some((e.path(), Staging::parse(e.file_name().to_str()?)?)))
-        .collect()
+fn staging(base: &Path) -> Result<Vec<(PathBuf, Staging)>> {
+    let entries = match fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_error(base.display(), e)),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(base.display(), e))?;
+        if let Some(s) = entry.file_name().to_str().and_then(Staging::parse) {
+            out.push((entry.path(), s));
+        }
+    }
+    Ok(out)
 }
 
 /// The newest complete generation of `name` set aside by an interrupted `save --force`.
-fn set_aside(base: &Path, name: &str) -> Option<PathBuf> {
-    let mut old: Vec<(u64, u128, PathBuf)> = staging(base)
-        .into_iter()
-        .filter(|(_, s)| s.kind == "old" && s.name == name)
-        .filter_map(|(path, s)| Some((valid_meta(&path, name)?.created_at, s.nanos, path)))
-        .collect();
+fn set_aside(base: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let mut old: Vec<(u64, u128, PathBuf)> = Vec::new();
+    for (path, s) in staging(base)? {
+        if s.kind == "old" && s.name == name {
+            if let Some(meta) = meta_at(&path, name)? {
+                old.push((meta.created_at, s.nanos, path));
+            }
+        }
+    }
     old.sort();
-    old.pop().map(|(_, _, path)| path)
+    Ok(old.pop().map(|(_, _, path)| path))
 }
 
-/// Where `name`'s snapshot is: the published directory, or, while a `save --force` without an
-/// exchange has it renamed aside (or crashed with it so), the generation set aside. Read only.
-fn generation(state: &Path, project: &ProjectId, name: &str) -> Option<PathBuf> {
+/// Where `name`'s snapshot is: the published directory when its metadata is valid, else,
+/// while a `save --force` without an exchange has it renamed aside (or crashed with it so),
+/// the newest valid generation set aside. Read only.
+fn generation(state: &Path, project: &ProjectId, name: &str) -> Result<Option<PathBuf>> {
     let base = store(state, project);
     let published = base.join(name);
-    if published.join(META).is_file() {
-        return Some(published);
+    if meta_at(&published, name)?.is_some() {
+        return Ok(Some(published));
     }
     set_aside(&base, name)
 }
 
+/// Rename within the store; tests fail a named step, as an I/O error would.
+fn store_rename(from: &Path, to: &Path, step: &'static str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_RENAMES.with(std::cell::Cell::get).contains(&step) {
+        return Err(std::io::Error::other(format!("{step} failed (test)")));
+    }
+    let _ = step;
+    fs::rename(from, to)
+}
+
 /// Under the store lock: put back every generation an interrupted `save --force` left set
-/// aside with nothing published in its place, then remove staging directories nobody owns any
-/// more. Returns what it did, for the report.
-fn recover_store(base: &Path) -> Vec<Value> {
+/// aside with no valid one published in its place, then remove staging directories nobody owns
+/// any more. Returns what it did, for the report. Whatever cannot be read or moved is an error,
+/// with the generation set aside left where it is for the next operation; one set aside is
+/// never removed while the name holds no valid generation.
+fn recover_store(base: &Path) -> Result<Vec<Value>> {
     let mut done = Vec::new();
-    let names: std::collections::BTreeSet<String> = staging(base).into_iter().filter(|(_, s)| s.kind == "old").map(|(_, s)| s.name).collect();
+    let names: std::collections::BTreeSet<String> = staging(base)?.into_iter().filter(|(_, s)| s.kind == "old").map(|(_, s)| s.name).collect();
     for name in names {
         let published = base.join(&name);
-        if published.join(META).is_file() {
+        if meta_at(&published, &name)?.is_some() {
             continue;
         }
-        let Some(old) = set_aside(base, &name) else { continue };
-        // An incomplete directory at the name (a crash before its meta.json) is staging too.
-        if fs::symlink_metadata(&published).is_ok() {
-            let stray = unique(base, &format!(".rm-{name}"));
-            if fs::rename(&published, &stray).is_err() {
-                continue;
+        let Some(old) = set_aside(base, &name)? else { continue };
+        let failed = |e: StackError| {
+            StackError::new("snapshot_failed", format!("snapshot '{name}' cannot be put back: {}; its last complete generation is kept at {}", e.message, old.display()))
+                .hint("retry; the next snapshot command puts it back")
+        };
+        // What is at the name is no valid generation (a crash before its meta.json, or metadata
+        // that does not parse or names another snapshot): staging too.
+        match fs::symlink_metadata(&published) {
+            Ok(_) => {
+                let stray = unique(base, &format!(".rm-{name}"));
+                store_rename(&published, &stray, "recover_stray").map_err(|e| failed(io_error(published.display(), e)))?;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(failed(io_error(published.display(), e))),
         }
-        if fs::rename(&old, &published).is_ok() {
-            done.push(json!({ "snapshot": name, "recovered": "the generation an interrupted `save --force` set aside" }));
-        }
+        store_rename(&old, &published, "recover_old").map_err(|e| failed(io_error(old.display(), e)))?;
+        done.push(json!({ "snapshot": name, "recovered": "the generation an interrupted `save --force` set aside" }));
     }
-    for (path, s) in staging(base) {
-        if !s.live_elsewhere() {
-            remove_tree(&path);
+    for (path, s) in staging(base)? {
+        if s.live_elsewhere() {
+            continue;
         }
+        if s.kind == "old" && meta_at(&base.join(&s.name), &s.name)?.is_none() && meta_at(&path, &s.name)?.is_some() {
+            continue;
+        }
+        remove_tree(&path);
     }
-    done
+    Ok(done)
 }
 
 /// Under the store lock: publish the complete snapshot `tmp` at `published`, replacing what
 /// is there. One exchange where the filesystem has one; otherwise the old generation is
-/// renamed aside first, and put back if the new one cannot take its place.
+/// renamed aside first, and put back if the new one cannot take its place (where even that
+/// fails, it stays set aside, read in place and put back by the next operation).
 fn publish(base: &Path, name: &str, tmp: &Path, published: &Path) -> Result<&'static str> {
     if fs::symlink_metadata(published).is_err() {
-        fs::rename(tmp, published).map_err(|e| io_error(published.display(), e))?;
+        store_rename(tmp, published, "publish").map_err(|e| io_error(published.display(), e))?;
         return Ok("rename");
     }
     if exchange(tmp, published).map_err(|e| io_error(published.display(), e))? {
@@ -262,14 +307,13 @@ fn publish(base: &Path, name: &str, tmp: &Path, published: &Path) -> Result<&'st
         return Ok("exchange");
     }
     let old = unique(base, &format!(".old-{name}"));
-    fs::rename(published, &old).map_err(|e| io_error(published.display(), e))?;
-    #[cfg(test)]
-    if CRASH_AFTER_ASIDE.with(std::cell::Cell::get) {
-        return Err(StackError::new("snapshot_failed", "crashed (test)"));
-    }
-    if let Err(e) = fs::rename(tmp, published) {
-        let _ = fs::rename(&old, published);
-        return Err(io_error(published.display(), e));
+    store_rename(published, &old, "aside").map_err(|e| io_error(published.display(), e))?;
+    if let Err(e) = store_rename(tmp, published, "publish") {
+        let e = io_error(published.display(), e);
+        return Err(match store_rename(&old, published, "put_back") {
+            Ok(()) => e,
+            Err(back) => StackError::new("snapshot_failed", format!("{}; the generation it replaces is kept at {} ({back}), and the next snapshot command puts it back", e.message, old.display())),
+        });
     }
     remove_tree(&old);
     Ok("rename")
@@ -277,8 +321,8 @@ fn publish(base: &Path, name: &str, tmp: &Path, published: &Path) -> Result<&'st
 
 #[cfg(test)]
 thread_local! {
-    /// Tests stop `publish` between its two renames, as a crash would.
-    static CRASH_AFTER_ASIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests fail these steps of the store's renames (see [`store_rename`]).
+    static FAIL_RENAMES: std::cell::Cell<&'static [&'static str]> = const { std::cell::Cell::new(&[]) };
 }
 
 pub fn valid_name(name: &str) -> Result<()> {
@@ -338,9 +382,15 @@ pub struct Meta {
     pub services: IndexMap<String, SnapService>,
 }
 
-/// The metadata of `name`'s snapshot (see [`generation`]), which must name it.
-fn read_meta(state: &Path, project: &ProjectId, name: &str) -> Result<Meta> {
-    let dir = generation(state, project, name).unwrap_or_else(|| store(state, project).join(name));
+/// One generation of a snapshot, as read: where it is and its metadata.
+struct Generation {
+    dir: PathBuf,
+    meta: Meta,
+}
+
+/// `name`'s snapshot (see [`generation`]), whose metadata must name it.
+fn read_generation(state: &Path, project: &ProjectId, name: &str) -> Result<Generation> {
+    let dir = generation(state, project, name)?.unwrap_or_else(|| store(state, project).join(name));
     let path = dir.join(META);
     let invalid = |why: String| StackError::new("snapshot_invalid", format!("{}: {why}", path.display())).hint(format!("remove it with `stack snapshot rm {name}`"));
     match fs::read_to_string(&path) {
@@ -349,11 +399,16 @@ fn read_meta(state: &Path, project: &ProjectId, name: &str) -> Result<Meta> {
             if meta.name != name {
                 return Err(invalid(format!("it describes snapshot '{}'", meta.name)));
             }
-            Ok(meta)
+            Ok(Generation { dir, meta })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found(state, project, name)),
         Err(e) => Err(io_error(path.display(), e)),
     }
+}
+
+/// The metadata of `name`'s snapshot (see [`read_generation`]).
+fn read_meta(state: &Path, project: &ProjectId, name: &str) -> Result<Meta> {
+    read_generation(state, project, name).map(|g| g.meta)
 }
 
 fn not_found(state: &Path, project: &ProjectId, name: &str) -> StackError {
@@ -377,8 +432,8 @@ fn names(state: &Path, project: &ProjectId) -> Vec<String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| valid_name(n).is_ok())
         .collect();
-    for (path, s) in staging(&base) {
-        if s.kind == "old" && !out.contains(&s.name) && valid_meta(&path, &s.name).is_some() {
+    for (path, s) in staging(&base).unwrap_or_default() {
+        if s.kind == "old" && !out.contains(&s.name) && meta_at(&path, &s.name).ok().flatten().is_some() {
             out.push(s.name);
         }
     }
@@ -1045,7 +1100,7 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
     let report = compile_readonly(ctx)?;
     let services = chosen(&report, named)?;
     let final_dir = store(&ctx.state, &project).join(name);
-    if generation(&ctx.state, &project, name).is_some() && !force {
+    if generation(&ctx.state, &project, name)?.is_some() && !force {
         return Err(StackError::new("snapshot_exists", format!("snapshot '{name}' already exists for this project"))
             .hint(format!("pick another name, `stack snapshot rm {name}`, or `stack snapshot save {name} --force` to replace it")));
     }
@@ -1056,7 +1111,7 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
         let _store = store_lock(&ctx.state, &project)?;
         let base = store(&ctx.state, &project);
         fs::create_dir_all(&base).map_err(|e| io_error(base.display(), e))?;
-        let recovered = recover_store(&base);
+        let recovered = recover_store(&base)?;
         let tmp = unique(&base, &format!(".tmp-{name}"));
         fs::create_dir(&tmp).map_err(|e| io_error(tmp.display(), e))?;
         fs::create_dir(tmp.join("data")).map_err(|e| io_error(tmp.display(), e))?;
@@ -1131,7 +1186,7 @@ pub fn restore(ctx: &Ctx, name: &str) -> Result<SnapshotReport> {
     let stopped = session::with_stopped(ctx, &services, |report, statuses| {
         let interrupted = recover_restore(&ctx.state, &ctx.root)?;
         let _store = store_lock(&ctx.state, &project)?;
-        recover_store(&store(&ctx.state, &project));
+        recover_store(&store(&ctx.state, &project))?;
         // Read again under the lock: it may have been replaced or removed meanwhile.
         let meta = read_meta(&ctx.state, &project, name)?;
         compatible(&meta, report)?;
@@ -1167,10 +1222,9 @@ pub fn check_up(ctx: &Ctx, report: &Report, options: &UpOptions) -> Result<()> {
 pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], name: &str) -> Result<Value> {
     let project = project_id(&ctx.root);
     let _store = store_lock(&ctx.state, &project)?;
-    recover_store(&store(&ctx.state, &project));
-    let meta = read_meta(&ctx.state, &project, name)?;
+    recover_store(&store(&ctx.state, &project))?;
+    let Generation { dir: snapshot, meta } = read_generation(&ctx.state, &project, name)?;
     compatible(&meta, report)?;
-    let snapshot = store(&ctx.state, &project).join(name);
     let unresolved = crate::supervisor::unresolved(&crate::supervisor::dir(&ctx.state, &ctx.root));
     if !unresolved.is_empty() {
         return Err(StackError::new("stop_unconfirmed", "processes of this checkout's services may still run; nothing was restored")
@@ -1220,7 +1274,12 @@ pub struct ListReport {
 
 pub fn list(ctx: &Ctx) -> Result<ListReport> {
     let project = project_id(&ctx.root);
-    let snapshots = names(&ctx.state, &project).iter().filter_map(|n| valid_meta(&generation(&ctx.state, &project, n)?, n)).collect();
+    let mut snapshots = Vec::new();
+    for name in names(&ctx.state, &project) {
+        if let Some(dir) = generation(&ctx.state, &project, &name)? {
+            snapshots.extend(meta_at(&dir, &name)?);
+        }
+    }
     Ok(ListReport { project, snapshots })
 }
 
@@ -1228,7 +1287,7 @@ pub fn rm(ctx: &Ctx, name: &str) -> Result<Value> {
     valid_name(name)?;
     let project = project_id(&ctx.root);
     let _store = store_lock(&ctx.state, &project)?;
-    recover_store(&store(&ctx.state, &project));
+    recover_store(&store(&ctx.state, &project))?;
     let dir = store(&ctx.state, &project).join(name);
     if !dir.join(META).is_file() {
         return Err(not_found(&ctx.state, &project, name));
@@ -1657,17 +1716,20 @@ mod tests {
         let tmp = unique(&base, ".tmp-base");
         snapshot_dir(&tmp, "base", 2, "new");
         datadirs::NO_EXCHANGE.with(|c| c.set(true));
-        CRASH_AFTER_ASIDE.with(|c| c.set(true));
-        publish(&base, "base", &tmp, &base.join("base")).unwrap_err();
+        // As a crash between the renames leaves it: the new one never published, the old one
+        // never put back.
+        FAIL_RENAMES.with(|c| c.set(&["publish", "put_back"]));
+        let e = publish(&base, "base", &tmp, &base.join("base")).unwrap_err();
         datadirs::NO_EXCHANGE.with(|c| c.set(false));
-        CRASH_AFTER_ASIDE.with(|c| c.set(false));
+        FAIL_RENAMES.with(|c| c.set(&[]));
+        assert!(e.message.contains("the next snapshot command puts it back"), "{e}");
         assert!(!base.join("base").exists(), "crashed with the name empty");
 
         // Readers without the lock see the old generation, never a missing snapshot.
         assert_eq!(names(state.path(), &project), ["base", "other"]);
         let meta = read_meta(state.path(), &project, "base").unwrap();
         assert_eq!(meta.created_at, 1);
-        assert!(generation(state.path(), &project, "base").unwrap().file_name().unwrap().to_str().unwrap().starts_with(".old-base-"));
+        assert!(generation(state.path(), &project, "base").unwrap().unwrap().file_name().unwrap().to_str().unwrap().starts_with(".old-base-"));
 
         // A stale staging directory of a process that is gone, and a live one of another.
         let mut gone = std::process::Command::new("true").spawn().unwrap();
@@ -1679,7 +1741,7 @@ mod tests {
         let live = base.join(format!(".tmp-other-{}-6", alive.id()));
         fs::create_dir_all(&live).unwrap();
 
-        let recovered = recover_store(&base);
+        let recovered = recover_store(&base).unwrap();
         assert_eq!(recovered.len(), 1, "{recovered:?}");
         assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "old", "the last valid generation is back");
         let mut want = vec!["base".to_string(), "other".to_string(), live.file_name().unwrap().to_str().unwrap().to_string()];
@@ -1689,7 +1751,7 @@ mod tests {
         alive.wait().unwrap();
         // Nothing to recover: a published generation is never replaced by one set aside.
         snapshot_dir(&unique(&base, ".old-base"), "base", 7, "older");
-        assert!(recover_store(&base).is_empty());
+        assert!(recover_store(&base).unwrap().is_empty());
         assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "old");
         assert_eq!(entries(&base), ["base", "other"]);
     }
@@ -1705,9 +1767,119 @@ mod tests {
         write(&base.join(".old-base-1-40/data/db/PG_VERSION"), "partial");
         // An incomplete directory at the name (no meta.json) is set aside too.
         write(&base.join("base/data/db/PG_VERSION"), "partial");
-        recover_store(&base);
+        recover_store(&base).unwrap();
         assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "three");
         assert_eq!(entries(&base), ["base"]);
+    }
+
+    /// The store's staging directories of one kind (`old`, `rm`, `tmp`).
+    fn staged(base: &Path, kind: &str) -> Vec<PathBuf> {
+        staging(base).unwrap().into_iter().filter(|(_, s)| s.kind == kind).map(|(p, _)| p).collect()
+    }
+
+    #[test]
+    fn a_published_generation_whose_metadata_is_malformed_never_hides_or_removes_the_valid_one() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "valid");
+        for published in ["{ not json", r#"{"name":"elsewhere","format":1,"project":"p","created_at":9,"source":"/s","services":{}}"#] {
+            let _ = fs::remove_dir_all(base.join("base"));
+            write(&base.join("base/data/db/PG_VERSION"), "damaged");
+            write(&base.join("base").join(META), published);
+            // Readers take the valid generation set aside, not the damaged one at the name.
+            assert!(generation(state.path(), &project, "base").unwrap().unwrap().ends_with(".old-base-1-10"), "{published}");
+            assert_eq!(read_meta(state.path(), &project, "base").unwrap().created_at, 3);
+            assert_eq!(list_names(state.path(), &project), ["base"]);
+            // Recovery puts the valid one in its place, never removes it.
+            let recovered = recover_store(&base).unwrap();
+            assert_eq!(recovered.len(), 1, "{recovered:?}");
+            assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "valid");
+            assert_eq!(entries(&base), ["base"]);
+            // Set aside again for the next round.
+            fs::rename(base.join("base"), base.join(".old-base-1-10")).unwrap();
+        }
+        // Damaged with nothing valid set aside: reported, and left for `rm`, never removed.
+        fs::remove_dir_all(base.join(".old-base-1-10")).unwrap();
+        write(&base.join("base").join(META), "{ not json");
+        snapshot_dir(&base.join(".old-base-1-20"), "elsewhere", 1, "other");
+        assert_eq!(read_meta(state.path(), &project, "base").unwrap_err().code, "snapshot_invalid");
+        assert!(recover_store(&base).unwrap().is_empty());
+        assert_eq!(entries(&base), ["base"], "the invalid generation set aside is staging; the name is left for `rm`");
+    }
+
+    fn list_names(state: &Path, project: &ProjectId) -> Vec<String> {
+        names(state, project).into_iter().filter(|n| generation(state, project, n).unwrap().is_some()).collect()
+    }
+
+    #[test]
+    fn a_failed_rename_of_a_forced_save_keeps_the_published_generation() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        datadirs::NO_EXCHANGE.with(|c| c.set(true));
+        // The first rename (the published one aside) fails: nothing moved.
+        // The second (the new one in) fails: the published one is put back.
+        for failing in [&["aside"][..], &["publish"][..]] {
+            let _ = fs::remove_dir_all(&base);
+            snapshot_dir(&base.join("base"), "base", 1, "old");
+            let tmp = unique(&base, ".tmp-base");
+            snapshot_dir(&tmp, "base", 2, "new");
+            FAIL_RENAMES.with(|c| c.set(failing));
+            let e = publish(&base, "base", &tmp, &base.join("base")).unwrap_err();
+            FAIL_RENAMES.with(|c| c.set(&[]));
+            assert!(e.message.contains("failed (test)"), "{failing:?}: {e}");
+            assert_eq!(read_meta(state.path(), &project, "base").unwrap().created_at, 1, "{failing:?}");
+            assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "old", "{failing:?}");
+            assert!(staged(&base, "old").is_empty(), "{failing:?}: nothing is left set aside");
+        }
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
+    }
+
+    #[test]
+    fn a_failed_rename_of_recovery_keeps_the_generation_set_aside() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        // Moving the incomplete directory at the name out of the way fails, then putting the
+        // generation set aside in its place does.
+        for failing in [&["recover_stray"][..], &["recover_old"][..]] {
+            let _ = fs::remove_dir_all(&base);
+            snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "valid");
+            write(&base.join("base/data/db/PG_VERSION"), "partial");
+            FAIL_RENAMES.with(|c| c.set(failing));
+            let e = recover_store(&base).unwrap_err();
+            FAIL_RENAMES.with(|c| c.set(&[]));
+            assert_eq!(e.code, "snapshot_failed", "{failing:?}: {e}");
+            assert!(e.message.contains(".old-base-1-10"), "{failing:?}: says where it is kept: {e}");
+            let old = staged(&base, "old");
+            assert_eq!(old.len(), 1, "{failing:?}: the generation set aside is never removed");
+            assert_eq!(fs::read_to_string(old[0].join("data/db/PG_VERSION")).unwrap(), "valid");
+            // Readers still find it, and the next recovery puts it back.
+            assert_eq!(read_meta(state.path(), &project, "base").unwrap().created_at, 3, "{failing:?}");
+            assert_eq!(recover_store(&base).unwrap().len(), 1, "{failing:?}");
+            assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "valid");
+            assert_eq!(entries(&base), ["base"], "{failing:?}");
+        }
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_an_error_not_an_empty_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "valid");
+        let old = base.join(".old-base-1-10");
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: nothing to show then.
+        let unreadable = fs::read_to_string(old.join(META)).is_err();
+        let recovered = recover_store(&base);
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+        if unreadable {
+            assert!(recovered.is_err(), "{recovered:?}");
+            assert_eq!(staged(&base, "old").len(), 1, "never removed on a read that failed");
+        }
     }
 
     #[test]
