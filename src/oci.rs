@@ -1135,16 +1135,18 @@ fn trusted_realm(realm: &Url, registry: &str, approved: &str) -> Result<bool> {
     if origin == registry {
         return Ok(true);
     }
-    for value in approved.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+    let mut trusted = false;
+    for (index, value) in approved.split(',').map(str::trim).enumerate() {
+        if value.is_empty() {
+            continue;
+        }
         let listed = registry_origin(value).ok_or_else(|| {
-            StackError::new("oci_auth_untrusted", format!("STACK_OCI_AUTH_REALMS entry '{value}' is not an origin"))
+            StackError::new("oci_auth_untrusted", format!("STACK_OCI_AUTH_REALMS entry {} is not an origin", index + 1))
                 .hint("list token service origins as scheme://host[:port], comma-separated, e.g. https://auth.docker.io")
         })?;
-        if listed == origin {
-            return Ok(true);
-        }
+        trusted |= listed == origin;
     }
-    Ok(false)
+    Ok(trusted)
 }
 
 fn verify_digest(bytes: &[u8], expected: &str, what: &str) -> Result<()> {

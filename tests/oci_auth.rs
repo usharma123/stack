@@ -423,10 +423,11 @@ fn a_malformed_realm_approval_is_reported_not_loosely_matched() {
     let registry = Server::new(move |_| {
         Response::new(401, "").header("WWW-Authenticate", &format!("Bearer realm=\"{realm}\""))
     });
-    let host_only = token.origin.trim_start_matches("http://").to_string();
-    let result = compile(&tempfile::tempdir().unwrap(), &registry, Some(&host_only));
+    let approved = format!("{}, https://example.invalid/?token=dummy-secret", token.origin);
+    let result = compile(&tempfile::tempdir().unwrap(), &registry, Some(&approved));
     assert_eq!(result["error"]["code"], "oci_auth_untrusted", "{result}");
-    assert!(result["error"]["message"].as_str().unwrap().contains("is not an origin"), "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("entry 2 is not an origin"), "{result}");
+    assert!(!result.to_string().contains("dummy-secret"), "{result}");
     assert!(token.seen().is_empty());
 }
 
