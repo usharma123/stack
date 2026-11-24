@@ -662,7 +662,11 @@ time (a reused PID), or the machine restarted. When that cannot be told, the lea
 for a live owner (a TTL beside it still runs out): on Linux, when the PID namespace it was
 recorded from is not this one or cannot be read (a container sharing `STACK_STATE_DIR` with
 the host, say, where the PID names another process), and when a process has the PID but its
-start time cannot be read, now or when the lease was taken. A command that keeps the session's
+start time cannot be read, now or when the lease was taken. Whether any process has the PID is
+asked of the kernel itself (`kill(pid, 0)`): another user's process counts as running though it
+may not be signalled, and only no process at all, or a zombie, counts as exited. A probe that
+fails otherwise (refused, an I/O error, a status that is hidden) is never taken for an exit: it
+cannot be told, for a bare-PID lease too. A command that keeps the session's
 lease (`exec --up`, `run --up`, `renew`) keeps its owner as recorded. A lease Stack 0.1.24 or
 earlier recorded names its owner by PID alone (`owner_identity` `pid`): it stays alive while
 any process has that PID, as before, until a command names an owner again.

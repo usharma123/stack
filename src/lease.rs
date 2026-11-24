@@ -3,9 +3,9 @@
 //! its owner, and how that owner is told from a later process that reuses its PID.
 
 use crate::error::{Result, StackError};
-use crate::procinfo::{self, Named};
+use crate::procinfo::{self, Liveness, Named};
 use crate::session::{Lease, MAX_OWNER_PID};
-use crate::state::{now, pid_alive};
+use crate::state::now;
 use serde::{Deserialize, Serialize};
 
 /// The owner process of a lease as observed when the lease named it: its start time (see
@@ -54,8 +54,9 @@ pub(crate) trait Observe {
     fn namespaced(&self) -> bool;
     /// The start time of the process `pid` is now, when it can be read.
     fn started(&self, pid: u32) -> Option<u64>;
-    /// Whether `pid` names any process (including one this process may not inspect).
-    fn alive(&self, pid: u32) -> bool;
+    /// Whether `pid` names a running process (including one this process may not inspect or
+    /// signal): only an affirmative absence, or a zombie, is [`Liveness::Gone`].
+    fn probe(&self, pid: u32) -> Liveness;
 }
 
 /// This machine, as this process sees it.
@@ -74,15 +75,16 @@ impl Observe for Here {
     fn started(&self, pid: u32) -> Option<u64> {
         procinfo::process(pid).map(|p| p.started)
     }
-    fn alive(&self, pid: u32) -> bool {
-        pid_alive(pid)
+    fn probe(&self, pid: u32) -> Liveness {
+        procinfo::liveness(pid)
     }
 }
 
 /// Whether the owner `pid` of a lease, observed as `identity` when the lease named it, still runs.
 ///
 /// - A lease an earlier Stack recorded (no `identity`) names its owner by PID alone: alive while
-///   any process has that PID, as it always was.
+///   any process has that PID, as it always was, and exited only once none has it (or a zombie
+///   does).
 /// - Recorded in another boot: exited.
 /// - Where PIDs are per namespace, recorded from another namespace, or one that cannot be read
 ///   (then or now): unknown, since the PID may mean another process here.
@@ -90,14 +92,23 @@ impl Observe for Here {
 ///   one is a reused PID, so the owner exited. No process at all: exited. A process whose start
 ///   time cannot be read, or an owner whose start time could not be read when recorded, while
 ///   something runs as `pid`: unknown.
+///
+/// Whether anything runs as `pid` is asked of the kernel (see [`procinfo::liveness`]): a status
+/// this process may not read, a signal it is refused, or a probe that fails says nothing, and is
+/// never taken for an exit; it is unknown, and only a TTL runs the lease out.
 pub fn owner_state(pid: u32, identity: Option<&OwnerIdentity>) -> OwnerState {
     owner_state_with(pid, identity, &Here)
 }
 
 pub(crate) fn owner_state_with(pid: u32, identity: Option<&OwnerIdentity>, here: &dyn Observe) -> OwnerState {
     let exited = || OwnerState::Exited(format!("owner process {pid} exited"));
+    let unknown = |why: String| OwnerState::Unknown(format!("owner process {pid}: {why}"));
     let Some(identity) = identity else {
-        return if here.alive(pid) { OwnerState::Alive } else { exited() };
+        return match here.probe(pid) {
+            Liveness::Running => OwnerState::Alive,
+            Liveness::Gone => exited(),
+            Liveness::Unknown(why) => unknown(why),
+        };
     };
     if let (Some(recorded), Some(now)) = (&identity.boot, here.boot()) {
         if *recorded != now {
@@ -117,8 +128,11 @@ pub(crate) fn owner_state_with(pid: u32, identity: Option<&OwnerIdentity>, here:
             "the start time of owner process {pid} could not be read when the lease named it, so the process now at PID {pid} \
              cannot be told from it"
         )),
-        (None, _) if !here.alive(pid) => exited(),
-        (None, _) => OwnerState::Unknown(format!("PID {pid} runs, but its start time cannot be read to tell whether it is the owner")),
+        (None, _) => match here.probe(pid) {
+            Liveness::Gone => exited(),
+            Liveness::Running => OwnerState::Unknown(format!("PID {pid} runs, but its start time cannot be read to tell whether it is the owner")),
+            Liveness::Unknown(why) => unknown(why),
+        },
     }
 }
 
@@ -303,12 +317,14 @@ mod tests {
     }
 
     /// A machine as a test says it is: this boot and PID namespace, whether PIDs are per
-    /// namespace, and the start time of each running PID (`None`: it runs but cannot be read).
+    /// namespace, the start time of each running PID (`None`: it runs but cannot be read), and
+    /// why the kernel cannot be asked whether a PID runs, when it cannot.
     struct Seen {
         boot: Option<&'static str>,
         pid_ns: Option<u64>,
         namespaced: bool,
         running: Vec<(u32, Option<u64>)>,
+        unprobed: Option<&'static str>,
     }
 
     impl Observe for Seen {
@@ -324,13 +340,17 @@ mod tests {
         fn started(&self, pid: u32) -> Option<u64> {
             self.running.iter().find(|(p, _)| *p == pid).and_then(|(_, s)| *s)
         }
-        fn alive(&self, pid: u32) -> bool {
-            self.running.iter().any(|(p, _)| *p == pid)
+        fn probe(&self, pid: u32) -> Liveness {
+            match self.unprobed {
+                Some(why) => Liveness::Unknown(why.into()),
+                None if self.running.iter().any(|(p, _)| *p == pid) => Liveness::Running,
+                None => Liveness::Gone,
+            }
         }
     }
 
     fn linux(running: Vec<(u32, Option<u64>)>) -> Seen {
-        Seen { boot: Some("boot-a"), pid_ns: Some(4026531836), namespaced: true, running }
+        Seen { boot: Some("boot-a"), pid_ns: Some(4026531836), namespaced: true, running, unprobed: None }
     }
 
     fn exited(state: OwnerState) -> String {
@@ -390,7 +410,7 @@ mod tests {
         let rebooted = Seen { boot: Some("boot-b"), pid_ns: Some(4026532000), ..linux(vec![]) };
         assert!(matches!(owner_state_with(42, Some(&owner), &rebooted), OwnerState::Exited(_)));
         // Where PIDs are not per namespace (macOS), none is recorded or needed.
-        let mac = Seen { boot: Some("boot-a"), pid_ns: None, namespaced: false, running: vec![(42, Some(1000))] };
+        let mac = Seen { boot: Some("boot-a"), pid_ns: None, namespaced: false, running: vec![(42, Some(1000))], unprobed: None };
         let on_mac = OwnerIdentity::observe_with(42, &mac);
         assert_eq!(on_mac.pid_ns, None);
         assert_eq!(owner_state_with(42, Some(&on_mac), &mac), OwnerState::Alive);
@@ -406,6 +426,46 @@ mod tests {
         // Readable then, not now (another user's process, say).
         let owner = OwnerIdentity { started: Some(1000), boot: Some("boot-a".into()), pid_ns: Some(4026531836) };
         assert!(unknown(owner_state_with(42, Some(&owner), &linux(vec![(42, None)]))).contains("cannot be read"));
+    }
+
+    /// A probe that cannot say (permission refused, I/O failing, a hidden status) is never an
+    /// exit, whether the owner is a bare PID or an identity whose start time cannot be read now;
+    /// a TTL still runs the lease out.
+    #[test]
+    fn an_owner_the_kernel_cannot_be_asked_about_is_unknown_never_exited() {
+        let refused = || Seen { unprobed: Some("whether process 42 runs cannot be told (Operation not permitted)"), ..linux(vec![]) };
+        assert!(unknown(owner_state_with(42, None, &refused())).contains("cannot be told"));
+        let owner = OwnerIdentity { started: Some(1000), boot: Some("boot-a".into()), pid_ns: Some(4026531836) };
+        assert!(unknown(owner_state_with(42, Some(&owner), &refused())).contains("cannot be told"));
+        // A start time read now still decides: the probe is asked only when it cannot be.
+        let reused = Seen { running: vec![(42, Some(7))], ..refused() };
+        assert!(exited(owner_state_with(42, Some(&owner), &reused)).contains("another process"));
+        // Another boot still decides too.
+        let rebooted = Seen { boot: Some("boot-b"), ..refused() };
+        assert!(exited(owner_state_with(42, Some(&owner), &rebooted)).contains("restarted"));
+    }
+
+    /// The kernel's own answers: this process runs; a child that exited and was reaped is gone;
+    /// one that exited and was not reaped (a zombie) is gone too; PID 1, another user's process
+    /// whenever this one is not root, runs, though it may not be signalled.
+    #[cfg(unix)]
+    #[test]
+    fn the_kernel_tells_a_running_process_from_an_exited_one_and_a_zombie() {
+        assert_eq!(procinfo::liveness(std::process::id()), Liveness::Running);
+        assert_eq!(procinfo::liveness(1), Liveness::Running);
+        assert_eq!(procinfo::liveness(0), Liveness::Gone);
+        let mut reaped = std::process::Command::new("true").spawn().unwrap();
+        let pid = reaped.id();
+        reaped.wait().unwrap();
+        // Its PID may already be another process's; then it runs, which is what a bare PID means.
+        assert!(matches!(procinfo::liveness(pid), Liveness::Gone | Liveness::Running));
+        let mut zombie = std::process::Command::new("true").spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while procinfo::liveness(zombie.id()) != Liveness::Gone {
+            assert!(std::time::Instant::now() < deadline, "the unreaped child never showed as a zombie");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        zombie.wait().unwrap();
     }
 
     /// A lease an earlier Stack recorded names a bare PID: alive while anything has it.

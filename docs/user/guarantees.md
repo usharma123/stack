@@ -72,7 +72,8 @@ differs.
   process the PID named when the lease was taken (its PID, start time and boot, and on Linux the
   PID namespace it was seen from): the lease ends when that process exits or the machine
   restarts, never kept alive by a later process given its PID. When that cannot be told (another
-  PID namespace, a start time that cannot be read) the lease is kept and `owner_unknown` says
+  PID namespace, a start time that cannot be read, a process status this process may not read)
+the lease is kept and `owner_unknown` says
   why; a lease Stack 0.1.24 or earlier recorded is checked by PID alone (see
   [leases](commands.md#leases)). Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
