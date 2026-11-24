@@ -367,11 +367,80 @@ fn record_bytes<T: Serialize>(record: &T) -> Vec<u8> {
     serde_json::to_vec_pretty(&serde_json::Value::Object(map)).expect("record serializes")
 }
 
+const SYMLINK: &str = "a symbolic link, which Stack does not follow";
+
+/// What a file of `kind` is, for an error saying a record path holds one instead of a file.
+fn kind_name(kind: fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    match kind {
+        k if k.is_dir() => "a directory",
+        k if k.is_symlink() => SYMLINK,
+        k if k.is_fifo() => "a FIFO",
+        k if k.is_socket() => "a socket",
+        k if k.is_block_device() || k.is_char_device() => "a device",
+        _ => "a file of another kind",
+    }
+}
+
+/// The error for a record path holding `kind` instead of a regular file: `InvalidData`, which
+/// only this gives (reading bytes never does), so a caller can tell it from a failed read.
+fn not_a_file(kind: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not a regular file: {kind}"))
+}
+
+/// The regular file at `path`, open for reading, with what its descriptor names; `None` when
+/// nothing is there. Anything else there (a symbolic link, never followed; a directory, a FIFO,
+/// a socket, a device) is a [`not_a_file`] error, found without blocking and before a byte is
+/// read: the path is looked at first, so what is not a file is normally not even opened, then
+/// opened non-blocking, without following a link or taking a terminal, and what the descriptor
+/// names is checked again (the path may have been replaced between the look and the open).
+/// Only the last component is not followed: the directories above it are Stack's own.
+fn open_regular(path: &Path) -> std::io::Result<Option<(fs::File, fs::Metadata)>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let absent = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => return Err(not_a_file(kind_name(meta.file_type()))),
+        Ok(_) => {}
+        Err(e) if absent(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC).open(path) {
+        Ok(file) => file,
+        Err(e) if absent(&e) => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_a_file(SYMLINK)),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(not_a_file(kind_name(meta.file_type())));
+    }
+    Ok(Some((file, meta)))
+}
+
+/// The bytes of the regular file at `path` (see [`open_regular`]); `None` when nothing is there.
+fn read_regular(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let Some((mut file, _)) = open_regular(path)? else { return Ok(None) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// A record's error for a failure to read `path`: one that is not a regular file is a record
+/// that cannot be read ([`invalid`]); any other failure (no permission, an I/O error) is `io`.
+fn read_failed(path: &Path, e: std::io::Error) -> StackError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        invalid(path, e)
+    } else {
+        io_error(path.display(), e)
+    }
+}
+
+/// The record at `path`: `None` when nothing is there; an error for anything there that is not
+/// a regular file holding a record this Stack reads (see [`open_regular`] and [`parse_record`]).
 fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match fs::read(path) {
-        Ok(bytes) => parse_record(path, &bytes).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_error(path.display(), e)),
+    match read_regular(path).map_err(|e| read_failed(path, e))? {
+        Some(bytes) => parse_record(path, &bytes).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -472,7 +541,7 @@ pub fn daemons(dir: &Path, configured: &[(String, u16, Option<PathBuf>)]) -> Vec
 // ---- commands ------------------------------------------------------------------------------
 
 fn failed(code: &'static str, message: String, dir: &Path) -> StackError {
-    let log = fs::read_to_string(dir.join("supervisor.log")).unwrap_or_default();
+    let log = read_regular(&dir.join("supervisor.log")).ok().flatten().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     let tail: Vec<&str> = log.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
     let mut e = StackError::new(code, message).hint("retry; `stack down` stops whatever the supervisor started");
     if !tail.is_empty() {
@@ -869,8 +938,7 @@ fn read_spec_identified(dir: &Path) -> Result<(Spec, (u64, u64))> {
     use std::os::unix::fs::MetadataExt;
     let path = spec_path(dir);
     let gone = || not_evidence(dir, "its spec.json is gone".into());
-    let mut file = fs::File::open(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { gone() } else { io_error(path.display(), e) })?;
-    let meta = file.metadata().map_err(|e| io_error(path.display(), e))?;
+    let (mut file, meta) = open_regular(&path).map_err(|e| read_failed(&path, e))?.ok_or_else(gone)?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_error(path.display(), e))?;
     let spec = parse_record(&path, &bytes)?;
@@ -1509,22 +1577,12 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
     let me = Proc::observe(std::process::id());
     // What a supervisor before this one left running is stopped first: this one cannot wait
     // for processes it did not start. What cannot be shown stopped keeps everything as it is.
-    let previous = match read_state(dir) {
-        Ok(state) => state.unwrap_or_default(),
-        // A record that is there but cannot be made sense of (damaged, or a newer Stack's) is
-        // not a fresh start: what it names may run, and this supervisor would write over it.
-        Err(e) if e.code == "state_invalid" => return Err(std::io::Error::other(format!("{}; nothing was started", e.message))),
-        // A directory in its place holds no record (and cannot be renamed over): the record is
-        // published once the supervisor can write it, and services stop if it never can.
-        Err(_) if state_path(dir).is_dir() => State::default(),
-        // Any other failure to read it (no permission, an I/O error) may hide a record naming
-        // what runs, which this supervisor would then write over.
-        Err(e) => return Err(std::io::Error::other(format!("{}; nothing was started", e.message))),
-    };
-    let mut spec = match read_spec(dir) {
-        Ok(spec) => spec.unwrap_or_default(),
-        Err(e) => return Err(std::io::Error::other(e.message)),
-    };
+    // Only a record that is missing is a fresh start. One that is there but cannot be made sense
+    // of (damaged, a newer Stack's, not a regular file, or unreadable) may name what runs, which
+    // this supervisor would write over: it starts, stops and writes nothing, and exits.
+    let refused = |e: StackError| std::io::Error::other(format!("{}; nothing was started", e.message));
+    let previous = read_state(dir).map_err(refused)?.unwrap_or_default();
+    let mut spec = read_spec(dir).map_err(refused)?.unwrap_or_default();
     let left = recover(dir, &previous, spec.token.as_deref());
     if !left.is_empty() {
         return Err(std::io::Error::other(format!("processes an earlier supervisor left could not be confirmed stopped, so nothing was started: {}", serde_json::Value::Array(left))));
@@ -2702,7 +2760,7 @@ pub fn legacy_data_dir(root: &Path, service: &str) -> Option<PathBuf> {
     let daemons = mise_state_dir()?.join("daemons");
     let wanted = root.to_string_lossy();
     for entry in fs::read_dir(&daemons).ok()?.flatten() {
-        let Ok(bytes) = fs::read(entry.path().join("state.json")) else { continue };
+        let Ok(Some(bytes)) = read_regular(&entry.path().join("state.json")) else { continue };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
         if v["root"].as_str() == Some(wanted.as_ref()) {
             let dir = entry.path().join("data").join(service);
@@ -3025,30 +3083,88 @@ mod tests {
         result
     }
 
-    /// Ways a record stops being one this Stack can read, with the code a read of it gives:
-    /// damaged, a newer Stack's, or no file at all (`None`: a directory in its place).
-    fn unreadable() -> [(&'static str, Option<Vec<u8>>, &'static str); 3] {
-        [
-            ("damaged", Some(b"{\"applied\": ".to_vec()), "state_invalid"),
-            ("newer", Some(serde_json::json!({ "schema_version": SCHEMA_VERSION + 1, "applied": 99 }).to_string().into_bytes()), "state_invalid"),
-            ("not a file", None, "io"),
-        ]
+    /// What is at a record path, as a test puts it there and finds it after.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Bad {
+        /// A regular file holding these bytes.
+        Bytes(Vec<u8>),
+        Dir,
+        Fifo,
+        /// A symbolic link to a copy of the record that was there: readable, were it followed.
+        Link,
+        /// The record that was there, mode 000.
+        Hidden,
     }
 
-    /// Put `bad` (see [`unreadable`]) where `path` is.
-    fn spoil(path: &Path, bad: &Option<Vec<u8>>) {
+    /// Ways a record stops being one this Stack can read, with the code a read of it gives:
+    /// damaged, a newer Stack's, not a regular file, or one this user may not read (not shown
+    /// as root, who reads it whatever its mode).
+    fn unreadable() -> Vec<(&'static str, Bad, &'static str)> {
+        let mut all = vec![
+            ("damaged", Bad::Bytes(b"{\"applied\": ".to_vec()), "state_invalid"),
+            ("newer", Bad::Bytes(serde_json::json!({ "schema_version": SCHEMA_VERSION + 1, "applied": 99 }).to_string().into_bytes()), "state_invalid"),
+            ("a directory", Bad::Dir, "state_invalid"),
+            ("a FIFO", Bad::Fifo, "state_invalid"),
+            ("a link to a readable record", Bad::Link, "state_invalid"),
+        ];
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            all.push(("unreadable", Bad::Hidden, "io"));
+        }
+        all
+    }
+
+    /// Remove whatever is at `path`, if anything.
+    fn clear(path: &Path) {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir(path).unwrap(),
+            Ok(_) => fs::remove_file(path).unwrap(),
+            Err(_) => {}
+        }
+    }
+
+    /// Put `bad` where `path` (a record) is.
+    fn spoil(path: &Path, bad: &Bad) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
         match bad {
-            Some(bytes) => replace(path, bytes),
-            None => {
-                fs::remove_file(path).unwrap();
+            Bad::Bytes(bytes) => replace(path, bytes),
+            Bad::Dir => {
+                clear(path);
                 fs::create_dir(path).unwrap();
+            }
+            Bad::Fifo => {
+                clear(path);
+                let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: mkfifo with a NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{}", std::io::Error::last_os_error());
+            }
+            Bad::Link => {
+                let target = path.with_extension("elsewhere");
+                fs::copy(path, &target).unwrap();
+                clear(path);
+                std::os::unix::fs::symlink(&target, path).unwrap();
+            }
+            Bad::Hidden => {
+                let fresh = path.with_extension("hidden");
+                fs::copy(path, &fresh).unwrap();
+                fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
+                fs::rename(&fresh, path).unwrap();
             }
         }
     }
 
-    /// What is at `path`: its bytes, or `None` for a directory.
-    fn found(path: &Path) -> Option<Vec<u8>> {
-        (!path.is_dir()).then(|| fs::read(path).unwrap())
+    /// What is at `path`, found without following a link or opening a FIFO.
+    fn found(path: &Path) -> Bad {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let meta = fs::symlink_metadata(path).unwrap();
+        match meta.file_type() {
+            t if t.is_dir() => Bad::Dir,
+            t if t.is_fifo() => Bad::Fifo,
+            t if t.is_symlink() => Bad::Link,
+            _ if meta.permissions().mode() & 0o777 == 0 => Bad::Hidden,
+            _ => Bad::Bytes(fs::read(path).unwrap()),
+        }
     }
 
     #[test]
@@ -3136,9 +3252,59 @@ mod tests {
             let left = unresolved(dir.path());
             assert!(left.len() == 1 && left[0]["record"] == serde_json::json!(spec_path(dir.path())), "{kind}: {left:?}");
             assert!(!forget(dir.path()), "{kind}: forgotten");
-            let _ = fs::remove_dir(spec_path(dir.path()));
+            assert_eq!(found(&spec_path(dir.path())), bad, "{kind}: the record changed");
+            clear(&spec_path(dir.path()));
             write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
         }
+    }
+
+    /// Every record in `dir` other than the two, the copies [`spoil`] made aside: a staged
+    /// write left behind, or one published under another name.
+    fn strays(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !["spec.json", "state.json", "spec.elsewhere", "state.elsewhere"].contains(&n.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_record_that_is_not_one_this_stack_can_read_is_refused_before_anything_is_written() {
+        for path_of in [spec_path as fn(&Path) -> PathBuf, state_path] {
+            for (kind, bad, code) in unreadable() {
+                let dir = tempfile::tempdir().unwrap();
+                write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+                let path = path_of(dir.path());
+                spoil(&path, &bad);
+                let other = if path == spec_path(dir.path()) { state_path(dir.path()) } else { spec_path(dir.path()) };
+                let other_before = found(&other);
+                let read = if path == spec_path(dir.path()) { read_spec(dir.path()).map(drop) } else { read_state(dir.path()).map(drop) };
+                assert_eq!(read.unwrap_err().code, code, "{kind}");
+                assert_eq!(readable(dir.path()).unwrap_err().code, code, "{kind}");
+                // A change is refused before its spec is written, a recovering shutdown before
+                // anything is signalled or written, and nothing is forgotten.
+                assert_eq!(apply(dir.path(), |s| s.shutdown = true).unwrap_err().code, code, "{kind}");
+                let (asked, project) = mine();
+                assert!(shutdown_accounted(dir.path(), &Expected { project: &project, token: "mine-token", asked: &asked }).is_err(), "{kind}");
+                assert!(!forget(dir.path()), "{kind}: forgotten");
+                assert_eq!(found(&path), bad, "{kind}: the record changed");
+                assert_eq!(found(&other), other_before, "{kind}: the other record changed");
+                assert_eq!(strays(dir.path()), Vec::<String>::new(), "{kind}: something was written");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_record_is_nothing_and_a_regular_one_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_spec(dir.path()).unwrap().is_none() && read_state(dir.path()).unwrap().is_none());
+        readable(dir.path()).unwrap();
+        let (spec, state) = record("/checkouts/mine", "mine-token", None, None, 1);
+        write(dir.path(), &(spec.clone(), state.clone()));
+        assert_eq!(read_state(dir.path()).unwrap(), Some(state));
+        assert_eq!(read_spec(dir.path()).unwrap().map(|s| s.revision), Some(spec.revision));
+        assert!(read_spec_identified(dir.path()).is_ok());
     }
 
     #[test]
