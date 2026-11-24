@@ -60,12 +60,16 @@ bundle content: they are not hashed or published, and an OCI layer containing th
 They are recognised however a case-insensitive filesystem (macOS) would spell them, on every
 platform: `.Git`, `.GIT` and `.Stack` are the same directories there, so a repository's metadata
 or Stack's own state is never hashed or published under another spelling (Unicode letters that
-fold to these and the code points HFS+ ignores in names are folded too, as Git does). A bundle
-that held such a spelling as ordinary content (Git itself refuses to commit one by default) now
-hashes without it, so the content hash `stack.lock` records for it no longer matches: a local
-path bundle is `lock_outdated` under `compile --locked` until `stack compile` records the new
-hash; for a git or OCI bundle (`content_hash_mismatch`), remove its `[[bundle]]` entry from
-`stack.lock` and run `stack compile` to record it again.
+fold to these and the code points HFS+ ignores in names are folded too, as Git does).
+
+If a local path bundle previously hashed one of those names, run `stack compile` to record the
+new hash. If a Git bundle reports `content_hash_mismatch` after this change, remove its
+`[[bundle]]` entry from `stack.lock` and run `stack compile` to record the hash again.
+An OCI artifact whose layer contains one of these names must be republished with that content
+removed. Keep the existing lock while waiting for a replacement. Once it is available, change
+the bundle reference to the corrected tag or digest and run `stack compile`. If the publisher
+reused the existing tag, run `stack compile --update` to resolve it again. Clearing the cache or
+removing the lock entry alone leaves the old artifact invalid.
 Each `paths.bin` entry must be a relative path to a real directory inside the bundle: `..`,
 absolute paths, symbolic links along the way, `.git` and `.stack` (under any spelling) are
 `bundle_invalid`, and a directory that does not exist is `missing_path`.
