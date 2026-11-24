@@ -433,8 +433,15 @@ fn service_of<'a>(manifest: &'a ProjectManifest, name: &str) -> impl Iterator<It
 }
 
 /// The `watch` paths stack.toml gives `name` (empty for a service a bundle defines).
+/// A full override (one with `preset` or `run`) replaces the base definition, including an empty
+/// `watch` list.
 fn watch_of(manifest: &ProjectManifest, name: &str) -> Vec<String> {
-    service_of(manifest, name).map(|s| s.watch.clone()).find(|w| !w.is_empty()).unwrap_or_default()
+    if let Some(ov) = manifest.overrides.services.get(name) {
+        if ov.preset.is_some() || ov.run.is_some() || !ov.watch.is_empty() {
+            return ov.watch.clone();
+        }
+    }
+    manifest.services.get(name).map(|s| s.watch.clone()).unwrap_or_default()
 }
 
 /// Where to reach the live service `name` on `port`: its preset's connection URL, the preset
@@ -666,6 +673,9 @@ pub struct Target {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: Labels,
+    /// Session ID observed during selection, rechecked under the target lock before mutating.
+    #[serde(skip)]
+    pub session_id: Option<String>,
 }
 
 impl Target {
@@ -675,17 +685,28 @@ impl Target {
     }
 }
 
-/// The checkouts `filter` selects, in path order. `manifest`: only those with a stack.toml (the
-/// commands that compile the project).
+/// The checkouts `filter` selects, in path order. `manifest`: for commands that compile the
+/// project, skip unstarted port-only reservations that lack a `stack.toml`, while keeping
+/// started checkouts (those with a session or unconfirmed down) so missing-manifest errors are
+/// reported rather than silently hidden.
 pub fn select(state: &Path, filter: &FleetFilter, manifest: bool) -> Result<Vec<Target>> {
     let records = Records::read(state)?;
     let scope = filter.project.as_deref().map(|p| crate::snapshot::project_id_offline(p).id);
     let mut out = Vec::new();
     for path in records.paths() {
-        if records.dir(&path) != "present" || (manifest && !path.join(manifest::PROJECT_FILE).is_file()) {
+        if records.dir(&path) != "present" {
             continue;
         }
-        let labels = records.sessions.get(&path).map(|s| s.labels.clone()).unwrap_or_default();
+        let session = records.sessions.get(&path);
+        let unconfirmed = if session.is_none() { session::unconfirmed_labels(state, &path) } else { None };
+        let has_active_state = session.is_some() || unconfirmed.is_some();
+        if manifest && !has_active_state && !path.join(manifest::PROJECT_FILE).is_file() {
+            continue;
+        }
+        let labels = session
+            .map(|s| s.labels.clone())
+            .or(unconfirmed)
+            .unwrap_or_default();
         if !labels::matches(&labels, &filter.labels) {
             continue;
         }
@@ -694,7 +715,8 @@ pub fn select(state: &Path, filter: &FleetFilter, manifest: bool) -> Result<Vec<
             continue;
         }
         let branch = git.as_ref().and_then(|g| gitdir::head(g).branch);
-        out.push(Target { path, branch, labels });
+        let session_id = session.map(|s| s.id.clone());
+        out.push(Target { path, branch, labels, session_id });
     }
     Ok(out)
 }
@@ -734,7 +756,7 @@ pub struct FleetStatusReport {
 pub fn status(state: &Path, cache: &Path, filter: &FleetFilter) -> Result<FleetStatusReport> {
     let mut checkouts = Vec::new();
     for target in select(state, filter, true)? {
-        let (status, error) = match session::status(&ctx_for(state, cache, &target)) {
+        let (status, error) = match session::status_readonly(&ctx_for(state, cache, &target)) {
             Ok(r) => (Some(r), None),
             Err(e) => (None, Some(e)),
         };
@@ -810,7 +832,13 @@ pub struct FleetDownReport {
 pub fn down(state: &Path, cache: &Path, filter: &FleetFilter, stop_supervisor: bool, purge: bool) -> Result<FleetDownReport> {
     let mut checkouts = Vec::new();
     for target in select(state, filter, false)? {
-        let (down, error) = match session::down_forgetting(&ctx_for(state, cache, &target), stop_supervisor, purge, false) {
+        let (down, error) = match session::down_matching(
+            &ctx_for(state, cache, &target),
+            stop_supervisor,
+            purge,
+            &filter.labels,
+            target.session_id.as_deref(),
+        ) {
             Ok(r) => (Some(r), None),
             Err(e) => (None, Some(e)),
         };
@@ -1496,7 +1524,7 @@ mod tests {
         assert_eq!(select(FleetFilter { all: true, ..Default::default() }).len(), 3);
         let targets = super::select(&state, &FleetFilter { project: Some(repo.clone()), ..Default::default() }, false).unwrap();
         assert_eq!(targets.iter().map(Target::name).collect::<Vec<_>>(), vec!["main", "feature"]);
-        assert_eq!(Target { path: lone.clone(), branch: None, labels: Labels::new() }.name(), "lone");
+        assert_eq!(Target { path: lone.clone(), branch: None, labels: Labels::new(), session_id: None }.name(), "lone");
         assert!(!FleetFilter::default().active());
         fs::remove_dir_all(&lone).unwrap();
         assert_eq!(select(FleetFilter { all: true, ..Default::default() }), vec![repo.clone(), wt.clone()], "a deleted checkout is not acted on");

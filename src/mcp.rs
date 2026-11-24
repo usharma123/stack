@@ -23,7 +23,7 @@ const DEFAULT_EXEC_TIMEOUT: u64 = 600;
 
 /// What the server tells a client about using its tools, once, at initialization. The
 /// envelope's meaning lives here and in `stack://guide`, not in every tool's `outputSchema`.
-const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root; the server's own working directory is never used). A `dir` below the checkout also works: the nearest stack.toml at or above it, up to the Git worktree root, is used, and every result names that checkout as `project`; stack_init alone writes stack.toml in exactly `dir`. Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Every result is the `--json` envelope: `ok` says whether Stack did what was asked; `passed` is also false when stack_exec or stack_run exited non-zero and when stack_status finds a started checkout unhealthy; on failure `error` carries `code`, `message`, `hint`, `retryable` (whether the same call can succeed unchanged), `next` (the operations that fix it) and `details`. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one. The resource stack://guide is the full agent guide.";
+const INSTRUCTIONS: &str = "Pass `dir`, the absolute path of the checkout you work in, to every tool (it may be omitted only when this client exposes exactly one root; the server's own working directory is never used). A `dir` below the checkout also works: the nearest stack.toml at or above it, up to the Git worktree root, is used, and every result names that checkout as `project`; stack_init alone writes stack.toml in exactly `dir`. Use stack_up before work that needs services, stack_run for the project's tasks (such as tests) and stack_exec for other commands (unverified service endpoints are withheld), stack_restart after editing code a running service loaded, stack_status to diagnose, and stack_down when finished. On stack_status, stack_logs and stack_down, `project: true`, `labels` or `all: true` act across multiple checkouts (e.g. every worktree of dir's repository, not just dir). Nothing reloads services for you: a service's `watch` list only makes stack_status, stack_exec and stack_run report changed files, and stack_up leaves a running service with unchanged configuration as it is, so call stack_restart after such edits (changed: true restarts just the services whose watched files changed). Every result is the `--json` envelope: `ok` says whether Stack did what was asked; `passed` is also false when stack_exec or stack_run exited non-zero and when stack_status finds a started checkout unhealthy; on failure `error` carries `code`, `message`, `hint`, `retryable` (whether the same call can succeed unchanged), `next` (the operations that fix it) and `details`. Tools in this stack may ship agent skills; `stack_inspect` lists them under `skills` and `stack_skill` returns one. The resource stack://guide is the full agent guide.";
 
 /// Which tools a server offers: `full` (every tool, the default) or `core`, the daily loop
 /// only, for clients that pay for every tool definition in their context.
@@ -112,9 +112,13 @@ const MACHINE_WIDE: &[&str] = &["stack_gc", "stack_ps", "stack_mv", "stack_error
 /// Tools that act on one checkout, or on several given `project`, `all` or `labels`.
 const FLEET: &[&str] = &["stack_status", "stack_logs", "stack_down"];
 
-/// Whether a call needs no checkout: a machine-wide tool, or a fleet call that selects
-/// checkouts by `all` or `labels` without `project` (which is `dir`'s project).
+/// Whether a call needs no checkout: a machine-wide tool (except `stack_ps` when scoped to a
+/// project or repository's worktrees), or a fleet call that selects checkouts by `all` or
+/// `labels` without `project` (which is `dir`'s project).
 fn machine_wide(name: &str, args: &Value) -> bool {
+    if name == "stack_ps" {
+        return args["project"] != true && args["worktrees"] != true;
+    }
     MACHINE_WIDE.contains(&name)
         || (FLEET.contains(&name)
             && args["project"] != true
@@ -128,7 +132,7 @@ fn labels_schema(what: &str) -> Value {
 
 /// The fleet selection of `stack_status`, `stack_logs` and `stack_down`.
 fn fleet_props(mut props: Value, verb: &str, all: bool) -> Value {
-    props["project"] = json!({ "type": "boolean", "description": format!("{verb} dir's project") });
+    props["project"] = json!({ "type": "boolean", "description": format!("{verb} ALL worktrees of dir's repo (not just dir)") });
     props["labels"] = labels_schema("Match labels");
     if all {
         props["all"] = json!({ "type": "boolean", "description": format!("{verb} all checkouts") });
@@ -558,13 +562,22 @@ fn call_in(profile: Profile, params: &Value, roots: Option<&[PathBuf]>) -> Value
             resolved = found.as_ref().map(|d| d.root.clone());
             let here = found.as_ref().map(|d| d.from.clone()).filter(|from| Some(from) != resolved.as_ref());
             dispatch(name, &args, &ctx(resolved.as_deref()), here).map_err(|e| match &found {
-                Some(d) => explain(d, e),
+                Some(d) => explain(profile, d, e),
                 None => e,
             })
         })
         .map_err(|e| with_usage_hint(e, "see this tool's inputSchema in tools/list"));
     call.dir = resolved.clone();
     let mut envelope = call.outcome(&outcome);
+    if profile == Profile::Core {
+        if let Some(steps) = envelope.get_mut("error").and_then(|e| e.get_mut("next")).and_then(Value::as_array_mut) {
+            for step in steps {
+                if step.get("tool").and_then(Value::as_str).is_some_and(|t| !profile.offers(t)) {
+                    step["tool"] = Value::Null;
+                }
+            }
+        }
+    }
     // Which checkout the call acted on, so a wrong one shows in every result.
     if let Some(project) = &resolved {
         envelope["project"] = json!(project);
@@ -588,12 +601,16 @@ fn offered(profile: Profile, name: &str) -> Result<()> {
 }
 
 /// Say where an upward search for `stack.toml` looked, on a `manifest_missing` error.
-fn explain(found: &Discovery, mut e: StackError) -> StackError {
+fn explain(profile: Profile, found: &Discovery, mut e: StackError) -> StackError {
     if found.found || e.code != "manifest_missing" || found.from == found.stop {
         return e;
     }
     e.message = format!("no stack.toml in {} or any directory above it up to {}", found.from.display(), found.stop.display());
-    e.hint = Some("call stack_init with this `dir` to create one, or pass the `dir` of the checkout that holds stack.toml".into());
+    e.hint = Some(if profile.offers("stack_init") {
+        "call stack_init with this `dir` to create one, or pass the `dir` of the checkout that holds stack.toml".into()
+    } else {
+        "run `stack init` in this directory to create one, or pass the `dir` of the checkout that holds stack.toml".into()
+    });
     e
 }
 
@@ -637,7 +654,11 @@ fn locate(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option<
     let start = dir
         .canonicalize()
         .map_err(|e| StackError::new("dir_not_found", format!("{}: {e}", dir.display())).hint("pass `dir` as the absolute path of an existing checkout"))?;
-    if name == "stack_init" || MACHINE_WIDE.contains(&name) {
+    if !start.is_dir() {
+        return Err(StackError::new("usage", format!("{name}: `dir` must be a directory, not {}", dir.display()))
+            .hint("pass `dir` as the absolute path of a checkout directory"));
+    }
+    if name == "stack_init" || (MACHINE_WIDE.contains(&name) && machine_wide(name, args)) {
         let found = start.join(crate::manifest::PROJECT_FILE).is_file();
         return Ok(Some(Discovery { root: start.clone(), found, from: start.clone(), stop: start }));
     }
@@ -645,10 +666,14 @@ fn locate(name: &str, args: &Value, roots: Option<&[PathBuf]>) -> Result<Option<
     Ok(Some(crate::discover::find(&start, home.as_deref())))
 }
 
-/// Whether a call needs the client's roots to find its checkout: it names no `dir` and acts
-/// on one checkout. Arguments that fail validation need nothing; the call reports them.
-fn needs_roots(params: &Value) -> bool {
+/// Whether a call needs the client's roots to find its checkout: it is offered by `profile`,
+/// names no `dir`, and acts on one checkout (or a project-scoped fleet/ps call). Unoffered
+/// tools or arguments that fail validation need nothing; the call reports them immediately.
+fn needs_roots(profile: Profile, params: &Value) -> bool {
     let name = params["name"].as_str().unwrap_or_default();
+    if !profile.offers(name) {
+        return false;
+    }
     validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").map_or(true, Value::is_null) && !machine_wide(name, &Value::Object(args)))
 }
 
@@ -734,7 +759,7 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx, here: Option<PathBuf>) -> Resul
                 LeaseOptions {
                     ttl_secs,
                     owner_pid,
-                    fallback_ttl_secs: None,
+                    ..LeaseOptions::default()
                 },
                 timeout,
                 session::UpOptions {
@@ -1295,7 +1320,7 @@ mod tests {
 
     #[test]
     fn fleet_calls_by_label_or_all_need_no_checkout_and_by_project_need_one() {
-        let needs = |name: &str, args: Value| needs_roots(&json!({ "name": name, "arguments": args }));
+        let needs = |name: &str, args: Value| needs_roots(Profile::Full, &json!({ "name": name, "arguments": args }));
         assert!(needs("stack_status", json!({})));
         assert!(!needs("stack_status", json!({ "all": true })));
         assert!(!needs("stack_status", json!({ "labels": { "agent": "claude" } })));
@@ -1303,7 +1328,10 @@ mod tests {
         assert!(needs("stack_down", json!({ "project": true, "labels": { "a": "b" } })), "project is dir's project");
         assert!(!needs("stack_logs", json!({ "labels": { "a": "b" } })));
         assert!(needs("stack_logs", json!({ "project": true })));
-        assert!(!needs("stack_ps", json!({ "project": true })), "ps stays machine-wide; project then asks for dir");
+        assert!(!needs("stack_ps", json!({})));
+        assert!(needs("stack_ps", json!({ "project": true })), "project-scoped ps uses dir or sole root");
+        assert!(needs("stack_ps", json!({ "worktrees": true })), "worktree-scoped ps uses dir or sole root");
+        assert!(!needs_roots(Profile::Core, &json!({ "name": "stack_inspect", "arguments": {} })), "excluded core tools never wait for roots");
         assert_eq!(project("stack_down", &json!({ "labels": { "a": "b" } }), None).unwrap(), None);
         assert_eq!(project("stack_down", &json!({ "project": true }), None).unwrap_err().code, "usage");
         assert!(validate("stack_status", &json!({ "all": true, "project": true })).unwrap_err().message.contains("cannot be given together"));
@@ -1313,7 +1341,7 @@ mod tests {
         assert!(!fleet_filter(&json!({}), &ctx).unwrap().active());
         assert_eq!(fleet_filter(&json!({ "project": true }), &ctx).unwrap_err().code, "usage");
         let called = call(&json!({ "name": "stack_ps", "arguments": { "project": true } }), None);
-        assert!(called["structuredContent"]["error"]["message"].as_str().unwrap().contains("`project` needs `dir`"), "{called}");
+        assert_eq!(called["structuredContent"]["error"]["code"], "usage", "{called}");
         let called = call(&json!({ "name": "stack_ps", "arguments": { "state": "happy" } }), None);
         assert_eq!(called["structuredContent"]["error"]["code"], "usage", "{called}");
     }
@@ -1412,6 +1440,8 @@ mod tests {
         // The nearest wins.
         std::fs::write(repo.join("src/stack.toml"), "").unwrap();
         assert_eq!(project("stack_status", &json!({ "dir": deep }), None).unwrap(), Some(repo.join("src")));
+        // Project-scoped `stack_ps` walks upward just like `stack_status`.
+        assert_eq!(project("stack_ps", &json!({ "dir": deep, "project": true }), None).unwrap(), Some(repo.join("src")));
 
         // stack_init writes in exactly `dir`; machine-wide tools search nothing either.
         assert_eq!(project("stack_init", &json!({ "dir": deep }), None).unwrap(), Some(deep.clone()));
@@ -1421,9 +1451,10 @@ mod tests {
         assert_eq!(init["structuredContent"]["project"], json!(deep));
         assert!(deep.join("stack.toml").is_file());
 
-        // Still absolute, still existing.
+        // Still absolute, still existing, and never a regular file.
         assert_eq!(project("stack_status", &json!({ "dir": "repo/src" }), None).unwrap_err().code, "usage");
         assert_eq!(project("stack_status", &json!({ "dir": repo.join("nope") }), None).unwrap_err().code, "dir_not_found");
+        assert_eq!(project("stack_status", &json!({ "dir": repo.join("stack.toml") }), None).unwrap_err().code, "usage");
     }
 
     #[test]

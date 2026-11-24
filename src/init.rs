@@ -58,9 +58,16 @@ pub fn init(root: &Path, tools: &[String], services: &[String], detect: bool) ->
     let detected: Vec<DetectedItem> = if detect {
         let named_tools: Vec<&str> = tools.iter().map(|t| t.split_once('=').map_or(t.as_str(), |(n, _)| n).trim()).collect();
         let named_services: Vec<&str> = services.iter().map(|s| service_name(s)).collect();
+        let named_presets: Vec<&str> = services.iter().map(|s| service_preset(s)).collect();
         self::detect(root)
             .into_iter()
-            .filter(|d| !(if d.kind == "tool" { &named_tools } else { &named_services }).contains(&d.name.as_str()))
+            .filter(|d| {
+                if d.kind == "tool" {
+                    !named_tools.contains(&d.name.as_str())
+                } else {
+                    !named_services.contains(&d.name.as_str()) && !named_presets.contains(&d.name.as_str())
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -159,6 +166,12 @@ fn service_name(spec: &str) -> &str {
     named.split_once('=').map_or(named, |(n, _)| n).trim()
 }
 
+/// The preset a `--service` spec asks for: after `=` when present, else the service name.
+fn service_preset(spec: &str) -> &str {
+    let named = spec.split_once('@').map_or(spec, |(n, _)| n);
+    named.split_once('=').map_or(named, |(_, p)| p).trim()
+}
+
 // ---- detection -----------------------------------------------------------------------------
 
 /// The most of one file detection reads. A larger file counts as present, but its contents are
@@ -191,10 +204,20 @@ impl Tree {
         self.file(name).is_some()
     }
 
-    /// `name`'s text, when it is a file inside the root of at most [`READ_LIMIT`] bytes of UTF-8.
+    /// `name`'s text, when it is a regular file inside the root of at most [`READ_LIMIT`] bytes
+    /// of UTF-8. Opens non-blocking (and `O_NOFOLLOW` on the resolved target) so a swapped FIFO
+    /// or symlink cannot block or escape the checkout.
     fn read(&self, name: &str) -> Option<String> {
         use std::io::Read;
-        let file = std::fs::File::open(self.file(name)?).ok()?;
+        let path = self.file(name)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = opts.open(&path).ok()?;
         if !file.metadata().ok()?.is_file() {
             return None;
         }
@@ -325,10 +348,10 @@ pub fn detect(root: &Path) -> Vec<DetectedItem> {
         found.tool("rust", None, "Cargo.toml");
     }
 
-    // Services: the images a Compose file runs, then the URLs an example environment names.
+    // Services: images under top-level `services:` in Compose files, then URLs in .env examples.
     for file in ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"] {
         let Some(text) = tree.read(file) else { continue };
-        for (preset, version) in text.lines().filter_map(compose_image) {
+        for (preset, version) in compose_service_images(&text) {
             found.service(preset, version, file);
         }
     }
@@ -390,6 +413,51 @@ fn pin(version: &str) -> Option<String> {
         && version != "system"
         && version.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.+".contains(&b));
     plain.then(|| version.to_string())
+}
+
+/// Scan Compose YAML for `image:` values inside the top-level `services:` block, ignoring
+/// extension blocks (`x-*`), other top-level sections, and indented block scalar strings.
+fn compose_service_images(text: &str) -> Vec<(&'static str, Option<String>)> {
+    let mut out = Vec::new();
+    let mut in_services = false;
+    let mut block_scalar_indent: Option<usize> = None;
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = raw.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        if let Some(base) = block_scalar_indent {
+            if indent > base {
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+        if indent == 0 {
+            in_services = trimmed == "services:" || trimmed.starts_with("services:#") || trimmed.starts_with("services: #");
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        let code = trimmed.split('#').next().unwrap_or("").trim_end();
+        if code.ends_with('|') || code.ends_with("|-") || code.ends_with("|+") || code.ends_with('>') || code.ends_with(">-") || code.ends_with(">+") {
+            block_scalar_indent = Some(indent);
+            continue;
+        }
+        if let Some(hit) = compose_image(trimmed) {
+            out.push(hit);
+        } else if let Some(brace_start) = code.find('{') {
+            if let Some(brace_end) = code[brace_start + 1..].find('}') {
+                for item in code[brace_start + 1..brace_start + 1 + brace_end].split(',') {
+                    if let Some(hit) = compose_image(item) {
+                        out.push(hit);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The preset a Compose `image:` line runs, and its major version when the tag starts with one.

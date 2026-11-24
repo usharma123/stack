@@ -656,20 +656,116 @@ fn binding_vars(
 /// a variable that names a key, token, secret or password is left out (SpiceDB's preshared
 /// key), and a password inside a URL is masked.
 fn endpoints(name: &str, service: &Service, port: u16, env: &IndexMap<String, String>) -> BTreeMap<String, String> {
-    mise::service_urls(name, service.preset.as_deref(), port, &IndexMap::new())
+    let rendered = mise::service_urls(name, service.preset.as_deref(), port, &IndexMap::new());
+    let port_str = port.to_string();
+    let colon_port = format!(":{port}");
+    // Confirm that at least one port-bearing variable in `env` actually points at this service's
+    // port (prevents a second service of the same preset, or an overridden env var pointing
+    // elsewhere, from attributing another instance's address to this service).
+    let primary_matches = rendered.iter().any(|(key, expected)| {
+        env.get(key).is_some_and(|val| {
+            val == expected || val == &port_str || val.contains(&colon_port) || val.contains(&format!("port={port}"))
+        })
+    });
+    rendered
         .into_iter()
-        .filter(|(key, _)| !["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|word| key.contains(word)))
-        .filter_map(|(key, _)| Some((key.clone(), mask_url_password(env.get(&key)?))))
+        .filter(|(key, _)| !is_sensitive_key(key))
+        .filter_map(|(key, expected)| {
+            let actual = env.get(&key)?;
+            let matches_port = actual == &expected
+                || actual == &port_str
+                || actual.contains(&colon_port)
+                || actual.contains(&format!("port={port}"));
+            let companion_var = matches!(
+                key.as_str(),
+                "PGHOST" | "PGUSER" | "PGDATABASE" | "CRDB_HTTP_PORT" | "NATS_MONITOR_PORT" | "SPICEDB_HTTP_PORT" | "SPICEDB_METRICS_PORT"
+            );
+            if !matches_port && !(companion_var && primary_matches) {
+                return None;
+            }
+            Some((key.clone(), sanitize_endpoint(&key, actual)?))
+        })
         .collect()
 }
 
-/// `value` with the password of a URL's user information, if it has one, replaced by `***`.
-fn mask_url_password(value: &str) -> String {
-    let Some((scheme, rest)) = value.split_once("://") else { return value.to_string() };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].rfind('@') else { return value.to_string() };
-    let Some(colon) = rest[..at].find(':') else { return value.to_string() };
-    format!("{scheme}://{}:***{}", &rest[..colon], &rest[at..])
+fn is_sensitive_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL"]
+        .iter()
+        .any(|word| upper.contains(word))
+}
+
+/// Sanitize an endpoint value for structured reports. Parses URLs via `url::Url` (masking
+/// passwords, query credentials, and username-only tokens on non-SQL schemes) and libpq keyword
+/// DSNs; omits values that cannot be safely parsed so credentials never leak.
+fn sanitize_endpoint(key: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    if value.contains("://") {
+        return sanitize_url(value);
+    }
+    if key.ends_with("_PORT") || key == "PGPORT" {
+        return value.bytes().all(|b| b.is_ascii_digit()).then(|| value.to_string());
+    }
+    if value.contains('=') {
+        return sanitize_kv_dsn(value);
+    }
+    // Plain host, host:port, user, or database name: never accept whitespace or `@`.
+    (!value.contains(char::is_whitespace) && !value.contains('@')).then(|| value.to_string())
+}
+
+fn sanitize_url(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    let keep_bare_user = matches!(parsed.scheme(), "postgres" | "postgresql" | "cockroachdb" | "mysql");
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(Some("***"));
+    } else if !parsed.username().is_empty() && !keep_bare_user {
+        // Schemes like nats://token@host:4222 carry a bearer token in the username slot.
+        let _ = parsed.set_username("***");
+    }
+    if parsed.query().is_some() {
+        let pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| {
+                let k_str = k.into_owned();
+                if is_sensitive_key(&k_str) || k_str.eq_ignore_ascii_case("pass") {
+                    (k_str, "***".to_string())
+                } else {
+                    (k_str, v.into_owned())
+                }
+            })
+            .collect();
+        parsed.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    let mut out = parsed.to_string();
+    if !value.ends_with('/') && parsed.path() == "/" && parsed.query().is_none() && parsed.fragment().is_none() {
+        if let Some(stripped) = out.strip_suffix('/') {
+            out = stripped.to_string();
+        }
+    }
+    Some(out)
+}
+
+/// Sanitize a libpq-style `key=value` DSN using `libpq_keywords`; masks sensitive keys and
+/// omits values that cannot be parsed cleanly.
+fn sanitize_kv_dsn(value: &str) -> Option<String> {
+    let pairs = libpq_keywords(value)?;
+    if pairs.is_empty() {
+        return None;
+    }
+    let out: Vec<String> = pairs
+        .into_iter()
+        .map(|(k, v)| {
+            if is_sensitive_key(&k) || k.eq_ignore_ascii_case("pass") {
+                format!("{k}=***")
+            } else {
+                format!("{k}={}", libpq_quote(&v))
+            }
+        })
+        .collect();
+    Some(out.join(" "))
 }
 
 /// The caller's environment, which commands inherit beneath the provider's. Used only to find
@@ -924,6 +1020,10 @@ pub struct LeaseOptions {
     /// --up` and `run --up` give [`DEFAULT_PREPARED_TTL`] so a one-shot call never leaves a
     /// session behind forever.
     pub fallback_ttl_secs: Option<u64>,
+    /// When true and neither `ttl_secs` nor `owner_pid` is given, preserve the current
+    /// session's lease (TTL, or a still-alive owner PID) read under the project lock before
+    /// falling back to `[session] default_ttl` / `fallback_ttl_secs`.
+    pub keep_existing_lease: bool,
 }
 
 /// The TTL `exec --up` and `run --up` give a session they start with no lease named, when the
@@ -931,11 +1031,30 @@ pub struct LeaseOptions {
 pub const DEFAULT_PREPARED_TTL: u64 = 30 * 60;
 
 impl LeaseOptions {
-    /// The lease to record: as given, else a TTL from the project's `[session] default_ttl`,
-    /// else the fallback.
+    /// The lease to record: as given, else (when `keep_existing_lease`) the session's current
+    /// lease read under the project lock, else a TTL from `[session] default_ttl`, else the
+    /// fallback.
     pub fn resolve(&self, default_ttl_secs: Option<u64>) -> (Option<u64>, Option<u32>) {
+        self.resolve_with_previous(default_ttl_secs, None, pid_alive)
+    }
+
+    pub(crate) fn resolve_with_previous(
+        &self,
+        default_ttl_secs: Option<u64>,
+        previous: Option<&Lease>,
+        alive: impl Fn(u32) -> bool,
+    ) -> (Option<u64>, Option<u32>) {
         if self.ttl_secs.is_some() || self.owner_pid.is_some() {
             return (self.ttl_secs, self.owner_pid);
+        }
+        if self.keep_existing_lease {
+            if let Some(prev) = previous {
+                let prev_ttl = prev.ttl_secs;
+                let prev_owner = prev.owner_pid.filter(|p| alive(*p));
+                if prev_ttl.is_some() || prev_owner.is_some() {
+                    return (prev_ttl, prev_owner);
+                }
+            }
         }
         (default_ttl_secs.or(self.fallback_ttl_secs), None)
     }
@@ -1225,7 +1344,11 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     // The labels this checkout's session had, with those given now added or replacing them.
     let mut labels = previous.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
     labels.extend(opts.labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let (ttl_secs, owner_pid) = lease.resolve(report.default_ttl_secs);
+    let (ttl_secs, owner_pid) = lease.resolve_with_previous(
+        report.default_ttl_secs,
+        previous.as_ref().and_then(|p| p.lease.as_ref()),
+        pid_alive,
+    );
     let lease = (ttl_secs.is_some() || owner_pid.is_some()).then_some(Lease { ttl_secs, owner_pid, renewed_at: stamp });
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
@@ -2852,7 +2975,58 @@ pub fn down_purging(ctx: &Ctx, stop_supervisor: bool, purge: bool) -> Result<Dow
 /// marker for the checkout (see [`unconfirmed_marker`]), which only `status` reads: without a
 /// session it keeps the checkout started until a `down` confirms, which removes it.
 pub fn down_forgetting(ctx: &Ctx, stop_supervisor: bool, purge: bool, forget_unrecorded: bool) -> Result<DownReport> {
+    down_inner(ctx, stop_supervisor, purge, forget_unrecorded, None, None)
+}
+
+/// Like [`down_purging`], but re-verifies under the project lock that the checkout's current
+/// session (or unconfirmed-down marker) still matches `required_labels` and `expected_session_id`
+/// before stopping or purging anything, preventing a concurrent `up --label` from being stopped
+/// under a stale fleet selection.
+pub(crate) fn down_matching(
+    ctx: &Ctx,
+    stop_supervisor: bool,
+    purge: bool,
+    required_labels: &crate::labels::Labels,
+    expected_session_id: Option<&str>,
+) -> Result<DownReport> {
+    down_inner(ctx, stop_supervisor, purge, false, Some(required_labels), expected_session_id)
+}
+
+fn down_inner(
+    ctx: &Ctx,
+    stop_supervisor: bool,
+    purge: bool,
+    forget_unrecorded: bool,
+    required_labels: Option<&crate::labels::Labels>,
+    expected_session_id: Option<&str>,
+) -> Result<DownReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
+    let existing = load(ctx).ok().flatten();
+    let existing_labels = existing
+        .as_ref()
+        .map(|s| s.labels.clone())
+        .or_else(|| unconfirmed_labels(&ctx.state, &ctx.root))
+        .unwrap_or_default();
+    if let Some(expected) = expected_session_id {
+        if let Some(current) = existing.as_ref() {
+            if current.id != expected {
+                return Err(StackError::new(
+                    "session_conflict",
+                    format!("checkout session changed from {expected} to {} while waiting to stop", current.id),
+                )
+                .hint("re-run the fleet `stack down` command so selection reflects the current session"));
+            }
+        }
+    }
+    if let Some(required) = required_labels.filter(|l| !l.is_empty()) {
+        if !crate::labels::matches(&existing_labels, required) {
+            return Err(StackError::new(
+                "session_conflict",
+                "checkout labels changed while waiting to stop; refusing to stop a non-matching session",
+            )
+            .hint("re-run `stack down` with the labels you want to stop"));
+        }
+    }
     let result = (|| {
         let forgotten = if forget_unrecorded { commands::forget_unrecorded(&ctx.state, &ctx.root)? } else { 0 };
         let mut report = down_unforgetting(ctx, stop_supervisor, purge)?;
@@ -2872,7 +3046,7 @@ pub fn down_forgetting(ctx: &Ctx, stop_supervisor: bool, purge: bool, forget_unr
             Ok(report)
         }
         Err(mut e) => {
-            if let Err(why) = mark_unconfirmed(ctx, &e) {
+            if let Err(why) = mark_unconfirmed(ctx, &e, existing_labels) {
                 e.message.push_str(&format!("; this unconfirmed `stack down` could not be recorded, so `stack status` may not show it ({})", why.message));
                 e.details.push(json!({ "kind": "marker", "error": why.message }));
             }
@@ -2884,21 +3058,35 @@ pub fn down_forgetting(ctx: &Ctx, stop_supervisor: bool, purge: bool, forget_unr
 /// Where a `down` that did not confirm leaves its marker for the checkout at `ctx.root` (keyed
 /// by the directory's identity, as the command registry is), when that identity can be computed.
 fn unconfirmed_marker(ctx: &Ctx) -> Option<PathBuf> {
-    crate::checkout::identity(&ctx.root).map(|id| ctx.state.join("unconfirmed").join(format!("{id}.json")))
+    unconfirmed_marker_at(&ctx.state, &ctx.root)
 }
 
-/// The marker a `down` that did not confirm leaves: when, and its error. Nothing but `status`
-/// reads it.
+fn unconfirmed_marker_at(state: &Path, root: &Path) -> Option<PathBuf> {
+    crate::checkout::identity(root).map(|id| state.join("unconfirmed").join(format!("{id}.json")))
+}
+
+/// The marker a `down` that did not confirm leaves: when, its error, and the labels the session
+/// carried before services were stopped so a label-filtered retry still finds it.
 #[derive(Debug, Serialize, Deserialize)]
 struct UnconfirmedDown {
     at_ms: u64,
     code: String,
     message: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    labels: crate::labels::Labels,
 }
 
-fn mark_unconfirmed(ctx: &Ctx, e: &StackError) -> Result<()> {
+fn mark_unconfirmed(ctx: &Ctx, e: &StackError, labels: crate::labels::Labels) -> Result<()> {
     let path = unconfirmed_marker(ctx).ok_or_else(|| StackError::new("state_invalid", "this directory's identity cannot be computed"))?;
-    write_json(&path, &UnconfirmedDown { at_ms: now_ms(), code: e.code.to_string(), message: e.message.clone() })
+    write_json(&path, &UnconfirmedDown { at_ms: now_ms(), code: e.code.to_string(), message: e.message.clone(), labels })
+}
+
+/// Labels persisted by an unconfirmed `stack down` for `root`, if a marker exists.
+pub(crate) fn unconfirmed_labels(state: &Path, root: &Path) -> Option<crate::labels::Labels> {
+    let path = unconfirmed_marker_at(state, root)?;
+    let bytes = fs::read(path).ok()?;
+    let m: UnconfirmedDown = serde_json::from_slice(&bytes).ok()?;
+    Some(m.labels)
 }
 
 fn clear_unconfirmed(ctx: &Ctx) -> Result<()> {
@@ -3705,6 +3893,16 @@ pub struct StatusReport {
 
 /// Always answers, even for a broken session: diagnosing that state is the point.
 pub fn status(ctx: &Ctx) -> Result<StatusReport> {
+    status_with(ctx, true)
+}
+
+/// Like [`status`], without renewing TTL leases: used by fleet `status` so polling every
+/// checkout on the machine does not keep idle sessions alive indefinitely.
+pub(crate) fn status_readonly(ctx: &Ctx) -> Result<StatusReport> {
+    status_with(ctx, false)
+}
+
+fn status_with(ctx: &Ctx, renew: bool) -> Result<StatusReport> {
     let _guard = project_lock(&ctx.state, &ctx.root)?;
     let mut session = load(ctx)?;
     let report = ctx.compile(false)?;
@@ -3737,8 +3935,10 @@ pub fn status(ctx: &Ctx) -> Result<StatusReport> {
     // Checking on a session is using it, as `exec` is: a lease that has not run out is
     // renewed. An expired one is left for GC rather than revived, and a session that is stale
     // or did not finish starting is not one to keep alive.
-    if let Some(session) = session.as_mut().filter(|s| !s.launching && !stale && lease_expired.is_none()) {
-        renew_in_status(ctx, session)?;
+    if renew {
+        if let Some(session) = session.as_mut().filter(|s| !s.launching && !stale && lease_expired.is_none()) {
+            renew_in_status(ctx, session)?;
+        }
     }
     let data_dirs = checks.iter().map(|c| (c.service.clone(), c.data_dir.clone())).collect();
     let init = crate::init_tasks::statuses(&ctx.state, &ctx.root, &report.stack, &data_dirs);
@@ -6826,24 +7026,29 @@ mod tests {
 
     #[test]
     fn url_passwords_are_masked_and_nothing_else_changes() {
-        for (value, masked) in [
-            ("postgresql://u:p@h:5432/db", "postgresql://u:***@h:5432/db"),
-            ("redis://:pw@127.0.0.1:6379", "redis://:***@127.0.0.1:6379"),
-            ("postgresql://u:p:q@h/db", "postgresql://u:***@h/db"),
-            ("postgresql://u@h/db", "postgresql://u@h/db"),
-            ("http://127.0.0.1:8080/a:b@c", "http://127.0.0.1:8080/a:b@c"),
-            ("127.0.0.1:50051", "127.0.0.1:50051"),
-            ("41000", "41000"),
+        for (key, value, masked) in [
+            ("DATABASE_URL", "postgresql://u:p@h:5432/db", Some("postgresql://u:***@h:5432/db")),
+            ("REDIS_URL", "redis://:pw@127.0.0.1:6379", Some("redis://:***@127.0.0.1:6379")),
+            ("DATABASE_URL", "postgresql://u:p:q@h/db", Some("postgresql://u:***@h/db")),
+            ("DATABASE_URL", "postgresql://u@h/db", Some("postgresql://u@h/db")),
+            ("DATABASE_URL", "postgresql://u@h:5432/db?password=s3cr3t&sslmode=disable", Some("postgresql://u@h:5432/db?password=***&sslmode=disable")),
+            ("DATABASE_URL", "host=127.0.0.1 port=5432 password='my secret' dbname=app", Some("host=127.0.0.1 port=5432 password=*** dbname=app")),
+            ("NATS_URL", "nats://secret-token@127.0.0.1:4222", Some("nats://***@127.0.0.1:4222")),
+            ("API_URL", "http://127.0.0.1:8080/a:b@c", Some("http://127.0.0.1:8080/a:b@c")),
+            ("SPICEDB_ENDPOINT", "127.0.0.1:50051", Some("127.0.0.1:50051")),
+            ("API_PORT", "41000", Some("41000")),
+            ("DATABASE_URL", "postgresql://[::bad", None),
+            ("DATABASE_URL", "host=127.0.0.1 password='unterminated", None),
         ] {
-            assert_eq!(mask_url_password(value), masked, "{value}");
+            assert_eq!(sanitize_endpoint(key, value).as_deref(), masked, "{key}={value}");
         }
     }
 
     #[test]
     fn a_lease_comes_from_the_command_then_the_project_then_the_fallback() {
-        let given = LeaseOptions { ttl_secs: Some(60), owner_pid: None, fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL) };
+        let given = LeaseOptions { ttl_secs: Some(60), owner_pid: None, fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL), keep_existing_lease: false };
         assert_eq!(given.resolve(Some(7200)), (Some(60), None));
-        let owned = LeaseOptions { ttl_secs: None, owner_pid: Some(42), fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL) };
+        let owned = LeaseOptions { ttl_secs: None, owner_pid: Some(42), fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL), keep_existing_lease: false };
         assert_eq!(owned.resolve(Some(7200)), (None, Some(42)), "an owner is a lease: no TTL is added");
         // `stack up` with nothing named: the project's default, else a session until `down`.
         let up = LeaseOptions::default();

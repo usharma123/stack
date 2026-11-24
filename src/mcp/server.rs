@@ -298,7 +298,7 @@ impl Server {
             },
             "tools/call" => {
                 // Calls after a held one are held too, so calls on one checkout keep their order.
-                if matches!(self.roots, Roots::Pending { .. }) && (needs_roots(params) || !self.deferred.is_empty()) {
+                if matches!(self.roots, Roots::Pending { .. }) && (needs_roots(self.profile, params) || !self.deferred.is_empty()) {
                     self.ask_roots_once();
                     self.deferred.push_back((message, reply));
                 } else {

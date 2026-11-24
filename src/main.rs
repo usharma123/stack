@@ -544,7 +544,7 @@ fn main() -> ExitCode {
             })
             .and_then(|(ttl_secs, owner_pid, timeout, labels)| {
                 let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone(), from_snapshot: from_snapshot.clone(), labels };
-                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid, fallback_ttl_secs: None }, timeout, opts)
+                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid, ..LeaseOptions::default() }, timeout, opts)
             })
             .map(|r| {
                 emit(cli.json, &r, || {
@@ -837,15 +837,20 @@ fn prepare(up: bool, ttl: Option<&str>, install: bool) -> Result<session::Prepar
     Ok(session::Prepare { up, ttl_secs, install })
 }
 
-/// `--project[=PATH]`: the project directory (the checkout's own without a path), canonical.
+/// `--project[=PATH]`: the project directory (the checkout's own without a path), canonicalized
+/// and resolved upward to its nearest `stack.toml` up to the Git worktree root.
 fn project_dir(root: &Path, project: Option<&Option<PathBuf>>) -> Result<Option<PathBuf>> {
     match project {
         None => Ok(None),
         Some(None) => Ok(Some(root.to_path_buf())),
-        Some(Some(path)) => path
-            .canonicalize()
-            .map(Some)
-            .map_err(|e| StackError::new("dir_not_found", format!("--project {}: {e}", path.display())).hint("pass --project=PATH with the path of an existing checkout of the project")),
+        Some(Some(path)) => {
+            let canonical = path.canonicalize().map_err(|e| {
+                StackError::new("dir_not_found", format!("--project {}: {e}", path.display()))
+                    .hint("pass --project=PATH with the path of an existing checkout of the project")
+            })?;
+            let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| h.canonicalize().ok());
+            Ok(Some(stack::discover::find(&canonical, home.as_deref()).root))
+        }
     }
 }
 

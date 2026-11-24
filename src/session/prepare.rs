@@ -2,13 +2,14 @@
 //! (`--up`, `--install`), which the caller would otherwise run and retry after an error.
 
 use super::{
-    install, startup_deadline, startup_timed_out, status, up, up_within, Ctx, ExecPlan, Lease, LeaseOptions, StatusReport, UpReport,
+    install, startup_deadline, startup_timed_out, status, up, up_within, Ctx, ExecPlan, LeaseOptions, StatusReport, UpReport,
     DEFAULT_PREPARED_TTL, DEFAULT_STARTUP_TIMEOUT,
 };
+#[cfg(test)]
+use super::Lease;
 use crate::error::{Result, StackError};
 use crate::ports;
 use crate::provider::scratch;
-use crate::state::pid_alive;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -121,29 +122,31 @@ pub fn needs_up(report: &StatusReport) -> Option<String> {
         .map(|c| format!("{} is not verified: {}", c.service, c.reason.as_deref().unwrap_or("unknown")))
 }
 
-/// The lease `--up` asks `up` for: `ttl_secs` when given, else the session's (a TTL, or an
-/// owner still alive). A session that has neither gets the project's `[session] default_ttl`,
-/// else [`DEFAULT_PREPARED_TTL`], never a lease that lives until `stack down`.
-fn prepared_lease(ttl_secs: Option<u64>, previous: Option<&Lease>, alive: impl Fn(u32) -> bool) -> LeaseOptions {
+/// The lease `--up` asks `up` for: `ttl_secs` when given, else preserve the session's current
+/// lease read under the startup lock (a TTL, or an owner still alive). A session that has
+/// neither gets the project's `[session] default_ttl`, else [`DEFAULT_PREPARED_TTL`], never a
+/// lease that lives until `stack down`.
+fn prepared_lease(ttl_secs: Option<u64>) -> LeaseOptions {
     match ttl_secs {
-        Some(ttl) => LeaseOptions { ttl_secs: Some(ttl), owner_pid: None, fallback_ttl_secs: None },
+        Some(ttl) => LeaseOptions { ttl_secs: Some(ttl), owner_pid: None, fallback_ttl_secs: None, keep_existing_lease: false },
         None => LeaseOptions {
-            ttl_secs: previous.and_then(|l| l.ttl_secs),
-            owner_pid: previous.and_then(|l| l.owner_pid).filter(|p| alive(*p)),
+            ttl_secs: None,
+            owner_pid: None,
             fallback_ttl_secs: Some(DEFAULT_PREPARED_TTL),
+            keep_existing_lease: true,
         },
     }
 }
 
 /// `--up`: `status`, then `up` when it would fix what status found. The session's lease is
-/// kept (a TTL, or an owner still alive) unless `ttl_secs` gives a new one; a session without
+/// kept (a TTL, or an owner still alive, read under `up`'s project lock so a concurrent
+/// `renew` or `up` is never overwritten) unless `ttl_secs` gives a new one; a session without
 /// one gets a default TTL (see [`prepared_lease`]). Startup gets what is left of the caller's
 /// deadline, at most `up`'s default.
 fn up_if_needed(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Option<Value>> {
     let report = status(ctx)?;
     let Some(reason) = needs_up(&report) else { return Ok(None) };
-    let previous = report.session.as_ref().and_then(|s| s.lease.as_ref());
-    let lease = prepared_lease(ttl_secs, previous, pid_alive);
+    let lease = prepared_lease(ttl_secs);
     let timeout = crate::process::remaining().map_or(DEFAULT_STARTUP_TIMEOUT, |r| r.min(DEFAULT_STARTUP_TIMEOUT));
     if timeout.is_zero() {
         return Err(StackError::new("timed_out", "no time is left to start the stack"));
@@ -178,7 +181,9 @@ mod tests {
     #[test]
     fn exec_up_keeps_a_sessions_lease_and_gives_one_without_a_default_ttl() {
         let lease = |ttl_secs, owner_pid| Lease { ttl_secs, owner_pid, renewed_at: 0 };
-        let resolved = |ttl: Option<u64>, previous: Option<&Lease>, project: Option<u64>| prepared_lease(ttl, previous, |pid| pid == 7).resolve(project);
+        let resolved = |ttl: Option<u64>, previous: Option<&Lease>, project: Option<u64>| {
+            prepared_lease(ttl).resolve_with_previous(project, previous, |pid| pid == 7)
+        };
         // No session, or one without a lease: the project's default, else 30 minutes, never a
         // session that outlives the call forever.
         assert_eq!(resolved(None, None, None), (Some(DEFAULT_PREPARED_TTL), None));

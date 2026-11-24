@@ -24,8 +24,34 @@ pub struct GitDirs {
     pub common_dir: PathBuf,
 }
 
+/// Read at most `limit` bytes of UTF-8 from `path` without blocking on FIFOs or non-regular files.
+fn read_bounded_file(path: &Path, limit: u64) -> Option<String> {
+    use std::io::Read;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > limit {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+const SMALL_GIT_FILE: u64 = 4 * 1024;
+const PACKED_REFS_LIMIT: u64 = 4 * 1024 * 1024;
+
 /// The Git directories of the worktree holding `start` (canonical), searching upward for `.git`
-/// as Git does. `None` outside Git or when what `.git` holds cannot be read.
+/// as Git does. `None` outside Git or when what `.git` holds cannot be read or is not a valid
+/// Git directory.
 pub fn locate(start: &Path) -> Option<GitDirs> {
     let mut dir = start;
     loop {
@@ -33,19 +59,33 @@ pub fn locate(start: &Path) -> Option<GitDirs> {
         if let Ok(meta) = fs::metadata(&dot) {
             let git_dir = if meta.is_dir() {
                 dot
-            } else {
-                let text = fs::read_to_string(&dot).ok()?;
+            } else if meta.is_file() {
+                let text = read_bounded_file(&dot, SMALL_GIT_FILE)?;
                 let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+                if target.is_empty() {
+                    return None;
+                }
                 dir.join(target)
+            } else {
+                return None;
             };
-            let common = match fs::read_to_string(git_dir.join("commondir")) {
-                Ok(text) => git_dir.join(text.trim()),
-                Err(_) => git_dir.clone(),
+            let git_dir = fs::canonicalize(&git_dir).ok()?;
+            // Validate that the resolved directory actually looks like a Git directory.
+            if !git_dir.is_dir() || !git_dir.join("HEAD").is_file() {
+                return None;
+            }
+            let common = match read_bounded_file(&git_dir.join("commondir"), SMALL_GIT_FILE) {
+                Some(text) if !text.trim().is_empty() => git_dir.join(text.trim()),
+                _ => git_dir.clone(),
             };
+            let common_dir = fs::canonicalize(common).ok()?;
+            if !common_dir.is_dir() {
+                return None;
+            }
             return Some(GitDirs {
                 toplevel: fs::canonicalize(dir).ok()?,
-                git_dir: fs::canonicalize(&git_dir).ok()?,
-                common_dir: fs::canonicalize(common).ok()?,
+                git_dir,
+                common_dir,
             });
         }
         dir = dir.parent()?;
@@ -65,7 +105,7 @@ const MAX_DEPTH: usize = 5;
 
 /// [`Head`] of the worktree whose directories are `dirs`.
 pub fn head(dirs: &GitDirs) -> Head {
-    let Ok(text) = fs::read_to_string(dirs.git_dir.join("HEAD")) else { return Head::default() };
+    let Some(text) = read_bounded_file(&dirs.git_dir.join("HEAD"), SMALL_GIT_FILE) else { return Head::default() };
     let text = text.trim();
     match text.strip_prefix("ref:") {
         Some(name) => {
@@ -84,7 +124,7 @@ fn resolve(dirs: &GitDirs, name: &str, depth: usize) -> Option<String> {
     // A worktree's own refs (`refs/bisect`, `refs/worktree`) are in its Git directory, the
     // shared ones in the common directory.
     for base in [&dirs.git_dir, &dirs.common_dir] {
-        if let Ok(text) = fs::read_to_string(base.join(name)) {
+        if let Some(text) = read_bounded_file(&base.join(name), SMALL_GIT_FILE) {
             let text = text.trim();
             return match text.strip_prefix("ref:") {
                 Some(next) => resolve(dirs, next.trim(), depth + 1),
@@ -98,7 +138,7 @@ fn resolve(dirs: &GitDirs, name: &str, depth: usize) -> Option<String> {
 /// `name`'s object in `packed-refs`: lines of `<object> <ref>`, with `#` comments and `^` peeled
 /// lines (which follow the tag they peel).
 fn packed(common: &Path, name: &str) -> Option<String> {
-    let text = fs::read_to_string(common.join("packed-refs")).ok()?;
+    let text = read_bounded_file(&common.join("packed-refs"), PACKED_REFS_LIMIT)?;
     text.lines().filter(|l| !l.starts_with('#') && !l.starts_with('^')).find_map(|l| {
         let (object, rest) = l.split_once(' ')?;
         (rest.trim() == name).then(|| object_name(object).map(String::from)).flatten()
@@ -121,25 +161,27 @@ pub struct Worktree {
     pub bare: bool,
 }
 
-/// The repository's worktrees, as `git worktree list --porcelain` run at `dir` lists them (one
-/// process for the whole repository). Empty outside Git or when git cannot be run.
+/// The repository's worktrees, as `git worktree list --porcelain -z` run at `dir` lists them
+/// (one process for the whole repository). Empty outside Git, when git fails, or if output was
+/// truncated.
 pub fn worktrees(dir: &Path) -> Vec<Worktree> {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(dir).args(["worktree", "list", "--porcelain"]).env("GIT_TERMINAL_PROMPT", "0");
+    command.arg("-C").arg(dir).args(["worktree", "list", "--porcelain", "-z"]).env("GIT_TERMINAL_PROMPT", "0");
     let Ok(out) = crate::process::capture(&mut command, std::time::Duration::from_secs(10), 1024 * 1024) else { return Vec::new() };
-    if out.exit_code != Some(0) || out.timed_out {
+    if out.exit_code != Some(0) || out.timed_out || out.stdout_truncated {
         return Vec::new();
     }
-    parse_worktrees(&out.stdout)
+    parse_worktrees_z(&out.stdout)
 }
 
-/// The porcelain format: blocks separated by empty lines, each starting `worktree <path>`.
-fn parse_worktrees(text: &str) -> Vec<Worktree> {
+/// The `-z` porcelain format: NUL-terminated records, empty record between stanzas, each stanza
+/// starting `worktree <path>`.
+fn parse_worktrees_z(text: &str) -> Vec<Worktree> {
     let mut out: Vec<Worktree> = Vec::new();
-    for line in text.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
+    for entry in text.split('\0') {
+        if let Some(path) = entry.strip_prefix("worktree ") {
             out.push(Worktree { path: PathBuf::from(path), bare: false });
-        } else if line == "bare" {
+        } else if entry == "bare" {
             if let Some(last) = out.last_mut() {
                 last.bare = true;
             }
@@ -249,12 +291,12 @@ mod tests {
 
     #[test]
     fn porcelain_listings_are_parsed() {
-        let text = "worktree /r\nHEAD 0123\nbranch refs/heads/main\n\nworktree /r/wt\nHEAD 4567\ndetached\n\nworktree /bare\nbare\n";
+        let text = "worktree /r\0HEAD 0123\0branch refs/heads/main\0\0worktree /r/wt\nline\0HEAD 4567\0detached\0\0worktree /bare\0bare\0\0";
         assert_eq!(
-            parse_worktrees(text),
+            parse_worktrees_z(text),
             vec![
                 Worktree { path: "/r".into(), bare: false },
-                Worktree { path: "/r/wt".into(), bare: false },
+                Worktree { path: "/r/wt\nline".into(), bare: false },
                 Worktree { path: "/bare".into(), bare: true }
             ]
         );
