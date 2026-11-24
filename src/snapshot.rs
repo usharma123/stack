@@ -382,10 +382,20 @@ pub struct Meta {
     pub services: IndexMap<String, SnapService>,
 }
 
-/// One generation of a snapshot, as read: where it is and its metadata.
+/// One generation of a snapshot, as read: where it is, its metadata, and which directory it is
+/// (device, inode), which a rename keeps and a new `save` changes.
 struct Generation {
     dir: PathBuf,
     meta: Meta,
+    identity: Option<[u64; 2]>,
+}
+
+impl Generation {
+    /// The same generation (the very directory, saved at the same time, of the same services):
+    /// put back from where an interrupted `save --force` set it aside counts, a new save does not.
+    fn same(&self, other: &Generation) -> bool {
+        self.identity.is_some() && self.identity == other.identity && self.meta.created_at == other.meta.created_at && self.meta.services.keys().eq(other.meta.services.keys())
+    }
 }
 
 /// `name`'s snapshot (see [`generation`]), whose metadata must name it.
@@ -399,7 +409,8 @@ fn read_generation(state: &Path, project: &ProjectId, name: &str) -> Result<Gene
             if meta.name != name {
                 return Err(invalid(format!("it describes snapshot '{}'", meta.name)));
             }
-            Ok(Generation { dir, meta })
+            let identity = dir_at(&dir);
+            Ok(Generation { dir, meta, identity })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found(state, project, name)),
         Err(e) => Err(io_error(path.display(), e)),
@@ -660,7 +671,8 @@ fn exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
 // nothing is recorded as restored, and the error (`restore_incomplete`) says where each
 // service's data is. An interrupted restore (a crash) is finished the same way by the next
 // snapshot operation or `up` of the checkout, before anything else touches the data: rolled
-// back before step 4, completed after it.
+// back before step 4, completed after it, and only with every service the journal names
+// confirmed stopped. `restart` refuses while a journal is there (see [`refuse_pending`]).
 
 /// One service's part of a restore, as the journal records it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -982,19 +994,34 @@ fn commit(state: &Path, root: &Path, journal: &Journal, how: &[&str]) -> Result<
     Ok(kept)
 }
 
+/// The journal of an interrupted restore of this checkout, if there is one. One that cannot be
+/// read is an error: which services it touched cannot be told.
+fn read_journal(state: &Path, root: &Path) -> Result<Option<Journal>> {
+    let path = journal_path(state, root);
+    match fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_error(path.display(), e)),
+        Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+            StackError::new("state_invalid", format!("{} cannot be read ({e})", path.display())).hint("remove it once the checkout's data directories are as they should be")
+        }),
+    }
+}
+
 /// Finish a restore of this checkout that was interrupted: undone when it had not committed,
 /// recorded when it had. `None` when there is none. The caller holds the project lock and has
-/// confirmed the journal's services are stopped ([`journaled`] names them).
-pub fn recover_restore(state: &Path, root: &Path) -> Result<Option<Value>> {
+/// confirmed `stopped` stopped, which must cover every service the journal names ([`journaled`]
+/// names them); otherwise nothing is touched.
+pub fn recover_restore(state: &Path, root: &Path, stopped: &[String]) -> Result<Option<Value>> {
     let path = journal_path(state, root);
-    let journal: Option<Journal> = match fs::read_to_string(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io_error(path.display(), e)),
-        Ok(text) => serde_json::from_str(&text).ok(),
-    };
-    let Some(journal) = journal else {
-        return Err(StackError::new("state_invalid", format!("{} cannot be read", path.display())).hint("remove it once the checkout's data directories are as they should be"));
-    };
+    let Some(journal) = read_journal(state, root)? else { return Ok(None) };
+    let unconfirmed: Vec<&str> = journal.swaps.iter().map(|s| s.service.as_str()).filter(|s| !stopped.iter().any(|n| n == s)).collect();
+    if !unconfirmed.is_empty() {
+        return Err(StackError::new(
+            "stop_unconfirmed",
+            format!("an interrupted restore of snapshot '{}' covers {}, not confirmed stopped; nothing was changed", journal.snapshot, unconfirmed.join(", ")),
+        )
+        .hint("run `stack down`, then `stack up`"));
+    }
     if journal.phase == "committed" {
         let kept = commit(state, root, &journal, &[])?;
         return Ok(Some(json!({ "snapshot": journal.snapshot, "interrupted_restore": "completed", "kept": kept })));
@@ -1008,10 +1035,21 @@ pub fn recover_restore(state: &Path, root: &Path) -> Result<Option<Value>> {
 }
 
 /// The services an interrupted restore of this checkout left, for the caller to confirm stopped
-/// before [`recover_restore`].
-pub fn journaled(state: &Path, root: &Path) -> Option<Vec<String>> {
-    let journal: Journal = serde_json::from_str(&fs::read_to_string(journal_path(state, root)).ok()?).ok()?;
-    Some(journal.swaps.into_iter().map(|s| s.service).collect())
+/// before [`recover_restore`]: every one the journal names, whether or not the configuration
+/// still defines it. `None` when there is none; an error when the journal cannot be read.
+pub fn journaled(state: &Path, root: &Path) -> Result<Option<Vec<String>>> {
+    Ok(read_journal(state, root)?.map(|j| j.swaps.into_iter().map(|s| s.service).collect()))
+}
+
+/// `restore_incomplete` for a command that would start services or claim their data while a
+/// restore of this checkout is still to be finished or undone (`restart`): it does neither.
+pub fn refuse_pending(state: &Path, root: &Path, command: &str) -> Result<()> {
+    let Some(services) = journaled(state, root)? else { return Ok(()) };
+    Err(incomplete(
+        format!("a snapshot restore of this checkout ({}) was interrupted; `{command}` changed nothing", services.join(", ")),
+        services.iter().map(|s| json!({ "service": s, "outcome": "pending" })).collect(),
+        &journal_path(state, root),
+    ))
 }
 
 fn restored(journal: &Journal, how: &[&str]) -> Vec<Value> {
@@ -1182,9 +1220,9 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
             .hint(format!("pick another name, `stack snapshot rm {name}`, or `stack snapshot save {name} --force` to replace it")));
     }
     let _run = init_tasks::run_lock(&ctx.state, &ctx.root)?;
-    let stopped = session::with_stopped(ctx, &services, |report, statuses| {
+    let stopped = session::with_stopped(ctx, &services, |report, statuses, confirmed| {
         // Never a copy of data a restore left half done.
-        let interrupted = recover_restore(&ctx.state, &ctx.root)?;
+        let interrupted = recover_restore(&ctx.state, &ctx.root, confirmed)?;
         let _store = store_lock(&ctx.state, &project)?;
         let base = store(&ctx.state, &project);
         fs::create_dir_all(&base).map_err(|e| io_error(base.display(), e))?;
@@ -1256,29 +1294,46 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
 pub fn restore(ctx: &Ctx, name: &str) -> Result<SnapshotReport> {
     valid_name(name)?;
     let project = project_id(&ctx.root);
-    let meta = read_meta(&ctx.state, &project, name)?;
-    compatible(&meta, &compile_readonly(ctx)?)?;
-    let services: Vec<String> = meta.services.keys().cloned().collect();
+    let chosen = read_generation(&ctx.state, &project, name)?;
+    compatible(&chosen.meta, &compile_readonly(ctx)?)?;
+    let services: Vec<String> = chosen.meta.services.keys().cloned().collect();
     let _run = init_tasks::run_lock(&ctx.state, &ctx.root)?;
-    let stopped = session::with_stopped(ctx, &services, |report, statuses| {
-        let interrupted = recover_restore(&ctx.state, &ctx.root)?;
+    let stopped = session::with_stopped(ctx, &services, |report, statuses, confirmed| {
+        let interrupted = recover_restore(&ctx.state, &ctx.root, confirmed)?;
         let _store = store_lock(&ctx.state, &project)?;
         recover_store(&store(&ctx.state, &project))?;
-        // Read again under the lock: it may have been replaced or removed meanwhile.
-        let meta = read_meta(&ctx.state, &project, name)?;
-        compatible(&meta, report)?;
-        let snapshot = store(&ctx.state, &project).join(name);
+        // Read again under the lock: it may have been replaced or removed meanwhile, by a
+        // `save --force` of another checkout. Only the generation whose services were stopped
+        // is restored; another is refused before anything is replaced.
+        let now = read_generation(&ctx.state, &project, name)?;
+        check_same(&chosen, &now, confirmed)?;
+        compatible(&now.meta, report)?;
         // Every directory is checked, and held, before any is replaced.
         let plan: Vec<(String, SnapService, DataDir)> =
-            meta.services.iter().map(|(service, snap)| Ok((service.clone(), snap.clone(), data_dir(ctx, statuses, service)?))).collect::<Result<_>>()?;
-        let restored = restore_services(ctx, name, &snapshot, &plan)?;
+            now.meta.services.iter().map(|(service, snap)| Ok((service.clone(), snap.clone(), data_dir(ctx, statuses, service)?))).collect::<Result<_>>()?;
+        let restored = restore_services(ctx, name, &now.dir, &plan)?;
         let mut out = json!({ "restored": restored });
         if let Some(interrupted) = interrupted {
             out["interrupted_restore"] = interrupted;
         }
         Ok(out)
     })?;
-    Ok(SnapshotReport { name: name.to_string(), project, services, steps: stopped.steps, restarted: stopped.restarted, checks: stopped.checks, meta: Some(meta) })
+    Ok(SnapshotReport { name: name.to_string(), project, services, steps: stopped.steps, restarted: stopped.restarted, checks: stopped.checks, meta: Some(chosen.meta) })
+}
+
+/// The generation read under the store lock (`now`) is the one `chosen` before its services
+/// were stopped, and those services are all confirmed stopped: `snapshot_failed` otherwise, with
+/// nothing replaced.
+fn check_same(chosen: &Generation, now: &Generation, confirmed: &[String]) -> Result<()> {
+    let name = &chosen.meta.name;
+    if !chosen.same(now) {
+        return Err(StackError::new("snapshot_failed", format!("snapshot '{name}' was replaced while its services were stopped for the restore; nothing was restored"))
+            .hint(format!("retry `stack snapshot restore {name}` to restore the snapshot as it is now")));
+    }
+    if let Some(service) = now.meta.services.keys().find(|s| !confirmed.contains(s)) {
+        return Err(StackError::new("stop_unconfirmed", format!("'{service}' was not confirmed stopped; nothing was restored")).hint("run `stack down`, then retry"));
+    }
+    Ok(())
 }
 
 /// `up --from-snapshot`: refused before anything starts when the snapshot is missing or does
@@ -1300,7 +1355,7 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
     let project = project_id(&ctx.root);
     let _store = store_lock(&ctx.state, &project)?;
     recover_store(&store(&ctx.state, &project))?;
-    let Generation { dir: snapshot, meta } = read_generation(&ctx.state, &project, name)?;
+    let Generation { dir: snapshot, meta, .. } = read_generation(&ctx.state, &project, name)?;
     compatible(&meta, report)?;
     let unresolved = crate::supervisor::unresolved(&crate::supervisor::dir(&ctx.state, &ctx.root));
     if !unresolved.is_empty() {
@@ -1331,7 +1386,7 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
 /// this checkout that was interrupted (see [`recover_restore`]), provided none of its services
 /// may still run. `None` when there was none.
 pub fn recover_before_start(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<Option<Value>> {
-    let Some(services) = journaled(&ctx.state, &ctx.root).or_else(|| journal_path(&ctx.state, &ctx.root).exists().then(Vec::new)) else { return Ok(None) };
+    let Some(services) = journaled(&ctx.state, &ctx.root)? else { return Ok(None) };
     let running: Vec<&String> = services.iter().filter(|s| statuses.iter().any(|d| d.name == **s && session::may_run(d))).collect();
     let unresolved = crate::supervisor::unresolved(&crate::supervisor::dir(&ctx.state, &ctx.root));
     if !running.is_empty() || !unresolved.is_empty() {
@@ -1340,7 +1395,7 @@ pub fn recover_before_start(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<Opti
             .with_detail(json!({ "running": running }))
             .details(unresolved));
     }
-    recover_restore(&ctx.state, &ctx.root)
+    recover_restore(&ctx.state, &ctx.root, &services)
 }
 
 #[derive(Debug, Serialize)]
@@ -1621,12 +1676,12 @@ mod tests {
             assert_eq!(r.journal().unwrap().phase, "swapping", "the journal stays for the next operation");
             assert!(r.markers().is_empty(), "nothing was recorded as restored");
             // The next operation undoes it.
-            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
             assert_eq!(recovered["interrupted_restore"], "rolled_back", "{recovered}");
             assert_eq!(r.contents(), ["old-db", "old-cache"]);
             assert_eq!(r.identities(), before);
             assert!(r.leftovers().is_empty() && r.journal().is_none(), "{:?}", r.leftovers());
-            assert_eq!(recover_restore(&r.ctx.state, &r.ctx.root).unwrap(), None);
+            assert_eq!(recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap(), None);
         });
     }
 
@@ -1640,8 +1695,8 @@ mod tests {
             r.run().unwrap_err();
             inject(None, None, None, false);
             assert_eq!(r.contents(), ["new-db", "new-cache", "old-queue"]);
-            assert_eq!(journaled(&r.ctx.state, &r.ctx.root).unwrap(), ["db", "cache", "queue"]);
-            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            assert_eq!(journaled(&r.ctx.state, &r.ctx.root).unwrap().unwrap(), ["db", "cache", "queue"]);
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
             assert_eq!(recovered["interrupted_restore"], "rolled_back");
             let outcomes: Vec<&str> = recovered["services"].as_array().unwrap().iter().map(|s| s["outcome"].as_str().unwrap()).collect();
             assert_eq!(outcomes, ["rolled_back", "rolled_back", "unchanged"]);
@@ -1657,7 +1712,7 @@ mod tests {
             assert_eq!(Restore::outcomes(&e), pairs(&[("db", "restored"), ("cache", "restored"), ("queue", "restored")]));
             assert_eq!(r.journal().unwrap().phase, "committed");
             assert!(r.markers().is_empty(), "not recorded yet");
-            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
             assert_eq!(recovered["interrupted_restore"], "completed", "{recovered}");
             assert_eq!(r.contents(), ["new-db", "new-cache", "new-queue"]);
             assert_eq!(r.markers().len(), 3);
@@ -1693,7 +1748,7 @@ mod tests {
             if replaced {
                 write(&r.target("cache").join("file"), "intruder");
             }
-            let e = recover_restore(&r.ctx.state, &r.ctx.root).unwrap_err();
+            let e = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap_err();
             assert_eq!(e.code, "restore_incomplete", "{e}");
             assert!(e.message.contains("is no longer the restored copy"), "{e}");
             assert_eq!(Restore::outcomes(&e), pairs(&[("db", "restored"), ("cache", "manual_recovery")]));
@@ -1704,7 +1759,7 @@ mod tests {
             assert_eq!(old_data(&r), old, "no old data is removed");
             assert_eq!(r.journal().unwrap().phase, "committed", "the journal stays");
             // Again, the same answer: nothing moved meanwhile.
-            assert_eq!(recover_restore(&r.ctx.state, &r.ctx.root).unwrap_err().code, "restore_incomplete");
+            assert_eq!(recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap_err().code, "restore_incomplete");
             assert_eq!(old_data(&r), old);
         }
         // Another checkout's token, and a record that no longer names this checkout's directory.
@@ -1720,7 +1775,7 @@ mod tests {
                 _ => datadirs::forget(&r.ctx.state, |e| e.service == "db").unwrap(),
             }
             let recorded = ledger(&r);
-            let e = recover_restore(&r.ctx.state, &r.ctx.root).unwrap_err();
+            let e = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap_err();
             assert_eq!(e.code, "restore_incomplete", "{case}: {e}");
             let outcomes = Restore::outcomes(&e);
             assert_eq!(outcomes[0], ("db".to_string(), "manual_recovery".to_string()), "{case}: {e}");
@@ -1741,7 +1796,7 @@ mod tests {
             assert_eq!(r.markers().len(), 2);
             let entry = |name: &str| datadirs::entries(&r.ctx.state).unwrap().into_iter().find(|e| e.service == name).unwrap();
             assert_ne!(entry("db").identity, dir_at(&r.target("db")), "not bound yet");
-            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
             assert_eq!(recovered["interrupted_restore"], "completed", "{recovered}");
             for name in ["db", "cache"] {
                 assert_eq!(entry(name).identity, dir_at(&r.target(name)), "bound to the restored copy");
@@ -1757,9 +1812,82 @@ mod tests {
         let target = r.target("db");
         journal.swaps.push(Swap { service: "db".into(), dir: target.clone(), target: target.clone(), fresh: target.with_file_name(".db.stack-restore-1-1"), aside: target.with_file_name(".db.stack-old-1-1"), old: Some([1, 1]), new: dir_at(&target).unwrap() });
         write_json(&journal_path(&r.ctx.state, &r.ctx.root), &journal).unwrap();
-        let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+        let recovered = recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
         assert_eq!(recovered["interrupted_restore"], "completed", "{recovered}");
         assert!(r.journal().is_none());
+    }
+
+    #[test]
+    fn an_interrupted_restore_is_finished_only_with_every_service_it_names_confirmed_stopped() {
+        let r = Restore::new(&["db", "cache"], true);
+        let before = r.identities();
+        inject(None, None, Some(1), false);
+        r.run().unwrap_err();
+        inject(None, None, None, false);
+        assert_eq!(r.contents(), ["new-db", "old-cache"]);
+        // Confirming only the service a command named is not enough.
+        let e = recover_restore(&r.ctx.state, &r.ctx.root, &["cache".to_string()]).unwrap_err();
+        assert_eq!(e.code, "stop_unconfirmed", "{e}");
+        assert!(e.message.contains("db"), "{e}");
+        assert_eq!(r.contents(), ["new-db", "old-cache"], "nothing was changed");
+        assert!(r.journal().is_some());
+        assert_eq!(refuse_pending(&r.ctx.state, &r.ctx.root, "restart").unwrap_err().code, "restore_incomplete");
+        recover_restore(&r.ctx.state, &r.ctx.root, &r.names).unwrap().unwrap();
+        assert_eq!(r.identities(), before);
+        refuse_pending(&r.ctx.state, &r.ctx.root, "restart").unwrap();
+        // A journal that cannot be read names no services, and is never taken for none.
+        write(&journal_path(&r.ctx.state, &r.ctx.root), "{ damaged");
+        assert_eq!(journaled(&r.ctx.state, &r.ctx.root).unwrap_err().code, "state_invalid");
+        assert_eq!(refuse_pending(&r.ctx.state, &r.ctx.root, "restart").unwrap_err().code, "state_invalid");
+    }
+
+    #[test]
+    fn a_restore_goes_ahead_only_with_the_generation_whose_services_were_stopped() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        let confirmed = ["db".to_string()];
+        let with_db = |path: &Path, created_at: u64, services: &[&str]| {
+            snapshot_dir(path, "base", created_at, "data");
+            let mut meta: Meta = serde_json::from_str(&fs::read_to_string(path.join(META)).unwrap()).unwrap();
+            let snap = SnapService { preset: "postgres".into(), version: "17.1".into(), major: "17".into(), files: 1, bytes: 1, init: InitState::None, init_digest: None, init_resume: None };
+            meta.services = services.iter().map(|s| (s.to_string(), snap.clone())).collect();
+            write(&path.join(META), &serde_json::to_string(&meta).unwrap());
+        };
+        with_db(&base.join("base"), 1, &["db"]);
+        let chosen = read_generation(state.path(), &project, "base").unwrap();
+        check_same(&chosen, &read_generation(state.path(), &project, "base").unwrap(), &confirmed).unwrap();
+
+        // Replaced by a forced save of another checkout, even within the same second, or with
+        // another service set: refused before anything is replaced.
+        for (created_at, services) in [(2, &["db"][..]), (1, &["db"][..]), (1, &["db", "cache"][..])] {
+            let tmp = unique(&base, ".tmp-base");
+            with_db(&tmp, created_at, services);
+            publish(&base, "base", &tmp, &base.join("base")).unwrap();
+            let now = read_generation(state.path(), &project, "base").unwrap();
+            let e = check_same(&chosen, &now, &confirmed).unwrap_err();
+            assert_eq!(e.code, "snapshot_failed", "{created_at} {services:?}: {e}");
+            assert!(e.message.contains("was replaced"), "{e}");
+        }
+
+        // The same generation, put back from where an interrupted save set it aside, goes ahead.
+        let _ = fs::remove_dir_all(&base);
+        with_db(&base.join("base"), 1, &["db"]);
+        let tmp = unique(&base, ".tmp-base");
+        with_db(&tmp, 2, &["db"]);
+        datadirs::NO_EXCHANGE.with(|c| c.set(true));
+        FAIL_RENAMES.with(|c| c.set(&["publish", "put_back"]));
+        publish(&base, "base", &tmp, &base.join("base")).unwrap_err();
+        FAIL_RENAMES.with(|c| c.set(&[]));
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
+        let chosen = read_generation(state.path(), &project, "base").unwrap();
+        assert!(chosen.dir.file_name().unwrap().to_str().unwrap().starts_with(".old-base-"));
+        recover_store(&base).unwrap();
+        let now = read_generation(state.path(), &project, "base").unwrap();
+        assert_eq!(now.dir, base.join("base"));
+        check_same(&chosen, &now, &confirmed).unwrap();
+        // A service of it that was not confirmed stopped is refused all the same.
+        assert_eq!(check_same(&chosen, &now, &[]).unwrap_err().code, "stop_unconfirmed");
     }
 
     #[test]

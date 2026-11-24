@@ -615,3 +615,102 @@ fn up_finishes_or_refuses_a_restore_that_was_interrupted() {
     f.ok(&a, &["up"]);
     f.ok(&a, &["down"]);
 }
+
+#[test]
+fn an_interrupted_restore_is_finished_only_with_every_service_it_covers_stopped() {
+    let f = Fixture::new(&two_services());
+    let a = f.repo();
+    f.ok(&a, &["compile"]);
+    f.env_for(&a, Some("A"));
+    f.ok(&a, &["up"]);
+    // As a crash leaves it before any swap: cache's restored copy made, nothing replaced yet.
+    let cache = f.data_of("A", "cache").canonicalize().unwrap();
+    let before = ino(&cache);
+    let fresh = cache.with_file_name(".cache.stack-restore-99-1");
+    fs::create_dir(&fresh).unwrap();
+    let journal = |service: &str, target: &Path| {
+        json!({
+            "snapshot": "x", "phase": "swapping", "token": "t", "markers": {},
+            "swaps": [{ "service": service, "dir": f.data_of("A", "cache"), "target": target, "fresh": fresh, "aside": target.with_file_name(".cache.stack-old-99-1"), "old": ino(target), "new": ino(&fresh) }],
+        })
+        .to_string()
+    };
+    fs::create_dir_all(f.journal("A").parent().unwrap()).unwrap();
+    fs::write(f.journal("A"), journal("cache", &cache)).unwrap();
+
+    // `restart` neither starts services on that data nor rebinds it; it changes nothing.
+    let restart = f.json(&a, &["restart", "db"]);
+    assert_eq!(restart["error"]["code"], "restore_incomplete", "{restart}");
+    assert!(f.journal("A").exists() && fresh.exists());
+    assert_eq!(f.ok(&a, &["status"])["healthy"], true, "nothing was stopped");
+
+    // A save of db alone also stops cache, which the restore covers, before finishing it, and
+    // starts both again after.
+    let saved = f.ok(&a, &["snapshot", "save", "db-only", "--service", "db"]);
+    let mut restarted: Vec<&str> = saved["restarted"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    restarted.sort();
+    assert_eq!(restarted, ["cache", "db"], "{saved}");
+    let copy = saved["steps"].as_array().unwrap().iter().find(|s| s["step"] == "copy").unwrap_or_else(|| panic!("{saved}"));
+    assert_eq!(copy["detail"]["interrupted_restore"]["interrupted_restore"], "rolled_back", "{saved}");
+    assert_eq!(ino(&cache), before);
+    assert!(!fresh.exists() && !f.journal("A").exists());
+    assert_eq!(f.ok(&a, &["status"])["healthy"], true);
+    f.ok(&a, &["restart", "db"]);
+    f.ok(&a, &["down"]);
+
+    // A journaled service stack.toml no longer defines is checked all the same: not running, so
+    // the restore is finished.
+    fs::write(a.join("stack.toml"), STACK).unwrap();
+    git(&a, &["commit", "-qam", "drop cache"]);
+    f.ok(&a, &["compile"]);
+    fs::create_dir(&fresh).unwrap();
+    fs::write(f.journal("A"), journal("cache", &cache)).unwrap();
+    let saved = f.ok(&a, &["snapshot", "save", "after", "--service", "db"]);
+    let copy = saved["steps"].as_array().unwrap().iter().find(|s| s["step"] == "copy").unwrap_or_else(|| panic!("{saved}"));
+    assert_eq!(copy["detail"]["interrupted_restore"]["interrupted_restore"], "rolled_back", "{saved}");
+    assert!(!fresh.exists() && !f.journal("A").exists());
+}
+
+#[test]
+fn a_committed_restore_whose_copy_vanished_is_never_recorded() {
+    let f = Fixture::new(STACK);
+    let a = f.repo();
+    f.ok(&a, &["compile"]);
+    f.env_for(&a, Some("A"));
+    f.ok(&a, &["up"]);
+    f.ok(&a, &["down"]);
+    let markers = || fs::read_to_string(f.dir.path().join("state/init").join(format!("{}.json", stack::state::project_key(&f.roots.borrow()["A"])))).unwrap_or_default();
+    let ledger = || fs::read_to_string(f.dir.path().join("state/data.json")).unwrap();
+    let (markers_before, ledger_before) = (markers(), ledger());
+    // As a committed restore whose recording was interrupted leaves it, but the restored copy
+    // is no longer at db's place: what is there is the data that was there before the restore.
+    let data = f.data_dir("A");
+    let target = data.canonicalize().unwrap();
+    let aside = target.with_file_name(".db.stack-old-99-1");
+    fs::create_dir(&aside).unwrap();
+    fs::write(aside.join("applied"), "old data\n").unwrap();
+    let token = stack::checkout::token(&f.roots.borrow()["A"]).unwrap();
+    let journal = json!({
+        "snapshot": "x", "phase": "committed", "token": token, "markers": { "db": null },
+        "swaps": [{ "service": "db", "dir": data, "target": target, "fresh": target.with_file_name(".db.stack-restore-99-1"), "aside": aside, "old": ino(&aside), "new": [1, 2] }],
+    });
+    fs::create_dir_all(f.journal("A").parent().unwrap()).unwrap();
+    fs::write(f.journal("A"), journal.to_string()).unwrap();
+
+    for args in [&["up"][..], &["snapshot", "save", "y"][..]] {
+        let out = f.json(&a, args);
+        assert_eq!(out["error"]["code"], "restore_incomplete", "{args:?}: {out}");
+        assert!(out["error"]["message"].as_str().unwrap().contains("is no longer the restored copy"), "{out}");
+        let services = out["error"]["details"].as_array().unwrap().iter().find_map(|d| d["services"].as_array()).unwrap();
+        assert_eq!(services[0]["outcome"], "manual_recovery", "{out}");
+        assert_eq!(services[0]["old_data"], json!(aside), "{out}");
+        // Nothing recorded, rebound or removed.
+        assert!(f.journal("A").exists() && aside.join("applied").exists(), "{args:?}");
+        assert_eq!((markers(), ledger()), (markers_before.clone(), ledger_before.clone()), "{args:?}");
+    }
+    // Resolved by hand, as the hint says.
+    fs::remove_file(f.journal("A")).unwrap();
+    fs::remove_dir_all(&aside).unwrap();
+    f.ok(&a, &["up"]);
+    f.ok(&a, &["down"]);
+}

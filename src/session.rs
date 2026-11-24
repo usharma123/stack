@@ -2380,6 +2380,9 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     if has_active_executions(&session) {
         return Err(busy(&session, "restart"));
     }
+    // Data a snapshot restore left to finish or undo is never started on or rebound here: that
+    // is for `up` or the snapshot command, which confirm every service it touched stopped.
+    crate::snapshot::refuse_pending(&ctx.state, &ctx.root, "restart")?;
     let report = ctx.compile(true)?;
     refuse_root(&report)?;
     mise::trust_once(&ctx.state, &ctx.root)?;
@@ -2510,7 +2513,10 @@ pub struct StoppedReport {
 
 /// Run `operation` with the named services confirmed stopped, under the project lock, then
 /// start and verify again those that were running (for snapshots, which copy data
-/// directories). Stopping and starting are `restart`'s: services that depend on a stopped one
+/// directories). The services an interrupted snapshot restore of this checkout names (see
+/// [`crate::snapshot::journaled`]) are confirmed stopped with them, since the operation finishes
+/// that restore first; one the configuration no longer defines cannot be stopped from here, and
+/// must already be shown not to run. `operation` gets every service confirmed stopped. Stopping and starting are `restart`'s: services that depend on a stopped one
 /// are stopped first and started after it, each service's `setup` runs before it starts, and
 /// the supervisor this environment names is the one addressed. `operation` gets the compiled
 /// report and the supervisor listing taken once they stopped. Services that run must belong to
@@ -2520,7 +2526,7 @@ pub struct StoppedReport {
 pub fn with_stopped(
     ctx: &Ctx,
     names: &[String],
-    operation: impl FnOnce(&Report, &[DaemonStatus]) -> Result<Value>,
+    operation: impl FnOnce(&Report, &[DaemonStatus], &[String]) -> Result<Value>,
 ) -> Result<StoppedReport> {
     let _deadline = crate::process::deadline_scope(Some(startup_deadline(DEFAULT_STARTUP_TIMEOUT)?));
     let mut steps = Steps::default();
@@ -2544,12 +2550,27 @@ pub fn with_stopped(
         return Err(StackError::new("session_stale", "these services were started by an older Stack under Pitchfork")
             .hint("run `stack up` (or `stack down`) first, then retry"));
     }
+    // Read under the project lock, which every restore holds while it writes its journal.
+    let mut confirm: Vec<String> = names.to_vec();
+    for service in crate::snapshot::journaled(&ctx.state, &ctx.root)?.unwrap_or_default() {
+        if !confirm.contains(&service) {
+            confirm.push(service);
+        }
+    }
     let statuses = listing(ctx, &report);
     let live = |n: &String| {
         statuses.iter().any(|d| d.name == *n && may_run(d))
             || session.as_ref().and_then(|s| s.services.get(n)).is_some_and(|r| r.pid.is_some_and(pid_alive))
     };
-    let mut stopping: Vec<String> = names.iter().filter(|n| live(n)).cloned().collect();
+    let undefined: Vec<&str> = confirm.iter().filter(|n| !report.stack.services.contains_key(*n) && live(n)).map(String::as_str).collect();
+    if !undefined.is_empty() {
+        return Err(StackError::new(
+            "stop_unconfirmed",
+            format!("an interrupted snapshot restore covers {}, which stack.toml no longer defines and which may still run; no data was touched", undefined.join(", ")),
+        )
+        .hint("run `stack down`, which stops what it can show is this checkout's, then retry"));
+    }
+    let mut stopping: Vec<String> = confirm.iter().filter(|n| report.stack.services.contains_key(*n) && live(n)).cloned().collect();
     if !stopping.is_empty() {
         let current = session.as_ref().is_some_and(|s| !s.launching && same_config(s, ctx, &report));
         if !current {
@@ -2570,7 +2591,7 @@ pub fn with_stopped(
     }
     // The supervisor must agree that nothing named still runs before any data is touched.
     let stopped = listing(ctx, &report);
-    let still: Vec<&str> = names
+    let still: Vec<&str> = confirm
         .iter()
         .filter(|n| stopped.iter().any(|d| d.name == **n && may_run(d)))
         .map(String::as_str)
@@ -2589,7 +2610,7 @@ pub fn with_stopped(
             .details(unresolved);
         return Err(steps.fail("confirm_stopped", err, !stopping.is_empty()));
     }
-    let outcome = operation(&report, &stopped);
+    let outcome = operation(&report, &stopped, &confirm);
     let result = match &outcome {
         Ok(v) => {
             steps.ok("copy", v.clone());
