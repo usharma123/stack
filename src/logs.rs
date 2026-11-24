@@ -17,7 +17,8 @@ use std::time::Duration;
 /// offset after the last whole line read. Callers keep it as an opaque string: `v1`, then
 /// `;<service, hex>:<device>:<inode>:<offset>` per service, or `;<service, hex>` for one with no
 /// log yet (its tail is read next time). An empty string is a cursor with no services: every
-/// service's tail is read, as a cursor read reports it.
+/// service's tail is read, as a cursor read reports it. A name no service can have (see
+/// [`crate::manifest::valid_service_name`]) makes the cursor invalid.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor(IndexMap<String, Option<LogPos>>);
 
@@ -40,7 +41,10 @@ impl Cursor {
                 [name, dev, ino, offset] => (name, Some(LogPos { dev: num(dev)?, ino: num(ino)?, offset: num(offset)? })),
                 _ => return Err(invalid()),
             };
-            cursor.0.insert(unhex(name).ok_or_else(invalid)?, pos);
+            // Only a name a service can have (see `crate::manifest::valid_service_name`): a cursor
+            // is read back from a caller, and names the log file it reads.
+            let name = unhex(name).filter(|n| crate::manifest::valid_service_name(n)).ok_or_else(invalid)?;
+            cursor.0.insert(name, pos);
         }
         Ok(cursor)
     }
@@ -205,8 +209,9 @@ fn after(ctx: &Ctx, service: &str, pos: LogPos, q: &Query) -> Result<LogsReport>
     let (mut at, mut more) = (read.pos, read.more);
     for (i, record) in read.records.into_iter().enumerate() {
         if lines.len() == q.tail {
-            // Full: the next read starts after the last line looked at.
-            (at, more) = (Some(read.ends[i - 1]), true);
+            // Full: the next read starts after the last line looked at (where this one began,
+            // when none was: a tail of 0 takes nothing).
+            (at, more) = (Some(i.checked_sub(1).map_or(pos, |last| read.ends[last])), true);
             break;
         }
         if from.map_or(true, |f| record.at_ms >= f) && q.matches(&record.line) {
@@ -429,6 +434,42 @@ mod tests {
         assert_eq!(Cursor::parse("v1").unwrap(), Cursor::default());
         for bad in ["v2;6462:1:2:3", "v1;6462:1:2", "v1;6462:1", "v1;646:1:2:3", "v1;zz:1:2:3", "v1;6462:1:2:-3", "x", "v1;;"] {
             assert_eq!(Cursor::parse(bad).unwrap_err().code, "usage", "{bad}");
+        }
+        // Names no service can have: a path out of the log directory, `.`, `..`, NUL.
+        for name in ["../spec", "a/b", ".", "..", "/etc/x", "nul\0"] {
+            let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+            for text in [format!("v1;{hex}"), format!("v1;{hex}:1:2:3")] {
+                assert_eq!(Cursor::parse(&text).unwrap_err().code, "usage", "{name:?}");
+            }
+        }
+        // Every name a project gives a service still round-trips.
+        let names = Cursor(["api.v2", "My Service", "...", "サービス"].into_iter().map(|n| (n.to_string(), None)).collect());
+        assert_eq!(Cursor::parse(&names.encode()).unwrap(), names);
+    }
+
+    /// A context whose Stack state is `state`, for a checkout at `root` (nothing compiled).
+    fn ctx(state: &std::path::Path, root: &std::path::Path) -> Ctx {
+        Ctx { root: root.to_path_buf(), cache: state.join("cache"), state: state.to_path_buf() }
+    }
+
+    #[test]
+    fn a_cursor_read_of_no_lines_takes_none_and_keeps_its_place() {
+        let (state, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ctx = ctx(state.path(), root.path());
+        let dir = supervisor::dir(&ctx.state, &ctx.root);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(supervisor::log_path(&dir, "db"), "100 dummy one\n200 dummy two\n").unwrap();
+        let start = supervisor::read_after(&dir, "db", supervisor::LogPos { dev: 0, ino: 0, offset: 0 }, 0, 0).unwrap().pos.unwrap();
+        let start = LogPos { offset: 0, ..start };
+        for grep in [None, Some("dummy".to_string())] {
+            let q = Query { services: vec!["db".into()], tail: 0, grep: grep.clone(), cursor: Some(Cursor::one("db", Some(start))), ..Query::default() };
+            let Logs::One(report) = fetch(&ctx, &q).unwrap() else { panic!("one service") };
+            assert!(report.lines.is_empty() && report.more, "{grep:?}: {report:?}");
+            assert_eq!(report.pos, Some(start), "{grep:?}: the next read starts where this one did");
+            // And a read that takes lines carries on from there.
+            let q = Query { tail: 10, ..q };
+            let Logs::One(report) = fetch(&ctx, &q).unwrap() else { panic!("one service") };
+            assert_eq!(report.lines, ["dummy one", "dummy two"], "{grep:?}");
         }
     }
 

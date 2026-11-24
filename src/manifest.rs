@@ -113,6 +113,13 @@ impl IdentityProbe {
     }
 }
 
+/// Whether `name` can name a service: one component of a path, as its log file and its data
+/// directory are named after it (not empty, `.` or `..`, and without `/` or NUL). Every other
+/// name a TOML key can hold is one.
+pub fn valid_service_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\0'])
+}
+
 /// The variable through which a service learns its instance token.
 pub fn identity_var(service: &str) -> String {
     format!(
@@ -246,6 +253,10 @@ impl Service {
     }
 
     pub fn validate(&self, name: &str, origin: &str) -> Result<()> {
+        if !valid_service_name(name) {
+            return Err(StackError::new("invalid_service", format!("service {name:?} in {origin}: a service name is one path component"))
+                .hint("name it without `/` or NUL, and not `.` or `..`: its log file and data directory are named after it"));
+        }
         if self.init_only() {
             return Ok(());
         }
@@ -524,6 +535,25 @@ mod tests {
         // The caret is under the last character shown.
         assert_eq!(lines[2].chars().count(), lines[1].chars().count());
         assert_eq!(at.column, long.chars().count());
+    }
+
+    #[test]
+    fn a_service_name_is_one_path_component() {
+        let service: Service = toml::from_str("run = 'serve'").unwrap();
+        // Dots, dashes, spaces, case and other scripts name services as before.
+        for name in ["web", "api.v2", "db.http", "My Service", "w_1-2", "...", ".hidden", "サービス"] {
+            assert!(valid_service_name(name), "{name}");
+            service.validate(name, "project").unwrap();
+        }
+        for name in ["", ".", "..", "a/b", "../other", "/abs", "nul\0"] {
+            assert!(!valid_service_name(name), "{name:?}");
+            for origin in ["project", "bundle:pybase", "[override.services]"] {
+                assert_eq!(service.validate(name, origin).unwrap_err().code, "invalid_service", "{name:?}");
+            }
+        }
+        // An init-only table names a service too.
+        let init: Service = toml::from_str("init = ['true']").unwrap();
+        assert_eq!(init.validate("../x", "project").unwrap_err().code, "invalid_service");
     }
 
     #[test]

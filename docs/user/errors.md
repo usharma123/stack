@@ -38,7 +38,7 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `invalid_env` | `[env]` sets a variable Stack reserves. | Remove the reserved variable (such as STACK_SESSION or MISE_*) from `[env]`. | no | - |
 | `invalid_path` | A configured path is not a directory inside the project. | Use a relative directory inside the project root, such as ".claude/skills". | no | - |
 | `invalid_secret` | A secret name cannot be granted. | Use an upper-case variable name that no service, `[env]` entry or Stack/mise variable uses. | no | - |
-| `invalid_service` | A service definition is malformed, or services collide (a name, an identity variable, or a second Postgres or Redis preset). | Follow the message: set exactly one of `preset` or `run`, rename a colliding service, or keep one service per Postgres or Redis preset. | no | - |
+| `invalid_service` | A service definition is malformed (its name is not one path component, say), or services collide (a name, an identity variable, or a second Postgres or Redis preset). | Follow the message: set exactly one of `preset` or `run`, name a service without `/` (and not `.` or `..`), rename a colliding service, or keep one service per Postgres or Redis preset. | no | - |
 | `invalid_tool` | A tool option or name is invalid. | Fix the `[tools]` entry the message names, then run `stack compile`. | no | - |
 | `io` | A file or directory could not be read or written. | Check the path and permissions in the message (and free disk space), then retry. | yes | - |
 | `lock_busy` | Another Stack command holds the lock this one needs. | Wait for the other Stack command in this checkout to finish, then retry. | yes | - |

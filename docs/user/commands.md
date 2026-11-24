@@ -428,7 +428,10 @@ single-service result.
   when output was lost between the cursor and what is kept. It compiles nothing and reads only
   the new bytes (at most 1 MiB per read). The cursor names the log file (device and inode) and
   the byte offset after the last whole line read, so a rotation is followed into the new file.
-  A line still being written is left for the next read. A cursor of several services reads those
+  A line still being written is left for the next read, and so is one that the rest of a read's
+  1 MiB cannot hold after a rotation (it comes whole, with its timestamp, on the next read). A
+  cursor naming a service no project can have (a name with `/` or NUL, `.` or `..`) is a
+  `usage` error. A cursor of several services reads those
   services, a service with no log yet included (its output appears once it has some); a service
   added to the project since needs a new cursor. Services an older Stack started under Pitchfork
   have no cursor reads until the next `up`.
@@ -441,7 +444,12 @@ several records, and output that ends without a newline is completed with one. T
 holds at most 1 MiB of each service's output it has not written yet: a service's output waits
 for room for up to a second (its writes block meanwhile, as on a slow terminal), then is
 dropped, and the log says so (`[stack] N line(s) of output (B bytes) dropped`); the supervisor's
-own lines never wait. For services an older
+own lines never wait. A write that fails part way is cut back off the file where the filesystem
+allows; where it does not (or a crash cut a record), the cut record's line is ended before
+anything else is written, so the dropped-output note is always a record of its own, and that cut
+record is the only one not as it was read. Logs are read and written only as regular files of
+the checkout's own `logs` directory: a symbolic link in a log's place, or in the directory's, is
+an error, never followed. For services an older
 Stack started under Pitchfork, `logs` asks Pitchfork (`pitchfork logs`) until the next `up`.
 `unknown_service` lists the project's services; `logs_failed` means the output could not be read
 (or the service never started in this checkout).

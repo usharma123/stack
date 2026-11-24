@@ -575,10 +575,20 @@ output (mise's answer when no release matches) is an error, not a version.
   Pumps hand it records (at most 64 KiB of line plus its stamp) through a queue bounded at 1 MiB
   per service: a pump waits up to a second for room (backpressure on the service's pipe), then
   drops and stops waiting until a record fits again; the supervisor's own lines never wait; every
-  drop is counted and noted in the log as a stamped `[stack]` record. A cursor (log file device
+  drop is counted and noted in the log as a stamped `[stack]` record. A write that fails part
+  way is cut back off with `ftruncate`; where that fails too, or a crash cut a record, the writer
+  finds the file ending without a newline when it opens it and ends that line first, so a note
+  or record written next is never read as part of the cut one (the cut record itself stays, the
+  one record not as it was read). Log files are opened through a descriptor of the checkout's
+  `logs` directory (`O_DIRECTORY | O_NOFOLLOW`) with `openat(O_NOFOLLOW)`, rotated with
+  `renameat` in it, and must be regular files; a service name is one path component (see
+  `manifest::valid_service_name`), checked when a manifest is composed, when a cursor is parsed,
+  and again when a log is opened. A cursor (log file device
   and inode, byte offset after the last whole record) lets `logs --cursor`, MCP `stack_logs`
   and `logs --follow` read only what was written since, following one rotation and reporting a
-  `gap` for output rotated away or truncated, with no compile and no re-read window.
+  `gap` for output rotated away or truncated, with no compile and no re-read window. A record
+  in the newer file that the rest of a read's byte budget cannot hold is left for the next read,
+  whole; only a record longer than a whole read's budget is ever returned cut.
   The pipes end with the supervisor: a service that writes after its supervisor died gets
   `SIGPIPE` (or `EPIPE`) and may exit. `logs <service> --tail N` reads the supervisor's
   `logs/<service>.log` (and the one older rotated file), at most its last 1 MiB, never following. `--since-start` keeps lines
