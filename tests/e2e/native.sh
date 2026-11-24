@@ -7,6 +7,7 @@
 # /tmp directory: Pitchfork's and Postgres' sockets must fit sun_path (104 bytes on macOS).
 # Scenario 5 needs an OCI registry: set STACK_E2E_REGISTRY=host:port, otherwise it is skipped
 # and reported as skipped. Results: one line per scenario on stdout and $STACK_E2E_RESULTS.
+# STACK_E2E_EVIDENCE can name an existing directory outside the fixture for JSON, JSONL, and .out files.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 binary="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -25,7 +26,7 @@ ln -s "$binary" "$work/bin/stack"
 # supervisor or machine-wide Stack registry, including during EXIT cleanup.
 for variable in $(compgen -e); do
   case "$variable" in
-    MISE_*|__MISE*|PITCHFORK_*|STACK_STATE_DIR|STACK_CACHE_DIR) unset "$variable" ;;
+    MISE_*|__MISE*|PITCHFORK_*|GIT_*|STACK_STATE_DIR|STACK_CACHE_DIR) unset "$variable" ;;
   esac
 done
 export STACK_STATE_DIR="$work/state" STACK_CACHE_DIR="$work/cache" PITCHFORK_STATE_DIR="$work/pf"
@@ -35,6 +36,7 @@ export MISE_DATA_DIR="$work/mise/data" MISE_CACHE_DIR="$work/mise/cache" \
   MISE_STATE_DIR="$work/mise/state" MISE_CONFIG_DIR="$work/mise/config"
 export MISE_GLOBAL_CONFIG_FILE="$work/mise/config/config.toml" \
   MISE_SYSTEM_CONFIG_FILE="$work/mise/config/system.toml" MISE_CEILING_PATHS="$work"
+export GIT_CONFIG_GLOBAL="$work/h/.gitconfig"
 export HOME="$work/h" XDG_CONFIG_HOME="$work/h/.config" XDG_CACHE_HOME="$work/h/.cache" \
   XDG_DATA_HOME="$work/h/.local/share" XDG_STATE_HOME="$work/h/.local/state"
 export STACK_E2E_EXAMPLES="$root/examples" STACK_E2E_SRV="$work/srv" STACK_E2E_WORK="$work/w" \
@@ -79,6 +81,13 @@ for name in "${scenarios[@]}"; do
   start=$(date +%s)
   if bash "$root/tests/e2e/$name.sh"; then result=passed; else result=failed; failed=1; fi
   printf '{"scenario":"%s","result":"%s","seconds":%s}\n' "$name" "$result" "$(( $(date +%s) - start ))" >>"$results"
+  if [ -n "${STACK_E2E_EVIDENCE:-}" ]; then
+    mkdir -p "$STACK_E2E_EVIDENCE/$name"
+    for artifact in "$work/t/"*.json "$work/t/"*.jsonl "$work/t/"*.out; do
+      [ -f "$artifact" ] || continue
+      cp -- "$artifact" "$STACK_E2E_EVIDENCE/$name/"
+    done
+  fi
   echo "--- $name: $result"
   [ "$result" = passed ] || break
 done
