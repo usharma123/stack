@@ -22,7 +22,7 @@
 | `stack ps [--no-size] [--project[=PATH]] [--state S] [--label K=V]... [--worktrees]` | List every checkout Stack has records for on this machine (read-only), or those selected |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
-| `stack setup [--force]` | Get mise, unless one is already on `PATH` |
+| `stack setup [--force]` | Get mise, unless a working one is already on `PATH`; one it installs comes first on `PATH` for Stack |
 | `stack setup --gc-agent [--print \| --remove] [--enable]` | Write a launchd agent or systemd user unit that runs `gc --watch` |
 | `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, and that the project compiles |
