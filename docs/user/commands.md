@@ -752,16 +752,37 @@ unavailable:`) without failing (Stack 0.1.24 and earlier said `stopped: true` th
 `skipped` (`"skipped": "unavailable"`). After a reboot gives a filesystem another device number
 (removable or network volumes, btrfs subvolumes), a checkout deleted from it stays
 `unavailable` rather than being taken for deleted; one still there is still recognised by its
-inode and birth time.
+inode and the birth time its session recorded (with none recorded, the same inode under another
+device may be another volume mounted there: `unavailable`, and `up` does not adopt its session).
+A root birth time recorded on one side only (recorded but unreadable now, or readable now but
+never recorded) is not taken for the same mount either.
+
+Two things update where a record says its checkout is. A command run in the checkout (`up`, any
+compile of it, the supervisor started for it) adopts the path's records for the checkout there
+now and records its mount; where the mount cannot be learned it keeps what was recorded, unless
+the checkout is now on another filesystem. Everything else, `gc` and other checkouts' commands
+included, only observes: it brings a record up to date only where what is at the path is shown
+to be on the very mount recorded (the same mount seen again after a restart gets its new ids),
+so the empty mount point a volume or bind mount that is not mounted leaves at a checkout's path,
+or another volume mounted there, never replaces the mount recorded, and once that mount point is
+gone too the checkout is still `unavailable`, never deleted.
 
 Records an earlier Stack kept (0.1.24 and earlier) name no mount. While their checkout is there,
-`up` in it, any compile of it (identity tokens), and `gc` (port reservations and data records)
-record its mount. Once it is gone they decide nothing on their own: one with only a device is
+a command run in it records its mount; `gc` completes them by observation only where that cannot
+pass a mount point off as the checkout: data records whose checkout token is the directory's at
+the path, and, where every mount has a device of its own (macOS), records whose device is the one
+there. Once the checkout is gone they decide nothing on their own: one with only a device is
 deleted only where every mount has a device of its own (macOS), never on Linux, where an unmounted
 bind mount of the same filesystem leaves the same behind; one with no device at all is never
-shown deleted, whatever its parent directory holds. Such a checkout stays `unavailable`, its
-reason saying so. To let Stack reclaim it, recreate the directory at that path, run `stack gc`
-(which records the mount the path is on now), and delete the directory again.
+shown deleted, whatever its parent directory holds. On Linux an earlier Stack's session whose
+path holds another directory on the same filesystem is `unavailable` rather than `replaced`, for
+the same reason. Such a checkout stays `unavailable`, its reason saying so. To let Stack reclaim
+it, first make sure it is not a volume or bind mount that is merely not mounted (mounting it
+again is all that takes: it is found as it was). If it was deleted, recreate the checkout at that
+path (its `stack.toml` with it) and run `stack up` there: that adopts the path's records for the
+new checkout and records its mount, and `stack down --purge` there then releases its ports and
+identities, or deleting the directory lets `gc` reclaim them. A directory recreated at the path
+and left alone is no longer enough: `gc` does not take what it finds there for the checkout.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once, and its

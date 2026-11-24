@@ -702,7 +702,9 @@ pub fn start(dir: &Path, project: &Path, specs: &IndexMap<String, ServiceSpec>, 
     apply(dir, |spec| {
         spec.shutdown = false;
         spec.project = Some(project.to_path_buf());
-        spec.project_at = crate::checkout::Recorded::of(project).or_kept(&spec.project_at);
+        // Started for the checkout at `project`, which adopts the record (see
+        // [`crate::checkout::Recorded`]).
+        spec.project_at = crate::checkout::Recorded::adopted(project, &spec.project_at);
         spec.token = specs.values().find_map(|s| s.env.get(crate::checkout::TOKEN_VAR).cloned()).or(spec.token.take());
         let previous = std::mem::take(&mut spec.services);
         for (name, def) in specs {

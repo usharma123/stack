@@ -175,7 +175,11 @@ fn assign_outside(
     // Only checkouts shown to be gone: one merely out of reach (its volume not mounted, a
     // lookup refused) keeps its ports for when it is back.
     reg.reservations.retain(|r| !r.checkout_gone());
-    let at = crate::checkout::Recorded::of(project);
+    // A command run in this checkout adopts the path's records (see
+    // [`crate::checkout::Recorded`]), keeping what they knew of its mount where nothing can be
+    // learned now, even for reservations given up below.
+    let previous_at = reg.reservations.iter().find(|r| r.project == project && r.project_at.location.is_some()).map(|r| r.project_at.clone()).unwrap_or_default();
+    let at = crate::checkout::Recorded::adopted(project, &previous_at);
     reg.reservations.retain(|r| {
         r.project != project || (!reassign && requests.iter().any(|q| q.service == r.service))
     });
@@ -242,8 +246,9 @@ pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec
         let mine = |r: &Reservation| r.project == project && &r.service == service;
         let Some(old) = reg.reservations.iter().find(|r| mine(r)).map(|r| r.port) else { continue };
         let new = find_free(&reg, project, service, &ephemeral)?;
+        let project_at = reg.reservations.iter().find(|r| mine(r)).map_or_else(|| crate::checkout::Recorded::of(project), |r| crate::checkout::Recorded::adopted(project, &r.project_at));
         reg.reservations.retain(|r| !mine(r));
-        reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone(), project_at: crate::checkout::Recorded::of(project) });
+        reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone(), project_at });
         moved.push((service.clone(), old, new));
     }
     write_json(&file, &reg)?;
@@ -252,9 +257,9 @@ pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec
 
 /// Release the reservations of projects shown to be gone (see [`crate::checkout::presence`]),
 /// except those `keep` holds on to (a project whose session record is still kept: its services
-/// may still listen there). The reservations of checkouts still there get where they are now
-/// (see [`crate::checkout::Refresh`]), so a record an earlier Stack kept, or one from another
-/// boot, can show the checkout's deletion later.
+/// may still listen there). The reservations of checkouts still there are brought up to date as
+/// far as observation may (see [`crate::checkout::Refresh`]): one from another boot gets the
+/// mount's ids there; one naming no mount is completed by the next command run in its checkout.
 /// Returns what was released. `assign` prunes gone projects too, but only when some project
 /// compiles; GC calls this so a removed checkout's ports come back without that.
 pub fn release_gone(state: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<Reservation>> {
@@ -269,7 +274,9 @@ pub fn release_gone(state: &Path, keep: impl Fn(&Path) -> bool) -> Result<Vec<Re
     let mut refresh = crate::checkout::Refresh::default();
     let mut refreshed = false;
     for r in &mut kept {
-        refreshed |= refresh.apply(&r.project, &mut r.project_at);
+        // Observation only: a reservation records no directory to show the one there is its
+        // checkout, so one naming no mount waits for a command run in it (see `assign`).
+        refreshed |= refresh.observe(&r.project, &mut r.project_at, false);
     }
     reg.reservations = kept;
     if !gone.is_empty() || refreshed {

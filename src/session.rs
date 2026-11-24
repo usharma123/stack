@@ -1317,7 +1317,14 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     let provider = (!report.stack.services.is_empty()).then(|| ProviderRecord::native(supervisor_dir(ctx)));
     let project_dir_id = dir_id(&ctx.root);
     let project_dir_created = dir_created(&ctx.root);
-    let project_location = crate::checkout::location(&ctx.root);
+    // Where nothing can be learned now, the mount the previous session recorded is kept when it
+    // was this very directory (inode and birth time): evidence is never dropped for want of it.
+    let project_location = crate::checkout::location(&ctx.root).or_else(|| {
+        previous
+            .as_ref()
+            .filter(|p| project_dir_id.is_some() && p.project_dir_id == project_dir_id && p.project_dir_created == project_dir_created)
+            .and_then(|p| p.project_location.clone())
+    });
 
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
@@ -3005,14 +3012,17 @@ pub(crate) fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.created().ok()
 }
 
-/// Whether the directory at `path` is not the one `session` recorded: another inode, or (once
-/// recorded) another birth time. A device number alone is not compared: a reboot can renumber a
-/// filesystem (removable and network volumes, btrfs subvolumes), and the same inode with the
-/// same birth time is the same directory. (Another device and inode is a filesystem mounted at
-/// or above the path: [`checkout_state`] calls that unavailable.)
+/// Whether the directory at `path` is not shown to be the one `session` recorded, so `up` there
+/// must not adopt (or stop) its services: another inode, or (once recorded) another birth time
+/// or none. A device number alone is not compared: a reboot can renumber a filesystem
+/// (removable and network volumes, btrfs subvolumes), and the same inode with the same birth
+/// time is the same directory. Under another device, though, only a birth time recorded and
+/// matching shows that: every volume's root has the same few inodes, so the same inode alone
+/// may be another volume mounted where the checkout was. (Whether the old checkout is gone is
+/// [`checkout_state`]'s to say.)
 fn project_replaced(session: &Session, path: &Path) -> bool {
-    if let (Some((_, recorded)), Some((_, current))) = (session.project_dir_id, dir_id(path)) {
-        if recorded != current {
+    if let (Some((dev, recorded)), Some((now_dev, current))) = (session.project_dir_id, dir_id(path)) {
+        if recorded != current || (dev != now_dev && session.project_dir_created.is_none()) {
             return true;
         }
     }
@@ -5503,13 +5513,20 @@ pub fn checkout_gone(session: &Session) -> Option<&'static str> {
 
 /// Whether `session`'s checkout is still there (see [`CheckoutState`]). Deleted only when
 /// [`crate::checkout::presence`] can show it, judged by the mount the directory was on at
-/// launch; replaced only when another directory is at the path on that same filesystem (or the
-/// birth time recorded no longer matches) and, once recorded, on the same mount. A directory
-/// there on another filesystem is a mount point whose volume is not mounted, or the volume
-/// mounted again: unavailable, unless it is the very directory (same inode and birth time) under
-/// a renumbered device. So is another directory whose mount is not the one recorded: the
-/// directory a checkout that was itself a mount point (a bind mount of the same filesystem
-/// included) leaves behind while that is not mounted.
+/// launch. What is at the path is:
+/// - the checkout, when it is the very directory: the same device and inode (and birth time
+///   where one was recorded), or the same inode and recorded birth time under a renumbered
+///   device;
+/// - unavailable when that cannot be told: its birth time, recorded, cannot be read now; the
+///   same inode under another device with no birth time recorded (every volume's root has the
+///   same few inodes); another device and inode (a mount point whose volume is not mounted, or
+///   the volume mounted again);
+/// - replaced only when it is another directory on the same filesystem that is on the very mount
+///   the checkout was on (see [`crate::checkout::on_mount`]: the mount's root, its birth time and,
+///   on Linux, its id). Another directory on another mount is what a checkout that was itself a
+///   mount point (a bind mount of the same filesystem included) leaves while that is not
+///   mounted: unavailable. A session that recorded no mount is replaced on the device alone only
+///   where every mount has a device of its own (not Linux).
 pub fn checkout_state(session: &Session) -> CheckoutState {
     use crate::checkout::Presence;
     let path = &session.project;
@@ -5520,35 +5537,54 @@ pub fn checkout_state(session: &Session) -> CheckoutState {
         Presence::Unknown(why) => return CheckoutState::Unavailable(why),
         Presence::Present => {}
     }
-    if let Some((dev, ino)) = recorded {
-        let Some((now_dev, now_ino)) = dir_id(path) else {
-            return CheckoutState::Unavailable(format!("{} cannot be looked up", path.display()));
-        };
-        // Another device and another inode: what is at the path is on another filesystem. The
-        // same inode under another device is the directory renumbered (see `project_replaced`).
-        if now_dev != dev && now_ino != ino {
-            return CheckoutState::Unavailable(format!(
-                "{} is on another filesystem (device {now_dev}) than when its session started (device {dev}): a mount \
-                 point whose volume is not mounted, or the volume mounted again",
-                path.display()
-            ));
-        }
-    }
-    if project_replaced(session, path) {
-        if let Some(was) = &session.project_location {
-            let now = crate::checkout::location(path);
-            if !now.as_ref().is_some_and(|now| now.mount_root == was.mount_root && now.root == was.root) {
+    let Some((dev, ino)) = recorded else { return CheckoutState::Present };
+    let Some((now_dev, now_ino)) = dir_id(path) else {
+        return CheckoutState::Unavailable(format!("{} cannot be looked up", path.display()));
+    };
+    let shown = path.display();
+    if now_ino == ino {
+        match (session.project_dir_created, dir_created(path)) {
+            (Some(was), Some(now)) if was == now => return CheckoutState::Present,
+            // Recorded without a birth time: the device and inode are all there is to go by.
+            (None, _) if now_dev == dev => return CheckoutState::Present,
+            (Some(_), None) => {
                 return CheckoutState::Unavailable(format!(
-                    "{} is another directory than when its session started, on another mount than the one it was on ({}): \
-                     the checkout may have been a mount point that is not mounted right now",
-                    path.display(),
-                    was.mount_root.display()
+                    "{shown} has the inode its session recorded, but no birth time to compare with the one recorded: whether \
+                     it is the same directory cannot be told"
                 ));
             }
+            (None, _) => {
+                return CheckoutState::Unavailable(format!(
+                    "{shown} has the inode its session recorded, on another filesystem (device {now_dev}, not {dev}), and no \
+                     birth time was recorded to tell that directory renumbered from another volume mounted there"
+                ));
+            }
+            // Another birth time: another directory that was given the inode.
+            (Some(_), Some(_)) => {}
         }
-        return CheckoutState::Gone("project directory replaced");
     }
-    CheckoutState::Present
+    if now_dev != dev {
+        return CheckoutState::Unavailable(format!(
+            "{shown} is on another filesystem (device {now_dev}) than when its session started (device {dev}): a mount point \
+             whose volume is not mounted, or the volume mounted again"
+        ));
+    }
+    match &session.project_location {
+        Some(was) => match crate::checkout::on_mount(path, was) {
+            Ok(()) => CheckoutState::Gone("project directory replaced"),
+            Err(why) => CheckoutState::Unavailable(format!(
+                "{shown} is another directory than when its session started, but {why} (the checkout may have been a mount \
+                 point that is not mounted right now)"
+            )),
+        },
+        None if crate::mounts::BINDS => CheckoutState::Unavailable(format!(
+            "{shown} is another directory than when its session started, on the same filesystem, but its session (an earlier \
+             Stack's) recorded no mount: a bind mount of that filesystem at the path, not mounted right now, leaves the same \
+             behind. If it is mounted again, it is found as it was; if it was deleted, see records an earlier Stack kept \
+             under `stack gc` in the commands reference"
+        )),
+        None => CheckoutState::Gone("project directory replaced"),
+    }
 }
 
 
@@ -7782,25 +7818,49 @@ mod native_records {
 
     /// A checkout found where it was, on another filesystem than at launch, is a mount point
     /// (or a volume mounted again), never another directory that took its path; the very
-    /// directory under a renumbered device is still it.
+    /// directory under a renumbered device is still it, but only by a birth time recorded.
     #[test]
-    fn only_another_directory_on_the_same_filesystem_replaces_a_checkout() {
+    fn only_another_directory_on_the_same_mount_replaces_a_checkout() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("app");
         fs::create_dir_all(&root).unwrap();
         let (dev, ino) = dir_id(&root).unwrap();
-        let at = |id: (u64, u64)| Session { project: root.clone(), project_dir_id: Some(id), project_dir_created: dir_created(&root), ..Session::default() };
+        let born = dir_created(&root);
+        let at = |id: (u64, u64)| Session { project: root.clone(), project_dir_id: Some(id), project_dir_created: born, ..Session::default() };
+        let unavailable = |session: &Session| match checkout_state(session) {
+            CheckoutState::Unavailable(why) => why,
+            other => panic!("{other:?}"),
+        };
         assert_eq!(checkout_state(&at((dev, ino))), CheckoutState::Present);
-        assert_eq!(checkout_state(&at((dev, ino + 1))), CheckoutState::Gone("project directory replaced"));
-        let CheckoutState::Unavailable(why) = checkout_state(&at((dev.wrapping_add(1), ino + 1))) else { panic!("not unavailable") };
-        assert!(why.contains("on another filesystem"), "{why}");
-        assert_eq!(checkout_state(&at((dev.wrapping_add(1), ino))), CheckoutState::Present, "renumbered: same inode and birth time");
-        assert!(!project_replaced(&at((dev.wrapping_add(1), ino)), &root), "up adopts it too");
+        assert!(unavailable(&at((dev.wrapping_add(1), ino + 1))).contains("on another filesystem"));
         assert!(project_replaced(&at((dev, ino + 1)), &root));
-        if let Some(born) = dir_created(&root) {
-            let reborn = Session { project_dir_created: Some(born + std::time::Duration::from_secs(1)), ..at((dev.wrapping_add(1), ino)) };
-            assert_eq!(checkout_state(&reborn), CheckoutState::Gone("project directory replaced"), "same inode, another birth time");
+        // An earlier Stack's session, which recorded no mount: another directory on the same
+        // filesystem replaced it only where mounts cannot share a device; on Linux it may be what
+        // a same-filesystem bind mount at the path leaves while not mounted.
+        if crate::mounts::BINDS {
+            assert!(unavailable(&at((dev, ino + 1))).contains("recorded no mount"));
+        } else {
+            assert_eq!(checkout_state(&at((dev, ino + 1))), CheckoutState::Gone("project directory replaced"));
         }
+        if let Some(born) = born {
+            assert_eq!(checkout_state(&at((dev.wrapping_add(1), ino))), CheckoutState::Present, "renumbered: same inode and birth time");
+            assert!(!project_replaced(&at((dev.wrapping_add(1), ino)), &root), "up adopts it too");
+            // Another birth time: on the same filesystem another directory given the inode, on
+            // another one another volume.
+            let reborn = |dev| Session { project_dir_created: Some(born + std::time::Duration::from_secs(1)), ..at((dev, ino)) };
+            if !crate::mounts::BINDS {
+                assert_eq!(checkout_state(&reborn(dev)), CheckoutState::Gone("project directory replaced"), "same inode, another birth time");
+            }
+            assert!(unavailable(&reborn(dev.wrapping_add(1))).contains("on another filesystem"));
+        }
+        // The same inode under another device, no birth time recorded: every volume's root has
+        // the same few inodes, so that may be another volume mounted there. Neither gone nor
+        // adopted.
+        let legacy = Session { project_dir_created: None, ..at((dev.wrapping_add(1), ino)) };
+        assert!(unavailable(&legacy).contains("no birth time was recorded"));
+        assert!(project_replaced(&legacy, &root), "up does not adopt it");
+        let legacy_here = Session { project_dir_created: None, ..at((dev, ino)) };
+        assert_eq!(checkout_state(&legacy_here), CheckoutState::Present);
         assert_eq!(checkout_session_gone(&root, dev), None);
         // Recorded on the mount it is on now: another directory there replaced it.
         let location = crate::checkout::location(&root).unwrap();
@@ -7809,9 +7869,19 @@ mod native_records {
         // Recorded as itself a mount's root (a bind mount of the same filesystem at the path,
         // say): another directory there now, on another mount, is what that leaves behind while
         // it is not mounted.
-        let mounted = crate::checkout::Location { mount_root: root.canonicalize().unwrap(), root: [dev, ino], ..location };
-        let CheckoutState::Unavailable(why) = checkout_state(&on(mounted)) else { panic!("not unavailable") };
-        assert!(why.contains("on another mount"), "{why}");
+        let mounted = crate::checkout::Location { mount_root: root.canonicalize().unwrap(), root: [dev, ino], ..location.clone() };
+        assert!(unavailable(&on(mounted)).contains("on another mount"));
+        // The mount root's birth time on one side only, or another one: not shown the same mount.
+        if let Some(root_born) = location.root_born.clone() {
+            assert!(unavailable(&on(crate::checkout::Location { root_born: None, ..location.clone() })).contains("where none was recorded"));
+            let remade = crate::checkout::Location { root_born: Some(format!("{root_born}1")), ..location.clone() };
+            assert!(unavailable(&on(remade)).contains("created at another time"));
+        }
+        // On Linux, another mount id in the same boot and namespace: another mount.
+        if let Some(mount) = location.mount.clone() {
+            let other = crate::checkout::Location { mount: Some(crate::checkout::MountInstance { id: mount.id + 1, unique: mount.unique.map(|u| u + 1), ..mount }), ..location };
+            assert!(unavailable(&on(other)).contains("another mount id"));
+        }
     }
 
     fn checkout_session_gone(root: &Path, dev: u64) -> Option<&'static str> {
@@ -7920,6 +7990,76 @@ mod native_records {
         assert_eq!(pass.reclaimed.iter().map(|e| (e.project.as_path(), e.reason.as_str(), e.stopped)).collect::<Vec<_>>(), [(root.as_path(), "project directory deleted", true)]);
         assert!(!index_path(&state, &root).exists());
         let entries = reclaim_deleted(&state, true).unwrap();
+        assert!(entries.iter().any(|e| e.project == root && e.services.iter().any(|s| s.outcome.as_deref().is_some_and(|o| o.contains("released")))), "{entries:?}");
+        assert!(ports::lookup(&state, &root).unwrap().is_empty());
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        assert!(crate::identity::lookup(&state, &root).unwrap().is_empty());
+    }
+
+    /// The lifecycle observation once got wrong: a checkout recorded as its own mount's root (a
+    /// bind mount of the same filesystem at its path, as `up` saw it) goes offline, and its mount
+    /// point, another directory on the mount above, is at the path. `gc` passes while the mount
+    /// point is there and again once it is gone: every record still names the checkout's own
+    /// mount, so its ports, data and identities are never reclaimed by what the mount point was
+    /// on. Deleted from the very mount it was on, they are.
+    #[test]
+    fn a_mount_point_left_where_a_checkout_was_is_never_taken_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let root = tmp.path().join("vol").join("app");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
+        let (dev, ino) = dir_id(&root).unwrap();
+        let here = crate::checkout::Recorded::of(&root);
+        let location = here.location.clone().expect("a temporary directory's mount can be learned");
+        let mounted = crate::checkout::Recorded {
+            device: here.device,
+            location: Some(crate::checkout::Location { mount_root: root.canonicalize().unwrap(), root: [dev, ino.wrapping_add(1000)], root_born: None, ..location }),
+        };
+        crate::identity::assign(&state, &root, &["web".to_string()]).unwrap();
+        ports::assign(&state, &root, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        let record = |at: &crate::checkout::Recorded| {
+            let recorded = serde_json::to_value(at).unwrap();
+            for (file, list) in [("ports.json", "reservations"), ("identities.json", "tokens")] {
+                let mut registry: serde_json::Value = read_json(&state.join(file)).unwrap();
+                for r in registry[list].as_array_mut().unwrap() {
+                    r["project_device"] = recorded["project_device"].clone();
+                    r["project_location"] = recorded["project_location"].clone();
+                }
+                write_json(&state.join(file), &registry).unwrap();
+            }
+            crate::datadirs::forget(&state, |_| true).unwrap();
+            // Even with the checkout token of the directory now at the path, observation does not
+            // let it stand in for the mount recorded.
+            let checkout = crate::checkout::token(&root).unwrap_or_else(|| "t1".into());
+            let entry = crate::datadirs::Entry { project: root.clone(), service: "web".into(), dir: tmp.path().join("data"), checkout, supervisor: None, location: None, identity: None, project_at: at.clone() };
+            crate::datadirs::record(&state, entry).unwrap();
+        };
+        record(&mounted);
+        let files = || ["ports.json", "data.json", "identities.json"].map(|f| fs::read(state.join(f)).unwrap());
+        let before = files();
+        // The mount point is there: present, and nothing is completed from it.
+        gc_checked(&state, true, false).unwrap();
+        assert!(files() == before, "observation changed a record from the mount point");
+        // The mount point gone too: unavailable, nothing released or removed.
+        fs::remove_dir(&root).unwrap();
+        let plan = gc_pass::gc_plan(&state, true).unwrap();
+        assert!(plan.deleted_checkouts.is_empty() && plan.unavailable.iter().any(|u| u.project == root && u.reason.contains("on another mount")), "{:?}", plan.unavailable);
+        gc_checked(&state, true, false).unwrap();
+        assert!(files() == before, "a record was reclaimed by the mount its mount point was on");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        ports::assign(&state, &other, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        assert_eq!(ports::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(crate::identity::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(crate::datadirs::entries(&state).unwrap().len(), 1);
+
+        // An ordinary deletion from the very mount the checkout was on: reclaimed.
+        fs::create_dir_all(&root).unwrap();
+        record(&crate::checkout::Recorded::of(&root));
+        fs::remove_dir(&root).unwrap();
+        let entries = gc_checked(&state, true, false).unwrap();
         assert!(entries.iter().any(|e| e.project == root && e.services.iter().any(|s| s.outcome.as_deref().is_some_and(|o| o.contains("released")))), "{entries:?}");
         assert!(ports::lookup(&state, &root).unwrap().is_empty());
         crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();

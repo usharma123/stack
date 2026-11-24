@@ -93,6 +93,15 @@ pub enum Presence {
 /// path is gone a deletion can be told from the mount it was on not being there (see
 /// [`presence`]). Both fields are absent in records an earlier Stack kept; `location` is absent
 /// in those Stack 0.1.24 or earlier kept, and wherever it could not be learned.
+///
+/// Two ways change one:
+/// - adoption ([`Recorded::adopted`]): a command run in the checkout at the path (`up`, a
+///   compile, the supervisor started for it) records where that checkout is now, whichever
+///   directory had the path before; the path's records are its records from then on;
+/// - observation ([`Refresh`]): anything else (`gc`, another checkout's commands) only brings a
+///   record up to date where what is at the path now is shown to be on the very mount it
+///   recorded, and never completes a record that names no mount from whatever directory is
+///   there (an empty mount point looks like any other directory).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recorded {
     /// The device of the filesystem the checkout was on.
@@ -109,12 +118,24 @@ impl Recorded {
         Self { device: device(root), location: location(root) }
     }
 
+    /// Adoption: where the checkout at `root`, which a command is being run in, is now, keeping
+    /// what `previous` recorded where that cannot be learned (see [`Recorded::or_kept`]).
+    pub fn adopted(root: &Path, previous: &Recorded) -> Self {
+        Self::of(root).or_kept(previous)
+    }
+
     /// `self`, learned now, keeping the location `previous` recorded when none could be learned
     /// now: evidence is never dropped for want of it (a mismatch keeps the checkout unknown).
+    /// Kept only while nothing shows it is about another filesystem: with another device learned
+    /// now, the location kept would name a mount the checkout is not on.
     pub fn or_kept(self, previous: &Recorded) -> Self {
-        match self.location {
+        if self.location.is_some() {
+            return self;
+        }
+        match self.device {
+            None => Self { device: previous.device, location: previous.location.clone() },
+            Some(device) if previous.device.map_or(true, |d| d == device) => Self { location: previous.location.clone(), ..self },
             Some(_) => self,
-            None => Self { location: previous.location.clone(), ..self },
         }
     }
 }
@@ -184,7 +205,7 @@ pub fn location(root: &Path) -> Option<Location> {
 /// bind mount of the same filesystem that is not mounted right now leaves the same thing behind
 /// as a deletion, so it is unknown. A record with neither is unknown everywhere: an empty or a
 /// full parent directory says nothing about a mount that is not there. Such a record is
-/// completed (see [`Refresh`]) while its checkout is there.
+/// completed while its checkout is there by a command run in it (see [`Recorded`]).
 pub fn presence(path: &Path, recorded: &Recorded) -> Presence {
     presence_with(&Disk, path, recorded)
 }
@@ -244,7 +265,7 @@ fn not_there(e: &std::io::Error) -> bool {
 
 /// Whether `a` and `b` are on one mount: one device and, where mounts can share one, one mount
 /// id (the unique one where both have it). Without ids where they are needed, never.
-fn same_mount(a: &Node, b: &Node, binds: bool) -> bool {
+fn one_mount(a: &Node, b: &Node, binds: bool) -> bool {
     a.dev == b.dev
         && (!binds
             || match (a.mount, b.mount) {
@@ -266,7 +287,7 @@ fn mount_root(fs: &dyn Lookup, dir: &Path, node: &Node) -> Result<(PathBuf, Node
     let mut above = dir.parent();
     while let Some(parent) = above {
         let found = fs.look(parent).map_err(|e| format!("{} cannot be looked up ({e})", parent.display()))?;
-        if !same_mount(node, &found, fs.binds()) {
+        if !one_mount(node, &found, fs.binds()) {
             break;
         }
         root = (parent.to_path_buf(), found);
@@ -275,15 +296,106 @@ fn mount_root(fs: &dyn Lookup, dir: &Path, node: &Node) -> Result<(PathBuf, Node
     Ok(root)
 }
 
-pub(crate) fn location_with(fs: &dyn Lookup, root: &Path) -> Option<Location> {
-    let root = fs.resolve(root).ok()?;
-    let node = fs.look(&root).ok().filter(|n| n.dir)?;
-    let (mount_root, top) = mount_root(fs, &root, &node).ok()?;
+/// What the directory `dir` (resolved, found as `node`) is on, as a [`Location`] would record it.
+fn location_of(fs: &dyn Lookup, dir: &Path, node: &Node) -> Result<Location, String> {
+    let (mount_root, top) = mount_root(fs, dir, node)?;
     let mount = match (fs.binds(), node.mount, fs.instance()) {
         (true, Some(ids), (Some(boot), Some(namespace))) => Some(MountInstance { id: ids.id, unique: ids.unique, boot, namespace }),
         _ => None,
     };
-    Some(Location { mount_root, root: [top.dev, top.ino], root_born: top.born, mount })
+    Ok(Location { mount_root, root: [top.dev, top.ino], root_born: top.born, mount })
+}
+
+pub(crate) fn location_with(fs: &dyn Lookup, root: &Path) -> Option<Location> {
+    let root = fs.resolve(root).ok()?;
+    let node = fs.look(&root).ok().filter(|n| n.dir)?;
+    location_of(fs, &root, &node).ok()
+}
+
+/// Whether `now`, where something is found today, is on the very mount `was` recorded: the one
+/// comparison every decision about a checkout's mount makes (whether a missing checkout is gone,
+/// whether another directory at its path replaced it, whether a record may be brought up to
+/// date). The same mount only when shown, in this order:
+/// - its root is on the same filesystem (device), at the same resolved path, the same directory
+///   (inode);
+/// - the root's birth times agree: both recorded and equal, or neither kept (a filesystem
+///   without birth times). One recorded and the other not is not taken for a match: it is
+///   another filesystem as often as one that lost the time;
+/// - where mounts can share a device ([`Lookup::binds`]), the same mount: by the kernel's id
+///   (the unique id where both sides have it) when both were read in the same boot and mount
+///   namespace, and otherwise only by root birth times recorded on both sides, which alone
+///   recognise a mount across a restart.
+///
+/// `Err` says why not, of `subject` (the path found), for a person.
+fn same_mount(was: &Location, now: &Location, binds: bool, subject: &Path) -> Result<(), String> {
+    let elsewhere = |what: String| {
+        Err(format!(
+            "{} is {what} than the checkout was on ({}): the mount it was on may not be there right now",
+            subject.display(),
+            was.mount_root.display()
+        ))
+    };
+    if now.root[0] != was.root[0] {
+        return elsewhere(format!("on another filesystem (device {}, not {})", now.root[0], was.root[0]));
+    }
+    if now.mount_root != was.mount_root || now.root != was.root {
+        return elsewhere(format!("on another mount (rooted at {})", now.mount_root.display()));
+    }
+    let born = match (&was.root_born, &now.root_born) {
+        (Some(recorded), Some(found)) if recorded != found => {
+            return elsewhere(format!("on another mount (its root {} was created at another time)", now.mount_root.display()));
+        }
+        (Some(_), Some(_)) => true,
+        (None, None) => false,
+        (Some(_), None) => {
+            return elsewhere(format!(
+                "on a mount whose root ({}) has no birth time to compare with the one recorded, so not shown to be the same mount",
+                now.mount_root.display()
+            ));
+        }
+        (None, Some(_)) => {
+            return elsewhere(format!(
+                "on a mount whose root ({}) has a birth time where none was recorded, so not shown to be the same mount",
+                now.mount_root.display()
+            ));
+        }
+    };
+    if !binds {
+        return Ok(());
+    }
+    match (&was.mount, &now.mount) {
+        (Some(w), Some(n)) if w.boot == n.boot && w.namespace == n.namespace => {
+            let same = match (w.unique, n.unique) {
+                (Some(recorded), Some(found)) => recorded == found,
+                _ => w.id == n.id,
+            };
+            if same {
+                Ok(())
+            } else {
+                elsewhere("on another mount of the same directory (another mount id)".into())
+            }
+        }
+        _ if born => Ok(()),
+        _ => Err(format!(
+            "the mount the checkout was on ({}) was recorded in another boot or mount namespace (or one that cannot be \
+             read), where its id means nothing here, on a filesystem that records no birth time to recognise its root by; \
+             a bind mount of the same directory that is not mounted right now cannot be ruled out",
+            was.mount_root.display()
+        )),
+    }
+}
+
+/// Whether the directory at `path`, which is there, is on the very mount `was` recorded (see
+/// [`same_mount`]); `Err` says why not, or why that cannot be told.
+pub fn on_mount(path: &Path, was: &Location) -> Result<(), String> {
+    on_mount_with(&Disk, path, was)
+}
+
+pub(crate) fn on_mount_with(fs: &dyn Lookup, path: &Path, was: &Location) -> Result<(), String> {
+    let resolved = fs.resolve(path).map_err(|e| format!("{} cannot be resolved ({e})", path.display()))?;
+    let node = fs.look(&resolved).map_err(|e| format!("{} cannot be looked up ({e})", path.display()))?;
+    let now = location_of(fs, &resolved, &node)?;
+    same_mount(was, &now, fs.binds(), path)
 }
 
 pub(crate) fn presence_with(fs: &dyn Lookup, path: &Path, recorded: &Recorded) -> Presence {
@@ -307,14 +419,28 @@ pub(crate) fn presence_with(fs: &dyn Lookup, path: &Path, recorded: &Recorded) -
         }
     };
     if let Some(location) = &recorded.location {
-        return on_recorded_mount(fs, path, found, &node, location);
+        // Another filesystem says so before anything above it is looked up.
+        if node.dev != location.root[0] {
+            return Presence::Unknown(format!(
+                "{shown} is not found, but {} is on another filesystem (device {}, not {}) than the checkout was on ({}): the \
+                 mount it was on may not be there right now",
+                found.display(),
+                node.dev,
+                location.root[0],
+                location.mount_root.display()
+            ));
+        }
+        return match on_mount_with(fs, found, location) {
+            Ok(()) => Presence::Absent,
+            Err(why) => Presence::Unknown(format!("{shown} is not found, but {why}")),
+        };
     }
     match recorded.device {
         Some(device) if fs.binds() => Presence::Unknown(format!(
             "{shown} is not found, and Stack recorded only the device of the filesystem it was on (device {device}), not \
              the mount: a bind mount of that filesystem that is not mounted right now leaves the same behind as a deletion. \
-             If it is mounted again, any Stack command records its mount; if it was deleted, recreate the directory, run \
-             `stack gc`, and delete it again"
+             If it is mounted again, any Stack command run in it records its mount; if it was deleted, see records an earlier \
+             Stack kept under `stack gc` in the commands reference"
         )),
         Some(device) if node.dev == device => Presence::Absent,
         Some(device) => Presence::Unknown(format!(
@@ -325,92 +451,55 @@ pub(crate) fn presence_with(fs: &dyn Lookup, path: &Path, recorded: &Recorded) -
         )),
         None => Presence::Unknown(format!(
             "{shown} is not found, and Stack recorded no filesystem for it (a record an earlier Stack kept), so a deletion \
-             cannot be told from a volume or mount that is not there right now. If it was deleted, recreate the directory, \
-             run `stack gc`, and delete it again"
+             cannot be told from a volume or mount that is not there right now. If it was deleted, see records an earlier \
+             Stack kept under `stack gc` in the commands reference"
         )),
     }
 }
 
-/// [`presence_with`] for a missing `path` whose deepest directory there is `found` (`node`),
-/// judged by the mount the checkout was on.
-fn on_recorded_mount(fs: &dyn Lookup, path: &Path, found: &Path, node: &Node, location: &Location) -> Presence {
-    let shown = path.display();
-    let elsewhere = |what: String| {
-        Presence::Unknown(format!(
-            "{shown} is not found, but {} is {what} than the checkout was on ({}): the mount it was on may not be there \
-             right now",
-            found.display(),
-            location.mount_root.display()
-        ))
-    };
-    if node.dev != location.root[0] {
-        return elsewhere(format!("on another filesystem (device {}, not {})", node.dev, location.root[0]));
-    }
-    let resolved = match fs.resolve(found) {
-        Ok(resolved) => resolved,
-        Err(e) => return Presence::Unknown(format!("{shown} is not found, but {} cannot be resolved ({e})", found.display())),
-    };
-    let (root, top) = match mount_root(fs, &resolved, node) {
-        Ok(root) => root,
-        Err(why) => return Presence::Unknown(format!("{shown} is not found, but {why}")),
-    };
-    if root != location.mount_root || [top.dev, top.ino] != location.root {
-        return elsewhere(format!("on another mount (rooted at {})", root.display()));
-    }
-    if let (Some(recorded), Some(now)) = (&location.root_born, &top.born) {
-        if recorded != now {
-            return elsewhere(format!("on another mount (its root {} was created at another time)", root.display()));
-        }
-    }
-    if !fs.binds() {
-        return Presence::Absent;
-    }
-    let (boot, namespace) = fs.instance();
-    match &location.mount {
-        Some(m) if boot.as_deref() == Some(m.boot.as_str()) && namespace == Some(m.namespace) => {
-            let Some(ids) = node.mount else {
-                return Presence::Unknown(format!("{shown} is not found, but which mount {} is on cannot be told", found.display()));
-            };
-            let same = match (m.unique, ids.unique) {
-                (Some(recorded), Some(now)) => recorded == now,
-                _ => m.id == ids.id,
-            };
-            if same {
-                Presence::Absent
-            } else {
-                elsewhere("on another mount of the same directory (another mount id)".into())
-            }
-        }
-        _ if location.root_born.is_some() && top.born.is_some() => Presence::Absent,
-        _ => Presence::Unknown(format!(
-            "{shown} is not found, and the mount it was on was recorded in another boot or mount namespace (or one that \
-             cannot be read), where its id means nothing here, on a filesystem that records no birth time to recognise its \
-             root by; a bind mount of the same directory that is not mounted right now cannot be ruled out"
-        )),
-    }
-}
-
-/// Completes and refreshes [`Recorded`] values of checkouts that are there: a record an earlier
-/// Stack kept, or one from another boot or mount namespace, gets where the checkout is now, so
-/// that once it is deleted that can be shown. Learned once per path.
+/// Observation: brings [`Recorded`] values of checkouts that are there up to date, for the
+/// commands that look at records without being run in their checkout (`gc`, another checkout's
+/// commands). What is at a path is learned once per path.
+///
+/// A record naming a mount is changed only where what is at the path now is on that very mount
+/// (see [`same_mount`]): a mount seen again in another boot or namespace gets its ids there.
+/// What is at the path on another mount (the empty mount point a volume that is not mounted
+/// leaves, another volume mounted there) never replaces it, so once that is gone too the record
+/// still names the mount the checkout was on, not the one its mount point was on.
+///
+/// A record naming no mount (an earlier Stack's, or one made where none could be learned) is
+/// completed only where that cannot pass a mount point off as the checkout: the caller shows the
+/// directory there is the very one recorded (`same_checkout`: a data record's checkout token),
+/// or every mount has a device of its own (not Linux) and the device recorded is the one there,
+/// which judges that record the same way already. Anything else waits for adoption (see
+/// [`Recorded`]).
 #[derive(Default)]
 pub struct Refresh(std::collections::HashMap<PathBuf, Option<Recorded>>);
 
 impl Refresh {
-    /// Bring `recorded`, kept for the checkout at `path`, up to where it is now, when something
-    /// is at the path and its mount can be learned. Whether it changed.
-    pub fn apply(&mut self, path: &Path, recorded: &mut Recorded) -> bool {
+    /// Bring `recorded`, kept for the checkout at `path`, up to date as far as observation may
+    /// (see [`Refresh`]); `same_checkout` when the caller showed the directory at the path is the
+    /// one the record was made for. Whether it changed.
+    pub fn observe(&mut self, path: &Path, recorded: &mut Recorded, same_checkout: bool) -> bool {
+        self.observe_with(&Disk, path, recorded, same_checkout)
+    }
+
+    pub(crate) fn observe_with(&mut self, fs: &dyn Lookup, path: &Path, recorded: &mut Recorded, same_checkout: bool) -> bool {
         let now = self.0.entry(path.to_path_buf()).or_insert_with(|| {
-            let now = Recorded::of(path);
-            now.location.is_some().then_some(now)
+            let location = location_with(fs, path)?;
+            let device = fs.look(path).ok().map(|n| n.dev);
+            Some(Recorded { device, location: Some(location) })
         });
-        match now {
-            Some(now) if now != recorded => {
-                *recorded = now.clone();
-                true
-            }
-            _ => false,
+        let Some(now) = now.as_ref().filter(|now| *now != recorded) else { return false };
+        let Some(found) = &now.location else { return false };
+        let take = match &recorded.location {
+            Some(was) => same_mount(was, found, fs.binds(), path).is_ok(),
+            None => same_checkout || (!fs.binds() && recorded.device.is_some() && recorded.device == now.device),
+        };
+        if take {
+            *recorded = now.clone();
         }
+        take
     }
 }
 
@@ -638,6 +727,109 @@ mod tests {
         assert_eq!(presence_with(&mounted, Path::new("/mnt/ext/wt"), &at), Presence::Absent);
     }
 
+    /// The lifecycle the comparison guards: a checkout that is its own mount's root goes offline,
+    /// leaving its mount point; `gc` looks at it (observation) while the mount point is there;
+    /// then the mount point goes too. The record still names the checkout's own mount, so the
+    /// checkout is never shown gone by the directory its mount point was on.
+    #[test]
+    fn observation_never_takes_a_mount_point_or_another_volume_for_the_checkout() {
+        let wt = Path::new("/mnt/wt");
+        let base = || Seen::linux().dir("/", ROOT_FS, 2, Some("mkfs"), Some((20, Some(1020)))).dir("/mnt", ROOT_FS, 3, None, Some((20, Some(1020))));
+        let online = || base().dir("/mnt/wt", VOLUME, 2, Some("vol"), Some((60, Some(1060))));
+        let at = recorded(&online(), "/mnt/wt");
+        assert_eq!(at.location.as_ref().unwrap().mount_root, wt);
+        // Offline: the mount point, an empty directory of `/`, is at the path.
+        let stub = base().dir("/mnt/wt", ROOT_FS, 77, Some("stub"), Some((20, Some(1020))));
+        assert_eq!(presence_with(&stub, wt, &at), Presence::Present);
+        for same_checkout in [false, true] {
+            let mut kept = at.clone();
+            assert!(!Refresh::default().observe_with(&stub, wt, &mut kept, same_checkout));
+            assert_eq!(kept, at, "the mount point never replaces the mount recorded");
+        }
+        assert!(on_mount_with(&stub, wt, at.location.as_ref().unwrap()).unwrap_err().contains("on another filesystem"));
+        // The mount point removed too: not shown gone, so nothing of it is reclaimed.
+        let why = unknown(presence_with(&base(), wt, &at));
+        assert!(why.contains("/mnt is on another filesystem") && why.contains("may not be there"), "{why}");
+        // Another volume mounted there, even one given the same device number: not it.
+        let other = base().dir("/mnt/wt", VOLUME + 1, 2, Some("vol"), Some((61, Some(1061))));
+        let renumbered = base().dir("/mnt/wt", VOLUME, 2, Some("other"), Some((61, Some(1061))));
+        let no_birth = base().dir("/mnt/wt", VOLUME, 2, None, Some((61, Some(1061))));
+        for fs in [&other, &renumbered, &no_birth] {
+            let mut kept = at.clone();
+            assert!(!Refresh::default().observe_with(fs, wt, &mut kept, true));
+            assert_eq!(kept, at);
+        }
+        // The same volume mounted again in a later boot, recognised by its root's birth time:
+        // the record gets its ids there.
+        let later = Seen { boot: Some("b"), ..base().dir("/mnt/wt", VOLUME, 2, Some("vol"), Some((62, Some(1062)))) };
+        let mut kept = at.clone();
+        assert!(Refresh::default().observe_with(&later, wt, &mut kept, false));
+        assert_eq!(kept.location.as_ref().unwrap().mount, Some(MountInstance { id: 62, unique: Some(1062), boot: "b".into(), namespace: NS }));
+        // Seen again in that boot: nothing more to record.
+        assert!(!Refresh::default().observe_with(&later, wt, &mut kept, false));
+        // A record from another boot on a filesystem without birth times is never brought to this
+        // one: nothing there recognises the mount.
+        let blind = || base().dir("/mnt/wt", VOLUME, 2, None, Some((60, Some(1060))));
+        let old = recorded(&blind(), "/mnt/wt");
+        let mut kept = old.clone();
+        assert!(!Refresh::default().observe_with(&Seen { boot: Some("b"), ..blind() }, wt, &mut kept, true));
+        assert_eq!(kept, old);
+        // A checkout deleted from the mount it was on, in the same boot: gone.
+        let tree = |fs: Seen| fs.dir("/mnt/wt/repo", VOLUME, 5, None, Some((60, Some(1060))));
+        let deep = recorded(&tree(online()), "/mnt/wt/repo");
+        let mut kept = deep.clone();
+        assert!(!Refresh::default().observe_with(&tree(online()), Path::new("/mnt/wt/repo"), &mut kept, false), "nothing to change");
+        assert_eq!(presence_with(&online(), Path::new("/mnt/wt/repo"), &deep), Presence::Absent);
+    }
+
+    /// One root birth time recorded and the other not is never taken for the same mount: on
+    /// macOS that was a match before, though another volume is as likely.
+    #[test]
+    fn a_birth_time_on_one_side_only_is_not_the_same_mount() {
+        let mac = |born: Option<&str>| Seen::mac().dir("/", ROOT_FS, 2, None, None).dir("/Volumes", ROOT_FS, 3, None, None).dir("/Volumes/ext", VOLUME, 2, born, None);
+        let wt = Path::new("/Volumes/ext/wt");
+        let with = recorded(&mac(Some("x")).dir("/Volumes/ext/wt", VOLUME, 9, None, None), "/Volumes/ext/wt");
+        let without = recorded(&mac(None).dir("/Volumes/ext/wt", VOLUME, 9, None, None), "/Volumes/ext/wt");
+        assert_eq!(presence_with(&mac(Some("x")), wt, &with), Presence::Absent);
+        assert_eq!(presence_with(&mac(None), wt, &without), Presence::Absent, "a filesystem without birth times");
+        assert!(unknown(presence_with(&mac(None), wt, &with)).contains("no birth time to compare"));
+        assert!(unknown(presence_with(&mac(Some("y")), wt, &without)).contains("where none was recorded"));
+        let mut kept = without.clone();
+        assert!(!Refresh::default().observe_with(&mac(Some("y")).dir("/Volumes/ext/wt", VOLUME, 9, None, None), wt, &mut kept, true));
+        assert_eq!(kept, without);
+    }
+
+    /// A record naming no mount is completed by observation only where the directory there
+    /// cannot be a mount point passed off as the checkout.
+    #[test]
+    fn observation_completes_a_record_naming_no_mount_only_where_that_cannot_mislead() {
+        let wt = Path::new("/home/me/repos/wt");
+        // Linux: the mount point of a same-filesystem bind mount has the recorded device.
+        let device_only = Recorded { device: Some(ROOT_FS), location: None };
+        let stub = unbound(bound()).dir("/home/me/repos/wt", ROOT_FS, 601, None, Some((20, Some(1020))));
+        let mut kept = device_only.clone();
+        assert!(!Refresh::default().observe_with(&stub, wt, &mut kept, false));
+        assert_eq!(kept, device_only);
+        let mut kept = Recorded::default();
+        assert!(!Refresh::default().observe_with(&stub, wt, &mut kept, false));
+        // Shown to be the very directory recorded (a data record's checkout token): completed.
+        let mut kept = device_only.clone();
+        assert!(Refresh::default().observe_with(&bound(), wt, &mut kept, true));
+        assert_eq!(kept, recorded(&bound(), "/home/me/repos/wt"));
+        // macOS: by the device recorded, which judges that record already; never another one,
+        // and never a record with no device.
+        let mac = || Seen::mac().dir("/", ROOT_FS, 2, None, None).dir("/Users", ROOT_FS, 3, None, None).dir("/Users/wt", ROOT_FS, 4, None, None);
+        let wt = Path::new("/Users/wt");
+        let mut kept = device_only.clone();
+        assert!(Refresh::default().observe_with(&mac(), wt, &mut kept, false));
+        assert_eq!(kept, recorded(&mac(), "/Users/wt"));
+        for record in [Recorded { device: Some(VOLUME), location: None }, Recorded::default()] {
+            let mut kept = record.clone();
+            assert!(!Refresh::default().observe_with(&mac(), wt, &mut kept, false));
+            assert_eq!(kept, record);
+        }
+    }
+
     /// Records an earlier Stack kept: a device alone decides only where every mount has a
     /// device of its own; with nothing recorded, nothing decides, whatever the parent holds.
     #[test]
@@ -648,7 +840,7 @@ mod tests {
         assert_eq!(presence_with(&mac, Path::new("/Users/me/wt"), &device_only), Presence::Absent);
         assert!(unknown(presence_with(&mac, Path::new("/Users/me/wt"), &Recorded { device: Some(VOLUME), location: None })).contains("another filesystem"));
         let why = unknown(presence_with(&mac, Path::new("/Users/me/wt"), &nothing));
-        assert!(why.contains("recorded no filesystem") && why.contains("recreate the directory"), "{why}");
+        assert!(why.contains("recorded no filesystem") && why.contains("records an earlier Stack kept"), "{why}");
         // Linux: the device of an unmounted same-filesystem bind mount's mount point is the same.
         let why = unknown(presence_with(&unbound(bound()), Path::new("/home/me/repos/wt"), &device_only));
         assert!(why.contains("only the device") && why.contains("bind mount"), "{why}");
@@ -658,10 +850,13 @@ mod tests {
         let legacy: Recorded = serde_json::from_str(r#"{"project_device": 7}"#).unwrap();
         assert_eq!(legacy, Recorded { device: Some(7), location: None });
         assert_eq!(serde_json::to_string(&legacy).unwrap(), r#"{"project_device":7}"#);
-        // A location that cannot be learned now never drops the one recorded.
+        // A location that cannot be learned now never drops the one recorded, unless another
+        // filesystem is learned now: then it names a mount the checkout is not on.
         let full = recorded(&bound(), "/home/me/repos/wt");
         assert_eq!(Recorded { device: Some(ROOT_FS), location: None }.or_kept(&full), full);
+        assert_eq!(Recorded::default().or_kept(&full), full);
         assert_eq!(full.clone().or_kept(&Recorded::default()), full);
+        assert_eq!(Recorded { device: Some(VOLUME), location: None }.or_kept(&full), Recorded { device: Some(VOLUME), location: None });
     }
 
     /// The same decisions on the disk: a refused lookup, a recorded mount that is not the one
@@ -688,18 +883,22 @@ mod tests {
             std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(unknown(refused).contains("cannot be looked up"));
         }
-        // A legacy record of it, completed while it is there.
+        // A legacy record of it, completed while it is there: by its device alone only where
+        // every mount has its own, else only once the caller shows the directory is the one.
         let mut legacy = Recorded { device: at.device, location: None };
         let mut refresh = Refresh::default();
-        assert!(refresh.apply(&wt, &mut legacy));
+        assert_eq!(refresh.observe(&wt, &mut legacy, false), !crate::mounts::BINDS);
+        assert!(refresh.observe(&wt, &mut legacy, true) || !crate::mounts::BINDS);
         assert_eq!(legacy, at);
-        assert!(!refresh.apply(&wt, &mut legacy), "nothing more to record");
+        assert!(!refresh.observe(&wt, &mut legacy, true), "nothing more to record");
+        // A command run in it adopts it whatever was recorded.
+        assert_eq!(Recorded::adopted(&wt, &Recorded::default()), at);
         std::fs::remove_dir(&wt).unwrap();
         assert_eq!(presence(&wt, &at), Presence::Absent);
         assert!(gone(&wt, &at));
         // Nothing to complete once it is gone.
         let mut missing = Recorded { device: at.device, location: None };
-        assert!(!Refresh::default().apply(&wt, &mut missing));
+        assert!(!Refresh::default().observe(&wt, &mut missing, true));
         // A record of another mount's root at that place: not this one.
         let elsewhere = Recorded { location: Some(Location { root: [location.root[0], location.root[1].wrapping_add(1)], ..location.clone() }), ..at.clone() };
         assert!(unknown(presence(&wt, &elsewhere)).contains("on another mount"));

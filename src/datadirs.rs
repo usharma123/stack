@@ -89,7 +89,11 @@ pub fn record_all(state: &Path, entries: Vec<Entry>) -> Result<()> {
     let _guard = FileLock::acquire(&lock)?;
     let mut ledger: Ledger = read_json(&file)?;
     let mut changed = false;
-    for entry in entries {
+    for mut entry in entries {
+        // Where its checkout is, kept from the entry it replaces when it cannot be learned now.
+        if let Some(previous) = ledger.entries.iter().find(|e| e.project == entry.project && e.service == entry.service) {
+            entry.project_at = entry.project_at.or_kept(&previous.project_at);
+        }
         if ledger.entries.contains(&entry) {
             continue;
         }
@@ -108,8 +112,10 @@ pub fn entries(state: &Path) -> Result<Vec<Entry>> {
     Ok(read_json::<Ledger>(&paths(state).0)?.entries)
 }
 
-/// Record where each entry's checkout is now, for those still there (see
-/// [`crate::checkout::Refresh`]), under the ledger's lock; written only when one changed.
+/// Bring each entry's record of where its checkout is up to date, for those still there, as far
+/// as observation may (see [`crate::checkout::Refresh`]): the directory at the path counts as the
+/// entry's checkout only when it has the entry's checkout token. Under the ledger's lock; written
+/// only when one changed.
 pub fn refresh_checkouts(state: &Path) -> Result<()> {
     let (file, lock) = paths(state);
     if !file.exists() {
@@ -120,7 +126,8 @@ pub fn refresh_checkouts(state: &Path) -> Result<()> {
     let mut refresh = crate::checkout::Refresh::default();
     let mut changed = false;
     for entry in &mut ledger.entries {
-        changed |= refresh.apply(&entry.project, &mut entry.project_at);
+        let same_checkout = crate::checkout::token(&entry.project).is_some_and(|t| t == entry.checkout);
+        changed |= refresh.observe(&entry.project, &mut entry.project_at, same_checkout);
     }
     if changed {
         write_json(&file, &ledger)?;

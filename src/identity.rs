@@ -43,13 +43,14 @@ pub fn assign(state: &Path, project: &Path, services: &[String]) -> Result<Index
     let before = reg.tokens.len();
     reg.tokens.retain(|t| !crate::checkout::gone(&t.project, &t.project_at) && (t.project != project || services.contains(&t.service)));
     let mut changed = reg.tokens.len() != before;
-    // This checkout's tokens record where it is now (an earlier Stack's record, or one from
-    // another boot, completed).
-    let mut refresh = crate::checkout::Refresh::default();
-    for t in reg.tokens.iter_mut().filter(|t| t.project == project) {
-        changed |= refresh.apply(project, &mut t.project_at);
-    }
+    // This checkout's tokens record where it is now: a compile of it adopts the path's records
+    // (see [`crate::checkout::Recorded`]), keeping what they knew where nothing can be learned.
     let at = crate::checkout::Recorded::of(project);
+    for t in reg.tokens.iter_mut().filter(|t| t.project == project) {
+        let now = at.clone().or_kept(&t.project_at);
+        changed |= now != t.project_at;
+        t.project_at = now;
+    }
     let mut out = IndexMap::new();
     for service in services {
         let existing = reg.tokens.iter().find(|t| t.project == project && t.service == *service);

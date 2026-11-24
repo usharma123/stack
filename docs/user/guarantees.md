@@ -81,7 +81,10 @@ the lease is kept and `owner_unknown` says
   deleted only once its path is gone and the mount it was on is there to show it: a lookup
   refused or failing, a volume that is not mounted, or a bind mount that is not mounted (even
   one of the same filesystem), leaves everything of it as it is, and so does a record that
-  names no mount (an earlier Stack's, on Linux, or one naming no filesystem at all) (see
+  names no mount (an earlier Stack's, on Linux, or one naming no filesystem at all). A mount
+  point left at a checkout's path while its volume or bind mount is not mounted, or another
+  volume mounted there, never stands in for it: only a command run in the checkout adopts what
+  is at the path, and `gc` updates a record only from the very mount it names (see
   [gc](commands.md#gc)). For a deleted
   checkout, `gc` stops what Stack's supervisor recorded for it, each process only while its pid
   and process start time still match the record, and drops the record once they are gone.
