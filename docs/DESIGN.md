@@ -707,7 +707,9 @@ output (mise's answer when no release matches) is an error, not a version.
   SIGINT, SIGTERM and SIGHUP on to the process group of every command running then. For a
   user's command (`exec`, `run`, MCP calls) Stack then goes on waiting, kills the group 10 seconds
   after the first signal or at the second, and reports the command once it is done; the MCP
-  server then answers the call and exits with 128 + the signal. A service's `setup` is run the
+  server then answers the call and exits with 128 + the signal; no call waiting to start is
+  admitted after the signal, by a call ending, roots arriving or input ending alike (a batch
+  such a call was in is owed nothing more for it). A service's `setup` is run the
   same way, and the signal cancels the start whatever the setup's exit status: `up` and
   `restart` run no later setup, request nothing more, and fail `cancelled`. A signal that comes
   as the command exits, too late to reach it, is still owed. The handler only records a

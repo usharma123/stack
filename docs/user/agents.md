@@ -259,7 +259,14 @@ checkouts are answered meanwhile. Calls on the same checkout run one at a time, 
 they arrived. At most 16 calls run at once; others wait their turn without holding a thread, and
 once 256 calls are waiting a new `tools/call` is refused at once with JSON-RPC error `-32000`
 (`data.retryable: true`): retry it once some finish. When the client closes the server's input,
-every call it already accepted still runs and is answered before the server exits.
+every call it already accepted still runs and is answered before the server exits. A signal
+that ends the server (one passed on to a call's command) lets the calls running finish and be
+answered; calls still waiting then never start and are not answered, and a batch they were in
+still gets its other responses. One message (or batch) is one line of at most 4 MiB: a longer
+line is skipped unread and answered with JSON-RPC error `-32600` (`id: null`,
+`data.limit`), and the session goes on as before. At most 16 lines read wait to be handled;
+past that the server stops reading until it catches up, so a client writing faster than that
+blocks rather than growing the server.
 
 - **Cancelling.** `notifications/cancelled` for a running call stops it the way its timeout
   would: its commands are killed with their process groups and no response is sent. A
