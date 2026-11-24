@@ -309,6 +309,22 @@ pub struct SnapService {
     /// Digest of the init list and tasks this data satisfies, when init had completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init_digest: Option<String>,
+    /// Where init stopped, when a task had failed: what `up` resumes from after a restore.
+    /// A field of its own, so a Stack that does not know it restores such data as `pending`
+    /// (init runs from the start), never as `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_resume: Option<Resume>,
+}
+
+/// The progress of an init that failed, as its marker recorded it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resume {
+    /// Digest of the init list it ran.
+    pub digest: String,
+    /// The leading tasks it completed, each with its definition's digest.
+    pub completed: Vec<init_tasks::CompletedTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_task: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +435,8 @@ struct DataDir {
     exists: bool,
     /// This checkout's token, which the record and the marker beside the directory name.
     token: String,
+    /// The recorded directory, held open as checked; `None` when nothing is there yet.
+    held: Option<datadirs::Held>,
 }
 
 /// The data directory of this checkout's `service`: the one the supervisor names, recorded by
@@ -443,7 +461,7 @@ fn data_dir(ctx: &Ctx, statuses: &[DaemonStatus], service: &str) -> Result<DataD
                 return Err(failed(format!("{} does not carry this checkout's marker", dir.display())).hint(rerun));
             }
             let location = entry.location.clone().expect("a held record has a location");
-            Ok(DataDir { dir, location, exists: true, token })
+            Ok(DataDir { dir, location, exists: true, token, held: Some(held) })
         }
         // Nothing there yet: it may be created, at the place the record says.
         Found::Gone | Found::Unbound(_) if absent => {
@@ -453,16 +471,11 @@ fn data_dir(ctx: &Ctx, statuses: &[DaemonStatus], service: &str) -> Result<DataD
             if !marked(fs::read(session::data_marker(&dir)).ok()) {
                 return Err(failed(format!("{} does not carry this checkout's marker", dir.display())).hint(rerun));
             }
-            Ok(DataDir { dir, location, exists: false, token })
+            Ok(DataDir { dir, location, exists: false, token, held: None })
         }
         Found::Gone | Found::Unbound(_) => Err(failed(format!("{} is not the data directory Stack recorded for '{service}'", dir.display())).hint(rerun)),
         Found::Other(why) => Err(StackError::new("snapshot_unsupported", format!("{service}'s data directory: {why}")).hint("Stack copies only the data directory it recorded, reached with no link followed")),
     }
-}
-
-/// After a restore put another directory at `data`'s place: the record names the new one.
-fn rebind(ctx: &Ctx, data: &DataDir) -> Result<()> {
-    datadirs::bind(&ctx.state, &data.dir, &data.token)
 }
 
 // ---- copying ------------------------------------------------------------------------------
@@ -561,102 +574,413 @@ fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
-/// Exchange two existing paths in one step: `Ok(true)` when done, `Ok(false)` when the platform
-/// or the filesystem has no exchange (the caller falls back), an error otherwise.
+/// Exchange two existing paths in one step (see [`datadirs::exchange`]).
 fn exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
-    #[cfg(test)]
-    if NO_EXCHANGE.with(std::cell::Cell::get) {
-        return Ok(false);
+    datadirs::exchange(a, b)
+}
+
+// ---- restoring ----------------------------------------------------------------------------
+//
+// A restore of several services is one change: every service's data is replaced, or none is.
+//
+// 1. Every service's snapshot data is copied beside its data directory
+//    (`.<dir>.stack-restore-…`) before anything is replaced. A failure removes the copies.
+// 2. A journal (`<state>/init/<checkout>.restore.json`) records each swap: the data
+//    directory, its copy, where its old data goes, and which directories they are (device,
+//    inode), and the init markers to write once every copy is in place.
+// 3. Each data directory, held open and checked as `up` recorded it (see [`datadirs::hold`]),
+//    on its parent's mount, is swapped with its copy through the held parent: one exchange
+//    where the filesystem has it, else two renames (`.<dir>.stack-old-…`). The old data is
+//    kept until step 4.
+// 4. The journal is marked `committed` (the restore has happened), then the init markers are
+//    written in one write, the record is bound to the new directories, the old data is
+//    removed as `gc --reclaim-data` removes data, and the journal goes.
+//
+// A failure in step 3 swaps every service back, judged by which directory is where, never by
+// what the steps meant to do: services not reached are `unchanged`, those swapped are
+// `rolled_back`. One that cannot be put back keeps its old data where it is, the journal stays,
+// nothing is recorded as restored, and the error (`restore_incomplete`) says where each
+// service's data is. An interrupted restore (a crash) is finished the same way by the next
+// snapshot operation or `up` of the checkout, before anything else touches the data: rolled
+// back before step 4, completed after it.
+
+/// One service's part of a restore, as the journal records it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Swap {
+    service: String,
+    /// As the supervisor names it, and the record with it.
+    dir: PathBuf,
+    /// Where it resolves: what is swapped.
+    target: PathBuf,
+    /// The complete copy of the snapshot's data, beside `target`. Exchanged, the old data.
+    fresh: PathBuf,
+    /// Where the old data is renamed to where the filesystem has no exchange.
+    aside: PathBuf,
+    /// The data directory before the restore (device, inode); `None`: nothing was there.
+    old: Option<[u64; 2]>,
+    /// The copy (device, inode).
+    new: [u64; 2],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Journal {
+    snapshot: String,
+    /// `swapping` until every copy is in place, then `committed`.
+    phase: String,
+    token: String,
+    swaps: Vec<Swap>,
+    /// The init marker of each service once committed (`None` removes it).
+    markers: IndexMap<String, Option<Marker>>,
+}
+
+fn journal_path(state: &Path, root: &Path) -> PathBuf {
+    state.join("init").join(format!("{}.restore.json", crate::state::project_key(root)))
+}
+
+/// The directory at `path` (device, inode), not following a link; `None` when nothing, or no
+/// directory, is there.
+fn dir_at(path: &Path) -> Option<[u64; 2]> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().filter(|m| m.is_dir()).map(|m| [m.dev(), m.ino()])
+}
+
+/// Remove the directory at `path` if it is `identity`: a copy this restore made, never
+/// anything else. Never across a mount inside it.
+fn discard(path: &Path, identity: [u64; 2]) {
+    if dir_at(path) == Some(identity) {
+        let _ = datadirs::remove_tree(path);
     }
-    use std::os::unix::ffi::OsStrExt;
-    let invalid = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in a path");
-    let a = std::ffi::CString::new(a.as_os_str().as_bytes()).map_err(invalid)?;
-    let b = std::ffi::CString::new(b.as_os_str().as_bytes()).map_err(invalid)?;
-    #[cfg(target_os = "macos")]
-    // SAFETY: valid NUL-terminated paths, resolved from the working directory as given.
-    let rc = unsafe { libc::renameatx_np(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_SWAP) };
-    #[cfg(target_os = "linux")]
-    // SAFETY: valid NUL-terminated paths; renameat2 only reads them. Called by number: musl
-    // declares no wrapper.
-    let rc = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) };
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let rc = {
-        let _ = (a, b);
-        return Ok(false);
+}
+
+fn rename(from: &Path, to: &Path) -> std::result::Result<(), String> {
+    fs::rename(from, to).map_err(|e| format!("renaming {} to {}: {e}", from.display(), to.display()))
+}
+
+/// Put `swap`'s old data back at its place, whatever step its swap reached, and remove the
+/// copy. `unchanged` when it was never swapped, `rolled_back` when it was swapped back; why
+/// not when neither can be shown, with everything left where it is.
+fn undo(swap: &Swap) -> std::result::Result<&'static str, String> {
+    let (target, fresh, aside) = (dir_at(&swap.target), dir_at(&swap.fresh), dir_at(&swap.aside));
+    let lost = || {
+        format!(
+            "{} is neither its old data nor the restored copy; the old data was {}",
+            swap.target.display(),
+            match (fresh, aside) {
+                (f, _) if f.is_some() && f == swap.old => format!("left at {}", swap.fresh.display()),
+                (_, a) if a.is_some() && a == swap.old => format!("left at {}", swap.aside.display()),
+                _ => "not found".to_string(),
+            }
+        )
     };
-    if rc == 0 {
-        return Ok(true);
+    let Some(old) = swap.old else {
+        // Nothing was there: the copy was renamed in, or not (whatever is there now, if the
+        // copy never moved, is not the restore's).
+        return match target {
+            _ if fresh == Some(swap.new) => {
+                discard(&swap.fresh, swap.new);
+                Ok("unchanged")
+            }
+            None => Ok("unchanged"),
+            Some(t) if t == swap.new && fresh.is_none() => {
+                rename(&swap.target, &swap.fresh)?;
+                discard(&swap.fresh, swap.new);
+                Ok("rolled_back")
+            }
+            Some(_) => Err(format!("{} is not the restored copy; it is left as it is", swap.target.display())),
+        };
+    };
+    if target == Some(old) {
+        discard(&swap.fresh, swap.new);
+        return Ok("unchanged");
     }
-    let e = std::io::Error::last_os_error();
-    // No such call (an old kernel, a seccomp filter), or a filesystem without exchange.
-    // (EOPNOTSUPP is ENOTSUP on Linux, another number on macOS.)
-    let code = e.raw_os_error().unwrap_or(0);
-    if [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code) {
-        return Ok(false);
+    if target.is_none() && aside == Some(old) {
+        // Renamed aside, the copy not in place yet.
+        rename(&swap.aside, &swap.target)?;
+    } else if fresh == Some(swap.new) && aside != Some(old) {
+        // The copy never moved, so neither did anything else this restore touches: whatever
+        // is at the place now (another directory put there since the check) is left alone.
+        discard(&swap.fresh, swap.new);
+        return Ok("unchanged");
+    } else if target == Some(swap.new) && fresh == Some(old) {
+        // Exchanged: exchange back (two renames through `aside` without an exchange now).
+        if !exchange(&swap.fresh, &swap.target).map_err(|e| format!("exchanging {} back: {e}", swap.target.display()))? {
+            rename(&swap.target, &swap.aside)?;
+            if let Err(e) = rename(&swap.fresh, &swap.target) {
+                let _ = fs::rename(&swap.aside, &swap.target);
+                return Err(e);
+            }
+            discard(&swap.aside, swap.new);
+        }
+    } else if target == Some(swap.new) && aside == Some(old) && fresh.is_none() {
+        // Renamed aside, then the copy renamed in.
+        rename(&swap.target, &swap.fresh)?;
+        if let Err(e) = rename(&swap.aside, &swap.target) {
+            let _ = fs::rename(&swap.fresh, &swap.target);
+            return Err(e);
+        }
+    } else {
+        return Err(lost());
     }
-    Err(e)
+    if dir_at(&swap.target) != Some(old) {
+        return Err(lost());
+    }
+    discard(&swap.fresh, swap.new);
+    Ok("rolled_back")
+}
+
+/// Swap `swap`'s copy into place: through the held data directory when there is one
+/// (still the recorded directory, on its parent's mount), by one rename when nothing is there.
+fn swap_in(swap: &Swap, held: Option<&datadirs::Held>) -> Result<&'static str> {
+    let failed = |why: String| StackError::new("snapshot_failed", format!("replacing {}'s data at {}: {why}", swap.service, swap.target.display()));
+    match (swap.old, held) {
+        (Some(old), Some(held)) => {
+            if held.identity() != old {
+                return Err(failed("it is not the directory that was checked".into()));
+            }
+            match held.on_parent_mount() {
+                Ok(true) => {}
+                Ok(false) => return Err(failed("it is a mount point; Stack never swaps a mount".into())),
+                Err(e) => return Err(failed(format!("which mount it is on cannot be told ({e})"))),
+            }
+            let name = |p: &Path| p.file_name().unwrap_or_default().to_os_string();
+            match held.swap_in(&name(&swap.fresh), &name(&swap.aside)).map_err(|e| failed(e.to_string()))? {
+                datadirs::Swapped::Exchanged => Ok("exchange"),
+                datadirs::Swapped::Renamed => Ok("rename"),
+            }
+        }
+        (None, _) => {
+            if fs::symlink_metadata(&swap.target).is_ok() {
+                return Err(failed("something was put there since it was checked".into()));
+            }
+            fs::rename(&swap.fresh, &swap.target).map_err(|e| failed(e.to_string()))?;
+            Ok("rename")
+        }
+        (Some(_), None) => Err(failed("it was not held open when checked".into())),
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Tests take the two-rename path the platforms without an exchange take.
-    static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests fail the swap of the service at this index, as an I/O error would.
+    static FAIL_SWAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests fail putting this index back, as an I/O error would.
+    static FAIL_UNDO: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests stop the restore after this many swaps, as a crash would (the journal stays).
+    static CRASH_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests fail recording a committed restore.
+    static FAIL_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Put the complete copy `fresh` (a sibling of `target`) at `target`. With no `target` yet,
-/// one rename. Otherwise an exchange, or two renames where the platform has none: `target`
-/// is then briefly missing, never half-written, and the old data is kept aside until the new
-/// is in place.
-fn replace(fresh: &Path, target: &Path) -> Result<&'static str> {
-    if fs::symlink_metadata(target).is_err() {
-        fs::rename(fresh, target).map_err(|e| io_error(target.display(), e))?;
-        return Ok("rename");
+/// Every service's swap undone: the outcome of each, and whether all are back as they were.
+fn undo_all(swaps: &[Swap]) -> (Vec<Value>, bool) {
+    let mut whole = true;
+    let mut out = Vec::new();
+    for (i, swap) in swaps.iter().enumerate().rev() {
+        #[cfg(test)]
+        let undone = if FAIL_UNDO.with(std::cell::Cell::get) == Some(i) { Err("putting it back failed (test)".to_string()) } else { undo(swap) };
+        #[cfg(not(test))]
+        let undone = undo(swap);
+        let _ = i;
+        out.push(match undone {
+            Ok(outcome) => json!({ "service": swap.service, "outcome": outcome, "data_dir": swap.dir }),
+            Err(why) => {
+                whole = false;
+                let mut v = json!({ "service": swap.service, "outcome": "manual_recovery", "data_dir": swap.dir, "why": why });
+                if let Some(old) = swap.old {
+                    if let Some(at) = [&swap.target, &swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(old)) {
+                        v["old_data"] = json!(at);
+                    }
+                }
+                if let Some(at) = [&swap.target, &swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(swap.new)) {
+                    v["restored_copy"] = json!(at);
+                }
+                v
+            }
+        });
     }
-    if exchange(fresh, target).map_err(|e| io_error(target.display(), e))? {
-        // `fresh` now holds the old data: removed only up to a mount inside it, never across.
-        let _ = datadirs::remove_tree(fresh);
-        return Ok("exchange");
-    }
-    let parent = target.parent().unwrap_or(Path::new("/"));
-    let aside = unique(parent, &format!(".{}.stack-old", target.file_name().unwrap_or_default().to_string_lossy()));
-    fs::rename(target, &aside).map_err(|e| io_error(target.display(), e))?;
-    if let Err(e) = fs::rename(fresh, target) {
-        let _ = fs::rename(&aside, target);
-        return Err(io_error(target.display(), e));
-    }
-    let _ = datadirs::remove_tree(&aside);
-    Ok("rename")
+    out.reverse();
+    (out, whole)
 }
 
-/// Copy a snapshot's data for `service` to `target`, through a sibling temporary directory.
-fn restore_into(snapshot: &Path, service: &str, target: &Path) -> Result<Value> {
-    let parent = target.parent().expect("checked absolute with a parent");
-    fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
-    let fresh = unique(parent, &format!(".{}.stack-restore", target.file_name().unwrap_or_default().to_string_lossy()));
-    let copied = copy_tree(&snapshot.join("data").join(service), &fresh);
-    let how = match copied.and_then(|how| replace(&fresh, target).map(|swap| (how, swap))) {
-        Ok(how) => how,
-        Err(e) => {
-            remove_tree(&fresh);
-            return Err(e);
+/// The error for a restore that changed nothing in the end: every service's data is as it was.
+fn unchanged(cause: StackError, services: Vec<Value>) -> StackError {
+    let mut e = StackError::new("snapshot_failed", format!("{}; every service's data is as it was", cause.message)).with_detail(json!({ "services": services, "cause": cause.code }));
+    e.details.extend(cause.details);
+    e.hint = cause.hint;
+    e
+}
+
+/// The error for a restore that left data in a state the restore did not finish: what each
+/// service holds and where its old data is, with the journal the next operation finishes from.
+fn incomplete(message: String, services: Vec<Value>, journal: &Path) -> StackError {
+    StackError::new("restore_incomplete", message)
+        .hint("services left this way are not started; run the snapshot command again or `stack up`, which first finishes or undoes the interrupted restore. Data marked `manual_recovery` must be moved back by hand (details name where it is); then remove the journal named in details")
+        .with_detail(json!({ "services": services, "journal": journal }))
+}
+
+/// Record a committed restore: the init markers in one write, the record bound to the new
+/// directories, the old data removed (kept where a mount is inside it), the journal removed.
+fn commit(state: &Path, root: &Path, journal: &Journal) -> Result<Vec<Value>> {
+    #[cfg(test)]
+    if FAIL_COMMIT.with(std::cell::Cell::get) {
+        return Err(StackError::new("state_invalid", "recording failed (test)"));
+    }
+    init_tasks::set_markers(state, root, &journal.markers)?;
+    let dirs: Vec<&Path> = journal.swaps.iter().map(|s| s.dir.as_path()).collect();
+    datadirs::bind_all(state, &dirs, &journal.token)?;
+    let mut kept = Vec::new();
+    for swap in &journal.swaps {
+        let Some(old) = swap.old else { continue };
+        let Some(at) = [&swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(old)) else { continue };
+        if let Err(e) = datadirs::remove_tree(at) {
+            kept.push(json!({ "service": swap.service, "old_data_kept": at, "why": e.to_string() }));
         }
-    };
-    Ok(json!({ "service": service, "data_dir": target, "copy": how.0, "replace": how.1 }))
+    }
+    match fs::remove_file(journal_path(state, root)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io_error(journal_path(state, root).display(), e)),
+        _ => {}
+    }
+    Ok(kept)
 }
 
-/// Mark restored data as initialised for the init digest the snapshot records, or forget any
-/// marker when it records none.
-fn mark_restored(ctx: &Ctx, name: &str, service: &str, snap: &SnapService, target: &Path) -> Result<()> {
-    let marker = snap.init_digest.clone().map(|digest| Marker {
-        data_dir: DirIdentity::of(target),
-        status: "done".into(),
-        digest,
-        completed: Vec::new(),
-        failed_task: None,
-        source: format!("snapshot:{name}"),
-        at: now(),
-    });
-    init_tasks::set_marker(&ctx.state, &ctx.root, service, marker)
+/// Finish a restore of this checkout that was interrupted: undone when it had not committed,
+/// recorded when it had. `None` when there is none. The caller holds the project lock and has
+/// confirmed the journal's services are stopped ([`journaled`] names them).
+pub fn recover_restore(state: &Path, root: &Path) -> Result<Option<Value>> {
+    let path = journal_path(state, root);
+    let journal: Option<Journal> = match fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error(path.display(), e)),
+        Ok(text) => serde_json::from_str(&text).ok(),
+    };
+    let Some(journal) = journal else {
+        return Err(StackError::new("state_invalid", format!("{} cannot be read", path.display())).hint("remove it once the checkout's data directories are as they should be"));
+    };
+    if journal.phase == "committed" {
+        let kept = commit(state, root, &journal)
+            .map_err(|e| incomplete(format!("snapshot '{}' was restored, but recording it failed: {}", journal.snapshot, e.message), restored(&journal, &[]), &path))?;
+        return Ok(Some(json!({ "snapshot": journal.snapshot, "interrupted_restore": "completed", "kept": kept })));
+    }
+    let (services, whole) = undo_all(&journal.swaps);
+    if !whole {
+        return Err(incomplete(format!("an interrupted restore of snapshot '{}' cannot be undone", journal.snapshot), services, &path));
+    }
+    let _ = fs::remove_file(&path);
+    Ok(Some(json!({ "snapshot": journal.snapshot, "interrupted_restore": "rolled_back", "services": services })))
+}
+
+/// The services an interrupted restore of this checkout left, for the caller to confirm stopped
+/// before [`recover_restore`].
+pub fn journaled(state: &Path, root: &Path) -> Option<Vec<String>> {
+    let journal: Journal = serde_json::from_str(&fs::read_to_string(journal_path(state, root)).ok()?).ok()?;
+    Some(journal.swaps.into_iter().map(|s| s.service).collect())
+}
+
+fn restored(journal: &Journal, how: &[&str]) -> Vec<Value> {
+    journal.swaps.iter().enumerate().map(|(i, s)| json!({ "service": s.service, "outcome": "restored", "data_dir": s.dir, "replace": how.get(i) })).collect()
+}
+
+/// What a snapshot's init state makes the init marker of restored data (see [`crate::init_tasks`]):
+/// done for the init list it completed; failed after the tasks it completed, so `up` resumes
+/// from the failed one; none at all (init runs from the start) when it had not begun or
+/// completed nothing.
+fn restored_marker(name: &str, snap: &SnapService, data_dir: DirIdentity) -> Option<Marker> {
+    let base = |status: &str, digest: String| Marker { data_dir: Some(data_dir.clone()), status: status.into(), digest, completed: Vec::new(), failed_task: None, source: format!("snapshot:{name}"), at: now() };
+    if let Some(digest) = snap.init_digest.clone() {
+        return Some(base("done", digest));
+    }
+    let resume = snap.init_resume.as_ref().filter(|r| !r.completed.is_empty())?;
+    Some(Marker { completed: resume.completed.clone(), failed_task: resume.failed_task.clone(), ..base("failed", resume.digest.clone()) })
+}
+
+/// Restore each planned service from the snapshot `name` at `snapshot`, all or none (see above).
+fn restore_services(ctx: &Ctx, name: &str, snapshot: &Path, plan: &[(String, SnapService, DataDir)]) -> Result<Vec<Value>> {
+    let Some((_, _, first)) = plan.first() else { return Ok(Vec::new()) };
+    let token = first.token.clone();
+    let path = journal_path(&ctx.state, &ctx.root);
+    let untouched = || plan.iter().map(|(s, _, d)| json!({ "service": s, "outcome": "unchanged", "data_dir": d.dir })).collect::<Vec<_>>();
+    // 1. Every copy, before anything is replaced.
+    let mut swaps: Vec<Swap> = Vec::new();
+    let mut copies = Vec::new();
+    for (service, _, data) in plan {
+        let parent = data.location.parent().expect("checked absolute with a parent");
+        let label = data.location.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let fresh = unique(parent, &format!(".{label}.stack-restore"));
+        let copied = fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e)).and_then(|()| copy_tree(&snapshot.join("data").join(service), &fresh));
+        let new = copied.and_then(|how| dir_at(&fresh).map(|id| (how, id)).ok_or_else(|| StackError::new("snapshot_failed", format!("the copy at {} is gone", fresh.display()))));
+        let (how, new) = match new {
+            Ok(v) => v,
+            Err(e) => {
+                remove_tree(&fresh);
+                swaps.iter().for_each(|s| discard(&s.fresh, s.new));
+                return Err(unchanged(e, untouched()));
+            }
+        };
+        let old = data.held.as_ref().map(datadirs::Held::identity);
+        swaps.push(Swap { service: service.clone(), dir: data.dir.clone(), target: data.location.clone(), fresh, aside: unique(parent, &format!(".{label}.stack-old")), old, new });
+        copies.push(how);
+    }
+    // 2. The journal.
+    let markers = plan.iter().zip(&swaps).map(|((service, snap, data), swap)| (service.clone(), restored_marker(name, snap, DirIdentity { location: data.location.clone(), identity: swap.new }))).collect();
+    let mut journal = Journal { snapshot: name.to_string(), phase: "swapping".into(), token, swaps, markers };
+    if let Err(e) = write_json(&path, &journal) {
+        journal.swaps.iter().for_each(|s| discard(&s.fresh, s.new));
+        return Err(unchanged(e, untouched()));
+    }
+    // 3. The swaps.
+    let mut how = Vec::new();
+    for (i, (swap, (_, _, data))) in journal.swaps.iter().zip(plan).enumerate() {
+        let _ = i;
+        #[cfg(test)]
+        if CRASH_AFTER.with(std::cell::Cell::get) == Some(i) {
+            return Err(StackError::new("snapshot_failed", "crashed (test)"));
+        }
+        #[cfg(test)]
+        let swapped = if FAIL_SWAP.with(std::cell::Cell::get) == Some(i) { Err(StackError::new("snapshot_failed", format!("replacing {}'s data failed (test)", swap.service))) } else { swap_in(swap, data.held.as_ref()) };
+        #[cfg(not(test))]
+        let swapped = swap_in(swap, data.held.as_ref());
+        match swapped {
+            Ok(h) => how.push(h),
+            Err(e) => return Err(roll_back(&journal, &path, e, &swap.service)),
+        }
+    }
+    // 4. Committed: the restore has happened.
+    journal.phase = "committed".into();
+    if let Err(e) = write_json(&path, &journal) {
+        journal.phase = "swapping".into();
+        return Err(roll_back(&journal, &path, e, "the journal"));
+    }
+    let kept = commit(&ctx.state, &ctx.root, &journal).map_err(|e| {
+        incomplete(
+            format!("snapshot '{name}' was restored, but recording it failed: {}; the restored data stays, and the next snapshot command or `stack up` records it", e.message),
+            restored(&journal, &how),
+            &path,
+        )
+    })?;
+    Ok(journal
+        .swaps
+        .iter()
+        .zip(copies.iter().zip(&how))
+        .map(|(s, (copy, replace))| {
+            let mut v = json!({ "service": s.service, "data_dir": s.target, "copy": copy, "replace": replace });
+            if let Some(k) = kept.iter().find(|k| k["service"] == json!(s.service)) {
+                v["old_data_kept"] = k["old_data_kept"].clone();
+            }
+            v
+        })
+        .collect())
+}
+
+/// Undo every swap of a restore that failed at `failed`: `snapshot_failed` when every service
+/// is back as it was (the journal removed), `restore_incomplete` otherwise (the journal kept).
+fn roll_back(journal: &Journal, path: &Path, cause: StackError, failed: &str) -> StackError {
+    let (services, whole) = undo_all(&journal.swaps);
+    if whole {
+        let _ = fs::remove_file(path);
+        return unchanged(cause, services).with_detail(json!({ "failed": failed }));
+    }
+    incomplete(format!("{}; restoring snapshot '{}' failed and not every service could be put back as it was", cause.message, journal.snapshot), services, path)
+        .with_detail(json!({ "failed": failed, "cause": cause.code }))
 }
 
 // ---- operations ---------------------------------------------------------------------------
@@ -727,6 +1051,8 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
     }
     let _run = init_tasks::run_lock(&ctx.state, &ctx.root)?;
     let stopped = session::with_stopped(ctx, &services, |report, statuses| {
+        // Never a copy of data a restore left half done.
+        let interrupted = recover_restore(&ctx.state, &ctx.root)?;
         let _store = store_lock(&ctx.state, &project)?;
         let base = store(&ctx.state, &project);
         fs::create_dir_all(&base).map_err(|e| io_error(base.display(), e))?;
@@ -751,6 +1077,9 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
                 let marker = markers.get(service);
                 let init = init_tasks::classify(&report.stack, service, marker, Some(&dir_str));
                 let init_digest = matches!(init, InitState::Done | InitState::Stale).then(|| marker.map(|m| m.digest.clone())).flatten();
+                let init_resume = (init == InitState::Failed)
+                    .then(|| marker.map(|m| Resume { digest: m.digest.clone(), completed: m.completed.clone(), failed_task: m.failed_task.clone() }))
+                    .flatten();
                 let version = locked_version(report, service).unwrap_or_default();
                 meta.services.insert(service.clone(), SnapService {
                     preset: preset(report, service).unwrap_or_default().to_string(),
@@ -760,6 +1089,7 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
                     bytes: tally.bytes,
                     init,
                     init_digest,
+                    init_resume,
                 });
                 copied.push(json!({ "service": service, "from": dir, "copy": how, "files": tally.files, "bytes": tally.bytes }));
             }
@@ -782,6 +1112,9 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
         if !recovered.is_empty() {
             out["recovered"] = json!(recovered);
         }
+        if let Some(interrupted) = interrupted {
+            out["interrupted_restore"] = interrupted;
+        }
         Ok(out)
     })?;
     let meta = serde_json::from_value(stopped.result["meta"].clone()).ok();
@@ -796,21 +1129,22 @@ pub fn restore(ctx: &Ctx, name: &str) -> Result<SnapshotReport> {
     let services: Vec<String> = meta.services.keys().cloned().collect();
     let _run = init_tasks::run_lock(&ctx.state, &ctx.root)?;
     let stopped = session::with_stopped(ctx, &services, |report, statuses| {
+        let interrupted = recover_restore(&ctx.state, &ctx.root)?;
         let _store = store_lock(&ctx.state, &project)?;
         recover_store(&store(&ctx.state, &project));
         // Read again under the lock: it may have been replaced or removed meanwhile.
         let meta = read_meta(&ctx.state, &project, name)?;
         compatible(&meta, report)?;
         let snapshot = store(&ctx.state, &project).join(name);
-        let mut restored = Vec::new();
-        // Every directory is checked before any is replaced.
-        let targets: Vec<DataDir> = meta.services.keys().map(|service| data_dir(ctx, statuses, service)).collect::<Result<_>>()?;
-        for ((service, snap), data) in meta.services.iter().zip(&targets) {
-            restored.push(restore_into(&snapshot, service, &data.location)?);
-            rebind(ctx, data)?;
-            mark_restored(ctx, name, service, snap, &data.location)?;
+        // Every directory is checked, and held, before any is replaced.
+        let plan: Vec<(String, SnapService, DataDir)> =
+            meta.services.iter().map(|(service, snap)| Ok((service.clone(), snap.clone(), data_dir(ctx, statuses, service)?))).collect::<Result<_>>()?;
+        let restored = restore_services(ctx, name, &snapshot, &plan)?;
+        let mut out = json!({ "restored": restored });
+        if let Some(interrupted) = interrupted {
+            out["interrupted_restore"] = interrupted;
         }
-        Ok(json!({ "restored": restored }))
+        Ok(out)
     })?;
     Ok(SnapshotReport { name: name.to_string(), project, services, steps: stopped.steps, restarted: stopped.restarted, checks: stopped.checks, meta: Some(meta) })
 }
@@ -843,7 +1177,8 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
             .hint("run `stack down`, which stops what it can show is this checkout's and names the rest, then retry")
             .details(unresolved));
     }
-    let (mut restored, mut skipped) = (Vec::new(), Vec::new());
+    let mut skipped = Vec::new();
+    let mut plan = Vec::new();
     for (service, snap) in &meta.services {
         let data = data_dir(ctx, statuses, service)?;
         if data.exists {
@@ -855,11 +1190,26 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
         if statuses.iter().any(|d| d.name == *service && session::may_run(d)) {
             return Err(StackError::new("snapshot_failed", format!("'{service}' is running; nothing was restored")).hint("run `stack down`, then retry"));
         }
-        restored.push(restore_into(&snapshot, service, &data.location)?);
-        rebind(ctx, &data)?;
-        mark_restored(ctx, name, service, snap, &data.location)?;
+        plan.push((service.clone(), snap.clone(), data));
     }
+    let restored = restore_services(ctx, name, &snapshot, &plan)?;
     Ok(json!({ "snapshot": name, "restored": restored, "skipped": skipped }))
+}
+
+/// `up`, under its project lock and before anything starts or claims data: finish a restore of
+/// this checkout that was interrupted (see [`recover_restore`]), provided none of its services
+/// may still run. `None` when there was none.
+pub fn recover_before_start(ctx: &Ctx, statuses: &[DaemonStatus]) -> Result<Option<Value>> {
+    let Some(services) = journaled(&ctx.state, &ctx.root).or_else(|| journal_path(&ctx.state, &ctx.root).exists().then(Vec::new)) else { return Ok(None) };
+    let running: Vec<&String> = services.iter().filter(|s| statuses.iter().any(|d| d.name == **s && session::may_run(d))).collect();
+    let unresolved = crate::supervisor::unresolved(&crate::supervisor::dir(&ctx.state, &ctx.root));
+    if !running.is_empty() || !unresolved.is_empty() {
+        return Err(StackError::new("stop_unconfirmed", "a snapshot restore of this checkout was interrupted, and its services may still run; nothing was changed")
+            .hint("run `stack down`, then `stack up`")
+            .with_detail(json!({ "running": running }))
+            .details(unresolved));
+    }
+    recover_restore(&ctx.state, &ctx.root)
 }
 
 #[derive(Debug, Serialize)]
@@ -934,23 +1284,321 @@ mod tests {
         assert!(!dir.path().join("copy").exists());
     }
 
+    /// A checkout whose services `names` each have recorded data (`old-<service>`, or nothing
+    /// when `existing` is false), and a snapshot holding `new-<service>` for each.
+    struct Restore {
+        _dir: tempfile::TempDir,
+        ctx: Ctx,
+        snapshot: PathBuf,
+        names: Vec<String>,
+    }
+
+    impl Restore {
+        fn new(names: &[&str], existing: bool) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let ctx = Ctx { root: base.join("checkout"), cache: base.join("cache"), state: base.join("state") };
+            fs::create_dir_all(&ctx.root).unwrap();
+            let snapshot = base.join("snap");
+            for name in names {
+                write(&snapshot.join("data").join(name).join("file"), &format!("new-{name}"));
+                if existing {
+                    write(&base.join("data").join(name).join("file"), &format!("old-{name}"));
+                }
+            }
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let r = Restore { _dir: dir, ctx, snapshot, names };
+            let token = r.token();
+            for name in &r.names {
+                let target = r.target(name);
+                let (location, identity) = datadirs::locate(&target);
+                let entry = datadirs::Entry { project: r.ctx.root.clone(), service: name.clone(), dir: target, checkout: token.clone(), supervisor: None, location, identity, project_device: None };
+                datadirs::record(&r.ctx.state, entry).unwrap();
+            }
+            r
+        }
+
+        fn token(&self) -> String {
+            "token".to_string()
+        }
+
+        fn target(&self, name: &str) -> PathBuf {
+            self.ctx.state.parent().unwrap().join("data").join(name)
+        }
+
+        fn plan(&self, snap: &SnapService) -> Vec<(String, SnapService, DataDir)> {
+            self.names
+                .iter()
+                .map(|name| {
+                    let target = self.target(name);
+                    let entry = datadirs::entries(&self.ctx.state).unwrap().into_iter().find(|e| e.service == *name).unwrap();
+                    let held = match datadirs::hold(&entry) {
+                        Found::Held(h) => Some(h),
+                        _ => None,
+                    };
+                    (name.clone(), snap.clone(), DataDir { dir: target.clone(), location: target, exists: held.is_some(), token: self.token(), held })
+                })
+                .collect()
+        }
+
+        fn run(&self) -> Result<Vec<Value>> {
+            let snap = SnapService { preset: "postgres".into(), version: "17.1".into(), major: "17".into(), files: 1, bytes: 1, init: InitState::Done, init_digest: Some("d1".into()), init_resume: None };
+            restore_services(&self.ctx, "base", &self.snapshot, &self.plan(&snap))
+        }
+
+        fn contents(&self) -> Vec<String> {
+            self.names.iter().map(|n| fs::read_to_string(self.target(n).join("file")).unwrap_or_else(|_| "-".into())).collect()
+        }
+
+        fn identities(&self) -> Vec<Option<[u64; 2]>> {
+            self.names.iter().map(|n| dir_at(&self.target(n))).collect()
+        }
+
+        /// What is in the data directories' parent besides the data directories.
+        fn leftovers(&self) -> Vec<String> {
+            let parent = self.target("x").parent().unwrap().to_path_buf();
+            fs::read_dir(parent).map(|d| d.flatten().map(|e| e.file_name().into_string().unwrap()).filter(|n| !self.names.contains(n)).collect()).unwrap_or_default()
+        }
+
+        fn journal(&self) -> Option<Journal> {
+            serde_json::from_str(&fs::read_to_string(journal_path(&self.ctx.state, &self.ctx.root)).ok()?).ok()
+        }
+
+        fn markers(&self) -> IndexMap<String, Marker> {
+            init_tasks::read_markers(&self.ctx.state, &self.ctx.root).unwrap()
+        }
+
+        fn outcomes(e: &StackError) -> Vec<(String, String)> {
+            let services = e.details.iter().find_map(|d| d["services"].as_array()).expect("per-service outcomes");
+            services.iter().map(|s| (s["service"].as_str().unwrap().to_string(), s["outcome"].as_str().unwrap().to_string())).collect()
+        }
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// Run `f` with the two-rename path of filesystems without an exchange, and with it.
+    fn both_ways(f: impl Fn(bool)) {
+        for no_exchange in [false, true] {
+            datadirs::NO_EXCHANGE.with(|c| c.set(no_exchange));
+            f(no_exchange);
+        }
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
+    }
+
+    fn inject(swap: Option<usize>, undo: Option<usize>, crash: Option<usize>, commit: bool) {
+        FAIL_SWAP.with(|c| c.set(swap));
+        FAIL_UNDO.with(|c| c.set(undo));
+        CRASH_AFTER.with(|c| c.set(crash));
+        FAIL_COMMIT.with(|c| c.set(commit));
+    }
+
     #[test]
-    fn replacing_swaps_whole_directories() {
+    fn a_restore_replaces_every_service_and_records_them_at_once() {
+        both_ways(|no_exchange| {
+            let r = Restore::new(&["db", "cache", "queue"], true);
+            let before = r.identities();
+            let restored = r.run().unwrap();
+            assert_eq!(r.contents(), ["new-db", "new-cache", "new-queue"]);
+            assert!(restored.iter().all(|v| v["replace"] == if no_exchange { "rename" } else { "exchange" }), "{restored:?}");
+            assert!(r.leftovers().is_empty(), "old data and copies are gone: {:?}", r.leftovers());
+            assert!(r.journal().is_none());
+            let markers = r.markers();
+            for (name, was) in r.names.iter().zip(before) {
+                let m = &markers[name];
+                assert_eq!((m.status.as_str(), m.digest.as_str(), m.source.as_str()), ("done", "d1", "snapshot:base"));
+                assert_eq!(m.data_dir.as_ref().unwrap().identity, dir_at(&r.target(name)).unwrap(), "the marker names the restored directory");
+                assert_ne!(Some(m.data_dir.as_ref().unwrap().identity), was);
+                let entry = datadirs::entries(&r.ctx.state).unwrap().into_iter().find(|e| e.service == *name).unwrap();
+                assert_eq!(entry.identity, dir_at(&r.target(name)), "the record is bound to the restored directory");
+            }
+        });
+        // Into data directories that do not exist yet (`up --from-snapshot`).
+        let r = Restore::new(&["db", "cache"], false);
+        r.run().unwrap();
+        assert_eq!(r.contents(), ["new-db", "new-cache"]);
+        assert!(r.leftovers().is_empty());
+    }
+
+    #[test]
+    fn a_swap_failing_midway_puts_back_every_service_it_replaced() {
+        both_ways(|_| {
+            let r = Restore::new(&["db", "cache", "queue"], true);
+            init_tasks::set_marker(&r.ctx.state, &r.ctx.root, "db", Some(Marker { data_dir: None, status: "done".into(), digest: "mine".into(), completed: Vec::new(), failed_task: None, source: "up".into(), at: 1 })).unwrap();
+            let before = r.identities();
+            inject(Some(2), None, None, false);
+            let e = r.run().unwrap_err();
+            inject(None, None, None, false);
+            assert_eq!(e.code, "snapshot_failed", "{e}");
+            assert!(e.message.contains("every service's data is as it was"), "{e}");
+            assert_eq!(Restore::outcomes(&e), pairs(&[("db", "rolled_back"), ("cache", "rolled_back"), ("queue", "unchanged")]));
+            assert!(e.details.iter().any(|d| d["failed"] == "queue"), "{e:?}");
+            assert_eq!(r.contents(), ["old-db", "old-cache", "old-queue"]);
+            assert_eq!(r.identities(), before, "the very directories that were there are back");
+            assert!(r.leftovers().is_empty(), "{:?}", r.leftovers());
+            assert!(r.journal().is_none());
+            assert_eq!(r.markers()["db"].digest, "mine", "nothing was recorded as restored");
+            assert_eq!(r.markers().len(), 1);
+        });
+        // A copy that fails: nothing was replaced at all.
+        let r = Restore::new(&["db", "cache"], true);
+        fs::remove_dir_all(r.snapshot.join("data/cache")).unwrap();
+        let e = r.run().unwrap_err();
+        assert_eq!(Restore::outcomes(&e), pairs(&[("db", "unchanged"), ("cache", "unchanged")]));
+        assert_eq!(r.contents(), ["old-db", "old-cache"]);
+        assert!(r.leftovers().is_empty() && r.journal().is_none());
+    }
+
+    #[test]
+    fn a_data_directory_replaced_after_its_check_is_never_swapped() {
+        let r = Restore::new(&["db", "cache"], true);
+        let snap = SnapService { preset: "postgres".into(), version: "17.1".into(), major: "17".into(), files: 1, bytes: 1, init: InitState::None, init_digest: None, init_resume: None };
+        let plan = r.plan(&snap);
+        // Something else put at cache's place once it was checked and held.
+        fs::rename(r.target("cache"), r.ctx.state.parent().unwrap().join("moved")).unwrap();
+        write(&r.target("cache").join("file"), "intruder");
+        let e = restore_services(&r.ctx, "base", &r.snapshot, &plan).unwrap_err();
+        assert_eq!(e.code, "snapshot_failed", "{e}");
+        assert!(e.message.contains("replaced since it was checked"), "{e}");
+        assert_eq!(Restore::outcomes(&e), pairs(&[("db", "rolled_back"), ("cache", "unchanged")]));
+        assert_eq!(r.contents(), ["old-db", "intruder"], "what replaced it is left alone");
+    }
+
+    #[test]
+    fn a_service_that_cannot_be_put_back_keeps_its_old_data_and_is_reported() {
+        both_ways(|no_exchange| {
+            let r = Restore::new(&["db", "cache"], true);
+            let before = r.identities();
+            inject(Some(1), Some(0), None, false);
+            let e = r.run().unwrap_err();
+            inject(None, None, None, false);
+            assert_eq!(e.code, "restore_incomplete", "{e}");
+            assert_eq!(Restore::outcomes(&e), pairs(&[("db", "manual_recovery"), ("cache", "unchanged")]));
+            let db = e.details.iter().find_map(|d| d["services"].as_array()).unwrap()[0].clone();
+            let old_data = PathBuf::from(db["old_data"].as_str().unwrap());
+            assert_eq!(fs::read_to_string(old_data.join("file")).unwrap(), "old-db", "{db}");
+            assert_eq!(dir_at(&old_data), before[0]);
+            assert_eq!(db["restored_copy"], json!(r.target("db")), "{db}");
+            assert!(old_data.file_name().unwrap().to_str().unwrap().contains(if no_exchange { ".stack-old-" } else { ".stack-restore-" }));
+            assert!(e.details.iter().any(|d| d["journal"].is_string()), "{e:?}");
+            assert_eq!(r.journal().unwrap().phase, "swapping", "the journal stays for the next operation");
+            assert!(r.markers().is_empty(), "nothing was recorded as restored");
+            // The next operation undoes it.
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            assert_eq!(recovered["interrupted_restore"], "rolled_back", "{recovered}");
+            assert_eq!(r.contents(), ["old-db", "old-cache"]);
+            assert_eq!(r.identities(), before);
+            assert!(r.leftovers().is_empty() && r.journal().is_none(), "{:?}", r.leftovers());
+            assert_eq!(recover_restore(&r.ctx.state, &r.ctx.root).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn an_interrupted_restore_is_undone_before_it_commits_and_finished_after() {
+        both_ways(|_| {
+            // Crashed with two of three services swapped.
+            let r = Restore::new(&["db", "cache", "queue"], true);
+            let before = r.identities();
+            inject(None, None, Some(2), false);
+            r.run().unwrap_err();
+            inject(None, None, None, false);
+            assert_eq!(r.contents(), ["new-db", "new-cache", "old-queue"]);
+            assert_eq!(journaled(&r.ctx.state, &r.ctx.root).unwrap(), ["db", "cache", "queue"]);
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            assert_eq!(recovered["interrupted_restore"], "rolled_back");
+            let outcomes: Vec<&str> = recovered["services"].as_array().unwrap().iter().map(|s| s["outcome"].as_str().unwrap()).collect();
+            assert_eq!(outcomes, ["rolled_back", "rolled_back", "unchanged"]);
+            assert_eq!(r.contents(), ["old-db", "old-cache", "old-queue"]);
+            assert_eq!(r.identities(), before);
+            assert!(r.leftovers().is_empty() && r.journal().is_none() && r.markers().is_empty());
+
+            // Every swap done, recording it failed: the restored data stays, and is recorded next.
+            inject(None, None, None, true);
+            let e = r.run().unwrap_err();
+            inject(None, None, None, false);
+            assert_eq!(e.code, "restore_incomplete", "{e}");
+            assert_eq!(Restore::outcomes(&e), pairs(&[("db", "restored"), ("cache", "restored"), ("queue", "restored")]));
+            assert_eq!(r.journal().unwrap().phase, "committed");
+            assert!(r.markers().is_empty(), "not recorded yet");
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            assert_eq!(recovered["interrupted_restore"], "completed", "{recovered}");
+            assert_eq!(r.contents(), ["new-db", "new-cache", "new-queue"]);
+            assert_eq!(r.markers().len(), 3);
+            assert!(r.leftovers().is_empty() && r.journal().is_none(), "{:?}", r.leftovers());
+        });
+    }
+
+    #[test]
+    fn undoing_a_swap_reads_where_each_directory_is() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("redis");
-        write(&target.join("dump.rdb"), "old");
-        let fresh = dir.path().join(".fresh");
-        write(&fresh.join("dump.rdb"), "new");
-        replace(&fresh, &target).unwrap();
-        assert_eq!(fs::read_to_string(target.join("dump.rdb")).unwrap(), "new");
-        assert!(!fresh.exists());
-        let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(leftovers, vec![std::ffi::OsString::from("redis")]);
-        // Into a place that does not exist yet.
-        let fresh = dir.path().join(".fresh2");
-        write(&fresh.join("x"), "1");
-        replace(&fresh, &dir.path().join("new")).unwrap();
-        assert!(dir.path().join("new/x").exists());
+        let p = dir.path().canonicalize().unwrap();
+        let (target, fresh, aside) = (p.join("data"), p.join(".data.stack-restore-1-1"), p.join(".data.stack-old-1-1"));
+        let setup = |old_at: Option<&Path>, new_at: Option<&Path>| {
+            for path in [&target, &fresh, &aside] {
+                let _ = fs::remove_dir_all(path);
+            }
+            let mut ids = (None, [0, 0]);
+            if let Some(at) = old_at {
+                write(&at.join("file"), "old");
+                ids.0 = dir_at(at);
+            }
+            if let Some(at) = new_at {
+                write(&at.join("file"), "new");
+                ids.1 = dir_at(at).unwrap();
+            }
+            Swap { service: "db".into(), dir: target.clone(), target: target.clone(), fresh: fresh.clone(), aside: aside.clone(), old: ids.0, new: ids.1 }
+        };
+        let content = |at: &Path| fs::read_to_string(at.join("file")).ok();
+        // Not swapped; set aside only; exchanged; renamed aside and in.
+        for (old_at, new_at, outcome) in [(&target, &fresh, "unchanged"), (&aside, &fresh, "rolled_back"), (&fresh, &target, "rolled_back"), (&aside, &target, "rolled_back")] {
+            let swap = setup(Some(old_at), Some(new_at));
+            assert_eq!(undo(&swap), Ok(outcome), "old at {old_at:?}, new at {new_at:?}");
+            assert_eq!((content(&target), dir_at(&target)), (Some("old".into()), swap.old));
+            assert!(!fresh.exists() && !aside.exists());
+        }
+        // Nothing was there: the copy is taken out again, or was never put in.
+        for (new_at, outcome) in [(&fresh, "unchanged"), (&target, "rolled_back")] {
+            let swap = setup(None, Some(new_at));
+            assert_eq!(undo(&swap), Ok(outcome));
+            assert!(!target.exists() && !fresh.exists());
+        }
+        // Something else at the place: left as it is, the old data's place said.
+        let swap = setup(Some(&fresh), Some(&aside));
+        write(&target.join("file"), "other");
+        let why = undo(&swap).unwrap_err();
+        assert!(why.contains(&format!("left at {}", fresh.display())), "{why}");
+        assert_eq!(content(&target), Some("other".into()));
+        assert_eq!(content(&fresh), Some("old".into()));
+    }
+
+    #[test]
+    fn restored_data_carries_the_init_state_it_was_saved_with() {
+        let id = DirIdentity { location: "/d".into(), identity: [1, 2] };
+        let snap = |init: InitState, digest: Option<&str>, resume: Option<Resume>| SnapService {
+            preset: "postgres".into(),
+            version: "17".into(),
+            major: "17".into(),
+            files: 0,
+            bytes: 0,
+            init,
+            init_digest: digest.map(String::from),
+            init_resume: resume,
+        };
+        let done = restored_marker("s", &snap(InitState::Done, Some("d"), None), id.clone()).unwrap();
+        assert_eq!((done.status.as_str(), done.digest.as_str(), done.data_dir.as_ref()), ("done", "d", Some(&id)));
+        let task = |t: &str| init_tasks::CompletedTask { task: t.into(), digest: format!("{t}-digest") };
+        let resume = Resume { digest: "d".into(), completed: vec![task("migrate")], failed_task: Some("seed".into()) };
+        let failed = restored_marker("s", &snap(InitState::Failed, None, Some(resume)), id.clone()).unwrap();
+        assert_eq!((failed.status.as_str(), failed.completed.len(), failed.failed_task.as_deref()), ("failed", 1, Some("seed")));
+        // Nothing completed, or never begun: no marker, so init runs from the start.
+        let none = Resume { digest: "d".into(), completed: Vec::new(), failed_task: Some("migrate".into()) };
+        assert!(restored_marker("s", &snap(InitState::Failed, None, Some(none)), id.clone()).is_none());
+        assert!(restored_marker("s", &snap(InitState::Pending, None, None), id.clone()).is_none());
+        // A snapshot an earlier Stack wrote has no `init_resume`; one this Stack writes is read
+        // by an earlier Stack as having no digest (init from the start), never as done.
+        let old: SnapService = serde_json::from_value(json!({ "preset": "postgres", "version": "17", "major": "17", "files": 0, "bytes": 0, "init": "failed" })).unwrap();
+        assert!(old.init_resume.is_none() && old.init_digest.is_none());
     }
 
     /// A complete snapshot directory of `name`, created at `created_at`, holding `data`.
@@ -983,7 +1631,7 @@ mod tests {
     #[test]
     fn a_forced_save_replaces_the_published_generation_whole() {
         for no_exchange in [false, true] {
-            NO_EXCHANGE.with(|c| c.set(no_exchange));
+            datadirs::NO_EXCHANGE.with(|c| c.set(no_exchange));
             let state = tempfile::tempdir().unwrap();
             let project = ProjectId::checkout(Path::new("/checkout"));
             let base = store(state.path(), &project);
@@ -996,7 +1644,7 @@ mod tests {
             assert_eq!(entries(&base), ["base"], "nothing staged is left");
             assert_eq!(read_meta(state.path(), &project, "base").unwrap().created_at, 2);
         }
-        NO_EXCHANGE.with(|c| c.set(false));
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
     }
 
     #[test]
@@ -1008,10 +1656,10 @@ mod tests {
         snapshot_dir(&base.join("other"), "other", 1, "x");
         let tmp = unique(&base, ".tmp-base");
         snapshot_dir(&tmp, "base", 2, "new");
-        NO_EXCHANGE.with(|c| c.set(true));
+        datadirs::NO_EXCHANGE.with(|c| c.set(true));
         CRASH_AFTER_ASIDE.with(|c| c.set(true));
         publish(&base, "base", &tmp, &base.join("base")).unwrap_err();
-        NO_EXCHANGE.with(|c| c.set(false));
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
         CRASH_AFTER_ASIDE.with(|c| c.set(false));
         assert!(!base.join("base").exists(), "crashed with the name empty");
 

@@ -74,6 +74,7 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `ref_not_found` | A git bundle's `ref=` names no branch, tag or commit. | Fix the `?ref=` value in the bundle source. | no | - |
 | `ref_required` | An OCI reference has no tag or digest. | Pin a tag or digest, such as oci:ghcr.io/acme/pybase:1.0.0. | no | - |
 | `resolve_failed` | A version request could not be resolved; stack.lock and the provider config were not changed. | Check the version requests the message names exist, and the network, then run `stack compile` again. | yes | - |
+| `restore_incomplete` | A snapshot restore of several services could not be finished or undone, or was interrupted; its services are left stopped. | Run the snapshot command again or `stack up`: Stack first finishes or undoes the interrupted restore. Data marked `manual_recovery` must be moved back where details say, then the journal they name removed. | yes | - |
 | `root_unsupported` | PostgreSQL refuses to run as root, and Stack is running as root. | Run Stack as an unprivileged user that owns the checkout (e.g. `su dev -c 'stack up'`); installs and tools-only commands work as root. | no | - |
 | `secret_missing` | fnox does not know a granted secret. | Define the key in fnox.toml for the active profile (FNOX_PROFILE), or remove the grant. | no | - |
 | `secret_unavailable` | fnox could not be run or could not resolve the secrets. | Run `stack doctor`, then `fnox env --json --describe` in the project to see fnox's own message. | yes | - |

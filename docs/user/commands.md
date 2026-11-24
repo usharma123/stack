@@ -311,7 +311,9 @@ A service that is not ready has a `reason` for people and a `reason_code` to bra
 `save <name>` copies this checkout's postgres and redis data, `restore <name>` replaces it,
 `list` and `rm <name>` manage them. Only the data directory `up` recorded for this checkout is
 copied or replaced. Running services, and those that depend on them, are stopped for the copy,
-then started and verified again. Snapshots are shared by every checkout of the same
+then started and verified again. A restore replaces every snapshotted service's data or none;
+a failure lists what each service holds (`unchanged`, `rolled_back`, or `manual_recovery`
+with where its old data is, `restore_incomplete`). Snapshots are shared by every checkout of the same
 repository. See [service data](data.md#snapshots).
 
 ## restart

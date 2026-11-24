@@ -18,6 +18,15 @@
 //!
 //! A service without a data directory (a plain command) is keyed by checkout and service only:
 //! its init runs once per checkout, until `--reinit`.
+//!
+//! Data restored from a snapshot (see [`crate::snapshot`]) replays exactly what its source would
+//! have: the snapshot records the marker's state when it was saved, and the restore writes a
+//! marker naming the restored directory with that state: `done` for the digest it completed (no
+//! task runs; `stale` when the definitions changed since), `failed` with the tasks it completed
+//! (the next `up` resumes from the failed one), or no marker when init had not completed a task
+//! (the next `up` runs the whole list against the restored data). The markers of every restored
+//! service are written in one write once every service's data is in place, never before, and
+//! a restore that fails or is undone leaves them as they were.
 
 use crate::compose::{Composed, Entry};
 use crate::error::{Result, StackError};
@@ -200,6 +209,25 @@ pub fn set_marker(state: &Path, root: &Path, service: &str, marker: Option<Marke
         }
         None => {
             all.services.shift_remove(service);
+        }
+    }
+    write_json(&path, &all)
+}
+
+/// Replace (or remove, for `None`) several services' markers in one write: a restore records
+/// every restored service's init state at once, or none of it.
+pub fn set_markers(state: &Path, root: &Path, markers: &IndexMap<String, Option<Marker>>) -> Result<()> {
+    let _guard = markers_lock(state, root)?;
+    let path = markers_file(state, root);
+    let mut all: Markers = read_json(&path)?;
+    for (service, marker) in markers {
+        match marker {
+            Some(m) => {
+                all.services.insert(service.clone(), m.clone());
+            }
+            None => {
+                all.services.shift_remove(service);
+            }
         }
     }
     write_json(&path, &all)

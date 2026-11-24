@@ -709,7 +709,10 @@ output (mise's answer when no release matches) is an error, not a version.
   copy and replace only the data directory recorded for the checkout (held as `gc
   --reclaim-data` holds it), only while its service and its dependents are confirmed stopped,
   keyed by the Git common directory, and restore by exchanging a complete sibling copy into
-  place, then bind the record to the new directory. The instance check compares the server's
+  place through the held directory, every service or none (a journal lets a failure or crash
+  be undone, judged by which directory is where, before it commits), then write the init
+  markers in one write and bind the record to the new directories. Restored data carries the
+  init state it was saved with (done, failed with the tasks completed, or none). The instance check compares the server's
   reported directory (from `-D`/`--dir`, not stored in the data) with the supervisor's, so
   restored data verifies as the restoring checkout's. See [service data](user/data.md).
 - **Partial failure.** `up` returns completed steps, whether services may have been started

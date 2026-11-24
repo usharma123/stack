@@ -152,9 +152,26 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
   `copy_file_range` on Btrfs and XFS. Elsewhere it is a plain copy, so expect the time and space
   of the data's size. Files describing one run of a server (`postmaster.pid`,
   `postmaster.opts`) are left out.
-- **Restoring replaces atomically.** The snapshot is copied to a sibling of the data directory,
-  then exchanged with it in one step (`renamex_np`/`renameat2`; two renames where the platform
-  has no exchange). An interrupted restore leaves the old data or the new, never a mix.
+- **Restoring replaces atomically, every service or none.** Each service's snapshot data is
+  copied to a sibling of its data directory before any is replaced (a copy that fails removes
+  the copies: nothing changed). A journal (`$STACK_STATE_DIR/init/<checkout>.restore.json`)
+  then records each swap, and each data directory, held open and checked as `up` recorded it
+  and on its parent's mount, is exchanged with its copy in one step
+  (`renameatx_np`/`renameat2`; two renames where the filesystem has no exchange). The old data
+  is kept until every service's copy is in place; only then are the init markers written (in
+  one write), the record bound to the new directories and the old data removed.
+- **A failed restore says what it changed.** A swap that fails puts back every service it
+  replaced, judged by which directory is where: the error (`snapshot_failed`) lists each
+  service as `unchanged` or `rolled_back`, and nothing is recorded as restored. A service that
+  cannot be put back keeps its old data where it is: the error is `restore_incomplete`, listing
+  that service as `manual_recovery` with where its old data (`old_data`) and the restored copy
+  (`restored_copy`) are, and the journal. Its services are left stopped (`left_stopped`), never
+  started on that data, and `up` refuses to start them until the restore is finished: move the
+  old data back as details say and remove the journal.
+- **An interrupted restore is finished before anything else touches the data.** The next
+  `snapshot save`, `snapshot restore` or `up` of the checkout (its `recover_restore` step)
+  undoes a restore interrupted before every copy was in place, and records one interrupted
+  after, provided its services are confirmed stopped.
 - **Saving publishes whole.** `save` builds the snapshot in a staging directory of the store
   and writes its `meta.json` last. `save --force` then exchanges it with the published
   snapshot in one step where the filesystem can (`renameatx_np`/`renameat2`; the step reports
@@ -166,10 +183,21 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
 - **Compatibility.** A snapshot records each service's preset and the exact release
   `stack.lock` pinned. Restoring into a different preset or major version fails with
   `snapshot_incompatible` before anything stops.
-- **Init.** A snapshot records whether init had completed and against which init list and task
-  definitions. Restored data counts as initialised for that digest: `done` if it matches the
-  checkout's current one, `stale` otherwise (never run again silently). Data saved before init
-  completed is `pending` after a restore.
+- **Init: restored data replays what its source would have.** A snapshot records the init state
+  of each service's data when it was saved, and a restore gives the restored data that state,
+  never more:
+  - saved with init `done` (or `stale`): restored data counts as initialised for the init list
+    and task definitions it ran: `done` if they match the checkout's current ones, `stale`
+    otherwise. No init task runs (until `up --reinit`).
+  - saved with init `failed` after completing some tasks (`init_resume` in the snapshot's
+    metadata): restored data is `failed`, and the next `up` resumes from the failed task,
+    skipping the completed ones whose definitions have not changed, exactly as it would have
+    in the checkout it was saved from.
+  - saved `pending`, or failed before completing a task: restored data has no init marker, and
+    the next `up` runs the whole init list against it.
+
+  The marker names the restored directory, so a data directory recreated later runs init again.
+  A restore that fails or is rolled back leaves every marker as it was.
 
 ### `up --from-snapshot`
 
@@ -268,7 +296,8 @@ Stack's state directory, or on a filesystem that cannot clone, is made by `initd
 | `snapshot_exists` | `save` to a name in use; pick another, `rm` it, or `--force` |
 | `snapshot_incompatible` | The snapshot's preset or major version differs from this checkout's |
 | `snapshot_unsupported` | A service that is not a postgres or redis preset, or data holding links or special files |
-| `snapshot_failed` | The supervisor reports no data directory, Stack has no record of it for this checkout, it is not the recorded directory or lacks this checkout's marker, or a service has no data yet (run `stack up`) |
+| `snapshot_failed` | The supervisor reports no data directory, Stack has no record of it for this checkout, it is not the recorded directory or lacks this checkout's marker, or a service has no data yet (run `stack up`); or a restore failed and every service was put back (details list each as `unchanged` or `rolled_back`) |
+| `restore_incomplete` | A restore could not put every service back, could not be recorded, or was interrupted and cannot be undone; details list each service (`manual_recovery` with `old_data`), its services stay stopped, and `up` refuses until it is resolved |
 | `stop_unconfirmed` | A service could not be confirmed stopped; nothing was copied |
 
 [All docs](../README.md)

@@ -1351,6 +1351,13 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         }
         steps.ok("ports", if mine.is_empty() { json!(null) } else { json!({ "stopped": mine.iter().map(Stray::json).collect::<Vec<_>>() }) });
         timings.mark("ports");
+        // A snapshot restore interrupted here is finished before anything claims or starts on
+        // its data.
+        match crate::snapshot::recover_before_start(ctx, &statuses) {
+            Ok(Some(detail)) => steps.ok("recover_restore", detail),
+            Ok(None) => {}
+            Err(e) => return Err(steps.fail("recover_restore", e, false)),
+        }
         match claim_data(ctx, &report, &statuses, provider.as_ref()) {
             Ok(moved) => warnings.extend(moved),
             Err(e) => return Err(steps.fail("data", e, false)),
@@ -2565,6 +2572,20 @@ pub fn with_stopped(
         }
     };
     let mut checks = Vec::new();
+    // Data a restore could not finish (or put back) is not started on: the services stay
+    // stopped until the restore is finished or undone (see `snapshot::recover_restore`).
+    let left_stopped = matches!(&outcome, Err(e) if e.code == "restore_incomplete");
+    if left_stopped {
+        if let Some(mut session) = session.take().filter(|_| !stopping.is_empty()) {
+            for name in &stopping {
+                if let Some(record) = session.services.get_mut(name) {
+                    record.pid = None;
+                    record.started_at_ms = None;
+                }
+            }
+            let _ = save(ctx, &session);
+        }
+    }
     if let Some(mut session) = session.filter(|_| !stopping.is_empty()) {
         let started_at = now_ms();
         for name in &stopping {
@@ -2614,7 +2635,11 @@ pub fn with_stopped(
         Err(e) => {
             let changed = !stopping.is_empty();
             // The failed copy step is already recorded; attach the progress record.
-            Err(e.with_detail(json!({ "steps": steps.0, "retry_safe": true, "changed": changed })))
+            let mut progress = json!({ "steps": steps.0, "retry_safe": true, "changed": changed });
+            if left_stopped {
+                progress["left_stopped"] = json!(stopping);
+            }
+            Err(e.with_detail(progress))
         }
     }
 }

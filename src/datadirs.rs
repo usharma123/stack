@@ -226,7 +226,9 @@ pub fn hold(entry: &Entry) -> Found {
 }
 
 #[cfg(unix)]
-pub use imp::{remove_tree, Held};
+pub use imp::{exchange, remove_tree, Held, Swapped};
+#[cfg(all(unix, test))]
+pub(crate) use imp::NO_EXCHANGE;
 /// How data removal learns which mount a directory is on, for tests to stand in for the kernel.
 #[cfg(all(unix, test))]
 pub(crate) mod imp_boundary {
@@ -489,6 +491,118 @@ mod imp {
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Tests take the two-rename path of platforms and filesystems without an exchange.
+        pub(crate) static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Exchange `a` in `dir_a` and `b` in `dir_b` (`None`: resolved from the working directory)
+    /// in one step: `renameatx_np(RENAME_SWAP)` on macOS, `renameat2(RENAME_EXCHANGE)` on Linux
+    /// (by syscall number: musl declares no wrapper). `Ok(false)` when the platform or the
+    /// filesystem has no exchange, so the caller falls back.
+    fn exchange_at(dir_a: Option<&OwnedFd>, a: &CStr, dir_b: Option<&OwnedFd>, b: &CStr) -> io::Result<bool> {
+        #[cfg(test)]
+        if NO_EXCHANGE.with(std::cell::Cell::get) {
+            return Ok(false);
+        }
+        let (fa, fb) = (dir_a.map_or(libc::AT_FDCWD, |d| d.as_raw_fd()), dir_b.map_or(libc::AT_FDCWD, |d| d.as_raw_fd()));
+        #[cfg(target_os = "macos")]
+        // SAFETY: valid descriptors (or AT_FDCWD) and NUL-terminated names, only read.
+        let rc = unsafe { libc::renameatx_np(fa, a.as_ptr(), fb, b.as_ptr(), libc::RENAME_SWAP) };
+        #[cfg(target_os = "linux")]
+        // SAFETY: as above; renameat2 only reads its arguments.
+        let rc = unsafe { libc::syscall(libc::SYS_renameat2, fa, a.as_ptr(), fb, b.as_ptr(), libc::RENAME_EXCHANGE) };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let rc = {
+            let _ = (fa, fb, a, b);
+            return Ok(false);
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        // No such call (an old kernel, a seccomp filter), or a filesystem without exchange
+        // (EOPNOTSUPP is ENOTSUP on Linux, another number on macOS).
+        let code = e.raw_os_error().unwrap_or(0);
+        if [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code) {
+            return Ok(false);
+        }
+        Err(e)
+    }
+
+    /// [`exchange_at`] of two absolute paths.
+    pub fn exchange(a: &Path, b: &Path) -> io::Result<bool> {
+        exchange_at(None, &cstring(a.as_os_str())?, None, &cstring(b.as_os_str())?)
+    }
+
+    /// How [`Held::swap_in`] put a directory in the held directory's place.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Swapped {
+        /// In one step: the held directory now has the other's name.
+        Exchanged,
+        /// Two renames: the held directory was renamed aside first.
+        Renamed,
+    }
+
+    impl Held {
+        /// Which directory this is (device, inode).
+        pub fn identity(&self) -> [u64; 2] {
+            self.identity
+        }
+
+        /// The directory named `name` beside the held one (device, inode), never following a
+        /// link; `None` when nothing, or no directory, is there.
+        pub fn sibling(&self, name: &OsStr) -> Option<[u64; 2]> {
+            let st = stat_at(&self.parent, &cstring(name).ok()?).ok()?;
+            is(&st, libc::S_IFDIR).then(|| id(&st))
+        }
+
+        /// Whether the held directory is on its parent's mount (no mount point itself), as
+        /// [`Held::remove`] requires before it removes anything.
+        pub fn on_parent_mount(&self) -> io::Result<bool> {
+            Ok(Kernel.mount(&self.dir, &fstat(&self.dir)?)? == Kernel.mount(&self.parent, &fstat(&self.parent)?)?)
+        }
+
+        /// Put the directory `fresh` (a name beside the held one) in the held directory's place,
+        /// through the held parent, provided the name still is the held directory: one exchange
+        /// where the filesystem has it (the held directory is then at `fresh`), else the held
+        /// directory is renamed to `aside` and `fresh` to its name (and back when that fails).
+        /// The held directory is then confirmed to be where it went, and everything put back
+        /// otherwise.
+        pub fn swap_in(&self, fresh: &OsStr, aside: &OsStr) -> io::Result<Swapped> {
+            let (fresh, aside) = (cstring(fresh)?, cstring(aside)?);
+            if id(&stat_at(&self.parent, &self.name)?) != self.identity {
+                return Err(io::Error::other("the data directory was replaced since it was checked; nothing was swapped"));
+            }
+            let renameat = |from: &CStr, to: &CStr| {
+                // SAFETY: renameat within the held parent, with NUL-terminated names.
+                match unsafe { libc::renameat(self.parent.as_raw_fd(), from.as_ptr(), self.parent.as_raw_fd(), to.as_ptr()) } {
+                    0 => Ok(()),
+                    _ => Err(io::Error::last_os_error()),
+                }
+            };
+            let at = |name: &CStr| stat_at(&self.parent, name).ok().map(|st| id(&st));
+            if exchange_at(Some(&self.parent), &fresh, Some(&self.parent), &self.name)? {
+                if at(&fresh) != Some(self.identity) {
+                    let _ = exchange_at(Some(&self.parent), &fresh, Some(&self.parent), &self.name);
+                    return Err(io::Error::other("the data directory changed while it was swapped; it was swapped back"));
+                }
+                return Ok(Swapped::Exchanged);
+            }
+            renameat(&self.name, &aside)?;
+            if at(&aside) != Some(self.identity) {
+                let _ = renameat(&aside, &self.name);
+                return Err(io::Error::other("the data directory changed while it was set aside; it was put back"));
+            }
+            if let Err(e) = renameat(&fresh, &self.name) {
+                let _ = renameat(&aside, &self.name);
+                return Err(e);
+            }
+            Ok(Swapped::Renamed)
+        }
+    }
+
     /// The names in `dir`, without `.` and `..`.
     fn names(dir: &OwnedFd) -> io::Result<Vec<CString>> {
         // SAFETY: dup of a valid descriptor; fdopendir takes the copy, closedir closes it.
@@ -680,7 +794,31 @@ pub fn remove_tree(path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swapped {
+    Exchanged,
+    Renamed,
+}
+
+#[cfg(not(unix))]
+pub fn exchange(_: &Path, _: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(unix))]
 impl Held {
+    pub fn identity(&self) -> [u64; 2] {
+        [0, 0]
+    }
+    pub fn sibling(&self, _: &std::ffi::OsStr) -> Option<[u64; 2]> {
+        None
+    }
+    pub fn on_parent_mount(&self) -> std::io::Result<bool> {
+        Err(std::io::Error::other("not supported"))
+    }
+    pub fn swap_in(&self, _: &std::ffi::OsStr, _: &std::ffi::OsStr) -> std::io::Result<Swapped> {
+        Err(std::io::Error::other("not supported"))
+    }
     pub fn beside(&self, _: &str) -> Option<Vec<u8>> {
         None
     }
