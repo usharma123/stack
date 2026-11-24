@@ -155,7 +155,9 @@ fn paths(state: &Path) -> (PathBuf, PathBuf) {
 /// Assign (or reuse) a port per service. Reservations persist across restarts, so a project
 /// keeps the same ports until `reassign` or until its directory is deleted. An assigned port
 /// the system may give an outgoing connection (one reserved before the range moved) is
-/// replaced; pinned ports are the project's to choose.
+/// replaced; pinned ports are the project's to choose. With `reassign` (`compile
+/// --reassign-ports`) every service that is not pinned gets a new port: the ports the project
+/// gives up stay excluded while new ones are chosen, as [`reassign`] keeps the old one.
 pub fn assign(state: &Path, project: &Path, requests: &[Request], reassign: bool) -> Result<IndexMap<String, u16>> {
     assign_outside(state, project, requests, reassign, &ephemeral())
 }
@@ -180,6 +182,7 @@ fn assign_outside(
     // learned now, even for reservations given up below.
     let previous_at = reg.reservations.iter().find(|r| r.project == project && r.project_at.location.is_some()).map(|r| r.project_at.clone()).unwrap_or_default();
     let at = crate::checkout::Recorded::adopted(project, &previous_at);
+    let given_up: Vec<u16> = if reassign { reg.reservations.iter().filter(|r| r.project == project).map(|r| r.port).collect() } else { Vec::new() };
     reg.reservations.retain(|r| {
         r.project != project || (!reassign && requests.iter().any(|q| q.service == r.service))
     });
@@ -204,7 +207,7 @@ fn assign_outside(
         } else if let Some(existing) = reg.reservations.iter().find(|r| mine(r) && !ephemeral.contains(&r.port)) {
             existing.port
         } else {
-            find_free(&reg, project, &req.service, ephemeral)?
+            find_free(&reg, project, &req.service, ephemeral, &given_up)?
         };
         let project_at = match reg.reservations.iter().find(|r| mine(r)) {
             Some(previous) => at.clone().or_kept(&previous.project_at),
@@ -245,7 +248,7 @@ pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec
     for service in services {
         let mine = |r: &Reservation| r.project == project && &r.service == service;
         let Some(old) = reg.reservations.iter().find(|r| mine(r)).map(|r| r.port) else { continue };
-        let new = find_free(&reg, project, service, &ephemeral)?;
+        let new = find_free(&reg, project, service, &ephemeral, &[])?;
         let project_at = reg.reservations.iter().find(|r| mine(r)).map_or_else(|| crate::checkout::Recorded::of(project), |r| crate::checkout::Recorded::adopted(project, &r.project_at));
         reg.reservations.retain(|r| !mine(r));
         reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone(), project_at });
@@ -340,14 +343,16 @@ pub fn rekey(state: &Path, old: &Path, new: &Path) -> Result<(usize, usize)> {
     Ok((moved, replaced))
 }
 
-fn find_free(reg: &Registry, project: &Path, service: &str, ephemeral: &RangeInclusive<u16>) -> Result<u16> {
+/// A free port for `service` of `project`: in Stack's range, outside `ephemeral`, reserved by
+/// no one, not in `excluded`, and one nothing listens on now.
+fn find_free(reg: &Registry, project: &Path, service: &str, ephemeral: &RangeInclusive<u16>, excluded: &[u16]) -> Result<u16> {
     let span = u32::from(RANGE_END - RANGE_START) + 1;
     // Spread projects across the range so concurrent first runs rarely race for the same port.
     let seed = sha256_hex(format!("{}\0{service}", project.display()).as_bytes());
     let offset = u32::from_str_radix(&seed[..8], 16).unwrap_or(0) % span;
     for i in 0..span {
         let port = RANGE_START + ((offset + i) % span) as u16;
-        if ephemeral.contains(&port) || reg.reservations.iter().any(|r| r.port == port) {
+        if ephemeral.contains(&port) || excluded.contains(&port) || reg.reservations.iter().any(|r| r.port == port) {
             continue;
         }
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -376,6 +381,24 @@ mod tests {
         assert_ne!(*new, ports["web"]);
         let now = lookup(state.path(), project.path()).unwrap();
         assert_eq!((now["web"], now["db"]), (*new, ports["db"]));
+    }
+
+    #[test]
+    fn compile_reassign_gives_every_assigned_service_a_new_port_and_keeps_pins() {
+        let (state, project, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let wanted = requests(&[("web", None), ("db", None), ("pinned", Some(40759))]);
+        let before = assign(state.path(), project.path(), &wanted, false).unwrap();
+        let theirs = assign(state.path(), other.path(), &requests(&[("web", None)]), false).unwrap();
+        // Every port is free (nothing listens): `--reassign-ports` still moves each assigned one.
+        let after = assign(state.path(), project.path(), &wanted, true).unwrap();
+        for service in ["web", "db"] {
+            assert_ne!(after[service], before[service], "{service} kept its port: {before:?} -> {after:?}");
+            assert!(!before.values().any(|p| *p == after[service]), "{service} took a port this checkout gave up: {after:?}");
+            assert_ne!(after[service], theirs["web"], "{service} took another checkout's port");
+        }
+        assert_eq!(after["pinned"], 40759, "a pinned port is never moved");
+        assert_eq!(lookup(state.path(), project.path()).unwrap(), after);
+        assert_eq!(lookup(state.path(), other.path()).unwrap(), theirs, "another checkout keeps its ports");
     }
 
     #[test]

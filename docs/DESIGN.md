@@ -92,7 +92,9 @@ output (mise's answer when no release matches) is an error, not a version.
   across restarts; never inside the system's ephemeral range, where an outgoing connection can
   hold a stopped service's port (a reservation made there earlier is replaced); pruned when a
   project directory disappears (by the next compile anywhere, and by `gc` once no session of
-  it is left); `--reassign-ports` after a foreign program takes one. Projects
+  it is left); `--reassign-ports` after a foreign program takes one (`compile
+  --reassign-ports` gives every assigned service a new port, never one the checkout gives up,
+  even when the old one is free at that moment). Projects
   may pin ports in `[override.services]`; pins are checked against other projects'
   reservations. Service defaults (5432, 6379) are never used. Before starting,
   `up` checks every assigned port: one that accepts connections without a running or starting
