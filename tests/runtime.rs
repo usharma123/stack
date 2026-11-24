@@ -1242,6 +1242,50 @@ fn verified_endpoints_pass_through_and_are_poisoned_once_verification_fails() {
     assert_eq!(seen["STACK_UNVERIFIED"], "web");
 }
 
+/// `STACK_UNVERIFIED` names the services this plan withheld, never what the caller carried: a
+/// shell that loaded `stack env` while a service was unverified keeps the list it got, and once
+/// every service verifies, neither `exec` (CLI or MCP) nor a new `stack env` passes it on.
+#[test]
+fn a_callers_stale_unverified_list_never_reaches_a_command_once_every_service_verifies() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+    fixture.set_env(&[("WEB_URL", format!("http://127.0.0.1:{port}/"))]);
+    fixture.sleepers();
+    let caller = [("STACK_UNVERIFIED", "web")];
+
+    // Unverified: Stack's own list replaces the caller's.
+    let out = fixture.command(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]).envs(caller).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(printed(&String::from_utf8_lossy(&out.stdout))["STACK_UNVERIFIED"], "web");
+
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let out = fixture.command(&["exec", "--require", "web", "--", "sh", "-c", PRINT_ENDPOINTS]).envs(caller).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = printed(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(seen["WEB_URL"], format!("http://127.0.0.1:{port}/"), "CLI exec");
+    assert_eq!(seen["STACK_UNVERIFIED"], "ABSENT", "CLI exec");
+
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", PRINT_ENDPOINTS], "require_all": true }))], &caller);
+    let data = &results[0]["structuredContent"]["data"];
+    assert_eq!(data["exit_code"], 0, "{data}");
+    assert_eq!(printed(data["stdout"].as_str().unwrap())["STACK_UNVERIFIED"], "ABSENT", "MCP exec");
+
+    // A shell evaluating `stack env` now drops the list it loaded before.
+    let env: Value = serde_json::from_slice(&fixture.command(&["env", "--json"]).envs(caller).output().unwrap().stdout).unwrap();
+    assert!(env["data"]["env"].get("STACK_UNVERIFIED").is_none(), "{env}");
+    assert!(env["data"]["unset"].as_array().unwrap().contains(&json!("STACK_UNVERIFIED")), "{env}");
+}
+
 /// Counts connections to a TCP port and a Unix socket that a libpq client would use for it,
 /// closing each at once so the client fails fast.
 /// Each named variable's raw bytes as the command saw them, or `None` when unset.

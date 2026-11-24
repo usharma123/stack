@@ -153,8 +153,9 @@ output (mise's answer when no release matches) is an error, not a version.
   variables (`PGHOST`, `PGHOSTADDR`, `PGSERVICE`, `*_HOST`) get the invalid host outright, and
   `PGHOST` is set even when absent so libpq cannot use its default. Empty or malformed endpoints
   become a URL that names only the invalid host. Only values that name no host (ports, users,
-  databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
-  turns this into a refusal to run.
+  databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services, and is
+  removed when every service verifies, so a list the caller carried (from an earlier `stack
+  env`) never reaches a command. `--require` turns this into a refusal to run.
 - **Provider environment.** `exec`, `run`, `env`, `status` and `up` need `mise env --json` and
   whether every pin is installed (`mise ls --json` in a scratch root). Stack keeps the two
   answers together in `$STACK_STATE_DIR/projects/<checkout key>.provider-env.json` (mode 0600,

@@ -4903,7 +4903,12 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         .filter(|c| !c.ready)
         .map(|c| c.service.as_str())
         .collect();
-    if !unverified.is_empty() {
+    // Stack's own list, never the caller's: a shell that loaded `stack env` while a service was
+    // unverified still carries the list it got, which no longer holds once every one verifies.
+    if unverified.is_empty() {
+        env.shift_remove("STACK_UNVERIFIED");
+        removed.push("STACK_UNVERIFIED".into());
+    } else {
         env.insert("STACK_UNVERIFIED".into(), unverified.join(","));
     }
     let granted = if grant.keys.is_empty() {
