@@ -1084,6 +1084,9 @@ extern "C" fn on_signal(signal: libc::c_int) {
 /// How long the supervisor may run services without publishing their record before it stops
 /// them: nothing may run that no record names.
 const PUBLISH_BOUND: Duration = Duration::from_secs(5);
+/// How long shutdown waits for service log pumps and writers to flush after every service has
+/// exited; bounded so an escaped descendant holding stdout open cannot hang shutdown.
+const LOG_DRAIN_BOUND: Duration = Duration::from_millis(500);
 /// Readiness is checked this often at first, then less often (up to [`READY_INTERVAL_MAX`]) for
 /// a service still not ready after [`READY_PATIENCE`].
 const READY_INTERVAL: Duration = Duration::from_millis(10);
@@ -1394,6 +1397,9 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
         }
         applied = applied.max(spec.revision);
         let done = shutting && live.is_empty() && orphan_probes.is_empty();
+        if done {
+            writers.drain(LOG_DRAIN_BOUND);
+        }
         let mut services = stopped.clone();
         for (name, l) in &live {
             services.insert(
@@ -1661,17 +1667,34 @@ fn spawn_service(name: &str, s: &ServiceSpec, log: std::sync::mpsc::Sender<Vec<u
 /// One writer per service log, for the supervisor's life: every process of the service (old
 /// generations still draining included) sends its lines here, so only one thread writes the
 /// file and rotates it.
-#[derive(Default)]
-struct LogWriters(IndexMap<String, std::sync::mpsc::Sender<Vec<u8>>>);
+struct LogWriters {
+    senders: IndexMap<String, std::sync::mpsc::Sender<Vec<u8>>>,
+    done_tx: std::sync::mpsc::Sender<()>,
+    done_rx: std::sync::mpsc::Receiver<()>,
+    spawned: usize,
+}
+
+impl Default for LogWriters {
+    fn default() -> Self {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        Self { senders: IndexMap::new(), done_tx, done_rx, spawned: 0 }
+    }
+}
 
 impl LogWriters {
     fn sender(&mut self, dir: &Path, service: &str) -> std::sync::mpsc::Sender<Vec<u8>> {
-        self.0
+        let done = self.done_tx.clone();
+        let spawned = &mut self.spawned;
+        self.senders
             .entry(service.to_string())
             .or_insert_with(|| {
                 let (send, receive) = std::sync::mpsc::channel::<Vec<u8>>();
                 let path = log_path(dir, service);
-                std::thread::spawn(move || write_log(receive, &path));
+                *spawned += 1;
+                std::thread::spawn(move || {
+                    write_log(receive, &path);
+                    let _ = done.send(());
+                });
                 send
             })
             .clone()
@@ -1680,6 +1703,23 @@ impl LogWriters {
     /// A line of the supervisor's own about `service`, in its log.
     fn line(&mut self, dir: &Path, service: &str, line: &str) {
         let _ = self.sender(dir, service).send(format!("{} {line}\n", now_ms()).into_bytes());
+    }
+
+    /// Close the supervisor's senders and wait up to `bound` for every writer thread to finish
+    /// (each ends once every pump for its service reaches EOF and queued lines are written).
+    fn drain(&mut self, bound: Duration) {
+        self.senders.clear();
+        let remaining = std::mem::take(&mut self.spawned);
+        if remaining == 0 {
+            return;
+        }
+        let deadline = Instant::now() + bound;
+        for _ in 0..remaining {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+            if self.done_rx.recv_timeout(left).is_err() {
+                break;
+            }
+        }
     }
 }
 

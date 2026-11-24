@@ -658,3 +658,63 @@ fn a_service_that_never_becomes_ready_costs_the_supervisor_little() {
     assert!(used < 0.1, "{used}s of CPU in 5s of waiting");
     sup.shutdown();
 }
+
+#[test]
+fn shutdown_drains_final_service_output_before_exiting() {
+    let sup = Supervisor::new();
+    let script = r#"exec "$PY" -c '
+import os, signal, sys, time
+def bye(*_):
+    for i in range(1, 6):
+        sys.stdout.write(f"goodbye-{i}\n")
+    sys.stdout.flush()
+    os._exit(0)
+signal.signal(signal.SIGTERM, bye)
+open(os.environ["OUT"] + "/ready", "w").write("ok")
+while True:
+    time.sleep(10)
+'"#;
+    sup.spec(json!({ "talk": sup.service(script) }), false);
+    sup.start();
+    let ready = sup.dir.path().join("ready");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "service never armed its SIGTERM handler");
+        thread::sleep(Duration::from_millis(10));
+    }
+    sup.shutdown();
+    let text = fs::read_to_string(sup.path().join("logs/talk.log")).unwrap_or_default();
+    for i in 1..=5 {
+        assert!(text.contains(&format!("goodbye-{i}")), "missing goodbye-{i} in:\n{text}");
+    }
+}
+
+#[test]
+fn a_detached_descendant_holding_stdout_open_does_not_hang_shutdown() {
+    struct Kill(u32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            end(self.0);
+        }
+    }
+    let sup = Supervisor::new();
+    let script = r#"exec "$PY" -c '
+import os, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+open(os.environ["OUT"] + "/escaped", "w").write(str(child.pid))
+time.sleep(600)
+'"#;
+    sup.spec(json!({ "talk": sup.service(script) }), false);
+    sup.start();
+    sup.until(5, "talk runs", |s| s["services"]["talk"]["status"] == "running");
+    let _escaped = Kill(sup.file_pid("escaped"));
+    let started = Instant::now();
+    sup.shutdown();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(5), "shutdown hung on detached descendant: {took:?}");
+    // A subsequent supervisor starts cleanly without hitting the flock timeout.
+    sup.spec(json!({ "after": sup.service("exec sleep 600") }), false);
+    sup.start();
+    sup.until(5, "after runs", |s| s["services"]["after"]["status"] == "running");
+    sup.shutdown();
+}
