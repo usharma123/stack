@@ -155,7 +155,8 @@ fn paths(state: &Path) -> (PathBuf, PathBuf) {
 /// Assign (or reuse) a port per service. Reservations persist across restarts, so a project
 /// keeps the same ports until `reassign` or until its directory is deleted. An assigned port
 /// the system may give an outgoing connection (one reserved before the range moved) is
-/// replaced; pinned ports are the project's to choose. With `reassign` (`compile
+/// replaced; pinned ports are the project's to choose, and no other service of it is given one.
+/// With `reassign` (`compile
 /// --reassign-ports`) every service that is not pinned gets a new port: the ports the project
 /// gives up stay excluded while new ones are chosen, as [`reassign`] keeps the old one.
 pub fn assign(state: &Path, project: &Path, requests: &[Request], reassign: bool) -> Result<IndexMap<String, u16>> {
@@ -182,7 +183,12 @@ fn assign_outside(
     // learned now, even for reservations given up below.
     let previous_at = reg.reservations.iter().find(|r| r.project == project && r.project_at.location.is_some()).map(|r| r.project_at.clone()).unwrap_or_default();
     let at = crate::checkout::Recorded::adopted(project, &previous_at);
-    let given_up: Vec<u16> = if reassign { reg.reservations.iter().filter(|r| r.project == project).map(|r| r.port).collect() } else { Vec::new() };
+    // Never chosen for a service: the ports this checkout gives up when reassigning, and those
+    // any of its services pins (a pin later in `requests` is not reserved yet).
+    let mut excluded: Vec<u16> = requests.iter().filter_map(|q| q.fixed).collect();
+    if reassign {
+        excluded.extend(reg.reservations.iter().filter(|r| r.project == project).map(|r| r.port));
+    }
     reg.reservations.retain(|r| {
         r.project != project || (!reassign && requests.iter().any(|q| q.service == r.service))
     });
@@ -207,7 +213,7 @@ fn assign_outside(
         } else if let Some(existing) = reg.reservations.iter().find(|r| mine(r) && !ephemeral.contains(&r.port)) {
             existing.port
         } else {
-            find_free(&reg, project, &req.service, ephemeral, &given_up)?
+            find_free(&reg, project, &req.service, ephemeral, &excluded)?
         };
         let project_at = match reg.reservations.iter().find(|r| mine(r)) {
             Some(previous) => at.clone().or_kept(&previous.project_at),
@@ -399,6 +405,20 @@ mod tests {
         assert_eq!(after["pinned"], 40759, "a pinned port is never moved");
         assert_eq!(lookup(state.path(), project.path()).unwrap(), after);
         assert_eq!(lookup(state.path(), other.path()).unwrap(), theirs, "another checkout keeps its ports");
+    }
+
+    #[test]
+    fn a_service_is_never_assigned_the_port_another_service_of_its_checkout_pins() {
+        let (scratch, state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // The port `web` of this checkout is assigned first wherever nothing else is reserved.
+        let first = assign(scratch.path(), project.path(), &requests(&[("web", None)]), false).unwrap()["web"];
+        // `db` pins exactly that port and comes after `web`: `web` must go elsewhere.
+        let wanted = requests(&[("web", None), ("db", Some(first))]);
+        for reassign in [false, true, false] {
+            let ports = assign(state.path(), project.path(), &wanted, reassign).unwrap_or_else(|e| panic!("reassign {reassign}: {}", e.message));
+            assert_eq!(ports["db"], first, "reassign {reassign}");
+            assert_ne!(ports["web"], first, "reassign {reassign}");
+        }
     }
 
     #[test]
