@@ -11,9 +11,43 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// refused in OCI layers, and never read at compose time (see `paths.bin`).
 pub const EXCLUDED: [&str; 2] = [".git", ".stack"];
 
-/// Whether `name` is one of [`EXCLUDED`].
+/// Whether `name` is one of [`EXCLUDED`], however a case-insensitive filesystem (macOS) would
+/// spell it: `.Git` there is the repository Git uses, and `.STACK` the directory Stack writes
+/// its state into, so case is folded (with the letters that fold to these, such as `ſ` to `s`)
+/// and the code points HFS+ ignores in names are dropped, as Git itself does when it protects
+/// `.git`. Folded on every platform, so a tree is the same bundle content wherever it is hashed.
 pub fn excluded(name: &std::ffi::OsStr) -> bool {
-    EXCLUDED.iter().any(|e| name == *e)
+    name.to_str().is_some_and(|name| {
+        let folded: String = name
+            .chars()
+            .filter(|c| !matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'))
+            .flat_map(|c| if c == '\u{17F}' { 's' } else { c }.to_lowercase())
+            .collect();
+        EXCLUDED.contains(&folded.as_str())
+    })
+}
+
+/// The first entry under `root`, at any depth, whose name is one of [`EXCLUDED`] (see
+/// [`excluded`]), relative to `root`. A tree expanded from an OCI layer has none (they are
+/// refused there), so one found in a cached tree means it was filled some other way (by an
+/// earlier Stack, which compared names exactly), with content its hash does not cover.
+pub fn first_excluded(root: &Path) -> Result<Option<PathBuf>> {
+    fn walk(root: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+        for entry in fs::read_dir(dir).map_err(|e| io_error(dir.display(), e))? {
+            let entry = entry.map_err(|e| io_error(dir.display(), e))?;
+            let path = entry.path();
+            if excluded(&entry.file_name()) {
+                return Ok(Some(path.strip_prefix(root).expect("path under root").to_path_buf()));
+            }
+            if entry.file_type().map_err(|e| io_error(path.display(), e))?.is_dir() {
+                if let Some(found) = walk(root, &path)? {
+                    return Ok(Some(found));
+                }
+            }
+        }
+        Ok(None)
+    }
+    walk(root, root)
 }
 
 /// Content hash of a bundle tree: relative paths, executable bits and file contents.
@@ -24,8 +58,16 @@ pub fn excluded(name: &std::ffi::OsStr) -> bool {
 /// distinct names never hash alike. Git checkouts, local directories and OCI layers all pass
 /// through here, so every transport holds bundles to the same rule.
 pub fn hash_dir(root: &Path) -> Result<String> {
+    Ok(hash_keeping(root, "")?.0)
+}
+
+/// [`hash_dir`], and the bytes of the file at `keep` (relative to `root`) exactly as they were
+/// hashed, when the tree has one: what is parsed from it is then what the hash covers, however
+/// the file changes afterwards.
+pub fn hash_keeping(root: &Path, keep: &str) -> Result<(String, Option<Vec<u8>>)> {
     let files = list_files(root)?;
     let mut hasher = Sha256::new();
+    let mut kept = None;
     for rel in files {
         let path = root.join(&rel);
         let contents = fs::read(&path).map_err(|e| io_error(path.display(), e))?;
@@ -33,8 +75,11 @@ pub fn hash_dir(root: &Path) -> Result<String> {
         hasher.update([0, is_executable(&path) as u8]);
         hasher.update((contents.len() as u64).to_le_bytes());
         hasher.update(&contents);
+        if !keep.is_empty() && rel == Path::new(keep) {
+            kept = Some(contents);
+        }
     }
-    Ok(format!("sha256:{}", hex(&hasher.finalize())))
+    Ok((format!("sha256:{}", hex(&hasher.finalize())), kept))
 }
 
 /// Files under `root` (skipping [`EXCLUDED`] directories), relative and sorted. Anything but a
@@ -127,6 +172,34 @@ mod tests {
         fs::write(dir.path().join("bin/.git"), "gitdir: elsewhere\n").unwrap();
         symlink("/etc", dir.path().join(".stack/link")).unwrap();
         assert_eq!(hash_dir(dir.path()).unwrap(), hash);
+        // Nor are they spelled another way, which on a case-insensitive filesystem is the same
+        // directory: Git's repository there, or the state Stack writes.
+        fs::create_dir_all(dir.path().join("bin/.Stack")).unwrap();
+        fs::write(dir.path().join("bin/.Stack/x"), "x").unwrap();
+        if fs::create_dir(dir.path().join(".GIT")).is_ok() {
+            fs::write(dir.path().join(".GIT/config"), "[remote]\n").unwrap();
+        }
+        assert_eq!(hash_dir(dir.path()).unwrap(), hash);
+        // The file kept is the one hashed, byte for byte.
+        let (again, kept) = hash_keeping(dir.path(), "bundle.toml").unwrap();
+        assert_eq!((again, kept.as_deref()), (hash.clone(), Some(&b"[bundle]\nname = 'b'\n"[..])));
+        assert_eq!(hash_keeping(dir.path(), "missing.toml").unwrap().1, None);
+        assert!(first_excluded(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn excluded_names_are_folded_as_a_case_insensitive_filesystem_folds_them() {
+        use std::ffi::OsStr;
+        for name in [".git", ".stack", ".GIT", ".Git", ".sTaCk", ".\u{17F}tack", ".g\u{200C}it", "\u{FEFF}.git", ".STAC\u{212A}"] {
+            assert!(excluded(OsStr::new(name)), "{name:?}");
+        }
+        for name in [".gitignore", ".github", "git", ".stackrc", ".gi", "stack", ".g it"] {
+            assert!(!excluded(OsStr::new(name)), "{name:?}");
+        }
+        let dir = tree();
+        assert_eq!(first_excluded(dir.path()).unwrap(), None);
+        fs::create_dir_all(dir.path().join("bin/deep/.Stack")).unwrap();
+        assert_eq!(first_excluded(dir.path()).unwrap(), Some(PathBuf::from("bin/deep/.Stack")));
     }
 
     #[test]

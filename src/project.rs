@@ -4,7 +4,7 @@ use crate::artifacts::{self, PinKey};
 use crate::compose::{compose, Composed, Entry, LoadedBundle};
 use crate::error::{io_error, Result, StackError};
 use crate::lock::{self, LockedBundle, LockedVersion, Lockfile};
-use crate::manifest::{read_bundle, read_project, Service};
+use crate::manifest::{read_project, Service};
 use crate::ports::{self, Request};
 use crate::provider::mise;
 use crate::source::{Mode, Source};
@@ -330,7 +330,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         let source = Source::parse(spec, &opts.root)?;
         let prior = previous.as_ref().and_then(|l| l.find(spec));
         let fetched = source.fetch(spec, prior, opts.mode, &opts.cache)?;
-        let manifest = read_bundle(&fetched.dir, spec)?;
+        let manifest = crate::manifest::parse_bundle(fetched.manifest.as_deref(), &fetched.dir, spec)?;
         let name = manifest.bundle.name.clone();
         if !names.insert(name.clone()) {
             return Err(StackError::new(

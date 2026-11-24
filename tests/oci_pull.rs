@@ -185,7 +185,7 @@ fn separate_projects_cold_fetch_one_digest_into_a_shared_cache_concurrently() {
     let published = format!("oci-{hex}");
     assert_eq!(
         cache_entries(machine.path()),
-        [format!(".oci-{hex}.lock"), published.clone()],
+        [format!(".oci-{hex}.evidence.json"), format!(".oci-{hex}.lock"), published.clone()],
         "staging directories were left behind"
     );
     let tree = machine.path().join("cache/bundles").join(&published);
@@ -247,7 +247,14 @@ fn layers_with_links_or_excluded_directories_never_reach_the_cache() {
         header.set_entry_type(tar::EntryType::Regular);
         tar.append_data(&mut header, ".stack/bin/tool", &b"x"[..]).unwrap();
     });
-    for (blob, reason) in [(link, "unsupported layer entry type"), (hidden, "inside .stack")] {
+    let folded = layer(|tar| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut header, ".GIT/config", &b"x"[..]).unwrap();
+    });
+    for (blob, reason) in [(link, "unsupported layer entry type"), (hidden, "inside .stack"), (folded, "inside .GIT")] {
         let (manifest, digest) = manifest_for(&blob);
         let registry = Registry::new(manifest, blob, 1);
         let machine = tempfile::tempdir().unwrap();
@@ -282,4 +289,140 @@ fn a_link_added_to_a_cached_bundle_is_refused_when_it_is_read() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["error"]["code"], "bundle_invalid", "{result}");
     assert!(result["error"]["message"].as_str().unwrap().contains("bin/hosts is a symbolic link"), "{result}");
+}
+
+/// The cache directory and its evidence file for `digest`.
+fn cached(machine: &Path, digest: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let hex = digest.trim_start_matches("sha256:");
+    let bundles = machine.join("cache/bundles");
+    (bundles.join(format!("oci-{hex}")), bundles.join(format!(".oci-{hex}.evidence.json")))
+}
+
+fn error_of(output: &Output) -> Value {
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    result["error"].clone()
+}
+
+/// A cached tree is reused without a lock vouching for it only with the evidence this Stack
+/// recorded when it installed it from that manifest. Without that evidence (a cache an earlier
+/// Stack filled) the registry is asked again and the tree reused only if it is the layer's; a
+/// tree changed since is refused and left for a person to remove. With stack.lock pinning the
+/// digest and content hash, no registry is needed.
+#[test]
+fn an_unlocked_cached_bundle_is_reused_only_with_evidence_tying_it_to_its_manifest() {
+    let source = bundle();
+    let blob = stack::oci::archive(source.path()).unwrap();
+    let expected = stack::hash::hash_dir(source.path()).unwrap();
+    let (manifest, digest) = manifest_for(&blob);
+    let registry = Registry::new(manifest, blob, 1);
+    let machine = tempfile::tempdir().unwrap();
+    let (tree, evidence) = cached(machine.path(), &digest);
+
+    let (locked, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+    assert_eq!(registry.blob_requests(), 1);
+    let recorded: Value = serde_json::from_slice(&std::fs::read(&evidence).unwrap()).unwrap();
+    assert_eq!((recorded["manifest"].as_str(), recorded["content_hash"].as_str()), (Some(digest.as_str()), Some(expected.as_str())));
+
+    // Another project, no lock: the evidence vouches, nothing is downloaded.
+    let (_b, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+    assert_eq!(registry.blob_requests(), 1);
+
+    // No evidence (as an earlier Stack left its cache): checked against the registry once,
+    // then recorded.
+    std::fs::remove_file(&evidence).unwrap();
+    let (_c, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+    assert_eq!(registry.blob_requests(), 2);
+    assert!(evidence.exists());
+    let (_d, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+    assert_eq!(registry.blob_requests(), 2);
+
+    // The project whose stack.lock pins it needs no evidence and no registry.
+    std::fs::remove_file(&evidence).unwrap();
+    let mut again = Command::new(env!("CARGO_BIN_EXE_stack"));
+    again
+        .args(["-C", locked.path().to_str().unwrap(), "--json", "compile", "--locked"])
+        .env("STACK_CACHE_DIR", machine.path().join("cache"))
+        .env("STACK_STATE_DIR", machine.path().join("state"))
+        .env_remove("STACK_OCI_PLAIN_HTTP");
+    assert_ok(&again.output().unwrap());
+    assert_eq!(registry.blob_requests(), 2);
+
+    // Changed since it was installed (dummy content): the evidence no longer matches, the
+    // registry's layer does not either, and the tree is refused, not replaced.
+    std::fs::write(tree.join("bin/tool"), "#!/bin/sh\necho changed\n").unwrap();
+    let (_e, mut compile) = project(machine.path(), &registry, &digest);
+    let output = compile.output().unwrap();
+    let error = error_of(&output);
+    assert_eq!(error["code"], "content_hash_mismatch", "{error}");
+    assert!(error["message"].as_str().unwrap().contains("is not what"), "{error}");
+    assert_eq!(registry.blob_requests(), 3);
+    assert_eq!(std::fs::read_to_string(tree.join("bin/tool")).unwrap(), "#!/bin/sh\necho changed\n");
+    // The locked project refuses it by its lock, offline.
+    let output = again.output().unwrap();
+    assert_eq!(error_of(&output)["code"], "content_hash_mismatch");
+    assert_eq!(registry.blob_requests(), 3);
+}
+
+/// A cached tree holding a directory bundles cannot contain, however it is spelled, was filled
+/// some other way: refused, whatever vouches for the rest.
+#[test]
+fn a_cached_bundle_holding_an_excluded_directory_is_refused() {
+    let source = bundle();
+    let blob = stack::oci::archive(source.path()).unwrap();
+    let (manifest, digest) = manifest_for(&blob);
+    let registry = Registry::new(manifest, blob, 1);
+    let machine = tempfile::tempdir().unwrap();
+    let (_a, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+    let (tree, _) = cached(machine.path(), &digest);
+    std::fs::create_dir_all(tree.join("bin/.Stack")).unwrap();
+    std::fs::write(tree.join("bin/.Stack/dummy"), "x").unwrap();
+    let (_b, mut compile) = project(machine.path(), &registry, &digest);
+    let error = error_of(&compile.output().unwrap());
+    assert_eq!(error["code"], "bundle_invalid", "{error}");
+    assert!(error["message"].as_str().unwrap().contains("bin/.Stack"), "{error}");
+}
+
+/// Digests from a reference, from stack.lock and from a manifest are checked before any of
+/// them names a path or a request.
+#[test]
+fn only_digests_name_cache_paths_or_registry_requests() {
+    let source = bundle();
+    let blob = stack::oci::archive(source.path()).unwrap();
+    // A manifest naming a layer by something that is not a digest: refused before the blob is
+    // asked for.
+    let manifest = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "layers": [{ "mediaType": stack::oci::LAYER_TYPE, "digest": "sha256:../../../dummy", "size": blob.len() }],
+    }))
+    .unwrap();
+    let digest = sha256(&manifest);
+    let registry = Registry::new(manifest, blob.clone(), 1);
+    let machine = tempfile::tempdir().unwrap();
+    let (_a, mut compile) = project(machine.path(), &registry, &digest);
+    let error = error_of(&compile.output().unwrap());
+    assert_eq!(error["code"], "bundle_invalid", "{error}");
+    assert!(error["message"].as_str().unwrap().contains("not a sha256 digest"), "{error}");
+    assert_eq!(registry.blob_requests(), 0);
+    assert!(!machine.path().join("cache/bundles").exists() || cache_entries(machine.path()).iter().all(|e| !e.contains("dummy")));
+
+    // A reference's digest, and the one stack.lock records.
+    let (manifest, digest) = manifest_for(&blob);
+    let registry = Registry::new(manifest, blob, 1);
+    let (bad, mut compile) = project(machine.path(), &registry, "sha256:../../dummy");
+    let error = error_of(&compile.output().unwrap());
+    assert_eq!(error["code"], "source_invalid", "{error}");
+    drop(bad);
+    let (pinned, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+    let lock = std::fs::read_to_string(pinned.path().join("stack.lock")).unwrap();
+    std::fs::write(pinned.path().join("stack.lock"), lock.replace(&format!("digest = \"{digest}\""), "digest = \"sha256:../../../dummy\"")).unwrap();
+    let before = registry.blob_requests();
+    let error = error_of(&compile.output().unwrap());
+    assert_eq!(error["code"], "lock_invalid", "{error}");
+    assert_eq!(registry.blob_requests(), before);
 }

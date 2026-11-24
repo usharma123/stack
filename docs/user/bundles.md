@@ -57,9 +57,25 @@ local path) refuses a symbolic link, socket or other special file anywhere in th
 `bundle_invalid`, rather than leave content readable through the bundle that its content hash
 does not cover; replace a link with a copy of what it points to. `.git` and `.stack` are never
 bundle content: they are not hashed or published, and an OCI layer containing them is refused.
+They are recognised however a case-insensitive filesystem (macOS) would spell them, on every
+platform: `.Git`, `.GIT` and `.Stack` are the same directories there, so a repository's metadata
+or Stack's own state is never hashed or published under another spelling (Unicode letters that
+fold to these and the code points HFS+ ignores in names are folded too, as Git does). A bundle
+that held such a spelling as ordinary content (Git itself refuses to commit one by default) now
+hashes without it, so the content hash `stack.lock` records for it no longer matches: a local
+path bundle is `lock_outdated` under `compile --locked` until `stack compile` records the new
+hash; for a git or OCI bundle (`content_hash_mismatch`), remove its `[[bundle]]` entry from
+`stack.lock` and run `stack compile` to record it again.
 Each `paths.bin` entry must be a relative path to a real directory inside the bundle: `..`,
-absolute paths, symbolic links along the way, `.git` and `.stack` are `bundle_invalid`, and a
-directory that does not exist is `missing_path`.
+absolute paths, symbolic links along the way, `.git` and `.stack` (under any spelling) are
+`bundle_invalid`, and a directory that does not exist is `missing_path`.
+
+A compile parses the very `bundle.toml` bytes its content hash covered, so the manifest it uses
+is the one `stack.lock` records, even if the file changes while it runs. The other files of a
+bundle (its tools, scripts and service commands) are read when they are used, from the cache or
+the local directory: Stack hashes them at compile time and does not keep an immutable copy, so a
+local path bundle edited afterwards, or a cache changed by another process running as you, is
+seen as it is then, until the next compile hashes it again.
 
 ```sh
 stack compile                          # resolve, lock, assign ports, write .config/mise/conf.d/stack.toml

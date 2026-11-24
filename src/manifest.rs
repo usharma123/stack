@@ -338,6 +338,17 @@ pub fn read_project(root: &Path) -> Result<ProjectManifest> {
     Ok(project)
 }
 
+/// The manifest of the bundle at `dir`, parsed from `bytes`: the very bytes of its
+/// [`BUNDLE_FILE`] the bundle's content hash covered (see [`crate::hash::hash_keeping`]), `None`
+/// when the tree hashed had none. So the manifest a compile uses is the one stack.lock pins,
+/// even if the file changes while it runs.
+pub fn parse_bundle(bytes: Option<&[u8]>, dir: &Path, source: &str) -> Result<BundleManifest> {
+    let path = dir.join(BUNDLE_FILE);
+    let bytes = bytes.ok_or_else(|| StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: it is not in the bundle")))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: {e}")))?;
+    parse(text).map_err(|e| e.into_error("bundle_invalid", &path, Some(source)))
+}
+
 pub fn read_bundle(dir: &Path, source: &str) -> Result<BundleManifest> {
     let path = dir.join(BUNDLE_FILE);
     // Read only as the regular file the content hash covers, never through a link.
