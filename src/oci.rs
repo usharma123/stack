@@ -3,7 +3,12 @@
 //! A bundle is one deterministic tar.gz layer in an OCI artifact manifest. Projects pin the
 //! manifest digest in stack.lock, the same way git sources pin a commit.
 //!
-//! Credentials, when a registry needs them: `STACK_OCI_USERNAME` and `STACK_OCI_PASSWORD`.
+//! Credentials, when a registry needs them: `STACK_OCI_USERNAME` and `STACK_OCI_PASSWORD`, bound
+//! to the one registry origin named by `STACK_OCI_REGISTRY` (scheme, host and effective port,
+//! e.g. `https://ghcr.io`). They are offered only when that exact origin challenges, and only to
+//! it or to a token service it names that is its own origin or approved in
+//! `STACK_OCI_AUTH_REALMS`. A reference, redirect or challenge can never widen that scope: every
+//! other registry is reached anonymously. Credentials set without a valid binding fail closed.
 //! Plain HTTP is used for loopback registries (`localhost`, `127.0.0.0/8`, `::1`). Elsewhere it
 //! requires exactly `STACK_OCI_PLAIN_HTTP=1`; any other value, including `0`, `false` or empty,
 //! keeps HTTPS. An HTTPS registry can never be downgraded to HTTP.
@@ -217,11 +222,88 @@ impl Drop for LookupSlot {
     }
 }
 
-fn creds() -> Option<(String, String)> {
-    Some((
-        std::env::var("STACK_OCI_USERNAME").ok()?,
-        std::env::var("STACK_OCI_PASSWORD").ok()?,
-    ))
+/// The operator's registry credentials and the origin they are bound to, as configured in the
+/// environment. Read when a registry challenges, never from a manifest or a server response.
+#[derive(Debug, Default, Clone)]
+struct CredentialEnv {
+    username: Option<String>,
+    password: Option<String>,
+    /// `STACK_OCI_REGISTRY`, as written.
+    registry: Option<String>,
+}
+
+/// What a challenged registry origin may be given.
+#[derive(Debug, PartialEq)]
+enum Grant {
+    /// No credentials are configured: requests stay anonymous.
+    Anonymous,
+    /// The origin is the configured one.
+    Credentials(String, String),
+    /// Credentials are configured for another origin (named here); requests stay anonymous.
+    Elsewhere(String),
+}
+
+impl CredentialEnv {
+    fn from_env() -> Self {
+        let var = |k: &str| std::env::var(k).ok();
+        Self {
+            username: var("STACK_OCI_USERNAME"),
+            password: var("STACK_OCI_PASSWORD"),
+            registry: var("STACK_OCI_REGISTRY"),
+        }
+    }
+
+    /// Whether `origin` (already serialized by [`Url::origin`]) may receive the credentials.
+    /// Credentials that are incomplete, unbound or bound to something that is not an origin
+    /// are an error rather than sent anywhere.
+    fn grant(&self, origin: &str) -> Result<Grant> {
+        let unbound = |message: String| {
+            StackError::new("oci_credentials_unbound", message).hint(format!(
+                "set STACK_OCI_REGISTRY to the registry origin the credentials belong to (this request was for {origin}), or unset STACK_OCI_USERNAME and STACK_OCI_PASSWORD"
+            ))
+        };
+        let (username, password) = match (&self.username, &self.password) {
+            (None, None) => return Ok(Grant::Anonymous),
+            (Some(u), Some(p)) => (u, p),
+            (Some(_), None) => return Err(unbound("STACK_OCI_USERNAME is set without STACK_OCI_PASSWORD; Stack sent no credentials".into())),
+            (None, Some(_)) => return Err(unbound("STACK_OCI_PASSWORD is set without STACK_OCI_USERNAME; Stack sent no credentials".into())),
+        };
+        let configured = match self.registry.as_deref().map(str::trim) {
+            None | Some("") => {
+                return Err(unbound(format!(
+                    "registry {origin} asked for authentication, but STACK_OCI_USERNAME and STACK_OCI_PASSWORD are not bound to a registry origin; Stack sent no credentials"
+                )))
+            }
+            // Not echoed: a malformed value may hold userinfo.
+            Some(value) => registry_origin(value).ok_or_else(|| {
+                unbound(
+                    "STACK_OCI_REGISTRY is not a registry origin (scheme://host[:port], no path, query or userinfo); Stack sent no credentials".into(),
+                )
+            })?,
+        };
+        Ok(if configured == origin {
+            Grant::Credentials(username.clone(), password.clone())
+        } else {
+            Grant::Elsewhere(configured)
+        })
+    }
+}
+
+/// `value` as an origin, if it is exactly one: HTTP(S), a host, an optional port and nothing
+/// else (a lone trailing `/` is allowed). Default ports are dropped and the host lower-cased, so
+/// `https://GHCR.io:443` and `https://ghcr.io` are the same origin.
+fn registry_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let bare = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        // `Url` accepts `https:host`; an origin is written with `//`.
+        && value.split_once("://").is_some();
+    bare.then(|| url.origin().ascii_serialization())
 }
 
 fn basic(user: &str, pass: &str) -> String {
@@ -257,7 +339,8 @@ fn bounded(req: ureq::Request) -> Result<ureq::Request> {
     Ok(req.timeout(crate::process::bounded(REQUEST_TIMEOUT)))
 }
 
-fn oci_err(context: &str, e: ureq::Error) -> StackError {
+/// `registry` is the origin whose credentials would apply, named in the hint for 401 and 403.
+fn oci_err(context: &str, registry: &str, e: ureq::Error) -> StackError {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
@@ -276,7 +359,9 @@ fn oci_err(context: &str, e: ureq::Error) -> StackError {
                 ),
             );
             if code == 401 || code == 403 {
-                err = err.hint("set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry");
+                err = err.hint(format!(
+                    "if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}; credentials are sent only to that origin"
+                ));
             }
             err
         }
@@ -325,7 +410,7 @@ impl Client {
                     challenged = true;
                     continue;
                 }
-                Err(e) => return Err(oci_err(&format!("{method} {}", target.as_str()), e)),
+                Err(e) => return Err(oci_err(&format!("{method} {}", target.as_str()), &registry, e)),
                 Ok(resp) => resp,
             };
             if [301, 302, 303, 307, 308].contains(&resp.status()) {
@@ -346,7 +431,14 @@ impl Client {
         }
     }
 
+    /// Answer `challenge` from `challenged`, which must be the request's own registry origin.
+    /// Credentials go only to the origin the operator bound them to (see [`CredentialEnv`]),
+    /// and through it only to its own or an approved token service.
     fn authenticate(&self, challenge: &str, challenged: &Url, registry: &str) -> Result<()> {
+        self.authenticate_with(challenge, challenged, registry, &CredentialEnv::from_env())
+    }
+
+    fn authenticate_with(&self, challenge: &str, challenged: &Url, registry: &str, credentials: &CredentialEnv) -> Result<()> {
         let target_origin = challenged.origin().ascii_serialization();
         if target_origin != registry {
             return Err(StackError::new(
@@ -369,22 +461,23 @@ impl Client {
                 &realm,
                 registry,
                 &std::env::var("STACK_OCI_AUTH_REALMS").unwrap_or_default(),
-            );
+            )?;
             if !trusted {
                 return Err(StackError::new("oci_auth_untrusted", format!("token origin {} is not approved", realm.origin().ascii_serialization()))
                     .hint("approve the registry's token service origin in STACK_OCI_AUTH_REALMS (comma-separated origins)"));
             }
+            let grant = credentials.grant(registry)?;
             let mut req = bounded(self.agent.get(realm.as_str()))?;
             for k in ["service", "scope"] {
                 if let Some(v) = field(k) {
                     req = req.query(k, &v);
                 }
             }
-            if let Some((u, p)) = creds() {
-                req = req.set("Authorization", &basic(&u, &p));
+            if let Grant::Credentials(u, p) = &grant {
+                req = req.set("Authorization", &basic(u, p));
             }
             // Auth requests never follow redirects, even to another approved origin.
-            let resp = req.call().map_err(|e| oci_err("authenticate", e))?;
+            let resp = req.call().map_err(|e| oci_err("authenticate", registry, e))?;
             if resp.status() != 200 {
                 return Err(StackError::new(
                     "oci_auth_untrusted",
@@ -402,12 +495,19 @@ impl Client {
             *self.token.borrow_mut() = Some((target_origin, format!("Bearer {token}")));
             Ok(())
         } else if challenge.starts_with("Basic") {
-            let (u, p) = creds().ok_or_else(|| {
-                StackError::new("oci_unauthorized", "registry requires credentials")
-                    .hint("set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry")
-            })?;
-            *self.token.borrow_mut() = Some((target_origin, basic(&u, &p)));
-            Ok(())
+            match credentials.grant(registry)? {
+                Grant::Credentials(u, p) => {
+                    *self.token.borrow_mut() = Some((target_origin, basic(&u, &p)));
+                    Ok(())
+                }
+                Grant::Anonymous => Err(StackError::new("oci_unauthorized", format!("registry {registry} requires credentials"))
+                    .hint(format!("if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}"))),
+                Grant::Elsewhere(configured) => Err(StackError::new(
+                    "oci_unauthorized",
+                    format!("registry {registry} requires credentials; STACK_OCI_USERNAME and STACK_OCI_PASSWORD are bound to {configured}, so Stack sent none"),
+                )
+                .hint(format!("credentials are sent only to STACK_OCI_REGISTRY; if you trust {registry}, use credentials for it with STACK_OCI_REGISTRY={registry}"))),
+            }
         } else {
             Err(StackError::new(
                 "oci_unauthorized",
@@ -823,9 +923,24 @@ fn validate_transport_with(target: &Url, registry: &str, plain_http: bool) -> Re
     Ok(())
 }
 
-fn trusted_realm(realm: &Url, registry: &str, approved: &str) -> bool {
+/// Whether a token service at `realm` may be asked: the registry's own origin, or one listed in
+/// `approved` (comma-separated origins, normalized like `STACK_OCI_REGISTRY`). A listed value that
+/// is not an origin is an error rather than silently ignored or loosely matched.
+fn trusted_realm(realm: &Url, registry: &str, approved: &str) -> Result<bool> {
     let origin = realm.origin().ascii_serialization();
-    origin == registry || approved.split(',').any(|v| v.trim() == origin)
+    if origin == registry {
+        return Ok(true);
+    }
+    for value in approved.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        let listed = registry_origin(value).ok_or_else(|| {
+            StackError::new("oci_auth_untrusted", format!("STACK_OCI_AUTH_REALMS entry '{value}' is not an origin"))
+                .hint("list token service origins as scheme://host[:port], comma-separated, e.g. https://auth.docker.io")
+        })?;
+        if listed == origin {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn verify_digest(bytes: &[u8], expected: &str, what: &str) -> Result<()> {
@@ -956,6 +1071,132 @@ mod tests {
         for target in [&remote_http, &local_http] {
             assert!(validate_transport_with(target, "https://registry.example", true).is_err());
         }
+    }
+
+    fn env(user: Option<&str>, pass: Option<&str>, registry: Option<&str>) -> CredentialEnv {
+        CredentialEnv {
+            username: user.map(String::from),
+            password: pass.map(String::from),
+            registry: registry.map(String::from),
+        }
+    }
+
+    #[test]
+    fn registry_origins_include_scheme_and_effective_port_and_nothing_else() {
+        for (value, origin) in [
+            ("https://ghcr.io", "https://ghcr.io"),
+            ("https://ghcr.io/", "https://ghcr.io"),
+            ("https://GHCR.io:443", "https://ghcr.io"),
+            ("http://localhost:5000", "http://localhost:5000"),
+            ("http://127.0.0.1:80/", "http://127.0.0.1"),
+            ("https://registry.example:8443", "https://registry.example:8443"),
+            (" https://ghcr.io".trim(), "https://ghcr.io"),
+        ] {
+            assert_eq!(registry_origin(value).as_deref(), Some(origin), "{value}");
+        }
+        for value in [
+            "ghcr.io",
+            "ghcr.io:443",
+            "https:ghcr.io",
+            "https://ghcr.io/v2",
+            "https://ghcr.io/acme/",
+            "https://ghcr.io?x=1",
+            "https://ghcr.io#x",
+            "https://user@ghcr.io",
+            "https://user:pw@ghcr.io",
+            "ftp://ghcr.io",
+            "file:///tmp",
+            "",
+        ] {
+            assert_eq!(registry_origin(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn credentials_are_granted_only_to_the_configured_origin() {
+        let bound = env(Some("u"), Some("p"), Some("https://registry.example"));
+        assert_eq!(bound.grant("https://registry.example").unwrap(), Grant::Credentials("u".into(), "p".into()));
+        // A default port written out is the same origin; anything else is not.
+        let explicit_port = env(Some("u"), Some("p"), Some("https://registry.example:443/"));
+        assert_eq!(explicit_port.grant("https://registry.example").unwrap(), Grant::Credentials("u".into(), "p".into()));
+        for other in [
+            "http://registry.example",
+            "https://registry.example:8443",
+            "https://registry.example.attacker.test",
+            "https://attacker.test",
+            "https://sub.registry.example",
+        ] {
+            assert_eq!(bound.grant(other).unwrap(), Grant::Elsewhere("https://registry.example".into()), "{other}");
+        }
+    }
+
+    #[test]
+    fn missing_credentials_stay_anonymous_and_broken_ones_fail_closed() {
+        for registry in [None, Some(""), Some("https://registry.example"), Some("not an origin")] {
+            assert_eq!(env(None, None, registry).grant("https://registry.example").unwrap(), Grant::Anonymous, "{registry:?}");
+        }
+        for (case, credentials) in [
+            ("unbound", env(Some("u"), Some("p"), None)),
+            ("empty binding", env(Some("u"), Some("p"), Some("  "))),
+            ("host only", env(Some("u"), Some("p"), Some("registry.example"))),
+            ("path", env(Some("u"), Some("p"), Some("https://registry.example/v2/acme"))),
+            ("userinfo", env(Some("u"), Some("p"), Some("https://u:dummy-secret@registry.example"))),
+            ("no password", env(Some("u"), None, Some("https://registry.example"))),
+            ("no username", env(None, Some("p"), Some("https://registry.example"))),
+        ] {
+            let err = credentials.grant("https://registry.example").unwrap_err();
+            assert_eq!(err.code, "oci_credentials_unbound", "{case}");
+            assert!(err.message.contains("sent no credentials"), "{case}: {}", err.message);
+            assert!(!err.message.contains("dummy-secret"), "{case}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn token_realms_are_the_registry_origin_or_explicitly_approved_origins() {
+        let realm = |s: &str| Url::parse(s).unwrap();
+        let registry = "https://registry.example";
+        assert!(trusted_realm(&realm("https://registry.example/token"), registry, "").unwrap());
+        assert!(!trusted_realm(&realm("https://auth.example/token"), registry, "").unwrap());
+        for approved in ["https://auth.example", " https://auth.example/ ", "https://AUTH.example:443", "https://x.example, https://auth.example"] {
+            assert!(trusted_realm(&realm("https://auth.example/token"), registry, approved).unwrap(), "{approved}");
+        }
+        for approved in ["http://auth.example", "https://auth.example:8443", "https://auth.example.attacker.test", "https://example"] {
+            assert!(!trusted_realm(&realm("https://auth.example/token"), registry, approved).unwrap(), "{approved}");
+        }
+        // A listed value that is not an origin is reported, never loosely matched.
+        for approved in ["auth.example", "https://auth.example/token"] {
+            assert_eq!(trusted_realm(&realm("https://auth.example/token"), registry, approved).unwrap_err().code, "oci_auth_untrusted", "{approved}");
+        }
+    }
+
+    #[test]
+    fn basic_challenges_receive_credentials_only_at_the_configured_origin() {
+        let challenged = Url::parse("https://registry.example/v2/b/manifests/1").unwrap();
+        let registry = "https://registry.example";
+        let client = Client::default();
+        client
+            .authenticate_with("Basic realm=\"r\"", &challenged, registry, &env(Some("u"), Some("p"), Some(registry)))
+            .unwrap();
+        assert_eq!(client.token.borrow().as_ref().unwrap(), &(registry.to_string(), basic("u", "p")));
+
+        for (credentials, code) in [
+            (env(Some("u"), Some("p"), Some("https://other.example")), "oci_unauthorized"),
+            (env(None, None, None), "oci_unauthorized"),
+            (env(Some("u"), Some("p"), None), "oci_credentials_unbound"),
+        ] {
+            let client = Client::default();
+            let err = client.authenticate_with("Basic realm=\"r\"", &challenged, registry, &credentials).unwrap_err();
+            assert_eq!(err.code, code, "{credentials:?}");
+            assert!(client.token.borrow().is_none());
+        }
+        // A challenge from anywhere but the request's own registry is never answered.
+        let redirected = Url::parse("https://other.example/v2/b/manifests/1").unwrap();
+        let client = Client::default();
+        let err = client
+            .authenticate_with("Basic realm=\"r\"", &redirected, registry, &env(Some("u"), Some("p"), Some("https://other.example")))
+            .unwrap_err();
+        assert_eq!(err.code, "oci_auth_untrusted");
+        assert!(client.token.borrow().is_none());
     }
 
     #[test]

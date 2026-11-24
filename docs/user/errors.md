@@ -58,10 +58,11 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `no_lease` | `renew` was called but the session has no lease to renew. | Nothing to renew: start the session with `stack up --ttl <duration>` or `--owner-pid` if it should expire. | no | - |
 | `no_session` | No session is running in this checkout. | Run `stack up` first. | no | `stack up` |
 | `not_ready` | Services started but failed verification. | Read each service's reason in details, check `stack logs <service>`, fix the cause and run `stack up` again. | yes | `stack status` |
-| `oci_auth_untrusted` | A registry redirected authentication to another origin; Stack refused. | Check the registry URL; credentials are only sent to the registry's own origin. | no | - |
+| `oci_auth_untrusted` | A registry redirected authentication to another origin or an unapproved token service; Stack refused. | Check the registry URL; approve a token service only by listing its origin in STACK_OCI_AUTH_REALMS. | no | - |
+| `oci_credentials_unbound` | STACK_OCI_USERNAME / STACK_OCI_PASSWORD are incomplete or not bound to a registry origin; Stack sent no credentials. | Set STACK_OCI_REGISTRY to the origin the credentials belong to (e.g. https://ghcr.io), or unset the credentials. | no | - |
 | `oci_failed` | An OCI registry request failed. | Read the HTTP status in the message, check the registry, then retry. | yes | - |
 | `oci_not_found` | The OCI reference does not exist in the registry. | Check the repository, tag or digest in the reference. | no | - |
-| `oci_unauthorized` | The OCI registry refused the credentials (HTTP 401/403). | Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry, then retry. | no | - |
+| `oci_unauthorized` | The OCI registry refused the credentials (HTTP 401/403). | Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD with STACK_OCI_REGISTRY set to this registry's origin, then retry. | no | - |
 | `oci_unreachable` | The OCI registry could not be reached. | Check the network and the registry host name, then retry. | yes | - |
 | `owner_not_found` | No ancestor process of Stack has the name given to `--owner-pid ancestor:<name>`. | Pick a name from the ancestor chain in details, pass a process ID with `--owner-pid <pid>`, or use `--ttl 30m` instead. | no | - |
 | `port_conflict` | Another program holds a port this checkout reserved. | Run `stack compile --reassign-ports`, then `stack up`; Stack never kills the other program. | no | `stack compile --reassign-ports`, then `stack up` |

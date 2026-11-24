@@ -266,14 +266,16 @@ codes! {
         "Run `stack up` first.";
     "not_ready", true, [STATUS], "Services started but failed verification.",
         "Read each service's reason in details, check `stack logs <service>`, fix the cause and run `stack up` again.";
-    "oci_auth_untrusted", false, [], "A registry redirected authentication to another origin; Stack refused.",
-        "Check the registry URL; credentials are only sent to the registry's own origin.";
+    "oci_auth_untrusted", false, [], "A registry redirected authentication to another origin or an unapproved token service; Stack refused.",
+        "Check the registry URL; approve a token service only by listing its origin in STACK_OCI_AUTH_REALMS.";
+    "oci_credentials_unbound", false, [], "STACK_OCI_USERNAME / STACK_OCI_PASSWORD are incomplete or not bound to a registry origin; Stack sent no credentials.",
+        "Set STACK_OCI_REGISTRY to the origin the credentials belong to (e.g. https://ghcr.io), or unset the credentials.";
     "oci_failed", true, [], "An OCI registry request failed.",
         "Read the HTTP status in the message, check the registry, then retry.";
     "oci_not_found", false, [], "The OCI reference does not exist in the registry.",
         "Check the repository, tag or digest in the reference.";
     "oci_unauthorized", false, [], "The OCI registry refused the credentials (HTTP 401/403).",
-        "Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry, then retry.";
+        "Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD with STACK_OCI_REGISTRY set to this registry's origin, then retry.";
     "oci_unreachable", true, [], "The OCI registry could not be reached.",
         "Check the network and the registry host name, then retry.";
     "owner_not_found", false, [], "No ancestor process of Stack has the name given to `--owner-pid ancestor:<name>`.",

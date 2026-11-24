@@ -715,8 +715,13 @@ output (mise's answer when no release matches) is an error, not a version.
 a content hash. A bundle's content hash is identical across transports (deterministic archives).
 OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
 
-OCI authorization is scoped to the original registry origin. Bearer token realms must share
-that origin or appear explicitly in `STACK_OCI_AUTH_REALMS`. HTTP is allowed for exact loopback
+OCI credentials (`STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`) are bound to the one origin the
+operator names in `STACK_OCI_REGISTRY` (scheme, host and effective port). They are offered only
+when that origin challenges a request for a reference naming it; references, redirects and
+challenges cannot widen the scope, other registries are reached anonymously, and credentials
+without a valid binding fail closed (`oci_credentials_unbound`). Authorization is scoped to the
+original registry origin. Bearer token realms must share that origin or appear explicitly, as
+origins, in `STACK_OCI_AUTH_REALMS`. HTTP is allowed for exact loopback
 hosts or the explicit development opt-in `STACK_OCI_PLAIN_HTTP=1` (exactly `1`; empty, `0` or
 `false` keep HTTPS); an HTTPS origin can never downgrade to HTTP. Token
 requests do not follow redirects, and upload/registry redirects do not receive another origin's
