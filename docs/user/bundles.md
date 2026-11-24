@@ -82,10 +82,13 @@ your own. Stack's own supervisor runs both, one per checkout (see
 
 Use each preset at most once per stack. Every service of a preset exports the same variable
 names (`DATABASE_URL` and `PG*` for every Postgres service, `REDIS_URL` for every Redis one),
-so with two of them only one service's values reach the app, and `up` fails for the other:
-its instance check reaches the wrong server (`DATABASE_URL reaches a different server`). Each
-still runs its own pinned release on its own port and data directory. For a second database
-of the same kind, use a service of your own with `run`.
+so with two of them only one service's values could reach the app and the other could never
+pass its instance check. A stack with two `postgres` or two `redis` services, from any mix of
+bundles, the project and `[override.services]`, therefore fails `stack compile` (and `up`,
+`exec` and `run`) with `invalid_service` naming each service and its layer, before any port is
+reserved or service started. A service several layers define identically is one service and is
+fine. For a second database of the same kind, use a service of your own with `run`; to replace
+a bundle's preset service, set `[override.services.<name>]` to such a definition.
 
 ```toml
 [services.web]

@@ -224,8 +224,8 @@ codes! {
         "Use a relative directory inside the project root, such as \".claude/skills\".";
     "invalid_secret", false, [], "A secret name cannot be granted.",
         "Use an upper-case variable name that no service, `[env]` entry or Stack/mise variable uses.";
-    "invalid_service", false, [], "A service definition is malformed.",
-        "Set exactly one of `preset` or `run` for the service in stack.toml or the bundle.";
+    "invalid_service", false, [], "A service definition is malformed, or services collide (a name, an identity variable, or a second Postgres or Redis preset).",
+        "Follow the message: set exactly one of `preset` or `run`, rename a colliding service, or keep one service per Postgres or Redis preset.";
     "invalid_tool", false, [], "A tool option or name is invalid.",
         "Fix the `[tools]` entry the message names, then run `stack compile`.";
     "io", true, [], "A file or directory could not be read or written.",

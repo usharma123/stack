@@ -1260,3 +1260,87 @@ fn paths_bin_must_stay_inside_the_hashed_bundle() {
     assert_eq!(err.code, "bundle_invalid", "{}", err.message);
     assert!(err.message.contains("symbolic link"), "{}", err.message);
 }
+
+#[test]
+fn a_second_postgres_or_redis_service_fails_compile_before_anything_starts() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project("");
+    // (stack.toml, preset, services named, in composed order with their layers)
+    for (toml, preset, named) in [
+        (
+            "[services.db]\npreset = 'postgres'\n[services.analytics]\npreset = 'postgres'\nversion = '16'\n".to_string(),
+            "postgres",
+            "'db' (project), 'analytics' (project)",
+        ),
+        (
+            "[services.cache]\npreset = 'redis'\n[services.queue]\npreset = 'redis'\n".to_string(),
+            "redis",
+            "'cache' (project), 'queue' (project)",
+        ),
+        // Composed: the bundle's postgres beside the project's.
+        (
+            format!("{}[services.reports]\npreset = 'postgres'\n", use_git(&base, "v1")),
+            "postgres",
+            "'postgres' (bundle:pybase), 'reports' (project)",
+        ),
+        // An override can introduce the duplicate, too.
+        (
+            format!("{}[override.services.cache]\npreset = 'redis'\n", use_git(&base, "v1")),
+            "redis",
+            "'redis' (bundle:pybase), 'cache' (override)",
+        ),
+    ] {
+        fs::write(root.join("stack.toml"), &toml).unwrap();
+        let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+        assert_eq!(err.code, "invalid_service", "{toml}: {}", err.message);
+        assert!(err.message.contains(&format!("2 services use preset '{preset}': {named}")), "{}", err.message);
+        let hint = err.hint.as_deref().unwrap();
+        assert!(hint.contains(&format!("keep one {preset} service")) && hint.contains("[override.services."), "{hint}");
+        assert_eq!(err.details.len(), 2, "{:?}", err.details);
+        assert!(!root.join("stack.lock").exists(), "{toml}: compile wrote a lock");
+        assert!(!mise::output_path(&root).exists(), "{toml}: compile wrote provider config");
+    }
+
+    // Locked operations (`up`, `exec`, `run`) refuse it too, ahead of any lock check.
+    fs::write(root.join("stack.toml"), use_git(&base, "v1")).unwrap();
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let lock = fs::read_to_string(root.join("stack.lock")).unwrap();
+    fs::write(root.join("stack.toml"), format!("{}[services.reports]\npreset = 'postgres'\n", use_git(&base, "v1"))).unwrap();
+    let err = sb.compile(&root, Mode::Frozen).unwrap_err();
+    assert_eq!(err.code, "invalid_service", "{}", err.message);
+    assert_eq!(fs::read_to_string(root.join("stack.lock")).unwrap(), lock);
+}
+
+#[test]
+fn distinct_or_agreeing_postgres_and_redis_services_still_compile() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project(&use_git(&base, "v1"));
+    // The bundle's one postgres and one redis.
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().stack.services.len(), 2);
+    // The project repeating the bundle's definition is one service, not two.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{}[services.postgres]\npreset = 'postgres'\nversion = '17'\n", use_git(&base, "v1")),
+    )
+    .unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().stack.services.len(), 2);
+    // A second database as a service of the project's own, as the hint suggests.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{}[services.reports]\nrun = 'exec ./reports-db'\n", use_git(&base, "v1")),
+    )
+    .unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.stack.services.len(), 3);
+    // And an override replacing a preset service resolves a duplicate.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{}[services.reports]\npreset = 'postgres'\n[override.services.postgres]\nrun = 'exec ./legacy-db'\n", use_git(&base, "v1")),
+    )
+    .unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.stack.services["reports"].value.preset.as_deref(), Some("postgres"));
+    assert_eq!(report.stack.services["postgres"].value.preset, None);
+}

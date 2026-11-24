@@ -6723,23 +6723,23 @@ fn a_snapshot_is_never_restored_under_a_server_a_dead_supervisor_left_running() 
     assert!(!pid_alive(server));
 }
 
-/// Council item 8: each preset service runs its own pinned release, of any major.
+/// Council item 8: a preset service runs its own pinned release, of any major, whatever release
+/// PATH offers first. (A stack has one Postgres service: a second is `invalid_service`.)
 #[test]
 fn each_preset_service_runs_its_own_pinned_release() {
-    for (a, b) in [("17.6", "18.1"), ("17.6", "17.11")] {
-        let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.pga]\npreset='postgres'\nversion='{a}'\n[services.pgb]\npreset='postgres'\nversion='{b}'\n"));
+    for (pinned, other) in [("18.1", "17.6"), ("17.6", "17.11")] {
+        let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.pg]\npreset='postgres'\nversion='{pinned}'\n"));
         let bin = fixture.dir.path().join("bin");
         servers::install(&bin);
-        let (da, db) = (servers::postgres_release(fixture.dir.path(), &bin, a), servers::postgres_release(fixture.dir.path(), &bin, b));
-        let path = format!("{}:{}:{}:{}", da.display(), db.display(), bin.display(), std::env::var("PATH").unwrap());
+        let (dp, dother) = (servers::postgres_release(fixture.dir.path(), &bin, pinned), servers::postgres_release(fixture.dir.path(), &bin, other));
+        let path = format!("{}:{}:{}:{}", dother.display(), dp.display(), bin.display(), std::env::var("PATH").unwrap());
         fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
-        // (Both share DATABASE_URL, so only one of them verifies as its instance.)
+        // Which release started is the question, not whether this fixture's environment
+        // lets it verify.
         let _ = fixture.command(&["up", "--timeout", "10s"]).output().unwrap();
-        for (service, version) in [("pga", a), ("pgb", b)] {
-            let port = assigned_port(&fixture, service);
-            let ran = fs::read_to_string(fixture.dir.path().join(format!("postgres-{port}.version"))).unwrap_or_default();
-            assert_eq!(ran.trim(), version, "{service} ran another release");
-        }
+        let port = assigned_port(&fixture, "pg");
+        let ran = fs::read_to_string(fixture.dir.path().join(format!("postgres-{port}.version"))).unwrap_or_default();
+        assert_eq!(ran.trim(), pinned, "ran {other}, which PATH lists first");
         fixture.ok(&["down"]);
     }
 }
