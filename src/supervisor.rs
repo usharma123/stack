@@ -1413,8 +1413,14 @@ pub fn read_after(dir: &Path, service: &str, pos: LogPos, max_records: usize, ma
 /// `since` (Unix milliseconds) when given; whether older output was left unread; and the cursor
 /// just past the last whole record of the current file (`None` when there is none yet).
 pub fn tail(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::io::Result<(Vec<Record>, bool, Option<LogPos>)> {
+    tail_within(dir, service, tail, since, LOGS_LIMIT)
+}
+
+/// [`tail`] reading at most `limit` bytes of the files.
+fn tail_within(dir: &Path, service: &str, tail: usize, since: Option<u64>, limit: u64) -> std::io::Result<(Vec<Record>, bool, Option<LogPos>)> {
+    use std::os::unix::fs::FileExt;
     let mut chunks: Vec<(String, bool)> = Vec::new();
-    let mut budget = LOGS_LIMIT;
+    let mut budget = limit;
     let mut pos = None;
     for (n, older) in [false, true].into_iter().enumerate() {
         let Some(mut log) = open_log(dir, service, older)? else { continue };
@@ -1430,8 +1436,14 @@ pub fn tail(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::
             pos = Some(LogPos { dev: log.dev, ino: log.ino, offset: start + whole as u64 });
         }
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
-        if start > 0 {
-            // Begin at a whole line.
+        // Begin at a whole record: one the window begins with (the byte before it ends the one
+        // before) is kept; only the part of one the window cuts is dropped.
+        let partial = start > 0 && {
+            let mut before = [0u8; 1];
+            log.file.read_exact_at(&mut before, start - 1)?;
+            before[0] != b'\n'
+        };
+        if partial {
             text = text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default();
         }
         chunks.push((text, start > 0));
@@ -3437,6 +3449,77 @@ mod tests {
         assert_eq!(logs(dir.path(), "db", 2, None).unwrap(), (vec!["three".to_string(), "stray".to_string()], false));
         assert_eq!(logs(dir.path(), "db", 10, Some(200)).unwrap().0, vec!["two", "three"]);
         assert!(logs(dir.path(), "none", 10, None).unwrap().0.is_empty());
+    }
+
+    /// `count` records from `first`, each `<1000 + n> rec-<nn>\n` (12 bytes), stamped apart.
+    fn numbered(first: u64, count: u64) -> String {
+        (first..first + count).map(|n| format!("{} rec-{n:02}\n", 1000 + n)).collect()
+    }
+
+    fn stamped(records: &[Record]) -> Vec<(u64, String)> {
+        records.iter().map(|r| (r.at_ms, r.line.clone())).collect()
+    }
+
+    fn expect(range: std::ops::Range<u64>) -> Vec<(u64, String)> {
+        range.map(|n| (1000 + n, format!("rec-{n:02}"))).collect()
+    }
+
+    #[test]
+    fn a_tail_window_beginning_at_a_record_keeps_it_and_drops_only_a_record_it_cuts() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        // One file of records 0..5 (60 bytes).
+        fs::write(&path, numbered(0, 5)).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let cursor = Some(LogPos { dev: meta.dev(), ino: meta.ino(), offset: 60 });
+        // A window of 36 bytes begins exactly at record 2: it is kept whole.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 36).unwrap();
+        assert_eq!(stamped(&records), expect(2..5));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // One of 30 begins inside record 2: only that part is dropped.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 30).unwrap();
+        assert_eq!(stamped(&records), expect(3..5));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // The whole file: nothing cut.
+        assert_eq!(tail_within(dir.path(), "db", 10, None, 60).unwrap().0, records_of(0..5));
+        assert_eq!(tail_within(dir.path(), "db", 10, None, 61).unwrap(), (records_of(0..5), false, cursor));
+
+        // Rotated: records 0..5 in the older file, 5..7 (24 bytes) in the current one.
+        fs::rename(&path, older_log(&path)).unwrap();
+        fs::write(&path, numbered(5, 2)).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let cursor = Some(LogPos { dev: meta.dev(), ino: meta.ino(), offset: 24 });
+        // The current file whole, then 36 bytes of the older one, beginning at its record 2.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 24 + 36).unwrap();
+        assert_eq!(stamped(&records), expect(2..7));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // 30 bytes of the older one, beginning inside its record 2.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 24 + 30).unwrap();
+        assert_eq!(stamped(&records), expect(3..7));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // A window of the current file alone, beginning at its record 6 or inside its record 5.
+        assert_eq!(stamped(&tail_within(dir.path(), "db", 10, None, 12).unwrap().0), expect(6..7));
+        assert_eq!(stamped(&tail_within(dir.path(), "db", 10, None, 18).unwrap().0), expect(6..7));
+        // A record still being written in the current file is left for the next read, and the
+        // window is measured from the end of what is there.
+        append(&path, "1007 rec-07 still bei");
+        let (records, _, pos) = tail_within(dir.path(), "db", 10, None, 21 + 24 + 36).unwrap();
+        assert_eq!(stamped(&records), expect(2..7));
+        assert_eq!(pos, cursor);
+        // `since` and `tail` apply to the records the window kept.
+        let (records, truncated, _) = tail_within(dir.path(), "db", 2, Some(1003), 21 + 24 + 36).unwrap();
+        assert_eq!(stamped(&records), expect(5..7));
+        assert!(!truncated, "more records than asked were kept: none of what was left unread is missing");
+    }
+
+    fn records_of(range: std::ops::Range<u64>) -> Vec<Record> {
+        expect(range).into_iter().map(|(at_ms, line)| Record { at_ms, line }).collect()
     }
 
     fn items(q: &LogQueue) -> Vec<Queued> {
