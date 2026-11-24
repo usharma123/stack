@@ -1340,6 +1340,10 @@ fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing()
             "CLI status: {status}"
         );
     }
+    // Nor is an unverified service's address shown to people.
+    let out = with_caller(&fixture, &["status"], &caller).output().unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(!human.contains("DATABASE_URL=") && !human.contains("port 0"), "CLI status: {human}");
 
     let results = fixture.mcp_with(
         with_caller(&fixture, &["mcp"], &caller),
@@ -1883,6 +1887,14 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let logs = json_result(&fixture.ok(&["logs", "web", "--since-start", "--json"]));
     assert_eq!(logs["data"]["since_start"], true);
     assert_eq!(logs["data"]["lines"], json!(["new"]), "{logs}");
+
+    // People are shown the address commands get, as `--json` lists it, and nothing else of the
+    // service's environment (its token stays out).
+    let url = format!("WEB_URL=http://127.0.0.1:{port}");
+    for args in [&["up"][..], &["status"], &["restart", "web"]] {
+        let human = String::from_utf8(fixture.ok(args).stdout).unwrap();
+        assert!(human.contains(&url) && !human.contains("WEB_PORT=") && !human.contains("t0ps3cr3t"), "{args:?}: {human}");
+    }
 
     let out = fixture.command(&["restart", "nope", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "unknown_service");

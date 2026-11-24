@@ -285,6 +285,11 @@ and `NATS_MONITORING_URL`; SpiceDB's `SPICEDB_ENDPOINT`, `SPICEDB_HTTP_PORT` and
 is left out, and a password inside a URL is shown as `***`. A service that does not verify has
 no `endpoints`; what it would have had is under `withheld`.
 
+Without `--json`, `up`, `restart` and `status` print a verified service's endpoints under its
+line, the same masked values: its URLs, or every variable when it has none. A service without an
+assigned port shows `port -`. A service that does not verify shows its reason and the variables
+withheld from commands, never an address.
+
 ### Reason codes
 
 A service that is not ready has a `reason` for people and a `reason_code` to branch on:

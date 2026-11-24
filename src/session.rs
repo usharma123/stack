@@ -283,6 +283,27 @@ pub struct Check {
     provider_id: Option<String>,
 }
 
+impl Check {
+    /// The port for people: `-` when the service has none assigned (never a made-up `0`).
+    pub fn port_label(&self) -> String {
+        self.port.map_or_else(|| "-".to_string(), |p| p.to_string())
+    }
+
+    /// The addresses a verified service gives commands, for people, as `NAME=value` (already
+    /// redacted: see [`endpoints`]): its URLs, or every variable when it has none. Nothing for a
+    /// service that is not verified: its connection variables are withheld, not shown.
+    pub fn endpoint_lines(&self) -> Vec<String> {
+        if !self.ready {
+            return Vec::new();
+        }
+        let urls: Vec<String> = self.endpoints.iter().filter(|(k, _)| k.ends_with("_URL")).map(|(k, v)| format!("{k}={v}")).collect();
+        if !urls.is_empty() {
+            return urls;
+        }
+        self.endpoints.iter().map(|(k, v)| format!("{k}={v}")).collect()
+    }
+}
+
 /// Why a service check failed, as a stable code beside the free-text `reason`. The values and
 /// the action each calls for are listed in docs/user/commands.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5581,16 +5602,17 @@ fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, lau
                 return unconfirmed(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
             }
             let Some(recorded) = record.pid else {
-                return unconfirmed(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
+                return unconfirmed(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.map_or_else(|| "?".into(), |p| p.to_string())));
             };
             if pid != Some(recorded) {
                 return unconfirmed(format!(
                     "{id} now runs pid {}, not the recorded pid {recorded} (restarted, or the path was reused); not signalled",
-                    pid.unwrap_or(0)
+                    pid.map_or_else(|| "?".into(), |p| p.to_string())
                 ));
             }
             if port != Some(record.port) {
-                return unconfirmed(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
+                let now = port.map_or_else(|| "no port the supervisor reports".to_string(), |p| format!("port {p}"));
+                return unconfirmed(format!("{id} now uses {now}, not the recorded port {}; not signalled", record.port));
             }
             Err(Unconfirmed {
                 why: format!(
@@ -7211,6 +7233,34 @@ mod tests {
         assert_eq!(pg["DATABASE_URL"], "postgresql://app:***@127.0.0.1:41000/app?sslmode=disable");
         assert!(!pg.contains_key("PGUSER") && !pg.contains_key("PGPASSWORD"), "{pg:?}");
         assert!(!pg.values().any(|v| v.contains("s3cret") || v.contains("sekret")), "{pg:?}");
+    }
+
+    #[test]
+    fn checks_show_people_their_redacted_urls_and_never_a_made_up_port() {
+        let check = |ready: bool, port: Option<u16>, endpoints: &[(&str, &str)]| Check {
+            service: "db".into(),
+            ready,
+            port,
+            pid: None,
+            identity: None,
+            reason: None,
+            reason_code: None,
+            withheld: Vec::new(),
+            endpoints: endpoints.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            changed_since_start: Vec::new(),
+            watch_incomplete: false,
+            checked_at: 0,
+            data_dir: None,
+            provider_id: None,
+        };
+        let pg = [("DATABASE_URL", "postgresql://app:***@127.0.0.1:41000/app"), ("PGHOST", "127.0.0.1"), ("PGPORT", "41000")];
+        // URLs when there are any; the rest are the same address spelled for one client.
+        assert_eq!(check(true, Some(41000), &pg).endpoint_lines(), ["DATABASE_URL=postgresql://app:***@127.0.0.1:41000/app"]);
+        assert_eq!(check(true, Some(41000), &pg[1..]).endpoint_lines(), ["PGHOST=127.0.0.1", "PGPORT=41000"]);
+        // Not verified: nothing, whatever the map holds.
+        assert!(check(false, Some(41000), &pg).endpoint_lines().is_empty());
+        assert_eq!(check(true, Some(41000), &[]).port_label(), "41000");
+        assert_eq!(check(true, None, &[]).port_label(), "-");
     }
 
     #[test]

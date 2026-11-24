@@ -557,7 +557,8 @@ fn main() -> ExitCode {
                         println!("{:<12} port {} -> {} (reassigned: another program held {})", p.service, p.old, p.new, p.old);
                     }
                     for c in &r.checks {
-                        println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                        println!("{:<12} port {:<5}  {}", c.service, c.port_label(), identity_label(c.identity));
+                        print_endpoints(c);
                     }
                     for (service, o) in &r.init {
                         let ran = if o.ran.is_empty() { String::new() } else { format!(" (ran {})", o.ran.join(", ")) };
@@ -612,7 +613,8 @@ fn main() -> ExitCode {
                 emit(cli.json, &r, || {
                     for c in &r.checks {
                         let note = if r.restarted.contains(&c.service) { "restarted" } else { "" };
-                        println!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                        println!("{}", format!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port_label(), identity_label(c.identity)).trim_end());
+                        print_endpoints(c);
                     }
                     println!("session {}", r.session.id);
                 })
@@ -640,7 +642,10 @@ fn main() -> ExitCode {
                 }
                 for c in &r.checks {
                     match &c.reason {
-                        None => println!("{:<12} ready  port {}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity)),
+                        None => {
+                            println!("{:<12} ready  port {}  {}", c.service, c.port_label(), identity_label(c.identity));
+                            print_endpoints(c);
+                        }
                         // Not started, a service is only worth a line when there is more to it
                         // than that (another program on its port, say).
                         Some(_) if !r.started => {
@@ -648,7 +653,12 @@ fn main() -> ExitCode {
                                 println!("{:<12} {note}", c.service);
                             }
                         }
-                        Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
+                        Some(reason) => {
+                            println!("{:<12} NOT READY  {reason}", c.service);
+                            if !c.withheld.is_empty() {
+                                println!("{:<12}   withheld from commands: {}", "", c.withheld.join(", "));
+                            }
+                        }
                     }
                 }
                 for (service, state) in r.init.iter().filter(|(_, s)| **s != stack::init_tasks::InitState::None) {
@@ -1085,6 +1095,13 @@ fn emit<T: Serialize>(as_json: bool, value: &T, human: impl FnOnce()) -> ExitCod
         human();
     }
     ExitCode::SUCCESS
+}
+
+/// A verified service's addresses under its line, as commands get them with credentials masked.
+fn print_endpoints(c: &session::Check) {
+    for line in c.endpoint_lines() {
+        println!("{:<12}   {line}", "");
+    }
 }
 
 fn identity_label(identity: Option<session::Identity>) -> &'static str {
