@@ -647,9 +647,12 @@ fn exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
 //    on its parent's mount, is swapped with its copy through the held parent: one exchange
 //    where the filesystem has it, else two renames (`.<dir>.stack-old-…`). The old data is
 //    kept until step 4.
-// 4. The journal is marked `committed` (the restore has happened), then the init markers are
-//    written in one write, the record is bound to the new directories, the old data is
-//    removed as `gc --reclaim-data` removes data, and the journal goes.
+// 4. The journal is marked `committed` (the restore has happened). Once the checkout is shown
+//    to be the one that restored (its token), each copy to be at its place as the directory
+//    the restore made, and each record to still name this checkout's directory there, the init
+//    markers are written in one write, each record is bound to its copy by the identity
+//    journaled, the old data is removed as `gc --reclaim-data` removes data, and the journal
+//    goes. Anything else keeps the journal and the old data (`restore_incomplete`).
 //
 // A failure in step 3 swaps every service back, judged by which directory is where, never by
 // what the steps meant to do: services not reached are `unchanged`, those swapped are
@@ -840,21 +843,27 @@ fn undo_all(swaps: &[Swap]) -> (Vec<Value>, bool) {
             Ok(outcome) => json!({ "service": swap.service, "outcome": outcome, "data_dir": swap.dir }),
             Err(why) => {
                 whole = false;
-                let mut v = json!({ "service": swap.service, "outcome": "manual_recovery", "data_dir": swap.dir, "why": why });
-                if let Some(old) = swap.old {
-                    if let Some(at) = [&swap.target, &swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(old)) {
-                        v["old_data"] = json!(at);
-                    }
-                }
-                if let Some(at) = [&swap.target, &swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(swap.new)) {
-                    v["restored_copy"] = json!(at);
-                }
-                v
+                manual_recovery(swap, why)
             }
         });
     }
     out.reverse();
     (out, whole)
+}
+
+/// A service whose data Stack leaves where it is for a person to sort out: why, and where its
+/// old data and the restored copy are, among the places the restore used.
+fn manual_recovery(swap: &Swap, why: String) -> Value {
+    let mut v = json!({ "service": swap.service, "outcome": "manual_recovery", "data_dir": swap.dir, "why": why });
+    if let Some(old) = swap.old {
+        if let Some(at) = [&swap.target, &swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(old)) {
+            v["old_data"] = json!(at);
+        }
+    }
+    if let Some(at) = [&swap.target, &swap.fresh, &swap.aside].into_iter().find(|p| dir_at(p) == Some(swap.new)) {
+        v["restored_copy"] = json!(at);
+    }
+    v
 }
 
 /// The error for a restore that changed nothing in the end: every service's data is as it was.
@@ -873,16 +882,89 @@ fn incomplete(message: String, services: Vec<Value>, journal: &Path) -> StackErr
         .with_detail(json!({ "services": services, "journal": journal }))
 }
 
-/// Record a committed restore: the init markers in one write, the record bound to the new
-/// directories, the old data removed (kept where a mount is inside it), the journal removed.
-fn commit(state: &Path, root: &Path, journal: &Journal) -> Result<Vec<Value>> {
-    #[cfg(test)]
-    if FAIL_COMMIT.with(std::cell::Cell::get) {
-        return Err(StackError::new("state_invalid", "recording failed (test)"));
+impl Swap {
+    fn rebind<'a>(&'a self, project: &'a Path) -> datadirs::Rebind<'a> {
+        datadirs::Rebind { project, service: &self.service, dir: &self.dir, location: &self.target, from: self.old, to: self.new }
     }
-    init_tasks::set_markers(state, root, &journal.markers)?;
-    let dirs: Vec<&Path> = journal.swaps.iter().map(|s| s.dir.as_path()).collect();
-    datadirs::bind_all(state, &dirs, &journal.token)?;
+}
+
+/// Before a committed restore is recorded: the checkout is still the one that restored (its
+/// token), each restored copy is still at its place as the very directory the restore made, and
+/// each record still names this checkout's directory there (see [`datadirs::Rebind::matches`]).
+/// Otherwise why, with what each service holds.
+fn check_committed(state: &Path, root: &Path, journal: &Journal) -> std::result::Result<(), (String, Vec<Value>)> {
+    let token = crate::checkout::token(root);
+    let entries = datadirs::entries(state);
+    let mut first = None;
+    let services = journal
+        .swaps
+        .iter()
+        .map(|swap| {
+            let why = if token.as_deref() != Some(journal.token.as_str()) {
+                Some(format!("{} is no longer the checkout that restored it", root.display()))
+            } else if dir_at(&swap.target) != Some(swap.new) {
+                Some(format!("{} is no longer the restored copy", swap.target.display()))
+            } else {
+                match &entries {
+                    Err(e) => Some(format!("Stack's record of data directories cannot be read ({})", e.message)),
+                    Ok(entries) if !entries.iter().any(|e| swap.rebind(root).matches(e, &journal.token)) => {
+                        Some(format!("Stack's record no longer names {} as {}'s data directory for this checkout", swap.dir.display(), swap.service))
+                    }
+                    Ok(_) => None,
+                }
+            };
+            match why {
+                None => json!({ "service": swap.service, "outcome": "restored", "data_dir": swap.dir }),
+                Some(why) => {
+                    first.get_or_insert_with(|| why.clone());
+                    manual_recovery(swap, why)
+                }
+            }
+        })
+        .collect();
+    first.map_or(Ok(()), |why| Err((why, services)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests fail recording a committed restore once its init markers are written, as a crash
+    /// between them would.
+    static FAIL_REBIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record a committed restore, once [`check_committed`] passes: the init markers in one write,
+/// each record bound to the directory that replaced it, the old data removed (kept where a
+/// mount is inside it), the journal removed. Each step can run again after an interruption.
+/// The error is `restore_incomplete`, with the journal and the old data kept.
+fn commit(state: &Path, root: &Path, journal: &Journal, how: &[&str]) -> Result<Vec<Value>> {
+    let path = journal_path(state, root);
+    if let Err((why, services)) = check_committed(state, root, journal) {
+        return Err(incomplete(
+            format!("snapshot '{}' was restored, but {why}; nothing was recorded and the old data is kept", journal.snapshot),
+            services,
+            &path,
+        ));
+    }
+    let recorded = (|| -> Result<()> {
+        #[cfg(test)]
+        if FAIL_COMMIT.with(std::cell::Cell::get) {
+            return Err(StackError::new("state_invalid", "recording failed (test)"));
+        }
+        init_tasks::set_markers(state, root, &journal.markers)?;
+        #[cfg(test)]
+        if FAIL_REBIND.with(std::cell::Cell::get) {
+            return Err(StackError::new("state_invalid", "binding failed (test)"));
+        }
+        let rebinds: Vec<datadirs::Rebind> = journal.swaps.iter().map(|s| s.rebind(root)).collect();
+        datadirs::rebind(state, &journal.token, &rebinds)
+    })();
+    recorded.map_err(|e| {
+        incomplete(
+            format!("snapshot '{}' was restored, but recording it failed: {}; the restored data stays, and the next snapshot command or `stack up` records it", journal.snapshot, e.message),
+            restored(journal, how),
+            &path,
+        )
+    })?;
     let mut kept = Vec::new();
     for swap in &journal.swaps {
         let Some(old) = swap.old else { continue };
@@ -891,8 +973,10 @@ fn commit(state: &Path, root: &Path, journal: &Journal) -> Result<Vec<Value>> {
             kept.push(json!({ "service": swap.service, "old_data_kept": at, "why": e.to_string() }));
         }
     }
-    match fs::remove_file(journal_path(state, root)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io_error(journal_path(state, root).display(), e)),
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(incomplete(format!("snapshot '{}' was restored and recorded, but its journal cannot be removed: {e}", journal.snapshot), restored(journal, how), &path))
+        }
         _ => {}
     }
     Ok(kept)
@@ -912,8 +996,7 @@ pub fn recover_restore(state: &Path, root: &Path) -> Result<Option<Value>> {
         return Err(StackError::new("state_invalid", format!("{} cannot be read", path.display())).hint("remove it once the checkout's data directories are as they should be"));
     };
     if journal.phase == "committed" {
-        let kept = commit(state, root, &journal)
-            .map_err(|e| incomplete(format!("snapshot '{}' was restored, but recording it failed: {}", journal.snapshot, e.message), restored(&journal, &[]), &path))?;
+        let kept = commit(state, root, &journal, &[])?;
         return Ok(Some(json!({ "snapshot": journal.snapshot, "interrupted_restore": "completed", "kept": kept })));
     }
     let (services, whole) = undo_all(&journal.swaps);
@@ -1005,13 +1088,7 @@ fn restore_services(ctx: &Ctx, name: &str, snapshot: &Path, plan: &[(String, Sna
         journal.phase = "swapping".into();
         return Err(roll_back(&journal, &path, e, "the journal"));
     }
-    let kept = commit(&ctx.state, &ctx.root, &journal).map_err(|e| {
-        incomplete(
-            format!("snapshot '{name}' was restored, but recording it failed: {}; the restored data stays, and the next snapshot command or `stack up` records it", e.message),
-            restored(&journal, &how),
-            &path,
-        )
-    })?;
+    let kept = commit(&ctx.state, &ctx.root, &journal, &how)?;
     Ok(journal
         .swaps
         .iter()
@@ -1378,7 +1455,7 @@ mod tests {
         }
 
         fn token(&self) -> String {
-            "token".to_string()
+            crate::checkout::token(&self.ctx.root).unwrap()
         }
 
         fn target(&self, name: &str) -> PathBuf {
@@ -1586,6 +1663,103 @@ mod tests {
             assert_eq!(r.markers().len(), 3);
             assert!(r.leftovers().is_empty() && r.journal().is_none(), "{:?}", r.leftovers());
         });
+    }
+
+    /// A restore of `names` that swapped every service and committed, but was not recorded.
+    fn committed_unrecorded(names: &[&str]) -> (Restore, Vec<Option<[u64; 2]>>) {
+        let r = Restore::new(names, true);
+        let before = r.identities();
+        inject(None, None, None, true);
+        assert_eq!(r.run().unwrap_err().code, "restore_incomplete");
+        inject(None, None, None, false);
+        assert_eq!(r.journal().unwrap().phase, "committed");
+        (r, before)
+    }
+
+    /// Where the old data of each journaled service is now (fresh or aside), if anywhere.
+    fn old_data(r: &Restore) -> Vec<Option<PathBuf>> {
+        r.journal().unwrap().swaps.iter().map(|s| [&s.fresh, &s.aside].into_iter().find(|p| dir_at(p) == s.old).cloned()).collect()
+    }
+
+    #[test]
+    fn a_committed_restore_is_recorded_only_while_its_copies_checkout_and_records_are_as_it_left_them() {
+        let ledger = |r: &Restore| datadirs::entries(&r.ctx.state).unwrap();
+        // The restored copy at cache's place vanished, or another directory took its place.
+        for replaced in [false, true] {
+            let (r, before) = committed_unrecorded(&["db", "cache"]);
+            let old = old_data(&r);
+            let recorded = ledger(&r);
+            fs::rename(r.target("cache"), r.ctx.state.parent().unwrap().join("elsewhere")).unwrap();
+            if replaced {
+                write(&r.target("cache").join("file"), "intruder");
+            }
+            let e = recover_restore(&r.ctx.state, &r.ctx.root).unwrap_err();
+            assert_eq!(e.code, "restore_incomplete", "{e}");
+            assert!(e.message.contains("is no longer the restored copy"), "{e}");
+            assert_eq!(Restore::outcomes(&e), pairs(&[("db", "restored"), ("cache", "manual_recovery")]));
+            let cache = e.details.iter().find_map(|d| d["services"].as_array()).unwrap()[1].clone();
+            assert_eq!(dir_at(Path::new(cache["old_data"].as_str().unwrap())), before[1], "{cache}");
+            assert!(r.markers().is_empty(), "no init marker is written");
+            assert_eq!(ledger(&r), recorded, "no record is rebound");
+            assert_eq!(old_data(&r), old, "no old data is removed");
+            assert_eq!(r.journal().unwrap().phase, "committed", "the journal stays");
+            // Again, the same answer: nothing moved meanwhile.
+            assert_eq!(recover_restore(&r.ctx.state, &r.ctx.root).unwrap_err().code, "restore_incomplete");
+            assert_eq!(old_data(&r), old);
+        }
+        // Another checkout's token, and a record that no longer names this checkout's directory.
+        for case in ["token", "ledger"] {
+            let (r, _) = committed_unrecorded(&["db", "cache"]);
+            let old = old_data(&r);
+            match case {
+                "token" => {
+                    let mut journal = r.journal().unwrap();
+                    journal.token = "another checkout".into();
+                    write_json(&journal_path(&r.ctx.state, &r.ctx.root), &journal).unwrap();
+                }
+                _ => datadirs::forget(&r.ctx.state, |e| e.service == "db").unwrap(),
+            }
+            let recorded = ledger(&r);
+            let e = recover_restore(&r.ctx.state, &r.ctx.root).unwrap_err();
+            assert_eq!(e.code, "restore_incomplete", "{case}: {e}");
+            let outcomes = Restore::outcomes(&e);
+            assert_eq!(outcomes[0], ("db".to_string(), "manual_recovery".to_string()), "{case}: {e}");
+            assert!(r.markers().is_empty() && ledger(&r) == recorded && old_data(&r) == old, "{case}: nothing recorded or removed");
+            assert!(r.journal().is_some(), "{case}");
+        }
+    }
+
+    #[test]
+    fn recording_a_committed_restore_can_be_interrupted_anywhere_and_finished() {
+        both_ways(|_| {
+            let r = Restore::new(&["db", "cache"], true);
+            // The init markers written, the records not bound yet.
+            FAIL_REBIND.with(|c| c.set(true));
+            let e = r.run().unwrap_err();
+            FAIL_REBIND.with(|c| c.set(false));
+            assert_eq!(e.code, "restore_incomplete", "{e}");
+            assert_eq!(r.markers().len(), 2);
+            let entry = |name: &str| datadirs::entries(&r.ctx.state).unwrap().into_iter().find(|e| e.service == name).unwrap();
+            assert_ne!(entry("db").identity, dir_at(&r.target("db")), "not bound yet");
+            let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+            assert_eq!(recovered["interrupted_restore"], "completed", "{recovered}");
+            for name in ["db", "cache"] {
+                assert_eq!(entry(name).identity, dir_at(&r.target(name)), "bound to the restored copy");
+            }
+            assert!(r.leftovers().is_empty() && r.journal().is_none(), "{:?}", r.leftovers());
+            assert_eq!(r.contents(), ["new-db", "new-cache"]);
+        });
+        // Everything recorded, the journal still there (a crash before removing it): finished
+        // again without complaint, the records already bound.
+        let r = Restore::new(&["db"], true);
+        r.run().unwrap();
+        let mut journal = Journal { snapshot: "base".into(), phase: "committed".into(), token: r.token(), swaps: Vec::new(), markers: r.markers().into_iter().map(|(k, v)| (k, Some(v))).collect() };
+        let target = r.target("db");
+        journal.swaps.push(Swap { service: "db".into(), dir: target.clone(), target: target.clone(), fresh: target.with_file_name(".db.stack-restore-1-1"), aside: target.with_file_name(".db.stack-old-1-1"), old: Some([1, 1]), new: dir_at(&target).unwrap() });
+        write_json(&journal_path(&r.ctx.state, &r.ctx.root), &journal).unwrap();
+        let recovered = recover_restore(&r.ctx.state, &r.ctx.root).unwrap().unwrap();
+        assert_eq!(recovered["interrupted_restore"], "completed", "{recovered}");
+        assert!(r.journal().is_none());
     }
 
     #[test]

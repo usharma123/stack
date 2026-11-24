@@ -199,6 +199,62 @@ pub fn bind_all(state: &Path, dirs: &[&Path], checkout: &str) -> Result<()> {
     Ok(())
 }
 
+/// A data directory a restore replaced, to bind its record to the replacement (see
+/// [`rebind`]).
+#[derive(Debug, Clone)]
+pub struct Rebind<'a> {
+    pub project: &'a Path,
+    pub service: &'a str,
+    pub dir: &'a Path,
+    /// Where it resolved when it was replaced.
+    pub location: &'a Path,
+    /// The directory replaced (`None`: nothing was there).
+    pub from: Option<[u64; 2]>,
+    /// The directory that replaced it.
+    pub to: [u64; 2],
+}
+
+impl Rebind<'_> {
+    /// `entry` is this checkout's record of the directory, still as the restore found it (or
+    /// already bound to the replacement): the same checkout, service and path, resolving to the
+    /// same place, naming the directory replaced or its replacement. A record that names no
+    /// directory yet (nothing was there) only has to resolve to the same place.
+    pub fn matches(&self, entry: &Entry, checkout: &str) -> bool {
+        entry.project == self.project
+            && entry.service == self.service
+            && entry.dir == self.dir
+            && entry.checkout == checkout
+            && entry.location.as_deref().map_or(self.from.is_none(), |l| l == self.location)
+            && (entry.identity == Some(self.to) || self.from.map_or(true, |from| entry.identity == Some(from)))
+    }
+}
+
+/// Bind each record of a restore's directories to the directory that replaced it, by the
+/// identity the restore journaled, never by what the path names now: all at once, and only
+/// when every record still [`Rebind::matches`]; otherwise nothing is written.
+pub fn rebind(state: &Path, checkout: &str, rebinds: &[Rebind]) -> Result<()> {
+    let (file, lock) = paths(state);
+    let _guard = FileLock::acquire(&lock)?;
+    let mut ledger: Ledger = read_json(&file)?;
+    let mut changed = false;
+    for r in rebinds {
+        let Some(entry) = ledger.entries.iter_mut().find(|e| r.matches(e, checkout)) else {
+            return Err(crate::error::StackError::new(
+                "state_invalid",
+                format!("Stack's record no longer names {} as {}'s data directory for this checkout", r.dir.display(), r.service),
+            ));
+        };
+        if (entry.location.as_deref(), entry.identity) != (Some(r.location), Some(r.to)) {
+            (entry.location, entry.identity) = (Some(r.location.to_path_buf()), Some(r.to));
+            changed = true;
+        }
+    }
+    if changed {
+        write_json(&file, &ledger)?;
+    }
+    Ok(())
+}
+
 /// What [`hold`] found for an entry.
 pub enum Found {
     /// The recorded directory, open, with its parent.
