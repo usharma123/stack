@@ -241,6 +241,15 @@ fn snapshots_seed_a_worktree_without_running_init() {
     let steps: Vec<&str> = saved["steps"].as_array().unwrap().iter().map(|s| s["step"].as_str().unwrap()).collect();
     assert_eq!(steps, ["stop", "copy", "start", "verify"]);
     assert_eq!(f.json(&a, &["snapshot", "save", "base"])["error"]["code"], "snapshot_exists");
+    // --force replaces it whole: an exchange where the filesystem has one, never an empty name.
+    let forced = f.ok(&a, &["snapshot", "save", "base", "--force"]);
+    let copy = forced["steps"].as_array().unwrap().iter().find(|s| s["step"] == "copy").unwrap();
+    let publish = copy["detail"]["publish"].as_str().unwrap();
+    assert!(publish == "exchange" || publish == "rename", "{forced}");
+    #[cfg(target_os = "macos")]
+    assert_eq!(publish, "exchange", "APFS swaps directories: {forced}");
+    let store: Vec<String> = fs::read_dir(f.dir.path().join("state/snapshots")).unwrap().flatten().filter(|e| e.path().is_dir()).flat_map(|e| fs::read_dir(e.path()).unwrap().flatten().map(|e| e.file_name().into_string().unwrap())).collect();
+    assert_eq!(store, ["base"], "nothing staged is left: {store:?}");
     f.ok(&a, &["down"]);
 
     // A new worktree of the same repository starts from it instead of running init.

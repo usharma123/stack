@@ -28,7 +28,7 @@ use crate::project::{self, Options, Report};
 use crate::provider::mise::DaemonStatus;
 use crate::session::{self, Ctx, UpOptions};
 use crate::source::Mode;
-use crate::state::{now, read_json, write_json, FileLock};
+use crate::state::{now, write_json, FileLock};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -132,6 +132,155 @@ fn store_lock(state: &Path, project: &ProjectId) -> Result<FileLock> {
     FileLock::acquire(&state.join("snapshots").join(format!("{}.lock", project.id)))
 }
 
+// ---- the store's generations ----------------------------------------------------------------
+//
+// A snapshot is the directory `<store>/<name>` holding `meta.json` (written last, so its presence
+// means the data beside it is complete) and `data/`. Every write happens under the store lock
+// in a staging directory of the store, then is published by renames:
+//
+// - `.tmp-<name>-<pid>-<ns>`: a snapshot being built by `save`;
+// - `.old-<name>-<pid>-<ns>`: a published generation set aside by `save --force` where the
+//   filesystem has no exchange, until the new one is in place;
+// - `.rm-<name>-<pid>-<ns>`: a snapshot `rm` took out of the listing, being deleted.
+//
+// `save --force` exchanges the new generation with the published one in one step
+// (`renameatx_np(RENAME_SWAP)`, `renameat2(RENAME_EXCHANGE)`), so the name always holds a
+// complete snapshot. Without an exchange it renames the published one aside first: a crash
+// between the two renames leaves the name empty and the old generation in `.old-*`. Readers
+// that take no lock (`list`, the checks before an operation) then read that old generation
+// in place, and the next operation under the lock moves it back ([`recover_store`]) before it
+// removes any staging directory.
+
+/// A staging directory of the store, by its name.
+#[derive(Debug, PartialEq, Eq)]
+struct Staging {
+    kind: &'static str,
+    name: String,
+    pid: u32,
+    nanos: u128,
+}
+
+impl Staging {
+    fn parse(entry: &str) -> Option<Staging> {
+        let (kind, rest) = [("tmp", ".tmp-"), ("old", ".old-"), ("rm", ".rm-")].into_iter().find_map(|(k, p)| entry.strip_prefix(p).map(|r| (k, r)))?;
+        let mut parts = rest.rsplitn(3, '-');
+        let nanos = parts.next()?.parse().ok()?;
+        let pid = parts.next()?.parse().ok()?;
+        let name = parts.next()?;
+        valid_name(name).ok()?;
+        Some(Staging { kind, name: name.to_string(), pid, nanos })
+    }
+
+    /// Whether another process that is still alive owns it. Every writer holds the store lock
+    /// while it stages, so under the lock a staging directory is stale; one whose owner still
+    /// runs is left alone all the same (a pid reused since only keeps it longer).
+    fn live_elsewhere(&self) -> bool {
+        self.pid != std::process::id() && crate::state::pid_alive(self.pid)
+    }
+}
+
+/// `meta.json` of the snapshot directory `dir`, if it parses and names `name`.
+fn valid_meta(dir: &Path, name: &str) -> Option<Meta> {
+    let meta: Meta = serde_json::from_str(&fs::read_to_string(dir.join(META)).ok()?).ok()?;
+    (meta.name == name).then_some(meta)
+}
+
+/// The store's staging directories, by name.
+fn staging(base: &Path) -> Vec<(PathBuf, Staging)> {
+    fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.path(), Staging::parse(e.file_name().to_str()?)?)))
+        .collect()
+}
+
+/// The newest complete generation of `name` set aside by an interrupted `save --force`.
+fn set_aside(base: &Path, name: &str) -> Option<PathBuf> {
+    let mut old: Vec<(u64, u128, PathBuf)> = staging(base)
+        .into_iter()
+        .filter(|(_, s)| s.kind == "old" && s.name == name)
+        .filter_map(|(path, s)| Some((valid_meta(&path, name)?.created_at, s.nanos, path)))
+        .collect();
+    old.sort();
+    old.pop().map(|(_, _, path)| path)
+}
+
+/// Where `name`'s snapshot is: the published directory, or, while a `save --force` without an
+/// exchange has it renamed aside (or crashed with it so), the generation set aside. Read only.
+fn generation(state: &Path, project: &ProjectId, name: &str) -> Option<PathBuf> {
+    let base = store(state, project);
+    let published = base.join(name);
+    if published.join(META).is_file() {
+        return Some(published);
+    }
+    set_aside(&base, name)
+}
+
+/// Under the store lock: put back every generation an interrupted `save --force` left set
+/// aside with nothing published in its place, then remove staging directories nobody owns any
+/// more. Returns what it did, for the report.
+fn recover_store(base: &Path) -> Vec<Value> {
+    let mut done = Vec::new();
+    let names: std::collections::BTreeSet<String> = staging(base).into_iter().filter(|(_, s)| s.kind == "old").map(|(_, s)| s.name).collect();
+    for name in names {
+        let published = base.join(&name);
+        if published.join(META).is_file() {
+            continue;
+        }
+        let Some(old) = set_aside(base, &name) else { continue };
+        // An incomplete directory at the name (a crash before its meta.json) is staging too.
+        if fs::symlink_metadata(&published).is_ok() {
+            let stray = unique(base, &format!(".rm-{name}"));
+            if fs::rename(&published, &stray).is_err() {
+                continue;
+            }
+        }
+        if fs::rename(&old, &published).is_ok() {
+            done.push(json!({ "snapshot": name, "recovered": "the generation an interrupted `save --force` set aside" }));
+        }
+    }
+    for (path, s) in staging(base) {
+        if !s.live_elsewhere() {
+            remove_tree(&path);
+        }
+    }
+    done
+}
+
+/// Under the store lock: publish the complete snapshot `tmp` at `published`, replacing what
+/// is there. One exchange where the filesystem has one; otherwise the old generation is
+/// renamed aside first, and put back if the new one cannot take its place.
+fn publish(base: &Path, name: &str, tmp: &Path, published: &Path) -> Result<&'static str> {
+    if fs::symlink_metadata(published).is_err() {
+        fs::rename(tmp, published).map_err(|e| io_error(published.display(), e))?;
+        return Ok("rename");
+    }
+    if exchange(tmp, published).map_err(|e| io_error(published.display(), e))? {
+        // `tmp` now holds the old generation.
+        remove_tree(tmp);
+        return Ok("exchange");
+    }
+    let old = unique(base, &format!(".old-{name}"));
+    fs::rename(published, &old).map_err(|e| io_error(published.display(), e))?;
+    #[cfg(test)]
+    if CRASH_AFTER_ASIDE.with(std::cell::Cell::get) {
+        return Err(StackError::new("snapshot_failed", "crashed (test)"));
+    }
+    if let Err(e) = fs::rename(tmp, published) {
+        let _ = fs::rename(&old, published);
+        return Err(io_error(published.display(), e));
+    }
+    remove_tree(&old);
+    Ok("rename")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests stop `publish` between its two renames, as a crash would.
+    static CRASH_AFTER_ASIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn valid_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -173,11 +322,19 @@ pub struct Meta {
     pub services: IndexMap<String, SnapService>,
 }
 
+/// The metadata of `name`'s snapshot (see [`generation`]), which must name it.
 fn read_meta(state: &Path, project: &ProjectId, name: &str) -> Result<Meta> {
-    let path = store(state, project).join(name).join(META);
+    let dir = generation(state, project, name).unwrap_or_else(|| store(state, project).join(name));
+    let path = dir.join(META);
+    let invalid = |why: String| StackError::new("snapshot_invalid", format!("{}: {why}", path.display())).hint(format!("remove it with `stack snapshot rm {name}`"));
     match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| StackError::new("snapshot_invalid", format!("{}: {e}", path.display())).hint(format!("remove it with `stack snapshot rm {name}`"))),
+        Ok(text) => {
+            let meta: Meta = serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+            if meta.name != name {
+                return Err(invalid(format!("it describes snapshot '{}'", meta.name)));
+            }
+            Ok(meta)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found(state, project, name)),
         Err(e) => Err(io_error(path.display(), e)),
     }
@@ -192,8 +349,11 @@ fn not_found(state: &Path, project: &ProjectId, name: &str) -> StackError {
     })
 }
 
+/// Every snapshot's name: published ones, and those an interrupted `save --force` left set
+/// aside with nothing published in their place.
 fn names(state: &Path, project: &ProjectId) -> Vec<String> {
-    let mut out: Vec<String> = fs::read_dir(store(state, project))
+    let base = store(state, project);
+    let mut out: Vec<String> = fs::read_dir(&base)
         .into_iter()
         .flatten()
         .flatten()
@@ -201,6 +361,11 @@ fn names(state: &Path, project: &ProjectId) -> Vec<String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| valid_name(n).is_ok())
         .collect();
+    for (path, s) in staging(&base) {
+        if s.kind == "old" && !out.contains(&s.name) && valid_meta(&path, &s.name).is_some() {
+            out.push(s.name);
+        }
+    }
     out.sort();
     out
 }
@@ -385,8 +550,10 @@ fn copy_dir(src: &Path, dst: &Path, top: bool) -> Result<()> {
     Ok(())
 }
 
+/// A fresh name in `parent`: `<prefix>-<pid>-<nanoseconds since the epoch>`. The pid says which
+/// process owns it (see [`Staging`]), the time orders generations.
 fn unique(parent: &Path, prefix: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     parent.join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
@@ -394,27 +561,46 @@ fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
-/// Exchange two existing paths in one step, where the platform can.
-fn exchange(a: &Path, b: &Path) -> bool {
+/// Exchange two existing paths in one step: `Ok(true)` when done, `Ok(false)` when the platform
+/// or the filesystem has no exchange (the caller falls back), an error otherwise.
+fn exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
+    #[cfg(test)]
+    if NO_EXCHANGE.with(std::cell::Cell::get) {
+        return Ok(false);
+    }
     use std::os::unix::ffi::OsStrExt;
-    let (Ok(a), Ok(b)) = (std::ffi::CString::new(a.as_os_str().as_bytes()), std::ffi::CString::new(b.as_os_str().as_bytes())) else {
-        return false;
-    };
+    let invalid = |_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in a path");
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes()).map_err(invalid)?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes()).map_err(invalid)?;
     #[cfg(target_os = "macos")]
-    {
-        // SAFETY: valid NUL-terminated paths.
-        unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) == 0 }
-    }
+    // SAFETY: valid NUL-terminated paths, resolved from the working directory as given.
+    let rc = unsafe { libc::renameatx_np(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_SWAP) };
     #[cfg(target_os = "linux")]
-    {
-        // SAFETY: valid NUL-terminated paths; renameat2 reads them only.
-        unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) == 0 }
-    }
+    // SAFETY: valid NUL-terminated paths; renameat2 only reads them. Called by number: musl
+    // declares no wrapper.
+    let rc = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
+    let rc = {
         let _ = (a, b);
-        false
+        return Ok(false);
+    };
+    if rc == 0 {
+        return Ok(true);
     }
+    let e = std::io::Error::last_os_error();
+    // No such call (an old kernel, a seccomp filter), or a filesystem without exchange.
+    // (EOPNOTSUPP is ENOTSUP on Linux, another number on macOS.)
+    let code = e.raw_os_error().unwrap_or(0);
+    if [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code) {
+        return Ok(false);
+    }
+    Err(e)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests take the two-rename path the platforms without an exchange take.
+    static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Put the complete copy `fresh` (a sibling of `target`) at `target`. With no `target` yet,
@@ -426,7 +612,7 @@ fn replace(fresh: &Path, target: &Path) -> Result<&'static str> {
         fs::rename(fresh, target).map_err(|e| io_error(target.display(), e))?;
         return Ok("rename");
     }
-    if exchange(fresh, target) {
+    if exchange(fresh, target).map_err(|e| io_error(target.display(), e))? {
         // `fresh` now holds the old data: removed only up to a mount inside it, never across.
         let _ = datadirs::remove_tree(fresh);
         return Ok("exchange");
@@ -535,7 +721,7 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
     let report = compile_readonly(ctx)?;
     let services = chosen(&report, named)?;
     let final_dir = store(&ctx.state, &project).join(name);
-    if final_dir.exists() && !force {
+    if generation(&ctx.state, &project, name).is_some() && !force {
         return Err(StackError::new("snapshot_exists", format!("snapshot '{name}' already exists for this project"))
             .hint(format!("pick another name, `stack snapshot rm {name}`, or `stack snapshot save {name} --force` to replace it")));
     }
@@ -544,6 +730,7 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
         let _store = store_lock(&ctx.state, &project)?;
         let base = store(&ctx.state, &project);
         fs::create_dir_all(&base).map_err(|e| io_error(base.display(), e))?;
+        let recovered = recover_store(&base);
         let tmp = unique(&base, &format!(".tmp-{name}"));
         fs::create_dir(&tmp).map_err(|e| io_error(tmp.display(), e))?;
         fs::create_dir(tmp.join("data")).map_err(|e| io_error(tmp.display(), e))?;
@@ -586,19 +773,16 @@ pub fn save(ctx: &Ctx, name: &str, named: &[String], force: bool) -> Result<Snap
                 return Err(e);
             }
         };
-        if final_dir.exists() {
-            if !force {
-                remove_tree(&tmp);
-                return Err(StackError::new("snapshot_exists", format!("snapshot '{name}' was created while this one was saved")));
-            }
-            let old = unique(&base, &format!(".old-{name}"));
-            fs::rename(&final_dir, &old).map_err(|e| io_error(final_dir.display(), e))?;
-            fs::rename(&tmp, &final_dir).map_err(|e| io_error(final_dir.display(), e))?;
-            remove_tree(&old);
-        } else {
-            fs::rename(&tmp, &final_dir).map_err(|e| io_error(final_dir.display(), e))?;
+        if fs::symlink_metadata(&final_dir).is_ok() && !force {
+            remove_tree(&tmp);
+            return Err(StackError::new("snapshot_exists", format!("snapshot '{name}' was created while this one was saved")));
         }
-        Ok(json!({ "copied": copied, "meta": meta }))
+        let published = publish(&base, name, &tmp, &final_dir).inspect_err(|_| remove_tree(&tmp))?;
+        let mut out = json!({ "copied": copied, "meta": meta, "publish": published });
+        if !recovered.is_empty() {
+            out["recovered"] = json!(recovered);
+        }
+        Ok(out)
     })?;
     let meta = serde_json::from_value(stopped.result["meta"].clone()).ok();
     Ok(SnapshotReport { name: name.to_string(), project, services, steps: stopped.steps, restarted: stopped.restarted, checks: stopped.checks, meta })
@@ -613,6 +797,7 @@ pub fn restore(ctx: &Ctx, name: &str) -> Result<SnapshotReport> {
     let _run = init_tasks::run_lock(&ctx.state, &ctx.root)?;
     let stopped = session::with_stopped(ctx, &services, |report, statuses| {
         let _store = store_lock(&ctx.state, &project)?;
+        recover_store(&store(&ctx.state, &project));
         // Read again under the lock: it may have been replaced or removed meanwhile.
         let meta = read_meta(&ctx.state, &project, name)?;
         compatible(&meta, report)?;
@@ -648,6 +833,7 @@ pub fn check_up(ctx: &Ctx, report: &Report, options: &UpOptions) -> Result<()> {
 pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus], name: &str) -> Result<Value> {
     let project = project_id(&ctx.root);
     let _store = store_lock(&ctx.state, &project)?;
+    recover_store(&store(&ctx.state, &project));
     let meta = read_meta(&ctx.state, &project, name)?;
     compatible(&meta, report)?;
     let snapshot = store(&ctx.state, &project).join(name);
@@ -684,10 +870,7 @@ pub struct ListReport {
 
 pub fn list(ctx: &Ctx) -> Result<ListReport> {
     let project = project_id(&ctx.root);
-    let snapshots = names(&ctx.state, &project)
-        .iter()
-        .filter_map(|n| read_json::<Option<Meta>>(&store(&ctx.state, &project).join(n).join(META)).ok().flatten())
-        .collect();
+    let snapshots = names(&ctx.state, &project).iter().filter_map(|n| valid_meta(&generation(&ctx.state, &project, n)?, n)).collect();
     Ok(ListReport { project, snapshots })
 }
 
@@ -695,6 +878,7 @@ pub fn rm(ctx: &Ctx, name: &str) -> Result<Value> {
     valid_name(name)?;
     let project = project_id(&ctx.root);
     let _store = store_lock(&ctx.state, &project)?;
+    recover_store(&store(&ctx.state, &project));
     let dir = store(&ctx.state, &project).join(name);
     if !dir.join(META).is_file() {
         return Err(not_found(&ctx.state, &project, name));
@@ -767,6 +951,115 @@ mod tests {
         write(&fresh.join("x"), "1");
         replace(&fresh, &dir.path().join("new")).unwrap();
         assert!(dir.path().join("new/x").exists());
+    }
+
+    /// A complete snapshot directory of `name`, created at `created_at`, holding `data`.
+    fn snapshot_dir(path: &Path, name: &str, created_at: u64, data: &str) {
+        let meta = Meta { name: name.into(), format: 1, project: "p".into(), created_at, source: "/src".into(), services: IndexMap::new() };
+        write(&path.join("data/db/PG_VERSION"), data);
+        write(&path.join(META), &serde_json::to_string(&meta).unwrap());
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn staging_names_say_their_kind_snapshot_and_owner() {
+        let base = Path::new("/s");
+        let tmp = unique(base, ".tmp-a-b.c");
+        let parsed = Staging::parse(tmp.file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!((parsed.kind, parsed.name.as_str(), parsed.pid), ("tmp", "a-b.c", std::process::id()));
+        assert_eq!(Staging::parse(".old-x-12-34"), Some(Staging { kind: "old", name: "x".into(), pid: 12, nanos: 34 }));
+        assert_eq!(Staging::parse(".rm-x-12-34").unwrap().kind, "rm");
+        for not in ["x", ".tmp-x", ".tmp--1-2", ".tmp-x-a-2", ".new-x-1-2", ".db.stack-old-1-2"] {
+            assert_eq!(Staging::parse(not), None, "{not}");
+        }
+        assert!(!parsed.live_elsewhere(), "this process's own staging is stale under the lock");
+    }
+
+    #[test]
+    fn a_forced_save_replaces_the_published_generation_whole() {
+        for no_exchange in [false, true] {
+            NO_EXCHANGE.with(|c| c.set(no_exchange));
+            let state = tempfile::tempdir().unwrap();
+            let project = ProjectId::checkout(Path::new("/checkout"));
+            let base = store(state.path(), &project);
+            snapshot_dir(&base.join("base"), "base", 1, "old");
+            let tmp = unique(&base, ".tmp-base");
+            snapshot_dir(&tmp, "base", 2, "new");
+            let how = publish(&base, "base", &tmp, &base.join("base")).unwrap();
+            assert_eq!(how, if no_exchange { "rename" } else { "exchange" });
+            assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "new");
+            assert_eq!(entries(&base), ["base"], "nothing staged is left");
+            assert_eq!(read_meta(state.path(), &project, "base").unwrap().created_at, 2);
+        }
+        NO_EXCHANGE.with(|c| c.set(false));
+    }
+
+    #[test]
+    fn a_save_interrupted_between_its_renames_keeps_the_old_generation_readable_and_recovers_it() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        snapshot_dir(&base.join("base"), "base", 1, "old");
+        snapshot_dir(&base.join("other"), "other", 1, "x");
+        let tmp = unique(&base, ".tmp-base");
+        snapshot_dir(&tmp, "base", 2, "new");
+        NO_EXCHANGE.with(|c| c.set(true));
+        CRASH_AFTER_ASIDE.with(|c| c.set(true));
+        publish(&base, "base", &tmp, &base.join("base")).unwrap_err();
+        NO_EXCHANGE.with(|c| c.set(false));
+        CRASH_AFTER_ASIDE.with(|c| c.set(false));
+        assert!(!base.join("base").exists(), "crashed with the name empty");
+
+        // Readers without the lock see the old generation, never a missing snapshot.
+        assert_eq!(names(state.path(), &project), ["base", "other"]);
+        let meta = read_meta(state.path(), &project, "base").unwrap();
+        assert_eq!(meta.created_at, 1);
+        assert!(generation(state.path(), &project, "base").unwrap().file_name().unwrap().to_str().unwrap().starts_with(".old-base-"));
+
+        // A stale staging directory of a process that is gone, and a live one of another.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        let stale = base.join(format!(".tmp-other-{gone_pid}-5"));
+        snapshot_dir(&stale, "other", 9, "half");
+        let mut alive = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let live = base.join(format!(".tmp-other-{}-6", alive.id()));
+        fs::create_dir_all(&live).unwrap();
+
+        let recovered = recover_store(&base);
+        assert_eq!(recovered.len(), 1, "{recovered:?}");
+        assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "old", "the last valid generation is back");
+        let mut want = vec!["base".to_string(), "other".to_string(), live.file_name().unwrap().to_str().unwrap().to_string()];
+        want.sort();
+        assert_eq!(entries(&base), want, "staging nobody owns is removed; a live owner's is left alone");
+        alive.kill().unwrap();
+        alive.wait().unwrap();
+        // Nothing to recover: a published generation is never replaced by one set aside.
+        snapshot_dir(&unique(&base, ".old-base"), "base", 7, "older");
+        assert!(recover_store(&base).is_empty());
+        assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "old");
+        assert_eq!(entries(&base), ["base", "other"]);
+    }
+
+    #[test]
+    fn recovery_takes_the_newest_valid_generation_and_ignores_invalid_ones() {
+        let state = tempfile::tempdir().unwrap();
+        let base = state.path().join("store");
+        snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "three");
+        snapshot_dir(&base.join(".old-base-1-20"), "base", 2, "two");
+        // Names another snapshot, and one with no metadata: neither is taken.
+        snapshot_dir(&base.join(".old-base-1-30"), "elsewhere", 9, "nine");
+        write(&base.join(".old-base-1-40/data/db/PG_VERSION"), "partial");
+        // An incomplete directory at the name (no meta.json) is set aside too.
+        write(&base.join("base/data/db/PG_VERSION"), "partial");
+        recover_store(&base);
+        assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "three");
+        assert_eq!(entries(&base), ["base"]);
     }
 
     #[test]

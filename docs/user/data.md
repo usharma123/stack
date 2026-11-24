@@ -155,6 +155,14 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
 - **Restoring replaces atomically.** The snapshot is copied to a sibling of the data directory,
   then exchanged with it in one step (`renamex_np`/`renameat2`; two renames where the platform
   has no exchange). An interrupted restore leaves the old data or the new, never a mix.
+- **Saving publishes whole.** `save` builds the snapshot in a staging directory of the store
+  and writes its `meta.json` last. `save --force` then exchanges it with the published
+  snapshot in one step where the filesystem can (`renameatx_np`/`renameat2`; the step reports
+  `publish: exchange`), so the name always holds a complete snapshot. Elsewhere the old one is
+  renamed aside (`.old-<name>-…`) first (`publish: rename`). If Stack is interrupted between the
+  two renames, `snapshot list`, `restore` and `up --from-snapshot` read the generation set
+  aside, and the next snapshot operation moves it back before it removes any staging directory.
+  A staging directory whose owning process still runs is never removed.
 - **Compatibility.** A snapshot records each service's preset and the exact release
   `stack.lock` pinned. Restoring into a different preset or major version fails with
   `snapshot_incompatible` before anything stops.
