@@ -375,6 +375,11 @@ enum Cmd {
         /// clients that pay for every tool definition in their context
         #[arg(long, value_enum, default_value_t = mcp::Profile::Full)]
         profile: mcp::Profile,
+        /// Let `stack_down` purge checkouts selected by `labels` anywhere on this machine. Off by
+        /// default: a client's roots are only where it works, not a sandbox, and purging one
+        /// checkout or `dir`'s project (`project: true`) needs no consent
+        #[arg(long)]
+        allow_host_purge: bool,
     },
     /// Save, restore, list or remove snapshots of service data, shared by every checkout of
     /// the project
@@ -455,8 +460,8 @@ fn main() -> ExitCode {
         Err(e) => return usage_error(e),
     };
     update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
-    if let Cmd::Mcp { profile } = cli.cmd {
-        return match mcp::serve(profile) {
+    if let Cmd::Mcp { profile, allow_host_purge } = cli.cmd {
+        return match mcp::serve(profile, mcp::Policy { host_purge: allow_host_purge }) {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from(contract::child_exit(None, Some(signal.into())))),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };

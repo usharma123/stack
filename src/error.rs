@@ -212,6 +212,8 @@ codes! {
         "Check the bundle's git URL and your network or credentials, then retry; the message carries git's output.";
     "git_unavailable", false, [DOCTOR], "git is not installed or cannot run.",
         "Install git (git bundle sources need it), then retry; `stack doctor` checks it.";
+    "host_purge_disabled", false, [], "This MCP server does not delete service data of checkouts selected machine-wide (`stack_down` by `labels` with `purge`); nothing was stopped or removed.",
+        "Purge one project instead (`stack_down` with its `dir`, alone or with `project: true`), run `stack down --label K=V --purge` yourself, or start the server as `stack mcp --allow-host-purge`.";
     "init_failed", true, [UP], "An init task of a service failed, or its data directory vanished; services are still running.",
         "Read the task's output in details, fix the cause and run `stack up` again; it resumes from the failed task.";
     "init_invalid", false, [], "A service's `init` list names an unknown or repeated task, or one that excludes the service.",

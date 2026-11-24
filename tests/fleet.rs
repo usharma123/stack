@@ -287,6 +287,11 @@ fn ps_status_logs_and_down_act_on_a_projects_worktrees_or_a_label() {
     let lines = &answers[1]["data"]["checkouts"][0]["logs"]["lines"];
     assert!(lines.as_array().unwrap().iter().any(|l| l == "web listening"), "{}", answers[1]);
     assert_eq!(paths(&answers[2]["data"]), vec![repo.clone(), wt.clone()], "{}", answers[2]);
+    // A purge of checkouts selected by label anywhere on the machine needs the server's consent:
+    // refused, and nothing stopped.
+    let answers = fixture.mcp(&[("stack_down", json!({ "labels": { "agent": "codex" }, "purge": true }))]);
+    assert_eq!(answers[0]["error"]["code"], "host_purge_disabled", "{}", answers[0]);
+    assert_eq!(row(&fixture.data(&["ps", "--no-size"]), &wt)["state"], "running");
 
     // ---- one checkout's service dies: the project's status fails ----
     let pid = row(&fixture.data(&["ps", "--no-size"]), &wt)["services"][0]["pid"].as_u64().unwrap();

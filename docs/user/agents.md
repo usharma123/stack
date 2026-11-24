@@ -31,6 +31,16 @@ there. Every result carries the checkout it acted on as `project`, an absolute p
 directory whose `stack.toml` was found. `stack_gc`, `stack_ps` and `stack_mv`
 act machine-wide and need no `dir`, as does `stack_errors`; their `dir` is never searched.
 
+**Roots and `dir` are where an agent works, not a sandbox.** They pick the checkout a call acts
+on and the project it searches for; they do not confine the server. It runs as your user and can
+reach every checkout Stack has records for: `stack_ps` lists them all, a fleet selection by
+`labels` matches checkouts anywhere on the machine, and `stack_gc` and `stack_mv` act
+machine-wide. One thing needs the server's consent: `stack_down` with `purge: true` and a
+`labels` selection (without `project`), which would delete the data of matching checkouts
+wherever they are, fails with `host_purge_disabled` and changes nothing unless the server was
+started as `stack mcp --allow-host-purge`. Purging the checkout `dir` names, or every checkout of
+its project (`project: true`), is unaffected, as is the CLI's `stack down --label K=V --purge`.
+
 | Tool | Does |
 |---|---|
 | `stack_status` | Checks every service now and renews the lease. Start here |

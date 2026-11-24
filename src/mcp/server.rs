@@ -16,7 +16,7 @@
 
 #[cfg(test)]
 use super::call;
-use super::{call_in, needs_roots, negotiate, project_key, tools_for, Profile};
+use super::{call_in, needs_roots, negotiate, project_key, tools_for, Policy, Profile};
 use crate::process::Cancel;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -60,8 +60,8 @@ enum Event {
 
 /// Serve `profile`'s tools until `input` ends, then let calls in flight finish and answer them.
 /// `tools/list` lists only the tools `profile` offers, and `tools/call` refuses the others.
-pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, profile: Profile) -> std::io::Result<()> {
-    serve_with(input, output, Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| call_in(profile, params, roots)), profile)
+pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, profile: Profile, policy: Policy) -> std::io::Result<()> {
+    serve_with(input, output, Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| call_in(profile, policy, params, roots)), profile)
 }
 
 pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, caller: Caller, profile: Profile) -> std::io::Result<()> {
@@ -993,7 +993,7 @@ mod tests {
 
     #[test]
     fn the_core_profile_lists_and_answers_only_its_tools() {
-        let session = Session::start_with(Arc::new(|params: &Value, roots: Option<&[PathBuf]>| call_in(Profile::Core, params, roots)), Profile::Core);
+        let session = Session::start_with(Arc::new(|params: &Value, roots: Option<&[PathBuf]>| call_in(Profile::Core, Policy::default(), params, roots)), Profile::Core);
         session.send(initialize("2025-06-18", json!({})));
         let instructions = session.recv()["result"]["instructions"].as_str().unwrap().to_string();
         assert!(instructions.contains("--profile core"), "{instructions}");

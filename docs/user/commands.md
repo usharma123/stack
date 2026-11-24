@@ -27,7 +27,7 @@
 | `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, and that the project compiles |
 | `stack errors [--markdown]` | List every [error code](errors.md) with its meaning, default hint and whether a retry can succeed |
-| `stack mcp` | Serve these operations over MCP (stdio); `--profile core` offers only the daily loop. See [coding agents](agents.md) |
+| `stack mcp [--profile core] [--allow-host-purge]` | Serve these operations over MCP (stdio); `--profile core` offers only the daily loop; `--allow-host-purge` lets `stack_down` purge checkouts selected by label. See [coding agents](agents.md) |
 
 Every command accepts `-C <dir>` (the project directory), `--json` (one result object on
 stdout; see [reading results](agents.md#reading-results)) and `--quiet` (`-q`).
