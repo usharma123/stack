@@ -417,6 +417,7 @@ fn cap_own_log(dir: &Path) {
     }
     // Only when stderr is that file (not when started some other way).
     let Ok(meta) = fs::metadata(&path) else { return };
+    #[allow(clippy::unnecessary_cast)]
     if meta.ino() != st.st_ino as u64 || meta.dev() != st.st_dev as u64 {
         return;
     }
