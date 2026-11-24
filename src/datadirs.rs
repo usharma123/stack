@@ -45,6 +45,18 @@ pub struct Entry {
     /// The directory at `location` (device, inode), once `up` saw it exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<[u64; 2]>,
+    /// The device of the filesystem the checkout (`project`) was on, so its data is reclaimed
+    /// only once the checkout is shown to be gone (see [`crate::checkout::presence`]); absent in
+    /// entries an earlier Stack recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_device: Option<u64>,
+}
+
+impl Entry {
+    /// Its checkout is shown to be gone (see [`crate::checkout::gone`]).
+    pub fn checkout_gone(&self) -> bool {
+        crate::checkout::gone(&self.project, self.project_device)
+    }
 }
 
 /// A service's supervisor identity: Stack's supervisor directory and the service's name, or,
@@ -518,7 +530,7 @@ mod tests {
     use super::*;
 
     fn entry(project: &str, service: &str, dir: &str, checkout: &str) -> Entry {
-        Entry { project: project.into(), service: service.into(), dir: dir.into(), checkout: checkout.into(), supervisor: None, location: None, identity: None }
+        Entry { project: project.into(), service: service.into(), dir: dir.into(), checkout: checkout.into(), supervisor: None, location: None, identity: None, project_device: None }
     }
 
     #[test]

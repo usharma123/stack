@@ -1621,7 +1621,16 @@ fn claim_each(
         // Where this checkout's data is, so `gc` can find it once the checkout is deleted.
         let supervisor = provider.map(|p| crate::datadirs::Supervisor { pitchfork: p.pitchfork.clone(), state_dir: p.state_dir.clone(), id: daemon.id.clone().unwrap_or_else(|| daemon.name.clone()) });
         let (location, identity) = crate::datadirs::locate(&dir);
-        let entry = crate::datadirs::Entry { project: ctx.root.clone(), service: daemon.name.clone(), dir: dir.clone(), checkout: token.clone(), supervisor, location, identity };
+        let entry = crate::datadirs::Entry {
+            project: ctx.root.clone(),
+            service: daemon.name.clone(),
+            dir: dir.clone(),
+            checkout: token.clone(),
+            supervisor,
+            location,
+            identity,
+            project_device: crate::checkout::device(&ctx.root),
+        };
         if running || owner.as_deref() == Some(token.as_str()) {
             if owner.as_deref() == Some(token.as_str()) {
                 claimed.push(entry);
@@ -2839,8 +2848,13 @@ pub(crate) fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.created().ok()
 }
 
+/// Whether the directory at `path` is not the one `session` recorded: another inode, or (once
+/// recorded) another birth time. A device number alone is not compared: a reboot can renumber a
+/// filesystem (removable and network volumes, btrfs subvolumes), and the same inode with the
+/// same birth time is the same directory. (Another device and inode is a filesystem mounted at
+/// or above the path: [`checkout_state`] calls that unavailable.)
 fn project_replaced(session: &Session, path: &Path) -> bool {
-    if let (Some(recorded), Some(current)) = (session.project_dir_id, dir_id(path)) {
+    if let (Some((_, recorded)), Some((_, current))) = (session.project_dir_id, dir_id(path)) {
         if recorded != current {
             return true;
         }
@@ -5018,11 +5032,15 @@ fn renew_in_status(ctx: &Ctx, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct GcEntry {
     pub project: PathBuf,
     pub reason: String,
     pub stopped: bool,
+    /// Whether the checkout is still there cannot be shown (`reason` says why): nothing of it was
+    /// stopped, reclaimed or released, and nothing needs to be until it can.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub left_alone: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-service outcomes for a gone project.
@@ -5088,9 +5106,15 @@ fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcE
         state: state.to_path_buf(),
     };
     let consumed = reconcile_executions(state, &ctx.root, &mut session);
+    let checkout = checkout_state(&session);
+    // A checkout whose presence cannot be shown is neither reclaimed as gone nor stopped as
+    // expired: both would act on a directory that may only be out of reach for now.
+    if let CheckoutState::Unavailable(_) = checkout {
+        return Ok(None);
+    }
     // Saved only for a project still there: a save would recreate a deleted checkout's
     // `.stack/`. A gone project's completion records go with its index.
-    if !consumed.is_empty() && project_gone(&session).is_none() {
+    if !consumed.is_empty() && checkout == CheckoutState::Present {
         save(&ctx, &session)?;
         forget_completions(&consumed);
     }
@@ -5102,7 +5126,7 @@ fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcE
         .and_then(|l| l.owner_pid)
         .is_some_and(|p| !pid_alive(p));
     let busy = !owner_dead && has_active_executions(&session);
-    if let Some(reason) = project_gone(&session) {
+    if let Some(reason) = checkout.gone() {
         if busy {
             return Ok(None);
         }
@@ -5121,6 +5145,7 @@ fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcE
         stopped: result.is_ok(),
         error: result.err().map(|e| e.to_string()),
         services: Vec::new(),
+        left_alone: false,
     }))
 }
 
@@ -5144,12 +5169,14 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
     }
     let mut settled = Vec::new();
     for entry in crate::datadirs::entries(state)? {
-        if entry.project.exists() || recorded(&entry.project) {
+        // Only a checkout shown to be gone: one out of reach for now (its volume not mounted, a
+        // lookup refused) keeps its data.
+        if recorded(&entry.project) || !entry.checkout_gone() {
             continue;
         }
         // A checkout created at the path meanwhile takes this lock for `up`; checked again under it.
         let _guard = project_lock(state, &entry.project)?;
-        if entry.project.exists() {
+        if !entry.checkout_gone() {
             continue;
         }
         let (outcome, done) = reclaim_data(&entry, remove_data);
@@ -5164,12 +5191,12 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
     // A supervisor still running for it (every service stopped one by one, then the checkout
     // removed) is shut down first, under the checkout's lock, as `down` would.
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
-    for (dir, project) in supervisor::orphaned_dirs(state) {
+    for (dir, project, device) in supervisor::orphaned_dirs(state) {
         if recorded(&project) {
             continue;
         }
         let _guard = project_lock(state, &project)?;
-        if project.exists() || recorded(&project) {
+        if !crate::checkout::gone(&project, device) || recorded(&project) {
             continue;
         }
         match supervisor::shutdown(&dir) {
@@ -5195,7 +5222,7 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         .into_iter()
         .map(|(project, services)| {
             let errors: Vec<String> = services.iter().filter_map(|s| s.error.clone()).collect();
-            GcEntry { project, reason: "project directory deleted".into(), stopped: errors.is_empty(), error: (!errors.is_empty()).then(|| errors.join("; ")), services }
+            GcEntry { project, reason: "project directory deleted".into(), stopped: errors.is_empty(), error: (!errors.is_empty()).then(|| errors.join("; ")), services, left_alone: false }
         })
         .collect())
 }
@@ -5282,19 +5309,68 @@ fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) 
     }
 }
 
-/// [`project_gone`], for the machine-wide commands (see [`crate::fleet`]).
-pub fn checkout_gone(session: &Session) -> Option<&'static str> {
-    project_gone(session)
+/// Whether a session's checkout is still the directory at its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutState {
+    Present,
+    /// Deleted, or replaced by another directory at the same path (which must never inherit the
+    /// authority to stop this session's services): why.
+    Gone(&'static str),
+    /// Neither can be shown (a lookup refused or failing, a volume that may not be mounted):
+    /// why. Nothing is reclaimed for it, and it is not taken to be there either.
+    Unavailable(String),
 }
 
-/// Why a session's project no longer exists: deleted, or replaced by another directory at the
-/// same path (which must never inherit the authority to stop this session's services).
-fn project_gone(session: &Session) -> Option<&'static str> {
-    if !session.project.exists() {
-        return Some("project directory deleted");
+impl CheckoutState {
+    /// The reason, when the checkout is gone.
+    pub fn gone(&self) -> Option<&'static str> {
+        match self {
+            Self::Gone(reason) => Some(reason),
+            _ => None,
+        }
     }
-    project_replaced(session, &session.project).then_some("project directory replaced")
 }
+
+/// [`checkout_state`], for the machine-wide commands (see [`crate::fleet`]).
+pub fn checkout_gone(session: &Session) -> Option<&'static str> {
+    checkout_state(session).gone()
+}
+
+/// Whether `session`'s checkout is still there (see [`CheckoutState`]). Deleted only when
+/// [`crate::checkout::presence`] can show it, judged by the filesystem the directory was on at
+/// launch; replaced only when another directory is at the path on that same filesystem (or the
+/// birth time recorded no longer matches). A directory there on another filesystem is a mount
+/// point whose volume is not mounted, or the volume mounted again: unavailable, unless it is the
+/// very directory (same inode and birth time) under a renumbered device.
+pub fn checkout_state(session: &Session) -> CheckoutState {
+    use crate::checkout::Presence;
+    let path = &session.project;
+    let recorded = session.project_dir_id;
+    match crate::checkout::presence(path, recorded.map(|(dev, _)| dev)) {
+        Presence::Absent => return CheckoutState::Gone("project directory deleted"),
+        Presence::Unknown(why) => return CheckoutState::Unavailable(why),
+        Presence::Present => {}
+    }
+    if let Some((dev, ino)) = recorded {
+        let Some((now_dev, now_ino)) = dir_id(path) else {
+            return CheckoutState::Unavailable(format!("{} cannot be looked up", path.display()));
+        };
+        // Another device and another inode: what is at the path is on another filesystem. The
+        // same inode under another device is the directory renumbered (see `project_replaced`).
+        if now_dev != dev && now_ino != ino {
+            return CheckoutState::Unavailable(format!(
+                "{} is on another filesystem (device {now_dev}) than when its session started (device {dev}): a mount \
+                 point whose volume is not mounted, or the volume mounted again",
+                path.display()
+            ));
+        }
+    }
+    if project_replaced(session, path) {
+        return CheckoutState::Gone("project directory replaced");
+    }
+    CheckoutState::Present
+}
+
 
 /// Reconcile a gone project without signalling a daemon whose identity can be replaced.
 /// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
@@ -5339,6 +5415,7 @@ fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str, stop
         stopped: problems.is_empty(),
         error: (!problems.is_empty()).then(|| problems.join("; ")),
         services,
+        left_alone: false,
     }
 }
 
@@ -5486,6 +5563,13 @@ pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result
     let pass = gc_with(state, &GcOptions { stop_orphans, ..GcOptions::default() })?;
     let mut entries = pass.reclaimed;
     entries.extend(pass.unreadable);
+    entries.extend(pass.skipped.into_iter().filter(|s| s.skipped == "unavailable").map(|s| GcEntry {
+        project: s.project,
+        reason: format!("checkout unavailable: {}", s.reason),
+        stopped: true,
+        left_alone: true,
+        ..GcEntry::default()
+    }));
     entries.extend(reclaim_deleted(state, remove_data)?);
     // Postgres templates nothing can use any more (see `pgtemplate`): a cache, removed quietly;
     // `gc --dry-run` lists them.
@@ -7461,6 +7545,125 @@ mod native_records {
         assert_eq!(old.legacy(), Some(Path::new("/pf")));
         let data = crate::datadirs::Supervisor { pitchfork: None, state_dir: "/d".into(), id: "db".into() };
         assert_eq!(serde_json::to_value(&data).unwrap()["pitchfork"], "");
+    }
+
+    /// A checkout found where it was, on another filesystem than at launch, is a mount point
+    /// (or a volume mounted again), never another directory that took its path; the very
+    /// directory under a renumbered device is still it.
+    #[test]
+    fn only_another_directory_on_the_same_filesystem_replaces_a_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+        let (dev, ino) = dir_id(&root).unwrap();
+        let at = |id: (u64, u64)| Session { project: root.clone(), project_dir_id: Some(id), project_dir_created: dir_created(&root), ..Session::default() };
+        assert_eq!(checkout_state(&at((dev, ino))), CheckoutState::Present);
+        assert_eq!(checkout_state(&at((dev, ino + 1))), CheckoutState::Gone("project directory replaced"));
+        let CheckoutState::Unavailable(why) = checkout_state(&at((dev.wrapping_add(1), ino + 1))) else { panic!("not unavailable") };
+        assert!(why.contains("on another filesystem"), "{why}");
+        assert_eq!(checkout_state(&at((dev.wrapping_add(1), ino))), CheckoutState::Present, "renumbered: same inode and birth time");
+        assert!(!project_replaced(&at((dev.wrapping_add(1), ino)), &root), "up adopts it too");
+        assert!(project_replaced(&at((dev, ino + 1)), &root));
+        if let Some(born) = dir_created(&root) {
+            let reborn = Session { project_dir_created: Some(born + std::time::Duration::from_secs(1)), ..at((dev.wrapping_add(1), ino)) };
+            assert_eq!(checkout_state(&reborn), CheckoutState::Gone("project directory replaced"), "same inode, another birth time");
+        }
+        assert_eq!(checkout_session_gone(&root, dev), None);
+    }
+
+    fn checkout_session_gone(root: &Path, dev: u64) -> Option<&'static str> {
+        checkout_gone(&Session { project: root.to_path_buf(), project_dir_id: Some((dev, dir_id(root).unwrap().1)), ..Session::default() })
+    }
+
+    /// A checkout whose presence cannot be shown (here its path is gone but the directory above
+    /// it is on another filesystem than the checkout was, as when its volume is not mounted) is
+    /// neither reclaimed as deleted nor stopped as expired, and its ports, identities and data
+    /// stay recorded; once the same absence is on its own filesystem, all of it is reclaimed.
+    #[test]
+    fn a_checkout_out_of_reach_is_left_alone_and_a_deleted_one_is_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let root = tmp.path().join("vol").join("app");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
+        let (dev, ino) = dir_id(&root).unwrap();
+        crate::identity::assign(&state, &root, &["web".to_string()]).unwrap();
+        ports::assign(&state, &root, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        let record = |device: u64| {
+            let session = Session {
+                id: "s1".into(),
+                project: root.clone(),
+                project_dir_id: Some((device, ino)),
+                lease: Some(Lease { ttl_secs: Some(1), owner_pid: None, renewed_at: 1 }),
+                ..Session::default()
+            };
+            write_json(&index_path(&state, &root), &session).unwrap();
+            let mut registry: serde_json::Value = read_json(&state.join("ports.json")).unwrap();
+            for r in registry["reservations"].as_array_mut().unwrap() {
+                r["project_device"] = json!(device);
+            }
+            write_json(&state.join("ports.json"), &registry).unwrap();
+            let mut tokens: serde_json::Value = read_json(&state.join("identities.json")).unwrap();
+            for t in tokens["tokens"].as_array_mut().unwrap() {
+                t["project_device"] = json!(device);
+            }
+            write_json(&state.join("identities.json"), &tokens).unwrap();
+            crate::datadirs::forget(&state, |_| true).unwrap();
+            crate::datadirs::record(
+                &state,
+                crate::datadirs::Entry {
+                    project: root.clone(),
+                    service: "web".into(),
+                    dir: tmp.path().join("data"),
+                    checkout: "t1".into(),
+                    supervisor: None,
+                    location: None,
+                    identity: None,
+                    project_device: Some(device),
+                },
+            )
+            .unwrap();
+        };
+        fs::remove_dir_all(&root).unwrap();
+        let elsewhere = dev.wrapping_add(1);
+        record(elsewhere);
+
+        let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+        assert!(pass.reclaimed.is_empty(), "{:?}", pass.reclaimed);
+        assert_eq!(pass.skipped.iter().map(|s| (s.project.as_path(), s.skipped)).collect::<Vec<_>>(), [(root.as_path(), "unavailable")]);
+        assert!(pass.skipped[0].reason.contains("may not be mounted"), "{}", pass.skipped[0].reason);
+        assert!(index_path(&state, &root).exists(), "the session record is kept");
+        // Recorded for the checkout: released or removed only once it is shown gone.
+        fs::remove_file(index_path(&state, &root)).unwrap();
+        assert!(reclaim_deleted(&state, true).unwrap().is_empty());
+        assert_eq!(ports::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(crate::datadirs::entries(&state).unwrap().len(), 1);
+        // Another checkout's `up` prunes only checkouts shown gone.
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        ports::assign(&state, &other, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        assert_eq!(crate::identity::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(ports::lookup(&state, &root).unwrap().len(), 1);
+        let plan = gc_pass::gc_plan(&state, true).unwrap();
+        assert!(plan.deleted_checkouts.is_empty() && plan.unavailable.iter().any(|u| u.project == root), "{:?}", plan.unavailable);
+        // `stack gc` reports it, left alone, without failing.
+        let entries = gc_checked(&state, true, false).unwrap();
+        assert!(entries.iter().all(|e| e.project != root || e.left_alone), "nothing reclaimed for it");
+
+        // Deleted from its own filesystem: the session goes once nothing of it runs, then its
+        // ports and identities; its data, recorded before Stack could tell which directory it is,
+        // is reported and kept.
+        record(dev);
+        let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+        assert!(pass.skipped.is_empty(), "{:?}", pass.skipped);
+        assert_eq!(pass.reclaimed.iter().map(|e| (e.project.as_path(), e.reason.as_str(), e.stopped)).collect::<Vec<_>>(), [(root.as_path(), "project directory deleted", true)]);
+        assert!(!index_path(&state, &root).exists());
+        let entries = reclaim_deleted(&state, true).unwrap();
+        assert!(entries.iter().any(|e| e.project == root && e.services.iter().any(|s| s.outcome.as_deref().is_some_and(|o| o.contains("released")))), "{entries:?}");
+        assert!(ports::lookup(&state, &root).unwrap().is_empty());
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        assert!(crate::identity::lookup(&state, &root).unwrap().is_empty());
     }
 
     /// Stack's supervisor confirms a recorded data directory's service stopped from its state

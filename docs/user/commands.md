@@ -666,6 +666,21 @@ one in place, if it cannot be renamed): `dir`, `reason` and `bytes`;
 one a build holds is left out, as a pass would skip it.
 `gc` removes them without listing them in its result.
 
+A checkout counts as deleted only when that can be shown: its path is not found and the
+deepest directory above it that is there is on the filesystem the checkout was on (recorded
+with its session, port reservations, identity tokens, data records and supervisor). A lookup
+refused for permission or failing for I/O, a volume that is not mounted right now (its
+directory under `/Volumes` gone, or its mount point left empty), or a directory at the path on
+another filesystem, shows nothing: such a checkout is `unavailable`, and nothing of it is
+stopped, reclaimed, released or removed, not even an expired lease's services. `gc` lists it
+(`left_alone`, the reason after `checkout unavailable:`) without failing, `--dry-run` under
+`unavailable`, `ps` with directory `unavailable`, and `up`'s pass under `skipped`
+(`"skipped": "unavailable"`). Records an earlier Stack kept name no filesystem: for them the
+checkout's own parent directory must be there, readable and not empty (an unmounted mount
+point is left empty). After a reboot gives a filesystem another device number (removable or
+network volumes, btrfs subvolumes), a checkout deleted from it stays `unavailable` rather than
+being taken for deleted; one still there is still recognised by its inode and birth time.
+
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once, and its
 supervisor directory (records and logs) removed. Its services' data, which Stack keeps under
@@ -724,12 +739,13 @@ while something may be starting services at a deleted checkout's path.
 
 Lists every checkout this machine's Stack state has records of: a session, port reservations,
 identity tokens or a data directory `up` recorded. For each: its path, whether the directory
-still exists (`dir` is `present`, `missing` or `replaced`), the session id and `state`, the
+still exists (`dir` is `present`, `missing`, `replaced`, or `unavailable` when that cannot be
+shown: see [gc](#gc)), the session id and `state`, the
 lease (see [leases](#leases)), and for each service its port, pid and
 data directory, with the directory's size on disk. `state` is `running` (every service live),
 `partial`, `stopped`, `launching`, `recorded` (a session without services) or `reserved`
 (records but no session). `reclaimable` marks a checkout [`gc`](#gc) reclaims: its directory is
-gone and no session of it is left, so gc releases its ports and reports its data, which
+shown to be gone and no session of it is left, so gc releases its ports and reports its data, which
 `--reclaim-data` removes where it is safe. `totals` adds it all up, with the data of reclaimable
 checkouts in `reclaimable_bytes`.
 

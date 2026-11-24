@@ -102,6 +102,10 @@ pub struct Spec {
     /// The checkout the services are of, so `gc` can tell when it is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<PathBuf>,
+    /// The device of the filesystem the checkout was on, so `gc` takes it to be gone only when
+    /// that can be shown (see [`crate::checkout::presence`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_device: Option<u64>,
     /// The checkout's token, which every process of its services carries: how what a dead
     /// supervisor left is told from other processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,6 +576,7 @@ pub fn start(dir: &Path, project: &Path, specs: &IndexMap<String, ServiceSpec>, 
     apply(dir, |spec| {
         spec.shutdown = false;
         spec.project = Some(project.to_path_buf());
+        spec.project_device = crate::checkout::device(project);
         spec.token = specs.values().find_map(|s| s.env.get(crate::checkout::TOKEN_VAR).cloned()).or(spec.token.take());
         let previous = std::mem::take(&mut spec.services);
         for (name, def) in specs {
@@ -873,15 +878,16 @@ pub fn forget(dir: &Path) -> bool {
     }
 }
 
-/// Supervisor directories in the Stack state `state` whose checkout no longer exists, with that
-/// checkout's path.
-pub fn orphaned_dirs(state: &Path) -> Vec<(PathBuf, PathBuf)> {
+/// Supervisor directories in the Stack state `state` whose checkout is shown to be gone (see
+/// [`crate::checkout::presence`]), with that checkout's path and recorded device.
+pub fn orphaned_dirs(state: &Path) -> Vec<(PathBuf, PathBuf, Option<u64>)> {
     let Ok(entries) = fs::read_dir(state.join("supervisors")) else { return Vec::new() };
     entries
         .flatten()
         .filter_map(|e| {
-            let project = read_spec(&e.path()).ok()??.project?;
-            (!project.exists()).then(|| (e.path(), project))
+            let spec = read_spec(&e.path()).ok()??;
+            let project = spec.project?;
+            crate::checkout::gone(&project, spec.project_device).then(|| (e.path(), project, spec.project_device))
         })
         .collect()
 }
@@ -2170,7 +2176,7 @@ mod tests {
             want: true,
             start_seq: 1,
         };
-        let spec = Spec { revision: applied.max(1), shutdown: false, project: Some(project.into()), token: Some(token.into()), services: IndexMap::from([("web".to_string(), service)]) };
+        let spec = Spec { revision: applied.max(1), shutdown: false, project: Some(project.into()), project_device: None, token: Some(token.into()), services: IndexMap::from([("web".to_string(), service)]) };
         let instance = Instance {
             status: if process.is_some() { "running" } else { "stopped" }.into(),
             group: process.as_ref().map(|p| p.pid),

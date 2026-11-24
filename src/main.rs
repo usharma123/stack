@@ -981,6 +981,9 @@ fn print_gc_plan(plan: &session::GcDryRun) {
     for u in &plan.unreadable {
         println!("{}: {} (left alone; run `stack down` in it)", u.project.display(), u.reason);
     }
+    for u in &plan.unavailable {
+        println!("{}: checkout unavailable: {} (left alone)", u.project.display(), u.reason);
+    }
     for d in &plan.deleted_checkouts {
         let after = if d.after_session { " (once its session is reclaimed)" } else { "" };
         println!("{}: deleted checkout{after}", d.project.display());
@@ -998,14 +1001,21 @@ fn print_gc_plan(plan: &session::GcDryRun) {
     for w in &plan.warnings {
         eprintln!("warning: {w}");
     }
-    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() && plan.templates.is_empty() {
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() && plan.unavailable.is_empty() && plan.templates.is_empty() {
         println!("nothing to reclaim");
     }
 }
 
 fn print_gc(entries: &[session::GcEntry]) {
     for e in entries {
-        println!("{}: {} ({})", e.project.display(), e.reason, if e.stopped { "stopped" } else { "not stopped" });
+        let outcome = if e.left_alone {
+            "left alone"
+        } else if e.stopped {
+            "stopped"
+        } else {
+            "not stopped"
+        };
+        println!("{}: {} ({outcome})", e.project.display(), e.reason);
         if let Some(error) = &e.error {
             println!("  {error}");
         }

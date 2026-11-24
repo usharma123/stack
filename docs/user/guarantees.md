@@ -41,7 +41,10 @@
   needs one restart after its first task edit.
 - **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
-  them. The pass in `up` never waits for, or fails because of, another checkout. For a deleted
+  them. The pass in `up` never waits for, or fails because of, another checkout. A checkout counts as
+  deleted only once its path is gone and the filesystem it was on is there to show it: a lookup
+  refused or failing, or a volume that is not mounted, leaves everything of it as it is (see
+  [gc](commands.md#gc)). For a deleted
   checkout, `gc` stops what Stack's supervisor recorded for it, each process only while its pid
   and process start time still match the record, and drops the record once they are gone.
   Services an older Stack started under Pitchfork are never stopped by name by default, because
