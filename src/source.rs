@@ -326,6 +326,26 @@ mod tests {
         assert_eq!(e.code, "bundle_invalid");
     }
 
+    /// A local bundle edited after stack.lock recorded it: locked mode refuses it (lock_outdated)
+    /// until an ordinary compile hashes it again, and that hash is the edited content's.
+    #[test]
+    fn a_local_bundle_edited_after_its_lock_is_outdated_until_compiled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bundle.toml"), "[bundle]\nname = 'b'\n").unwrap();
+        let source = Source::parse(&format!("path:{}", dir.path().display()), Path::new("/")).unwrap();
+        let first = source.fetch("path:b", None, Mode::UseLock, dir.path()).unwrap();
+        let locked = LockedBundle { source: "path:b".into(), name: "b".into(), commit: None, digest: None, content_hash: first.content_hash.clone() };
+        assert_eq!(source.fetch("path:b", Some(&locked), Mode::Frozen, dir.path()).unwrap().content_hash, first.content_hash);
+
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/tool"), "edited").unwrap();
+        let e = source.fetch("path:b", Some(&locked), Mode::Frozen, dir.path()).unwrap_err();
+        assert_eq!(e.code, "lock_outdated");
+        let again = source.fetch("path:b", Some(&locked), Mode::UseLock, dir.path()).unwrap();
+        assert_ne!(again.content_hash, first.content_hash);
+        assert_eq!(again.content_hash, crate::hash::hash_dir(dir.path()).unwrap());
+    }
+
     #[test]
     fn only_commit_ids_name_git_bundle_checkouts() {
         assert!(is_commit(&"a".repeat(40)) && is_commit(&"0".repeat(64)));

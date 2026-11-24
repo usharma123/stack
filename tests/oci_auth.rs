@@ -416,6 +416,26 @@ fn a_repository_selected_registry_cannot_redirect_into_the_bound_origin() {
     assert!(authorized(&selected).is_empty());
 }
 
+/// What the bound registry authorized stays with its origin: a request it redirects elsewhere
+/// (a blob store, say) goes there without the Authorization the registry was sent.
+#[test]
+fn an_authorized_request_redirected_to_another_origin_carries_no_authorization() {
+    let elsewhere = Server::new(|_| Response::new(404, ""));
+    let location = format!("{}/blob", elsewhere.origin);
+    let registry = Server::new(move |request| {
+        if request.headers.contains_key("authorization") {
+            Response::new(307, "").header("Location", &location)
+        } else {
+            Response::new(401, "").header("WWW-Authenticate", "Basic realm=\"registry\"")
+        }
+    });
+    let result = compile(&tempfile::tempdir().unwrap(), &registry, None);
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+    assert!(authorized(&registry)[0].headers["authorization"].starts_with("Basic "));
+    assert_eq!(elsewhere.seen().len(), 1, "the redirect was followed once");
+    assert!(authorized(&elsewhere).is_empty(), "{:?}", elsewhere.seen());
+}
+
 #[test]
 fn a_malformed_realm_approval_is_reported_not_loosely_matched() {
     let token = Server::new(|_| Response::new(200, "{\"token\":\"t\"}"));

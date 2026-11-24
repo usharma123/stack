@@ -1286,6 +1286,82 @@ fn a_callers_stale_unverified_list_never_reaches_a_command_once_every_service_ve
     assert!(env["data"]["unset"].as_array().unwrap().contains(&json!("STACK_UNVERIFIED")), "{env}");
 }
 
+/// A service whose live check passes is still withheld once the evidence of its launch is lost:
+/// a launch record still `launching`, a process other than the one recorded, a configuration
+/// changed since `up`. `status` then lists no endpoints and the reason, and exec (CLI or MCP)
+/// gets the unresolvable host, or is refused when it requires the service.
+#[test]
+fn a_verified_service_is_withheld_once_its_launch_evidence_is_lost() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+    let verified = format!("http://127.0.0.1:{port}/");
+    fixture.set_env(&[("WEB_URL", verified.clone())]);
+    fixture.sleepers();
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let check = |when: &str, ready: bool, code: Option<&str>| {
+        let out = fixture.command(&["status", "--json"]).output().unwrap();
+        let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let web = &status["data"]["checks"][0];
+        assert_eq!(web["ready"], ready, "{when}: {status}");
+        assert_eq!(web["reason_code"].as_str(), code, "{when}: {status}");
+        assert_eq!(web.get("endpoints").is_some(), ready, "{when}: {status}");
+        let seen = printed(&String::from_utf8_lossy(&fixture.ok(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]).stdout));
+        let results = fixture.mcp(
+            &[
+                ("stack_exec", json!({ "command": ["sh", "-c", PRINT_ENDPOINTS] })),
+                ("stack_exec", json!({ "command": ["true"], "require": ["web"] })),
+            ],
+            &[],
+        );
+        let mcp = printed(results[0]["structuredContent"]["data"]["stdout"].as_str().unwrap());
+        if ready {
+            assert_eq!((seen["WEB_URL"].as_str(), seen["STACK_UNVERIFIED"].as_str()), (verified.as_str(), "ABSENT"), "{when}: CLI");
+            assert_eq!(mcp["WEB_URL"], verified, "{when}: MCP");
+            assert_eq!(results[1]["structuredContent"]["data"]["exit_code"], 0, "{when}: MCP --require");
+        } else {
+            let withheld = format!("http://unverified.stack.invalid:{port}/");
+            assert_eq!((seen["WEB_URL"].as_str(), seen["STACK_UNVERIFIED"].as_str()), (withheld.as_str(), "web"), "{when}: CLI");
+            assert_eq!(mcp["WEB_URL"], withheld, "{when}: MCP");
+            assert_eq!(results[1]["structuredContent"]["error"]["code"], "service_unavailable", "{when}: MCP --require");
+        }
+    };
+    check("as launched", true, None);
+
+    // Each record of the session (the machine index and the checkout's copy), rewritten.
+    let records: Vec<(std::path::PathBuf, Vec<u8>)> = fixture.session_paths().into_iter().map(|p| { let b = fs::read(&p).unwrap(); (p, b) }).collect();
+    let rewrite = |edit: &dyn Fn(&mut Value)| {
+        for (path, bytes) in &records {
+            let mut record: Value = serde_json::from_slice(bytes).unwrap();
+            edit(&mut record);
+            fs::write(path, record.to_string()).unwrap();
+        }
+    };
+    let restore = || records.iter().for_each(|(path, bytes)| fs::write(path, bytes).unwrap());
+
+    rewrite(&|r| r["launching"] = json!(true));
+    check("launching", false, Some("launch_incomplete"));
+    restore();
+    rewrite(&|r| {
+        let pid = r["services"]["web"]["pid"].as_u64().unwrap();
+        r["services"]["web"]["pid"] = json!(pid + 1);
+    });
+    check("another process", false, Some("process_changed"));
+    restore();
+    check("restored", true, None);
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
+    check("configuration changed", false, Some("config_changed"));
+}
+
 /// Counts connections to a TCP port and a Unix socket that a libpq client would use for it,
 /// closing each at once so the client fails fast.
 /// Each named variable's raw bytes as the command saw them, or `None` when unset.
