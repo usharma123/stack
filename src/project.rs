@@ -365,6 +365,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     let legacy_pin = previous.as_ref().is_some_and(|l| l.tools.iter().any(|t| t.name == "pitchfork")) && !stack.tools.contains_key("pitchfork");
     let previous = previous.map(|lock| without_provider_pitchfork(lock, &stack));
     let probed = probed_services(&stack)?;
+    check_secondary_collisions(&stack)?;
     let (tools, services, mut versions) = lock_versions(&stack, previous.as_ref(), opts)?;
     let mut new_lock = Lockfile::new(locked, tools.clone(), services.clone());
     let pins = artifacts::pin_keys(&new_lock);
@@ -531,6 +532,28 @@ pub(crate) fn without_provider_pitchfork(mut lock: Lockfile, stack: &Composed) -
         tools.remove("pitchfork");
     }
     lock
+}
+
+/// Secondary ports are reserved under `<service>.<role>` (see [`secondary_keys`]); reject any
+/// service whose name collides with one so port reservations and lookups stay unambiguous.
+fn check_secondary_collisions(stack: &Composed) -> Result<()> {
+    for (name, e) in &stack.services {
+        let Some(preset) = e.value.preset.as_deref() else { continue };
+        for role in crate::supervisor::secondary_roles(preset) {
+            let key = format!("{name}.{role}");
+            if let Some(other) = stack.services.get(&key) {
+                return Err(StackError::new(
+                    "invalid_service",
+                    format!(
+                        "service '{key}' ({}) collides with the {role} port reserved for {preset} service '{name}' ({}); rename one",
+                        other.origin, e.origin
+                    ),
+                )
+                .hint(format!("rename service '{key}' or '{name}' so neither matches '<service>.<role>'")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `<service>.<role>` for each further port the stack's presets need (see

@@ -1164,3 +1164,28 @@ fn a_lock_with_the_pitchfork_pin_an_older_stack_added_stays_valid_until_compile_
     assert!(lock_text(&own).contains("name = \"pitchfork\""));
     sb.compile(&own, Mode::Frozen).unwrap();
 }
+
+#[test]
+fn service_names_colliding_with_preset_secondary_ports_are_rejected() {
+    let sb = Sandbox::new();
+    for (preset, role) in [("cockroachdb", "http"), ("nats", "monitor"), ("spicedb", "http"), ("spicedb", "metrics")] {
+        let root = sb.project(&format!(
+            "[services.db]\npreset = \"{preset}\"\n[services.\"db.{role}\"]\nrun = \"true\"\n"
+        ));
+        for (mode, write) in [(Mode::UseLock, true), (Mode::UseLock, false), (Mode::Update, true)] {
+            let err = compile(&sb.options(&root, mode, write)).unwrap_err();
+            assert_eq!(err.code, "invalid_service", "{preset}/{role}: {err:?}");
+            assert!(err.message.contains(&format!("db.{role}")) && err.message.contains(role), "{err:?}");
+        }
+        assert!(!root.join("stack.lock").exists(), "{preset}/{role}: lock written");
+        assert!(!sb.path("state/ports.json").exists(), "{preset}/{role}: ports written");
+    }
+    assert_eq!(sb.upstream.calls(), 0, "rejected before resolving anything");
+
+    // Unrelated dotted service names still compile alongside multi-port presets.
+    let ok = sb.project("[services.db]\npreset = \"cockroachdb\"\n[services.\"api.v2\"]\nrun = \"true\"\n");
+    let report = sb.compile(&ok, Mode::UseLock).unwrap();
+    assert!(report.ports.contains_key("db") && report.ports.contains_key("api.v2"));
+    assert!(report.secondary_ports.contains_key("db.http"));
+    assert_ne!(report.ports["api.v2"], report.secondary_ports["db.http"]);
+}
