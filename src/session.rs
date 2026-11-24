@@ -185,6 +185,11 @@ pub struct Lease {
     /// A long-lived runner process; the session expires when it exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_pid: Option<u32>,
+    /// Which process `owner_pid` was when the lease named it (start time, boot, PID namespace),
+    /// so a later process reusing the PID does not keep the session. Absent in a lease an
+    /// earlier Stack recorded, whose owner is a bare PID (see [`crate::lease::owner_state`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::lease::OwnerIdentity>,
     pub renewed_at: u64,
 }
 
@@ -196,10 +201,20 @@ impl Lease {
                 return Some(format!("lease expired: idle {idle}s > ttl {ttl}s"));
             }
         }
-        match self.owner_pid {
-            Some(pid) if !pid_alive(pid) => Some(format!("owner process {pid} exited")),
+        match self.owner_state()? {
+            crate::lease::OwnerState::Exited(why) => Some(why),
             _ => None,
         }
+    }
+
+    /// Whether the owner process still runs, when the lease has one.
+    pub fn owner_state(&self) -> Option<crate::lease::OwnerState> {
+        self.owner_pid.map(|pid| crate::lease::owner_state(pid, self.owner.as_ref()))
+    }
+
+    /// The lease has an owner, and it is shown to have exited.
+    pub fn owner_exited(&self) -> bool {
+        matches!(self.owner_state(), Some(crate::lease::OwnerState::Exited(_)))
     }
 }
 
@@ -1060,6 +1075,22 @@ impl LeaseOptions {
     }
 }
 
+/// Which process the lease's owner is: one `named` by this command is bound to the process it is
+/// now (`observe`); one `kept` from the `previous` lease is bound as it was, and a lease an
+/// earlier Stack recorded stays a bare PID, never bound to whatever has the PID now.
+fn bind_owner(
+    named: Option<u32>,
+    kept: Option<u32>,
+    previous: Option<&Lease>,
+    observe: impl Fn(u32) -> crate::lease::OwnerIdentity,
+) -> Option<crate::lease::OwnerIdentity> {
+    match (named, kept) {
+        (Some(pid), _) => Some(observe(pid)),
+        (None, Some(pid)) => previous.filter(|l| l.owner_pid == Some(pid)).and_then(|l| l.owner.clone()),
+        (None, None) => None,
+    }
+}
+
 /// Largest owner PID a lease accepts. `pid_t` is a signed 32-bit integer on supported
 /// platforms; 0 and larger values name a process group, every process, or nothing, so a
 /// lease on them would never expire or would expire immediately depending on the platform.
@@ -1344,12 +1375,12 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     // The labels this checkout's session had, with those given now added or replacing them.
     let mut labels = previous.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
     labels.extend(opts.labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let (ttl_secs, owner_pid) = lease.resolve_with_previous(
-        report.default_ttl_secs,
-        previous.as_ref().and_then(|p| p.lease.as_ref()),
-        pid_alive,
-    );
-    let lease = (ttl_secs.is_some() || owner_pid.is_some()).then_some(Lease { ttl_secs, owner_pid, renewed_at: stamp });
+    let previous_lease = previous.as_ref().and_then(|p| p.lease.as_ref());
+    // A previous owner is kept unless it is shown to have exited (one whose state cannot be told
+    // is kept, as the lease it is part of would be).
+    let (ttl_secs, owner_pid) = lease.resolve_with_previous(report.default_ttl_secs, previous_lease, |_| previous_lease.is_some_and(|l| !l.owner_exited()));
+    let owner = bind_owner(lease.owner_pid, owner_pid, previous_lease, crate::lease::OwnerIdentity::observe);
+    let lease = (ttl_secs.is_some() || owner_pid.is_some()).then_some(Lease { ttl_secs, owner_pid, owner, renewed_at: stamp });
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
         // Ownership is recorded before anything starts. If start or verification fails, or the
@@ -4999,7 +5030,7 @@ pub fn renew_with(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Session> {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
     if let (None, Some(ttl)) = (&session.lease, ttl_secs) {
-        session.lease = Some(Lease { ttl_secs: Some(ttl), owner_pid: None, renewed_at: now() });
+        session.lease = Some(Lease { ttl_secs: Some(ttl), owner_pid: None, owner: None, renewed_at: now() });
     }
     let lease = session.lease.as_mut().ok_or_else(|| {
         StackError::new(
@@ -5120,11 +5151,7 @@ fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcE
     }
     // TTL describes idle time; an executing command is not idle. Owner death still
     // follows the explicit runner policy even if one of its commands has survived.
-    let owner_dead = session
-        .lease
-        .as_ref()
-        .and_then(|l| l.owner_pid)
-        .is_some_and(|p| !pid_alive(p));
+    let owner_dead = session.lease.as_ref().is_some_and(Lease::owner_exited);
     let busy = !owner_dead && has_active_executions(&session);
     if let Some(reason) = checkout.gone() {
         if busy {
@@ -6597,7 +6624,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let token = |c: char| c.to_string().repeat(64);
         let me = std::process::id();
-        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, owner: None, renewed_at: 100 }), ..Session::default() };
         for t in ['1', '2', '4', '6'] {
             session.active_executions.insert(token(t), me);
         }
@@ -6645,7 +6672,7 @@ mod tests {
         };
         let (finished, crashed) = ("f".repeat(64), "c".repeat(64));
         let (finished_pid, crashed_pid): (u32, u32) = (exited(()), exited(()));
-        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, owner: None, renewed_at: 100 }), ..Session::default() };
         session.active_executions.insert(finished.clone(), finished_pid);
         session.active_executions.insert(crashed.clone(), crashed_pid);
         let path = dir.join(format!("{finished}.json"));
@@ -6681,7 +6708,7 @@ mod tests {
         let mut session = Session {
             id: "s1".into(),
             project: root.clone(),
-            lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at }),
+            lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, owner: None, renewed_at }),
             ..Session::default()
         };
         session.active_executions.insert("f".repeat(64), coordinator.id());
@@ -7028,6 +7055,7 @@ mod tests {
         let lease = Lease {
             ttl_secs: Some(60),
             owner_pid: None,
+            owner: None,
             renewed_at: 1000,
         };
         assert!(lease.expired(1060).is_none());
@@ -7036,6 +7064,7 @@ mod tests {
         let none = Lease {
             ttl_secs: None,
             owner_pid: None,
+            owner: None,
             renewed_at: 0,
         };
         assert!(none.expired(u64::MAX).is_none());
@@ -7043,6 +7072,7 @@ mod tests {
         let me = Lease {
             ttl_secs: None,
             owner_pid: Some(std::process::id()),
+            owner: None,
             renewed_at: 0,
         };
         assert!(
@@ -7052,6 +7082,7 @@ mod tests {
         let gone = Lease {
             ttl_secs: None,
             owner_pid: Some(u32::MAX - 1),
+            owner: None,
             renewed_at: 0,
         };
         assert!(gone.expired(now()).unwrap().contains("exited"));
@@ -7133,6 +7164,23 @@ mod tests {
         ] {
             assert_eq!(sanitize_endpoint(key, value).as_deref(), masked, "{key}={value}");
         }
+    }
+
+    /// `--owner-pid` binds the owner to the process it is now; a kept owner stays bound as it
+    /// was, and a bare PID an earlier Stack recorded stays bare; a renewal keeps the binding.
+    #[test]
+    fn an_owner_is_bound_when_named_and_kept_as_it_was() {
+        use crate::lease::OwnerIdentity;
+        let observed = |pid: u32| OwnerIdentity { started: Some(u64::from(pid) * 10), boot: Some("b".into()), pid_ns: None };
+        let bound = Lease { ttl_secs: None, owner_pid: Some(7), owner: Some(observed(7)), renewed_at: 1 };
+        let legacy = Lease { owner: None, ..bound.clone() };
+        assert_eq!(bind_owner(Some(9), None, Some(&bound), observed), Some(observed(9)), "named now: bound now");
+        assert_eq!(bind_owner(Some(7), None, Some(&legacy), observed), Some(observed(7)), "named again: bound, even over a bare PID");
+        assert_eq!(bind_owner(None, Some(7), Some(&bound), |_| panic!("not observed again")), Some(observed(7)));
+        assert_eq!(bind_owner(None, Some(7), Some(&legacy), |_| panic!("never bound to whatever has the PID")), None);
+        assert_eq!(bind_owner(None, None, Some(&bound), observed), None);
+        let renewed = Lease { renewed_at: 99, ..bound.clone() };
+        assert_eq!(renewed.owner, bound.owner);
     }
 
     #[test]
@@ -7250,7 +7298,7 @@ mod tests {
         let session = |pid: u32, at: u64, ttl: Option<u64>| Session {
             id: "s".into(),
             services: IndexMap::from([("db".to_string(), record(pid, at))]),
-            lease: ttl.map(|ttl| Lease { ttl_secs: Some(ttl), owner_pid: None, renewed_at: at }),
+            lease: ttl.map(|ttl| Lease { ttl_secs: Some(ttl), owner_pid: None, owner: None, renewed_at: at }),
             ..Default::default()
         };
         let before = session(10, 100, Some(60));
@@ -7601,7 +7649,7 @@ mod native_records {
                 id: "s1".into(),
                 project: root.clone(),
                 project_dir_id: Some((device, ino)),
-                lease: Some(Lease { ttl_secs: Some(1), owner_pid: None, renewed_at: 1 }),
+                lease: Some(Lease { ttl_secs: Some(1), owner_pid: None, owner: None, renewed_at: 1 }),
                 ..Session::default()
             };
             write_json(&index_path(&state, &root), &session).unwrap();

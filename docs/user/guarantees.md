@@ -39,7 +39,13 @@
   services count as unverified until `stack up` restarts them. Adding or editing a task needs
   no restart. A session started by Stack 0.1.22 or earlier, whose fingerprint included tasks,
   needs one restart after its first task edit.
-- **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
+- **Lifetimes are owned.** A session can be leased for a TTL or to a process. The owner is the
+  process the PID named when the lease was taken (its PID, start time and boot, and on Linux the
+  PID namespace it was seen from): the lease ends when that process exits or the machine
+  restarts, never kept alive by a later process given its PID. When that cannot be told (another
+  PID namespace, a start time that cannot be read) the lease is kept and `owner_unknown` says
+  why; a lease Stack 0.1.24 or earlier recorded is checked by PID alone (see
+  [leases](commands.md#leases)). Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
   them. The pass in `up` never waits for, or fails because of, another checkout. A checkout counts as
   deleted only once its path is gone and the filesystem it was on is there to show it: a lookup

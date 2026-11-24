@@ -111,7 +111,8 @@ A few things that are easy to get wrong:
   (MCP `owner_ancestor: "claude"`): Stack uses its nearest ancestor process with that command
   name, and fails with `owner_not_found`, listing the ancestors, if there is none.
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
-  `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
+  `ttl_secs`, `expires_at` and, for an owner, `owner_alive` (absent, with `owner_unknown`
+  saying why, when Stack cannot tell whether the owner process still runs). `status`, `exec`, `run` and
   `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
 - **`down` is confirmed only once your commands are gone too.** A command you started with
   `exec` or `run` (a dev server, a watcher, something you backgrounded) keeps the checkout's

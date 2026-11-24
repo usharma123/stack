@@ -159,7 +159,8 @@ as usual.
 
 - **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec`, `run`,
   `status` and `renew` extend it). `--owner-pid N` ties it to a process that lives as long as
-  your work. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
+  your work: that very process, by PID, start time and boot, so a later process given its PID
+  does not keep the session. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
   own parent and uses the nearest ancestor whose command name (or `argv[0]`) is `<name>`, for
   example `ancestor:claude` from a hook Claude Code runs. With no match it fails with
   `owner_not_found`, listing the ancestors it saw, and starts nothing. With neither flag, a
@@ -613,10 +614,24 @@ with `no_lease`, whose hint says how to give it one.
 | `ttl_secs` | The TTL, when there is one |
 | `renewed_at` | When it was last renewed (Unix seconds; 0 without a lease) |
 | `expires_at` | When a TTL lease runs out unless something renews it first (Unix seconds) |
-| `owner_pid`, `owner_alive` | The owner process, and whether it is alive now |
+| `owner_pid`, `owner_alive` | The owner process, and whether it is alive now (absent when that cannot be told) |
+| `owner_identity` | `pid+start_time+boot`, or `pid` for a lease an earlier Stack recorded |
+| `owner_unknown` | Why whether the owner runs cannot be told; the lease is kept meanwhile |
 | `expired`, `expired_reason` | The lease ran out, and why; `gc` or the next `up` anywhere reclaims the session |
 
 `status` keeps `lease_expired`, the reason with what to do about it, beside it.
+
+An owner is the process the PID named when the lease was taken: `up` records its start time,
+the boot it runs in and, on Linux, the PID namespace `up` saw it from. The lease runs out once
+that process exits: no process has the PID, the PID now names a process with another start
+time (a reused PID), or the machine restarted. When that cannot be told, the lease is kept, as
+for a live owner (a TTL beside it still runs out): on Linux, when the PID namespace it was
+recorded from is not this one or cannot be read (a container sharing `STACK_STATE_DIR` with
+the host, say, where the PID names another process), and when a process has the PID but its
+start time cannot be read, now or when the lease was taken. A command that keeps the session's
+lease (`exec --up`, `run --up`, `renew`) keeps its owner as recorded. A lease Stack 0.1.24 or
+earlier recorded names its owner by PID alone (`owner_identity` `pid`): it stays alive while
+any process has that PID, as before, until a command names an owner again.
 
 Which lease a session gets, when the command starting it names none:
 

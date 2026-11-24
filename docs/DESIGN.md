@@ -205,8 +205,14 @@ output (mise's answer when no release matches) is an error, not a version.
   `--owner-pid ancestor:<name>` walks the parent chain of the stack process (kernel process
   info through `procinfo`, no subprocess) and takes the nearest process whose `comm` or
   `argv[0]` basename is `<name>`; none is `owner_not_found` listing the chain.
+  The lease records the owner's identity (`lease::OwnerIdentity`: start time, boot id and,
+  on Linux, the observer's PID namespace) and `lease::owner_state` judges it Alive, Exited
+  (gone, a reused PID, another boot) or Unknown (another or unreadable namespace, an
+  unreadable start time); Unknown keeps the lease. Leases without an identity (0.1.24 and
+  earlier) stay PID-only; carrying a lease never rebinds it.
   `status`, `up` and `ps` report the lease as one structured `lease` object (`kind`,
-  `ttl_secs`, `renewed_at`, `expires_at`, `owner_alive`, `expired`).
+  `ttl_secs`, `renewed_at`, `expires_at`, `owner_alive`, `owner_identity`, `owner_unknown`,
+  `expired`).
   Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.

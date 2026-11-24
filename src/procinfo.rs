@@ -156,9 +156,31 @@ pub fn boot_id() -> Option<String> {
     BOOT.get_or_init(imp::boot_id).clone()
 }
 
+/// This process's PID namespace, the only one in which a PID it reads names the process it
+/// means: on Linux the namespace `/proc/self/ns/pid` names (`None` when that cannot be read, as
+/// when `/proc` is another namespace's). Platforms without PID namespaces have none (`None`), and
+/// [`PID_NAMESPACES`] says which those are.
+pub fn pid_namespace() -> Option<u64> {
+    imp::pid_namespace()
+}
+
+/// Whether PIDs on this platform are per namespace (Linux), so that one recorded by a process in
+/// another namespace may name another process here.
+pub const PID_NAMESPACES: bool = cfg!(target_os = "linux");
+
+/// The namespace number in a `/proc/<pid>/ns/pid` link's target, `pid:[4026531836]`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_namespace(link: &str) -> Option<u64> {
+    link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Process;
+
+    pub fn pid_namespace() -> Option<u64> {
+        None
+    }
 
     /// `kern.bootsessionuuid`: set once per boot. (`kern.boottime` is not an identity: the
     /// kernel rewrites it whenever the clock is stepped, after a sleep for instance.)
@@ -300,6 +322,10 @@ mod imp {
 mod imp {
     use super::Process;
 
+    pub fn pid_namespace() -> Option<u64> {
+        super::parse_namespace(std::fs::read_link("/proc/self/ns/pid").ok()?.to_str()?)
+    }
+
     pub fn boot_id() -> Option<String> {
         let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
         Some(id.trim().to_string()).filter(|i| !i.is_empty())
@@ -354,6 +380,10 @@ mod imp {
 mod imp {
     use super::Process;
 
+    pub fn pid_namespace() -> Option<u64> {
+        None
+    }
+
     pub fn boot_id() -> Option<String> {
         None
     }
@@ -400,6 +430,17 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         assert_eq!(std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(), first);
+    }
+
+    #[test]
+    fn a_pid_namespace_is_read_where_pids_are_per_namespace() {
+        assert_eq!(parse_namespace("pid:[4026531836]"), Some(4026531836));
+        assert_eq!(parse_namespace("net:[4026531836]"), None);
+        assert_eq!(parse_namespace("pid:[x]"), None);
+        #[cfg(target_os = "linux")]
+        assert!(pid_namespace().is_some(), "this process's own namespace is readable");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!((pid_namespace(), PID_NAMESPACES), (None, false));
     }
 
     /// A child to describe: this test binary (not a platform binary, whose environment macOS

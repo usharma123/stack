@@ -314,7 +314,7 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
             continue;
         }
         let Some(reason) = candidate(&session, &checkout, now) else { continue };
-        let owner_dead = session.lease.as_ref().and_then(|l| l.owner_pid).is_some_and(|p| !pid_alive(p));
+        let owner_dead = session.lease.as_ref().is_some_and(super::Lease::owner_exited);
         let busy = !owner_dead && session.active_executions.values().any(|pid| pid_alive(*pid));
         planned.push(GcPlanned {
             session: session.id.clone(),
