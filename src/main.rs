@@ -64,8 +64,9 @@ enum Cmd {
     },
     /// Show the composed stack without writing anything
     Inspect {
-        /// Also list skills of tools stack adds for its provider (Pitchfork), under
-        /// `provider_skills`. For people: an agent should not drive the supervisor directly
+        /// Also list skills of provider tools (Pitchfork, which a lock written by Stack 0.1.23 or
+        /// earlier may still pin), under `provider_skills`. For people: an agent should not drive
+        /// a supervisor directly
         #[arg(long)]
         all_skills: bool,
     },

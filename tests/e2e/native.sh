@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Service and session scenarios on this machine (macOS or Linux) against real mise + Pitchfork.
+# Service and session scenarios on this machine (macOS or Linux) against real mise and Stack's
+# own service supervisor.
 #
 #   tests/e2e/native.sh <path-to-stack-binary> [scenario ...]
 #
 # Needs mise and jq on PATH and port 5432 free. HOME and XDG directories are isolated in a short
-# /tmp directory: Pitchfork's and Postgres' sockets must fit sun_path (104 bytes on macOS).
+# /tmp directory: Postgres' sockets must fit sun_path (104 bytes on macOS).
 # Scenario 5 needs an OCI registry: set STACK_E2E_REGISTRY=host:port, otherwise it is skipped
 # and reported as skipped. Results: one line per scenario on stdout and $STACK_E2E_RESULTS.
 # STACK_E2E_EVIDENCE can name an existing directory outside the fixture for JSON, JSONL, and .out files.
@@ -23,14 +24,16 @@ work=$(cd "$work" && pwd -P)
 mkdir -p "$work/bin" "$work/h" "$work/srv" "$work/w" "$work/t"
 ln -s "$binary" "$work/bin/stack"
 # Provider selectors and state overrides outrank HOME/XDG. Never inherit the caller's
-# supervisor or machine-wide Stack registry, including during EXIT cleanup.
+# machine-wide Stack registry, or (for services Stack 0.1.23 and earlier started under it) the
+# caller's Pitchfork, including during EXIT cleanup.
 for variable in $(compgen -e); do
   case "$variable" in
     MISE_*|__MISE*|PITCHFORK_*|GIT_*|STACK_STATE_DIR|STACK_CACHE_DIR) unset "$variable" ;;
   esac
 done
 export STACK_STATE_DIR="$work/state" STACK_CACHE_DIR="$work/cache" PITCHFORK_STATE_DIR="$work/pf"
-# Pitchfork registers projects in its config directory; name it rather than rely on HOME.
+# Stack no longer runs services under Pitchfork; its state stays isolated in case a fixture pins
+# it. Pitchfork registers projects in its config directory; name it rather than rely on HOME.
 export PITCHFORK_CONFIG_DIR="$work/h/.config/pitchfork"
 export MISE_DATA_DIR="$work/mise/data" MISE_CACHE_DIR="$work/mise/cache" \
   MISE_STATE_DIR="$work/mise/state" MISE_CONFIG_DIR="$work/mise/config"
@@ -55,8 +58,9 @@ cleanup() {
     [ -f "$app/stack.toml" ] || continue
     supervisor=$(cd "$app" && mise which pitchfork 2>/dev/null) && break
   done
-  # Invoke the isolated binary directly with its explicit state directory. `mise exec`
-  # would evaluate project env again while choosing the supervisor to stop.
+  # Only a fixture that pins Pitchfork has one to stop. Invoke the isolated binary directly with
+  # its explicit state directory: `mise exec` would evaluate project env again while choosing
+  # the supervisor to stop.
   case "$supervisor" in
     "$work"/*) PITCHFORK_STATE_DIR="$work/pf" "$supervisor" supervisor stop >/dev/null 2>&1 || true ;;
   esac

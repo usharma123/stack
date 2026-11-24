@@ -40,9 +40,10 @@ Without `stack.lock` nothing is pinned and every entry is `unavailable`. When mi
 
 ### The provider's skills
 
-Stack adds Pitchfork to run services. Pitchfork's skill teaches an agent to start and stop
-daemons itself, around stack's ownership, identity checks and leases, so it is never listed
-in `skills`, never returned by `stack_skill`, and never linked. People can see it with
+Stack 0.1.23 and earlier pinned Pitchfork to run services; Stack now runs them itself, and the
+next `stack compile` drops that pin. While a lock still pins it, Pitchfork's skill is never
+listed in `skills`, never returned by `stack_skill`, and never linked: it teaches an agent to
+start and stop daemons itself, around stack's ownership, identity checks and leases. People can see it with
 `stack inspect --all-skills` (MCP `stack_inspect` with `all_skills: true`), under
 `provider_skills`.
 

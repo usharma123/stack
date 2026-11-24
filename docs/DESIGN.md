@@ -410,7 +410,8 @@ output (mise's answer when no release matches) is an error, not a version.
   - *Clone.* `clonefile` of the directory on macOS, and nothing else: on another volume, or a
     filesystem that cannot clone (HFS+), `initdb` runs at the data directory, since a copy saves
     little and would need every file flushed. On Linux `FICLONE` per file (Btrfs, XFS), else a
-    plain copy, then `syncfs`; the Linux path has been type-checked, not run. Stack never starts
+    plain copy, then `syncfs`. On Linux the test suite runs the copy-and-`syncfs` fallback (CI's
+    Linux runners, ext4); the `FICLONE` success path (Btrfs, XFS) has been type-checked, not run. Stack never starts
     a server on a template. After each clone the template's digest is taken again and must be
     the recorded one: any write, chmod, link, rename or new entry since the build changes some
     change time, which cannot be set back, so the clone is of what was built; otherwise the

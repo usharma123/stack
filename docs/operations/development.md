@@ -14,7 +14,7 @@ node --test tests/*.test.mjs
 ```sh
 cargo test                       # unit + integration tests (real git repos in temp dirs)
 cargo run -- -C examples/app inspect
-tests/e2e/run.sh                 # Docker: real mise + Pitchfork + OCI registry, all scenarios
+tests/e2e/run.sh                 # Docker: real mise + Stack's supervisor + OCI registry, all scenarios
 tests/e2e/native.sh target/release/stack   # same scenarios on this macOS/Linux host (needs mise)
 python3 eval/harness/pilot.py --stack target/release/stack   # scripted concurrency pilot
 ```

@@ -69,6 +69,10 @@ stack exec --require postgres -- psql  # any other command
 stack down                             # succeeds only once the processes are confirmed gone
 ```
 
+A task's `services` names the services it uses; each must be one the stack defines
+(`unknown_service` otherwise). It does not narrow what `stack run` waits for: every service
+must verify first.
+
 A task can also list `secrets = ["DEPLOY_KEY"]`: names of fnox secrets `stack run` grants it.
 Bundles may declare names (never values); the stack must list `fnox` in `[tools]`, and a name
 may not be a service endpoint, an `[env]` key or a variable stack reserves. See

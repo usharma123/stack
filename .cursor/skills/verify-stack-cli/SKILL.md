@@ -5,7 +5,7 @@ description: Build and drive the real Stack CLI and stdio MCP against isolated l
 
 ## Launch
 
-From the repo root, run `.cursor/skills/verify-stack-cli/drive.sh 3-leases` for the lease journey. The runner builds the locked debug binary, runs the doctor checks, and drives the native suite in order through the selected scenario with isolated Stack, mise, and Pitchfork state. Earlier scenarios create the checkouts and leave the service state required by later scenarios. Each CLI call is a separate process. Readiness comes from the scenario's `stack up --json` and subsequent verified execution or service checks.
+From the repo root, run `.cursor/skills/verify-stack-cli/drive.sh 3-leases` for the lease journey. The runner builds the locked debug binary, runs the doctor checks, and drives the native suite in order through the selected scenario with isolated Stack and mise state (Pitchfork's too, though services run under Stack's own supervisor). Earlier scenarios create the checkouts and leave the service state required by later scenarios. Each CLI call is a separate process. Readiness comes from the scenario's `stack up --json` and subsequent verified execution or service checks.
 
 ## Doctor
 
@@ -21,7 +21,7 @@ The wrapper prints an absolute evidence directory under `target/verification/cli
 
 ## Cleanup
 
-The native harness stops the fixture apps and the isolated Pitchfork supervisor on exit. A passing run removes the fixture directory. A failed run preserves it after teardown for diagnosis. The evidence directory lives outside the fixture and survives both outcomes.
+The native harness stops the fixture apps (and with them each checkout's Stack supervisor) on exit, and an isolated Pitchfork supervisor only if a fixture pinned Pitchfork. A passing run removes the fixture directory. A failed run preserves it after teardown for diagnosis. The evidence directory lives outside the fixture and survives both outcomes.
 
 ## Helpers
 

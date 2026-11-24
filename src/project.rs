@@ -163,7 +163,8 @@ pub fn inspect_mode(root: &Path) -> Mode {
     }
 }
 
-/// Presets `mise daemons` documents. Newer mise releases may add more, so others only warn.
+/// Presets Stack's supervisor runs (`stack __preset`, see [`crate::supervisor::main_preset`]).
+/// Another name only warns here; `stack up` fails on it.
 const KNOWN_PRESETS: &[&str] = &["cockroachdb", "nats", "postgres", "redis", "spicedb"];
 
 fn warnings(stack: &Composed) -> Vec<String> {
@@ -172,7 +173,7 @@ fn warnings(stack: &Composed) -> Vec<String> {
         let Some(preset) = e.value.preset.as_deref() else { continue };
         if !KNOWN_PRESETS.contains(&preset) {
             out.push(format!(
-                "services.{name} ({}) uses preset '{preset}', which mise does not document (known: {}); `stack up` will fail if your mise lacks it",
+                "services.{name} ({}) uses preset '{preset}', which Stack does not know (known: {}); `stack up` will fail to start it",
                 e.origin,
                 KNOWN_PRESETS.join(", ")
             ));

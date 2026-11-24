@@ -130,7 +130,9 @@ pub struct Task {
     pub run: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Services that must be running and ready before the task starts.
+    /// Services the task uses, checked to name services the stack defines (`unknown_service`
+    /// otherwise). Not a narrower requirement: `stack run` waits for every service to verify,
+    /// whatever this lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
     /// Names of fnox secrets the task is granted (never values). Resolved by stack when the
