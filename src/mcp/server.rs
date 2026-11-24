@@ -339,6 +339,9 @@ struct Server {
     signalled: Signalled,
     /// Calls not started were dropped for one: none is admitted again.
     stopped: bool,
+    /// Run on a call's worker just before its admission point (see [`Server::start`]).
+    #[cfg(test)]
+    before_admission: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Server {
@@ -361,6 +364,8 @@ impl Server {
             log_level: DEFAULT_LOG_LEVEL,
             signalled: Arc::new(|| crate::process::passed_on().is_some()),
             stopped: false,
+            #[cfg(test)]
+            before_admission: None,
         }
     }
 
@@ -612,7 +617,9 @@ impl Server {
     /// next call on a checkout is always the oldest one waiting for it.
     ///
     /// Once a signal came, none starts, whatever asked (a call ending, roots arriving, input
-    /// ending): every waiting call is dropped instead.
+    /// ending): every waiting call is dropped instead. That check, like the loop's, only keeps
+    /// calls from getting a worker; whether a call's tool runs is settled on its worker, at its
+    /// admission point (see [`Server::start`]).
     fn admit(&mut self) {
         if self.stopping() {
             return self.drop_waiting();
@@ -638,6 +645,18 @@ impl Server {
         self.admit();
     }
 
+    /// Give `call` a worker. Every call reaches its tool only through here, whatever started it
+    /// (arriving, roots arriving, a call ending, input ending).
+    ///
+    /// The call's admission point is on that worker, just before the tool is called: the tool
+    /// runs only if the call was not cancelled and no signal that ends the server has been seen
+    /// ([`Server::signalled`]) by then. A signal seen after the loop's or [`Server::admit`]'s
+    /// check, and before that point, drops the call as a waiting one is dropped: unanswered, its
+    /// batch owed nothing more for it, its worker ending and freeing its checkout. A signal
+    /// that comes after that point comes during the call, and is handled as one coming while
+    /// any call runs (passed on to the commands it runs, or ending Stack while it runs none;
+    /// see [`crate::process::passed_on`]): the check and the tool's first step are not one
+    /// atomic step, and nothing here makes them one.
     fn start(&mut self, call: Waiting) {
         let Waiting { message, reply, project, roots } = call;
         let id = message["id"].clone();
@@ -649,13 +668,21 @@ impl Server {
             self.busy.insert(project.clone());
         }
         let params = message["params"].clone();
-        let (out, caller, inflight) = (self.out.clone(), self.caller.clone(), self.inflight.clone());
+        let (out, caller, inflight, signalled) = (self.out.clone(), self.caller.clone(), self.inflight.clone(), self.signalled.clone());
+        #[cfg(test)]
+        let before_admission = self.before_admission.clone();
         let ended = Ended { events: self.events.clone(), project: project.clone() };
         self.workers.retain(|w| !w.is_finished());
         let failed_reply = reply.clone();
         let spawned = std::thread::Builder::new().name("stack-mcp-call".into()).spawn(move || {
             let _ended = ended;
-            let outcome = (!cancel.is_cancelled()).then(|| {
+            #[cfg(test)]
+            if let Some(seam) = &before_admission {
+                seam();
+            }
+            // The admission point.
+            let admitted = !cancel.is_cancelled() && !signalled();
+            let outcome = admitted.then(|| {
                 let token = &params["_meta"]["progressToken"];
                 let progress = (token.is_string() || token.is_i64() || token.is_u64())
                     .then(|| Progress::start(out.clone(), token.clone(), params["name"].as_str().unwrap_or_default()));
@@ -670,7 +697,7 @@ impl Server {
             });
             inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
             match outcome {
-                // Cancelled: the client expects no response.
+                // Cancelled, or dropped for a signal at its admission: no response.
                 _ if cancel.is_cancelled() => reply.skip(),
                 Some(Ok(result)) => reply.ok(&id, result),
                 Some(Err(_)) => reply.error(&id, -32603, "internal error: the call panicked"),
@@ -1259,6 +1286,62 @@ mod tests {
             assert_eq!(**batch, json!([{ "jsonrpc": "2.0", "id": ping, "result": {} }]), "the dropped call's batch kept only its answered sibling");
         }
         assert_eq!(gate.counts().1, MAX_RUNNING, "a dropped call ran");
+    }
+
+    /// A signal seen after `admit`'s scan gave a call a worker and before that worker reaches
+    /// the call's tool: the seam raises it there, on the worker, every time.
+    #[test]
+    fn a_signal_after_a_call_got_its_worker_and_before_its_tool_runs_drops_it_and_holds_up_nothing() {
+        for batched in [false, true] {
+            let gate = Arc::new(Gate::default());
+            let (mut server, received, output, signal) = signalled_server(gate.caller());
+            server.line(&initialize(BATCH_VERSION, json!({})).to_string());
+            assert_eq!(output.recv().unwrap()["id"], 0);
+            let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            server.before_admission = Some(Arc::new({
+                let (signal, reached) = (Arc::clone(&signal), Arc::clone(&reached));
+                move || {
+                    signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                    reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+            let call = tool_call(1, "stack_ps", json!({}));
+            if batched {
+                server.line(&json!([{ "jsonrpc": "2.0", "id": "p1", "method": "ping" }, call]).to_string());
+            } else {
+                server.line(&call.to_string());
+            }
+            // `admit`'s scan saw no signal: the call got a worker.
+            assert_eq!((server.running, server.workers.len()), (1, 1), "batched {batched}");
+            ended(&mut server, &received, 1);
+            assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(gate.counts().1, 0, "batched {batched}: the tool was called after the signal");
+            assert!(server.inflight.lock().unwrap().is_empty());
+            // The batch is owed nothing more for the dropped call: its sibling goes out.
+            if batched {
+                assert_eq!(output.recv_timeout(Duration::from_secs(5)).unwrap(), json!([{ "jsonrpc": "2.0", "id": "p1", "result": {} }]));
+            }
+            // Nothing starts after the signal, and input ending finishes at once.
+            server.line(&anywhere(2));
+            server.finish(&received);
+            assert_eq!(gate.counts().1, 0, "batched {batched}");
+            assert!(server.workers.is_empty() && server.waiting.is_empty() && server.busy.is_empty() && server.running == 0, "batched {batched}");
+            assert!(output.try_recv().is_err(), "batched {batched}: a dropped call was answered");
+        }
+    }
+
+    /// Without the signal, the seam changes nothing: the call runs and is answered.
+    #[test]
+    fn a_call_with_no_signal_at_its_admission_runs() {
+        let gate = Arc::new(Gate::default());
+        gate.open();
+        let (mut server, received, output, _signal) = signalled_server(gate.caller());
+        server.before_admission = Some(Arc::new(|| {}));
+        server.line(&anywhere(1));
+        ended(&mut server, &received, 1);
+        server.finish(&received);
+        assert_eq!(gate.counts().1, 1);
+        assert_eq!(output.recv_timeout(Duration::from_secs(5)).unwrap()["id"], 1);
     }
 
     #[test]

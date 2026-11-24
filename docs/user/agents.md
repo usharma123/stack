@@ -262,7 +262,8 @@ once 256 calls are waiting a new `tools/call` is refused at once with JSON-RPC e
 every call it already accepted still runs and is answered before the server exits. A signal
 that ends the server (one passed on to a call's command) lets the calls running finish and be
 answered; calls still waiting then never start and are not answered, and a batch they were in
-still gets its other responses. One message (or batch) is one line of at most 4 MiB: a longer
+still gets its other responses. A call counts as running once its tool is about to be called and
+no such signal has been seen: one given a thread just before the signal is dropped the same way. One message (or batch) is one line of at most 4 MiB: a longer
 line is skipped unread and answered with JSON-RPC error `-32600` (`id: null`,
 `data.limit`), and the session goes on as before. At most 16 lines read wait to be handled;
 past that the server stops reading until it catches up, so a client writing faster than that
