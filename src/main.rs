@@ -425,14 +425,28 @@ fn update_call(f: impl FnOnce(&mut Call)) {
 /// The subcommand named on the command line, for envelopes of calls clap refused: the first
 /// argument (before `--`) that names one. Empty when none does.
 fn command_from_args() -> String {
-    let cmd = Cli::command();
-    let names: Vec<String> = cmd.get_subcommands().map(|s| s.get_name().to_string()).collect();
-    std::env::args_os()
-        .skip(1)
-        .take_while(|a| a != "--")
-        .filter_map(|a| a.into_string().ok())
-        .find(|a| names.contains(a))
-        .unwrap_or_default()
+    let words: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    subcommand_in(&words).map(|at| words[at].clone()).unwrap_or_default()
+}
+
+/// Where the subcommand is in `words` (the arguments, without the program): the first word
+/// before `--` that names one and is not the value of a global option (`-C logs`, `--dir status`
+/// and `-qC down` name a directory, whatever it is called).
+fn subcommand_in(words: &[String]) -> Option<usize> {
+    let names: Vec<String> = Cli::command().get_subcommands().map(|s| s.get_name().to_string()).collect();
+    let mut at = 0;
+    while let Some(word) = words.get(at).map(String::as_str) {
+        if word == "--" {
+            return None;
+        }
+        if names.iter().any(|n| n == word) {
+            return Some(at);
+        }
+        // `-C` alone, or ending a cluster of the other global short flag, takes the next word.
+        let short_dir = word.len() > 1 && word.starts_with('-') && !word.starts_with("--") && word.ends_with('C') && word[1..word.len() - 1].chars().all(|c| c == 'q');
+        at += if word == "--dir" || short_dir { 2 } else { 1 };
+    }
+    None
 }
 
 fn main() -> ExitCode {
@@ -1356,10 +1370,10 @@ fn json_requested() -> bool {
 /// or `..`) is taken for one: `logs --project web` is the `web` service of every checkout.
 fn project_spelling(words: &[String]) -> Option<StackError> {
     const FLEET: [&str; 4] = ["logs", "status", "down", "ps"];
+    // The subcommand: the first word naming one (`exec ls logs` runs `ls`, it is not `logs`),
+    // past the directory `-C` names.
+    let at = subcommand_in(words)?;
     let words: Vec<&str> = words.iter().map(String::as_str).take_while(|w| *w != "--").collect();
-    // The subcommand: the first word naming one (`exec ls logs` runs `ls`, it is not `logs`).
-    let names: Vec<String> = Cli::command().get_subcommands().map(|s| s.get_name().to_string()).collect();
-    let at = words.iter().position(|w| names.iter().any(|n| n == w))?;
     let cmd = words[at];
     if !FLEET.contains(&cmd) {
         return None;
@@ -1518,6 +1532,35 @@ mod tests {
         ] {
             assert!(refused(args).is_none(), "{args:?}: refused");
         }
+    }
+
+    #[test]
+    fn a_directory_named_like_a_subcommand_is_never_taken_for_one() {
+        let refused = |args: &[&str]| project_spelling(&words(args));
+        // `-C`/`--dir` take the next word as the checkout's directory, whatever it is called.
+        for args in [
+            &["-C", "logs", "exec", "tool", "--project", "./x"][..],
+            &["--dir", "status", "logs", "--project", "web"],
+            &["-qC", "down", "run", "deploy", "--project", "/srv/app"],
+            &["--json", "-C", "ps", "exec", "ls", "--project", "."],
+        ] {
+            assert!(refused(args).is_none(), "{args:?}: refused");
+        }
+        // The real subcommand after them is still checked.
+        for (args, cmd) in [
+            (&["-C", "logs", "logs", "--project", "./x"][..], "logs"),
+            (&["--dir=status", "status", "--project", "app"], "status"),
+            (&["-Cdown", "down", "--project", "/srv/app"], "down"),
+            (&["-q", "-C", "app", "ps", "--project", "app"], "ps"),
+        ] {
+            let e = refused(args).unwrap_or_else(|| panic!("{args:?}: accepted"));
+            assert!(e.hint.as_deref().unwrap().contains(&format!("stack {cmd} --project=")), "{args:?}: {e:?}");
+        }
+        // Every word before the subcommand is one of these options or a flag: the envelope of a
+        // refused call names the subcommand, not the directory.
+        assert_eq!(subcommand_in(&words(&["-C", "logs", "exec", "x"])), Some(2));
+        assert_eq!(subcommand_in(&words(&["--dir", "run", "--json", "up"])), Some(3));
+        assert_eq!(subcommand_in(&words(&["-C"])), None);
     }
 
     #[test]
