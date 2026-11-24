@@ -10,7 +10,7 @@
 | `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME] [--label K=V]...` | Start services, verify them, run pending [init tasks](data.md), record a session |
 | `stack status [--project[=PATH] \| --all] [--label K=V]...` | Verify every service now (exit 1 if any fails in a started checkout) and renew the lease; with a [fleet selection](#fleet-selections), of every matching checkout |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
-| `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
+| `stack run [--timeout D] [--up [--ttl D]] <task> [args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow \| --project[=PATH] \| --label K=V]` | Show services' recent output (default 100 lines each) |
 | `stack env [--shell bash\|zsh\|fish]` | Print the environment `exec` would give a command, for `eval` |
@@ -395,6 +395,11 @@ arguments after `--`). Every service must verify first, whatever the task's `ser
 says; for a command that should run with services down, use `exec`. A task gets the secrets it
 declares, and installs any missing pinned tool before it starts. `unknown_task` lists the
 tasks the project defines. `--up` and `--ttl` work as for [`exec`](#exec).
+
+Stack's options, global ones such as `--json` included, go before the task's name. Every
+argument after the name is the task's: `stack run test --timeout 3` gives the task `--timeout 3`,
+while `stack run --timeout 5m test` bounds the run. A `--` right after the name only separates
+(`stack run test -- -x` gives the task `-x`); any later `--` is passed on.
 
 ## logs
 

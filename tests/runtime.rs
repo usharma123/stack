@@ -4208,6 +4208,10 @@ fn run_hands_a_declared_task_to_mise_without_its_daemon_startup() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "greet|a b|it's|--flag|", "arguments arrive intact");
     let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
     assert!(log.contains("run --skip-deps --no-timings greet -- a b it's --flag"), "{log}");
+    // After the task's name every argument is the task's, even one stack would know; before it,
+    // stack's own options still apply.
+    let out = fixture.ok(&["run", "--timeout", "1m", "greet", "--timeout", "3", "--json", "--", "x"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "greet|--timeout|3|--json|--|x|", "forwarded");
 
     let out = fixture.command(&["--json", "run", "fail"]).output().unwrap();
     assert_eq!(out.status.code(), Some(3), "the task's exit code");

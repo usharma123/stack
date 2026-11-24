@@ -207,9 +207,10 @@ enum Cmd {
         cmd: Vec<String>,
     },
     /// Run a task from stack.toml once every service verifies, granted the secrets it declares
+    ///
+    /// Stack's options go before the task name; every argument after it is the task's
+    #[command(override_usage = "stack run [OPTIONS] <TASK> [--] [ARGS]...")]
     Run {
-        /// Task name, as in [tasks.<name>]
-        task: String,
         /// Give up after this long (e.g. 10m), killing the task, and exit 124. Counts from the
         /// call: planning, including installing missing pins, is included. Default: no limit
         #[arg(long, value_name = "DURATION")]
@@ -221,9 +222,11 @@ enum Cmd {
         /// session without one gets `[session] default_ttl` of stack.toml, else 30m)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
-        /// Extra arguments, appended to the task's command
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Task name, as in [tasks.<name>], then extra arguments appended to the task's command.
+        /// Every argument after the name is the task's, `--timeout` and `--json` included; a `--`
+        /// right after the name is only a separator
+        #[arg(value_name = "TASK", required = true, num_args = 1.., trailing_var_arg = true)]
+        task: Vec<String>,
     },
     /// Stop services; succeeds only once their processes are gone. Stack's supervisor for the
     /// checkout exits with them (for services an older Stack started under Pitchfork, its
@@ -701,7 +704,8 @@ fn main() -> ExitCode {
                 })
             })
         }
-        Cmd::Run { task, timeout, up, ttl, args } => prepare(*up, ttl.as_deref(), false).and_then(|prepare| {
+        Cmd::Run { task, timeout, up, ttl } => prepare(*up, ttl.as_deref(), false).and_then(|prepare| {
+            let (task, args) = task_and_args(task);
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
                 session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
             })
@@ -840,6 +844,13 @@ fn main() -> ExitCode {
         }
         Err(e) => fail(cli.json, e),
     }
+}
+
+/// `stack run`'s words: the task's name and the arguments it is given. One `--` right after the
+/// name only separates them, as it did when clap parsed it; any other is the task's.
+fn task_and_args(words: &[String]) -> (&str, &[String]) {
+    let (task, rest) = words.split_first().map_or(("", &[][..]), |(t, rest)| (t.as_str(), rest));
+    (task, rest.strip_prefix(&["--".to_string()][..]).unwrap_or(rest))
 }
 
 /// The subcommand's name, as clap parsed the arguments it already accepted.
@@ -1416,4 +1427,44 @@ fn human_detail(detail: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `stack run` takes from these arguments: the global `--json`, its own `--timeout`,
+    /// the task and the task's arguments.
+    fn run(args: &[&str]) -> (bool, Option<String>, String, Vec<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("stack").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        let Cmd::Run { task, timeout, .. } = &cli.cmd else { panic!("{args:?}: not run") };
+        let (task, rest) = task_and_args(task);
+        (cli.json, timeout.clone(), task.to_string(), rest.to_vec())
+    }
+
+    fn words(w: &[&str]) -> Vec<String> {
+        w.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn run_gives_the_task_every_argument_after_its_name() {
+        // Before the name, options are stack's, global ones included.
+        assert_eq!(run(&["--json", "run", "--timeout", "5m", "test"]), (true, Some("5m".into()), "test".into(), vec![]));
+        assert_eq!(run(&["run", "--json", "--timeout=5m", "test"]), (true, Some("5m".into()), "test".into(), vec![]));
+        // After it, every one is the task's, even those stack would know.
+        assert_eq!(
+            run(&["run", "test", "--timeout", "3", "--json", "-q", "--up", "x"]),
+            (false, None, "test".into(), words(&["--timeout", "3", "--json", "-q", "--up", "x"]))
+        );
+        assert_eq!(run(&["run", "--timeout", "1s", "test", "--timeout=9"]), (false, Some("1s".into()), "test".into(), words(&["--timeout=9"])));
+        // A `--` right after the name only separates; a later one, or a second one, is the task's.
+        assert_eq!(run(&["run", "test", "--", "--flag", "--"]), (false, None, "test".into(), words(&["--flag", "--"])));
+        assert_eq!(run(&["run", "test", "--", "--", "x"]), (false, None, "test".into(), words(&["--", "x"])));
+        assert_eq!(run(&["run", "test", "a", "--", "b"]), (false, None, "test".into(), words(&["a", "--", "b"])));
+        assert_eq!(run(&["run", "--", "test", "--x"]), (false, None, "test".into(), words(&["--x"])));
+        // Without a task, or with an option stack does not know before it, the call is refused.
+        assert!(Cli::try_parse_from(["stack", "run"]).is_err());
+        assert!(Cli::try_parse_from(["stack", "run", "--timeout", "5m"]).is_err());
+        assert!(Cli::try_parse_from(["stack", "run", "--nope", "test"]).is_err());
+    }
 }
