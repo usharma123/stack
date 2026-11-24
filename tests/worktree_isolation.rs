@@ -33,9 +33,21 @@ struct Fleet {
     worktrees: Vec<PathBuf>,
 }
 
+fn stack_bin() -> PathBuf {
+    std::env::var_os("STACK_TEST_BINARY").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_stack")))
+}
+
+fn require_installs() -> Option<PathBuf> {
+    let found = installs();
+    if found.is_none() && std::env::var_os("STACK_REQUIRE_WORKTREE_ISOLATION").is_some() {
+        panic!("STACK_REQUIRE_WORKTREE_ISOLATION is set, but mise with Postgres 17 and Redis 8 was not found");
+    }
+    found
+}
+
 impl Fleet {
     fn stack(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_stack"))
+        Command::new(stack_bin())
             .args(["-C", dir.to_str().unwrap()])
             .args(args)
             .env("STACK_STATE_DIR", self.dir.path().join("state"))
@@ -99,7 +111,7 @@ const READ: &str = r#"printf '%s|%s|%s\n' "$(psql "$DATABASE_URL" -X -Atc "selec
 
 #[test]
 fn worktrees_started_together_never_touch_each_others_services_or_data() {
-    let Some(_installs) = installs() else {
+    let Some(_installs) = require_installs() else {
         eprintln!("skipping: no mise on PATH with Postgres 17 and Redis 8 installed");
         return;
     };
@@ -199,7 +211,7 @@ fn worktrees_started_together_never_touch_each_others_services_or_data() {
 /// counts as such a command. Once it ends, `down --purge` confirms and removes the data.
 #[test]
 fn a_running_command_keeps_down_purge_from_removing_data_while_services_stop() {
-    if installs().is_none() {
+    if require_installs().is_none() {
         eprintln!("skipping: no mise on PATH with Postgres 17 and Redis 8 installed");
         return;
     }

@@ -680,7 +680,7 @@ fn endpoints(name: &str, service: &Service, port: u16, env: &IndexMap<String, St
                 key.as_str(),
                 "PGHOST" | "PGUSER" | "PGDATABASE" | "CRDB_HTTP_PORT" | "NATS_MONITOR_PORT" | "SPICEDB_HTTP_PORT" | "SPICEDB_METRICS_PORT"
             );
-            if !matches_port && !(companion_var && primary_matches) {
+            if !(matches_port || companion_var && primary_matches) {
                 return None;
             }
             Some((key.clone(), sanitize_endpoint(&key, actual)?))

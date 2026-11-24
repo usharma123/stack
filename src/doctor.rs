@@ -203,4 +203,3 @@ mod tests {
         assert!(!same_install(&wrapper, None));
     }
 }
-

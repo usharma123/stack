@@ -1583,7 +1583,16 @@ fn child_setup(stop_signal: i32, parent: libc::pid_t) -> std::io::Result<()> {
             libc::signal(sig, libc::SIG_DFL);
         }
         #[cfg(target_os = "linux")]
-        libc::prctl(libc::PR_SET_PDEATHSIG, stop_signal as libc::c_ulong);
+        if libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            stop_signal as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
         #[cfg(not(target_os = "linux"))]
         let _ = stop_signal;
         if libc::getppid() != parent {

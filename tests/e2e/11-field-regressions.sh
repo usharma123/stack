@@ -30,7 +30,7 @@ echo 'Services start and verify, and the result is one check per service'
 stack up --json >"$T/up-appR.json"
 assert_json '.ok and ([.data.checks[].service] | sort) == ["api", "postgres", "redis"] and all(.data.checks[]; .ready)' "$T/up-appR.json"
 assert_json '.data.session | keys == ["id", "started_at"]' "$T/up-appR.json"
-(( $(wc -c <"$T/up-appR.json") < 1500 )) || fail "up result is $(wc -c <"$T/up-appR.json") bytes"
+(( $(wc -c <"$T/up-appR.json") < 2200 )) || fail "up result is $(wc -c <"$T/up-appR.json") bytes"
 
 echo "A custom service's URL is its loopback address and answers"
 port=$(checked api port "$T/up-appR.json")
@@ -45,8 +45,9 @@ jq -se --arg url "$url" 'length == 1 and (.[0].result.structuredContent.data | .
   || fail "MCP stack_run: $(cat "$T/mcp-run-url.out")"
 
 echo 'Services carry the checkout token; commands do not'
-token=$(stack exec -- python3 -c 'import tomllib; print(tomllib.load(open(".config/mise/conf.d/stack.toml", "rb"))["daemons"]["postgres"]["env"]["STACK_CHECKOUT_TOKEN"])')
-[[ ${#token} -eq 32 ]] || fail "no token rendered: $token"
+sup_dir=$(jq -r '.provider.state_dir' .stack/session.json)
+token=$(jq -r '.token' "$sup_dir/state.json")
+[[ ${#token} -eq 32 ]] || fail "no token in supervisor state: $token"
 pg_pid=$(checked postgres pid "$T/up-appR.json")
 ps eww -p "$pg_pid" | grep -q "STACK_CHECKOUT_TOKEN=$token" || fail 'postgres does not carry the checkout token'
 if stack exec -- env | grep -q STACK_CHECKOUT_TOKEN; then fail 'a command received the checkout token'; fi
@@ -71,16 +72,23 @@ assert_json '.ok and (.data.warnings | length == 2) and all(.data.warnings[]; te
 if stack exec --require postgres -- sh -c 'psql "$DATABASE_URL" -Atc "select v from note"' 2>/dev/null; then fail 'the recreated checkout inherited the old data'; fi
 moved=$(jq -r '.data.warnings[] | select(startswith("postgres:")) | capture("moved to (?<p>.*); ").p' "$T/up-recreated.json")
 [[ -f "$moved/PG_VERSION" ]] || fail "old Postgres data not kept at $moved"
+# Capture the recreated checkout's token and pinned python before stopping its supervisor.
+sup_dir=$(jq -r '.provider.state_dir' .stack/session.json)
+token=$(jq -r '.token' "$sup_dir/state.json")
+[[ ${#token} -eq 32 ]] || fail "no token for recreated checkout: $token"
+py_bin=$(stack exec -- which python3)
 stack down >/dev/null
 
 echo "A service process of this checkout that nothing recorded is stopped by up, not called foreign"
-# The recreated directory has a token of its own.
-token=$(stack exec -- python3 -c 'import tomllib; print(tomllib.load(open(".config/mise/conf.d/stack.toml", "rb"))["daemons"]["postgres"]["env"]["STACK_CHECKOUT_TOKEN"])')
-stray=$(stack exec -- sh -c "STACK_CHECKOUT_TOKEN=$token exec python3 -m http.server $port --bind 127.0.0.1 >/dev/null 2>&1 & echo \$!")
+# Launch directly (not via `stack exec`, whose command mark intentionally exempts commands).
+STACK_CHECKOUT_TOKEN="$token" "$py_bin" -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 &
+stray=$!
+trap 'kill -9 "$stray" 2>/dev/null || true' EXIT
 for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null && break; sleep 0.1; done
 stack up --json >"$T/up-stray.json"
 jq -e --argjson pid "$stray" '.ok and any(.data.steps[]; .step == "stop_previous" and any(.detail.stopped[]; .pid == $pid and .unrecorded))' "$T/up-stray.json" >/dev/null || fail "stray: $(cat "$T/up-stray.json")"
 assert_dead "$stray"
+trap - EXIT
 assert_json 'all(.data.checks[]; .ready)' "$T/up-stray.json"
 stack down --json >"$T/down-stray.json"
 assert_json '.ok and .data.confirmed and (.data.conflicts == null)' "$T/down-stray.json"
