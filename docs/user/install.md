@@ -7,7 +7,12 @@ stack doctor
 ```
 
 The package carries prebuilt binaries for macOS 13+ and Linux (static, any distribution) on
-x64 and arm64, and needs Node.js 22.14+. You also need `git` and `tar` on `PATH`.
+x64 and arm64, and needs Node.js 22.14+. You also need `git` and `tar` on `PATH`, and `curl` for
+a NATS or SpiceDB service (their readiness checks run it).
+
+Postgres and Redis are the generally available service presets; CockroachDB, NATS and SpiceDB
+are experimental, and services listen on loopback without authentication. See
+[scope and security model](guarantees.md#scope) before running Stack on a shared host.
 
 Stack installs everything through [mise](https://mise.jdx.dev). `stack setup` uses the mise on
 your `PATH`; if there is none, or it does not run, it downloads the release Stack is tested
