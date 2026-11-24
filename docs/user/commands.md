@@ -780,9 +780,11 @@ the same reason. Such a checkout stays `unavailable`, its reason saying so. To l
 it, first make sure it is not a volume or bind mount that is merely not mounted (mounting it
 again is all that takes: it is found as it was). If it was deleted, recreate the checkout at that
 path (its `stack.toml` with it) and run `stack up` there: that adopts the path's records for the
-new checkout and records its mount, and `stack down --purge` there then releases its ports and
-identities, or deleting the directory lets `gc` reclaim them. A directory recreated at the path
-and left alone is no longer enough: `gc` does not take what it finds there for the checkout.
+new checkout and records its mount if there is no conflicting session. `stack down --purge`
+there then releases its ports and identities, or deleting the directory lets `gc` reclaim them.
+If `up` reports `session_conflict` and `gc` still reports `unavailable`, the old session needs
+manual recovery. Confirm its services are stopped before changing its records. A directory
+recreated at the path and left alone does not give `gc` evidence about the original checkout.
 
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once, and its
