@@ -835,6 +835,10 @@ state `unstarted` (one `git worktree list` for the repository). `totals` count w
 `--all` (every checkout with records). Only checkouts whose directory is still there are acted
 on, one after another, each under its own lock. Labels are set by `stack up --label K=V`, kept
 while the session lives (a later `up --label` adds or replaces keys) and gone after `down`.
+A path is given only as `--project=PATH`: `--project PATH` (with a space) is refused as a usage
+error naming that spelling, in `ps` too, rather than taking the path for a service of `logs`.
+`stack logs --project web` is still the `web` service of every checkout: for `logs`, only a word
+with a `/`, or `.` or `..`, is taken for a misplaced path.
 
 - `stack status --project` returns `{checkouts: [{path, branch, labels, status | error}],
   total, running, healthy, passed}` and exits 0 only when every started checkout is healthy and

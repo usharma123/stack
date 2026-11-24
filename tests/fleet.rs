@@ -266,6 +266,15 @@ fn ps_status_logs_and_down_act_on_a_projects_worktrees_or_a_label() {
     assert!(!human.contains("[main:"), "{human}");
     let out = fixture.run(&["logs", "--project", "--follow"]);
     assert_eq!(out.status.code(), Some(2), "--follow cannot follow several checkouts");
+    // A path after a space is not taken for a service: the call is refused with the spelling
+    // that works, and `--project=PATH` selects that project.
+    let out = fixture.run(&["--json", "logs", "--project", wt_dir, "--since-start"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    let refused: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(refused["error"]["code"], "usage", "{refused}");
+    assert!(refused["error"]["hint"].as_str().unwrap().contains(&format!("stack logs --project={wt_dir}")), "{refused}");
+    let logs = fixture.data(&["logs", &format!("--project={wt_dir}"), "--since-start"]);
+    assert_eq!(paths(&logs), vec![repo.clone(), wt.clone()]);
 
     // ---- MCP status and logs by label, without a dir ----
     let answers = fixture.mcp(&[

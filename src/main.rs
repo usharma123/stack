@@ -442,6 +442,10 @@ fn main() -> ExitCode {
     }
     stack::setup::use_managed_tools();
     update_call(|_| {});
+    let words: Vec<String> = args.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Some(e) = project_spelling(&words) {
+        return fail(json_requested(), e);
+    }
     let matches = match Cli::command().try_get_matches() {
         Ok(matches) => matches,
         Err(e) => return usage_error(e),
@@ -1325,14 +1329,47 @@ fn usage_error(e: clap::Error) -> ExitCode {
     if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
         e.exit();
     }
-    // `--json` after `--` belongs to the command being run, not to stack.
-    // Compared as OS strings: arguments need not be Unicode, and this must not panic on them.
-    let as_json = std::env::args_os().skip(1).take_while(|a| a != "--").any(|a| a == "--json");
-    if !as_json {
+    if !json_requested() {
         e.exit();
     }
     let (message, hint) = usage_text(&e.render().to_string());
     fail(true, StackError::new("usage", message).hint(hint))
+}
+
+/// Whether `--json` was asked for, by arguments clap may not have accepted. `--json` after `--`
+/// belongs to the command being run, not to stack. Compared as OS strings: arguments need not be
+/// Unicode, and this must not panic on them.
+fn json_requested() -> bool {
+    std::env::args_os().skip(1).take_while(|a| a != "--").any(|a| a == "--json")
+}
+
+/// `--project PATH`, spelled with a space, where `--project` takes a path only as `--project=PATH`
+/// (alone, it means this checkout's project). clap would read the path as a service of `logs`, or
+/// refuse it as an unexpected argument without saying why; this says how to write it instead.
+/// For `logs`, whose services follow, only a word that looks like a path (has a `/`, or is `.`
+/// or `..`) is taken for one: `logs --project web` is the `web` service of every checkout.
+fn project_spelling(words: &[String]) -> Option<StackError> {
+    const FLEET: [&str; 4] = ["logs", "status", "down", "ps"];
+    let words: Vec<&str> = words.iter().map(String::as_str).take_while(|w| *w != "--").collect();
+    // The subcommand: the first word naming one (`exec ls logs` runs `ls`, it is not `logs`).
+    let names: Vec<String> = Cli::command().get_subcommands().map(|s| s.get_name().to_string()).collect();
+    let at = words.iter().position(|w| names.iter().any(|n| n == w))?;
+    let cmd = words[at];
+    if !FLEET.contains(&cmd) {
+        return None;
+    }
+    let rest = &words[at + 1..];
+    let i = rest.iter().position(|w| *w == "--project")?;
+    let path = *rest.get(i + 1)?;
+    let path_like = path.contains('/') || path == "." || path == "..";
+    if path.starts_with('-') || (cmd == "logs" && !path_like) {
+        return None;
+    }
+    let read_as = if cmd == "logs" { "a service name" } else { "an unexpected argument" };
+    Some(
+        StackError::new("usage", format!("`--project {path}`: --project takes a path only as --project=PATH; `{path}` would be read as {read_as}"))
+            .hint(format!("run `stack {cmd} --project={path}`, or `stack {cmd} --project` for this checkout's project")),
+    )
 }
 
 /// clap's rendered error as one message and a hint: the error with the lines that continue it
@@ -1444,6 +1481,37 @@ mod tests {
 
     fn words(w: &[&str]) -> Vec<String> {
         w.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_project_path_after_a_space_is_refused_with_the_spelling_that_works() {
+        let refused = |args: &[&str]| project_spelling(&words(args));
+        for (args, cmd, path) in [
+            (&["logs", "--project", "/srv/app"][..], "logs", "/srv/app"),
+            (&["--json", "logs", "--project", "../app", "web"], "logs", "../app"),
+            (&["logs", "web", "--project", "."], "logs", "."),
+            (&["status", "--project", "app"], "status", "app"),
+            (&["down", "--project", "/srv/app"], "down", "/srv/app"),
+            (&["ps", "--project", "app"], "ps", "app"),
+        ] {
+            let e = refused(args).unwrap_or_else(|| panic!("{args:?}: accepted"));
+            assert_eq!(e.code, "usage", "{args:?}");
+            assert!(e.message.contains(&format!("`{path}` would be read as")), "{args:?}: {}", e.message);
+            assert!(e.hint.as_deref().unwrap().contains(&format!("stack {cmd} --project={path}")), "{args:?}");
+        }
+        for args in [
+            // The spellings that work, and a service of every checkout.
+            &["logs", "--project=/srv/app", "web"][..],
+            &["logs", "--project", "web"],
+            &["logs", "--project", "--since-start"],
+            &["status", "--project"],
+            // Not stack's: the command being run, or after `--`.
+            &["exec", "ls", "logs", "--project", "/x"],
+            &["exec", "--", "stack", "logs", "--project", "/x"],
+            &["run", "t", "status", "--project", "/x"],
+        ] {
+            assert!(refused(args).is_none(), "{args:?}: refused");
+        }
     }
 
     #[test]
