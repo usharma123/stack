@@ -3,7 +3,12 @@
 //! Stdin is read on its own thread, so cheap requests (`ping`, `tools/list`, ...) are answered
 //! at once, also while a long `tools/call` runs. Each `tools/call` runs on a worker thread.
 //! Calls on the same checkout run one at a time, in the order they arrived; calls on different
-//! checkouts run concurrently. `notifications/cancelled` stops an in-flight call through its
+//! checkouts run concurrently. Admission is bounded before any thread is made: at most
+//! [`MAX_RUNNING`] calls run (each on one worker, plus a heartbeat when it asked for progress),
+//! a call waits without a thread while its checkout is busy or every worker is, and once
+//! [`MAX_WAITING`] calls wait, a new one is refused at once with a JSON-RPC error saying to retry.
+//! A waiting call can be cancelled; it never runs and is not answered. When input ends, every
+//! call already accepted still runs and is answered. `notifications/cancelled` stops an in-flight call through its
 //! [`Cancel`], which ends it exactly as its deadline would (subprocesses killed with their
 //! process groups, launched services recorded), and no response is sent for it. A call that
 //! carries `_meta.progressToken` gets `notifications/progress` for each lifecycle step and a
@@ -19,13 +24,25 @@ use super::call;
 use super::{call_in, needs_roots, negotiate, project_key, tools_for, Policy, Profile};
 use crate::process::Cancel;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Calls running at once, each on its own worker thread.
+const MAX_RUNNING: usize = 16;
+
+/// Calls accepted but not running (waiting for their checkout, a worker or the client's roots).
+/// One more is refused rather than held.
+const MAX_WAITING: usize = 256;
+
+/// The JSON-RPC error code of a call refused because [`MAX_WAITING`] calls already wait.
+const BUSY: i64 = -32000;
 
 /// How long calls that need the client's roots wait for its `roots/list` answer.
 const ROOTS_WAIT: Duration = Duration::from_secs(5);
@@ -54,8 +71,8 @@ enum Event {
     Line(std::io::Result<String>),
     /// Input ended.
     End,
-    /// A call was answered after a signal was passed on to a command (see below).
-    Stop,
+    /// A call ended (answered or not), freeing its worker and its checkout.
+    Done(Option<PathBuf>),
 }
 
 /// Serve `profile`'s tools until `input` ends, then let calls in flight finish and answer them.
@@ -82,7 +99,7 @@ pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Writ
         // instead: nothing more starts, and the server ends as the signal asked once the calls
         // in flight are answered.
         if crate::process::passed_on().is_some() {
-            server.deferred.clear();
+            server.drop_waiting();
             break Ok(());
         }
         let next = match server.roots_deadline() {
@@ -92,12 +109,12 @@ pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Writ
         match next {
             Ok(Event::Line(Ok(line))) => server.line(&line),
             Ok(Event::Line(Err(e))) => break Err(e),
-            Ok(Event::Stop) => {}
+            Ok(Event::Done(project)) => server.done(project),
             Err(RecvTimeoutError::Timeout) => server.roots_failed("the client did not answer roots/list in time"),
             Ok(Event::End) | Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
     };
-    server.finish();
+    server.finish(&received);
     result
 }
 
@@ -191,7 +208,12 @@ struct Server {
     deferred: VecDeque<(Value, Reply)>,
     /// The [`Cancel`] of each call in flight, by its request id.
     inflight: Arc<Mutex<HashMap<String, Cancel>>>,
-    queues: Arc<Queues>,
+    /// Calls accepted and not started, in arrival order: see [`Server::admit`].
+    waiting: VecDeque<Waiting>,
+    /// Checkouts with a call running; the next call on one starts when that one ends.
+    busy: HashSet<PathBuf>,
+    /// Calls running, at most [`MAX_RUNNING`].
+    running: usize,
     workers: Vec<JoinHandle<()>>,
     /// The least severe of [`LEVELS`] sent as `notifications/message`.
     log_level: usize,
@@ -210,7 +232,9 @@ impl Server {
             requests_sent: 0,
             deferred: VecDeque::new(),
             inflight: Arc::default(),
-            queues: Arc::default(),
+            waiting: VecDeque::new(),
+            busy: HashSet::new(),
+            running: 0,
             workers: Vec::new(),
             log_level: DEFAULT_LOG_LEVEL,
         }
@@ -297,12 +321,17 @@ impl Server {
                 None => reply.error(&id, -32602, format!("invalid params: level must be one of {}", LEVELS.join(", "))),
             },
             "tools/call" => {
+                if self.waiting.len() + self.deferred.len() >= MAX_WAITING {
+                    return reply.send(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": BUSY,
+                        "message": format!("server busy: {MAX_WAITING} calls are waiting to start; retry once some finish"),
+                        "data": { "retryable": true, "running": self.running, "waiting": MAX_WAITING } } }));
+                }
                 // Calls after a held one are held too, so calls on one checkout keep their order.
                 if matches!(self.roots, Roots::Pending { .. }) && (needs_roots(self.profile, params) || !self.deferred.is_empty()) {
                     self.ask_roots_once();
                     self.deferred.push_back((message, reply));
                 } else {
-                    self.spawn_call(message, reply);
+                    self.accept(message, reply);
                 }
             }
             _ => reply.error(&id, -32601, format!("method not found: {method}")),
@@ -377,7 +406,7 @@ impl Server {
 
     fn run_deferred(&mut self) {
         while let Some((message, reply)) = self.deferred.pop_front() {
-            self.spawn_call(message, reply);
+            self.accept(message, reply);
         }
     }
 
@@ -405,6 +434,12 @@ impl Server {
             cancel.cancel();
             return;
         }
+        if let Some(at) = self.waiting.iter().position(|w| w.message["id"] == *request) {
+            if let Some(w) = self.waiting.remove(at) {
+                w.reply.skip();
+            }
+            return;
+        }
         if let Some(at) = self.deferred.iter().position(|(m, _)| m["id"] == *request) {
             if let Some((_, reply)) = self.deferred.remove(at) {
                 reply.skip();
@@ -412,20 +447,65 @@ impl Server {
         }
     }
 
-    fn spawn_call(&mut self, message: Value, reply: Reply) {
+    /// Calls not started yet are dropped unanswered: a signal ends the server (see the loop).
+    fn drop_waiting(&mut self) {
+        self.deferred.clear();
+        self.waiting.clear();
+    }
+
+    /// Take a call in line. Its checkout and the roots it sees are fixed now, on the reading
+    /// thread, so calls on one checkout keep their arrival order and a later roots change does
+    /// not move a call already accepted.
+    fn accept(&mut self, message: Value, reply: Reply) {
+        let roots = self.roots_snapshot();
+        let project = project_key(&message["params"], roots.as_deref());
+        self.waiting.push_back(Waiting { message, reply, project, roots });
+        self.admit();
+    }
+
+    /// Start waiting calls, oldest first, while a worker is free: each whose checkout has no
+    /// call running (one on no checkout always may). A call passed over keeps its place, so the
+    /// next call on a checkout is always the oldest one waiting for it.
+    fn admit(&mut self) {
+        let mut at = 0;
+        while at < self.waiting.len() && self.running < MAX_RUNNING {
+            if self.waiting[at].project.as_ref().is_some_and(|p| self.busy.contains(p)) {
+                at += 1;
+                continue;
+            }
+            if let Some(call) = self.waiting.remove(at) {
+                self.start(call);
+            }
+        }
+    }
+
+    /// A call ended: its worker and checkout are free for the next.
+    fn done(&mut self, project: Option<PathBuf>) {
+        self.running = self.running.saturating_sub(1);
+        if let Some(project) = project {
+            self.busy.remove(&project);
+        }
+        self.admit();
+    }
+
+    fn start(&mut self, call: Waiting) {
+        let Waiting { message, reply, project, roots } = call;
         let id = message["id"].clone();
         let key = id.to_string();
         let cancel = Cancel::new();
         self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone(), cancel.clone());
-        let roots = self.roots_snapshot();
+        self.running += 1;
+        if let Some(project) = &project {
+            self.busy.insert(project.clone());
+        }
         let params = message["params"].clone();
-        // Taken here, on the reading thread, so calls on one checkout keep their arrival order.
-        let ticket = project_key(&params, roots.as_deref()).map(|project| self.queues.take(project));
-        let (out, caller, inflight, queues, events) = (self.out.clone(), self.caller.clone(), self.inflight.clone(), self.queues.clone(), self.events.clone());
+        let (out, caller, inflight) = (self.out.clone(), self.caller.clone(), self.inflight.clone());
+        let ended = Ended { events: self.events.clone(), project: project.clone() };
         self.workers.retain(|w| !w.is_finished());
-        self.workers.push(std::thread::spawn(move || {
-            let turn = Turn { queues: &queues, ticket };
-            let outcome = turn.wait(&cancel).then(|| {
+        let failed_reply = reply.clone();
+        let spawned = std::thread::Builder::new().name("stack-mcp-call".into()).spawn(move || {
+            let _ended = ended;
+            let outcome = (!cancel.is_cancelled()).then(|| {
                 let token = &params["_meta"]["progressToken"];
                 let progress = (token.is_string() || token.is_i64() || token.is_u64())
                     .then(|| Progress::start(out.clone(), token.clone(), params["name"].as_str().unwrap_or_default()));
@@ -438,7 +518,6 @@ impl Server {
                 drop(progress);
                 outcome
             });
-            drop(turn);
             inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
             match outcome {
                 // Cancelled: the client expects no response.
@@ -447,16 +526,35 @@ impl Server {
                 Some(Err(_)) => reply.error(&id, -32603, "internal error: the call panicked"),
                 None => reply.skip(),
             }
-            if crate::process::passed_on().is_some() {
-                let _ = events.send(Event::Stop);
+        });
+        match spawned {
+            Ok(worker) => self.workers.push(worker),
+            // The closure, and its `Ended`, were dropped: the worker and checkout are freed by
+            // the `Done` it sent.
+            Err(e) => {
+                self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&message["id"].to_string());
+                failed_reply.error(&message["id"], -32603, format!("internal error: no thread for the call: {e}"));
             }
-        }));
+        }
     }
 
-    /// Calls still held for roots run without them; then every call in flight is answered.
-    fn finish(&mut self) {
+    /// Calls still held for roots run without them; then every call accepted runs, as workers
+    /// free up, and is answered (unless a signal passed on to a command ends the server first:
+    /// then only the calls running finish).
+    fn finish(&mut self, received: &mpsc::Receiver<Event>) {
         if matches!(self.roots, Roots::Pending { .. }) {
             self.roots_failed("the client closed the connection before answering roots/list");
+        }
+        while self.running > 0 {
+            if crate::process::passed_on().is_some() {
+                self.drop_waiting();
+            }
+            match received.recv() {
+                Ok(Event::Done(project)) => self.done(project),
+                // Nothing more is read once input ended or failed.
+                Ok(Event::Line(_) | Event::End) => {}
+                Err(_) => break,
+            }
         }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -464,84 +562,24 @@ impl Server {
     }
 }
 
-/// Per-checkout lines of calls: each is served in the order its ticket was taken.
-#[derive(Default)]
-struct Queues {
-    lines: Mutex<HashMap<PathBuf, Line>>,
-    turn: Condvar,
+/// A call accepted and not started: see [`Server::admit`].
+struct Waiting {
+    message: Value,
+    reply: Reply,
+    /// The checkout it acts on; `None` when it acts on none or will fail before acting.
+    project: Option<PathBuf>,
+    roots: Option<Vec<PathBuf>>,
 }
 
-#[derive(Default)]
-struct Line {
-    next: u64,
-    serving: u64,
-    /// Tickets given up before their turn.
-    abandoned: BTreeSet<u64>,
+/// Says a call ended when dropped, also on a panic outside the caller.
+struct Ended {
+    events: mpsc::Sender<Event>,
+    project: Option<PathBuf>,
 }
 
-struct Ticket {
-    project: PathBuf,
-    number: u64,
-}
-
-impl Queues {
-    fn take(&self, project: PathBuf) -> Ticket {
-        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let line = lines.entry(project.clone()).or_default();
-        line.next += 1;
-        Ticket { project, number: line.next - 1 }
-    }
-
-    /// Wait for the ticket's turn; `false` if cancelled first.
-    fn wait(&self, ticket: &Ticket, cancel: &Cancel) -> bool {
-        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if lines.get(&ticket.project).is_some_and(|l| l.serving == ticket.number) {
-                return true;
-            }
-            if cancel.is_cancelled() {
-                return false;
-            }
-            lines = self.turn.wait_timeout(lines, Duration::from_millis(50)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
-        }
-    }
-
-    /// The ticket is done with, served or not: the next one in line may go.
-    fn leave(&self, ticket: &Ticket) {
-        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(line) = lines.get_mut(&ticket.project) else { return };
-        if line.serving == ticket.number {
-            line.serving += 1;
-            while line.abandoned.remove(&line.serving) {
-                line.serving += 1;
-            }
-        } else {
-            line.abandoned.insert(ticket.number);
-        }
-        if line.serving == line.next {
-            lines.remove(&ticket.project);
-        }
-        self.turn.notify_all();
-    }
-}
-
-/// A call's place in its checkout's line, given up when dropped (also on a panic).
-struct Turn<'a> {
-    queues: &'a Queues,
-    ticket: Option<Ticket>,
-}
-
-impl Turn<'_> {
-    fn wait(&self, cancel: &Cancel) -> bool {
-        self.ticket.as_ref().map_or(!cancel.is_cancelled(), |t| self.queues.wait(t, cancel))
-    }
-}
-
-impl Drop for Turn<'_> {
+impl Drop for Ended {
     fn drop(&mut self) {
-        if let Some(ticket) = &self.ticket {
-            self.queues.leave(ticket);
-        }
+        let _ = self.events.send(Event::Done(self.project.take()));
     }
 }
 
@@ -906,6 +944,131 @@ mod tests {
         let answered: Vec<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
         assert_eq!(answered, [1, 3], "the call after the cancelled one still got its turn");
         assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    /// A caller that holds every call until opened, counting how many run at once.
+    #[derive(Default)]
+    struct Gate {
+        /// Open, running now, most ever running, calls run.
+        state: Mutex<(bool, usize, usize, usize)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn caller(self: &Arc<Self>) -> Caller {
+            let gate = Arc::clone(self);
+            Arc::new(move |params: &Value, _: Option<&[PathBuf]>| {
+                let mut state = gate.state.lock().unwrap();
+                state.1 += 1;
+                state.2 = state.2.max(state.1);
+                state.3 += 1;
+                gate.changed.notify_all();
+                while !state.0 && !crate::process::cancelled() {
+                    state = gate.changed.wait_timeout(state, Duration::from_millis(20)).unwrap().0;
+                }
+                state.1 -= 1;
+                json!({ "ran": params["arguments"] })
+            })
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().0 = true;
+            self.changed.notify_all();
+        }
+
+        /// Wait until `n` calls are running.
+        fn running(&self, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut state = self.state.lock().unwrap();
+            while state.1 != n {
+                assert!(Instant::now() < deadline, "{} running, not {n}", state.1);
+                state = self.changed.wait_timeout(state, Duration::from_millis(20)).unwrap().0;
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            let state = self.state.lock().unwrap();
+            (state.2, state.3)
+        }
+    }
+
+    /// A call on no checkout (`stack_ps` without `project`), so only the worker bound holds it.
+    fn anywhere(id: u64) -> String {
+        tool_call(id, "stack_ps", json!({})).to_string()
+    }
+
+    #[test]
+    fn calls_past_the_worker_bound_wait_without_a_thread_and_past_the_waiting_bound_are_refused() {
+        let gate = Arc::new(Gate::default());
+        let (events, received) = mpsc::channel();
+        let (messages, output) = mpsc::channel();
+        let out = Arc::new(Out(Mutex::new(Box::new(Sink { buffer: Vec::new(), messages }))));
+        let mut server = Server::new(out, gate.caller(), events, Profile::Full);
+        let total = (MAX_RUNNING + MAX_WAITING + 1) as u64;
+        for id in 1..=total {
+            server.line(&anywhere(id));
+        }
+        // Only the bound got a thread; the rest wait as data, and the one past both is refused.
+        gate.running(MAX_RUNNING);
+        assert_eq!((server.workers.len(), server.running, server.waiting.len()), (MAX_RUNNING, MAX_RUNNING, MAX_WAITING));
+        let refused = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((refused["id"].as_u64(), refused["error"]["code"].as_i64()), (Some(total), Some(BUSY)), "{refused}");
+        assert_eq!(refused["error"]["data"]["retryable"], true, "{refused}");
+        // A waiting call cancelled never runs and is not answered.
+        let cancelled = (MAX_RUNNING + 1) as u64;
+        server.line(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": cancelled } }).to_string());
+        assert_eq!(server.waiting.len(), MAX_WAITING - 1);
+        // Input ends; every accepted call still runs, never more at once than the bound.
+        gate.open();
+        server.finish(&received);
+        let answered: Vec<Value> = output.try_iter().collect();
+        let ids: BTreeSet<u64> = answered.iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        let expected: BTreeSet<u64> = (1..total).filter(|id| *id != cancelled).collect();
+        assert_eq!(ids, expected);
+        assert!(answered.iter().all(|m| m["result"]["ran"].is_object()), "every accepted call was answered by its result");
+        assert_eq!(gate.counts(), (MAX_RUNNING, (total - 2) as usize), "never more than the bound at once, and the cancelled call never ran");
+        assert!(server.workers.is_empty() && server.busy.is_empty());
+    }
+
+    #[test]
+    fn calls_waiting_for_a_worker_are_answered_after_input_ends() {
+        let gate = Arc::new(Gate::default());
+        let session = Session::start(gate.caller());
+        let total = (MAX_RUNNING + 5) as u64;
+        for id in 1..=total {
+            session.input.as_ref().unwrap().send(anywhere(id)).unwrap();
+        }
+        gate.running(MAX_RUNNING);
+        let opener = std::thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                gate.open();
+            }
+        });
+        let answered: BTreeSet<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        opener.join().unwrap();
+        assert_eq!(answered, (1..=total).collect());
+        assert_eq!(gate.counts().0, MAX_RUNNING);
+    }
+
+    #[test]
+    fn a_busy_checkout_holds_only_its_own_calls_and_keeps_their_order() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let log: Arc<Mutex<Vec<(String, Instant, Instant)>>> = Arc::default();
+        let session = Session::start(sleeper(Arc::clone(&log)));
+        // Many calls on `a` wait for one another without taking a worker each, so `b` still runs.
+        for id in 1..=(MAX_RUNNING as u64 + 2) {
+            session.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": a.path() }, "ms": 20 } }));
+        }
+        session.send(json!({ "jsonrpc": "2.0", "id": 100, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": b.path() }, "ms": 0 } }));
+        let answered: Vec<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        let on_a: Vec<u64> = answered.iter().copied().filter(|id| *id != 100).collect();
+        assert_eq!(on_a, (1..=(MAX_RUNNING as u64 + 2)).collect::<Vec<_>>(), "one checkout's calls run in arrival order");
+        assert!(answered.iter().position(|id| *id == 100).unwrap() < 3, "the other checkout did not wait behind them: {answered:?}");
+        let log = log.lock().unwrap();
+        let on_a: Vec<_> = log.iter().filter(|(d, _, _)| *d == a.path().to_str().unwrap()).collect();
+        assert!(on_a.windows(2).all(|w| w[1].1 >= w[0].2), "two calls on one checkout overlapped");
     }
 
     #[test]

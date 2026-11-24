@@ -256,7 +256,10 @@ try again.
 
 The server reads requests while a call runs, so `ping`, `tools/list` and calls on other
 checkouts are answered meanwhile. Calls on the same checkout run one at a time, in the order
-they arrived.
+they arrived. At most 16 calls run at once; others wait their turn without holding a thread, and
+once 256 calls are waiting a new `tools/call` is refused at once with JSON-RPC error `-32000`
+(`data.retryable: true`): retry it once some finish. When the client closes the server's input,
+every call it already accepted still runs and is answered before the server exits.
 
 - **Cancelling.** `notifications/cancelled` for a running call stops it the way its timeout
   would: its commands are killed with their process groups and no response is sent. A
