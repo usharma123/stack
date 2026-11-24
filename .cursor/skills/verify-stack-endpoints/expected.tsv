@@ -1,0 +1,15 @@
+# config, expected TLC exit code, invariant it must violate (- for a pass), distinct states (one worker).
+config	exit	violated	distinct_states
+FALSE.cfg	0	-	475008
+LIMIT-PerpetualReach.cfg	12	PerpetualReach	8498
+TRUE-CallerVarsIgnored.cfg	12	NoUncheckedReach	9
+TRUE-DuplicateAllowed.cfg	12	NoCheckAnsweredBySibling	155
+TRUE-EndpointsUnmatched.cfg	12	ReportedEndpointsAreOwn	13818
+TRUE-KeepInheritedList.cfg	12	UnverifiedListIsCurrent	2973
+TRUE-LaunchingCountsVerified.cfg	12	NoUncheckedReach	200
+TRUE-NaiveMask.cfg	12	ReportsCarryNoCredentials	5674
+TRUE-ProbeIgnoresCaller.cfg	12	RequireRefusesUnverified	3107
+TRUE-ProcessChangeIgnored.cfg	12	NoUncheckedReach	8526
+TRUE-RemoveInsteadOfPoison.cfg	12	NoUncheckedReach	9
+TRUE-RunRequiresNothing.cfg	12	NoUncheckedReach	9
+TRUE-StaleGenerationTrusted.cfg	12	NoUncheckedReach	8546

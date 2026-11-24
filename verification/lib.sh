@@ -1,6 +1,6 @@
 # Shared by the TLA+ verify skills under .cursor/skills/verify-stack-*/: source it, then call
-# `verify_model <skill dir> <spec>` and `verify_rust <test>...`. Needs bash, Java 11+, git,
-# curl, and sha256sum or shasum.
+# `verify_model <skill dir> <spec>` and `verify_rust <test>...` (or `verify_rust_list <file>`).
+# Needs bash, Java 11+, git, curl, and sha256sum or shasum.
 set -euo pipefail
 
 VERIFY_ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -91,20 +91,52 @@ verify_model() {
   return "$failed"
 }
 
-# Run the named Rust library tests, each exactly, and require each to pass. Set
-# VERIFY_SKIP_RUST=1 to check only the models; CARGO overrides the command (e.g.
-# CARGO="cargo +1.93.1").
+# Run the named Rust tests, each exactly, and require each to pass. A name is a library test
+# (`module::tests::name`), or an integration test as `tests/<crate>.rs <name>`; each target is
+# built and run once. Set VERIFY_SKIP_RUST=1 to check only the models; CARGO overrides the
+# command (e.g. CARGO="cargo +1.93.1"), and CARGO_BUILD_JOBS bounds the build as usual.
 verify_rust() {
   if [ "${VERIFY_SKIP_RUST:-0}" = 1 ]; then
     echo "Rust tests skipped (VERIFY_SKIP_RUST=1)"
     return 0
   fi
-  local cargo test
+  local cargo test target targets=() names=() name entry
   read -r -a cargo <<<"${CARGO:-cargo}"
-  (cd "$VERIFY_ROOT" && "${cargo[@]}" test --locked --target-dir "$VERIFY_ROOT/target/verification/build" --lib -- --exact "$@") \
-    >"$EVIDENCE/rust.log" 2>&1 || { tail -40 "$EVIDENCE/rust.log" >&2; return 1; }
-  for test in "$@"; do
-    grep -Fxq "test $test ... ok" "$EVIDENCE/rust.log" || { echo "Rust test $test did not pass; see $EVIDENCE/rust.log" >&2; return 1; }
+  : >"$EVIDENCE/rust.log"
+  for entry in "$@"; do
+    case "$entry" in
+      "tests/"*" "*) target=${entry%% *}; target=${target#tests/}; target=${target%.rs} ;;
+      *) target=lib ;;
+    esac
+    case " ${targets[*]-} " in *" $target "*) ;; *) targets+=("$target") ;; esac
   done
-  echo "Rust: $# tests passed ($EVIDENCE/rust.log)"
+  for target in "${targets[@]}"; do
+    names=()
+    for entry in "$@"; do
+      case "$entry" in
+        "tests/$target.rs "*) names+=("${entry#* }") ;;
+        "tests/"*) ;;
+        *) [ "$target" = lib ] && names+=("$entry") ;;
+      esac
+    done
+    local select=(--lib)
+    [ "$target" = lib ] || select=(--test "$target")
+    (cd "$VERIFY_ROOT" && "${cargo[@]}" test --locked --target-dir "$VERIFY_ROOT/target/verification/build" "${select[@]}" -- --exact "${names[@]}") \
+      >>"$EVIDENCE/rust.log" 2>&1 || { tail -40 "$EVIDENCE/rust.log" >&2; return 1; }
+  done
+  for entry in "$@"; do
+    name=${entry#tests/* }
+    grep -Fxq "test $name ... ok" "$EVIDENCE/rust.log" || { echo "Rust test $entry did not pass; see $EVIDENCE/rust.log" >&2; return 1; }
+  done
+  echo "Rust: $# tests passed (${targets[*]}; $EVIDENCE/rust.log)"
+}
+
+# verify_rust with the tests listed in the file $1, one per line (`#` comments and blank lines
+# skipped).
+verify_rust_list() {
+  local tests=() test
+  while IFS= read -r test; do
+    case "$test" in ''|'#'*) ;; *) tests+=("$test") ;; esac
+  done <"$1"
+  verify_rust "${tests[@]}"
 }

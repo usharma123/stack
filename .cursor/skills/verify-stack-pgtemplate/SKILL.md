@@ -3,7 +3,7 @@ name: verify-stack-pgtemplate
 description: Check PostgreSQL template generation lookup when Stack's cache entry is discarded and rebuilt concurrently with a record read.
 ---
 
-From the repository root, run `.cursor/skills/verify-stack-pgtemplate/check.sh`, or `verification/check.sh pgtemplate`, which runs it among Stack's other models (`verify-stack-session`, `verify-stack-snapshot`). This needs Java, Cargo, ripgrep, curl, and shasum. The runner downloads the TLA+ v1.7.4 release jar on first use and checks its SHA-256 on every run, a cached copy included. Read the TLC results with pstack `/statechart`. Logs survive under the printed `target/verification/pgtemplate.*` directory.
+From the repository root, run `.cursor/skills/verify-stack-pgtemplate/check.sh`, or `verification/check.sh pgtemplate`, which runs it among Stack's other models (`verify-stack-session`, `verify-stack-snapshot`, `verify-stack-endpoints`, `verify-stack-bundles`). This needs Java, Cargo, ripgrep, curl, and shasum. The runner downloads the TLA+ v1.7.4 release jar on first use and checks its SHA-256 on every run, a cached copy included. Read the TLC results with pstack `/statechart`. Logs survive under the printed `target/verification/pgtemplate.*` directory.
 
 An accepted template record must come from the directory observed by both identity checks. If a stale record is accepted for a replacement directory, Stack can reject a valid template and fall back to a fresh PostgreSQL initialization.
 
