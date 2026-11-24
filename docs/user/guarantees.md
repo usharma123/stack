@@ -82,6 +82,11 @@
   last search; an older Stack's commands beyond the first `down`; a command a service starts in
   the service's own process group, which ends with the service; and a recreated directory that
   inherits the old inode on a filesystem without creation times.
+- **Data is removed only where Stack recorded it.** `down --purge` and `gc --reclaim-data`
+  remove only the data directory `up` recorded, reached with no link followed, as that same
+  directory, its marker naming the checkout, and never across a mount: data that is a mount
+  point or holds one, a bind mount of the same filesystem included, is kept and reported (see
+  [gc](commands.md#gc)).
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was
   granted. Values never enter `stack.lock`, generated config, session records or logs, and
   are redacted from output captured with `--json` or MCP. Terminal output is not redacted, and

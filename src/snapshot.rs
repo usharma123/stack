@@ -427,7 +427,8 @@ fn replace(fresh: &Path, target: &Path) -> Result<&'static str> {
         return Ok("rename");
     }
     if exchange(fresh, target) {
-        remove_tree(fresh);
+        // `fresh` now holds the old data: removed only up to a mount inside it, never across.
+        let _ = datadirs::remove_tree(fresh);
         return Ok("exchange");
     }
     let parent = target.parent().unwrap_or(Path::new("/"));
@@ -437,7 +438,7 @@ fn replace(fresh: &Path, target: &Path) -> Result<&'static str> {
         let _ = fs::rename(&aside, target);
         return Err(io_error(target.display(), e));
     }
-    remove_tree(&aside);
+    let _ = datadirs::remove_tree(&aside);
     Ok("rename")
 }
 

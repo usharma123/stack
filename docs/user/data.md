@@ -139,7 +139,9 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
   checkout (the record `stack gc --reclaim-data` and `stack mv` use): the supervisor must name
   it, it must still be the same directory, reached with no link followed, and carry this
   checkout's marker. Anything else fails with `snapshot_failed` or `snapshot_unsupported`, and
-  nothing is copied or replaced. After a restore the record names the new directory.
+  nothing is copied or replaced. After a restore the record names the new directory, and the
+  old data is removed as `gc --reclaim-data` removes data: never across a mount inside it (it
+  is left where it was set aside, `.<name>.stack-old` or `.<name>.stack-restore`, instead).
 - **Only while stopped.** `save` and `restore` take the project lock, stop the affected
   services if they run, and the services that `depends_on` them, and confirm they are gone, as
   `stack restart` does. They check that the supervisor agrees, copy, then start them again (each

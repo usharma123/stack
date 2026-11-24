@@ -5273,7 +5273,14 @@ fn purge_locked(ctx: &Ctx) -> Result<PurgeReport> {
 /// The directory is only ever the one `up` recorded, reached by its recorded location with no
 /// link followed (see [`crate::datadirs::hold`]); its marker is read, and it is removed, through
 /// the handles that check opened, never by looking a path up again.
+///
+/// Nothing on another mount is removed: a data directory that is a mount point, or holds one, is
+/// kept and reported (see [`crate::datadirs::Held::remove`]).
 fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) {
+    reclaim_data_with(entry, remove, |held| held.remove(MARKER_SUFFIX))
+}
+
+fn reclaim_data_with(entry: &crate::datadirs::Entry, remove: bool, removal: impl FnOnce(crate::datadirs::Held) -> std::io::Result<u64>) -> (String, bool) {
     use crate::datadirs::Found;
     let dir = &entry.dir;
     let shown = dir.display();
@@ -5303,7 +5310,7 @@ fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) 
     if !remove {
         return (format!("data kept in {shown} ({} bytes); `stack gc --reclaim-data` removes it", held.size()), false);
     }
-    match held.remove(MARKER_SUFFIX) {
+    match removal(held) {
         Ok(bytes) => (format!("data in {shown} removed ({bytes} bytes)"), true),
         Err(e) => (format!("data in {shown} could not be removed: {e}"), false),
     }
@@ -7664,6 +7671,52 @@ mod native_records {
         assert!(ports::lookup(&state, &root).unwrap().is_empty());
         crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
         assert!(crate::identity::lookup(&state, &root).unwrap().is_empty());
+    }
+
+    /// `down --purge` and `gc --reclaim-data` (both through `reclaim_data`) keep data that holds
+    /// a mount, and its record, so a later pass can try again; with no mount it is removed.
+    #[cfg(unix)]
+    #[test]
+    fn reclaimed_data_holding_a_mount_is_kept_with_its_record() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = tmp.path().join("supervisor");
+        fs::create_dir_all(&sup).unwrap();
+        fs::write(sup.join("state.json"), serde_json::to_vec(&supervisor::State::default()).unwrap()).unwrap();
+        let dir = tmp.path().join("data/pg");
+        fs::create_dir_all(dir.join("mounted")).unwrap();
+        fs::write(dir.join("mounted/rows"), b"keep").unwrap();
+        fs::write(data_marker(&dir), json!({ "checkout": "t-mount" }).to_string()).unwrap();
+        let (location, identity) = crate::datadirs::locate(&dir);
+        let entry = crate::datadirs::Entry {
+            project: tmp.path().join("gone"),
+            service: "pg".into(),
+            dir: dir.clone(),
+            checkout: "t-mount".into(),
+            supervisor: Some(crate::datadirs::Supervisor { pitchfork: None, state_dir: sup, id: "pg".into() }),
+            location,
+            identity,
+            project_device: None,
+        };
+        // As the kernel would answer with a bind mount at `mounted`.
+        let mounted = fs::symlink_metadata(dir.join("mounted")).unwrap().ino();
+        struct Bind(u64);
+        impl crate::datadirs::imp_boundary::Boundary for Bind {
+            fn mount(&self, fd: &std::os::fd::OwnedFd, st: &libc::stat) -> std::io::Result<crate::datadirs::imp_boundary::Mount> {
+                let real = crate::datadirs::imp_boundary::Kernel.mount(fd, st)?;
+                #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+                let bind = st.st_ino as u64 == self.0;
+                Ok(if bind { crate::datadirs::imp_boundary::Mount { id: Some(real.id.unwrap_or(0) + 1000), ..real } } else { real })
+            }
+        }
+        let (outcome, done) = reclaim_data_with(&entry, true, |held| held.remove_within(Some(MARKER_SUFFIX), &Bind(mounted)));
+        assert!(outcome.contains("could not be removed") && outcome.contains("mounted inside it is a mount point"), "{outcome}");
+        assert!(!done, "its record is kept");
+        assert_eq!(fs::read(dir.join("mounted/rows")).unwrap(), b"keep");
+        assert!(data_marker(&dir).exists());
+        let (outcome, done) = reclaim_data(&entry, true);
+        assert!(outcome.contains("removed (4 bytes)") && done, "{outcome}");
+        assert!(!dir.exists());
     }
 
     /// Stack's supervisor confirms a recorded data directory's service stopped from its state

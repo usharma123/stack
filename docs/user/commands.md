@@ -696,6 +696,12 @@ reported with its size and kept; `--reclaim-data` removes it. Data is removed on
   put in its place marker and all, is left alone; it is removed through the directory checked,
   never by looking its path up again. Data recorded before its directory existed is kept until
   an `up` sees it,
+- nothing of it is on another mount: the directory is no mount point itself and nothing under
+  it is one, a bind mount of the same filesystem included (Linux tells those apart by the
+  kernel's mount id, from `statx`, else `/proc/self/fdinfo`; a kernel that gives neither keeps
+  the data). Each directory is checked as it was opened, not as its path named it. A mount
+  found keeps all of the data, and one put there while the data is being removed stops the
+  removal before it; either way the result says where, and the record is kept,
 - the supervisor recorded with it confirms the service is not running, and
 - no process carrying the checkout's token runs.
 

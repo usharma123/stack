@@ -226,7 +226,12 @@ pub fn hold(entry: &Entry) -> Found {
 }
 
 #[cfg(unix)]
-pub use imp::Held;
+pub use imp::{remove_tree, Held};
+/// How data removal learns which mount a directory is on, for tests to stand in for the kernel.
+#[cfg(all(unix, test))]
+pub(crate) mod imp_boundary {
+    pub(crate) use super::imp::{Boundary, Kernel, Mount};
+}
 
 #[cfg(unix)]
 mod imp {
@@ -363,16 +368,46 @@ mod imp {
             Some(bytes)
         }
 
-        /// Bytes of regular files in the directory, never following links.
+        /// Bytes of regular files in the directory, never following links, nor counting what a
+        /// mount inside it holds.
         pub fn size(&self) -> u64 {
-            walk(&self.dir, false).unwrap_or(0)
+            self.size_within(&Kernel)
+        }
+
+        /// [`Held::size`], learning which mount each directory is on from `boundary`.
+        pub(crate) fn size_within(&self, boundary: &dyn Boundary) -> u64 {
+            let Ok(st) = fstat(&self.dir) else { return 0 };
+            let Ok(mount) = boundary.mount(&self.dir, &st) else { return 0 };
+            walk(&self.dir, Walk::Size, &Within { mount, boundary }, Path::new("")).unwrap_or(0)
         }
 
         /// Remove everything in the held directory, then the directory and the `suffix` file
         /// beside it from the held parent, provided the name there still is this directory.
         /// Returns the bytes of regular files removed.
+        ///
+        /// Nothing on another mount is ever removed: the directory must be on its parent's mount
+        /// (it is no mount point itself), and nothing under it may be a mount point, a bind mount
+        /// of the same filesystem included. Both are checked on every directory as opened, not as
+        /// its path named it, before anything is removed and again while removing; a mount found
+        /// before refuses the removal whole, one that appears during it stops it there.
         pub fn remove(self, suffix: &str) -> io::Result<u64> {
-            let bytes = walk(&self.dir, true)?;
+            self.remove_within(Some(suffix), &Kernel)
+        }
+
+        /// [`Held::remove`], learning which mount each directory is on from `boundary`, and
+        /// removing the `suffix` file beside it when there is one.
+        pub(crate) fn remove_within(self, suffix: Option<&str>, boundary: &dyn Boundary) -> io::Result<u64> {
+            let mount = boundary.mount(&self.dir, &fstat(&self.dir)?)?;
+            let parent = boundary.mount(&self.parent, &fstat(&self.parent)?)?;
+            if mount != parent {
+                return Err(io::Error::other(format!(
+                    "it is a mount point ({}); Stack never removes what a mount holds, and nothing was removed",
+                    mount.differs(&parent)
+                )));
+            }
+            let within = Within { mount, boundary };
+            walk(&self.dir, Walk::Check, &within, Path::new(""))?;
+            let bytes = walk(&self.dir, Walk::Remove, &within, Path::new(""))?;
             let now = stat_at(&self.parent, &self.name)?;
             if id(&now) != self.identity {
                 return Err(io::Error::other("the directory was replaced while it was being removed; what replaced it is left alone"));
@@ -381,6 +416,7 @@ mod imp {
             if unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
                 return Err(io::Error::last_os_error());
             }
+            let Some(suffix) = suffix else { return Ok(bytes) };
             let mut marker = self.name.as_bytes().to_vec();
             marker.extend_from_slice(suffix.as_bytes());
             let marker = CString::new(marker).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))?;
@@ -393,6 +429,24 @@ mod imp {
             }
             Ok(bytes)
         }
+    }
+
+    /// Remove the directory at `path` (an absolute path) and everything under it as
+    /// [`Held::remove`] does: never following a link, and never removing anything when it or
+    /// anything under it is on another mount than the directory holding it.
+    pub fn remove_tree(path: &Path) -> io::Result<u64> {
+        remove_tree_within(path, &Kernel)
+    }
+
+    pub(crate) fn remove_tree_within(path: &Path, boundary: &dyn Boundary) -> io::Result<u64> {
+        let (Some(parent_path), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} names no directory to remove", path.display())));
+        };
+        let parent = open_at(None, &cstring(parent_path.as_os_str())?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let name = cstring(name)?;
+        let dir = open_at(Some(&parent), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let identity = id(&fstat(&dir)?);
+        Held { parent, name, dir, identity }.remove_within(None, boundary)
     }
 
     impl Held {
@@ -466,9 +520,103 @@ mod imp {
         }
     }
 
-    /// Bytes of regular files under `dir`, removing everything under it when `remove`. Links
-    /// are never followed: a link is removed (or counted as nothing) itself.
-    fn walk(dir: &OwnedFd, remove: bool) -> io::Result<u64> {
+    /// Which mount a directory is on: its filesystem's device and, on Linux, the kernel's id of
+    /// the mount, which tells a bind mount of the same filesystem (same device) from the
+    /// directory it is mounted on.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Mount {
+        pub dev: u64,
+        pub id: Option<u64>,
+    }
+
+    impl Mount {
+        /// How `self` differs from `other`, said for a person.
+        fn differs(&self, other: &Mount) -> String {
+            if self.dev != other.dev {
+                format!("device {}, not {}", self.dev, other.dev)
+            } else {
+                format!("mount {}, not {}, of the same filesystem", self.id.unwrap_or(0), other.id.unwrap_or(0))
+            }
+        }
+    }
+
+    /// How the mount of an open directory is learned: from the kernel, or as a test says.
+    pub(crate) trait Boundary {
+        /// The mount `dir` (whose `fstat` is `st`) is on; an error when it cannot be told.
+        fn mount(&self, dir: &OwnedFd, st: &libc::stat) -> io::Result<Mount>;
+    }
+
+    /// The kernel's answer, from the open directory itself (so a mount put at its path after it
+    /// was opened changes nothing).
+    pub(crate) struct Kernel;
+
+    impl Boundary for Kernel {
+        fn mount(&self, dir: &OwnedFd, st: &libc::stat) -> io::Result<Mount> {
+            Ok(Mount { dev: id(st)[0], id: mount_id(dir)? })
+        }
+    }
+
+    /// Linux: `statx`'s mount id (5.8), else the `mnt_id` of the descriptor in
+    /// `/proc/self/fdinfo` (3.15). Neither answering refuses: without it a bind mount of the same
+    /// filesystem cannot be told from a directory.
+    #[cfg(target_os = "linux")]
+    fn mount_id(dir: &OwnedFd) -> io::Result<Option<u64>> {
+        statx_mount_id(dir)
+            .or_else(|| fdinfo_mount_id(dir))
+            .map(Some)
+            .ok_or_else(|| io::Error::other("which mount a directory is on cannot be told (neither statx nor /proc/self/fdinfo says)"))
+    }
+
+    /// macOS has no bind mounts: every mount is a filesystem of its own, with its own device.
+    #[cfg(not(target_os = "linux"))]
+    fn mount_id(_: &OwnedFd) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn statx_mount_id(dir: &OwnedFd) -> Option<u64> {
+        // The kernel's `struct statx` (256 bytes, `stx_mask` at 0 and `stx_mnt_id` at 144),
+        // called directly: not every libc Stack builds against declares it.
+        const STX_MNT_ID: u32 = 0x1000;
+        #[repr(C, align(8))]
+        struct Statx([u8; 256]);
+        let mut buf = Statx([0; 256]);
+        // SAFETY: statx with AT_EMPTY_PATH on a valid descriptor and an empty NUL-terminated
+        // name writes at most the 256 bytes of `struct statx` into `buf`.
+        let rc = unsafe {
+            libc::syscall(libc::SYS_statx, dir.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, STX_MNT_ID, buf.0.as_mut_ptr())
+        };
+        let mask = u32::from_ne_bytes(buf.0[0..4].try_into().ok()?);
+        (rc == 0 && mask & STX_MNT_ID != 0).then(|| u64::from_ne_bytes(buf.0[144..152].try_into().expect("8 bytes")))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fdinfo_mount_id(dir: &OwnedFd) -> Option<u64> {
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", dir.as_raw_fd())).ok()?;
+        info.lines().find_map(|l| l.strip_prefix("mnt_id:")).and_then(|v| v.trim().parse().ok())
+    }
+
+    /// The mount a walk keeps to, and how it learns where each directory is.
+    struct Within<'a> {
+        mount: Mount,
+        boundary: &'a dyn Boundary,
+    }
+
+    /// What a [`walk`] does: count bytes (a mount inside is not counted), check that nothing
+    /// under the directory is on another mount, or remove everything under it (stopping at a
+    /// mount).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Walk {
+        Size,
+        Check,
+        Remove,
+    }
+
+    /// Bytes of regular files under `dir` (`at` below the directory walked from), removing
+    /// everything under it for [`Walk::Remove`]. Links are never followed: a link is removed (or
+    /// counted as nothing) itself. Each directory is opened, then checked as opened: still the
+    /// directory looked at, and on the walk's mount.
+    fn walk(dir: &OwnedFd, mode: Walk, within: &Within, at: &Path) -> io::Result<u64> {
         let mut bytes = 0;
         for name in names(dir)? {
             let st = match stat_at(dir, &name) {
@@ -477,12 +625,29 @@ mod imp {
             };
             let directory = is(&st, libc::S_IFDIR);
             if directory {
+                let shown = at.join(OsStr::from_bytes(name.as_bytes()));
                 let child = open_at(Some(dir), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
-                bytes += walk(&child, remove)?;
+                let opened = fstat(&child)?;
+                if id(&opened) != id(&st) {
+                    return Err(io::Error::other(format!("{} changed while it was walked; left alone", shown.display())));
+                }
+                let mount = within.boundary.mount(&child, &opened)?;
+                if mount != within.mount {
+                    if mode == Walk::Size {
+                        continue;
+                    }
+                    return Err(io::Error::other(format!(
+                        "{} inside it is a mount point ({}); Stack never removes what a mount holds{}",
+                        shown.display(),
+                        mount.differs(&within.mount),
+                        if mode == Walk::Check { ", and nothing was removed" } else { "; removal stopped there" }
+                    )));
+                }
+                bytes += walk(&child, mode, within, &shown)?;
             } else if is(&st, libc::S_IFREG) {
                 bytes += u64::try_from(st.st_size).unwrap_or(0);
             }
-            if remove {
+            if mode == Walk::Remove {
                 let flag = if directory { libc::AT_REMOVEDIR } else { 0 };
                 // SAFETY: unlinkat with a held descriptor and a NUL-terminated name.
                 if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flag) } != 0 {
@@ -508,6 +673,11 @@ mod imp {
 
 #[cfg(not(unix))]
 pub struct Held;
+
+#[cfg(not(unix))]
+pub fn remove_tree(path: &Path) -> std::io::Result<u64> {
+    std::fs::remove_dir_all(path).map(|()| 0)
+}
 
 #[cfg(not(unix))]
 impl Held {
@@ -720,6 +890,129 @@ mod tests {
         assert_eq!(found.size(), 5);
         found.remove(".stack-checkout").unwrap();
         assert_eq!(std::fs::read(outside.path().join("big")).unwrap().len(), 1000);
+    }
+
+    /// Where each directory is mounted, as the kernel says, except the directories (by inode)
+    /// a test puts on another mount: with its own device, or as a bind mount of the same
+    /// filesystem (same device, another mount id), from the `after`-th question about it on.
+    #[cfg(unix)]
+    struct Mounted {
+        at: Vec<(u64, bool, usize)>,
+        asked: std::cell::RefCell<std::collections::HashMap<u64, usize>>,
+    }
+
+    #[cfg(unix)]
+    impl Mounted {
+        fn new(at: &[(&Path, bool, usize)]) -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let at = at.iter().map(|(p, bind, after)| (std::fs::symlink_metadata(p).unwrap().ino(), *bind, *after)).collect();
+            Self { at, asked: Default::default() }
+        }
+    }
+
+    #[cfg(unix)]
+    impl imp::Boundary for Mounted {
+        fn mount(&self, dir: &std::os::fd::OwnedFd, st: &libc::stat) -> std::io::Result<imp::Mount> {
+            let real = imp::Kernel.mount(dir, st)?;
+            #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+            let ino = st.st_ino as u64;
+            let mut asked = self.asked.borrow_mut();
+            let n = asked.entry(ino).or_default();
+            *n += 1;
+            Ok(match self.at.iter().find(|(i, _, after)| *i == ino && *n > *after) {
+                Some((_, true, _)) => imp::Mount { id: Some(real.id.unwrap_or(0) + 1000), ..real },
+                Some((_, false, _)) => imp::Mount { dev: real.dev.wrapping_add(1), ..real },
+                None => real,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_on_another_mount_inside_the_data_is_removed() {
+        for bind in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (parent, entry) = recorded(root.path());
+            let found = held(hold(&entry));
+            // A mount at `data/sub`: refused before anything is removed.
+            let mounted = Mounted::new(&[(&parent.join("data/sub"), bind, 0)]);
+            assert_eq!(found.size_within(&mounted), 3, "what the mount holds is not counted");
+            let e = found.remove_within(Some(".stack-checkout"), &mounted).unwrap_err().to_string();
+            assert!(e.contains("sub inside it is a mount point") && e.contains("nothing was removed"), "{e}");
+            assert!(e.contains(if bind { "of the same filesystem" } else { "device" }), "{e}");
+            assert!(intact(&parent), "bind {bind}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_directory_that_is_itself_a_mount_point_is_not_emptied() {
+        for bind in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (parent, entry) = recorded(root.path());
+            let mounted = Mounted::new(&[(&parent.join("data"), bind, 0)]);
+            let e = held(hold(&entry)).remove_within(Some(".stack-checkout"), &mounted).unwrap_err().to_string();
+            assert!(e.contains("it is a mount point") && e.contains("nothing was removed"), "{e}");
+            assert!(intact(&parent), "bind {bind}");
+        }
+    }
+
+    /// A mount put at a path inside the data after the check that found none: the removal
+    /// learns it from the directory it opened there, and stops before going into it.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_put_inside_the_data_during_its_removal_stops_it_there() {
+        let root = tempfile::tempdir().unwrap();
+        let (parent, entry) = recorded(root.path());
+        // `sub` is asked about once by the check, then again, now mounted, by the removal.
+        let mounted = Mounted::new(&[(&parent.join("data/sub"), true, 1)]);
+        let e = held(hold(&entry)).remove_within(Some(".stack-checkout"), &mounted).unwrap_err().to_string();
+        assert!(e.contains("sub inside it is a mount point") && e.contains("removal stopped there"), "{e}");
+        assert_eq!(std::fs::read(parent.join("data/sub/more")).unwrap(), b"45", "what the mount holds is untouched");
+        assert!(parent.join("data.stack-checkout").exists(), "the marker stays with what is left");
+    }
+
+    /// Data removed by its path (snapshot restore's old data): the same refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_removed_by_its_path_is_never_removed_across_a_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let (parent, _) = recorded(root.path());
+        let mounted = Mounted::new(&[(&parent.join("data/sub"), true, 0)]);
+        let e = imp::remove_tree_within(&parent.join("data"), &mounted).unwrap_err().to_string();
+        assert!(e.contains("mount point"), "{e}");
+        assert!(intact(&parent));
+        assert_eq!(remove_tree(&parent.join("data")).unwrap(), 5);
+        assert!(!parent.join("data").exists() && parent.join("data.stack-checkout").exists());
+    }
+
+    /// The kernel's answer for directories on one filesystem: one mount, so the data is removed.
+    #[cfg(unix)]
+    #[test]
+    fn directories_on_one_mount_are_on_the_same_mount() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        let open = |p: &Path| {
+            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: open with a NUL-terminated path; the descriptor is owned here.
+            unsafe { OwnedFd::from_raw_fd(libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)) }
+        };
+        let mount = |p: &Path| {
+            let fd = open(p);
+            // SAFETY: fstat with a valid descriptor and local storage.
+            let st = unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                assert_eq!(libc::fstat(std::os::fd::AsRawFd::as_raw_fd(&fd), &mut st), 0);
+                st
+            };
+            imp::Boundary::mount(&imp::Kernel, &fd, &st).unwrap()
+        };
+        assert_eq!(mount(root.path()), mount(&root.path().join("a/b")));
+        #[cfg(target_os = "linux")]
+        assert!(mount(root.path()).id.is_some(), "Linux tells mounts apart");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(mount(root.path()).id, None);
     }
 
     #[cfg(unix)]
