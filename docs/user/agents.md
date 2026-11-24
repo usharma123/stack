@@ -15,12 +15,21 @@ Any other MCP client: launch the command `stack` with the argument `mcp`.
 
 **Pass `dir` on every call.** One registered server is shared by every agent on the machine,
 whatever checkout it works in, so the server never acts on its own working directory. Each tool
-takes `dir`, the absolute path of the checkout. It may be left out only when the client
+takes `dir`, an absolute path. It may be left out only when the client
 supports MCP roots and exposes exactly one: the server asks for `roots/list` after
 `initialize` (and again on `notifications/roots/list_changed`) and uses that root. Otherwise a
-call without `dir`, or with a relative one, fails with a `usage` error. Every result carries
-the checkout it acted on as `project`, an absolute path. `stack_gc`, `stack_ps` and `stack_mv`
-act machine-wide and need no `dir`, as does `stack_errors`.
+call without `dir`, or with a relative one, fails with a `usage` error, and a `dir` that does
+not exist with `dir_not_found`.
+
+Like the CLI, the server finds the project from a subdirectory: when `dir` (or the one root)
+holds no `stack.toml`, the nearest one above it is used, searching no higher than the Git
+worktree root (or `$HOME` outside Git). When there is none, the call keeps `dir`, and tools that
+need a project fail with `manifest_missing`, saying where the search went. `stack_exec` given a
+subdirectory runs its command there, as `stack exec` does. `stack_init` never searches: it
+writes `stack.toml` in exactly `dir`, so calling it in a subdirectory starts a new project
+there. Every result carries the checkout it acted on as `project`, an absolute path: the
+directory whose `stack.toml` was found. `stack_gc`, `stack_ps` and `stack_mv`
+act machine-wide and need no `dir`, as does `stack_errors`; their `dir` is never searched.
 
 | Tool | Does |
 |---|---|
@@ -30,22 +39,35 @@ act machine-wide and need no `dir`, as does `stack_errors`.
 | `stack_exec` | Runs any other command (an argv list) with the stack's tools and env |
 | `stack_restart` | Restarts services after you edit code they loaded |
 | `stack_logs` | Shows recent output of one service, or of every service; `grep`, `ignore_case` and `since` filter it |
-| `stack_down` | Stops everything and confirms it is gone |
+| `stack_down` | Stops the services and confirms everything is gone; not confirmed while a command you started still runs |
 | `stack_ps` | Lists every checkout on the machine, its services and data size (liveness only) |
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
 | `stack_inspect`, `stack_compile`, `stack_install`, `stack_renew`, `stack_gc`, `stack_doctor` | Same as the CLI commands |
 | `stack_skill` | Returns the [agent skill](skills.md) a pinned tool ships (CLI: `stack skill <tool>`) |
-| `stack_init` | Writes a starting `stack.toml` (`tools`, `services`), like `stack init` |
+| `stack_init` | Writes a starting `stack.toml` (`tools`, `services`, and `detect: true` to add what the checkout's files suggest), like `stack init` |
 | `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapshot_list`, `stack_snapshot_rm` | Save a checkout's Postgres and Redis data and restore it in any checkout of the project, like `stack snapshot` ([service data](data.md)) |
 | `stack_errors` | Lists every [error code](errors.md): its meaning, default hint, `retryable` and `next` (CLI: `stack errors`) |
 | `stack_env` | The environment `stack_exec` would give a command, with what is withheld. Prefer `stack_exec`, which checks every time |
 
-Each tool has a `title`, a short description that says when to use it, a description for
-every argument, and the standard MCP hints: `readOnlyHint` for `stack_status`,
+Each tool has a short description that says when to use it, a one-line description for every
+argument whose name does not say it all, and the standard MCP annotations: a `title`, `readOnlyHint` for `stack_status`,
 `stack_inspect`, `stack_logs`, `stack_skill`, `stack_doctor`, `stack_ps`, `stack_env`,
 `stack_errors` and `stack_snapshot_list`, `destructiveHint` for `stack_down`, `stack_gc`, `stack_snapshot_restore`
 and `stack_snapshot_rm`, and `idempotentHint` for those that are
 safe to repeat (`stack_up`, `stack_down`, `stack_compile` and `stack_install` among them).
+
+Definitions are kept short, since a client may put every one in its model's context; what a
+result means is said once, in the server's instructions and on this page, not in every tool.
+Clients that pay for each tool can register only the daily loop:
+
+```sh
+claude mcp add stack -- stack mcp --profile core
+```
+
+`--profile core` offers `stack_up`, `stack_status`, `stack_run`, `stack_exec`,
+`stack_restart`, `stack_logs`, `stack_down` and `stack_ps`, without their `outputSchema`
+(results are the same envelope). Any other tool is `unknown_tool` there, with a hint that it
+needs the default `--profile full`.
 
 The server also offers this page as the resource `stack://guide`, takes `logging/setLevel`
 (it warns, for example, when a client's roots cannot be used), negotiates the protocol revision
@@ -68,13 +90,16 @@ To save a round-trip, `stack exec --up -- <command>` and `stack run --up <task>`
 stack first when it needs it (no session, a stale or expired one, or a service that does not
 verify), and `stack exec --install` installs missing pinned tools instead of failing with
 `tools_not_installed`. Over MCP these are `up`, `ttl` and `install` on `stack_exec` and
-`stack_run`; what ran is listed under `prepared`.
+`stack_run`; what ran is listed under `prepared`. A session `--up` starts without a lease to
+keep gets the project's `[session] default_ttl`, else a 30-minute TTL, so a one-shot call never
+leaves services running forever; pass `--ttl` for a longer one.
 
 A few things that are easy to get wrong:
 
 - **Read connection details from the environment.** `DATABASE_URL`, `REDIS_URL`,
   `<NAME>_PORT` and, for your own services, `<NAME>_URL` (`http://127.0.0.1:<port>`) are set
-  for every command. Ports differ per checkout, so never hardcode one.
+  for every command. Ports differ per checkout, so never hardcode one. `status` and `up` list a
+  verified service's variables and values under `endpoints` in its check.
 - **Declare `depends_on` for a service that holds connections to another**, such as an API to
   Postgres. Then a restart or recovery of Postgres restarts the API too; without it, the API
   keeps its dead connection while every check still passes.
@@ -88,6 +113,23 @@ A few things that are easy to get wrong:
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
   `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
   `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
+- **`down` is confirmed only once your commands are gone too.** A command you started with
+  `exec` or `run` (a dev server, a watcher, something you backgrounded) keeps the checkout's
+  `DATABASE_URL` and ports after the services stop. `stack down` stops the services anyway, but
+  it never stops your commands: while one runs it fails `stop_unconfirmed`, and each such
+  command is a detail with `"kind": "command"` (`pid`, `program`, `started_by`,
+  `running_secs`). Branch on that: details with `kind: "command"` mean "end or wait for these
+  commands, then run `stack down` again", and retrying sooner gives the same answer; details
+  without a `kind` are service processes that did not stop, where a retry is the fix; a
+  detail with `kind: "registry"` means Stack cannot read its record of your commands (the
+  message names the file and the hint what to check).
+  `"another_checkout": true` marks another checkout's process holding this checkout's token:
+  look at that checkout. `started_by: "older stack"` is a command an older Stack started: wait
+  for that call to finish or restart that session under this Stack. A `kind: "registry"` detail
+  about a command "whose process was never recorded" clears with `stack down
+  --forget-unrecorded` (MCP `forget_unrecorded`) once you have checked it no longer runs. `stack status` lists the commands Stack registered
+  under `commands`. See [commands still
+  running](commands.md#commands-still-running) for what can and cannot be found.
 - **Port conflicts.** `stack up --reassign-ports` (MCP `reassign_ports`) moves this checkout's
   conflicting ports and continues; the other program is left alone.
 - **Do not work around `artifact_mismatch`.** It means a download differs from what
@@ -95,21 +137,22 @@ A few things that are easy to get wrong:
   expected upstream.
 - **`stack logs <service> --since-start`** shows only the current process's output.
   `stack logs --grep error -i` searches every service's output at once.
-- **The CLI finds the project from a subdirectory**, up to the Git worktree root. `exec` runs
-  your command in the directory you called it from. Pass `-C` to be explicit. MCP `dir` is
-  never searched upward: it must be the directory that holds `stack.toml`.
+- **The CLI and MCP `dir` find the project from a subdirectory**, up to the Git worktree root.
+  `exec` (and `stack_exec`) runs your command in the directory you called it from. Pass `-C`
+  to be explicit; `-C` is never searched upward. `init` (and `stack_init`) writes in exactly
+  the directory given.
 
 ## Reading results
 
 With `--json`, every command prints one object on stdout. MCP returns the same object as
-`structuredContent`, and every tool's `outputSchema` describes it (`ok`, then `data` or
+`structuredContent`, and every tool's `outputSchema` (under the default `--profile full`) describes it (`ok`, then `data` or
 `error` with `code`, `message`, `hint` and `details`). `ok` says whether Stack did what you asked, not whether your command
 passed:
 
 | Operation | Succeeded when |
 |---|---|
 | `exec`, `run` | `ok` is true and `data.exit_code` is 0 |
-| `status` | `ok` is true and `data.healthy` is true |
+| `status` | `ok` is true, and `data.healthy` is true or `data.started` is false |
 | anything else | `ok` is true |
 
 ```python
@@ -121,13 +164,14 @@ def succeeded(operation, envelope):
     if operation in ("exec", "run"):
         return envelope["data"]["exit_code"] == 0
     if operation == "status":
-        return envelope["data"]["healthy"]
+        # started false: nothing of the checkout runs (never started, or after `down`).
+        return envelope["data"]["healthy"] or not envelope["data"].get("started", True)
     return True
 ```
 
 Every envelope also answers that check itself: **`passed`** is false when `ok` is false, when
-`exec` or `run` exited non-zero or by a signal, and when `status` finds a service unhealthy,
-so `envelope["passed"]` is the same test without the table. Beside it, `command` names the
+`exec` or `run` exited non-zero or by a signal, and when `status` finds a service unhealthy
+in a started checkout, so `envelope["passed"]` is the same test without the table. Beside it, `command` names the
 operation (MCP tool names without `stack_`), `stack_version` the Stack release that answered,
 `schema` the version of these shapes (currently `1`, raised only on an incompatible change)
 and `duration_ms` how long the call took:
@@ -143,6 +187,18 @@ and `duration_ms` how long the call took:
 - A `status` that finds a service down still gives `ok: true`, with `data.healthy: false` and
   `data.checks` saying which service and why: a sentence in `reason` and a stable
   [`reason_code`](commands.md#reason-codes) to branch on. The CLI exits 1.
+- A `status` of a checkout with nothing started (no session, and nothing of it found running:
+  never started, or after `down`) is not a failure: the CLI exits 0 and prints ``not started;
+  run `stack up` `` (plus anything that would make `up` fail, such as a port another program
+  holds), and `data.started` is false. `data.healthy` is false too, unless the checkout declares
+  no services. It is a fine first look at a worktree. Registered commands still running appear
+  in `data.commands`; anything else the second look finds (the last `down` was not confirmed, a
+  process carrying the checkout's environment) in `data.found`, and either
+  makes it `started`. That look is best effort: a process whose environment was hidden from the
+  start (macOS's own binaries) is seen by neither `down` nor `status`, and a detached parent that
+  exits mid-scan can hand off to a child the single pass misses. To know the services are up,
+  read `data.started and data.healthy`, or skip the check and run `stack exec --up` or
+  `--require-all`.
 - `ok: false` (MCP `isError: true`) means Stack could not do it. Act on `error.code` and
   `error.hint`. `error.details` carries the specifics. The CLI exits 70 (124 for
   `timed_out`); see [exit codes](commands.md#exit-codes).
@@ -212,7 +268,7 @@ refused, not split. `null` counts as omitted.
 `stack_up` takes `no_init`, `reinit` (a list of services) and `from_snapshot`, like the CLI's
 `--no-init`, `--reinit` and `--from-snapshot` (see [service data](data.md)); `no_init` and
 `reinit` cannot be given together. `stack_down` takes `purge: true`, like the CLI's
-`--purge`. `stack_ps` takes `no_size`, like the CLI's `--no-size`. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
+`--purge`. `stack_up` takes `labels` (an object of strings, like `--label K=V`). `stack_ps` takes `no_size`, `project` (`dir`'s project), `state`, `labels` and `worktrees`, like the CLI's `--no-size`, `--project`, `--state`, `--label` and `--worktrees`. `stack_status`, `stack_logs` and `stack_down` take `project` (every checkout of `dir`'s project) and `labels`, and `stack_status` also `all`: a [fleet selection](commands.md#fleet-selections), which needs no `dir` unless `project` is set. `stack_mv` takes `from` and `to`: absolute paths, or paths relative to
 `dir` when it is given.
 
 `stack_exec` takes `secrets: ["KEY"]` to grant named fnox secrets to one command. A name that

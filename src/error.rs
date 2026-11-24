@@ -250,8 +250,6 @@ codes! {
         "Add the directory to the bundle or remove it from `paths` in bundle.toml.";
     "mv_data_unmovable", false, [], "`stack mv` could not move a service's data directory to the new path's location.",
         "Check that MISE_STATE_DIR is what it was when the services started, then retry `stack mv <old> <new>`.";
-    "mv_data_unplaced", false, [], "The provider names no data directory for a service at the new path.",
-        "Run `stack compile` in the new directory so its provider configuration is current, then retry `stack mv <old> <new>`.";
     "mv_nothing_recorded", false, [], "Stack has no records for the old path.",
         "Run `stack ps` to list the paths Stack knows; if the checkout is not there, just run `stack up` in the new directory.";
     "mv_services_running", false, [], "Services recorded for the old path may still be running, so its records cannot move.",
@@ -308,8 +306,6 @@ codes! {
         "Use `stack exec -- fnox exec -- <command>` for file secrets and leases, or a longer secret value.";
     "service_unavailable", false, [UP], "A required service did not verify, so the command was not run.",
         "Run `stack up` (or `stack restart <service>`), then retry.";
-    "services_unsupported", false, [], "This platform cannot run services (no Pitchfork build).",
-        "Run services on Apple silicon or Linux; on this machine use a tools-only project.";
     "session_busy", true, [], "Commands are still running in the session.",
         "Wait for the running `stack exec`/`stack run` commands to finish, then retry.";
     "session_conflict", false, [], "The session record belongs to a checkout at another path (it may have been moved).",
@@ -338,24 +334,16 @@ codes! {
         "Run `stack snapshot list` to see the names, or save one with `stack snapshot save <name>`.";
     "snapshot_unsupported", false, [], "The service or its data directory cannot be snapshotted (only postgres and redis data in real directories).",
         "Use the service's own dump and restore tools through `stack exec` instead.";
-    "socket_path_too_long", false, [], "Pitchfork's supervisor socket path is longer than this platform allows.",
-        "Set PITCHFORK_STATE_DIR to a short absolute directory, such as /tmp/pitchfork-$USER, then retry.";
     "source_invalid", false, [], "A bundle source or publish target is malformed.",
         "Use a valid source, such as path:../b, git+https://...?ref=v1 or oci:<registry>/<repo>:<tag>.";
     "start_failed", true, [STATUS], "The supervisor could not start a service.",
         "Read the output in details and `stack logs <service>`, fix the cause, then run `stack up` again.";
     "state_invalid", false, [], "A Stack state file is unreadable or corrupt.",
-        "Delete the state file the message names to reset it, then retry.";
+        "For a session record, run `stack down` in that checkout: it stops what the checkout's supervisor recorded and removes the record once that is confirmed. For other state files, delete the file the message names, then retry.";
     "stop_failed", true, [], "The supervisor could not stop a service.",
         "Retry `stack down`; details carry the supervisor's output.";
-    "stop_unconfirmed", true, [], "Services did not stop in time.",
-        "Retry `stack down` (or `stack restart`); details list the processes still alive.";
-    "supervisor_changed", true, [], "The Pitchfork supervisor the project's environment names changed while the command ran; nothing more was started or stopped.",
-        "Run the command again: it uses the supervisor the environment names when it begins; `stack status` shows what was already started.";
-    "supervisor_unbound", false, [COMPILE], "Stack cannot bind a request to the supervisor whose lock it holds; nothing was asked of it.",
-        "Run `stack compile` to write the configuration again, then retry.";
-    "supervisor_unknown", false, [], "Stack cannot tell which Pitchfork supervisor a request would reach; nothing was asked of it.",
-        "Set PITCHFORK_STATE_DIR to an absolute directory.";
+    "stop_unconfirmed", true, [], "Services did not stop in time, or a command Stack started for the checkout is still running.",
+        "Retry `stack down` (or `stack restart`); details list the processes still alive. A detail with kind \"command\" is a command Stack started and never stops: wait for it or end it first.";
     "tag_exists", false, [], "The OCI tag already points to different content.",
         "Publish a new tag, or pass --force to move this one.";
     "tar_unavailable", false, [DOCTOR], "tar is not installed or cannot run.",
@@ -529,7 +517,7 @@ mod tests {
         let unused: Vec<_> = listed.difference(&used).collect();
         assert!(missing.is_empty(), "codes used under src/ but missing from REGISTRY in src/error.rs: {missing:?}");
         assert!(unused.is_empty(), "REGISTRY entries no code under src/ uses: {unused:?}");
-        assert!(used.contains("socket_path_too_long") && used.contains("oci_not_found"), "{used:?}");
+        assert!(used.contains("start_failed") && used.contains("oci_not_found"), "{used:?}");
     }
 
     #[test]

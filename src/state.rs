@@ -59,6 +59,26 @@ pub struct FileLock {
     _gate: Option<Box<FileLock>>,
 }
 
+/// The waits between attempts at a lock another command holds, for a caller that cannot block
+/// on it (it has a deadline, or may be cancelled). Most holders are done within milliseconds
+/// (a command planning, or recording that it finished), so the first waits are short and
+/// double up to [`Backoff::LONGEST`], which is how often a long holder (`up`, `down`) is asked.
+struct Backoff(std::time::Duration);
+
+impl Backoff {
+    const LONGEST: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn new() -> Self {
+        Self(std::time::Duration::from_millis(1))
+    }
+
+    /// Sleep for the next wait, no longer than `limit`.
+    fn wait(&mut self, limit: std::time::Duration) {
+        std::thread::sleep(self.0.min(limit));
+        self.0 = (self.0 * 2).min(Self::LONGEST);
+    }
+}
+
 impl FileLock {
     pub fn acquire(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -79,6 +99,7 @@ impl FileLock {
         }
         // Under a deadline (or in a call that may be cancelled), wait for another holder only as
         // long as it allows.
+        let mut backoff = Backoff::new();
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { _file: file, _gate: None }),
@@ -89,7 +110,7 @@ impl FileLock {
                     return Err(StackError::new("lock_busy", format!("{} is still locked by another stack command", path.display()))
                         .hint("another `stack up`, `restart` or `down` may be running for this project; retry when it finishes"))
                 }
-                Err(_) => std::thread::sleep(crate::process::bounded(std::time::Duration::from_millis(50))),
+                Err(_) => backoff.wait(crate::process::bounded(Backoff::LONGEST)),
             }
         }
     }
@@ -132,6 +153,7 @@ impl SharedLock {
     /// Share the lock, waiting for an exclusive holder as long as the caller's deadline allows.
     pub fn shared(path: &Path) -> Result<Self> {
         let mut file = open_lock(path)?;
+        let mut backoff = Backoff::new();
         loop {
             let locked = if !crate::process::interruptible() {
                 FileExt::lock_shared(&file).map(|()| true)
@@ -148,7 +170,7 @@ impl SharedLock {
                     return Err(StackError::new("lock_busy", format!("{} is still locked by another stack command", path.display()))
                         .hint("another checkout's `stack down` may be stopping this supervisor; retry when it finishes"))
                 }
-                Ok(false) => std::thread::sleep(crate::process::bounded(std::time::Duration::from_millis(50))),
+                Ok(false) => backoff.wait(crate::process::bounded(Backoff::LONGEST)),
                 Err(e) => return Err(io_error(path.display(), e)),
             }
         }
@@ -158,6 +180,7 @@ impl SharedLock {
     pub fn exclusive_within(path: &Path, wait: std::time::Duration) -> Result<Option<Self>> {
         let mut file = open_lock(path)?;
         let until = std::time::Instant::now() + crate::process::bounded(wait);
+        let mut backoff = Backoff::new();
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) if still_at(&file, path) => return Ok(Some(Self { file, path: path.to_path_buf() })),
@@ -166,7 +189,7 @@ impl SharedLock {
                     return Err(io_error(path.display(), e))
                 }
                 Err(_) if std::time::Instant::now() >= until => return Ok(None),
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => backoff.wait(Backoff::LONGEST),
             }
         }
     }
@@ -259,6 +282,16 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 
 /// Atomic write: temp file then rename.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_with(path, value, true)
+}
+
+/// [`write_json`] without waiting for the disk: for records that describe running processes
+/// only (an execution in progress), which a crash of the machine ends anyway.
+pub fn write_json_unsynced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_with(path, value, false)
+}
+
+fn write_json_with<T: Serialize>(path: &Path, value: &T, sync: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
     }
@@ -268,12 +301,33 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(path.display(), e))?;
     tmp.write_all(text.as_bytes())
         .map_err(|e| io_error(path.display(), e))?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| io_error(path.display(), e))?;
+    if sync {
+        sync_file(tmp.as_file()).map_err(|e| io_error(path.display(), e))?;
+    }
     tmp.persist(path)
         .map_err(|e| io_error(path.display(), e.error))?;
     Ok(())
+}
+
+/// Flush `file` to the disk, as a state write waits for it before replacing a record: `fsync`.
+/// On macOS that hands the data to the drive without also flushing the drive's own cache
+/// (`F_FULLFSYNC`, which `File::sync_all` asks for): a flush of the whole device, which many
+/// checkouts starting at once queue behind one another for, and which buys durability across
+/// power loss, which Stack does not claim (Postgres, too, uses `fsync` there by default).
+fn sync_file(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid open descriptor.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -468,5 +522,21 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!pid_alive(pid));
+    }
+}
+
+/// An optional path that older Stack releases required: `None` is written as an empty string,
+/// which they read as a path that names nothing (and so confirms nothing), and read back as
+/// `None`.
+pub mod required_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+        Ok(Option::<PathBuf>::deserialize(d)?.filter(|p| !p.as_os_str().is_empty()))
     }
 }

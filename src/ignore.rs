@@ -143,6 +143,63 @@ fn contained(root: &Path, dir: &Path, warnings: &mut Vec<String>, planned: &mut 
 
 /// The exclude file git reads for `root`'s repository, when `root` is in a work tree.
 fn locate(root: &Path) -> Option<PathBuf> {
+    located_plainly(root).or_else(|| ask_git(root))
+}
+
+/// [`locate`] read from the checkout itself, for the two layouts nearly every checkout has: a
+/// repository's own work tree (`.git` is its directory) and a linked worktree (`.git` is a file
+/// naming a directory that names the repository's in `commondir`). Every compile comes through
+/// here, so every command does, and asking git costs a process each time.
+///
+/// `None` is "ask git", never "not a work tree": anything else (a checkout below the top of
+/// its work tree, a `.git` that is a symbolic link, a repository that is bare or names its work
+/// tree, git redirected through its environment) is git's to answer.
+fn located_plainly(root: &Path) -> Option<PathBuf> {
+    if ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"].iter().any(|var| std::env::var_os(var).is_some()) {
+        return None;
+    }
+    let dot = root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot).ok()?;
+    let git_dir = if meta.is_dir() {
+        dot
+    } else if meta.is_file() {
+        let text = std::fs::read_to_string(&dot).ok()?;
+        root.join(text.strip_prefix("gitdir: ")?.trim_end_matches(['\n', '\r']))
+    } else {
+        return None;
+    };
+    // Configuration of this work tree alone can say it is bare or lies elsewhere.
+    if !git_dir.join("HEAD").is_file() || std::fs::symlink_metadata(git_dir.join("config.worktree")).is_ok() {
+        return None;
+    }
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(dir) => git_dir.join(dir.trim_end_matches(['\n', '\r'])),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && meta.is_dir() => git_dir,
+        // A `.git` file whose directory names no repository is a submodule's, or broken.
+        Err(_) => return None,
+    };
+    // A linked worktree is a work tree whatever the repository says of itself; a repository's
+    // own directory is one unless it says it is bare.
+    let config = std::fs::read_to_string(common.join("config")).ok()?;
+    if config.lines().any(|line| unusual(line, meta.is_file())) {
+        return None;
+    }
+    common.join("HEAD").is_file().then(|| common.join("info/exclude"))
+}
+
+/// Whether a line of a repository's configuration may change where its work tree is, or
+/// whether it has one, in a way only git can follow: a work tree named there, configuration
+/// read from other files or kept per work tree, and, unless `linked`, a repository that does
+/// not plainly say it is not bare.
+fn unusual(line: &str, linked: bool) -> bool {
+    let line: String = line.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    line.starts_with("worktree=")
+        || line.starts_with("worktreeconfig")
+        || line.starts_with("[include")
+        || (!linked && line.starts_with("bare") && line != "bare=false")
+}
+
+fn ask_git(root: &Path) -> Option<PathBuf> {
     let mut command = Command::new("git");
     command.arg("-C").arg(root).args(["rev-parse", "--is-inside-work-tree", "--git-path", "info/exclude"]).env("GIT_TERMINAL_PROMPT", "0");
     let out = crate::process::output(&mut command).ok().filter(|o| o.status.success())?;
@@ -347,6 +404,79 @@ fn write(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Where git says the exclude file is, and where reading the checkout says, as one file.
+    fn both(root: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+        let real = |p: Option<PathBuf>| p.map(|p| p.parent().unwrap().canonicalize().unwrap().join("exclude"));
+        (real(ask_git(root)), real(located_plainly(root)))
+    }
+
+    #[test]
+    fn the_exclude_file_read_from_a_checkout_is_the_one_git_names_or_git_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        let (asked, read) = both(&main);
+        assert!(asked.is_some());
+        assert_eq!(read, asked, "a repository's own work tree");
+
+        let linked = dir.path().join("linked");
+        git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        let (asked, read) = both(&linked);
+        assert_eq!(asked, both(&main).0, "one exclude file for the repository");
+        assert_eq!(read, asked, "a linked worktree");
+
+        // Below the top of a work tree, and outside any: git's to answer.
+        let below = main.join("below");
+        std::fs::create_dir(&below).unwrap();
+        assert_eq!(located_plainly(&below), None);
+        assert!(locate(&below).is_some());
+        assert_eq!(located_plainly(dir.path()), None);
+
+        // A work tree named by the repository is not the directory its `.git` is in.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        git(&main, &["config", "core.worktree", elsewhere.to_str().unwrap()]);
+        assert_eq!(located_plainly(&main), None);
+        git(&main, &["config", "--unset", "core.worktree"]);
+
+        // A linked worktree of a bare repository is a work tree all the same.
+        let bare = dir.path().join("bare.git");
+        git(dir.path(), &["clone", "-q", "--bare", main.to_str().unwrap(), bare.to_str().unwrap()]);
+        let of_bare = dir.path().join("of-bare");
+        git(&bare, &["worktree", "add", "-q", of_bare.to_str().unwrap()]);
+        let (asked, read) = both(&of_bare);
+        assert!(asked.is_some());
+        assert_eq!(read, asked, "a linked worktree of a bare repository");
+        assert_eq!(located_plainly(&bare), None, "a bare repository has no work tree");
+
+        // Configuration kept per work tree, or read from another file, can say any of that.
+        git(&main, &["config", "extensions.worktreeConfig", "true"]);
+        assert_eq!(located_plainly(&main), None);
+        assert_eq!(located_plainly(&linked), None);
+        git(&main, &["config", "--worktree", "core.bare", "true"]);
+        assert_eq!(ask_git(&main), None, "git: not a work tree");
+        assert_eq!(locate(&main), None);
+        std::fs::remove_file(main.join(".git/config.worktree")).unwrap();
+        git(&main, &["config", "--unset", "extensions.worktreeConfig"]);
+        assert_eq!(both(&main).1, both(&main).0);
+        git(&main, &["config", "include.path", "elsewhere.config"]);
+        assert_eq!(located_plainly(&main), None);
+        assert_eq!(located_plainly(&linked), None);
+    }
 
     #[test]
     fn stacks_gitignore_names_itself_and_exact_escaped_entries() {

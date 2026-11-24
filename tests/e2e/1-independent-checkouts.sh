@@ -28,8 +28,10 @@ cd "$W/appA" || exit 1
 stack compile --locked --json >"$T/versions.json"
 assert_json '.ok and all(.data.versions[]; .resolved != null and (.resolved | test("^[0-9]+(\\.[0-9]+)+$")))' "$T/versions.json"
 assert_json '[.data.versions[] | select(.kind == "service")] | length == 2' "$T/versions.json"
-for v in $(jq -r '.data.versions[] | select(.kind == "service") | .resolved' "$T/versions.json"); do
-  grep -q "version = \"$v\"" .config/mise/conf.d/stack.toml || fail "service version $v was not rendered"
+for pair in $(jq -r '.data.versions[] | select(.kind == "service") | "\(.name)=\(.resolved)"' "$T/versions.json"); do
+  svc=${pair%%=*}
+  ver=${pair#*=}
+  grep -q "^${svc} = \"${ver}\"" .config/mise/conf.d/stack.toml || fail "service $svc version $ver was not rendered in [tools]"
 done
 echo 'Two independent checkouts start with distinct verified instances'
 for a in appA appB; do

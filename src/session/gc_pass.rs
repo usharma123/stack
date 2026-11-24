@@ -2,10 +2,10 @@
 //! because of, another checkout, what `gc --dry-run` reports, and the opt-in stop of a deleted
 //! checkout's services (`gc --stop-orphans`).
 
-use super::{accepting, gc_locked, index_path, project_gone, GcEntry, ProviderRecord, ServiceRecord, Session, Steps, Unconfirmed, STOP_TIMEOUT};
-use crate::error::Result;
+use super::{accepting, gc_locked, index_path, is_unreadable, project_gone, session_record, GcEntry, ProviderRecord, ServiceRecord, Session, Steps, Unconfirmed, STOP_TIMEOUT};
+use crate::error::{Result, StackError};
 use crate::provider::mise;
-use crate::state::{now, pid_alive, project_lock, project_try_lock, read_json, rfc3339};
+use crate::state::{now, pid_alive, project_lock, project_try_lock, rfc3339};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,45 @@ pub struct GcPass {
     /// Problems a background pass did not fail on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Checkouts whose session record could not be read (see `session_record`): reported, never
+    /// stopped, reclaimed or released.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<GcEntry>,
+}
+
+/// The `reason` of a [`GcEntry`] for an unreadable session record.
+pub const UNREADABLE: &str = "session record unreadable";
+
+/// The report for an unreadable record: the checkout when it is known, else the record.
+fn unreadable_entry(project: &Path, error: &StackError) -> GcEntry {
+    GcEntry { project: project.to_path_buf(), reason: UNREADABLE.into(), stopped: false, error: Some(error.to_string()), services: Vec::new() }
+}
+
+/// What one checkout's index entry at `path` holds, both copies considered: the indexed
+/// session when it and the project copy can be read; `Err` (the checkout, when known, and why)
+/// when either cannot. A deleted checkout has no copy to read.
+pub(crate) fn readable_session(state: &Path, path: &Path) -> Result<std::result::Result<Option<Session>, (PathBuf, StackError)>> {
+    let indexed = match session_record(path) {
+        Ok(Some(indexed)) => indexed,
+        Ok(None) => return Ok(Ok(None)),
+        Err(e) if is_unreadable(&e) => {
+            let checkout = super::checkout_of_record(state, path);
+            let e = match &checkout {
+                Some(c) => super::session_record_of(path, Some(c)).err().unwrap_or(e),
+                None => e,
+            };
+            return Ok(Err((checkout.unwrap_or_else(|| path.to_path_buf()), e)));
+        }
+        Err(e) => return Err(e),
+    };
+    if indexed.project.exists() {
+        match super::session_record_of(&indexed.project.join(".stack").join("session.json"), Some(&indexed.project)) {
+            Err(e) if is_unreadable(&e) => return Ok(Err((indexed.project.clone(), e))),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+    }
+    Ok(Ok(Some(indexed)))
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +109,17 @@ pub fn gc_with(state: &Path, opts: &GcOptions) -> Result<GcPass> {
     let mut pass = GcPass::default();
     for path in index_files(state) {
         let outcome = (|| -> Result<()> {
-            let indexed: Session = read_json(&path)?;
+            // An unreadable record (the index's, or the checkout's own copy), whether or not the
+            // checkout looks reclaimable, is reported, that checkout left alone, and the pass
+            // goes on.
+            let indexed = match readable_session(state, &path)? {
+                Ok(Some(indexed)) => indexed,
+                Ok(None) => return Ok(()),
+                Err((checkout, e)) => {
+                    pass.unreadable.push(unreadable_entry(&checkout, &e));
+                    return Ok(());
+                }
+            };
             let Some(reason) = candidate(&indexed, now()) else { return Ok(()) };
             let _guard = if opts.background {
                 match project_try_lock(state, &indexed.project)? {
@@ -83,7 +132,14 @@ pub fn gc_with(state: &Path, opts: &GcOptions) -> Result<GcPass> {
             } else {
                 project_lock(state, &indexed.project)?
             };
-            if let Some(entry) = gc_locked(state, &path, opts.stop_orphans)? {
+            let locked = match gc_locked(state, &path, opts.stop_orphans) {
+                Err(e) if is_unreadable(&e) => {
+                    pass.unreadable.push(unreadable_entry(&indexed.project, &e));
+                    return Ok(());
+                }
+                other => other?,
+            };
+            if let Some(entry) = locked {
                 if opts.background && !entry.stopped {
                     pass.warnings.push(format!(
                         "{}: {} but not confirmed stopped ({}); run `stack gc` for details",
@@ -110,10 +166,13 @@ pub fn gc_with(state: &Path, opts: &GcOptions) -> Result<GcPass> {
 /// what it skipped when anything was busy); returns what it reclaimed and the warnings for
 /// the result.
 pub(super) fn before_up(state: &Path, steps: &mut Steps) -> (Vec<GcEntry>, Vec<String>) {
-    let pass = gc_with(state, &GcOptions { background: true, stop_orphans: false }).unwrap_or_else(|e| GcPass {
+    let mut pass = gc_with(state, &GcOptions { background: true, stop_orphans: false }).unwrap_or_else(|e| GcPass {
         warnings: vec![e.to_string()],
         ..GcPass::default()
     });
+    for entry in std::mem::take(&mut pass.unreadable) {
+        pass.warnings.push(format!("{}: {}; left alone", entry.project.display(), entry.error.unwrap_or_default()));
+    }
     let mut detail = serde_json::json!({ "reaped": pass.reclaimed.len() });
     if !pass.skipped.is_empty() {
         detail["skipped"] = serde_json::json!(pass.skipped);
@@ -192,8 +251,15 @@ pub struct PlannedData {
 pub struct GcDryRun {
     pub dry_run: bool,
     pub would_reclaim: Vec<GcPlanned>,
+    /// Checkouts whose session record cannot be read: a pass reports them and leaves them alone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<GcEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deleted_checkouts: Vec<DeletedPlan>,
+    /// Postgres templates nothing can use any more (see [`crate::pgtemplate`]), which a pass
+    /// removes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<crate::pgtemplate::Unused>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -204,10 +270,17 @@ pub struct GcDryRun {
 pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
     let mut planned = Vec::new();
     let mut warnings = Vec::new();
+    let mut unreadable = Vec::new();
     let now = now();
     for path in index_files(state) {
-        let session: Session = match read_json(&path) {
-            Ok(s) => s,
+        // As the pass decides it (see `gc_with`): both copies, before anything is planned.
+        let session: Session = match readable_session(state, &path) {
+            Ok(Ok(Some(s))) => s,
+            Ok(Ok(None)) => continue,
+            Ok(Err((checkout, e))) => {
+                unreadable.push(unreadable_entry(&checkout, &e));
+                continue;
+            }
             Err(e) => {
                 warnings.push(e.to_string());
                 continue;
@@ -266,7 +339,7 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
         deleted[i].ports.extend(port);
         deleted[i].data.extend(data);
     }
-    Ok(GcDryRun { dry_run: true, would_reclaim: planned, deleted_checkouts: deleted, warnings })
+    Ok(GcDryRun { dry_run: true, would_reclaim: planned, unreadable, deleted_checkouts: deleted, templates: crate::pgtemplate::collect(state, true), warnings })
 }
 
 /// How long before the recorded start a process may appear to have started: the recorded
@@ -292,7 +365,7 @@ fn start_matches(recorded: u64, actual: u64) -> bool {
 pub(super) fn stop_orphan(provider: Option<&ProviderRecord>, record: &ServiceRecord, refused: Unconfirmed) -> std::result::Result<String, Unconfirmed> {
     let Unconfirmed { recovery, .. } = refused;
     let keep = |why: String| Unconfirmed { why: format!("--stop-orphans: {why}; not signalled"), recovery: recovery.clone() };
-    let (Some(provider), Some(id), Some(pid)) = (provider, record.provider_id.as_deref(), record.pid) else {
+    let (Some((provider, bin)), Some(id), Some(pid)) = (provider.and_then(|p| Some((p, p.legacy()?))), record.provider_id.as_deref(), record.pid) else {
         return Err(keep("the record names no supervisor, id or pid".into()));
     };
     let Some(recorded) = record.started_at_ms else {
@@ -308,12 +381,12 @@ pub(super) fn stop_orphan(provider: Option<&ProviderRecord>, record: &ServiceRec
             rfc3339(recorded / 1000)
         )));
     }
-    match mise::supervised(&provider.pitchfork, &provider.state_dir, id) {
+    match mise::supervised(bin, &provider.state_dir, id) {
         Ok(mise::Supervised::Found { status, pid: Some(now), port: Some(port) }) if status == "running" && now == pid && port == record.port => {}
         Ok(other) => return Err(keep(format!("{id} changed before the stop ({other:?})"))),
         Err(e) => return Err(keep(e)),
     }
-    if let Err(e) = mise::stop_supervised(&provider.pitchfork, &provider.state_dir, id) {
+    if let Err(e) = mise::stop_supervised(bin, &provider.state_dir, id) {
         return Err(Unconfirmed { why: format!("--stop-orphans: {e}"), recovery });
     }
     let deadline = Instant::now() + crate::process::bounded(STOP_TIMEOUT);

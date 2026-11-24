@@ -221,10 +221,10 @@ fn inspect_lists_the_skills_of_exactly_the_locked_releases() {
     assert_eq!(db["services"], json!(["db"]));
     assert!(db["reason"].as_str().unwrap().contains("stack install"));
 
-    // People can ask for the provider's too; they are listed apart.
+    // People can ask for the provider's too; they are listed apart. Stack adds no provider
+    // tool any more (services are its own), so there are none.
     let all = f.json(&["inspect", "--all-skills"]);
-    assert_eq!(statuses(&all["data"]["provider_skills"]), ["pitchfork@2.29.0 available pitchfork"]);
-    assert_eq!(all["data"]["provider_skills"][0]["origin"], "provider");
+    assert!(all["data"]["provider_skills"].as_array().map_or(true, |a| a.is_empty()), "{all}");
     assert_eq!(statuses(&all["data"]["skills"]), EXPECTED);
 
     // compile --json reports them too.
@@ -257,7 +257,7 @@ fn discovery_sees_only_the_locks_pins_in_a_scratch_root_and_writes_nothing() {
         let tools = doc["tools"].as_table().unwrap();
         assert_eq!(tools["fnox"].as_str(), Some("1.39.0"), "exact pin, not the request: {config}");
         assert_eq!(tools["postgres"].as_str(), Some("17.11"), "service pins under their preset tool: {config}");
-        assert_eq!(tools["pitchfork"].as_str(), Some("2.29.0"));
+        assert!(tools.get("pitchfork").is_none(), "{config}");
         assert!(!config.contains("SENTINEL") && !config.contains("exec("), "{config}");
     }
     assert!(!f.path("app/SENTINEL-RAN").exists());
@@ -410,7 +410,7 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     assert_eq!(statuses(&inspect["data"]["skills"]), EXPECTED);
     assert!(inspect["data"].get("provider_skills").is_none());
     let all = mcp.call("stack_inspect", json!({ "all_skills": true }));
-    assert_eq!(statuses(&all["data"]["provider_skills"]), ["pitchfork@2.29.0 available pitchfork"]);
+    assert!(all["data"]["provider_skills"].as_array().map_or(true, |a| a.is_empty()), "{all}");
 
     let text = mcp.call("stack_skill", json!({ "tool": "mbx", "name": "mbx-advanced" }));
     assert_eq!(text["ok"], true, "{text}");
@@ -418,7 +418,6 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     assert_eq!(text["data"]["text"], "# mbx-advanced 1.22.0\nDocumentation only. SENTINEL-DOC\n");
 
     for (tool, name, why) in [
-        ("pitchfork", "pitchfork", "provider"),
         ("postgres", "postgres", "not installed"),
         ("fnox", "fnox-old", "another release's skill"),
         ("other", "other", "a tool the stack does not pin"),
@@ -482,7 +481,6 @@ fn step<'a>(report: &'a Value, name: &str) -> &'a Value {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn install_links_available_skills_into_the_configured_directory() {
     let f = Fixture::new(SYNC_PROJECT);
     let v = f.json(&["install"]);
@@ -507,7 +505,6 @@ fn install_links_available_skills_into_the_configured_directory() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn skill_links_and_their_registry_are_excluded_from_git_but_a_users_own_skills_are_not() {
     let f = Fixture::new(SYNC_PROJECT);
     let git = |args: &[&str]| {
@@ -552,7 +549,6 @@ fn untracked_in(dir: &Path, under: &str) -> Vec<String> {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_link_made_in_one_checkout_never_hides_the_same_path_in_another() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");
@@ -615,7 +611,6 @@ fn a_skills_dir_linked_into_another_checkout_leaves_that_checkouts_files_alone()
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both() {
     use std::os::unix::fs::MetadataExt;
     let project = |dir: &str| SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}"));
@@ -664,7 +659,6 @@ fn a_skills_dir_that_is_the_provider_directory_gets_one_ignore_file_naming_both(
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_skills_dir_linked_to_the_provider_directory_keeps_the_file_there_as_it_is() {
     let project = |dir: &str| SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}"));
     let f = Fixture::new(&project(".config/mise"));
@@ -685,7 +679,6 @@ fn a_skills_dir_linked_to_the_provider_directory_keeps_the_file_there_as_it_is()
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn an_unreadable_skills_registry_keeps_stacks_ignore_file_as_it_is() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");
@@ -711,7 +704,6 @@ fn an_unreadable_skills_registry_keeps_stacks_ignore_file_as_it_is() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
     let f = Fixture::new(SYNC_PROJECT);
     let app = f.path("app");
@@ -743,7 +735,6 @@ fn a_compile_stops_ignoring_a_generated_link_the_user_replaced() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn a_skills_dir_written_with_dot_or_doubled_separators_is_ignored_where_the_links_are() {
     for dir in ["./.claude/skills", ".claude//skills/", "./.claude/./skills"] {
         let f = Fixture::new(&SYNC_PROJECT.replace("dir = \".claude/skills\"", &format!("dir = {dir:?}")));
@@ -756,7 +747,6 @@ fn a_skills_dir_written_with_dot_or_doubled_separators_is_ignored_where_the_link
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn skills_are_never_linked_into_stack_or_git_under_another_spelling() {
     for (alias, reserved) in [(".Stack", ".stack"), (".GIT", ".git")] {
         // Whether the reserved directory came first or not.

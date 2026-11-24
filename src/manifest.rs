@@ -164,6 +164,36 @@ pub struct ProjectManifest {
     /// Project only; a bundle cannot set it.
     #[serde(default)]
     pub lock: LockSettings,
+    /// Session defaults (`default_ttl`). Project only; a bundle cannot set it.
+    #[serde(default)]
+    pub session: Option<SessionSettings>,
+}
+
+/// `[session]` in stack.toml.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSettings {
+    /// The lease TTL a session gets when the command starting it names no lease (`30m`, `2h`).
+    #[serde(default)]
+    pub default_ttl: Option<String>,
+}
+
+impl ProjectManifest {
+    /// `[session] default_ttl` in seconds, checked: `manifest_invalid` when it is not a
+    /// duration `--ttl` accepts.
+    pub fn default_ttl_secs(&self) -> Result<Option<u64>> {
+        let Some(text) = self.session.as_ref().and_then(|s| s.default_ttl.as_deref()) else { return Ok(None) };
+        let invalid = |why: String| {
+            StackError::new("manifest_invalid", format!("{PROJECT_FILE}: [session] default_ttl {text:?}: {why}"))
+                .hint("write a positive duration such as \"30m\", \"2h\" or \"90s\", as `--ttl` takes")
+                .with_detail(serde_json::json!({ "file": PROJECT_FILE, "key": "session.default_ttl", "value": text }))
+        };
+        match crate::mcp::parse_duration(text) {
+            Ok(0) => Err(invalid("a session would expire as soon as it started".into())),
+            Ok(secs) => Ok(Some(secs)),
+            Err(e) => Err(invalid(e.message)),
+        }
+    }
 }
 
 /// `[skills]` in stack.toml.
@@ -290,7 +320,9 @@ pub fn read_project(root: &Path) -> Result<ProjectManifest> {
         StackError::new("manifest_missing", format!("cannot read {}: {e}", path.display()))
             .hint("create a stack.toml; see README.md for the format")
     })?;
-    parse(&text).map_err(|e| e.into_error("manifest_invalid", &path, None))
+    let project: ProjectManifest = parse(&text).map_err(|e| e.into_error("manifest_invalid", &path, None))?;
+    project.default_ttl_secs()?;
+    Ok(project)
 }
 
 pub fn read_bundle(dir: &Path, source: &str) -> Result<BundleManifest> {
@@ -508,6 +540,41 @@ mod tests {
         for text in ["preset = 'postgres'\nversion = '17'", "preset = 'postgres'\nversion = 'prefix:17'", "preset = 'redis'", "run = 'x'\nversion = '1{2}'"] {
             service(text).validate("db", "project").unwrap();
         }
+    }
+
+    #[test]
+    fn session_default_ttl_is_read_checked_and_project_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |text: &str| fs::write(dir.path().join(PROJECT_FILE), text).unwrap();
+        write("[tools]\n");
+        assert_eq!(read_project(dir.path()).unwrap().default_ttl_secs().unwrap(), None);
+        write("[session]\n");
+        assert_eq!(read_project(dir.path()).unwrap().default_ttl_secs().unwrap(), None);
+        for (text, secs) in [("30m", 1800), ("2h", 7200), ("90", 90), ("1d", 86400)] {
+            write(&format!("[session]\ndefault_ttl = '{text}'\n"));
+            assert_eq!(read_project(dir.path()).unwrap().default_ttl_secs().unwrap(), Some(secs), "{text}");
+        }
+        for bad in ["soon", "30x", "", "0", "0m", "-5m"] {
+            write(&format!("[session]\ndefault_ttl = '{bad}'\n"));
+            let e = read_project(dir.path()).unwrap_err();
+            assert_eq!(e.code, "manifest_invalid", "{bad}: {e}");
+            assert!(e.message.contains("[session] default_ttl"), "{bad}: {}", e.message);
+            assert!(e.hint.as_deref().unwrap().contains("30m"), "{bad}: {e:?}");
+            assert_eq!(e.details[0]["key"], "session.default_ttl");
+        }
+        // Not a string, or a key [session] does not have: the schema refuses it, located.
+        write("[session]\ndefault_ttl = 30\n");
+        assert_eq!(read_project(dir.path()).unwrap_err().code, "manifest_invalid");
+        write("[session]\nttl = '30m'\n");
+        let e = read_project(dir.path()).unwrap_err();
+        assert!(e.code == "manifest_invalid" && e.message.contains("unknown field `ttl`"), "{e}");
+
+        // A bundle cannot set it.
+        let f = parse::<BundleManifest>("[bundle]\nname = 'b'\n[session]\ndefault_ttl = '30m'\n").unwrap_err();
+        assert!(f.message.contains("unknown field `session`"), "{f:?}");
+        let bundle = tempfile::tempdir().unwrap();
+        fs::write(bundle.path().join(BUNDLE_FILE), "[bundle]\nname = 'b'\n[session]\ndefault_ttl = '30m'\n").unwrap();
+        assert_eq!(read_bundle(bundle.path(), "path:../b").unwrap_err().code, "bundle_invalid");
     }
 
     #[test]

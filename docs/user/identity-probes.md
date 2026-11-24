@@ -1,5 +1,12 @@
 # Service identity probes
 
+Postgres and Redis presets need none: Stack asks the server for its data directory over the
+app's own `DATABASE_URL` or `REDIS_URL`, speaking the protocol itself, and runs `psql` or
+`redis-cli` instead when the URL names a host name, a password or options, a libpq or redis-cli
+variable could change the connection, or the server asks for a password or refuses the
+connection. A server that answers anything else, or not in time, is not verified. `psql` runs
+with `-X`: your `~/.psqlrc` does not change what it prints.
+
 A custom service can prove which instance it is. stack gives each checkout's service a random
 token in `STACK_IDENTITY_<NAME>`; the probe asks the live service through the app's own
 connection settings and must print exactly that token:

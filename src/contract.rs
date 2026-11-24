@@ -97,11 +97,17 @@ impl Call {
 }
 
 /// Whether what was asked for is in the wanted state: a command that ran exited 0, a check
-/// found everything healthy. Everything else that succeeded passed.
+/// found everything healthy or nothing started (`started: false`, a checkout never started or
+/// stopped by a confirmed `down`). Everything else that succeeded passed. Matches the CLI's exit
+/// code: 0 exactly when this is true.
 pub fn passed(command: &str, data: &Value) -> bool {
     match command {
         "exec" | "run" => data["exit_code"] == 0,
-        "status" => data["healthy"] == true,
+        // A fleet status (`--project`, `--all`, `--label`) says whether it passed.
+        "status" if data["passed"].is_boolean() => data["passed"] == true,
+        "status" => data["healthy"] == true || data["started"] == false,
+        // A fleet down counts the checkouts that failed; one checkout's down fails as an error.
+        "down" => data["failed"].as_u64().map_or(true, |failed| failed == 0),
         _ => true,
     }
 }
@@ -143,5 +149,24 @@ mod tests {
         assert_eq!(failed["error"]["next"][0]["command"], json!(["stack", "-C", "/p", "up"]));
         assert_eq!(failed["error"]["retryable"], false);
         assert_eq!(Call::new("down").success(json!({}))["passed"], true);
+    }
+
+    #[test]
+    fn a_status_of_nothing_started_passes_and_one_started_and_unhealthy_does_not() {
+        let call = Call::new("status");
+        assert_eq!(call.success(json!({ "healthy": false, "started": false }))["passed"], true);
+        assert_eq!(call.success(json!({ "healthy": false, "started": true }))["passed"], false);
+        assert_eq!(call.success(json!({ "healthy": true, "started": true }))["passed"], true);
+    }
+
+    #[test]
+    fn a_fleet_status_or_down_passes_only_when_every_checkout_did() {
+        let status = Call::new("status");
+        assert_eq!(status.success(json!({ "checkouts": [], "total": 2, "running": 2, "healthy": 1, "passed": false }))["passed"], false);
+        assert_eq!(status.success(json!({ "checkouts": [], "total": 2, "running": 1, "healthy": 1, "passed": true }))["passed"], true);
+        let down = Call::new("down");
+        assert_eq!(down.success(json!({ "checkouts": [], "confirmed": 1, "failed": 1 }))["passed"], false);
+        assert_eq!(down.success(json!({ "checkouts": [], "confirmed": 2, "failed": 0 }))["passed"], true);
+        assert_eq!(down.success(json!({ "stopped": [], "confirmed": true }))["passed"], true, "one checkout's down is unchanged");
     }
 }

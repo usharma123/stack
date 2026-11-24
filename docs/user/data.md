@@ -192,14 +192,61 @@ Stack's machine state per checkout, never in a data directory.
 
 ## Where data directories live
 
-mise's presets own the data. Each checkout's data directory is
-`$MISE_STATE_DIR/daemons/<checkout hash>/data/<service>` (by default under
-`~/.local/state/mise`), keyed by the checkout's path. mise creates it on the service's first
-start (`initdb` for Postgres) and reuses it afterwards as long as the major version matches.
-Stack reads the path from `mise daemons --json`, which reports it before the first start, and
-records it for the checkout when `up` claims it. Snapshots copy and replace only that recorded
+Stack runs the presets itself and owns their data. A new checkout's data directory is
+`$STACK_STATE_DIR/data/<checkout key>/<service>` (by default under `~/.local/state/stack`),
+keyed by the checkout's path. The supervisor creates it on the service's first start (for
+Postgres, a copy of what `initdb -U postgres --auth=trust` writes under the pinned `C.UTF-8`
+locale, put in a sibling directory renamed into place; see *Postgres templates* below) and
+records the preset and major version in it
+(`.mise-daemon-version`, the file mise's presets wrote); it reuses the directory afterwards only
+while the major version matches, and refuses it otherwise, kept as it is. It also refuses to
+initialise data with a server whose major version is not the one stack.lock pins (one found on
+PATH because the pinned release is not installed). A checkout an older Stack ran keeps the
+directory mise's preset made for it (`$MISE_STATE_DIR/daemons/<hash>/data/<service>`): Stack
+finds it through its own data record, the session's record, or mise's state for that path, and
+never initialises a new one in its place. Stack records the directory for the checkout when `up`
+claims it. Snapshots copy and replace only that recorded
 directory. `stack down` and `stack gc` keep data directories unless asked to remove them
 (`down --purge`, `gc --reclaim-data`).
+
+### Postgres templates
+
+`initdb` takes about half a second per new database, more when several checkouts start at
+once. Stack runs it once for each Postgres release, locale and time zone and keeps the result
+as a template in `$STACK_STATE_DIR/templates/postgres/<key>/` (about 40 MB each); a new data
+directory is a copy of it, made in milliseconds. On APFS, Btrfs and XFS the copy shares the
+template's blocks until either is written, so a new database takes almost no space at first
+(`stack ps` still counts each one in full). On macOS a data directory on another volume than
+Stack's state directory, or on a filesystem that cannot clone, is made by `initdb` as before.
+
+- The first start that needs a template builds it; checkouts starting at the same time wait for
+  that one build instead of each running `initdb`. Reinstalling or upgrading the release,
+  changing a file it installs, the locale or the time zone, or (on Linux) the system C
+  library, keys another template.
+- A copy is the cluster `initdb` would have made, with its own system identifier and
+  authentication nonce: Postgres stamps each cluster with a random identifier, which
+  replication, `pg_rewind`, WAL archives and backup tools use to tell clusters apart, so Stack
+  gives each copy a new one. It does this only for Postgres releases whose file layout it has
+  checked (17 and 18); for others every new database is made by `initdb`. A template build it
+  cannot do this for (a damaged control file, say) is never used or kept, and the database is
+  made by `initdb` instead. A published template it cannot do this for is never used either:
+  each new database that copies it first tries to remove it, waiting up to 5 seconds for the
+  template's lock, and the service's log says what came of that (removed, or not and why).
+  File times and the time of the cluster's first checkpoint come from when the template was
+  built.
+- A template is kept only when `initdb` was not held back by the machine (on a machine short of
+  shared memory it lowers `max_connections`): such a build is used for that one database and
+  the next new database tries again. A template is flushed to stable storage before it is
+  used; one that could not be is used only until the machine restarts.
+- Stack never runs a server on a template, and checks after every copy that nothing changed it
+  since it was built; one that changed is never used, `initdb` runs instead, and Stack tries to
+  remove the template the same way. Anything else that goes wrong with a template, including
+  a full disk where templates are kept, also makes the database by `initdb`; the service's log
+  (`stack logs postgres`) says which way a database was made.
+- `stack gc` removes templates whose release was reinstalled or removed, and ones unused for 14
+  days; `stack gc --dry-run` lists the ones a pass would try to remove. Deleting the directory
+  by hand is safe while no `stack up` is starting a new database: the next one builds what it
+  needs.
 
 ## Errors
 

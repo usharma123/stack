@@ -43,6 +43,12 @@ enum Cmd {
         /// A preset service, as NAME, NAME=PRESET and either with @VERSION (repeatable), e.g. --service postgres@17
         #[arg(long = "service", value_name = "NAME[=PRESET][@VERSION]")]
         services: Vec<String>,
+        /// Also add the tools and preset services this directory's files suggest
+        /// (.python-version, pyproject.toml, package.json, Cargo.toml, go.mod, .mise.toml,
+        /// .tool-versions, compose files, .env.example). Reads files only, never runs project
+        /// code; --tool and --service win over a detected entry of the same name
+        #[arg(long)]
+        detect: bool,
     },
     /// Resolve bundles, write stack.lock and the generated provider config
     Compile {
@@ -97,10 +103,18 @@ enum Cmd {
         /// Keep printing new lines until interrupted (polls the supervisor every second; not with --json)
         #[arg(short, long)]
         follow: bool,
+        /// Logs of every checkout of this project (its repository's worktrees with Stack
+        /// records), each line prefixed [<branch>:<service>]; --project=PATH names another
+        #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true, conflicts_with = "follow")]
+        project: Option<Option<PathBuf>>,
+        /// Logs of every checkout whose session has this label, as KEY=VALUE (repeatable: all must match)
+        #[arg(long = "label", value_name = "KEY=VALUE", conflicts_with = "follow")]
+        labels: Vec<String>,
     },
     /// Start services, verify each one, and record a session
     Up {
-        /// Reclaim the session after this long without activity (e.g. 30m, 2h)
+        /// Reclaim the session after this long without activity (e.g. 30m, 2h). Without it or
+        /// --owner-pid, `[session] default_ttl` of stack.toml applies when set
         #[arg(long)]
         ttl: Option<String>,
         /// Reclaim the session when this process exits. Pass a long-lived process such as the
@@ -126,6 +140,10 @@ enum Cmd {
         /// snapshot (see `stack snapshot`); its init counts as done
         #[arg(long, value_name = "NAME")]
         from_snapshot: Option<String>,
+        /// Record a label on the session, as KEY=VALUE (repeatable), e.g. --label agent=claude;
+        /// added to the labels it has. `ps`, `status`, `logs` and `down` select checkouts by them
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
     },
     /// Restart services of the running session (all when none are named), then verify again
     Restart {
@@ -139,7 +157,18 @@ enum Cmd {
         timeout: Option<String>,
     },
     /// Verify every service now, and show session and lease state
-    Status,
+    Status {
+        /// Check every checkout of this project (its repository's worktrees with Stack
+        /// records); --project=PATH names another. Exits 0 only if every started one is healthy
+        #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true, conflicts_with = "all")]
+        project: Option<Option<PathBuf>>,
+        /// Check every checkout Stack has records for on this machine
+        #[arg(long)]
+        all: bool,
+        /// Check every checkout whose session has this label, as KEY=VALUE (repeatable: all must match)
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+    },
     /// Run a command with the stack's tools and env; unverified endpoints are withheld
     Exec {
         /// Fail unless this service verifies (repeatable)
@@ -162,7 +191,8 @@ enum Cmd {
         /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
         #[arg(long)]
         up: bool,
-        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        /// With --up: the lease of a session `up` records (default: keep the current lease; a
+        /// session without one gets `[session] default_ttl` of stack.toml, else 30m)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
         /// Install pinned tools that are missing instead of failing with tools_not_installed
@@ -182,17 +212,20 @@ enum Cmd {
         /// Run `stack up` first when there is no session, or it is stale, expired or unhealthy
         #[arg(long)]
         up: bool,
-        /// With --up: the lease of a session `up` records (default: keep the current lease)
+        /// With --up: the lease of a session `up` records (default: keep the current lease; a
+        /// session without one gets `[session] default_ttl` of stack.toml, else 30m)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
         /// Extra arguments, appended to the task's command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Stop services; succeeds only once their processes are gone. Then stops the Pitchfork
-    /// supervisor that ran them if Stack started it and no other session or daemon uses it
+    /// Stop services; succeeds only once their processes are gone. Stack's supervisor for the
+    /// checkout exits with them (for services an older Stack started under Pitchfork, its
+    /// supervisor is stopped if Stack started it and nothing else uses it)
     Down {
-        /// Leave the supervisor running even when Stack started it and nothing else uses it
+        /// Leave a Pitchfork supervisor an older Stack started running (Stack's own supervisor
+        /// always exits with the checkout's services)
         #[arg(long, conflicts_with = "stop_supervisor")]
         keep_supervisor: bool,
         /// Stop the supervisor as above: what `down` does unless told to keep it (accepted for
@@ -203,6 +236,17 @@ enum Cmd {
         /// and release its ports and identity tokens
         #[arg(long)]
         purge: bool,
+        /// First forget registered commands whose process was never recorded and whose Stack
+        /// process is gone (check they no longer run); nothing else is forgotten
+        #[arg(long)]
+        forget_unrecorded: bool,
+        /// Stop every checkout of this project (its repository's worktrees with Stack records);
+        /// --project=PATH names another. Exits 1 if any stop fails or is not confirmed
+        #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true, conflicts_with = "forget_unrecorded")]
+        project: Option<Option<PathBuf>>,
+        /// Stop every checkout whose session has this label, as KEY=VALUE (repeatable: all must match)
+        #[arg(long = "label", value_name = "KEY=VALUE", conflicts_with = "forget_unrecorded")]
+        labels: Vec<String>,
     },
     /// Renew this project's session lease
     Renew {
@@ -239,6 +283,21 @@ enum Cmd {
         /// Skip measuring data directories on disk, which can be slow
         #[arg(long)]
         no_size: bool,
+        /// Only checkouts of this project: its repository's worktrees at the same subdirectory
+        /// (the directory alone outside Git); --project=PATH names another
+        #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true)]
+        project: Option<Option<PathBuf>>,
+        /// Only checkouts in this state: running, partial, stopped, launching, recorded,
+        /// reserved, unreadable or unstarted
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        /// Only checkouts whose session has this label, as KEY=VALUE (repeatable: all must match)
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        /// Also list the repository's worktrees that have a stack.toml and nothing recorded
+        /// yet, as `unstarted`
+        #[arg(long)]
+        worktrees: bool,
     },
     /// After a checkout was moved or renamed, carry its records and service data to the new path
     Mv {
@@ -302,7 +361,13 @@ enum Cmd {
         markdown: bool,
     },
     /// Serve the stack tools over MCP (stdio)
-    Mcp,
+    Mcp {
+        /// Which tools to offer: `full` (every tool) or `core` (stack_up, stack_status,
+        /// stack_run, stack_exec, stack_restart, stack_logs, stack_down and stack_ps), for
+        /// clients that pay for every tool definition in their context
+        #[arg(long, value_enum, default_value_t = mcp::Profile::Full)]
+        profile: mcp::Profile,
+    },
     /// Save, restore, list or remove snapshots of service data, shared by every checkout of
     /// the project
     Snapshot {
@@ -357,6 +422,16 @@ fn command_from_args() -> String {
 }
 
 fn main() -> ExitCode {
+    // Stack's own supervisor and preset runner: hidden modes of this binary, dispatched before
+    // anything else runs (the supervisor forks, which needs a process with one thread).
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match args.get(1).and_then(|a| a.to_str()) {
+        Some(stack::supervisor::SUPERVISE) if args.len() == 3 => {
+            return ExitCode::from(stack::supervisor::main_supervise(std::path::Path::new(&args[2])) as u8);
+        }
+        Some(stack::supervisor::PRESET) => return ExitCode::from(stack::supervisor::main_preset(&args[2..]).clamp(0, 255) as u8),
+        _ => {}
+    }
     stack::setup::use_managed_tools();
     update_call(|_| {});
     let matches = match Cli::command().try_get_matches() {
@@ -368,8 +443,8 @@ fn main() -> ExitCode {
         Err(e) => return usage_error(e),
     };
     update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
-    if let Cmd::Mcp = cli.cmd {
-        return match mcp::serve() {
+    if let Cmd::Mcp { profile } = cli.cmd {
+        return match mcp::serve(profile) {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from(contract::child_exit(None, Some(signal.into())))),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
@@ -424,8 +499,11 @@ fn main() -> ExitCode {
     };
 
     let result: Result<ExitCode> = match &cli.cmd {
-        Cmd::Init { tools, services } => stack::init::init(&root, tools, services).map(|r| {
+        Cmd::Init { tools, services, detect } => stack::init::init(&root, tools, services, *detect).map(|r| {
             emit(cli.json, &r, || {
+                for d in &r.detected {
+                    println!("detected {} {} = {} ({})", d.kind, d.name, d.value, d.source);
+                }
                 println!("wrote {}", r.path.display());
                 println!("next: {}", r.next.join(", then "));
             })
@@ -456,17 +534,17 @@ fn main() -> ExitCode {
                 print!("{}", skill.text);
             })
         }),
-        Cmd::Up { ttl, owner_pid, timeout, reassign_ports, no_init, reinit, from_snapshot } => ttl
+        Cmd::Up { ttl, owner_pid, timeout, reassign_ports, no_init, reinit, from_snapshot, labels } => ttl
             .as_deref()
             .map(parse_duration)
             .transpose()
             .and_then(|ttl_secs| {
                 let timeout = startup_timeout(timeout.as_deref())?;
-                Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout))
+                Ok((ttl_secs, owner_pid.as_ref().map(stack::lease::Owner::resolve).transpose()?, timeout, stack::labels::parse_all(labels)?))
             })
-            .and_then(|(ttl_secs, owner_pid, timeout)| {
-                let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone(), from_snapshot: from_snapshot.clone() };
-                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid }, timeout, opts)
+            .and_then(|(ttl_secs, owner_pid, timeout, labels)| {
+                let opts = session::UpOptions { reassign_ports: *reassign_ports, no_init: *no_init, reinit: reinit.clone(), from_snapshot: from_snapshot.clone(), labels };
+                session::up_with(&ctx, LeaseOptions { ttl_secs, owner_pid, ..LeaseOptions::default() }, timeout, opts)
             })
             .map(|r| {
                 emit(cli.json, &r, || {
@@ -507,7 +585,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow } => logs(
+        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow, project, labels } => fleet_filter(&root, project.as_ref(), labels, false).and_then(|fleet| logs(
             &ctx,
             cli.json,
             stack::logs::Query {
@@ -520,7 +598,8 @@ fn main() -> ExitCode {
             },
             since.as_deref(),
             *follow,
-        ),
+            &fleet,
+        )),
         Cmd::Restart { services, changed, timeout } => startup_timeout(timeout.as_deref())
             .and_then(|timeout| if *changed { session::restart_changed(&ctx, timeout) } else { session::restart(&ctx, services, timeout) })
             .map(|r| {
@@ -532,10 +611,19 @@ fn main() -> ExitCode {
                     println!("session {}", r.session.id);
                 })
             }),
-        Cmd::Status => session::status(&ctx).map(|r| {
-            let healthy = r.healthy;
+        Cmd::Status { project, all, labels } if project.is_some() || *all || !labels.is_empty() => fleet_filter(&root, project.as_ref(), labels, *all)
+            .and_then(|fleet| stack::fleet::status(&ctx.state, &ctx.cache, &fleet))
+            .map(|r| {
+                let code = emit(cli.json, &r, || stack::fleet::print_fleet_status(&r));
+                if r.passed { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
+            }),
+        Cmd::Status { .. } => session::status(&ctx).map(|r| {
+            // A checkout with nothing of it started (never, or since a confirmed `down`) is not
+            // a failed check: `started: false` says so. See `contract::passed`.
+            let passed = r.healthy || !r.started;
             let code = emit(cli.json, &r, || {
                 match &r.session {
+                    _ if !r.started => println!("not started; run `stack up`"),
                     Some(s) => println!("session {}{}", s.id, if r.stale { " (stale: compiled configuration changed)" } else { "" }),
                     None => println!("no session"),
                 }
@@ -547,15 +635,36 @@ fn main() -> ExitCode {
                 for c in &r.checks {
                     match &c.reason {
                         None => println!("{:<12} ready  port {}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity)),
+                        // Not started, a service is only worth a line when there is more to it
+                        // than that (another program on its port, say).
+                        Some(_) if !r.started => {
+                            if let Some(note) = session::beyond_not_launched(c) {
+                                println!("{:<12} {note}", c.service);
+                            }
+                        }
                         Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
                     }
                 }
                 for (service, state) in r.init.iter().filter(|(_, s)| **s != stack::init_tasks::InitState::None) {
                     println!("{service:<12} init {state}");
                 }
+                for c in &r.commands {
+                    let pid = c.pid.map_or_else(|| "starting".to_string(), |p| format!("pid {p}"));
+                    let running = c.running_secs.map(|s| format!("  running {s}s")).unwrap_or_default();
+                    println!("{:<12} {pid}  {} ({}){running}", "command", c.program, c.started_by);
+                }
+                if let Some(why) = &r.commands_error {
+                    println!("{:<12} unknown: {why}", "command");
+                }
+                for what in &r.found {
+                    println!("{:<12} {what}", "found");
+                }
+                for what in &r.other_checkout {
+                    println!("{:<12} {what}", "other");
+                }
                 warn_changed(&r.checks);
             });
-            if healthy { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
+            if passed { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
         }),
         Cmd::Exec { require, require_all, timeout, secret, up, ttl, install, cmd } => {
             let req = if *require_all {
@@ -581,9 +690,28 @@ fn main() -> ExitCode {
                 session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
             })
         }),
-        Cmd::Down { keep_supervisor, stop_supervisor: _, purge } => session::down_purging(&ctx, !*keep_supervisor, *purge).map(|r| {
+        Cmd::Down { keep_supervisor, purge, project, labels, .. } if project.is_some() || !labels.is_empty() => fleet_filter(&root, project.as_ref(), labels, false)
+            .and_then(|fleet| stack::fleet::down(&ctx.state, &ctx.cache, &fleet, !*keep_supervisor, *purge))
+            .map(|r| {
+                let code = emit(cli.json, &r, || stack::fleet::print_fleet_down(&r));
+                if r.failed == 0 { code } else { ExitCode::from(contract::exit::UNHEALTHY) }
+            }),
+        Cmd::Down { keep_supervisor, stop_supervisor: _, purge, forget_unrecorded, .. } => session::down_forgetting(&ctx, !*keep_supervisor, *purge, *forget_unrecorded).map(|r| {
             emit(cli.json, &r, || {
+                if r.forgotten_unrecorded > 0 {
+                    println!("forgot {} unrecorded command(s)", r.forgotten_unrecorded);
+                }
                 println!("stopped {} service(s); confirmed", r.stopped.len());
+                for w in &r.warnings {
+                    // Not `eprintln!`: a closed stderr must not abort a stop that is already done.
+                    let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("warning: {w}\n"));
+                }
+                for record in &r.removed_unreadable {
+                    println!("removed unreadable session record {}", record.display());
+                }
+                if let Some(checked) = &r.recovery_checked {
+                    println!("checked: {checked}");
+                }
                 if let Some(p) = &r.purge {
                     for d in &p.data {
                         println!("{} {}: {}", if d.kept { "kept" } else { "data" }, d.service, d.outcome);
@@ -626,7 +754,18 @@ fn main() -> ExitCode {
         Cmd::Gc { reclaim_data, stop_orphans, .. } => session::gc_checked(&ctx.state, *reclaim_data, *stop_orphans).map(|r| {
             emit(cli.json, &r, || print_gc(&r))
         }),
-        Cmd::Ps { no_size } => stack::fleet::ps(&ctx.state, !*no_size).map(|r| emit(cli.json, &r, || stack::fleet::print_ps(&r))),
+        Cmd::Ps { no_size, project, state, labels, worktrees } => stack::labels::parse_all(labels)
+            .and_then(|labels| {
+                let opts = stack::fleet::PsOptions {
+                    project: project_dir(&root, project.as_ref())?,
+                    state: state.clone(),
+                    labels,
+                    worktrees: *worktrees,
+                    cwd: Some(root.clone()),
+                };
+                stack::fleet::ps_with(&ctx.state, !*no_size, &opts)
+            })
+            .map(|r| emit(cli.json, &r, || stack::fleet::print_ps(&r))),
         Cmd::Mv { old, new } => std::env::current_dir()
             .map_err(|e| StackError::new("io", format!("current directory: {e}")))
             .and_then(|cwd| stack::fleet::mv(&ctx.state, &cwd, old, new))
@@ -660,7 +799,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Mcp | Cmd::Errors { .. } => unreachable!("handled above"),
+        Cmd::Mcp { .. } | Cmd::Errors { .. } => unreachable!("handled above"),
         Cmd::Snapshot { action } => snapshot(&ctx, cli.json, action),
     };
     // Without -C, a missing stack.toml says where the search looked.
@@ -674,7 +813,8 @@ fn main() -> ExitCode {
         // A start the caller's signal cancelled ends as that signal would have ended it.
         Err(e) if e.code == "cancelled" => {
             let signal = stack::process::passed_on().unwrap_or(15);
-            fail(cli.json, e);
+            // Reported like any failure, but the exit status is the signal's, not the error's.
+            report_failure(cli.json, &e);
             ExitCode::from(contract::child_exit(None, Some(signal.into())))
         }
         // Like an argument error clap rejects: the same code, a hint, and exit 2.
@@ -697,6 +837,28 @@ fn prepare(up: bool, ttl: Option<&str>, install: bool) -> Result<session::Prepar
     Ok(session::Prepare { up, ttl_secs, install })
 }
 
+/// `--project[=PATH]`: the project directory (the checkout's own without a path), canonicalized
+/// and resolved upward to its nearest `stack.toml` up to the Git worktree root.
+fn project_dir(root: &Path, project: Option<&Option<PathBuf>>) -> Result<Option<PathBuf>> {
+    match project {
+        None => Ok(None),
+        Some(None) => Ok(Some(root.to_path_buf())),
+        Some(Some(path)) => {
+            let canonical = path.canonicalize().map_err(|e| {
+                StackError::new("dir_not_found", format!("--project {}: {e}", path.display()))
+                    .hint("pass --project=PATH with the path of an existing checkout of the project")
+            })?;
+            let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| h.canonicalize().ok());
+            Ok(Some(stack::discover::find(&canonical, home.as_deref()).root))
+        }
+    }
+}
+
+/// The fleet selection of `status`, `logs` and `down`: `--project[=PATH]`, `--label` and `--all`.
+fn fleet_filter(root: &Path, project: Option<&Option<PathBuf>>, labels: &[String], all: bool) -> Result<stack::fleet::FleetFilter> {
+    Ok(stack::fleet::FleetFilter { project: project_dir(root, project)?, labels: stack::labels::parse_all(labels)?, all })
+}
+
 /// `--owner-pid`: a process ID or `ancestor:<name>`, checked as an argument (exit 2).
 fn owner_arg(value: &str) -> std::result::Result<stack::lease::Owner, String> {
     stack::lease::Owner::parse(value).map_err(|e| e.message)
@@ -704,8 +866,14 @@ fn owner_arg(value: &str) -> std::result::Result<stack::lease::Owner, String> {
 
 /// `stack logs`: one service as before, several (every one when none is named) with each line
 /// prefixed by its service, or following until interrupted.
-fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>, follow: bool) -> Result<ExitCode> {
+fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>, follow: bool, fleet: &stack::fleet::FleetFilter) -> Result<ExitCode> {
     q.since_secs = since.map(parse_duration).transpose()?;
+    if fleet.active() {
+        let r = stack::fleet::logs(&ctx.state, &ctx.cache, fleet, &q)?;
+        return Ok(emit(as_json, &r, || {
+            let _ = stack::fleet::print_fleet_logs(&r);
+        }));
+    }
     if follow {
         if as_json {
             return Err(StackError::new("usage", "--follow cannot be combined with --json")
@@ -810,6 +978,9 @@ fn print_gc_plan(plan: &session::GcDryRun) {
             println!("  {} port {}{pid}", s.service, s.port);
         }
     }
+    for u in &plan.unreadable {
+        println!("{}: {} (left alone; run `stack down` in it)", u.project.display(), u.reason);
+    }
     for d in &plan.deleted_checkouts {
         let after = if d.after_session { " (once its session is reclaimed)" } else { "" };
         println!("{}: deleted checkout{after}", d.project.display());
@@ -821,10 +992,13 @@ fn print_gc_plan(plan: &session::GcDryRun) {
             println!("  {} data {} {what}", data.service, data.dir.display());
         }
     }
+    for t in &plan.templates {
+        println!("{}: Postgres template, {} MB, a pass would try to remove it: {}", t.dir.display(), t.bytes / 1_000_000, t.reason);
+    }
     for w in &plan.warnings {
         eprintln!("warning: {w}");
     }
-    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() {
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() && plan.templates.is_empty() {
         println!("nothing to reclaim");
     }
 }
@@ -1044,6 +1218,7 @@ fn exec(ctx: &Ctx, plan: session::ExecPlan, timeout: Option<Duration>) -> Result
     }
     command.args(&plan.args).envs(&plan.env).current_dir(plan.dir.as_deref().unwrap_or(&ctx.root));
     let start_error = |e: std::io::Error| StackError::new("exec_failed", format!("cannot start {}: {e}", plan.program.display()));
+    let _recorded = plan.record_spawn();
     let code = match timeout {
         None => {
             // Like a shell: a command ended by a signal reports 128 + its number.
@@ -1144,12 +1319,17 @@ fn usage_text(rendered: &str) -> (String, String) {
 
 /// Report `e` and return its exit code: 2 for `usage`, 124 for `timed_out`, 70 otherwise.
 fn fail(as_json: bool, e: StackError) -> ExitCode {
-    if as_json {
-        println!("{}", call().failure(&e));
-    } else {
-        print_error(&e);
-    }
+    report_failure(as_json, &e);
     ExitCode::from(contract::error_exit(&e))
+}
+
+/// Say what failed, as [`fail`] does, without choosing the exit code.
+fn report_failure(as_json: bool, e: &StackError) {
+    if as_json {
+        println!("{}", call().failure(e));
+    } else {
+        print_error(e);
+    }
 }
 
 /// An error for people, on stderr: the message, then the hint and details that say what to do.

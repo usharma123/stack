@@ -138,7 +138,11 @@ def benchmark(tool):
             run('settle-B','sleep 3')
             run('identity-B',cmd('appB',enter('printf "DATABASE_URL=%s REDIS_URL=%s\n" "$DATABASE_URL" "$REDIS_URL"; psql "$DATABASE_URL" -Atc "show data_directory"')))
             run('tests-B',cmd('appB',enter('set -e; uv sync -q; uv run pytest -q')))
-            status={'stack':'stack status --json','mise':'mise daemons status --json','flox':'flox services status --json',
+            # `stack status` exits 0 for a checkout with nothing started too, so its exit code
+            # is no readiness check: assert started and healthy from its JSON.
+            stack_status=('out=$(stack status --json); printf "%s\\n" "$out"; '
+                          'grep -q \'"started":true\' <<<"$out" && grep -q \'"healthy":true\' <<<"$out"')
+            status={'stack':stack_status,'mise':'mise daemons status --json','flox':'flox services status --json',
                     'devenv':'devenv processes list','devbox':'devbox services ls'}[tool]
             run('status-B',cmd('appB',status))
             stop={'stack':'stack down --json','mise':'mise daemons stop','flox':'flox activate -- flox services stop',

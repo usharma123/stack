@@ -11,8 +11,9 @@ use std::process::Command;
 pub const LAUNCHD_LABEL: &str = "dev.stack.gc";
 pub const SYSTEMD_UNIT: &str = "stack-gc.service";
 
-/// Variables the agent keeps from the shell that wrote it: `PATH` (to find mise, Pitchfork and
-/// node for the npm launcher) and the stores Stack and Pitchfork use, when set.
+/// Variables the agent keeps from the shell that wrote it: `PATH` (to find mise, the Pitchfork
+/// binary of sessions an older Stack started, and node for the npm launcher) and the stores
+/// Stack and Pitchfork use, when set.
 const PASSED: &[&str] = &[
     "PATH",
     "STACK_STATE_DIR",

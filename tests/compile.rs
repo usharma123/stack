@@ -239,29 +239,28 @@ fn compiles_git_bundle_with_services_files_and_pinned_commit() {
 
     let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
     for expected in [
-        "experimental = true",
-        "pitchfork = \"2.29.0\"",
         "python = \"3.13.2\"",
         "uv = \"0.12.1\"",
-        "version = \"17.2\"",
-        "version = \"8.2.1\"",
-        "[daemons.postgres]",
-        "preset = \"postgres\"",
-        "daemons = [\"postgres\"]",
+        // Each preset's server at its pinned release, installed like any tool.
+        "postgres = \"17.2\"",
+        "redis = \"8.2.1\"",
         "UV_PYTHON_PREFERENCE = \"only-system\"",
         "UV_PYTHON = \"3.13.2\"",
     ] {
         assert!(rendered.contains(expected), "missing `{expected}` in:\n{rendered}");
     }
     assert!(!rendered.contains("{{bundle_dir}}"));
+    // Services are Stack's own: nothing of them, nor of Pitchfork, is provider configuration.
+    for absent in ["pitchfork", "[daemons", "experimental", "daemons = ", "STACK_SUPERVISOR_BINDING"] {
+        assert!(!rendered.contains(absent), "`{absent}` in:\n{rendered}");
+    }
 
-    // Postgres and Redis get a TCP fallback on their assigned ports. Stack still verifies
-    // their instance identity after the supervisor reports them started.
+    // Each service's connection variables name its assigned loopback port.
     for (service, port) in &report.ports {
         assert!((20000..=29999).contains(port), "{service} got {port}");
-        assert!(rendered.contains(&format!("port = {port}")));
-        assert!(rendered.contains(&format!("ready_port = {port}")), "{service}:\n{rendered}");
     }
+    assert!(rendered.contains(&format!("DATABASE_URL = \"postgresql://postgres@127.0.0.1:{}/postgres\"", report.ports["postgres"])), "{rendered}");
+    assert!(rendered.contains(&format!("REDIS_URL = \"redis://127.0.0.1:{}\"", report.ports["redis"])), "{rendered}");
     assert_eq!(report.ports.len(), 2);
 }
 
@@ -325,13 +324,13 @@ fn a_postgres_preset_initializes_with_a_fixed_utf8_locale_whatever_the_callers()
     let root = sb.project("[services.db]\npreset = \"postgres\"\n[services.cache]\npreset = \"redis\"\n[services.web]\nrun = \"serve\"\n");
     sb.compile(&root, Mode::UseLock).unwrap();
     let rendered: toml::Table = fs::read_to_string(mise::output_path(&root)).unwrap().parse().unwrap();
-    let daemons = rendered["daemons"].as_table().unwrap();
-    // The daemon's own environment, which its one-time `initdb` runs with, replaces the
-    // caller's locale; it is not in `[env]`, so commands keep theirs.
-    assert_eq!(daemons["db"]["env"]["LC_ALL"].as_str(), Some("C.UTF-8"), "{daemons:?}");
+    // The service's own environment, which its one-time `initdb` runs with, replaces the
+    // caller's locale (Stack's supervisor sets it; see the runtime tests); it is not in
+    // `[env]`, so commands keep theirs.
+    assert_eq!(mise::preset_env(Some("postgres")), [("LC_ALL", "C.UTF-8")]);
     // Redis starts under any caller's locale, including one the machine lacks.
-    assert_eq!(daemons["cache"]["env"]["LC_ALL"].as_str(), Some("C"), "{daemons:?}");
-    assert!(daemons["web"].get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{daemons:?}");
+    assert_eq!(mise::preset_env(Some("redis")), [("LC_ALL", "C")]);
+    assert!(mise::preset_env(None).is_empty());
     assert!(rendered.get("env").and_then(|e| e.get("LC_ALL")).is_none(), "{rendered:?}");
 }
 
@@ -354,34 +353,6 @@ fn uv_python_selection_is_left_to_the_project_when_it_sets_one() {
     sb.compile(&root, Mode::UseLock).unwrap();
     let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
     assert!(!rendered.contains("UV_PYTHON_PREFERENCE"), "only projects that pin python: {rendered}");
-}
-
-#[test]
-fn a_services_own_readiness_check_is_kept() {
-    let sb = Sandbox::new();
-    let root = sb.project("[services.postgres]\npreset = \"postgres\"\nversion = \"17\"\nready_cmd = \"pg_isready\"\n[services.web]\nrun = \"exec ./serve\"\n");
-    sb.compile(&root, Mode::UseLock).unwrap();
-    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
-    assert!(rendered.contains("ready_cmd = \"pg_isready\""), "{rendered}");
-    assert!(!rendered.contains("ready_port"), "custom services and explicit checks are left alone:\n{rendered}");
-}
-
-#[test]
-fn tcp_readiness_fallback_requires_builtin_protocol_verification() {
-    let sb = Sandbox::new();
-    let root = sb.project("[services.pg]\npreset='postgres'\n[services.redis]\npreset='redis'\n[services.cr]\npreset='cockroachdb'\n[services.nats]\npreset='nats'\n[services.spice]\npreset='spicedb'\n[services.explicit]\npreset='redis'\nready_port=6379\n");
-    let report = sb.compile(&root, Mode::UseLock).unwrap();
-    let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
-    let config: toml::Value = toml::from_str(&rendered).unwrap();
-    let daemons = config["daemons"].as_table().unwrap();
-    for name in ["pg", "redis"] {
-        assert_eq!(daemons[name]["ready_port"].as_integer(), Some(report.ports[name].into()));
-    }
-    for name in ["cr", "nats", "spice"] {
-        assert!(daemons[name].get("ready_port").is_none(), "{name}'s functional check must not be bypassed");
-        assert!(daemons[name].get("ready_cmd").is_none(), "{name} keeps the provider's preset check");
-    }
-    assert_eq!(daemons["explicit"]["ready_port"].as_integer(), Some(6379));
 }
 
 #[test]
@@ -517,7 +488,7 @@ fn project_can_add_its_own_service_and_pin_a_port() {
     let report = sb.compile(&root, Mode::UseLock).unwrap();
     assert_eq!(report.stack.services["api"].origin, "project");
     let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
-    assert!(rendered.contains("port = 15432"));
+    assert!(rendered.contains("PGPORT = \"15432\"") && rendered.contains("127.0.0.1:15432/postgres"), "{rendered}");
 }
 
 #[test]
@@ -660,14 +631,14 @@ fn exact_tool_and_service_versions_survive_upstream_releases_and_a_fresh_cache()
     let base = sb.bundle("pybase", PYBASE);
     let root = sb.project(&use_git(&base, "v1"));
     let first = sb.compile(&root, Mode::UseLock).unwrap();
-    for (name, version) in [("python", "3.13.2"), ("uv", "0.12.1"), ("pitchfork", "2.29.0"), ("postgres", "17.2"), ("redis", "8.2.1")] {
+    for (name, version) in [("python", "3.13.2"), ("uv", "0.12.1"), ("postgres", "17.2"), ("redis", "8.2.1")] {
         assert_eq!(resolved(&first, name), version, "{name}");
     }
     let locked = lock::read(&root).unwrap().unwrap();
     assert_eq!(locked.version, 3);
     let pg = locked.service("postgres").unwrap();
     assert_eq!((pg.tool.as_deref(), pg.requested.as_str(), pg.resolved.as_str()), (Some("postgres"), "17", "17.2"));
-    assert_eq!(locked.tool("pitchfork").unwrap().resolved, "2.29.0", "provider tools are locked too");
+    assert!(locked.tool("pitchfork").is_none(), "Stack adds no provider tool");
     let pinned = lock_text(&root);
     let config = fs::read_to_string(mise::output_path(&root)).unwrap();
 
@@ -695,10 +666,8 @@ fn exact_tool_and_service_versions_survive_upstream_releases_and_a_fresh_cache()
         let v = updated.versions.iter().find(|v| v.name == name).unwrap();
         assert_eq!((v.resolved.as_deref(), v.moved_from.as_deref()), (Some(to), Some(from)), "{name}");
     }
-    let pitchfork = updated.versions.iter().find(|v| v.name == "pitchfork").unwrap();
-    assert_eq!(pitchfork.moved_from, None);
     let rendered = fs::read_to_string(mise::output_path(&root)).unwrap();
-    assert!(rendered.contains("python = \"3.13.9\"") && rendered.contains("version = \"17.9\""), "{rendered}");
+    assert!(rendered.contains("python = \"3.13.9\"") && rendered.contains("postgres = \"17.9\""), "{rendered}");
 }
 
 #[test]
@@ -1131,7 +1100,7 @@ fn locked_pins_become_a_tools_only_scratch_configuration() {
     sb.compile(&root, Mode::UseLock).unwrap();
     let pins = scratch::pins(&lock::read(&root).unwrap().unwrap());
     let names: Vec<String> = pins.iter().map(|p| format!("{}@{}", p.tool, p.spec.version)).collect();
-    assert_eq!(names, ["rust@1.93.1", "mbx@1.22.0", "pitchfork@2.29.0", "postgres@17.2"]);
+    assert_eq!(names, ["rust@1.93.1", "mbx@1.22.0", "postgres@17.2"]);
     let root_a = scratch::ScratchRoot::create(&sb.path("cache"), "skills").unwrap();
     let written = fs::read_to_string(root_a.write_tools(&pins).unwrap()).unwrap();
     let doc: toml::Table = toml::from_str(&written).unwrap();
@@ -1155,4 +1124,68 @@ fn trust_options_on_a_registry_name_need_mises_packslip_backend() {
     sb.compile(&root, Mode::Frozen).unwrap();
     compile(&sb.options(&root, Mode::Frozen, false)).unwrap();
     assert_eq!(sb.upstream.calls(), 0);
+}
+
+/// A stack.lock Stack 0.1.23 or earlier wrote pins Pitchfork for a stack with services (and
+/// embeds its artifact entries). Locked operations accept it as it is; the next compile drops
+/// the pin and its entries, and nothing else.
+#[test]
+fn a_lock_with_the_pitchfork_pin_an_older_stack_added_stays_valid_until_compile_drops_it() {
+    let sb = Sandbox::new();
+    let root = sb.project("[services.db]\npreset = \"postgres\"\nversion = \"17\"\n");
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let current = lock_text(&root);
+    let mut old: toml::Table = current.parse().unwrap();
+    let mut pin = toml::Table::new();
+    for (k, v) in [("name", "pitchfork"), ("requested", "2.29.0"), ("resolved", "2.29.0"), ("resolved_on", "macos-arm64")] {
+        pin.insert(k.into(), toml::Value::String(v.into()));
+    }
+    old.entry("tool").or_insert(toml::Value::Array(Vec::new())).as_array_mut().unwrap().insert(0, toml::Value::Table(pin));
+    if let Some(tools) = old.get_mut("provider_lock").and_then(|p| p.get_mut("tools")).and_then(toml::Value::as_table_mut) {
+        let mut entry = toml::Table::new();
+        entry.insert("version".into(), toml::Value::String("2.29.0".into()));
+        entry.insert("backend".into(), toml::Value::String("packslip:github.com/jdx/pitchfork".into()));
+        tools.insert("pitchfork".into(), toml::Value::Array(vec![toml::Value::Table(entry)]));
+    }
+    let old = toml::to_string(&old).unwrap();
+    fs::write(root.join("stack.lock"), &old).unwrap();
+    let locked = sb.compile(&root, Mode::Frozen).unwrap_or_else(|e| panic!("an older lock is refused: {e:?}"));
+    assert!(!locked.lock_changed);
+    assert_eq!(lock_text(&root), old, "locked operations never rewrite the lock");
+    assert!(!fs::read_to_string(mise::output_path(&root)).unwrap().contains("pitchfork"));
+    let compiled = sb.compile(&root, Mode::UseLock).unwrap();
+    assert!(compiled.lock_changed);
+    let rewritten: toml::Table = lock_text(&root).parse().unwrap();
+    assert!(!lock_text(&root).contains("pitchfork"), "{rewritten}");
+    assert_eq!(rewritten["service"], current.parse::<toml::Table>().unwrap()["service"], "every other pin is kept");
+    // A project that asks for Pitchfork itself keeps it.
+    let own = sb.project("[tools]\npitchfork = \"2.29.0\"\n[services.db]\npreset = \"postgres\"\nversion = \"17\"\n");
+    sb.compile(&own, Mode::UseLock).unwrap();
+    assert!(lock_text(&own).contains("name = \"pitchfork\""));
+    sb.compile(&own, Mode::Frozen).unwrap();
+}
+
+#[test]
+fn service_names_colliding_with_preset_secondary_ports_are_rejected() {
+    let sb = Sandbox::new();
+    for (preset, role) in [("cockroachdb", "http"), ("nats", "monitor"), ("spicedb", "http"), ("spicedb", "metrics")] {
+        let root = sb.project(&format!(
+            "[services.db]\npreset = \"{preset}\"\n[services.\"db.{role}\"]\nrun = \"true\"\n"
+        ));
+        for (mode, write) in [(Mode::UseLock, true), (Mode::UseLock, false), (Mode::Update, true)] {
+            let err = compile(&sb.options(&root, mode, write)).unwrap_err();
+            assert_eq!(err.code, "invalid_service", "{preset}/{role}: {err:?}");
+            assert!(err.message.contains(&format!("db.{role}")) && err.message.contains(role), "{err:?}");
+        }
+        assert!(!root.join("stack.lock").exists(), "{preset}/{role}: lock written");
+        assert!(!sb.path("state/ports.json").exists(), "{preset}/{role}: ports written");
+    }
+    assert_eq!(sb.upstream.calls(), 0, "rejected before resolving anything");
+
+    // Unrelated dotted service names still compile alongside multi-port presets.
+    let ok = sb.project("[services.db]\npreset = \"cockroachdb\"\n[services.\"api.v2\"]\nrun = \"true\"\n");
+    let report = sb.compile(&ok, Mode::UseLock).unwrap();
+    assert!(report.ports.contains_key("db") && report.ports.contains_key("api.v2"));
+    assert!(report.secondary_ports.contains_key("db.http"));
+    assert_ne!(report.ports["api.v2"], report.secondary_ports["db.http"]);
 }

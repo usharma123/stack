@@ -81,20 +81,46 @@ pub fn project_id(root: &Path) -> ProjectId {
         Some((common, sub))
     };
     match git() {
-        Some((common, sub)) => ProjectId {
+        Some((common, sub)) => ProjectId::git(common, sub),
+        None => ProjectId::checkout(root),
+    }
+}
+
+/// [`project_id`] read from the checkout's Git files instead of asking `git` (see
+/// [`crate::gitdir`]): the same identity for every repository Git itself lays out, at the cost
+/// of a few file reads, so `ps` can name the project of every checkout it lists.
+pub fn project_id_offline(root: &Path) -> ProjectId {
+    project_id_of(root, crate::gitdir::locate(root).as_ref())
+}
+
+/// [`project_id_offline`] from Git directories already located for `root`.
+pub fn project_id_of(root: &Path, dirs: Option<&crate::gitdir::GitDirs>) -> ProjectId {
+    let git = dirs.and_then(|d| Some((d.common_dir.clone(), root.strip_prefix(&d.toplevel).ok()?.to_string_lossy().into_owned())));
+    match git {
+        Some((common, sub)) => ProjectId::git(common, sub),
+        None => ProjectId::checkout(root),
+    }
+}
+
+impl ProjectId {
+    fn git(common: PathBuf, sub: String) -> Self {
+        ProjectId {
             id: sha256_hex(format!("git\0{}\0{sub}", common.display()).as_bytes())[..16].to_string(),
             kind: "git",
             git_common_dir: Some(common),
             subdir: Some(sub),
             checkout: None,
-        },
-        None => ProjectId {
+        }
+    }
+
+    fn checkout(root: &Path) -> Self {
+        ProjectId {
             id: sha256_hex(format!("checkout\0{}", root.display()).as_bytes())[..16].to_string(),
             kind: "checkout",
             git_common_dir: None,
             subdir: None,
             checkout: Some(root.to_path_buf()),
-        },
+        }
     }
 }
 
@@ -624,6 +650,12 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
     let meta = read_meta(&ctx.state, &project, name)?;
     compatible(&meta, report)?;
     let snapshot = store(&ctx.state, &project).join(name);
+    let unresolved = crate::supervisor::unresolved(&crate::supervisor::dir(&ctx.state, &ctx.root));
+    if !unresolved.is_empty() {
+        return Err(StackError::new("stop_unconfirmed", "processes of this checkout's services may still run; nothing was restored")
+            .hint("run `stack down`, which stops what it can show is this checkout's and names the rest, then retry")
+            .details(unresolved));
+    }
     let (mut restored, mut skipped) = (Vec::new(), Vec::new());
     for (service, snap) in &meta.services {
         let data = data_dir(ctx, statuses, service)?;
@@ -633,7 +665,7 @@ pub fn restore_before_start(ctx: &Ctx, report: &Report, statuses: &[DaemonStatus
         }
         // Nothing can be running on a directory that does not exist; still, never copy under
         // a running daemon.
-        if statuses.iter().any(|d| d.name == *service && matches!(d.status.as_str(), "running" | "starting" | "waiting")) {
+        if statuses.iter().any(|d| d.name == *service && session::may_run(d)) {
             return Err(StackError::new("snapshot_failed", format!("'{service}' is running; nothing was restored")).hint("run `stack down`, then retry"));
         }
         restored.push(restore_into(&snapshot, service, &data.location)?);
@@ -778,5 +810,11 @@ mod tests {
         let lone = dir.path().join("lone");
         fs::create_dir(&lone).unwrap();
         assert_eq!(project_id(&lone.canonicalize().unwrap()).kind, "checkout");
+        // Read from Git's files, the identity is the same.
+        for at in [&repo, &wt, &sub, &lone] {
+            let at = at.canonicalize().unwrap();
+            let (asked, read) = (project_id(&at), project_id_offline(&at));
+            assert_eq!((asked.id, asked.kind, asked.subdir), (read.id, read.kind, read.subdir), "{at:?}");
+        }
     }
 }

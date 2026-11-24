@@ -52,8 +52,20 @@ impl Drop for Timings {
 }
 
 fn report(label: &str, phase: &str, elapsed: Duration) {
-    eprintln!(
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
         "stack: timing {label}.{phase} {:.1}ms",
         elapsed.as_secs_f64() * 1000.0
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_formats_without_panicking() {
+        report("test", "phase", Duration::from_millis(12));
+    }
 }

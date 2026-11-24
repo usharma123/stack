@@ -233,9 +233,10 @@ fn a_gc_problem_is_a_warning_of_up_never_its_failure() {
     assert_eq!(gc["status"], "warning", "{gc}");
     assert!(gc["detail"]["warnings"][0].as_str().unwrap().contains("broken.json"), "{gc}");
     assert!(up["data"]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().starts_with("gc: ")), "{up}");
-    // The standalone collector still reports it.
+    // The standalone collector still reports it, as a checkout it left alone.
     let (ok, result) = fixture.gc(&[]);
-    assert!(!ok && result["error"]["code"] == "state_invalid", "{result}");
+    assert!(!ok && result["error"]["code"] == "gc_incomplete", "{result}");
+    assert_eq!(result["error"]["details"][0]["reason"], "session record unreadable", "{result}");
 }
 
 #[test]
@@ -316,6 +317,12 @@ fn gc_dry_run_reports_what_would_be_reclaimed_and_changes_nothing() {
 // ---- gc --stop-orphans -------------------------------------------------------------------
 
 const WEB: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\n";
+/// A service command for Stack's supervisor that listens on `$PORT` until stopped.
+const LISTEN: &str = r#"exec "$REVIEW_PYTHON" -c 'import os,socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(os.environ["PORT"]))); s.listen(); time.sleep(600)'"#;
+/// [`WEB`], listening.
+fn listening_web() -> String {
+    WEB.replace("run='true'", &format!("run='''{LISTEN}'''"))
+}
 const WEB_ID: &str = "app-0123456789abcdef/web";
 
 /// A detached process standing in for a supervised service, killed when dropped.
@@ -345,25 +352,28 @@ struct Running {
 }
 
 impl Fixture {
-    /// `stack up` of one supervised service that is really running and listening.
+    /// A session of one service as Stack 0.1.23 left it under Pitchfork (the fake `pitchfork`
+    /// in `bin/`): a native `up` of a listening service gives the record its digests and
+    /// directory identity and is stopped, then the record is rewritten to name a detached
+    /// process as the service, Pitchfork as its supervisor and `WEB_ID` as its id, and the
+    /// service's port is held by a listener of the test's.
     fn start_web(&self) -> Running {
         let inspect = json_result(&self.ok(&["inspect", "--json"]));
         let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
+        fs::write(self.path("bundle/bundle.toml"), listening_web()).unwrap();
+        self.ok(&["compile"]);
+        self.ok(&["up"]);
+        let index = fs::read_dir(self.path("state/sessions")).unwrap().next().unwrap().unwrap().path();
+        let mut session: Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        self.ok(&["down"]);
         let service = Detached::spawn();
-        fs::write(
-            self.path("daemons-started.json"),
-            json!([{ "id": WEB_ID, "name": "web", "status": "running", "pid": service.0, "port": port }]).to_string(),
-        )
-        .unwrap();
-        let up = self.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !self.path("started").exists() {
-            assert!(Instant::now() < deadline, "provider start never ran");
-            thread::sleep(Duration::from_millis(10));
+        session["provider"] = json!({ "pitchfork": self.path("bin/pitchfork"), "state_dir": self.path("pfs") });
+        session["services"]["web"]["pid"] = json!(service.0);
+        session["services"]["web"]["provider_id"] = json!(WEB_ID);
+        for path in [index, self.path("app/.stack/session.json")] {
+            fs::write(path, session.to_string()).unwrap();
         }
         let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let out = up.wait_with_output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
         Running { service, port, listener: Some(listener) }
     }
 
@@ -388,7 +398,6 @@ impl Fixture {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stop_orphans_stops_a_deleted_checkouts_service_only_when_every_recorded_fact_matches() {
     let fixture = Fixture::with_bundle(WEB);
     let mut running = fixture.start_web();
@@ -427,7 +436,6 @@ fn stop_orphans_stops_a_deleted_checkouts_service_only_when_every_recorded_fact_
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn stop_orphans_never_stops_a_service_whose_supervisor_reports_another_pid() {
     let fixture = Fixture::with_bundle(WEB);
     let running = fixture.start_web();
@@ -605,6 +613,56 @@ fn exec_up_starts_the_stack_only_when_needed_and_keeps_the_lease() {
 }
 
 #[test]
+fn exec_up_and_run_up_never_start_a_session_that_lives_forever() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tasks.t]\nrun='true'\n");
+    // No --ttl and no [session] default_ttl: 30 minutes, not a session until `stack down`.
+    let result = json_result(&fixture.ok(&["--json", "exec", "--up", "--", "true"]));
+    assert_eq!(result["data"]["prepared"][0]["step"], "up", "{result}");
+    assert_eq!(result["data"]["prepared"][0]["lease"]["kind"], "ttl", "{result}");
+    assert_eq!(result["data"]["prepared"][0]["lease"]["ttl_secs"], 1800, "{result}");
+    assert_eq!(saved_session(&fixture)["lease"]["ttl_secs"], 1800);
+    fixture.ok(&["down"]);
+    let results = fixture.mcp(&[("stack_run", json!({ "task": "t", "up": true }))]);
+    assert_eq!(results[0]["data"]["prepared"][0]["lease"]["ttl_secs"], 1800, "{}", results[0]);
+    fixture.ok(&["down"]);
+
+    // `stack up` alone still records no lease; a stale session without one gets the default
+    // when `run --up` starts it again.
+    fixture.ok(&["up"]);
+    assert!(saved_session(&fixture).get("lease").map_or(true, Value::is_null), "{}", saved_session(&fixture));
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
+    let result = json_result(&fixture.ok(&["--json", "run", "--up", "t"]));
+    assert!(result["data"]["prepared"][0]["reason"].as_str().unwrap().contains("configuration changed"), "{result}");
+    assert_eq!(saved_session(&fixture)["lease"]["ttl_secs"], 1800, "{result}");
+    fixture.ok(&["down"]);
+
+    // [session] default_ttl: what `up` with no lease named, and `exec --up`, record.
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[session]\ndefault_ttl='10m'\n").unwrap();
+    let up = json_result(&fixture.ok(&["--json", "up"]));
+    assert_eq!((up["data"]["lease"]["kind"].as_str(), up["data"]["lease"]["ttl_secs"].as_u64()), (Some("ttl"), Some(600)), "{up}");
+    fixture.ok(&["down"]);
+    let up = json_result(&fixture.ok(&["--json", "up", "--ttl", "1h"]));
+    assert_eq!(up["data"]["lease"]["ttl_secs"], 3600, "--ttl wins: {up}");
+    fixture.ok(&["down"]);
+    let pid = std::process::id().to_string();
+    let up = json_result(&fixture.ok(&["--json", "up", "--owner-pid", &pid]));
+    assert_eq!(up["data"]["lease"]["kind"], "owner_pid", "an owner is a lease; no TTL is added: {up}");
+    fixture.ok(&["down"]);
+    let result = json_result(&fixture.ok(&["--json", "exec", "--up", "--", "true"]));
+    assert_eq!(result["data"]["prepared"][0]["lease"]["ttl_secs"], 600, "{result}");
+    let results = fixture.mcp(&[("stack_up", json!({}))]);
+    assert_eq!(results[0]["data"]["lease"]["ttl_secs"], 600, "{}", results[0]);
+    fixture.ok(&["down"]);
+
+    // An invalid default is refused before anything starts.
+    fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[session]\ndefault_ttl='soon'\n").unwrap();
+    let out = fixture.command(&["--json", "exec", "--up", "--", "true"]).output().unwrap();
+    let error = &json_result(&out)["error"];
+    assert_eq!(error["code"], "manifest_invalid", "{error}");
+    assert!(error["message"].as_str().unwrap().contains("default_ttl"), "{error}");
+}
+
+#[test]
 fn exec_install_installs_missing_pins_instead_of_failing() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.8.2'\n");
     let out = fixture.command(&["--json", "exec", "--", "true"]).output().unwrap();
@@ -625,32 +683,11 @@ fn exec_install_installs_missing_pins_instead_of_failing() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn up_reassign_ports_moves_a_port_another_program_holds_and_leaves_the_program_alone() {
     let fixture = Fixture::with_bundle(WEB);
-    // A provider that starts a supervised listener on whatever port web is assigned when it
-    // starts, as a real daemon would.
-    let real = fixture.path("bin/mise-fake");
-    fs::rename(fixture.path("bin/mise"), &real).unwrap();
-    write_exe(
-        &fixture.path("bin/mise"),
-        &format!(
-            r#"#!/bin/sh
-if test "$1 $2" = "daemons start"; then
-  "$REVIEW_PYTHON" -c '
-import json, os, sys
-f = sys.argv[1]
-r = json.load(open(os.path.join(os.environ["STACK_STATE_DIR"], "ports.json")))
-p = [x["port"] for x in r["reservations"] if x["service"] == "web"][0]
-open(os.path.join(f, "listen-port"), "w").write(str(p))
-json.dump([{{"id": "{WEB_ID}", "name": "web", "status": "running", "port": p}}], open(os.path.join(f, "daemons-started.json"), "w"))
-' "$REVIEW_FIXTURE"
-fi
-exec "{}" "$@"
-"#,
-            real.display()
-        ),
-    );
+    // web listens on whatever port it is assigned when it starts, as a real daemon would.
+    fs::write(fixture.path("bundle/bundle.toml"), listening_web()).unwrap();
+    fixture.ok(&["compile"]);
     let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
     let port = inspect["data"]["ports"]["web"].as_u64().unwrap() as u16;
     let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
@@ -705,7 +742,6 @@ fn a_repeated_up_skips_the_install_only_while_every_pin_is_installed() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn commands_in_one_checkout_plan_side_by_side_and_every_one_is_recorded_then_released() {
     let fixture = Fixture::new();
     fixture.ok(&["up"]);

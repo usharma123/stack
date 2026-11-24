@@ -29,8 +29,9 @@ su dev -c 'cd /work/app && stack setup && stack compile --locked && stack up'
 
 ### Intel Macs
 
-Pitchfork, which runs services, has no Intel macOS build. Tools-only stacks work. A stack with
-services fails with `services_unsupported` before anything is installed.
+Services run under Stack's own supervisor, so a stack with services needs only its servers'
+releases for the platform. The default lock platforms still leave out `macos-x64` (list it in
+`[lock] platforms` to lock it).
 
 ## First run
 

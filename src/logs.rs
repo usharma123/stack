@@ -56,6 +56,7 @@ pub struct Many {
     pub errors: IndexMap<String, StackError>,
 }
 
+#[derive(Debug)]
 pub enum Logs {
     One(LogsReport),
     Many(Many),

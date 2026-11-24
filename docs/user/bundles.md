@@ -68,7 +68,15 @@ may not be a service endpoint, an `[env]` key or a variable stack reserves. See
 ## Services
 
 A service is a preset (`postgres`, `redis`, `cockroachdb`, `nats`, `spicedb`) or a command of
-your own. Pitchfork supervises both through mise.
+your own. Stack's own supervisor runs both, one per checkout (see
+[worktrees](worktrees.md#services-and-the-supervisor)); mise installs their tools.
+
+Use each preset at most once per stack. Every service of a preset exports the same variable
+names (`DATABASE_URL` and `PG*` for every Postgres service, `REDIS_URL` for every Redis one),
+so with two of them only one service's values reach the app, and `up` fails for the other:
+its instance check reaches the wrong server (`DATABASE_URL reaches a different server`). Each
+still runs its own pinned release on its own port and data directory. For a second database
+of the same kind, use a service of your own with `run`.
 
 ```toml
 [services.web]
@@ -80,11 +88,11 @@ watch = ["index.html"]
 
 | Field | Default | Meaning |
 |---|---|---|
-| `preset` | none | Use mise's preset for that server; `version` picks its release (default `latest`, pinned in stack.lock) |
+| `preset` | none | Run that server the way mise's preset did (same data layout, `initdb -U postgres --auth=trust` for Postgres); `version` picks its release (default `latest`, pinned in stack.lock) |
 | `version` | `latest` | Preset services only |
-| `run` | the preset's | Shell command Pitchfork starts. It gets `$PORT`, the port stack assigned; the app gets it as `$<NAME>_PORT`, and a service without a preset also as `$<NAME>_URL` (`http://127.0.0.1:<port>`) |
-| `ready_cmd` | none | Command Pitchfork runs until it succeeds before it reports the service started. Stack runs it the same way (`sh -c`) where it checks readiness itself; one it cannot run does not pass, and the error says why |
-| `ready_port` | none (postgres and redis: the assigned port) | A port Pitchfork waits to accept connections before it reports the service started |
+| `run` | the preset's | Shell command (`/bin/sh -c`) the supervisor starts, in a process group of its own. It gets `$PORT`, the port stack assigned; the app gets it as `$<NAME>_PORT`, and a service without a preset also as `$<NAME>_URL` (`http://127.0.0.1:<port>`) |
+| `ready_cmd` | none | Command the supervisor runs (`sh -c`, `sh` from the stack's PATH) until it succeeds before it reports the service running. Stack runs it the same way where it checks readiness itself; one it cannot run does not pass, and the error says why |
+| `ready_port` | none (postgres and redis: the assigned port) | A port the supervisor waits to accept connections before it reports the service running |
 | `port` | `"auto"` | `"auto"` takes a free port from this machine's registry (20000-29999), stable per checkout; a number pins it, in the project's `stack.toml` or `[override.services]` only (`bundle_fixed_port` in a bundle) |
 | `identity` | none | An [identity probe](identity-probes.md): without one a custom service is verified for liveness only |
 | `watch` | `[]` | Files whose change after start `status`, `exec` and `run` report, with a `stack restart` hint |
@@ -92,11 +100,13 @@ watch = ["index.html"]
 | `depends_on` | `[]` | Services this one needs: they start, and pass their checks, before it does. `stack restart` of one restarts this one after it, and `up` restarting one (it died, say) stops this one first and starts it again after, so it reconnects. `stack restart` of this one alone needs the ones it depends on running and ready, or fails `dependency_not_ready` before stopping, setting up or starting anything. Names must be services of the stack, without cycles (`dependency_cycle`) |
 | `init` | none | Tasks `up` runs, in order, once per new data directory, after every service verified, such as `["migrate", "seed"]`: unlike `setup`, which runs before every start, init runs once and reaches the running service. Composed as its own key: a table with only `init` adds it to another layer's service. See [service data](data.md) |
 
-Whatever the readiness settings, `up` verifies every service itself: Pitchfork reports it
+Whatever the readiness settings, `up` verifies every service itself: the supervisor reports it
 running, its process is alive, and the assigned port accepts connections, plus the preset's
 instance check or the identity probe. `{{bundle_dir}}` expands in `run`, `ready_cmd`,
-`identity.command` and `watch`. Services need Pitchfork, which has no Intel macOS build (see
-[install](install.md)).
+`identity.command` and `watch`. A service that exits on its own is not restarted: `status`
+reports it not running and `stack up` starts it again. Postgres is stopped with `SIGINT` (its
+fast shutdown), everything else with `SIGTERM`, each sent to the service's whole process group,
+which is killed 10 seconds later if it is still there.
 
 ## Tool options
 
@@ -154,7 +164,8 @@ run = "cargo build"
 ## Artifact lock settings
 
 `[lock]` (`platforms`, `artifacts`) belongs to the project's `stack.toml` only; a bundle that
-sets it is `bundle_invalid`. Bundles cannot weaken or widen a project's artifact policy. See
+sets it is `bundle_invalid`. So does `[session]` (`default_ttl`, the lease a session gets when
+the command starting it names none; see [leases](commands.md#leases)). Bundles cannot weaken or widen a project's artifact policy. See
 [Artifact checksums](commands.md#artifact-checksums).
 
 See [commands](commands.md) for compile options and [guarantees](guarantees.md) for locking and conflict rules.

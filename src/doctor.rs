@@ -33,7 +33,6 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
     }
     checks.push(writable(state));
     checks.push(stack_release(root));
-    let mut configured = indexmap::IndexMap::new();
     if root.join(crate::manifest::PROJECT_FILE).exists() {
         let compiled = project::compile(&Options {
             root: root.to_path_buf(),
@@ -45,11 +44,6 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             resolver: None,
             locker: None,
         });
-        if let Ok(r) = &compiled {
-            for key in ["PITCHFORK_STATE_DIR", "HOME", "XDG_STATE_HOME"] {
-                if let Some(entry) = r.stack.env.get(key) { configured.insert(key.into(), entry.value.clone()); }
-            }
-        }
         if let Ok(r) = &compiled {
             if let Some(check) = provider_release(root, &project::install_requirements(r)) {
                 checks.push(check);
@@ -75,7 +69,6 @@ pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
             Err(e) => Check { name: "project", ok: false, detail: e.to_string(), hint: None },
         });
     }
-    checks.push(socket(root, configured));
     let failed = checks.iter().filter(|c| !c.ok).count();
     if failed == 0 {
         return Ok(checks);
@@ -123,7 +116,7 @@ fn stack_release(root: &Path) -> Check {
     let mut notes = vec![format!("{} at {}", crate::lock::writer(), me.as_ref().map_or("?".into(), |p| p.display().to_string()))];
     let on_path = std::env::var("PATH").ok().and_then(|path| crate::session::which_in(Some(&path), "stack")).and_then(|p| p.canonicalize().ok());
     match on_path {
-        Some(found) if Some(&found) != me.as_ref() => {
+        Some(found) if !same_install(&found, me.as_deref()) => {
             let mut command = Command::new(&found);
             command.arg("--version");
             let version = crate::process::capture(&mut command, std::time::Duration::from_secs(5), 4096)
@@ -150,6 +143,33 @@ fn stack_release(root: &Path) -> Check {
     }
 }
 
+/// Whether `on_path` launches `me`: either the exact same path, or the npm package wrapper
+/// `<pkg>/bin/stack.cjs` launching `<pkg>/binaries/<platform>/stack` in the same package.
+fn same_install(on_path: &Path, me: Option<&Path>) -> bool {
+    let Some(me) = me else { return false };
+    if on_path == me {
+        return true;
+    }
+    if on_path.file_name().and_then(|n| n.to_str()) != Some("stack.cjs") {
+        return false;
+    }
+    let Some(bin_dir) = on_path.parent() else { return false };
+    if bin_dir.file_name().and_then(|n| n.to_str()) != Some("bin") {
+        return false;
+    }
+    let Some(pkg_root) = bin_dir.parent() else { return false };
+    let Ok(rel) = me.strip_prefix(pkg_root) else { return false };
+    let parts: Vec<_> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+    matches!(
+        parts.as_slice(),
+        [
+            Some("binaries"),
+            Some("darwin-x64" | "darwin-arm64" | "linux-x64" | "linux-arm64"),
+            Some("stack")
+        ]
+    )
+}
+
 fn writable(state: &Path) -> Check {
     let probe = std::fs::create_dir_all(state).and_then(|_| tempfile::tempfile_in(state).map(drop));
     let ok = probe.is_ok();
@@ -164,25 +184,22 @@ fn writable(state: &Path) -> Check {
     }
 }
 
-/// Pitchfork's supervisor socket must fit `sun_path`; a long state directory fails `stack up`
-/// only after every download. Reads the project's own `[env]` value when it sets one.
-fn socket(root: &Path, configured: indexmap::IndexMap<String, String>) -> Check {
-    use crate::provider::mise;
-    if configured.values().any(|v| v.contains("{{")) {
-        return Check {
-            name: "pitchfork_socket",
-            ok: true,
-            detail: "Socket location uses a template; not checked here. `stack up` checks the rendered environment".into(),
-            hint: None,
-        };
-    }
-    match mise::socket_path(&mise::SocketEnv::effective(root, &configured), mise::socket_capacity()) {
-        Ok(s) => Check {
-            name: "pitchfork_socket",
-            ok: s.fits(),
-            detail: format!("{} ({} of {} bytes, from {})", s.path.display(), s.bytes, s.limit, s.source),
-            hint: (!s.fits()).then_some("set PITCHFORK_STATE_DIR to a shorter absolute directory, e.g. /tmp/pitchfork-$USER"),
-        },
-        Err(note) => Check { name: "pitchfork_socket", ok: true, detail: note, hint: None },
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npm_wrapper_matches_its_packaged_binary_only() {
+        let pkg = Path::new("/opt/homebrew/lib/node_modules/@ushawarma/stack");
+        let wrapper = pkg.join("bin/stack.cjs");
+        let packaged = pkg.join("binaries/darwin-arm64/stack");
+        let other = Path::new("/Users/dev/stack/target/release/stack");
+        let other_pkg = Path::new("/tmp/other/binaries/darwin-arm64/stack");
+
+        assert!(same_install(&packaged, Some(&packaged)));
+        assert!(same_install(&wrapper, Some(&packaged)));
+        assert!(!same_install(&wrapper, Some(other)));
+        assert!(!same_install(&wrapper, Some(other_pkg)));
+        assert!(!same_install(&wrapper, None));
     }
 }

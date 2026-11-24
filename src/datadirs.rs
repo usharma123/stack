@@ -47,10 +47,13 @@ pub struct Entry {
     pub identity: Option<[u64; 2]>,
 }
 
-/// A service's supervisor identity: the Pitchfork binary, its state directory and the daemon id.
+/// A service's supervisor identity: Stack's supervisor directory and the service's name, or,
+/// for data an older Stack recorded, the Pitchfork binary, its state directory and the daemon id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Supervisor {
-    pub pitchfork: PathBuf,
+    /// Empty for Stack's own supervisor (older releases require the field).
+    #[serde(default, with = "crate::state::required_path")]
+    pub pitchfork: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub id: String,
 }
@@ -61,15 +64,31 @@ fn paths(state: &Path) -> (PathBuf, PathBuf) {
 
 /// Record (or replace) where `entry`'s service keeps its data.
 pub fn record(state: &Path, entry: Entry) -> Result<()> {
+    record_all(state, vec![entry])
+}
+
+/// [`record`] for several entries, with one write of the ledger (shared by every checkout, so
+/// many checkouts starting at once each hold its lock, and wait for the disk, once).
+pub fn record_all(state: &Path, entries: Vec<Entry>) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     let (file, lock) = paths(state);
     let _guard = FileLock::acquire(&lock)?;
     let mut ledger: Ledger = read_json(&file)?;
-    if ledger.entries.contains(&entry) {
-        return Ok(());
+    let mut changed = false;
+    for entry in entries {
+        if ledger.entries.contains(&entry) {
+            continue;
+        }
+        ledger.entries.retain(|e| !(e.project == entry.project && e.service == entry.service) && e.dir != entry.dir);
+        ledger.entries.push(entry);
+        changed = true;
     }
-    ledger.entries.retain(|e| !(e.project == entry.project && e.service == entry.service) && e.dir != entry.dir);
-    ledger.entries.push(entry);
-    write_json(&file, &ledger)
+    if changed {
+        write_json(&file, &ledger)?;
+    }
+    Ok(())
 }
 
 /// Every recorded entry.
@@ -128,18 +147,38 @@ fn identity(_: &Path) -> Option<[u64; 2]> {
 /// Bind the entry recording `dir` for `checkout` to where `dir` now resolves and which
 /// directory it is, now that it exists: `up` calls this once the service using it verified.
 pub fn bind(state: &Path, dir: &Path, checkout: &str) -> Result<()> {
-    let (location, identity) = locate(dir);
-    if identity.is_none() {
+    bind_all(state, &[dir], checkout)
+}
+
+/// [`bind`] for several directories of one checkout, with at most one write of the ledger.
+/// Nothing is locked or written when every entry is already bound as found.
+pub fn bind_all(state: &Path, dirs: &[&Path], checkout: &str) -> Result<()> {
+    let found: Vec<(&Path, Option<PathBuf>, [u64; 2])> = dirs
+        .iter()
+        .filter_map(|dir| {
+            let (location, identity) = locate(dir);
+            identity.map(|identity| (*dir, location, identity))
+        })
+        .collect();
+    let bound = |ledger: &Ledger| {
+        found.iter().all(|(dir, location, identity)| {
+            ledger.entries.iter().filter(|e| e.dir == *dir && e.checkout == checkout).all(|e| (e.location.as_ref(), e.identity) == (location.as_ref(), Some(*identity)))
+        })
+    };
+    // Read without the lock first: bound already is the common case (every later `up`).
+    if found.is_empty() || read_json::<Ledger>(&paths(state).0).is_ok_and(|l| bound(&l)) {
         return Ok(());
     }
     let (file, lock) = paths(state);
     let _guard = FileLock::acquire(&lock)?;
     let mut ledger: Ledger = read_json(&file)?;
     let mut changed = false;
-    for entry in ledger.entries.iter_mut().filter(|e| e.dir == dir && e.checkout == checkout) {
-        if (entry.location.as_ref(), entry.identity) != (location.as_ref(), identity) {
-            (entry.location, entry.identity) = (location.clone(), identity);
-            changed = true;
+    for (dir, location, identity) in &found {
+        for entry in ledger.entries.iter_mut().filter(|e| e.dir == *dir && e.checkout == checkout) {
+            if (entry.location.as_ref(), entry.identity) != (location.as_ref(), Some(*identity)) {
+                (entry.location, entry.identity) = (location.clone(), Some(*identity));
+                changed = true;
+            }
         }
     }
     if changed {

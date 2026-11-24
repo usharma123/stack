@@ -50,7 +50,6 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `materialize_failed` | A fetched bundle commit could not be extracted. | Retry; if it persists, delete the bundle's entry in Stack's cache directory and run `stack compile`. | yes | - |
 | `missing_path` | A bundle declares a path that is not in the bundle. | Add the directory to the bundle or remove it from `paths` in bundle.toml. | no | - |
 | `mv_data_unmovable` | `stack mv` could not move a service's data directory to the new path's location. | Check that MISE_STATE_DIR is what it was when the services started, then retry `stack mv <old> <new>`. | no | - |
-| `mv_data_unplaced` | The provider names no data directory for a service at the new path. | Run `stack compile` in the new directory so its provider configuration is current, then retry `stack mv <old> <new>`. | no | - |
 | `mv_nothing_recorded` | Stack has no records for the old path. | Run `stack ps` to list the paths Stack knows; if the checkout is not there, just run `stack up` in the new directory. | no | - |
 | `mv_services_running` | Services recorded for the old path may still be running, so its records cannot move. | Move the directory back, run `stack down` there, move it again and rerun `stack mv <old> <new>`. | no | - |
 | `mv_source_exists` | The old path still exists, so the checkout was not moved. | Move the directory first (`git worktree move` or `mv`), then run `stack mv <old> <new>`. | no | - |
@@ -79,7 +78,6 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `secret_unavailable` | fnox could not be run or could not resolve the secrets. | Run `stack doctor`, then `fnox env --json --describe` in the project to see fnox's own message. | yes | - |
 | `secret_unsupported` | A granted secret cannot be injected or redacted safely. | Use `stack exec -- fnox exec -- <command>` for file secrets and leases, or a longer secret value. | no | - |
 | `service_unavailable` | A required service did not verify, so the command was not run. | Run `stack up` (or `stack restart <service>`), then retry. | no | `stack up` |
-| `services_unsupported` | This platform cannot run services (no Pitchfork build). | Run services on Apple silicon or Linux; on this machine use a tools-only project. | no | - |
 | `session_busy` | Commands are still running in the session. | Wait for the running `stack exec`/`stack run` commands to finish, then retry. | yes | - |
 | `session_conflict` | The session record belongs to a checkout at another path (it may have been moved). | Run `stack down` in the original directory, or remove the session record the message names, then `stack up`. | no | - |
 | `session_stale` | The compiled configuration changed since the session started. | Run `stack up` to restart and verify the services with the new configuration. | no | `stack up` |
@@ -94,15 +92,11 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `snapshot_invalid` | A snapshot's metadata cannot be read. | Remove it with `stack snapshot rm <name>` and save it again. | no | - |
 | `snapshot_not_found` | This project has no snapshot of that name. | Run `stack snapshot list` to see the names, or save one with `stack snapshot save <name>`. | no | - |
 | `snapshot_unsupported` | The service or its data directory cannot be snapshotted (only postgres and redis data in real directories). | Use the service's own dump and restore tools through `stack exec` instead. | no | - |
-| `socket_path_too_long` | Pitchfork's supervisor socket path is longer than this platform allows. | Set PITCHFORK_STATE_DIR to a short absolute directory, such as /tmp/pitchfork-$USER, then retry. | no | - |
 | `source_invalid` | A bundle source or publish target is malformed. | Use a valid source, such as path:../b, git+https://...?ref=v1 or oci:<registry>/<repo>:<tag>. | no | - |
 | `start_failed` | The supervisor could not start a service. | Read the output in details and `stack logs <service>`, fix the cause, then run `stack up` again. | yes | `stack status` |
-| `state_invalid` | A Stack state file is unreadable or corrupt. | Delete the state file the message names to reset it, then retry. | no | - |
+| `state_invalid` | A Stack state file is unreadable or corrupt. | For a session record, run `stack down` in that checkout: it stops what the checkout's supervisor recorded and removes the record once that is confirmed. For other state files, delete the file the message names, then retry. | no | - |
 | `stop_failed` | The supervisor could not stop a service. | Retry `stack down`; details carry the supervisor's output. | yes | - |
-| `stop_unconfirmed` | Services did not stop in time. | Retry `stack down` (or `stack restart`); details list the processes still alive. | yes | - |
-| `supervisor_changed` | The Pitchfork supervisor the project's environment names changed while the command ran; nothing more was started or stopped. | Run the command again: it uses the supervisor the environment names when it begins; `stack status` shows what was already started. | yes | - |
-| `supervisor_unbound` | Stack cannot bind a request to the supervisor whose lock it holds; nothing was asked of it. | Run `stack compile` to write the configuration again, then retry. | no | `stack compile` |
-| `supervisor_unknown` | Stack cannot tell which Pitchfork supervisor a request would reach; nothing was asked of it. | Set PITCHFORK_STATE_DIR to an absolute directory. | no | - |
+| `stop_unconfirmed` | Services did not stop in time, or a command Stack started for the checkout is still running. | Retry `stack down` (or `stack restart`); details list the processes still alive. A detail with kind "command" is a command Stack started and never stops: wait for it or end it first. | yes | - |
 | `tag_exists` | The OCI tag already points to different content. | Publish a new tag, or pass --force to move this one. | no | - |
 | `tar_unavailable` | tar is not installed or cannot run. | Install tar (git bundle sources need it), then retry; `stack doctor` checks it. | no | `stack doctor` |
 | `timed_out` | The call did not finish within its deadline. | Raise the timeout if the work needs longer; for `up`/`restart` check `stack status` first, since services may still be starting. | yes | `stack status` |

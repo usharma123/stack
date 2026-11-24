@@ -4,7 +4,7 @@
 //! `exec`, the result is a snapshot: a shell keeps it after the service stops verifying.
 
 use crate::error::{Result, StackError};
-use crate::session::{self, Ctx, Require};
+use crate::session::{self, Ctx};
 use indexmap::IndexMap;
 use serde::Serialize;
 
@@ -48,9 +48,9 @@ fn exportable(key: &str) -> bool {
 
 /// Plan as `stack exec` does, then keep only the environment.
 pub fn plan(ctx: &Ctx) -> Result<EnvReport> {
-    // `sh` stands in for the command: planning needs one on the stack's PATH. The execution
-    // the plan reserves is released when it drops, below.
-    let plan = session::plan_exec(ctx, &["sh".to_string()], &Require::Nothing)?;
+    // `sh` stands in for the command: planning needs one on the stack's PATH. Nothing runs, so
+    // nothing is registered as running.
+    let plan = session::plan_env(ctx)?;
     let mut env = IndexMap::new();
     let mut skipped = Vec::new();
     for (key, value) in &plan.env {

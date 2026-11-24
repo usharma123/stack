@@ -137,11 +137,15 @@ status=$?
 
 phase=cleanup
 step "$checkout" stack down || keep "stack down failed; services may still run, see stack status"
-step "$checkout" stack exec -- pitchfork supervisor stop || keep "supervisor stop failed"
-step "$checkout" stack exec -- pitchfork supervisor status --json >"$iso/supervisor-after" ||
-  keep "supervisor status failed"
-node -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).status === "down" ? 0 : 1)' \
-  "$iso/supervisor-after" || keep "the supervisor is not confirmed down"
+# Releases before 0.1.24 ran services under Pitchfork, whose supervisor outlives `down`; later
+# ones run them under a supervisor of their own that exits with them, and install no Pitchfork.
+if step "$checkout" stack exec -- sh -c 'command -v pitchfork >/dev/null'; then
+  step "$checkout" stack exec -- pitchfork supervisor stop || keep "supervisor stop failed"
+  step "$checkout" stack exec -- pitchfork supervisor status --json >"$iso/supervisor-after" ||
+    keep "supervisor status failed"
+  node -e 'process.exit(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).status === "down" ? 0 : 1)' \
+    "$iso/supervisor-after" || keep "the supervisor is not confirmed down"
+fi
 step "$checkout" stack gc || keep "stack gc failed"
 [ -z "$late" ] || keep "cleanup was interrupted"
 global_receipt >"$iso/global-after" || keep "cannot read a global provider file"

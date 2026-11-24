@@ -42,6 +42,16 @@ impl Fixture {
         self.dir.path().join("app").canonicalize().unwrap()
     }
 
+    /// Append `text`'s lines to what Stack's supervisor kept of `service`'s output, stamped now.
+    fn logs(&self, service: &str, text: &str) {
+        let dir = self.dir.path().join("state/supervisors").join(stack::state::project_key(&self.app())).join("logs");
+        fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let stamped: String = text.lines().map(|l| format!("{now} {l}\n")).collect();
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{service}.log"))).unwrap();
+        std::io::Write::write_all(&mut file, stamped.as_bytes()).unwrap();
+    }
+
     /// `stack <args>` run from `cwd`, without `-C` unless `args` gives one.
     fn command_in(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stack"));
@@ -145,16 +155,43 @@ fn init_from_a_subdirectory_of_a_project_refuses_to_write_a_second_one() {
 }
 
 #[test]
-fn mcp_dir_means_exactly_that_directory_and_never_the_servers_own() {
+fn mcp_dir_finds_its_project_like_the_cli_and_never_uses_the_servers_own() {
     let fixture = Fixture::new("[bundle]\nname='test'\n");
     let app = fixture.app();
     let deep = app.join("src/deep");
+    fixture.ok(&["compile"]);
     // Started inside the checkout: the server's working directory still decides nothing.
-    let replies = fixture.mcp(&deep, &[("stack_inspect", json!({ "dir": app })), ("stack_inspect", json!({ "dir": deep })), ("stack_inspect", json!({}))]);
+    let replies = fixture.mcp(
+        &deep,
+        &[
+            ("stack_inspect", json!({ "dir": app })),
+            ("stack_inspect", json!({ "dir": deep })),
+            ("stack_inspect", json!({})),
+            ("stack_exec", json!({ "dir": deep, "command": ["sh", "-c", "pwd -P; echo $STACK_PROJECT"] })),
+        ],
+    );
     assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
-    assert_eq!(replies[1]["error"]["code"], "manifest_missing", "{}", replies[1]);
-    assert_eq!(replies[1]["project"], deep.to_str().unwrap());
+    // A directory inside the checkout finds its stack.toml, as the CLI does from there.
+    assert_eq!(replies[1]["ok"], true, "{}", replies[1]);
+    assert_eq!(replies[1]["project"], app.to_str().unwrap());
     assert_eq!(replies[2]["error"]["code"], "usage", "{}", replies[2]);
+    // The command runs where `dir` points, like `stack exec` from a subdirectory.
+    assert_eq!(replies[3]["data"]["stdout"], format!("{}\n{}\n", deep.display(), app.display()), "{}", replies[3]);
+    assert_eq!(replies[3]["project"], app.to_str().unwrap());
+    // stack_init means exactly `dir`: a new project inside this one, never this one's stack.toml.
+    // Sent after stack_exec so concurrent MCP dispatch (keyed on `app` vs `deep`) cannot create
+    // `deep/stack.toml` before stack_exec resolves its project.
+    let init = fixture.mcp(&deep, &[("stack_init", json!({ "dir": deep }))]);
+    assert_eq!(init[0]["ok"], true, "{}", init[0]);
+    assert_eq!(init[0]["project"], deep.to_str().unwrap());
+    assert!(deep.join("stack.toml").is_file());
+    // With no stack.toml up to the worktree root, the error says where the search went.
+    fs::remove_file(deep.join("stack.toml")).unwrap();
+    fs::remove_file(app.join("stack.toml")).unwrap();
+    let replies = fixture.mcp(&app, &[("stack_inspect", json!({ "dir": deep }))]);
+    assert_eq!(replies[0]["error"]["code"], "manifest_missing", "{}", replies[0]);
+    assert_eq!(replies[0]["project"], deep.to_str().unwrap());
+    assert!(replies[0]["error"]["message"].as_str().unwrap().contains(&format!("up to {}", app.display())), "{}", replies[0]);
 }
 
 #[test]
@@ -172,8 +209,8 @@ const TWO: &str = "[bundle]\nname='test'\n[services.web]\nrun='true'\n[services.
 #[test]
 fn logs_of_every_service_are_prefixed_filtered_and_split_per_service() {
     let fixture = Fixture::new(TWO);
-    fs::write(fixture.dir.path().join("logs-web.txt"), "web up\nGET / 200\nGET /x 500 Error\n").unwrap();
-    fs::write(fixture.dir.path().join("logs-worker.txt"), "worker up\nerror: retrying\n").unwrap();
+    fixture.logs("web", "web up\nGET / 200\nGET /x 500 Error\n");
+    fixture.logs("worker", "worker up\nerror: retrying\n");
     let out = fixture.ok(&["logs"]);
     assert_eq!(stdout(&out), "web    | web up\nweb    | GET / 200\nweb    | GET /x 500 Error\nworker | worker up\nworker | error: retrying\n");
     let result = json_result(&fixture.ok(&["logs", "--json", "--grep", "error", "-i"]));
@@ -182,12 +219,12 @@ fn logs_of_every_service_are_prefixed_filtered_and_split_per_service() {
     // One named service keeps the single-service shape; --tail counts matching lines.
     let result = json_result(&fixture.ok(&["logs", "web", "--json", "--grep", "GET", "--tail", "1"]));
     assert_eq!(result["data"]["lines"], json!(["GET /x 500 Error"]), "{result}");
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(log.contains("daemons logs -- web -n 10000 --raw --no-pager"), "{log}");
-    // --since asks the supervisor for that window.
-    fixture.ok(&["logs", "web", "--since", "10m"]);
-    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
-    assert!(log.lines().any(|l| l.starts_with("daemons logs -- web") && l.contains("--since")), "{log}");
+    // --since keeps that window: everything here was written just now.
+    let result = json_result(&fixture.ok(&["logs", "web", "--since", "10m", "--json"]));
+    assert_eq!(result["data"]["lines"].as_array().unwrap().len(), 3, "{result}");
+    // Nothing is asked of a provider process.
+    let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap_or_default();
+    assert!(!log.contains("daemons"), "{log}");
 
     let out = fixture.command_in(&fixture.app(), &["logs", "nope", "worker", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
@@ -198,8 +235,8 @@ fn logs_of_every_service_are_prefixed_filtered_and_split_per_service() {
 #[test]
 fn mcp_logs_of_every_service_filtered() {
     let fixture = Fixture::new(TWO);
-    fs::write(fixture.dir.path().join("logs-web.txt"), "a\nboom\n").unwrap();
-    fs::write(fixture.dir.path().join("logs-worker.txt"), "b\n").unwrap();
+    fixture.logs("web", "a\nboom\n");
+    fixture.logs("worker", "b\n");
     let app = fixture.app();
     let replies = fixture.mcp(&app, &[("stack_logs", json!({ "dir": app, "grep": "BOOM", "ignore_case": true })), ("stack_logs", json!({ "dir": app, "service": "worker" }))]);
     assert_eq!(replies[0]["data"]["services"]["web"]["lines"], json!(["boom"]), "{}", replies[0]);
@@ -210,12 +247,11 @@ fn mcp_logs_of_every_service_filtered() {
 #[test]
 fn follow_prints_new_lines_until_interrupted() {
     let fixture = Fixture::new(TWO);
-    let logs = fixture.dir.path().join("logs-web.txt");
-    fs::write(&logs, "one\n").unwrap();
-    fs::write(fixture.dir.path().join("logs-worker.txt"), "").unwrap();
+    fixture.logs("web", "one\n");
+    fixture.logs("worker", "");
     let child = fixture.command_in(&fixture.app(), &["logs", "web", "--follow"]).stdout(Stdio::piped()).spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    fs::write(&logs, "one\ntwo\n").unwrap();
+    fixture.logs("web", "two\n");
     std::thread::sleep(std::time::Duration::from_millis(2500));
     // SAFETY: signals a child this test started and has not reaped.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
@@ -230,7 +266,6 @@ fn follow_prints_new_lines_until_interrupted() {
 }
 
 #[test]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "services need Pitchfork, which publishes no Intel macOS build")]
 fn env_withholds_exactly_what_exec_withholds() {
     let fixture = Fixture::new(TWO);
     let inspect = json_result(&fixture.ok(&["inspect", "--json"]));
@@ -343,4 +378,41 @@ fn mcp_init_writes_a_project_in_dir_and_never_replaces_one() {
     assert!(written.contains("python = \"3.13\""), "{written}");
     assert_eq!(replies[1]["error"]["code"], "project_exists", "{}", replies[1]);
     assert_eq!(replies[2]["error"]["code"], "usage", "{}", replies[2]);
+}
+
+#[test]
+fn init_detect_adds_what_the_checkout_suggests_on_the_cli_and_over_mcp() {
+    let fixture = Fixture::new("[bundle]\nname='test'\n");
+    let make = |name: &str| {
+        let dir = fixture.dir.path().join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(".python-version"), "3.12\n").unwrap();
+        fs::write(dir.join("uv.lock"), "").unwrap();
+        fs::write(dir.join("compose.yml"), "services:\n  db:\n    image: postgres:17\n").unwrap();
+        dir.canonicalize().unwrap()
+    };
+    let cli = make("cli");
+    let out = fixture.command_in(&cli, &["-C", cli.to_str().unwrap(), "init", "--detect", "--tool", "python=3.13", "--json"]).output().unwrap();
+    let result = json_result(&out);
+    assert_eq!(result["data"]["tools"], json!(["python", "uv"]), "{result}");
+    assert_eq!(result["data"]["services"], json!(["postgres"]), "{result}");
+    assert_eq!(
+        result["data"]["detected"],
+        json!([
+            { "kind": "tool", "name": "uv", "value": "latest", "source": "uv.lock" },
+            { "kind": "service", "name": "postgres", "value": "postgres@17", "source": "compose.yml" }
+        ]),
+        "{result}"
+    );
+    let written = fs::read_to_string(cli.join("stack.toml")).unwrap();
+    assert!(written.contains("python = \"3.13\"") && written.contains("version = \"17\""), "{written}");
+
+    let mcp = make("mcp");
+    let plain = make("plain");
+    let replies = fixture.mcp(&fixture.app(), &[("stack_init", json!({ "dir": mcp, "detect": true })), ("stack_init", json!({ "dir": plain }))]);
+    assert_eq!(replies[0]["data"]["tools"], json!(["python", "uv"]), "{}", replies[0]);
+    assert_eq!(replies[0]["data"]["detected"][0], json!({ "kind": "tool", "name": "python", "value": "3.12", "source": ".python-version" }), "{}", replies[0]);
+    // Without detect, the result is what it always was: no `detected` key.
+    assert!(replies[1]["data"].get("detected").is_none(), "{}", replies[1]);
+    assert_eq!(replies[1]["data"]["tools"], json!([]), "{}", replies[1]);
 }
