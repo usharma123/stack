@@ -242,7 +242,7 @@ fn a_running_command_keeps_down_purge_from_removing_data_while_services_stop() {
 
     // A command started with `stack exec` still running.
     let (pids, ports, data) = up(&fleet);
-    let mut exec = Command::new(env!("CARGO_BIN_EXE_stack"))
+    let mut exec = Command::new(stack_bin())
         .args(["-C", app.to_str().unwrap(), "exec", "--", "/bin/sleep", "60"])
         .env("STACK_STATE_DIR", fleet.dir.path().join("state"))
         .env("STACK_CACHE_DIR", fleet.dir.path().join("cache"))
@@ -274,7 +274,7 @@ fn a_running_command_keeps_down_purge_from_removing_data_while_services_stop() {
 
     // A shell that runs `stack down --purge` and carries on.
     let (pids, ports, data) = up(&fleet);
-    let script = format!("'{}' -C '{}' --json down --purge; echo; echo carried-on", env!("CARGO_BIN_EXE_stack"), app.display());
+    let script = format!("'{}' -C '{}' --json down --purge; echo; echo carried-on", stack_bin().display(), app.display());
     let out = fleet.ok(&app, &["exec", "--", "/bin/sh", "-c", &script]);
     let text = out["stdout"].as_str().unwrap();
     let inner: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
