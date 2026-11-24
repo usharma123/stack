@@ -1189,3 +1189,74 @@ fn service_names_colliding_with_preset_secondary_ports_are_rejected() {
     assert!(report.secondary_ports.contains_key("db.http"));
     assert_ne!(report.ports["api.v2"], report.secondary_ports["db.http"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn links_in_git_and_local_bundles_are_refused_not_left_unhashed() {
+    let sb = Sandbox::new();
+    let secret = sb.path("outside/secret");
+    fs::create_dir_all(secret.parent().unwrap()).unwrap();
+    fs::write(&secret, "not covered by any hash\n").unwrap();
+    let repo = sb.bundle("linked", "[bundle]\nname = 'linked'\n");
+    std::os::unix::fs::symlink(&secret, repo.join("fixtures/secret")).unwrap();
+    commit_all(&repo, "link");
+    git(&repo, &["tag", "v2"]);
+
+    // Git: the checkout holds the link exactly as committed.
+    let root = sb.project(&use_git(&repo, "v2"));
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+    assert!(err.message.contains("fixtures/secret is a symbolic link"), "{}", err.message);
+
+    // Local: the same directory as a path source.
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", repo.display())).unwrap();
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+
+    // A symlinked bundle.toml is refused too.
+    let other = sb.path("bundles/manifest-link");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(sb.path("outside/bundle.toml"), "[bundle]\nname = 'elsewhere'\n").unwrap();
+    std::os::unix::fs::symlink(sb.path("outside/bundle.toml"), other.join("bundle.toml")).unwrap();
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", other.display())).unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "bundle_invalid");
+
+    // Without the link the same bundle compiles, and both transports agree on its hash.
+    fs::remove_file(repo.join("fixtures/secret")).unwrap();
+    commit_all(&repo, "unlink");
+    git(&repo, &["tag", "v3"]);
+    fs::write(root.join("stack.toml"), use_git(&repo, "v3")).unwrap();
+    let by_git = sb.compile(&root, Mode::UseLock).unwrap().bundles[0].content_hash.clone();
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", repo.display())).unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().bundles[0].content_hash, by_git);
+}
+
+#[cfg(unix)]
+#[test]
+fn paths_bin_must_stay_inside_the_hashed_bundle() {
+    let sb = Sandbox::new();
+    let outside = sb.path("bundles/tools");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("tool"), "#!/bin/sh\n").unwrap();
+    let root = sb.project("");
+    // (paths.bin, expected code)
+    for (bin, code) in [("../tools", "bundle_invalid"), ("bin/../../tools", "bundle_invalid"), (".git", "bundle_invalid"), ("nope", "missing_path")] {
+        let dir = sb.path(&format!("bundles/b-{}", bin.replace(['/', '.'], "_")));
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bundle.toml"), format!("[bundle]\nname = 'b'\n[paths]\nbin = [{bin:?}]\n")).unwrap();
+        fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", dir.display())).unwrap();
+        let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+        assert_eq!(err.code, code, "{bin}: {}", err.message);
+    }
+
+    // A committed link to a directory outside the checkout: refused by the hash before paths.bin
+    // is looked at, so the target never reaches PATH.
+    let repo = sb.bundle("escape", "[bundle]\nname = 'escape'\n[paths]\nbin = ['tools']\n");
+    std::os::unix::fs::symlink(&outside, repo.join("tools")).unwrap();
+    commit_all(&repo, "link");
+    git(&repo, &["tag", "v2"]);
+    fs::write(root.join("stack.toml"), use_git(&repo, "v2")).unwrap();
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+    assert!(err.message.contains("symbolic link"), "{}", err.message);
+}

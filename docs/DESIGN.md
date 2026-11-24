@@ -713,6 +713,13 @@ output (mise's answer when no release matches) is an error, not a version.
 
 `git+<url>?ref=[&dir=<subdir>]` pins a commit (other parameters are rejected); `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
 a content hash. A bundle's content hash is identical across transports (deterministic archives).
+Every transport holds a bundle to one rule: regular files and directories with UTF-8 names, `.git`
+and `.stack` excluded. Hashing refuses a symbolic link or special file anywhere in the tree
+(`bundle_invalid`) instead of skipping it, so nothing is readable through a bundle that its hash
+does not cover; `bundle.toml` is read only as a regular file, OCI layers carrying excluded
+directories are refused at extraction, and each `paths.bin` entry must name a real directory
+inside the bundle (no `..`, absolute path, link or excluded directory), checked when the bundle
+is loaded and again when it is composed.
 OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
 
 OCI credentials (`STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`) are bound to the one origin the

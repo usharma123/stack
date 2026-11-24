@@ -327,6 +327,14 @@ pub fn read_project(root: &Path) -> Result<ProjectManifest> {
 
 pub fn read_bundle(dir: &Path, source: &str) -> Result<BundleManifest> {
     let path = dir.join(BUNDLE_FILE);
+    // Read only as the regular file the content hash covers, never through a link.
+    if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file()) {
+        return Err(StackError::new(
+            "bundle_invalid",
+            format!("{source}: {BUNDLE_FILE} is not a regular file; bundles contain only regular files and directories"),
+        )
+        .hint(format!("replace {BUNDLE_FILE} with a regular file, then retry")));
+    }
     let text = fs::read_to_string(&path).map_err(|e| {
         StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: {e}"))
     })?;
@@ -575,6 +583,21 @@ mod tests {
         let bundle = tempfile::tempdir().unwrap();
         fs::write(bundle.path().join(BUNDLE_FILE), "[bundle]\nname = 'b'\n[session]\ndefault_ttl = '30m'\n").unwrap();
         assert_eq!(read_bundle(bundle.path(), "path:../b").unwrap_err().code, "bundle_invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_toml_is_read_only_as_a_regular_file() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("elsewhere.toml"), "[bundle]\nname = 'b'\n").unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("elsewhere.toml"), bundle.path().join(BUNDLE_FILE)).unwrap();
+        let e = read_bundle(bundle.path(), "path:../b").unwrap_err();
+        assert_eq!(e.code, "bundle_invalid");
+        assert!(e.message.contains("not a regular file"), "{}", e.message);
+        fs::remove_file(bundle.path().join(BUNDLE_FILE)).unwrap();
+        fs::write(bundle.path().join(BUNDLE_FILE), "[bundle]\nname = 'b'\n").unwrap();
+        assert_eq!(read_bundle(bundle.path(), "path:../b").unwrap().bundle.name, "b");
     }
 
     #[test]

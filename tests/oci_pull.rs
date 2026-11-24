@@ -215,3 +215,71 @@ fn a_failed_install_leaves_neither_a_destination_nor_staging() {
     let hex = digest.trim_start_matches("sha256:");
     assert_eq!(cache_entries(machine.path()), [format!(".oci-{hex}.lock")]);
 }
+
+/// A gzip-compressed tar holding `bundle.toml` and whatever `extra` adds.
+fn layer(extra: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    let manifest = b"[bundle]\nname='shared'\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Regular);
+    tar.append_data(&mut header, "bundle.toml", &manifest[..]).unwrap();
+    extra(&mut tar);
+    let raw = tar.into_inner().unwrap();
+    let mut gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
+    gz.write_all(&raw).unwrap();
+    gz.finish().unwrap()
+}
+
+#[test]
+fn layers_with_links_or_excluded_directories_never_reach_the_cache() {
+    let link = layer(|tar| {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        tar.append_link(&mut header, "bin", "/usr/bin").unwrap();
+    });
+    let hidden = layer(|tar| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut header, ".stack/bin/tool", &b"x"[..]).unwrap();
+    });
+    for (blob, reason) in [(link, "unsupported layer entry type"), (hidden, "inside .stack")] {
+        let (manifest, digest) = manifest_for(&blob);
+        let registry = Registry::new(manifest, blob, 1);
+        let machine = tempfile::tempdir().unwrap();
+        let (_project, mut compile) = project(machine.path(), &registry, &digest);
+        let output = compile.output().unwrap();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "bundle_invalid", "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains(reason), "{result}");
+        let hex = digest.trim_start_matches("sha256:");
+        assert_eq!(cache_entries(machine.path()), [format!(".oci-{hex}.lock")]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_added_to_a_cached_bundle_is_refused_when_it_is_read() {
+    let source = bundle();
+    let blob = stack::oci::archive(source.path()).unwrap();
+    let (manifest, digest) = manifest_for(&blob);
+    let registry = Registry::new(manifest, blob, 1);
+    let machine = tempfile::tempdir().unwrap();
+    let (_a, mut compile) = project(machine.path(), &registry, &digest);
+    assert_ok(&compile.output().unwrap());
+
+    let tree = machine
+        .path()
+        .join("cache/bundles")
+        .join(format!("oci-{}", digest.trim_start_matches("sha256:")));
+    std::os::unix::fs::symlink("/etc/hosts", tree.join("bin/hosts")).unwrap();
+    let (_b, mut compile) = project(machine.path(), &registry, &digest);
+    let output = compile.output().unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "bundle_invalid", "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("bin/hosts is a symbolic link"), "{result}");
+}

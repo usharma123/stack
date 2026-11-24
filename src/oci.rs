@@ -736,7 +736,7 @@ fn remove_tree(path: &Path) {
 }
 
 /// Unpack only regular files and directories, within `limits`, refusing any entry that would
-/// land outside `into`. The whole gzip stream is then read through the same budget: its length
+/// land outside `into`, inside a directory the content hash excludes, or under a non-UTF-8 name. The whole gzip stream is then read through the same budget: its length
 /// and CRC must check out, anything after the tar end marker must be zero padding, and nothing
 /// may follow the single gzip member.
 fn extract(blob: &[u8], into: &Path, limits: ExtractLimits) -> Result<()> {
@@ -792,6 +792,17 @@ fn extract(blob: &[u8], into: &Path, limits: ExtractLimits) -> Result<()> {
         let mut relative = std::path::PathBuf::new();
         for part in path.components() {
             match part {
+                // Never hashed, so never let into the shared cache (`archive` never writes them).
+                std::path::Component::Normal(part) if crate::hash::excluded(part) => {
+                    return Err(malformed(&format!(
+                        "entry {} is inside {}, which bundles cannot contain",
+                        path.display(),
+                        part.to_string_lossy()
+                    )))
+                }
+                std::path::Component::Normal(part) if part.to_str().is_none() => {
+                    return Err(malformed(&format!("entry {} is not valid UTF-8", path.display())))
+                }
                 std::path::Component::Normal(part) => relative.push(part),
                 std::path::Component::ParentDir => {
                     return Err(malformed(&format!(
@@ -1395,6 +1406,48 @@ mod tests {
             assert!(err.message.contains(reason), "{}", err.message);
             assert_eq!(left, [".oci-x.lock"]);
         }
+    }
+
+    #[test]
+    fn layers_cannot_carry_content_the_hash_would_skip() {
+        let raw_name = |name: &[u8]| {
+            gzip(&tar(|t| {
+                let mut header = tar::Header::new_old();
+                header.as_old_mut().name[..name.len()].copy_from_slice(name);
+                header.set_size(1);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                t.append(&header, &b"x"[..]).unwrap();
+            }))
+        };
+        for (blob, reason) in [
+            (gzip(&tar(|t| file_entry(t, ".git/config", b"x"))), "inside .git"),
+            (gzip(&tar(|t| file_entry(t, "bin/.stack/tool", b"x"))), "inside .stack"),
+            (gzip(&tar(|t| dir_entry(t, ".stack", 0o755))), "inside .stack"),
+            (raw_name(b"bin/\xff"), "not valid UTF-8"),
+        ] {
+            let (result, left) = install_into(&blob, EXTRACT_LIMITS);
+            let err = result.unwrap_err();
+            assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+            assert!(err.message.contains(reason), "{}", err.message);
+            assert_eq!(left, [".oci-x.lock"]);
+        }
+        // Names that merely resemble them are ordinary content.
+        let lookalikes = gzip(&tar(|t| {
+            file_entry(t, ".gitignore", b"x");
+            file_entry(t, "bin/.stackrc", b"x");
+        }));
+        assert!(install_into(&lookalikes, EXTRACT_LIMITS).0.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publishing_refuses_links_instead_of_dropping_them() {
+        let source = bundle_dir();
+        std::os::unix::fs::symlink("/etc/hosts", source.path().join("bin/hosts")).unwrap();
+        let err = archive(source.path()).unwrap_err();
+        assert_eq!(err.code, "bundle_invalid");
+        assert!(err.message.contains("symbolic link"), "{}", err.message);
     }
 
     fn gzip(raw: &[u8]) -> Vec<u8> {

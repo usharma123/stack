@@ -52,6 +52,15 @@ A local path needs the `path:` prefix; a bare `../bundles/team` fails with `sour
 `stack.lock` records a local bundle's content hash, so after editing it run `stack compile`:
 `compile --locked` reports `lock_outdated` until you do.
 
+A bundle holds only regular files and directories, with UTF-8 names. Every transport (git, OCI,
+local path) refuses a symbolic link, socket or other special file anywhere in the bundle with
+`bundle_invalid`, rather than leave content readable through the bundle that its content hash
+does not cover; replace a link with a copy of what it points to. `.git` and `.stack` are never
+bundle content: they are not hashed or published, and an OCI layer containing them is refused.
+Each `paths.bin` entry must be a relative path to a real directory inside the bundle: `..`,
+absolute paths, symbolic links along the way, `.git` and `.stack` are `bundle_invalid`, and a
+directory that does not exist is `missing_path`.
+
 ```sh
 stack compile                          # resolve, lock, assign ports, write .config/mise/conf.d/stack.toml
 stack up --ttl 30m                     # start services, verify each is *this* instance, record a session
