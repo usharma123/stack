@@ -1321,6 +1321,14 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     let legacy = legacy_provider(previous.as_ref()).cloned();
     let restart = legacy.is_some() || previous.as_ref().is_some_and(|s| !same_config(s, ctx, &report));
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
+    // What the supervisor's records say decides what is stopped below (the port check takes a
+    // service it does not list for a stray): records that cannot be read (damaged, or a newer
+    // Stack's) stop `up` before anything is.
+    if !report.stack.services.is_empty() {
+        if let Err(e) = supervisor::readable(&supervisor_dir(ctx)) {
+            return Err(steps.fail("stop_previous", e, false));
+        }
+    }
     if restart || unrecorded {
         match down_locked(ctx) {
             Err(e) => return Err(steps.fail("stop_previous", e, true)),

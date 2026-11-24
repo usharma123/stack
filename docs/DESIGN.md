@@ -483,7 +483,13 @@ output (mise's answer when no release matches) is an error, not a version.
   from another boot, names nothing alive and is never signalled. A request gets a revision above
   both the spec's and the last one the supervisor acknowledged, and a `spec.json` or
   `state.json` that exists but cannot be read is `state_invalid`, not a fresh start, so an
-  acknowledgment only ever comes from a supervisor that read the request. A start asked of a
+  acknowledgment only ever comes from a supervisor that read the request. Both records carry
+  `schema_version` (1). One without it was written by Stack 0.1.24 or earlier, or by a
+  supervisor of such a release still running after an upgrade, and is read as before (every
+  reader ignores fields it does not know, so such a supervisor reads this Stack's spec too). One
+  of a later version is `state_invalid`: `up`, `restart`, `down` and `gc` stop, start, write and
+  remove nothing on its word, `up` checks both records before its port check could take a
+  listed-as-gone service for a stray, and a supervisor refuses to start over such a state. A start asked of a
   service already running is consumed by it: it is not started again when it later exits. A
   start asked while it is stopping is kept, and starts it once the stop completed. The
   supervisor retries a `state.json` it could not write every pass; if services run without a

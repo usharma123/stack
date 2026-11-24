@@ -14,6 +14,10 @@
 //!   last applied, and for each service its status, pid, process start time, process group,
 //!   port and data directory. Written only by the supervisor (or, once it is gone, by the command
 //!   that cleaned up after it), atomically.
+//! - Both records carry `schema_version` ([`SCHEMA_VERSION`]). One without it was written by
+//!   Stack 0.1.24 or earlier, or by a supervisor of such a release still running after Stack was
+//!   upgraded: the same layout, read as it is. One of a later version is refused (`state_invalid`),
+//!   never read as empty, and nothing is written over it or stopped on its word.
 //! - `lock`, held exclusively by the live supervisor, so two never run for one checkout.
 //! - `logs/<service>.log`, each line of the service's output prefixed with when it was read
 //!   (Unix milliseconds), which `stack logs` reads (see the section on reading logs). One writer
@@ -77,6 +81,12 @@ fn exempt_for(dir: &Path) -> crate::commands::Exempt {
     let project = read_spec(dir).ok().flatten().and_then(|s| s.project);
     crate::commands::Exempt::load(state, project.as_deref())
 }
+
+/// The layout of `spec.json` and `state.json` this Stack writes, as their `schema_version`.
+/// Records without one (Stack 0.1.24 and earlier) have this layout too; a record of a higher
+/// version is refused (see [`check_schema`]). Raise it only for a change older readers would
+/// misread: an added field with a default is not one (every reader ignores unknown fields).
+pub const SCHEMA_VERSION: u64 = 1;
 
 fn spec_path(dir: &Path) -> PathBuf {
     dir.join("spec.json")
@@ -268,9 +278,51 @@ fn invalid(path: &Path, e: impl std::fmt::Display) -> StackError {
     StackError::new("state_invalid", format!("{}: {e}", path.display())).hint(hint)
 }
 
+/// A record whose `schema_version` is above [`SCHEMA_VERSION`]: written by a newer Stack, its
+/// meaning unknown, so neither read as nothing nor replaced.
+fn unsupported(path: &Path, version: u64) -> StackError {
+    StackError::new(
+        "state_invalid",
+        format!("{}: written by a newer Stack (schema_version {version}; this Stack reads {SCHEMA_VERSION} and unversioned records)", path.display()),
+    )
+    .hint("use the Stack release that wrote it, or a newer one, for this checkout: this one stops, starts, writes and removes nothing on the strength of a record it cannot read")
+    .with_detail(serde_json::json!({ "record": path, "schema_version": version, "supported": SCHEMA_VERSION }))
+}
+
+/// Whether this Stack reads a record of `value`'s `schema_version`: none (written before it
+/// existed) or one up to [`SCHEMA_VERSION`].
+fn check_schema(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let Some(version) = value.get("schema_version") else { return Ok(()) };
+    match version.as_u64() {
+        Some(1..=SCHEMA_VERSION) => Ok(()),
+        Some(n) if n > SCHEMA_VERSION => Err(unsupported(path, n)),
+        _ => Err(invalid(path, format!("schema_version must be a positive integer, not {version}"))),
+    }
+}
+
+/// A record read from `path`, checked for its schema before anything else is made of it.
+fn parse_record<T: serde::de::DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| invalid(path, e))?;
+    if !value.is_object() {
+        return Err(invalid(path, "not a JSON object"));
+    }
+    check_schema(path, &value)?;
+    serde_json::from_value(value).map_err(|e| invalid(path, e))
+}
+
+/// `record` as written: its fields after `schema_version` ([`SCHEMA_VERSION`]).
+fn record_bytes<T: Serialize>(record: &T) -> Vec<u8> {
+    let mut map = serde_json::Map::new();
+    map.insert("schema_version".into(), SCHEMA_VERSION.into());
+    if let serde_json::Value::Object(fields) = serde_json::to_value(record).expect("record serializes") {
+        map.extend(fields.into_iter().filter(|(k, _)| k != "schema_version"));
+    }
+    serde_json::to_vec_pretty(&serde_json::Value::Object(map)).expect("record serializes")
+}
+
 fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| invalid(path, e)),
+        Ok(bytes) => parse_record(path, &bytes).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_error(path.display(), e)),
     }
@@ -284,6 +336,14 @@ pub fn read_spec(dir: &Path) -> Result<Option<Spec>> {
 /// `state.json`: `None` when there is none; an error when one exists that cannot be read.
 pub fn read_state(dir: &Path) -> Result<Option<State>> {
     read_record(&state_path(dir))
+}
+
+/// Both records, when they exist, can be read: before anything is stopped or started on what
+/// the listing ([`daemons`], which takes an unreadable record for nothing) says.
+pub fn readable(dir: &Path) -> Result<()> {
+    read_spec(dir)?;
+    read_state(dir)?;
+    Ok(())
 }
 
 /// `state.json` for listing only: one that cannot be read lists as nothing.
@@ -489,7 +549,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
     let state = read_state(dir)?.unwrap_or_default();
     change(&mut spec);
     spec.revision = spec.revision.max(state.applied) + 1;
-    let bytes = serde_json::to_vec_pretty(&spec).expect("spec serializes");
+    let bytes = record_bytes(&spec);
     write_atomic(&spec_path(dir), &bytes).map_err(|e| io_error(spec_path(dir).display(), e))?;
     let mut spawned_at = None;
     if !signal_supervisor(&state, libc::SIGHUP) {
@@ -564,7 +624,7 @@ fn settled(services: &IndexMap<String, Instance>) -> IndexMap<String, Instance> 
 /// Never creates `dir`: a supervisor whose directory was removed must not bring it back (with
 /// every parent the removal took) by writing its last record.
 fn write_state(dir: &Path, state: &State) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(state).expect("state serializes");
+    let bytes = record_bytes(state);
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&bytes)?;
     tmp.persist(state_path(dir)).map_err(|e| e.error)?;
@@ -676,7 +736,7 @@ pub fn shutdown_accounted(dir: &Path, expected: &Expected) -> Result<()> {
     // Staged completely first (mode included); then the spec about to be replaced is read
     // again, and must be the same file and still this checkout's; then only the rename.
     let path = spec_path(dir);
-    let bytes = serde_json::to_vec_pretty(&spec).expect("spec serializes");
+    let bytes = record_bytes(&spec);
     let staged = stage(&path, &bytes).map_err(|e| io_error(path.display(), e))?;
     seam("spec_staged");
     let (again, now) = read_spec_identified(dir)?;
@@ -730,7 +790,7 @@ fn settle_dead(dir: &Path, expected: &Expected, state: &State, revision: u64) ->
 /// about to be replaced read again and required to name this checkout, then only the rename.
 fn publish_state_checked(dir: &Path, expected: &Expected, state: &State) -> Result<()> {
     let path = state_path(dir);
-    let bytes = serde_json::to_vec_pretty(state).expect("state serializes");
+    let bytes = record_bytes(state);
     let staged = stage(&path, &bytes).map_err(|e| io_error(path.display(), e))?;
     seam("state_staged");
     identified_state(dir, expected)?;
@@ -747,7 +807,7 @@ fn read_spec_identified(dir: &Path) -> Result<(Spec, (u64, u64))> {
     let meta = file.metadata().map_err(|e| io_error(path.display(), e))?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_error(path.display(), e))?;
-    let spec = serde_json::from_slice(&bytes).map_err(|e| invalid(&path, e))?;
+    let spec = parse_record(&path, &bytes)?;
     Ok((spec, (meta.dev(), meta.ino())))
 }
 
@@ -870,8 +930,9 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
 /// Remove the supervisor directory `dir` (its spec, state and the services' logs) once nothing
 /// it recorded runs. Whether it was removed (or was not there).
 pub fn forget(dir: &Path) -> bool {
-    let state = state_lossy(dir);
-    if alive(&state) || !unresolved(dir).is_empty() {
+    // A record that cannot be read (damaged, or of a newer Stack) is no evidence nothing runs.
+    let Ok(state) = read_state(dir).map(Option::unwrap_or_default) else { return false };
+    if read_spec(dir).is_err() || alive(&state) || !unresolved(dir).is_empty() {
         return false;
     }
     match fs::remove_dir_all(dir) {
@@ -1017,7 +1078,11 @@ pub fn recover(dir: &Path, state: &State, token: Option<&str>) -> Vec<serde_json
 /// to be the checkout's. Empty while the supervisor runs (it accounts for its services) and
 /// once nothing recorded remains. Data operations refuse while this is not empty.
 pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
-    let state = state_lossy(dir);
+    // One that cannot be read says nothing of what runs: that is not "nothing".
+    let state = match read_state(dir) {
+        Ok(state) => state.unwrap_or_default(),
+        Err(e) => return vec![serde_json::json!({ "record": state_path(dir), "reason": format!("cannot be read: {}", e.message) })],
+    };
     if alive(&state) {
         return Vec::new();
     }
@@ -1368,7 +1433,15 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
     let me = Proc::observe(std::process::id());
     // What a supervisor before this one left running is stopped first: this one cannot wait
     // for processes it did not start. What cannot be shown stopped keeps everything as it is.
-    let previous = state_lossy(dir);
+    let previous = match read_state(dir) {
+        Ok(state) => state.unwrap_or_default(),
+        // A record that is there but cannot be made sense of (damaged, or a newer Stack's) is
+        // not a fresh start: what it names may run, and this supervisor would write over it.
+        Err(e) if e.code == "state_invalid" => return Err(std::io::Error::other(format!("{}; nothing was started", e.message))),
+        // One that cannot be read at all (not a file) holds nothing; it is published once the
+        // supervisor can write it, and services stop if it never can.
+        Err(_) => State::default(),
+    };
     let mut spec = match read_spec(dir) {
         Ok(spec) => spec.unwrap_or_default(),
         Err(e) => return Err(std::io::Error::other(e.message)),
@@ -2603,6 +2676,72 @@ mod tests {
         let e = result.expect_err(at);
         assert_eq!(e.code, "state_invalid", "{at}: {e:?}");
         assert!(e.message.contains("not this checkout's") || e.message.contains("does not name this checkout") || e.message.contains("was replaced"), "{at}: {e:?}");
+    }
+
+    #[test]
+    fn records_are_written_versioned_and_unversioned_ones_read_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, state) = record("/checkouts/mine", "mine-token", None, None, 3);
+        // Unversioned, as Stack 0.1.24 and its supervisors (still running after an upgrade) write.
+        write(dir.path(), &(spec.clone(), state.clone()));
+        assert_eq!(read_spec(dir.path()).unwrap(), Some(spec.clone()));
+        assert_eq!(read_state(dir.path()).unwrap(), Some(state.clone()));
+        assert_eq!(read_spec_identified(dir.path()).unwrap().0, spec);
+        // What this Stack writes says its version first, and reads back as it was.
+        write_state(dir.path(), &state).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(state_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(written.as_object().unwrap().keys().next().map(String::as_str), Some("schema_version"));
+        assert_eq!(written["schema_version"], SCHEMA_VERSION);
+        assert_eq!(read_state(dir.path()).unwrap(), Some(state.clone()));
+        let bytes = record_bytes(&spec);
+        assert_eq!(parse_record::<Spec>(&spec_path(dir.path()), &bytes).unwrap(), spec);
+        // A field this Stack does not know, at its version, is ignored, as a reader of an older
+        // release ignores `schema_version` and any field added since.
+        let mut extra: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        extra["added_later"] = serde_json::json!({ "x": 1 });
+        assert_eq!(parse_record::<Spec>(&spec_path(dir.path()), extra.to_string().as_bytes()).unwrap(), spec);
+    }
+
+    #[test]
+    fn a_record_of_a_newer_schema_is_refused_and_nothing_is_written_over_it_or_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, state) = record("/checkouts/mine", "mine-token", None, None, 3);
+        let newer = |bytes: Vec<u8>| {
+            let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["schema_version"] = serde_json::json!(SCHEMA_VERSION + 1);
+            serde_json::to_vec(&v).unwrap()
+        };
+        let (spec_bytes, state_bytes) = (newer(record_bytes(&spec)), newer(record_bytes(&state)));
+        fs::write(spec_path(dir.path()), &spec_bytes).unwrap();
+        fs::write(state_path(dir.path()), record_bytes(&state)).unwrap();
+        let e = read_spec(dir.path()).unwrap_err();
+        assert_eq!(e.code, "state_invalid");
+        assert!(e.message.contains("written by a newer Stack") && e.message.contains(&format!("schema_version {}", SCHEMA_VERSION + 1)), "{e:?}");
+        assert!(read_spec_identified(dir.path()).is_err());
+        // A change is refused before anything is written; nothing is forgotten either.
+        assert_eq!(apply(dir.path(), |s| s.shutdown = true).unwrap_err().code, "state_invalid");
+        assert_eq!(fs::read(spec_path(dir.path())).unwrap(), spec_bytes);
+        assert!(!forget(dir.path()) && dir.path().exists());
+
+        // The same for a newer state: never read as "nothing runs".
+        fs::write(spec_path(dir.path()), record_bytes(&spec)).unwrap();
+        fs::write(state_path(dir.path()), &state_bytes).unwrap();
+        assert_eq!(read_state(dir.path()).unwrap_err().code, "state_invalid");
+        assert_eq!(apply(dir.path(), |s| s.shutdown = true).unwrap_err().code, "state_invalid");
+        assert_eq!(super::stop(dir.path(), &["web".to_string()]).unwrap_err().code, "state_invalid");
+        assert_eq!(fs::read(state_path(dir.path())).unwrap(), state_bytes);
+        let unresolved = unresolved(dir.path());
+        assert!(unresolved.len() == 1 && unresolved[0]["reason"].as_str().unwrap().contains("newer Stack"), "{unresolved:?}");
+        assert!(!forget(dir.path()) && dir.path().exists());
+
+        // A version that is no version at all is refused too.
+        for bad in [serde_json::json!(0), serde_json::json!("1"), serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v: serde_json::Value = serde_json::from_slice(&record_bytes(&state)).unwrap();
+            v["schema_version"] = bad.clone();
+            let e = parse_record::<State>(&state_path(dir.path()), v.to_string().as_bytes()).unwrap_err();
+            assert!(e.code == "state_invalid" && e.message.contains("schema_version must be a positive integer"), "{bad}: {e:?}");
+        }
+        assert_eq!(parse_record::<State>(&state_path(dir.path()), b"[]").unwrap_err().code, "state_invalid");
     }
 
     #[test]

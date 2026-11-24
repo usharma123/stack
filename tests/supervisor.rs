@@ -762,3 +762,18 @@ time.sleep(600)
     sup.until(5, "after runs", |s| s["services"]["after"]["status"] == "running");
     sup.shutdown();
 }
+
+#[test]
+fn a_supervisor_never_starts_over_a_state_a_newer_stack_wrote() {
+    let sup = Supervisor::new();
+    fs::create_dir_all(sup.path()).unwrap();
+    let newer = json!({ "schema_version": 99, "applied": 4, "services": {}, "token": sup.token() }).to_string();
+    fs::write(sup.path().join("state.json"), &newer).unwrap();
+    sup.spec(json!({ "a": sup.service("echo started > \"$OUT/a.ran\"; exec sleep 600") }), false);
+    sup.start_logged();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!sup.dir.path().join("a.ran").exists(), "a service started");
+    assert_eq!(fs::read_to_string(sup.path().join("state.json")).unwrap(), newer, "the record was written over");
+    let log = fs::read_to_string(sup.path().join("supervisor.log")).unwrap();
+    assert!(log.contains("written by a newer Stack") && log.contains("nothing was started"), "{log}");
+}

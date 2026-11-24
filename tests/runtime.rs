@@ -7253,3 +7253,55 @@ fn clearing_a_tools_only_record_says_what_was_checked_and_never_signals_an_unsee
     assert!(text.contains("a process whose environment cannot be read is not seen") && text.contains("the command registry, and their mark"), "{text}");
     assert!(!index.exists());
 }
+
+/// The one supervisor directory of the fixture's checkout.
+fn supervisor_dir(fixture: &Fixture) -> std::path::PathBuf {
+    fs::read_dir(fixture.dir.path().join("state/supervisors")).unwrap().next().unwrap().unwrap().path()
+}
+
+#[test]
+fn records_a_live_supervisor_of_an_older_stack_wrote_are_read_as_before() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let dir = supervisor_dir(&fixture);
+    for file in ["spec.json", "state.json"] {
+        let record: Value = serde_json::from_slice(&fs::read(dir.join(file)).unwrap()).unwrap();
+        assert_eq!(record["schema_version"], 1, "{file}: {record}");
+    }
+    // The running supervisor's state as one of Stack 0.1.24 writes it: no schema_version (it
+    // rewrites the file only when something changes).
+    let mut state: Value = serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state.as_object_mut().unwrap().remove("schema_version");
+    fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(status["data"]["healthy"], true, "{status}");
+    fixture.ok(&["restart", "web"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_supervisor_record_of_a_newer_stack_is_refused_and_left_as_it_is() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let state_file = supervisor_dir(&fixture).join("state.json");
+    let written = fs::read(&state_file).unwrap();
+    let mut newer: Value = serde_json::from_slice(&written).unwrap();
+    newer["schema_version"] = json!(99);
+    let newer = newer.to_string();
+    fs::write(&state_file, &newer).unwrap();
+    for args in [&["down", "--json"][..], &["up", "--json"], &["restart", "web", "--json"]] {
+        let out = fixture.command(args).output().unwrap();
+        let result = json_result(&out);
+        assert_eq!(result["error"]["code"], "state_invalid", "{args:?}: {result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("written by a newer Stack (schema_version 99"), "{args:?}: {result}");
+        assert_ne!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), newer, "{args:?}: the record was written over");
+    }
+    let human = fixture.command(&["down"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&human.stderr).contains("newer Stack"), "{}", String::from_utf8_lossy(&human.stderr));
+    // As the release that wrote it would leave it again: stopping works.
+    fs::write(&state_file, &written).unwrap();
+    fixture.ok(&["down"]);
+}
