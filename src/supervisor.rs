@@ -560,7 +560,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
         if spec.shutdown {
             // Nothing to start: record that the dead supervisor's services are gone.
             let done = State { supervisor: None, applied: spec.revision, services: settled(&state.services), project: spec.project.clone(), token: spec.token.clone() };
-            write_state(dir, &done).map_err(|e| io_error(state_path(dir).display(), e))?;
+            replace_state(dir, &done)?;
             return Ok(done);
         }
         spawn(dir)?;
@@ -570,7 +570,10 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
     let mut respawned = false;
     let mut pause = Duration::from_millis(1);
     loop {
-        let now = state_lossy(dir);
+        seam("apply_poll");
+        // A state that exists but cannot be read (damaged, a newer Stack's, not a file) says
+        // nothing of what runs: never a dead supervisor to replace, nor one to settle.
+        let now = read_state(dir)?.unwrap_or_default();
         if now.applied >= spec.revision && (alive(&now) || spec.shutdown) {
             return Ok(now);
         }
@@ -585,7 +588,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
             }
             if spec.shutdown {
                 let done = State { supervisor: None, applied: spec.revision, services: settled(&now.services), project: spec.project.clone(), token: spec.token.clone() };
-                write_state(dir, &done).map_err(|e| io_error(state_path(dir).display(), e))?;
+                replace_state(dir, &done)?;
                 return Ok(done);
             }
             respawned = true;
@@ -628,6 +631,20 @@ fn write_state(dir: &Path, state: &State) -> std::io::Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&bytes)?;
     tmp.persist(state_path(dir)).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// [`write_state`] by a command, over the record it read: staged completely first, then the
+/// record about to be replaced read again, and replaced only when it is still one this Stack
+/// can read (or gone). One that became unreadable meanwhile (damaged, a newer Stack's) is kept.
+fn replace_state(dir: &Path, state: &State) -> Result<()> {
+    let path = state_path(dir);
+    let bytes = record_bytes(state);
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| io_error(path.display(), e))?;
+    tmp.write_all(&bytes).map_err(|e| io_error(path.display(), e))?;
+    seam("state_replace");
+    read_state(dir)?;
+    tmp.persist(&path).map_err(|e| io_error(path.display(), e.error))?;
     Ok(())
 }
 
@@ -877,12 +894,11 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
     let deadline = Instant::now() + crate::process::bounded(STOP_WAIT);
     let mut pause = Duration::from_millis(2);
     loop {
-        if accounted.is_some() {
-            seam("wait_poll");
-        }
+        seam("wait_poll");
+        // One that cannot be read is no evidence that anything stopped.
         let state = match accounted {
             Some(expected) => evidence(dir, expected)?,
-            None => state_lossy(dir),
+            None => read_state(dir)?.unwrap_or_default(),
         };
         let left: Vec<serde_json::Value> = state
             .services
@@ -898,7 +914,7 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
             // Recovering: the expected token, never what the spec says now.
             let token = match accounted {
                 Some(expected) => Some(expected.token.to_string()),
-                None => read_spec(dir).ok().flatten().and_then(|s| s.token),
+                None => read_spec(dir)?.and_then(|s| s.token),
             };
             let survivors = recover(dir, &state, token.as_deref());
             if !survivors.is_empty() {
@@ -908,7 +924,7 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
                 let settled_state = State { supervisor: None, applied: state.applied, services: settled(&state.services), ..state.clone() };
                 match accounted {
                     Some(expected) => publish_state_checked(dir, expected, &settled_state)?,
-                    None => write_state(dir, &settled_state).map_err(|e| io_error(state_path(dir).display(), e))?,
+                    None => replace_state(dir, &settled_state)?,
                 }
             }
             return Ok(());
@@ -1086,7 +1102,11 @@ pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
     if alive(&state) {
         return Vec::new();
     }
-    let token = read_spec(dir).ok().flatten().and_then(|s| s.token);
+    // Nor one whose spec cannot be read: its token is how the services' processes are found.
+    let token = match read_spec(dir) {
+        Ok(spec) => spec.and_then(|s| s.token),
+        Err(e) => return vec![serde_json::json!({ "record": spec_path(dir), "reason": format!("cannot be read: {}", e.message) })],
+    };
     let (strays, others, mut unverified) = scan(&state, token.as_deref(), &exempt_for(dir));
     let mut found: Vec<serde_json::Value> = strays.iter().map(|s| serde_json::json!({ "service": s.service, "pid": s.chain[0].pid })).collect();
     found.extend(others.iter().map(|p| serde_json::json!({ "pid": p.pid })));
@@ -1438,9 +1458,12 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
         // A record that is there but cannot be made sense of (damaged, or a newer Stack's) is
         // not a fresh start: what it names may run, and this supervisor would write over it.
         Err(e) if e.code == "state_invalid" => return Err(std::io::Error::other(format!("{}; nothing was started", e.message))),
-        // One that cannot be read at all (not a file) holds nothing; it is published once the
-        // supervisor can write it, and services stop if it never can.
-        Err(_) => State::default(),
+        // A directory in its place holds no record (and cannot be renamed over): the record is
+        // published once the supervisor can write it, and services stop if it never can.
+        Err(_) if state_path(dir).is_dir() => State::default(),
+        // Any other failure to read it (no permission, an I/O error) may hide a record naming
+        // what runs, which this supervisor would then write over.
+        Err(e) => return Err(std::io::Error::other(format!("{}; nothing was started", e.message))),
     };
     let mut spec = match read_spec(dir) {
         Ok(spec) => spec.unwrap_or_default(),
@@ -2855,6 +2878,143 @@ mod tests {
         let state = read_state(dir.path()).unwrap().unwrap();
         assert_eq!((state.project.as_deref(), state.token.as_deref()), (Some(Path::new("/checkouts/mine")), Some("mine-token")));
         assert!(state.services["web"].process.is_none() && read_spec(dir.path()).unwrap().unwrap().shutdown);
+    }
+
+    /// Run `f` with `action` done the `nth` (from 1) time the seam `at` is reached.
+    fn at_seam<T>(at: &'static str, nth: usize, action: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
+        let mut action = Some(action);
+        let mut seen = 0;
+        EVIDENCE_SEAM.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |point| {
+                if point == at {
+                    seen += 1;
+                    if seen == nth {
+                        if let Some(action) = action.take() {
+                            action();
+                        }
+                    }
+                }
+            }))
+        });
+        let result = f();
+        EVIDENCE_SEAM.with(|seam| *seam.borrow_mut() = None);
+        result
+    }
+
+    /// Ways a record stops being one this Stack can read, with the code a read of it gives:
+    /// damaged, a newer Stack's, or no file at all (`None`: a directory in its place).
+    fn unreadable() -> [(&'static str, Option<Vec<u8>>, &'static str); 3] {
+        [
+            ("damaged", Some(b"{\"applied\": ".to_vec()), "state_invalid"),
+            ("newer", Some(serde_json::json!({ "schema_version": SCHEMA_VERSION + 1, "applied": 99 }).to_string().into_bytes()), "state_invalid"),
+            ("not a file", None, "io"),
+        ]
+    }
+
+    /// Put `bad` (see [`unreadable`]) where `path` is.
+    fn spoil(path: &Path, bad: &Option<Vec<u8>>) {
+        match bad {
+            Some(bytes) => replace(path, bytes),
+            None => {
+                fs::remove_file(path).unwrap();
+                fs::create_dir(path).unwrap();
+            }
+        }
+    }
+
+    /// What is at `path`: its bytes, or `None` for a directory.
+    fn found(path: &Path) -> Option<Vec<u8>> {
+        (!path.is_dir()).then(|| fs::read(path).unwrap())
+    }
+
+    #[test]
+    fn a_state_that_becomes_unreadable_while_a_change_is_applied_is_never_taken_for_a_dead_supervisor() {
+        for (kind, bad, code) in unreadable() {
+            // A live supervisor that never acknowledges (it ignores the SIGHUP), so the change is
+            // waited for; the state goes bad on the second look.
+            let dir = tempfile::tempdir().unwrap();
+            let supervisor = child(true);
+            write(dir.path(), &record("/checkouts/mine", "mine-token", None, Proc::observe(supervisor.id()), 1));
+            let path = state_path(dir.path());
+            let (target, spoiled) = (path.clone(), bad.clone());
+            let result = at_seam("apply_poll", 2, move || spoil(&target, &spoiled), || apply(dir.path(), |s| s.shutdown = true));
+            let after = found(&path);
+            assert!(stop(supervisor), "{kind}: the supervisor did not outlive the wait");
+            let e = result.expect_err(kind);
+            assert_eq!(e.code, code, "{kind}: {e:?}");
+            assert_eq!(after, bad, "{kind}: the record was settled over");
+        }
+    }
+
+    #[test]
+    fn an_unversioned_state_acknowledging_a_change_is_read_as_before_while_it_is_waited_for() {
+        // As a supervisor of Stack 0.1.24, still running after an upgrade, acknowledges.
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = child(true);
+        let live = Proc::observe(supervisor.id());
+        write(dir.path(), &record("/checkouts/mine", "mine-token", None, live.clone(), 1));
+        let target = dir.path().to_path_buf();
+        let acknowledged = move || {
+            let mut state = record("/checkouts/mine", "mine-token", None, live, 2).1;
+            state.services.clear();
+            replace(&state_path(&target), &serde_json::to_vec(&state).unwrap());
+        };
+        let state = at_seam("apply_poll", 2, acknowledged, || apply(dir.path(), |s| s.services.clear()));
+        stop(supervisor);
+        assert_eq!(state.unwrap().applied, 2);
+    }
+
+    #[test]
+    fn a_state_that_becomes_unreadable_while_services_are_waited_for_is_no_evidence_they_stopped() {
+        for names in [Some(vec!["web".to_string()]), None] {
+            for (kind, bad, code) in unreadable() {
+                // A service still running under a live supervisor: the wait goes on until the
+                // state goes bad on its second look.
+                let dir = tempfile::tempdir().unwrap();
+                let (supervisor, service) = (child(true), child(false));
+                write(dir.path(), &record("/checkouts/mine", "mine-token", Proc::observe(service.id()), Proc::observe(supervisor.id()), 1));
+                let path = state_path(dir.path());
+                let (target, spoiled) = (path.clone(), bad.clone());
+                let result = at_seam("wait_poll", 2, move || spoil(&target, &spoiled), || wait_gone(dir.path(), names.as_deref()));
+                let after = found(&path);
+                assert!(stop(service) && stop(supervisor), "{kind}: a process was signalled");
+                let e = result.expect_err(kind);
+                assert_eq!(e.code, code, "{kind} ({names:?}): {e:?}");
+                assert_eq!(after, bad, "{kind}: the record was settled over");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_supervisors_state_that_becomes_unreadable_before_it_is_settled_is_kept() {
+        for (kind, bad, code) in unreadable() {
+            // The supervisor is gone and left a service running: it is stopped, and the record
+            // goes bad just before it would be settled.
+            let dir = tempfile::tempdir().unwrap();
+            let service = child(false);
+            write(dir.path(), &record("/checkouts/mine", "mine-token", Proc::observe(service.id()), None, 1));
+            let path = state_path(dir.path());
+            let (target, spoiled) = (path.clone(), bad.clone());
+            let result = at_seam("state_replace", 1, move || spoil(&target, &spoiled), || wait_gone(dir.path(), None));
+            stop(service);
+            assert_eq!(result.expect_err(kind).code, code, "{kind}");
+            assert_eq!(found(&path), bad, "{kind}: the record was settled over");
+        }
+    }
+
+    #[test]
+    fn what_may_run_is_unresolved_while_the_spec_naming_its_token_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+        assert!(unresolved(dir.path()).is_empty());
+        for (kind, bad, _) in unreadable() {
+            spoil(&spec_path(dir.path()), &bad);
+            let left = unresolved(dir.path());
+            assert!(left.len() == 1 && left[0]["record"] == serde_json::json!(spec_path(dir.path())), "{kind}: {left:?}");
+            assert!(!forget(dir.path()), "{kind}: forgotten");
+            let _ = fs::remove_dir(spec_path(dir.path()));
+            write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+        }
     }
 
     #[test]

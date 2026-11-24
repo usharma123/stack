@@ -777,3 +777,26 @@ fn a_supervisor_never_starts_over_a_state_a_newer_stack_wrote() {
     let log = fs::read_to_string(sup.path().join("supervisor.log")).unwrap();
     assert!(log.contains("written by a newer Stack") && log.contains("nothing was started"), "{log}");
 }
+
+#[test]
+fn a_supervisor_never_starts_over_a_state_it_may_not_read() {
+    // Root reads a file whatever its mode: nothing to show there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let sup = Supervisor::new();
+    fs::create_dir_all(sup.path()).unwrap();
+    let record = json!({ "applied": 4, "services": {}, "token": sup.token() }).to_string();
+    let state = sup.path().join("state.json");
+    fs::write(&state, &record).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    sup.spec(json!({ "a": sup.service("echo started > \"$OUT/a.ran\"; exec sleep 600") }), false);
+    sup.start_logged();
+    thread::sleep(Duration::from_millis(1500));
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!sup.dir.path().join("a.ran").exists(), "a service started");
+    assert_eq!(fs::read_to_string(&state).unwrap(), record, "the record was written over");
+    let log = fs::read_to_string(sup.path().join("supervisor.log")).unwrap();
+    assert!(log.contains("nothing was started"), "{log}");
+}

@@ -483,8 +483,14 @@ output (mise's answer when no release matches) is an error, not a version.
   which macOS rewrites when the clock is stepped); a record without a boot, or
   from another boot, names nothing alive and is never signalled. A request gets a revision above
   both the spec's and the last one the supervisor acknowledged, and a `spec.json` or
-  `state.json` that exists but cannot be read is `state_invalid`, not a fresh start, so an
-  acknowledgment only ever comes from a supervisor that read the request. Both records carry
+  `state.json` that exists but cannot be read is `state_invalid` (or an I/O error), not a fresh
+  start, so an acknowledgment only ever comes from a supervisor that read the request. That holds
+  on every look, not only the first: one that goes bad while a command waits for the
+  acknowledgment or for services to stop ends the wait with that error, and is never taken for
+  a dead supervisor to replace, for services gone, or for a record to settle over (a command
+  reads the state again after staging its write, and keeps one it can no longer read). A
+  supervisor starts over a `state.json` it may not read only when a directory is in its place;
+  any other read error stops it before anything starts. Both records carry
   `schema_version` (1). One without it was written by Stack 0.1.24 or earlier, or by a
   supervisor of such a release still running after an upgrade, and is read as before (every
   reader ignores fields it does not know, so such a supervisor reads this Stack's spec too). One
