@@ -5889,7 +5889,7 @@ fn version_2_locks_install_plainly_and_required_policies_refuse_before_any_insta
     assert_eq!(fs::read_to_string(fixture.dir.path().join("app/stack.lock")).unwrap(), v2, "install never rewrites it");
 
     let required = |extra: &str| fs::write(fixture.dir.path().join("app/stack.toml"), format!("[[use]]\nbundle='path:../bundle'\n[lock]\nartifacts='required'\n{extra}")).unwrap();
-    required("");
+    required("platforms=['current']\n");
     let before = mise_log(&fixture).len();
     let e = json_result(&fixture.command(&["install", "--json"]).output().unwrap())["error"].clone();
     assert_eq!(e["code"], "lock_outdated", "{e}");
@@ -6701,28 +6701,23 @@ fn a_snapshot_is_never_restored_under_a_server_a_dead_supervisor_left_running() 
     fixture.ok(&["snapshot", "save", "base"]);
     fs::write(data.join("rows"), "after").unwrap();
     let server = fixture.session()["services"]["web"]["pid"].as_u64().unwrap() as u32;
-    // On Linux, PR_SET_PDEATHSIG delivers the service's stop signal when the supervisor dies;
-    // let the stand-in ignore that one signal so this test exercises a server that survived.
+    // On Linux, PR_SET_PDEATHSIG can fire once per reparenting as the supervisor's threads exit;
+    // keep the stand-in alive across all of them until `down` so this test exercises a server
+    // that survived its supervisor's crash.
     #[cfg(target_os = "linux")]
     let keep = {
-        let p = fixture.dir.path().join("ignore-one-signal");
+        let p = fixture.dir.path().join("ignore-signals");
         fs::write(&p, "").unwrap();
         p
     };
     fixture.kill_supervisor();
-    #[cfg(target_os = "linux")]
-    {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while keep.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let _ = fs::remove_file(&keep);
-    }
     fixture.remove_session_records();
     let out = fixture.command(&["snapshot", "restore", "base", "--json"]).output().unwrap();
     assert!(!out.status.success(), "{}", json_result(&out));
     assert!(pid_alive(server));
     assert_eq!(fs::read_to_string(data.join("rows")).unwrap(), "after", "data replaced under a running server");
+    #[cfg(target_os = "linux")]
+    fs::remove_file(&keep).unwrap();
     let down = json_result(&fixture.ok(&["down", "--json"]));
     assert_eq!(down["data"]["confirmed"], true, "{down}");
     assert!(!pid_alive(server));

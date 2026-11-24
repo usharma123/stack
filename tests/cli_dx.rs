@@ -168,7 +168,6 @@ fn mcp_dir_finds_its_project_like_the_cli_and_never_uses_the_servers_own() {
             ("stack_inspect", json!({ "dir": deep })),
             ("stack_inspect", json!({})),
             ("stack_exec", json!({ "dir": deep, "command": ["sh", "-c", "pwd -P; echo $STACK_PROJECT"] })),
-            ("stack_init", json!({ "dir": deep })),
         ],
     );
     assert_eq!(replies[0]["ok"], true, "{}", replies[0]);
@@ -180,8 +179,11 @@ fn mcp_dir_finds_its_project_like_the_cli_and_never_uses_the_servers_own() {
     assert_eq!(replies[3]["data"]["stdout"], format!("{}\n{}\n", deep.display(), app.display()), "{}", replies[3]);
     assert_eq!(replies[3]["project"], app.to_str().unwrap());
     // stack_init means exactly `dir`: a new project inside this one, never this one's stack.toml.
-    assert_eq!(replies[4]["ok"], true, "{}", replies[4]);
-    assert_eq!(replies[4]["project"], deep.to_str().unwrap());
+    // Sent after stack_exec so concurrent MCP dispatch (keyed on `app` vs `deep`) cannot create
+    // `deep/stack.toml` before stack_exec resolves its project.
+    let init = fixture.mcp(&deep, &[("stack_init", json!({ "dir": deep }))]);
+    assert_eq!(init[0]["ok"], true, "{}", init[0]);
+    assert_eq!(init[0]["project"], deep.to_str().unwrap());
     assert!(deep.join("stack.toml").is_file());
     // With no stack.toml up to the worktree root, the error says where the search went.
     fs::remove_file(deep.join("stack.toml")).unwrap();
