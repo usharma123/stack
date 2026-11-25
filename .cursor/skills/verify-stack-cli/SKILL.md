@@ -5,7 +5,7 @@ description: Build and drive the real Stack CLI and stdio MCP against isolated l
 
 ## Launch
 
-From the repo root, run `.cursor/skills/verify-stack-cli/drive.sh 3-leases` for the lease journey. The runner builds the locked debug binary, runs the doctor checks, and drives the native suite in order through the selected scenario with isolated Stack and mise state (Pitchfork's too, though services run under Stack's own supervisor). Earlier scenarios create the checkouts and leave the service state required by later scenarios. Each CLI call is a separate process. Readiness comes from the scenario's `stack up --json` and subsequent verified execution or service checks.
+From the repo root, run `.cursor/skills/verify-stack-cli/drive.sh 3-leases` for the lease journey. The runner builds the locked debug binary, runs the doctor checks, and drives the native suite with isolated Stack and mise state (Pitchfork's too, though services run under Stack's own supervisor). The original four scenarios (`1-independent-checkouts`, `2-wrong-instance`, `3-leases`, `4-mcp`) run in order through the selected one: earlier scenarios create the checkouts and leave the service state required by later scenarios. The Pass 2 scenarios (`13-port-isolation`, `14-run-logs-cursor`, `15-mcp-eof`) use checkouts of their own and run after `1-independent-checkouts` only; `drive.sh pass2` runs all three. CI (`tests/e2e/native.sh` with no scenario, and `tests/e2e/run.sh` in Docker) runs every numbered scenario, so the new ones there too; scenario 5 (OCI) is skipped without `STACK_E2E_REGISTRY`. Each CLI call is a separate process. Readiness comes from the scenario's `stack up --json` and subsequent verified execution or service checks.
 
 ## Doctor
 
