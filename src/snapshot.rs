@@ -149,7 +149,10 @@ fn store_lock(state: &Path, project: &ProjectId) -> Result<FileLock> {
 // between the two renames leaves the name empty and the old generation in `.old-*`. Readers
 // that take no lock (`list`, the checks before an operation) then read that old generation
 // in place, and the next operation under the lock moves it back ([`recover_store`]) before it
-// removes any staging directory. A generation counts only when its `meta.json` parses and
+// removes any staging directory. A save that is not interrupted moves the published one aside,
+// publishes the new one and removes the old one between any two reads of a reader that takes
+// no lock, so a reader that found neither looks again (see [`lookup`]) and keeps what it read
+// rather than reading a directory twice. A generation counts only when its `meta.json` parses and
 // names it: one at the name that does not is no generation, and never hides, or has removed,
 // a valid one set aside. A read or rename that fails stops the operation with what was set
 // aside left in place.
@@ -215,28 +218,78 @@ fn staging(base: &Path) -> Result<Vec<(PathBuf, Staging)>> {
 
 /// The newest complete generation of `name` set aside by an interrupted `save --force`.
 fn set_aside(base: &Path, name: &str) -> Result<Option<PathBuf>> {
-    let mut old: Vec<(u64, u128, PathBuf)> = Vec::new();
+    Ok(set_aside_read(base, name)?.0.map(|(path, _)| path))
+}
+
+/// A generation's directory, with the metadata read there.
+type Located = (PathBuf, Meta);
+
+/// [`set_aside`] with the metadata it read, and the staging directories of `name` it saw
+/// (valid or not), in name order.
+fn set_aside_read(base: &Path, name: &str) -> Result<(Option<Located>, Vec<PathBuf>)> {
+    let mut old: Vec<(u64, u128, PathBuf, Meta)> = Vec::new();
+    let mut seen = Vec::new();
     for (path, s) in staging(base)? {
         if s.kind == "old" && s.name == name {
+            seen.push(path.clone());
             if let Some(meta) = meta_at(&path, name)? {
-                old.push((meta.created_at, s.nanos, path));
+                old.push((meta.created_at, s.nanos, path, meta));
             }
         }
     }
-    old.sort();
-    Ok(old.pop().map(|(_, _, path)| path))
+    old.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    seen.sort();
+    Ok((old.pop().map(|(_, _, path, meta)| (path, meta)), seen))
 }
+
+/// How many times a reader without the lock looks for a generation while what it sees keeps
+/// changing (see [`lookup`]).
+const LOOKUPS: usize = 100;
 
 /// Where `name`'s snapshot is: the published directory when its metadata is valid, else,
 /// while a `save --force` without an exchange has it renamed aside (or crashed with it so),
-/// the newest valid generation set aside. Read only.
+/// the newest valid generation set aside. Read only (see [`lookup`]).
 fn generation(state: &Path, project: &ProjectId, name: &str) -> Result<Option<PathBuf>> {
-    let base = store(state, project);
+    Ok(lookup(&store(state, project), name)?.map(|(path, _)| path))
+}
+
+/// [`generation`] with the metadata it read there, which is what callers use: the directory is
+/// never read a second time, since a save may remove it in between. Without the lock, a save
+/// that moves the published generation aside after the name is read, then publishes the new
+/// one and removes the old one before the generation set aside is read, leaves this reader
+/// with neither; the new generation is in place by then, so the name is read again. Only
+/// another save in the same few reads can hide it again, so this goes round while the
+/// generations set aside it saw change, at most [`LOOKUPS`] times, and finds none only when two
+/// rounds in a row saw the same: no generation at the name and none valid set aside.
+fn lookup(base: &Path, name: &str) -> Result<Option<Located>> {
     let published = base.join(name);
-    if meta_at(&published, name)?.is_some() {
-        return Ok(Some(published));
+    let mut before: Option<Vec<PathBuf>> = None;
+    for _ in 0..LOOKUPS {
+        if let Some(meta) = meta_at(&published, name)? {
+            return Ok(Some((published, meta)));
+        }
+        let (aside, seen) = set_aside_read(base, name)?;
+        if aside.is_some() {
+            return Ok(aside);
+        }
+        #[cfg(test)]
+        BETWEEN_READS.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f();
+            }
+        });
+        if before.as_ref() == Some(&seen) {
+            break;
+        }
+        before = Some(seen);
     }
-    set_aside(&base, name)
+    Ok(meta_at(&published, name)?.map(|meta| (published, meta)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests run this in [`lookup`] after a round found nothing, as a save would act there.
+    static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Rename within the store; tests fail a named step, as an I/O error would.
@@ -400,7 +453,12 @@ impl Generation {
 
 /// `name`'s snapshot (see [`generation`]), whose metadata must name it.
 fn read_generation(state: &Path, project: &ProjectId, name: &str) -> Result<Generation> {
-    let dir = generation(state, project, name)?.unwrap_or_else(|| store(state, project).join(name));
+    if let Some((dir, meta)) = lookup(&store(state, project), name)? {
+        let identity = dir_at(&dir);
+        return Ok(Generation { dir, meta, identity });
+    }
+    // No generation: why, from what is at the name.
+    let dir = store(state, project).join(name);
     let path = dir.join(META);
     let invalid = |why: String| StackError::new("snapshot_invalid", format!("{}: {why}", path.display())).hint(format!("remove it with `stack snapshot rm {name}`"));
     match fs::read_to_string(&path) {
@@ -433,23 +491,39 @@ fn not_found(state: &Path, project: &ProjectId, name: &str) -> StackError {
 
 /// Every snapshot's name: published ones, and those an interrupted `save --force` left set
 /// aside with nothing published in their place.
+///
+/// Read without the lock, so the published names are listed again after the generations set
+/// aside: a save may move one aside after the first listing and remove it before the second
+/// (see [`lookup`]). Rounds repeat while the names found change, at most [`LOOKUPS`] times.
 fn names(state: &Path, project: &ProjectId) -> Vec<String> {
     let base = store(state, project);
-    let mut out: Vec<String> = fs::read_dir(&base)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().join(META).is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| valid_name(n).is_ok())
-        .collect();
-    for (path, s) in staging(&base).unwrap_or_default() {
-        if s.kind == "old" && !out.contains(&s.name) && meta_at(&path, &s.name).ok().flatten().is_some() {
-            out.push(s.name);
+    let published = || -> Vec<String> {
+        fs::read_dir(&base)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().join(META).is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| valid_name(n).is_ok())
+            .collect()
+    };
+    let mut before: Option<Vec<String>> = None;
+    for _ in 0..LOOKUPS {
+        let mut out = published();
+        for (path, s) in staging(&base).unwrap_or_default() {
+            if s.kind == "old" && meta_at(&path, &s.name).ok().flatten().is_some() {
+                out.push(s.name);
+            }
         }
+        out.extend(published());
+        out.sort();
+        out.dedup();
+        if before.as_ref() == Some(&out) {
+            break;
+        }
+        before = Some(out);
     }
-    out.sort();
-    out
+    before.unwrap_or_default()
 }
 
 fn major(version: &str) -> String {
@@ -1407,8 +1481,8 @@ pub fn list(ctx: &Ctx) -> Result<ListReport> {
     let project = project_id(&ctx.root);
     let mut snapshots = Vec::new();
     for name in names(&ctx.state, &project) {
-        if let Some(dir) = generation(&ctx.state, &project, &name)? {
-            snapshots.extend(meta_at(&dir, &name)?);
+        if let Some((_, meta)) = lookup(&store(&ctx.state, &project), &name)? {
+            snapshots.push(meta);
         }
     }
     Ok(ListReport { project, snapshots })
@@ -2136,6 +2210,85 @@ mod tests {
         assert_eq!(read_meta(state.path(), &project, "base").unwrap_err().code, "snapshot_invalid");
         assert!(recover_store(&base).unwrap().is_empty());
         assert_eq!(entries(&base), ["base"], "the invalid generation set aside is staging; the name is left for `rm`");
+    }
+
+    /// Readers take no lock, and a `save --force` without an exchange moves the published
+    /// generation aside, publishes the new one and removes the old one between any two of their
+    /// reads: every read, of the metadata, the listing and `list`, still finds a generation.
+    #[test]
+    fn readers_racing_forced_saves_without_an_exchange_always_find_a_generation() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        snapshot_dir(&base.join("base"), "base", 1, "x");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saver = {
+            let (base, stop) = (base.clone(), stop.clone());
+            std::thread::spawn(move || {
+                datadirs::NO_EXCHANGE.with(|c| c.set(true));
+                let mut created_at = 1;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    created_at += 1;
+                    let tmp = unique(&base, ".tmp-base");
+                    snapshot_dir(&tmp, "base", created_at, "x");
+                    assert_eq!(publish(&base, "base", &tmp, &base.join("base")).unwrap(), "rename");
+                }
+                created_at
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let (mut reads, mut misses) = (0, Vec::new());
+        while std::time::Instant::now() < deadline {
+            reads += 1;
+            if let Err(e) = read_meta(state.path(), &project, "base") {
+                misses.push(format!("read_meta: {}", e.code));
+            }
+            if names(state.path(), &project) != ["base"] {
+                misses.push("names".into());
+            }
+            if list_names(state.path(), &project) != ["base"] {
+                misses.push("generation".into());
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let saves = saver.join().unwrap();
+        assert!(saves > 10, "the saver published only {saves} generations");
+        assert!(misses.is_empty(), "{} of {reads} rounds missed the snapshot during {saves} saves: {:?}", misses.len(), &misses[..misses.len().min(10)]);
+    }
+
+    /// The interleaving behind the race above, one step at a time: the reader finds the name
+    /// empty (moved aside) and the generation set aside already half removed, and only then is
+    /// the new one published. It reads the name again and finds that.
+    #[test]
+    fn a_reader_that_finds_neither_the_name_nor_a_generation_set_aside_reads_the_name_again() {
+        let state = tempfile::tempdir().unwrap();
+        let project = ProjectId::checkout(Path::new("/checkout"));
+        let base = store(state.path(), &project);
+        // A save midway: the old generation renamed aside and its metadata already removed, the
+        // new one built but not yet published.
+        let old = unique(&base, ".old-base");
+        snapshot_dir(&old, "base", 1, "x");
+        fs::remove_file(old.join(META)).unwrap();
+        let tmp = unique(&base, ".tmp-base");
+        snapshot_dir(&tmp, "base", 2, "x");
+        let (published, aside) = (base.join("base"), old.clone());
+        let mut steps = 0;
+        BETWEEN_READS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                steps += 1;
+                if steps == 1 {
+                    fs::rename(&tmp, &published).unwrap();
+                    remove_tree(&aside);
+                }
+            }))
+        });
+        let meta = read_meta(state.path(), &project, "base");
+        BETWEEN_READS.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(meta.unwrap().created_at, 2);
+
+        // With no save there, a missing snapshot is still missing, after a bounded look.
+        fs::remove_dir_all(base.join("base")).unwrap();
+        assert_eq!(read_meta(state.path(), &project, "base").unwrap_err().code, "snapshot_not_found");
     }
 
     fn list_names(state: &Path, project: &ProjectId) -> Vec<String> {
