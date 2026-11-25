@@ -5,8 +5,4 @@ skill=$(cd "$(dirname "$0")" && pwd)
 . "$(git -C "$skill" rev-parse --show-toplevel)/verification/lib.sh"
 verify_evidence session
 verify_model "$skill" SessionLifecycle.tla
-tests=()
-while IFS= read -r test; do
-  case "$test" in ''|'#'*) ;; *) tests+=("$test") ;; esac
-done <"$skill/rust-tests.txt"
-verify_rust "${tests[@]}"
+verify_rust_list "$skill/rust-tests.txt"

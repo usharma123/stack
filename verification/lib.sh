@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by the TLA+ verify skills under .cursor/skills/verify-stack-*/: source it, then call
 # `verify_model <skill dir> <spec>` and `verify_rust <test>...` (or `verify_rust_list <file>`).
 # Needs bash, Java 11+, git, curl, and sha256sum or shasum.
@@ -54,9 +55,11 @@ verify_evidence() {
 # Check the spec $2 in the skill directory $1 under every config `expected.tsv` lists, each
 # with one worker so counts are reproducible, and compare the exit code, the violated invariant
 # (or `-` for a pass) and the distinct states with the table. Every config file in the directory
-# must be listed. Writes `<config>.log` and a `summary.tsv` to $EVIDENCE.
+# must be listed, and a table that lists none fails. The last row counts without a trailing
+# newline, and TLC reads its standard input from /dev/null, never from the table. Writes
+# `<config>.log` and a `summary.tsv` to $EVIDENCE.
 verify_model() {
-  local dir=$1 spec=$2 failed=0 cfg exit invariant states
+  local dir=$1 spec=$2 failed=0 checked=0 cfg exit invariant states
   tla_jar
   for cfg in "$dir"/*.cfg; do
     if ! cut -f1 "$dir/expected.tsv" | grep -qx "$(basename "$cfg")"; then
@@ -65,12 +68,13 @@ verify_model() {
     fi
   done
   printf 'config\texit\tviolated\tdistinct_states\tverdict\n' >"$EVIDENCE/summary.tsv"
-  while IFS=$'\t' read -r cfg exit invariant states; do
+  while IFS=$'\t' read -r cfg exit invariant states || [ -n "$cfg" ]; do
     case "$cfg" in ''|'#'*|config) continue ;; esac
     local name=${cfg%.cfg} log status=0 got_inv got_states verdict=ok
     log="$EVIDENCE/$name.log"
+    checked=$((checked + 1))
     (cd "$dir" && java -XX:+UseParallelGC -cp "$TLA_JAR" tlc2.TLC -workers 1 -metadir "$EVIDENCE/$name.states" \
-      -config "$cfg" "$spec" >"$log" 2>&1) || status=$?
+      -config "$cfg" "$spec" </dev/null >"$log" 2>&1) || status=$?
     got_inv=$(sed -n 's/^Error: Invariant \([A-Za-z0-9_]*\) is violated\.$/\1/p' "$log" | head -1)
     got_states=$(sed -n 's/^[0-9]* states generated, \([0-9]*\) distinct states found.*/\1/p' "$log" | tail -1)
     [ -n "$got_inv" ] || got_inv=-
@@ -88,6 +92,10 @@ verify_model() {
       echo "  expected exit $exit, $invariant, $states distinct states; see $log" >&2
     fi
   done <"$dir/expected.tsv"
+  if [ "$checked" -eq 0 ]; then
+    echo "$dir/expected.tsv lists no config" >&2
+    failed=1
+  fi
   return "$failed"
 }
 
@@ -139,11 +147,12 @@ verify_rust() {
 }
 
 # verify_rust with the tests listed in the file $1, one per line (`#` comments and blank lines
-# skipped).
+# skipped, the last line counted without a trailing newline). A list that names no test fails.
 verify_rust_list() {
   local tests=() test
-  while IFS= read -r test; do
+  while IFS= read -r test || [ -n "$test" ]; do
     case "$test" in ''|'#'*) ;; *) tests+=("$test") ;; esac
   done <"$1"
+  [ ${#tests[@]} -gt 0 ] || { echo "$1 names no Rust test" >&2; return 1; }
   verify_rust "${tests[@]}"
 }

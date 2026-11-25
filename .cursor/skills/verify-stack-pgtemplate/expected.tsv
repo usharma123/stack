@@ -1,0 +1,4 @@
+# config, expected TLC exit code, invariant it must violate (- for a pass), distinct states (one worker).
+config	exit	violated	distinct_states
+FALSE.cfg	0	-	23
+TRUE.cfg	12	AcceptedRecordMatchesObservedDirectory	25

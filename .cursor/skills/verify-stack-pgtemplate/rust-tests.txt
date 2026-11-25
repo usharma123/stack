@@ -1,0 +1,2 @@
+# Rust library test that injects a replacement at each lookup stage of `generation` (see SKILL.md).
+pgtemplate::tests::a_template_replaced_while_its_record_is_read_is_read_again_under_the_lock
