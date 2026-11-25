@@ -1604,6 +1604,8 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
         .map(|d| d.join("psql"))
         .find(|p| p.is_file())
     else {
+        // A check the formal verification lists: CI requires it to run.
+        assert!(std::env::var_os("STACK_REQUIRE_PSQL").is_none(), "STACK_REQUIRE_PSQL is set, but psql is not on PATH");
         eprintln!("skipping: psql is not on PATH");
         return;
     };
