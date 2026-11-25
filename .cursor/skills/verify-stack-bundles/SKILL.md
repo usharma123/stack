@@ -52,10 +52,10 @@ What one compile accepts, from the snapshot it hashed. The other files of a bund
 
 ## Bounds and case distinctions
 
-- `Compiles = 3` compiles and `Events = 2` events per behavior, one `[[use]]` bundle, versions 1 and 2 of its content (a local edit or a moved ref). There are 1,512 initial states.
+- `Compiles = 3` compiles and `Events = 2` events per behavior, one `[[use]]` bundle, versions 1 and 2 of its content (a local edit or a moved ref). There are 2,016 initial states.
 - Transport: local directory, Git, OCI. The tree holds a link or special file or not; `paths.bin` is a plain relative directory, a `..` path, or `.Stack/bin`; a link replaces it only after a hash saw the tree (`LocalEdit`), since a link already there is refused by hashing first. An OCI layer can hold a directory folding to `.git`/`.stack`.
 - stack.lock: none, or pinning version 1; it can be edited to a pin that is not a commit id or digest. The OCI cache slot of the locked digest starts absent, installed with evidence, filled with the same content without evidence, filled with other content, or holding an excluded directory; another process can change it.
-- `[lock]`: best effort, `required` with a pin unchecked, or `required` on a machine `platforms` does not list.
+- `[lock]`: best effort; `required` on a listed machine with every pin checked (`requiredCovered`, the case where locked operations must go ahead); `required` with a pin unchecked; or `required` on a machine `platforms` does not list.
 - Registry: one conversation per fetch, starting at `R`, with at most one redirect (to `R` or another origin `Y`), one challenge per target (Basic, or Bearer with realm `R`, approved `A`, or unapproved `U`), and a token service that answers with a token or a redirect (to `Z`). Operator credentials: none, bound to `R`, bound to `Y`, or unbound.
 
 ## Atomicity assumptions and what is outside
@@ -66,7 +66,11 @@ What one compile accepts, from the snapshot it hashed. The other files of a bund
 
 ## Faults (historical bugs) and expected results
 
-`FALSE.cfg` passes every invariant (1,295,681 distinct states). Each `TRUE-*.cfg` puts one bug back and must end with TLC exit 12 and the named violation. `LIMIT-LocalToolsAtUse.cfg` has no fault: it shows that a local bundle edited after a compile is read as edited, which the model does not promise. `expected.tsv` pins every config's exit code, invariant and distinct-state count.
+`FALSE.cfg` passes every invariant (1,785,966 distinct states). Each `TRUE-*.cfg` puts one bug back and must end with TLC exit 12 and the named violation. `LIMIT-LocalToolsAtUse.cfg` has no fault: it shows that a local bundle edited after a compile is read as edited, which the model does not promise. `expected.tsv` pins every config's exit code, invariant and distinct-state count.
+
+The refusal invariants under `required` (`UnlistedHostRefusedFirst`, `RequiredMeansCovered`) would also hold in a model that refused every locked operation under `required`. Two configs rule that out. `WITNESS-RequiredLockedRuns.cfg` checks `RequiredLockedNeverRuns`, which is not a promise but its opposite, and must violate it (exit 12, 332,645 distinct states): a locked operation under `requiredCovered` reaches mise. Its counterexample is a locked compile of a local bundle on a listed machine with every pin checked, which `tests/runtime.rs` `every_locked_operation_runs_under_required_on_a_listed_platform_with_every_pin_checked` runs for real: install (reaching `mise install --locked`), up, exec, run, status, inspect and `compile --locked`, from the CLI and over MCP, each going ahead without rewriting stack.lock. `WITNESS-RefuseRequired.cfg` puts back that over-refusal (`RefuseRequired`) and passes the same check (exit 0), so the witness row would fail if the model, or a change to it, refused them all.
+
+Two guards hold a locked compile to stack.lock: `Begin` takes its pin and never resolves, and `Finish` compares the pins (`same_pins`). In the baseline either alone suffices. `REDUNDANT-NoSamePins.cfg` removes `same_pins` and keeps `LockedAcceptsTheLock`, with exactly the baseline's distinct states, since `Fetch`'s hash checks and the pin `Begin` took leave it nothing to catch. The mutants therefore remove the pin choice: `TRUE-IgnoreLockPin` lets compile resolve the moved tag, and `TRUE-LockedSkipsSamePins` removes both guards from locked mode.
 
 | Config | Bug put back | Violation |
 |---|---|---|
@@ -83,7 +87,12 @@ What one compile accepts, from the snapshot it hashed. The other files of a bund
 | `TRUE-AuthFollowsRedirects` | b727b0d: the HTTP agent follows redirects, carrying Authorization | `AuthOnlyToItsOrigin` |
 | `TRUE-HostCheckOnlyInInstall` | 974bdf4: only install and up refuse an unlisted platform | `UnlistedHostRefusedFirst` |
 | `TRUE-CoverageOnlyInInstall` | design guard (7eabc0e): locked operations other than install skip `check_committed_artifacts` | `RequiredMeansCovered` |
+| `TRUE-IgnoreLockPin` | design guard: compile and locked mode resolve the ref or tag instead of taking stack.lock's pin (`moved_tag_does_not_change_a_locked_project`) | `PinsMoveOnlyByUpdate` |
+| `TRUE-LockedSkipsSamePins` | design guard: that, with locked mode also skipping `same_pins` (`locked_mode_refuses_to_change_the_lock`) | `LockedAcceptsTheLock` |
 | `LIMIT-LocalToolsAtUse` | none: a local bundle edited after its compile | `ToolsUsedAreHashed` |
+| `WITNESS-RequiredLockedRuns` | none: a locked operation goes ahead under `required` | `RequiredLockedNeverRuns` (must be violated) |
+| `WITNESS-RefuseRequired` | over-refusal: every locked operation under `required` refused | none (passes the witness, so the witness above is what notices) |
+| `REDUNDANT-NoSamePins` | locked mode skips `same_pins` alone | none (`LockedAcceptsTheLock` holds) |
 
 ## Rust regressions
 
@@ -94,7 +103,7 @@ What one compile accepts, from the snapshot it hashed. The other files of a bund
 - `compose::tests::*` for `Load` and `Finish`'s `bin_dir`, including a bin directory replaced after loading.
 - `oci::tests::*` for `Grant`, `trusted_realm`, `registry_origin`, `authenticate_with` (Basic only at the configured origin), digest and reference grammars, transport checks, `extract` and `install_with`.
 - `artifacts::tests::required_policies_refuse_an_unlisted_runtime_platform_and_best_effort_ones_never_do` for `check_host`.
-- `tests/compile.rs` (links in Git and local bundles, `paths.bin`, a moved tag, locked mode), `tests/oci_pull.rs` (layers with links or excluded directories, a link added to a cached tree, evidence-only reuse, a cached tree holding an excluded directory, only digests naming paths and requests), `tests/oci_auth.rs` (unapproved and approved token services, a token service's redirect, origin binding however spelled, unbound credentials failing closed, anonymous flows beside bound credentials, an approved realm of an unbound registry, a selected registry redirecting into the bound origin, and an authorized request redirected elsewhere carrying no Authorization), `tests/artifacts.rs` (`required_coverage_fails_before_anything_is_written`) and `tests/runtime.rs` (`every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordinary_compile_does_not`, CLI and MCP).
+- `tests/compile.rs` (links in Git and local bundles, `paths.bin`, a moved tag, locked mode), `tests/oci_pull.rs` (layers with links or excluded directories, a link added to a cached tree, evidence-only reuse, a cached tree holding an excluded directory, only digests naming paths and requests), `tests/oci_auth.rs` (unapproved and approved token services, a token service's redirect, origin binding however spelled, unbound credentials failing closed, anonymous flows beside bound credentials, an approved realm of an unbound registry, a selected registry redirecting into the bound origin, and an authorized request redirected elsewhere carrying no Authorization), `tests/artifacts.rs` (`required_coverage_fails_before_anything_is_written`) and `tests/runtime.rs` (`every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordinary_compile_does_not` and, for the witness, `every_locked_operation_runs_under_required_on_a_listed_platform_with_every_pin_checked`, CLI and MCP).
 
 ## Reading a result
 
@@ -104,4 +113,4 @@ A counterexample is a real bug only if each step can happen in the code. Replay 
 
 Covered files: `src/project.rs` (`compile`, `compile_checked`, `check_committed_artifacts`), `src/source.rs` (`fetch_git`, `fetch_oci`, `fetch_path`, `is_commit`), `src/hash.rs` (`hash_keeping`, `list_files`, `excluded`, `first_excluded`), `src/manifest.rs` (`parse_bundle`), `src/compose.rs` (`LoadedBundle::new`, `bin_dir`, `compose`'s bin paths), `src/oci.rs` (`Client::send`, `authenticate_with`, `CredentialEnv::grant`, `registry_origin`, `trusted_realm`, `resolve`, `pull`, `verify_cached`, `layer`, `digest`, `verify_digest`, `install_with`, `extract`, `Evidence`), `src/artifacts.rs` (`Policy::check_host`, `unchecked_targets`, `unlocked_error`).
 
-The model was confirmed against these files at `402090b`; since 1710fbf, the last change to them, only a test was added (`src/source.rs`, 402090b). If any covered function changes, recheck the action table, the bounds, `expected.tsv` and the Rust list. Move the sync commit forward only after confirming that the model describes the new code and rerunning the check. Use `/maintain-formal-verification-skill` to reconcile intervening changes. If a config is intended to change, update its row in `expected.tsv` and say why in the commit.
+The model was confirmed against these files at `402090b`; since 1710fbf, the last change to them, only a test was added (`src/source.rs`, 402090b). None of them changed by `f2d4fe7`, where the `requiredCovered` policy, the witness and the pin mutants were added. If any covered function changes, recheck the action table, the bounds, `expected.tsv` and the Rust list. Move the sync commit forward only after confirming that the model describes the new code and rerunning the check. Use `/maintain-formal-verification-skill` to reconcile intervening changes. If a config is intended to change, update its row in `expected.tsv` and say why in the commit.

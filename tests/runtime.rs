@@ -6122,6 +6122,56 @@ fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordina
     assert_eq!(snapshot(&fixture), before, "nothing was written");
 }
 
+/// The success side of `required` (BundleIntegrity's witness): on a machine `[lock] platforms`
+/// lists, with every pin checked, every locked operation goes ahead, reaches mise with the lock,
+/// and leaves stack.lock as it was.
+#[test]
+fn every_locked_operation_runs_under_required_on_a_listed_platform_with_every_pin_checked() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[tasks.lint]\nrun='true'\n");
+    let platform = stack::artifacts::current_platform();
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(&platform).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\nartifacts='required'\n").unwrap();
+    let compiled = json_result(&fixture.ok(&["compile", "--json"]));
+    let jq = compiled["data"]["versions"].as_array().unwrap().iter().find(|v| v["name"] == "jq").unwrap().clone();
+    assert_eq!(jq["artifacts"][platform.as_str()]["state"], "verified", "{jq}");
+    let lock = fs::read(fixture.dir.path().join("app/stack.lock")).unwrap();
+
+    let calls = mise_log(&fixture).len();
+    for args in [
+        &["--json", "install"][..],
+        &["--json", "up"],
+        &["--json", "exec", "--", "touch", "ran"],
+        &["--json", "run", "lint"],
+        &["--json", "status"],
+        &["--json", "inspect"],
+        &["--json", "compile", "--locked"],
+    ] {
+        let result = json_result(&fixture.ok(args));
+        assert_eq!(result["ok"], true, "{args:?}: {result}");
+    }
+    assert!(fixture.dir.path().join("app/ran").exists(), "the command ran");
+    fs::remove_file(fixture.dir.path().join("app/ran")).unwrap();
+    let results = fixture.mcp(
+        &[
+            ("stack_install", json!({})),
+            ("stack_up", json!({})),
+            ("stack_exec", json!({ "command": ["touch", "ran"] })),
+            ("stack_run", json!({ "task": "lint" })),
+            ("stack_status", json!({})),
+            ("stack_inspect", json!({})),
+            ("stack_compile", json!({ "locked": true })),
+        ],
+        &[],
+    );
+    for (i, result) in results.iter().enumerate() {
+        assert_ne!(result["isError"], true, "{i}: {result}");
+    }
+    assert!(fixture.dir.path().join("app/ran").exists(), "the MCP command ran");
+    let log = &mise_log(&fixture)[calls..];
+    assert!(log.lines().any(|l| l.trim() == "install --locked --yes --quiet jq"), "mise installs with the lock:\n{log}");
+    assert_eq!(fs::read(fixture.dir.path().join("app/stack.lock")).unwrap(), lock, "no locked operation rewrites stack.lock");
+}
+
 #[test]
 fn a_mise_too_old_for_the_lock_fails_install_and_up_before_ports_identities_or_config_change() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[services.web]\nrun='true'\n");

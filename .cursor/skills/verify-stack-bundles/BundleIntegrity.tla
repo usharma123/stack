@@ -45,7 +45,9 @@ VARIABLES
     transport,   \* where the bundle comes from
     excl,        \* (OCI) the published layer holds a directory .git/.stack would fold to (.Git)
     cred,        \* operator credentials: "none", "bound" (to R), "elsewhere" (to Y), "unbound"
-    policy,      \* [lock] artifacts: "best", "requiredGap" (a pin unchecked), "requiredUnlisted"
+    policy,      \* [lock] artifacts: "best", "requiredCovered" (this machine listed and every pin
+                 \* checked), "requiredGap" (a pin unchecked), "requiredUnlisted" (this machine
+                 \* not listed)
     shape,       \* the bundle's tree holds a link or special file somewhere ("link") or not
     binNow,      \* its paths.bin entry as on disk now: plain, `..`, a link, or `.Stack/bin`
     upstream,    \* what the Git ref or OCI tag resolves to now (1 or 2)
@@ -68,22 +70,24 @@ VARIABLES
     uncovered,          \* history: under required, a locked operation reached mise, or a compile
                         \*          wrote, with a pin unchecked
     credsTo,            \* history: origins the operator's credentials were sent to
-    authCross           \* history: an Authorization header went to an origin it was not for
+    authCross,          \* history: an Authorization header went to an origin it was not for
+    requiredRan         \* witness: under required, a locked operation went ahead to mise
 
 vars == <<transport, excl, cred, policy, shape, binNow, upstream, localVer, lock, cache, c, talk,
           accepted, compiles, events, manifestUnhashed, unhashedAccepted, binOutside, notDigest,
           excludedAccepted, badNamed, lockedDrift, pinMoved, unlistedRan, uncovered, credsTo,
-          authCross>>
+          authCross, requiredRan>>
 static == <<transport, excl, cred, policy>>
 world == <<shape, binNow, upstream, localVer, lock, cache>>
 flags == <<manifestUnhashed, unhashedAccepted, binOutside, notDigest, excludedAccepted, badNamed,
-           lockedDrift, pinMoved, unlistedRan, uncovered, credsTo, authCross>>
+           lockedDrift, pinMoved, unlistedRan, uncovered, credsTo, authCross, requiredRan>>
+Required == policy # "best"
 
 Init ==
     /\ transport \in Transports
     /\ excl \in (IF transport = "oci" THEN {"none", "folded"} ELSE {"none"})
     /\ cred \in (IF transport = "oci" THEN {"none", "bound", "elsewhere", "unbound"} ELSE {"none"})
-    /\ policy \in {"best", "requiredGap", "requiredUnlisted"}
+    /\ policy \in {"best", "requiredCovered", "requiredGap", "requiredUnlisted"}
     /\ shape \in {"regular", "link"}
     \* As bundle.toml writes it; a link is a directory replaced after a hash saw the tree.
     /\ binNow \in {"plain", "dotdot", "folded"}
@@ -100,7 +104,7 @@ Init ==
     /\ manifestUnhashed = FALSE /\ unhashedAccepted = FALSE /\ binOutside = FALSE
     /\ notDigest = FALSE /\ excludedAccepted = FALSE /\ badNamed = FALSE /\ lockedDrift = FALSE
     /\ pinMoved = FALSE /\ unlistedRan = FALSE /\ uncovered = FALSE /\ credsTo = {}
-    /\ authCross = FALSE
+    /\ authCross = FALSE /\ requiredRan = FALSE
 
 Refuse == c' = Idle /\ talk' = NoTalk
 Oci == transport = "oci"
@@ -112,11 +116,12 @@ Oci == transport = "oci"
 \* any bundle fetch or provider call (974bdf4; before it only install and up refused). The pin
 \* is stack.lock's commit or digest in compile and locked mode, checked to be one (lock_invalid,
 \* 9a97f0e), and the upstream ref or tag resolved otherwise. Locked mode never resolves.
+\* (IgnoreLockPin, a design guard: compile and locked mode resolve the ref or tag as --update does.)
 Begin(mode) ==
     /\ c.step = "idle" /\ compiles > 0 /\ compiles' = compiles - 1
     /\ LET locked == mode = "locked"
            unlisted == locked /\ policy = "requiredUnlisted"
-           usesLock == mode # "update" /\ lock.on /\ transport # "local"
+           usesLock == mode # "update" /\ lock.on /\ transport # "local" /\ ~Fault("IgnoreLockPin")
            pin == IF transport = "local" THEN 0 ELSE IF usesLock THEN lock.pin ELSE upstream
        IN IF (locked /\ ~lock.on) \/ (unlisted /\ ~Fault("HostCheckOnlyInInstall"))
           THEN Refuse /\ UNCHANGED flags
@@ -126,7 +131,8 @@ Begin(mode) ==
                /\ badNamed' = (badNamed \/ Fault("UncheckedDigests"))
                /\ unlistedRan' = (unlistedRan \/ (unlisted /\ Fault("UncheckedDigests")))
                /\ UNCHANGED <<manifestUnhashed, unhashedAccepted, binOutside, notDigest,
-                              excludedAccepted, lockedDrift, pinMoved, uncovered, credsTo, authCross>>
+                              excludedAccepted, lockedDrift, pinMoved, uncovered, credsTo, authCross,
+                              requiredRan>>
           ELSE /\ c' = [Idle EXCEPT !.step = IF Oci THEN "registry" ELSE "fetch", !.mode = mode,
                                     !.pin = pin, !.lockOn = lock.on, !.lockPin = lock.pin,
                                     !.lockHash = lock.hash]
@@ -134,7 +140,7 @@ Begin(mode) ==
                /\ unlistedRan' = (unlistedRan \/ unlisted)
                /\ UNCHANGED <<manifestUnhashed, unhashedAccepted, binOutside, notDigest,
                               excludedAccepted, badNamed, lockedDrift, pinMoved, uncovered,
-                              credsTo, authCross>>
+                              credsTo, authCross, requiredRan>>
     /\ UNCHANGED <<static, world, accepted, events>>
 
 ---------------------------------------------------------------------------------------------
@@ -162,7 +168,7 @@ RegistryDone ==
     /\ c' = [c EXCEPT !.step = "fetch"]
     /\ UNCHANGED <<static, world, talk, accepted, compiles, events, manifestUnhashed,
                    unhashedAccepted, binOutside, notDigest, excludedAccepted, badNamed,
-                   lockedDrift, pinMoved, unlistedRan, uncovered, credsTo>>
+                   lockedDrift, pinMoved, unlistedRan, uncovered, credsTo, requiredRan>>
 
 \* A redirect (at most one here): the next request goes to the location, unchallenged.
 RegistryRedirect(to) ==
@@ -171,7 +177,7 @@ RegistryRedirect(to) ==
     /\ talk' = [talk EXCEPT !.at = to, !.challenged = FALSE, !.redirects = 1]
     /\ UNCHANGED <<static, world, c, accepted, compiles, events, manifestUnhashed,
                    unhashedAccepted, binOutside, notDigest, excludedAccepted, badNamed,
-                   lockedDrift, pinMoved, unlistedRan, uncovered, credsTo>>
+                   lockedDrift, pinMoved, unlistedRan, uncovered, credsTo, requiredRan>>
 
 \* CredentialEnv::grant for the registry origin R: the credentials when they are bound to R,
 \* anonymous when none are set or they are bound elsewhere, an error when they are set without a
@@ -208,7 +214,7 @@ RegistryChallenge(kind, tokenReply) ==
              ELSE Refuse
     /\ UNCHANGED <<static, world, accepted, compiles, events, manifestUnhashed, unhashedAccepted,
                    binOutside, notDigest, excludedAccepted, badNamed, lockedDrift, pinMoved,
-                   unlistedRan, uncovered>>
+                   unlistedRan, uncovered, requiredRan>>
 
 \* An error status, a second 401 on one target, a second redirect: the fetch fails.
 RegistryFails ==
@@ -268,7 +274,7 @@ Fetch(layerOk) ==
                   /\ UNCHANGED <<talk, badNamed>>
     /\ UNCHANGED <<static, shape, binNow, upstream, localVer, lock, accepted, compiles, events,
                    manifestUnhashed, unhashedAccepted, binOutside, notDigest, excludedAccepted,
-                   lockedDrift, pinMoved, unlistedRan, uncovered, credsTo, authCross>>
+                   lockedDrift, pinMoved, unlistedRan, uncovered, credsTo, authCross, requiredRan>>
 
 \* parse_bundle: from the bundle.toml bytes hash_keeping kept. Before 9a97f0e the file was read
 \* again from the tree (read_bundle), as it is by then.
@@ -300,14 +306,17 @@ Load ==
 \* compose (bin_dir again), then: locked, the pins must be the lock's it read (lock_outdated) and,
 \* under required, every pin checked (check_committed_artifacts) before the preflight or the
 \* command reaches mise; compile and --update, under required, unchecked pins fail before
-\* anything is written (unlocked_error), else stack.lock is written.
+\* anything is written (unlocked_error), else stack.lock is written. (NoSamePins, a design guard:
+\* locked mode skips same_pins. RefuseRequired, an over-refusal: every locked operation under
+\* required is refused, which keeps every safety invariant and loses only the witness.)
 Finish ==
     /\ c.step = "compose"
     /\ LET bin == IF Fault("NoComposeRecheck") THEN c.binAtLoad ELSE binNow
            locked == c.mode = "locked"
-           pinsChanged == c.pin # c.lockPin \/ c.hashed # c.lockHash \/ ~c.lockOn
+           pinsChanged == ~Fault("NoSamePins") /\ (c.pin # c.lockPin \/ c.hashed # c.lockHash \/ ~c.lockOn)
            gap == policy = "requiredGap"
        IN IF ~BinOk(bin) \/ (locked /\ pinsChanged) \/ (gap /\ ~(locked /\ Fault("CoverageOnlyInInstall")))
+             \/ (locked /\ Required /\ Fault("RefuseRequired"))
           THEN Refuse /\ UNCHANGED <<lock, accepted, flags>>
           ELSE /\ lock' = IF locked THEN lock ELSE [on |-> TRUE, pin |-> c.pin, hash |-> c.hashed]
                /\ accepted' = [on |-> TRUE, hash |-> c.hashed]
@@ -322,6 +331,7 @@ Finish ==
                /\ pinMoved' = (pinMoved \/ (c.mode # "update" /\ c.lockOn /\ transport # "local"
                                              /\ c.pin # c.lockPin))
                /\ uncovered' = (uncovered \/ gap)
+               /\ requiredRan' = (requiredRan \/ (locked /\ Required))
                /\ UNCHANGED <<badNamed, unlistedRan, credsTo, authCross>>
     /\ UNCHANGED <<static, shape, binNow, upstream, localVer, cache, compiles, events>>
 
@@ -415,6 +425,12 @@ CredentialsOnlyWhereBound == credsTo \subseteq (IF cred = "bound" THEN {"R", "A"
 
 \* Authorization goes only to the origin it was issued for, never across a redirect.
 AuthOnlyToItsOrigin == ~authCross
+
+\* Witness (WITNESS configs), not a promise: under required, some locked operation goes ahead to
+\* mise. WITNESS-RequiredLockedRuns must violate it, so a model that refused every locked
+\* operation under required, keeping RequiredMeansCovered and UnlistedHostRefusedFirst vacuously,
+\* fails the check; WITNESS-RefuseRequired shows that such a model would pass it.
+RequiredLockedNeverRuns == ~requiredRan
 
 \* NOT promised (LIMIT config): the bundle files a tool runs from are those the compile hashed.
 \* A local directory edited after a compile is read as it is then.
