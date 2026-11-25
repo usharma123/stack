@@ -422,3 +422,90 @@ test('the clean-machine smoke, interrupted while Stack runs, stops Stack\'s grou
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A fake Stack that passes every step of the smoke, with a TCP listener standing in for Postgres,
+// except that its first down behaves as FAULT says. Every call is appended to DIR/calls.
+function passingStack(dir, fault) {
+  const pinned = readFileSync('src/setup.rs', 'utf8').match(/^pub const MISE_VERSION: &str = "(.*)";$/m)[1];
+  writeFileSync(path.join(dir, 'listener.js'), `const fs = require('fs');
+const server = require('net').createServer(socket => socket.end()).listen(0, '127.0.0.1', () => {
+  fs.writeFileSync(process.argv[2] + '.new', String(server.address().port));
+  fs.renameSync(process.argv[2] + '.new', process.argv[2]);
+});
+`);
+  const ok = (data) => `echo '{"ok":true,"data":${data}}'`;
+  return `#!/usr/bin/env bash
+d=${dir}
+echo "$*" >>"$d/calls"
+mise="$HOME/.local/share/stack/bin/mise"
+stop_listener() {
+  local pid tries=0
+  pid=$(cat "$d/listener.pid")
+  kill -KILL "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done
+}
+first_down() { [ "$(grep -cx -- '--json down' "$d/calls")" -eq 1 ]; }
+case "$*" in
+  --version) echo 'stack fixture' ;;
+  '--json setup')
+    if [ -x "$mise" ]; then installed=false; else
+      installed=true; mkdir -p "\${mise%/*}"; printf '#!/bin/sh\\n' >"$mise"; chmod +x "$mise"
+    fi
+    printf '{"ok":true,"data":{"installed":%s,"first_on_path":true,"mise":"%s","version":"%s"}}\\n' "$installed" "$mise" '${pinned}' ;;
+  '--json doctor'|'--json compile --locked') ${ok('{}')} ;;
+  '--json compile') : >stack.lock; ${ok('{}')} ;;
+  '--json up --timeout 10m')
+    '${process.execPath}' "$d/listener.js" "$d/port" </dev/null >/dev/null 2>&1 &
+    echo $! >"$d/listener.pid"
+    until [ -s "$d/port" ]; do sleep 0.05; done
+    printf '{"ok":true,"data":{"checks":[{"service":"postgres","ready":true,"identity":"instance","pid":%s,"port":%s}]}}\\n' "$(cat "$d/listener.pid")" "$(cat "$d/port")" ;;
+  '--json exec --require postgres -- sh -c '*)
+    printf '{"ok":true,"data":{"exit_code":0,"stdout":"42\\\\npostgres://smoke@127.0.0.1:%s/smoke\\\\n"}}\\n' "$(cat "$d/port")" ;;
+  '--json exec -- sh -c command -v mise') printf '{"ok":true,"data":{"exit_code":0,"stdout":"%s\\\\n"}}\\n' "$mise" ;;
+  'run smoke') echo 42 ;;
+  '--json down')
+    fault=${fault}
+    first_down || fault=none
+    case "$fault" in
+      fails) echo '{"ok":false,"error":{"code":"provider"}}'; exit 1 ;;
+      unconfirmed) stop_listener; ${ok('{"confirmed":false}')} ;;
+      leaves-listener) ${ok('{"confirmed":true}')} ;;
+      *) stop_listener; ${ok('{"confirmed":true}')} ;;
+    esac ;;
+  '--json status')
+    if [ "${fault}" = healthy-status ]; then ${ok('{"session":{},"healthy":true}')}; else ${ok('{"session":null,"healthy":false}')}; fi ;;
+  *) echo "unexpected: $*" >&2; exit 64 ;;
+esac
+`;
+}
+
+const faults = { none: '', fails: 'fails', unconfirmed: 'is not confirmed', 'leaves-listener': 'leaves the service process and port',
+  'healthy-status': 'leaves status healthy' };
+for (const [fault, says] of Object.entries(faults)) {
+  test(`the clean-machine smoke ${fault === 'none' ? 'passes, with one down' : `runs its own down after a first down that ${says}`}`, () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-down-'));
+    let work;
+    try {
+      writeFileSync(path.join(dir, 'stack'), passingStack(dir, fault), { mode: 0o755 });
+      const result = spawnSync('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+        { encoding: 'utf8', env: { ...process.env, STACK_SMOKE_SECONDS: '20' }, timeout: 60000 });
+      work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+      const downs = readFileSync(path.join(dir, 'calls'), 'utf8').split('\n').filter(line => line === '--json down');
+      if (fault === 'none') {
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /clean-machine smoke passed/);
+        assert.equal(downs.length, 1);
+      } else {
+        assert.equal(result.status, 1, result.stderr);
+        assert.ok(work, result.stderr);
+        assert.match(result.stderr, /FAIL: /);
+        assert.equal(downs.length, 2, 'the smoke did not run its own down after the failed check');
+        assert.ok(existsSync(path.join(work, 'out', 'cleanup-down.out')));
+      }
+      assert.ok(!exists(Number(readFileSync(path.join(dir, 'listener.pid'), 'utf8'))), 'the listener survived');
+    } finally {
+      if (work) rmSync(work, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

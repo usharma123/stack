@@ -232,11 +232,12 @@ stack run run smoke || { cat "$out/run.out" "$out/run.err" >&2; fail "stack run 
 grep -qx 42 "$out/run.out" || { cat "$out/run.out" "$out/run.err" >&2; fail "stack run smoke did not print 42"; }
 
 step 'down stops everything'
+# Until every check below passes, the cleanup still runs its own down.
 ok down down
-up=false
 assert_json '.data.confirmed == true' down
 if kill -0 "$pid" 2>/dev/null; then fail "Postgres ($pid) survived down"; fi
 if accepting "$port"; then fail "port $port still accepts after down"; fi
 # Whether status exits zero with nothing running is not the question; what it reports is.
 stack status --json status || true
 assert_json '.data.session == null and .data.healthy == false' status
+up=false
