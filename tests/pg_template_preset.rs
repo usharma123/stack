@@ -22,7 +22,7 @@
 //! clone's, which the running server reports, and data written in one never seen in another.
 
 use std::ffi::OsString;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -94,9 +94,9 @@ fn stack_bin() -> PathBuf {
     std::env::var_os("STACK_TEST_BINARY").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_stack")))
 }
 
-/// Run the preset until it listens, call `listening` with its port, stop it with `SIGINT` (it is
+/// Run the preset until Postgres accepts queries, call `ready` with its port, stop it with `SIGINT` (it is
 /// the postmaster after its `exec`), and return what it logged.
-fn run_preset(bin: &Path, version: &str, data: &Path, templates: &Path, log: &Path, listening: impl FnOnce(u16)) -> String {
+fn run_preset(bin: &Path, version: &str, data: &Path, templates: &Path, log: &Path, ready: impl FnOnce(u16)) -> String {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let mut child = Command::new(stack_bin())
         .args(["__preset", "postgres", data.to_str().unwrap(), &port.to_string(), version, &format!("templates={}", templates.display())])
@@ -109,19 +109,26 @@ fn run_preset(bin: &Path, version: &str, data: &Path, templates: &Path, log: &Pa
         .spawn()
         .unwrap();
     let until = Instant::now() + Duration::from_secs(30);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+    // The postmaster binds its socket before startup finishes. A TCP handshake can succeed
+    // while a SQL connection still receives "the database system is starting up".
+    loop {
+        let bytes = std::fs::read(log).unwrap_or_default();
+        let output = String::from_utf8_lossy(&bytes);
         // Ended (and so reaped): nothing to signal.
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("the preset {version} exited ({status}) before it listened on {port}: {}", std::fs::read_to_string(log).unwrap_or_default());
+            panic!("the preset {version} exited ({status}) before it was ready on {port}: {output}");
+        }
+        if output.contains("database system is ready to accept connections") {
+            break;
         }
         if Instant::now() > until {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the preset {version} did not listen on {port} within 30s, stopped: {}", std::fs::read_to_string(log).unwrap_or_default());
+            panic!("the preset {version} was not ready on {port} within 30s, stopped: {output}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Stopped whatever `listening` asserts.
+    // Stopped whatever `ready` asserts.
     struct Stop(std::process::Child);
     impl Drop for Stop {
         fn drop(&mut self) {
@@ -131,7 +138,7 @@ fn run_preset(bin: &Path, version: &str, data: &Path, templates: &Path, log: &Pa
         }
     }
     let stop = Stop(child);
-    listening(port);
+    ready(port);
     drop(stop);
     std::fs::read_to_string(log).unwrap()
 }
