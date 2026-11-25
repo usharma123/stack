@@ -9,6 +9,7 @@ echo "$(cd "$self" && pwd -P)/${0##*/} $1 $2" >>"$REVIEW_FIXTURE/mise-self.log"
 # started it: `mise x` in stack's own session, or a request client in its killable group.
 supervise() {
   if test -f "$REVIEW_FIXTURE/supervisor-process" && ! kill -0 "$(cut -d' ' -f1 "$REVIEW_FIXTURE/supervisor-pid" 2>/dev/null)" 2>/dev/null; then
+    # shellcheck disable=SC2217 # Detached from the caller's input and output on purpose.
     sleep 60 </dev/null >/dev/null 2>&1 &
     echo "$! $1" >"$REVIEW_FIXTURE/supervisor-pid"
   fi
@@ -161,6 +162,7 @@ with open(os.path.join(sys.argv[1], "installed"), "a") as f:
     # Like mise, without the generated configuration (which enables experimental features)
     # there are no daemons to ask about.
     if test -n "${MISE_OVERRIDE_CONFIG_FILENAMES-}" && ! test -f "$MISE_OVERRIDE_CONFIG_FILENAMES"; then
+      # shellcheck disable=SC2016 # mise's message, backticks and all.
       echo 'mise ERROR mise daemons is experimental. Enable it with `mise settings experimental=true`' >&2; exit 1
     fi
     if test -f "$REVIEW_FIXTURE/fail-query-after-one" && test -f "$REVIEW_FIXTURE/started"; then

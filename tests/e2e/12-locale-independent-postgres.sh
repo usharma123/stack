@@ -17,7 +17,7 @@ TOML
 stack compile >/dev/null
 
 echo 'A first up under LC_ALL=C creates a UTF8 cluster with the C.UTF-8 locale'
-LC_ALL=C LANG= stack up --json >"$T/up-appL.json"
+LC_ALL=C LANG='' stack up --json >"$T/up-appL.json"
 assert_json '.ok and all(.data.checks[]; .ready) and (.data.warnings == null)' "$T/up-appL.json"
 settings=$(LC_ALL=C stack exec --require postgres -- sh -c 'psql "$DATABASE_URL" -Atc "show server_encoding" -c "select datcollate from pg_database where datname = current_database()"' | tr '\n' ' ')
 [[ "$settings" == "UTF8 C.UTF-8 " ]] || fail "cluster settings: $settings"
