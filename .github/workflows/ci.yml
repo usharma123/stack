@@ -12,9 +12,11 @@ jobs:
   validate:
     permissions:
       contents: read
-    uses: ./.github/workflows/validate.yml
+    # Self-repository syntax: validate.yml at this run's own commit (see .github/actionlint.yaml).
+    uses: $/.github/workflows/validate.yml
   required:
     name: CI passed
+    permissions: {}
     # Superseded runs are cancelled, not validation failures.
     if: ${{ always() && !cancelled() }}
     needs: validate

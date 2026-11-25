@@ -1242,6 +1242,189 @@ fn verified_endpoints_pass_through_and_are_poisoned_once_verification_fails() {
     assert_eq!(seen["STACK_UNVERIFIED"], "web");
 }
 
+/// `STACK_UNVERIFIED` names the services this plan withheld, never what the caller carried: a
+/// shell that loaded `stack env` while a service was unverified keeps the list it got, and once
+/// every service verifies, neither `exec` (CLI or MCP) nor a new `stack env` passes it on.
+#[test]
+fn a_callers_stale_unverified_list_never_reaches_a_command_once_every_service_verifies() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+    fixture.set_env(&[("WEB_URL", format!("http://127.0.0.1:{port}/"))]);
+    fixture.sleepers();
+    let caller = [("STACK_UNVERIFIED", "web")];
+
+    // Unverified: Stack's own list replaces the caller's.
+    let out = fixture.command(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]).envs(caller).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(printed(&String::from_utf8_lossy(&out.stdout))["STACK_UNVERIFIED"], "web");
+
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let out = fixture.command(&["exec", "--require", "web", "--", "sh", "-c", PRINT_ENDPOINTS]).envs(caller).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen = printed(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(seen["WEB_URL"], format!("http://127.0.0.1:{port}/"), "CLI exec");
+    assert_eq!(seen["STACK_UNVERIFIED"], "ABSENT", "CLI exec");
+
+    let results = fixture.mcp(&[("stack_exec", json!({ "command": ["sh", "-c", PRINT_ENDPOINTS], "require_all": true }))], &caller);
+    let data = &results[0]["structuredContent"]["data"];
+    assert_eq!(data["exit_code"], 0, "{data}");
+    assert_eq!(printed(data["stdout"].as_str().unwrap())["STACK_UNVERIFIED"], "ABSENT", "MCP exec");
+
+    // A shell evaluating `stack env` now drops the list it loaded before.
+    let env: Value = serde_json::from_slice(&fixture.command(&["env", "--json"]).envs(caller).output().unwrap().stdout).unwrap();
+    assert!(env["data"]["env"].get("STACK_UNVERIFIED").is_none(), "{env}");
+    assert!(env["data"]["unset"].as_array().unwrap().contains(&json!("STACK_UNVERIFIED")), "{env}");
+}
+
+/// A service whose live check passes is still withheld once the evidence of its launch is lost:
+/// a launch record still `launching`, a process other than the one recorded, a configuration
+/// changed since `up`. `status` then lists no endpoints and the reason, and exec (CLI or MCP)
+/// gets the unresolvable host, or is refused when it requires the service.
+#[test]
+fn a_verified_service_is_withheld_once_its_launch_evidence_is_lost() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[services.web]\nrun='true'\n");
+    let inspect: Value = serde_json::from_slice(&fixture.ok(&["inspect", "--json"]).stdout).unwrap();
+    let port = inspect["data"]["ports"]["web"].as_u64().unwrap();
+    let verified = format!("http://127.0.0.1:{port}/");
+    fixture.set_env(&[("WEB_URL", verified.clone())]);
+    fixture.sleepers();
+    let up = fixture.command(&["up", "--json"]).stdout(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixture.dir.path().join("started").exists() {
+        assert!(Instant::now() < deadline, "provider start never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _listener = std::net::TcpListener::bind(("127.0.0.1", port as u16)).unwrap();
+    let out = up.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let check = |when: &str, ready: bool, code: Option<&str>| {
+        let out = fixture.command(&["status", "--json"]).output().unwrap();
+        let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let web = &status["data"]["checks"][0];
+        assert_eq!(web["ready"], ready, "{when}: {status}");
+        assert_eq!(web["reason_code"].as_str(), code, "{when}: {status}");
+        assert_eq!(web.get("endpoints").is_some(), ready, "{when}: {status}");
+        let seen = printed(&String::from_utf8_lossy(&fixture.ok(&["exec", "--", "sh", "-c", PRINT_ENDPOINTS]).stdout));
+        let results = fixture.mcp(
+            &[
+                ("stack_exec", json!({ "command": ["sh", "-c", PRINT_ENDPOINTS] })),
+                ("stack_exec", json!({ "command": ["true"], "require": ["web"] })),
+            ],
+            &[],
+        );
+        let mcp = printed(results[0]["structuredContent"]["data"]["stdout"].as_str().unwrap());
+        if ready {
+            assert_eq!((seen["WEB_URL"].as_str(), seen["STACK_UNVERIFIED"].as_str()), (verified.as_str(), "ABSENT"), "{when}: CLI");
+            assert_eq!(mcp["WEB_URL"], verified, "{when}: MCP");
+            assert_eq!(results[1]["structuredContent"]["data"]["exit_code"], 0, "{when}: MCP --require");
+        } else {
+            let withheld = format!("http://unverified.stack.invalid:{port}/");
+            assert_eq!((seen["WEB_URL"].as_str(), seen["STACK_UNVERIFIED"].as_str()), (withheld.as_str(), "web"), "{when}: CLI");
+            assert_eq!(mcp["WEB_URL"], withheld, "{when}: MCP");
+            assert_eq!(results[1]["structuredContent"]["error"]["code"], "service_unavailable", "{when}: MCP --require");
+        }
+    };
+    check("as launched", true, None);
+
+    // Each record of the session (the machine index and the checkout's copy), rewritten.
+    let records: Vec<(std::path::PathBuf, Vec<u8>)> = fixture.session_paths().into_iter().map(|p| { let b = fs::read(&p).unwrap(); (p, b) }).collect();
+    let rewrite = |edit: &dyn Fn(&mut Value)| {
+        for (path, bytes) in &records {
+            let mut record: Value = serde_json::from_slice(bytes).unwrap();
+            edit(&mut record);
+            fs::write(path, record.to_string()).unwrap();
+        }
+    };
+    let restore = || records.iter().for_each(|(path, bytes)| fs::write(path, bytes).unwrap());
+
+    rewrite(&|r| r["launching"] = json!(true));
+    check("launching", false, Some("launch_incomplete"));
+    restore();
+    rewrite(&|r| {
+        let pid = r["services"]["web"]["pid"].as_u64().unwrap();
+        r["services"]["web"]["pid"] = json!(pid + 1);
+    });
+    check("another process", false, Some("process_changed"));
+    restore();
+    check("restored", true, None);
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
+    check("configuration changed", false, Some("config_changed"));
+}
+
+/// `up` over this configuration's verified launch writes no launch record (EndpointWithholding's
+/// partial launch): a service that died is started again while the record stays `launching:
+/// false` and names the process that died, so a failed `up` leaves the new process withheld
+/// (`process_changed`). The next `up` that verifies it records the process its check saw.
+#[test]
+fn an_up_that_restarts_a_dead_service_of_a_verified_launch_records_only_the_process_its_check_saw() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let recorded = |when: &str| {
+        let pids: Vec<(bool, u64)> = fixture
+            .session_paths()
+            .iter()
+            .map(|p| {
+                let record: Value = serde_json::from_slice(&fs::read(p).unwrap()).unwrap();
+                (record["launching"].as_bool().unwrap_or(false), record["services"]["web"]["pid"].as_u64().unwrap())
+            })
+            .collect();
+        assert!(pids.windows(2).all(|w| w[0] == w[1]), "{when}: {pids:?}");
+        pids[0]
+    };
+    let tracked = || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(pid) = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the service never recorded its pid");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let first = tracked();
+    assert_eq!(recorded("verified"), (false, first));
+
+    // The service dies, and the process the next `up` starts again listens only after its
+    // deadline: that `up` fails.
+    fs::remove_file(fixture.dir.path().join("pf-tracked-pid")).unwrap();
+    unsafe { libc::kill(first as i32, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(first as u32) {
+        assert!(Instant::now() < deadline, "the service never died");
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(fixture.dir.path().join("slow-start"), "4").unwrap();
+    let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(recorded("after the failed up"), (false, first), "no launch record, and the dead process still named");
+
+    // Serving now, the new process is still not the launch's: withheld.
+    let second = tracked();
+    assert_ne!(second, first);
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["checks"][0]["ready"], false, "{status}");
+    assert_eq!(status["data"]["checks"][0]["reason_code"], "process_changed", "{status}");
+
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(up["data"]["checks"][0]["pid"], second, "{up}");
+    assert_eq!(recorded("verified again"), (false, second), "the process the check saw");
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(status["data"]["checks"][0]["ready"], true, "{status}");
+    fixture.ok(&["down"]);
+}
+
 /// Counts connections to a TCP port and a Unix socket that a libpq client would use for it,
 /// closing each at once so the client fails fast.
 /// Each named variable's raw bytes as the command saw them, or `None` when unset.
@@ -1340,6 +1523,10 @@ fn non_unicode_caller_variables_are_inherited_raw_or_withheld_without_crashing()
             "CLI status: {status}"
         );
     }
+    // Nor is an unverified service's address shown to people.
+    let out = with_caller(&fixture, &["status"], &caller).output().unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(!human.contains("DATABASE_URL=") && !human.contains("port 0"), "CLI status: {human}");
 
     let results = fixture.mcp_with(
         with_caller(&fixture, &["mcp"], &caller),
@@ -1417,6 +1604,8 @@ fn libpq_never_reaches_a_listener_through_a_withheld_postgres_endpoint() {
         .map(|d| d.join("psql"))
         .find(|p| p.is_file())
     else {
+        // A check the formal verification lists: CI requires it to run.
+        assert!(std::env::var_os("STACK_REQUIRE_PSQL").is_none(), "STACK_REQUIRE_PSQL is set, but psql is not on PATH");
         eprintln!("skipping: psql is not on PATH");
         return;
     };
@@ -1883,6 +2072,14 @@ fn restart_replaces_only_the_named_service_and_keeps_the_session() {
     let logs = json_result(&fixture.ok(&["logs", "web", "--since-start", "--json"]));
     assert_eq!(logs["data"]["since_start"], true);
     assert_eq!(logs["data"]["lines"], json!(["new"]), "{logs}");
+
+    // People are shown the address commands get, as `--json` lists it, and nothing else of the
+    // service's environment (its token stays out).
+    let url = format!("WEB_URL=http://127.0.0.1:{port}");
+    for args in [&["up"][..], &["status"], &["restart", "web"]] {
+        let human = String::from_utf8(fixture.ok(args).stdout).unwrap();
+        assert!(human.contains(&url) && !human.contains("WEB_PORT=") && !human.contains("t0ps3cr3t"), "{args:?}: {human}");
+    }
 
     let out = fixture.command(&["restart", "nope", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "unknown_service");
@@ -4196,6 +4393,10 @@ fn run_hands_a_declared_task_to_mise_without_its_daemon_startup() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "greet|a b|it's|--flag|", "arguments arrive intact");
     let log = fs::read_to_string(fixture.dir.path().join("mise.log")).unwrap();
     assert!(log.contains("run --skip-deps --no-timings greet -- a b it's --flag"), "{log}");
+    // After the task's name every argument is the task's, even one stack would know; before it,
+    // stack's own options still apply.
+    let out = fixture.ok(&["run", "--timeout", "1m", "greet", "--timeout", "3", "--json", "--", "x"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "greet|--timeout|3|--json|--|x|", "forwarded");
 
     let out = fixture.command(&["--json", "run", "fail"]).output().unwrap();
     assert_eq!(out.status.code(), Some(3), "the task's exit code");
@@ -5986,6 +6187,56 @@ fn every_locked_operation_refuses_an_unlisted_platform_under_required_and_ordina
     assert_eq!(snapshot(&fixture), before, "nothing was written");
 }
 
+/// The success side of `required` (BundleIntegrity's witness): on a machine `[lock] platforms`
+/// lists, with every pin checked, every locked operation goes ahead, reaches mise with the lock,
+/// and leaves stack.lock as it was.
+#[test]
+fn every_locked_operation_runs_under_required_on_a_listed_platform_with_every_pin_checked() {
+    let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[tasks.lint]\nrun='true'\n");
+    let platform = stack::artifacts::current_platform();
+    fs::write(fixture.dir.path().join("mise-lock.toml"), tool_lock(&platform).split("[[tools.rust]]").next().unwrap()).unwrap();
+    fs::write(fixture.dir.path().join("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[lock]\nplatforms=['current']\nartifacts='required'\n").unwrap();
+    let compiled = json_result(&fixture.ok(&["compile", "--json"]));
+    let jq = compiled["data"]["versions"].as_array().unwrap().iter().find(|v| v["name"] == "jq").unwrap().clone();
+    assert_eq!(jq["artifacts"][platform.as_str()]["state"], "verified", "{jq}");
+    let lock = fs::read(fixture.dir.path().join("app/stack.lock")).unwrap();
+
+    let calls = mise_log(&fixture).len();
+    for args in [
+        &["--json", "install"][..],
+        &["--json", "up"],
+        &["--json", "exec", "--", "touch", "ran"],
+        &["--json", "run", "lint"],
+        &["--json", "status"],
+        &["--json", "inspect"],
+        &["--json", "compile", "--locked"],
+    ] {
+        let result = json_result(&fixture.ok(args));
+        assert_eq!(result["ok"], true, "{args:?}: {result}");
+    }
+    assert!(fixture.dir.path().join("app/ran").exists(), "the command ran");
+    fs::remove_file(fixture.dir.path().join("app/ran")).unwrap();
+    let results = fixture.mcp(
+        &[
+            ("stack_install", json!({})),
+            ("stack_up", json!({})),
+            ("stack_exec", json!({ "command": ["touch", "ran"] })),
+            ("stack_run", json!({ "task": "lint" })),
+            ("stack_status", json!({})),
+            ("stack_inspect", json!({})),
+            ("stack_compile", json!({ "locked": true })),
+        ],
+        &[],
+    );
+    for (i, result) in results.iter().enumerate() {
+        assert_ne!(result["isError"], true, "{i}: {result}");
+    }
+    assert!(fixture.dir.path().join("app/ran").exists(), "the MCP command ran");
+    let log = &mise_log(&fixture)[calls..];
+    assert!(log.lines().any(|l| l.trim() == "install --locked --yes --quiet jq"), "mise installs with the lock:\n{log}");
+    assert_eq!(fs::read(fixture.dir.path().join("app/stack.lock")).unwrap(), lock, "no locked operation rewrites stack.lock");
+}
+
 #[test]
 fn a_mise_too_old_for_the_lock_fails_install_and_up_before_ports_identities_or_config_change() {
     let fixture = Fixture::with_bundle("[bundle]\nname='test'\n[tools]\njq='1.7.1'\n[services.web]\nrun='true'\n");
@@ -6074,7 +6325,12 @@ fn ps_lists_every_checkout_without_a_lock_or_a_stack_toml() {
     let (port, data) = up_with_data(&fixture, &["--ttl", "30m"], 8192);
     // Another checkout, deleted while its session is still recorded.
     let gone = dir.canonicalize().unwrap().join("deleted");
-    let record = json!({ "id": "gone12345678", "project": gone, "lock_digest": "", "started_at": 1, "services": { "web": { "port": 1, "identity": "liveness", "verified_at": 1 } } });
+    // Recorded as `up` records it, with the directory and the mount it was on.
+    fs::create_dir(&gone).unwrap();
+    let (dev, ino) = stack::session::dir_id(&gone).unwrap();
+    let location = stack::checkout::location(&gone);
+    fs::remove_dir(&gone).unwrap();
+    let record = json!({ "id": "gone12345678", "project": gone, "lock_digest": "", "started_at": 1, "project_dir_id": [dev, ino], "project_location": location, "services": { "web": { "port": 1, "identity": "liveness", "verified_at": 1 } } });
     fs::write(dir.join(format!("state/sessions/{}.json", stack::state::project_key(&gone))), record.to_string()).unwrap();
 
     let ps = |args: &[&str]| -> Value {
@@ -6723,23 +6979,23 @@ fn a_snapshot_is_never_restored_under_a_server_a_dead_supervisor_left_running() 
     assert!(!pid_alive(server));
 }
 
-/// Council item 8: each preset service runs its own pinned release, of any major.
+/// Council item 8: a preset service runs its own pinned release, of any major, whatever release
+/// PATH offers first. (A stack has one Postgres service: a second is `invalid_service`.)
 #[test]
 fn each_preset_service_runs_its_own_pinned_release() {
-    for (a, b) in [("17.6", "18.1"), ("17.6", "17.11")] {
-        let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.pga]\npreset='postgres'\nversion='{a}'\n[services.pgb]\npreset='postgres'\nversion='{b}'\n"));
+    for (pinned, other) in [("18.1", "17.6"), ("17.6", "17.11")] {
+        let fixture = Fixture::with_bundle(&format!("[bundle]\nname='test'\n[services.pg]\npreset='postgres'\nversion='{pinned}'\n"));
         let bin = fixture.dir.path().join("bin");
         servers::install(&bin);
-        let (da, db) = (servers::postgres_release(fixture.dir.path(), &bin, a), servers::postgres_release(fixture.dir.path(), &bin, b));
-        let path = format!("{}:{}:{}:{}", da.display(), db.display(), bin.display(), std::env::var("PATH").unwrap());
+        let (dp, dother) = (servers::postgres_release(fixture.dir.path(), &bin, pinned), servers::postgres_release(fixture.dir.path(), &bin, other));
+        let path = format!("{}:{}:{}:{}", dother.display(), dp.display(), bin.display(), std::env::var("PATH").unwrap());
         fs::write(fixture.dir.path().join("env.json"), json!({ "PATH": path }).to_string()).unwrap();
-        // (Both share DATABASE_URL, so only one of them verifies as its instance.)
+        // Which release started is the question, not whether this fixture's environment
+        // lets it verify.
         let _ = fixture.command(&["up", "--timeout", "10s"]).output().unwrap();
-        for (service, version) in [("pga", a), ("pgb", b)] {
-            let port = assigned_port(&fixture, service);
-            let ran = fs::read_to_string(fixture.dir.path().join(format!("postgres-{port}.version"))).unwrap_or_default();
-            assert_eq!(ran.trim(), version, "{service} ran another release");
-        }
+        let port = assigned_port(&fixture, "pg");
+        let ran = fs::read_to_string(fixture.dir.path().join(format!("postgres-{port}.version"))).unwrap_or_default();
+        assert_eq!(ran.trim(), pinned, "ran {other}, which PATH lists first");
         fixture.ok(&["down"]);
     }
 }
@@ -7236,4 +7492,56 @@ fn clearing_a_tools_only_record_says_what_was_checked_and_never_signals_an_unsee
     assert!(text.contains(&format!("checked: {}", stack::session::TOOLS_ONLY_CHECKED)), "{text}");
     assert!(text.contains("a process whose environment cannot be read is not seen") && text.contains("the command registry, and their mark"), "{text}");
     assert!(!index.exists());
+}
+
+/// The one supervisor directory of the fixture's checkout.
+fn supervisor_dir(fixture: &Fixture) -> std::path::PathBuf {
+    fs::read_dir(fixture.dir.path().join("state/supervisors")).unwrap().next().unwrap().unwrap().path()
+}
+
+#[test]
+fn records_a_live_supervisor_of_an_older_stack_wrote_are_read_as_before() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let dir = supervisor_dir(&fixture);
+    for file in ["spec.json", "state.json"] {
+        let record: Value = serde_json::from_slice(&fs::read(dir.join(file)).unwrap()).unwrap();
+        assert_eq!(record["schema_version"], 1, "{file}: {record}");
+    }
+    // The running supervisor's state as one of Stack 0.1.24 writes it: no schema_version (it
+    // rewrites the file only when something changes).
+    let mut state: Value = serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
+    state.as_object_mut().unwrap().remove("schema_version");
+    fs::write(dir.join("state.json"), state.to_string()).unwrap();
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(status["data"]["healthy"], true, "{status}");
+    fixture.ok(&["restart", "web"]);
+    fixture.ok(&["down"]);
+}
+
+#[test]
+fn a_supervisor_record_of_a_newer_stack_is_refused_and_left_as_it_is() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let state_file = supervisor_dir(&fixture).join("state.json");
+    let written = fs::read(&state_file).unwrap();
+    let mut newer: Value = serde_json::from_slice(&written).unwrap();
+    newer["schema_version"] = json!(99);
+    let newer = newer.to_string();
+    fs::write(&state_file, &newer).unwrap();
+    for args in [&["down", "--json"][..], &["up", "--json"], &["restart", "web", "--json"]] {
+        let out = fixture.command(args).output().unwrap();
+        let result = json_result(&out);
+        assert_eq!(result["error"]["code"], "state_invalid", "{args:?}: {result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("written by a newer Stack (schema_version 99"), "{args:?}: {result}");
+        assert_ne!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), newer, "{args:?}: the record was written over");
+    }
+    let human = fixture.command(&["down"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&human.stderr).contains("newer Stack"), "{}", String::from_utf8_lossy(&human.stderr));
+    // As the release that wrote it would leave it again: stopping works.
+    fs::write(&state_file, &written).unwrap();
+    fixture.ok(&["down"]);
 }

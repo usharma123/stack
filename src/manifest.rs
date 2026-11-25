@@ -113,6 +113,13 @@ impl IdentityProbe {
     }
 }
 
+/// Whether `name` can name a service: one component of a path, as its log file and its data
+/// directory are named after it (not empty, `.` or `..`, and without `/` or NUL). Every other
+/// name a TOML key can hold is one.
+pub fn valid_service_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\0'])
+}
+
 /// The variable through which a service learns its instance token.
 pub fn identity_var(service: &str) -> String {
     format!(
@@ -130,7 +137,9 @@ pub struct Task {
     pub run: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Services that must be running and ready before the task starts.
+    /// Services the task uses, checked to name services the stack defines (`unknown_service`
+    /// otherwise). Not a narrower requirement: `stack run` waits for every service to verify,
+    /// whatever this lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
     /// Names of fnox secrets the task is granted (never values). Resolved by stack when the
@@ -244,6 +253,10 @@ impl Service {
     }
 
     pub fn validate(&self, name: &str, origin: &str) -> Result<()> {
+        if !valid_service_name(name) {
+            return Err(StackError::new("invalid_service", format!("service {name:?} in {origin}: a service name is one path component"))
+                .hint("name it without `/` or NUL, and not `.` or `..`: its log file and data directory are named after it"));
+        }
         if self.init_only() {
             return Ok(());
         }
@@ -325,8 +338,27 @@ pub fn read_project(root: &Path) -> Result<ProjectManifest> {
     Ok(project)
 }
 
+/// The manifest of the bundle at `dir`, parsed from `bytes`: the very bytes of its
+/// [`BUNDLE_FILE`] the bundle's content hash covered (see [`crate::hash::hash_keeping`]), `None`
+/// when the tree hashed had none. So the manifest a compile uses is the one stack.lock pins,
+/// even if the file changes while it runs.
+pub fn parse_bundle(bytes: Option<&[u8]>, dir: &Path, source: &str) -> Result<BundleManifest> {
+    let path = dir.join(BUNDLE_FILE);
+    let bytes = bytes.ok_or_else(|| StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: it is not in the bundle")))?;
+    let text = std::str::from_utf8(bytes).map_err(|e| StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: {e}")))?;
+    parse(text).map_err(|e| e.into_error("bundle_invalid", &path, Some(source)))
+}
+
 pub fn read_bundle(dir: &Path, source: &str) -> Result<BundleManifest> {
     let path = dir.join(BUNDLE_FILE);
+    // Read only as the regular file the content hash covers, never through a link.
+    if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file()) {
+        return Err(StackError::new(
+            "bundle_invalid",
+            format!("{source}: {BUNDLE_FILE} is not a regular file; bundles contain only regular files and directories"),
+        )
+        .hint(format!("replace {BUNDLE_FILE} with a regular file, then retry")));
+    }
     let text = fs::read_to_string(&path).map_err(|e| {
         StackError::new("bundle_invalid", format!("{source} has no readable {BUNDLE_FILE}: {e}"))
     })?;
@@ -517,6 +549,25 @@ mod tests {
     }
 
     #[test]
+    fn a_service_name_is_one_path_component() {
+        let service: Service = toml::from_str("run = 'serve'").unwrap();
+        // Dots, dashes, spaces, case and other scripts name services as before.
+        for name in ["web", "api.v2", "db.http", "My Service", "w_1-2", "...", ".hidden", "サービス"] {
+            assert!(valid_service_name(name), "{name}");
+            service.validate(name, "project").unwrap();
+        }
+        for name in ["", ".", "..", "a/b", "../other", "/abs", "nul\0"] {
+            assert!(!valid_service_name(name), "{name:?}");
+            for origin in ["project", "bundle:pybase", "[override.services]"] {
+                assert_eq!(service.validate(name, origin).unwrap_err().code, "invalid_service", "{name:?}");
+            }
+        }
+        // An init-only table names a service too.
+        let init: Service = toml::from_str("init = ['true']").unwrap();
+        assert_eq!(init.validate("../x", "project").unwrap_err().code, "invalid_service");
+    }
+
+    #[test]
     fn service_versions_and_presets_with_template_syntax_are_refused() {
         let service = |text: &str| -> Service { toml::from_str(text).unwrap() };
         for (field, text) in [
@@ -575,6 +626,21 @@ mod tests {
         let bundle = tempfile::tempdir().unwrap();
         fs::write(bundle.path().join(BUNDLE_FILE), "[bundle]\nname = 'b'\n[session]\ndefault_ttl = '30m'\n").unwrap();
         assert_eq!(read_bundle(bundle.path(), "path:../b").unwrap_err().code, "bundle_invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_toml_is_read_only_as_a_regular_file() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("elsewhere.toml"), "[bundle]\nname = 'b'\n").unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("elsewhere.toml"), bundle.path().join(BUNDLE_FILE)).unwrap();
+        let e = read_bundle(bundle.path(), "path:../b").unwrap_err();
+        assert_eq!(e.code, "bundle_invalid");
+        assert!(e.message.contains("not a regular file"), "{}", e.message);
+        fs::remove_file(bundle.path().join(BUNDLE_FILE)).unwrap();
+        fs::write(bundle.path().join(BUNDLE_FILE), "[bundle]\nname = 'b'\n").unwrap();
+        assert_eq!(read_bundle(bundle.path(), "path:../b").unwrap().bundle.name, "b");
     }
 
     #[test]

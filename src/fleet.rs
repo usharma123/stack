@@ -47,7 +47,9 @@ pub struct PsReport {
 pub struct Checkout {
     pub path: PathBuf,
     pub dir_exists: bool,
-    /// `present`, `missing`, or `replaced` (another directory now has this path).
+    /// `present`, `missing`, `replaced` (another directory now has this path), or
+    /// `unavailable` (whether it is still there cannot be shown: a lookup refused or failing, or
+    /// its volume may not be mounted).
     pub dir: &'static str,
     /// `running` (every service live), `partial`, `stopped`, `launching`, `recorded` (a session
     /// without services), `reserved` (ports, tokens or data recorded, no session),
@@ -202,12 +204,29 @@ impl Records {
         paths
     }
 
-    /// `present`, `missing`, or `replaced`, as `ps` reports a checkout's directory.
+    /// `present`, `missing`, `replaced`, or `unavailable` (whether it is still there cannot be
+    /// shown: see [`crate::checkout::presence`]), as `ps` reports a checkout's directory.
     fn dir(&self, path: &Path) -> &'static str {
         let recorded: Vec<&datadirs::Entry> = self.data.iter().filter(|e| e.project == path).collect();
-        match (path.exists(), self.sessions.get(path)) {
+        if let Some(s) = self.sessions.get(path) {
+            return match session::checkout_state(s) {
+                session::CheckoutState::Present => "present",
+                session::CheckoutState::Gone("project directory deleted") => "missing",
+                session::CheckoutState::Gone(_) => "replaced",
+                session::CheckoutState::Unavailable(_) => "unavailable",
+            };
+        }
+        // The fullest record kept: one with a location, else one with a device.
+        let mut kept: Vec<&crate::checkout::Recorded> = self.reservations.iter().filter(|r| r.project == path).map(|r| &r.project_at).chain(recorded.iter().map(|e| &e.project_at)).collect();
+        kept.sort_by_key(|at| (at.location.is_none(), at.device.is_none()));
+        let at = kept.first().copied().cloned().unwrap_or_default();
+        let present = match crate::checkout::presence(path, &at) {
+            crate::checkout::Presence::Present => true,
+            crate::checkout::Presence::Absent => false,
+            crate::checkout::Presence::Unknown(_) => return "unavailable",
+        };
+        match (present, self.sessions.get(path)) {
             (false, _) => "missing",
-            (true, Some(s)) if session::checkout_gone(s).is_some() => "replaced",
             // Only data recorded for a checkout token the directory there now does not have.
             (true, None) if !recorded.is_empty() && {
                 let here = crate::checkout::token(path);
@@ -298,8 +317,9 @@ impl Records {
             lease: session.map(|s| LeaseSummary::of(s.lease.as_ref())),
             services,
             identity_tokens: self.tokens.iter().filter(|(p, _)| *p == path).count(),
-            // As `gc` decides: a missing directory with no session left (an unreadable one is left).
-            reclaimable: !dir_exists && session.is_none() && unreadable_record.is_none(),
+            // As `gc` decides: a directory shown to be gone with no session left (an unreadable
+            // one is left, and so is one whose presence cannot be shown).
+            reclaimable: dir == "missing" && session.is_none() && unreadable_record.is_none(),
             unreadable: unreadable_record,
             project_id,
             branch: head.branch,
@@ -1084,6 +1104,7 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
                     supervisor: entry.supervisor.clone(),
                     location,
                     identity,
+                    project_at: crate::checkout::Recorded::of(&new),
                 },
             )?;
         }
@@ -1110,6 +1131,7 @@ pub fn mv(state: &Path, base: &Path, old: &Path, new: &Path) -> Result<MvReport>
         session.project = new.clone();
         session.project_dir_id = session::dir_id(&new);
         session.project_dir_created = session::dir_created(&new);
+        session.project_location = crate::checkout::location(&new);
         for (entry, to) in &done {
             if let Some(record) = session.services.get_mut(&entry.service) {
                 record.data_dir = Some(to.to_string_lossy().into_owned());

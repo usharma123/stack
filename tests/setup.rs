@@ -40,6 +40,7 @@ fn a_mise_the_user_installed_takes_precedence() {
     fake_mise(user.path());
     let out = stack(data.path(), &format!("{}:/usr/bin:/bin", user.path().display()), &["setup", "--json"]);
     assert_eq!(out["data"]["mise"], user.path().join("mise").to_str().unwrap(), "{out}");
+    assert_eq!(out["data"]["first_on_path"], false, "{out}");
 }
 
 #[test]
@@ -50,4 +51,28 @@ fn a_missing_mise_points_to_setup() {
     let mise = checks.iter().find(|c| c["name"] == "mise").unwrap();
     assert_eq!(mise["ok"], false, "{out}");
     assert!(mise["hint"].as_str().unwrap().contains("stack setup"), "{out}");
+}
+
+#[test]
+fn a_mise_setup_installed_wins_over_a_broken_one_on_path() {
+    let data = tempfile::tempdir().unwrap();
+    let system = tempfile::tempdir().unwrap();
+    fake_mise(&data.path().join("bin"));
+    // What `stack setup` leaves beside a mise it installed (with --force, or in place of a mise
+    // that did not run).
+    fs::write(data.path().join("bin/mise.first"), "").unwrap();
+    let broken = system.path().join("mise");
+    fs::write(&broken, "#!/bin/sh\necho 'broken' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", system.path().display());
+    let out = stack(data.path(), &path, &["setup", "--json"]);
+    assert_eq!(out["data"]["mise"], data.path().join("bin/mise").to_str().unwrap(), "{out}");
+    assert_eq!((out["data"]["installed"].clone(), out["data"]["first_on_path"].clone()), (Value::Bool(false), Value::Bool(true)), "{out}");
+    // Doctor, and every command Stack runs, find the same one.
+    let out = stack(data.path(), &path, &["doctor", "--json"]);
+    let checks = out["data"].as_array().or(out["error"]["details"].as_array()).unwrap();
+    let mise = checks.iter().find(|c| c["name"] == "mise").unwrap();
+    assert_eq!(mise["ok"], true, "{out}");
+    assert!(mise["detail"].as_str().unwrap().contains("fake"), "{out}");
+    assert!(checks.iter().all(|c| c["name"] != "mise_daemons"), "services do not run through mise daemons: {out}");
 }

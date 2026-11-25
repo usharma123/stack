@@ -3,10 +3,20 @@
 //! A bundle is one deterministic tar.gz layer in an OCI artifact manifest. Projects pin the
 //! manifest digest in stack.lock, the same way git sources pin a commit.
 //!
-//! Credentials, when a registry needs them: `STACK_OCI_USERNAME` and `STACK_OCI_PASSWORD`.
+//! Credentials, when a registry needs them: `STACK_OCI_USERNAME` and `STACK_OCI_PASSWORD`, bound
+//! to the one registry origin named by `STACK_OCI_REGISTRY` (scheme, host and effective port,
+//! e.g. `https://ghcr.io`). They are offered only when that exact origin challenges, and only to
+//! it or to a token service it names that is its own origin or approved in
+//! `STACK_OCI_AUTH_REALMS`. A reference, redirect or challenge can never widen that scope: every
+//! other registry is reached anonymously. Credentials set without a valid binding fail closed.
 //! Plain HTTP is used for loopback registries (`localhost`, `127.0.0.0/8`, `::1`). Elsewhere it
 //! requires exactly `STACK_OCI_PLAIN_HTTP=1`; any other value, including `0`, `false` or empty,
 //! keeps HTTPS. An HTTPS registry can never be downgraded to HTTP.
+//!
+//! Every digest is checked to be one (`sha256:` and 64 lowercase hex digits, see [`digest`])
+//! before it names a cache path or a registry request: a reference's, one stack.lock records,
+//! and a manifest's layer. A cached bundle is reused only with evidence tying it to the manifest
+//! asked for (see [`Client::pull`] and `source::fetch_oci`).
 
 use crate::error::{io_error, Result, StackError};
 use crate::hash::{is_executable, list_files, sha256_hex};
@@ -89,6 +99,21 @@ impl Reference {
         if repository.is_empty() || reference.is_empty() {
             return Err(invalid());
         }
+        // The registry is a host and an optional port: nothing that could add userinfo, a path,
+        // a query or a fragment to the URLs built from it.
+        if !registry.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')) {
+            return Err(invalid());
+        }
+        if !repository.split('/').all(path_component) {
+            return Err(StackError::new("source_invalid", format!("invalid OCI reference '{s}': the repository is not a registry repository name"))
+                .hint("repository names are lowercase letters and digits, separated by '.', '_', '__' or '-', in '/'-separated parts"));
+        }
+        if rest.contains('@') {
+            digest(reference, "source_invalid", &format!("the digest of OCI reference '{s}'"))?;
+        } else if !tag(reference) {
+            return Err(StackError::new("source_invalid", format!("invalid OCI reference '{s}': the tag is not a registry tag"))
+                .hint("tags are letters, digits, '_', '.' and '-', at most 128, not starting with '.' or '-'"));
+        }
         Ok(Self {
             registry: registry.into(),
             repository: repository.into(),
@@ -110,6 +135,57 @@ impl Reference {
             self.repository
         )
     }
+}
+
+/// Whether `value` is a SHA-256 digest as registries and stack.lock write it: `sha256:` and 64
+/// lowercase hex digits. Nothing else may name a cache directory or a registry path: `..`, `/`,
+/// `?` or `#` in one would reach another path or another request.
+pub fn is_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// `value`, checked to be a digest (see [`is_digest`]); `code` and `what` (where it came from)
+/// make the error otherwise, which shows at most a bounded, escaped part of the value.
+pub fn digest(value: &str, code: &'static str, what: &str) -> Result<()> {
+    if is_digest(value) {
+        return Ok(());
+    }
+    let shown: String = value.chars().take(80).collect();
+    Err(StackError::new(code, format!("{what} is not a sha256 digest: \"{}\"", shown.escape_debug()))
+        .hint("a digest is sha256: followed by 64 lowercase hex digits"))
+}
+
+/// One `/`-separated part of a repository name, as the OCI distribution spec has it.
+fn path_component(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if bytes.is_empty() || !alnum(&bytes[0]) || !alnum(&bytes[bytes.len() - 1]) {
+        return false;
+    }
+    // Separators: '.', '_', '__' or any run of '-', always between letters or digits.
+    let mut i = 0;
+    while i < bytes.len() {
+        if alnum(&bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let run = bytes[i..].iter().take_while(|b| !alnum(b)).count();
+        let sep = &part[i..i + run];
+        if !(sep == "." || sep == "_" || sep == "__" || sep.bytes().all(|b| b == b'-')) {
+            return false;
+        }
+        i += run;
+    }
+    true
+}
+
+/// Whether `value` is a tag as the OCI distribution spec has it.
+fn tag(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 pub struct Client {
@@ -217,11 +293,88 @@ impl Drop for LookupSlot {
     }
 }
 
-fn creds() -> Option<(String, String)> {
-    Some((
-        std::env::var("STACK_OCI_USERNAME").ok()?,
-        std::env::var("STACK_OCI_PASSWORD").ok()?,
-    ))
+/// The operator's registry credentials and the origin they are bound to, as configured in the
+/// environment. Read when a registry challenges, never from a manifest or a server response.
+#[derive(Debug, Default, Clone)]
+struct CredentialEnv {
+    username: Option<String>,
+    password: Option<String>,
+    /// `STACK_OCI_REGISTRY`, as written.
+    registry: Option<String>,
+}
+
+/// What a challenged registry origin may be given.
+#[derive(Debug, PartialEq)]
+enum Grant {
+    /// No credentials are configured: requests stay anonymous.
+    Anonymous,
+    /// The origin is the configured one.
+    Credentials(String, String),
+    /// Credentials are configured for another origin (named here); requests stay anonymous.
+    Elsewhere(String),
+}
+
+impl CredentialEnv {
+    fn from_env() -> Self {
+        let var = |k: &str| std::env::var(k).ok();
+        Self {
+            username: var("STACK_OCI_USERNAME"),
+            password: var("STACK_OCI_PASSWORD"),
+            registry: var("STACK_OCI_REGISTRY"),
+        }
+    }
+
+    /// Whether `origin` (already serialized by [`Url::origin`]) may receive the credentials.
+    /// Credentials that are incomplete, unbound or bound to something that is not an origin
+    /// are an error rather than sent anywhere.
+    fn grant(&self, origin: &str) -> Result<Grant> {
+        let unbound = |message: String| {
+            StackError::new("oci_credentials_unbound", message).hint(format!(
+                "set STACK_OCI_REGISTRY to the registry origin the credentials belong to (this request was for {origin}), or unset STACK_OCI_USERNAME and STACK_OCI_PASSWORD"
+            ))
+        };
+        let (username, password) = match (&self.username, &self.password) {
+            (None, None) => return Ok(Grant::Anonymous),
+            (Some(u), Some(p)) => (u, p),
+            (Some(_), None) => return Err(unbound("STACK_OCI_USERNAME is set without STACK_OCI_PASSWORD; Stack sent no credentials".into())),
+            (None, Some(_)) => return Err(unbound("STACK_OCI_PASSWORD is set without STACK_OCI_USERNAME; Stack sent no credentials".into())),
+        };
+        let configured = match self.registry.as_deref().map(str::trim) {
+            None | Some("") => {
+                return Err(unbound(format!(
+                    "registry {origin} asked for authentication, but STACK_OCI_USERNAME and STACK_OCI_PASSWORD are not bound to a registry origin; Stack sent no credentials"
+                )))
+            }
+            // Not echoed: a malformed value may hold userinfo.
+            Some(value) => registry_origin(value).ok_or_else(|| {
+                unbound(
+                    "STACK_OCI_REGISTRY is not a registry origin (scheme://host[:port], no path, query or userinfo); Stack sent no credentials".into(),
+                )
+            })?,
+        };
+        Ok(if configured == origin {
+            Grant::Credentials(username.clone(), password.clone())
+        } else {
+            Grant::Elsewhere(configured)
+        })
+    }
+}
+
+/// `value` as an origin, if it is exactly one: HTTP(S), a host, an optional port and nothing
+/// else (a lone trailing `/` is allowed). Default ports are dropped and the host lower-cased, so
+/// `https://GHCR.io:443` and `https://ghcr.io` are the same origin.
+fn registry_origin(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    let bare = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        // `Url` accepts `https:host`; an origin is written with `//`.
+        && value.split_once("://").is_some();
+    bare.then(|| url.origin().ascii_serialization())
 }
 
 fn basic(user: &str, pass: &str) -> String {
@@ -257,7 +410,35 @@ fn bounded(req: ureq::Request) -> Result<ureq::Request> {
     Ok(req.timeout(crate::process::bounded(REQUEST_TIMEOUT)))
 }
 
-fn oci_err(context: &str, e: ureq::Error) -> StackError {
+/// A failed request to a token service at `realm`, said by its origin alone: the realm (its
+/// path and query) comes from the registry's challenge and is never echoed, nor the service's
+/// reply.
+fn auth_err(realm: &Url, registry: &str, e: ureq::Error) -> StackError {
+    let at = realm.origin().ascii_serialization();
+    match e {
+        ureq::Error::Status(code, _) => {
+            let mut err = StackError::new(
+                if code == 401 || code == 403 { "oci_unauthorized" } else { "oci_failed" },
+                format!("authenticate at the token service {at}: HTTP {code}"),
+            );
+            if code == 401 || code == 403 {
+                err = err.hint(format!(
+                    "if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}; credentials are sent only to that origin"
+                ));
+            }
+            err
+        }
+        // Its kind and the underlying I/O error (a lookup or connection naming the host and
+        // port at most), never the URL ureq attaches.
+        ureq::Error::Transport(t) => {
+            let cause = std::error::Error::source(&t).map(|c| format!(" ({c})")).unwrap_or_default();
+            StackError::new("oci_unreachable", format!("authenticate at the token service {at}: {}{cause}", t.kind()))
+        }
+    }
+}
+
+/// `registry` is the origin whose credentials would apply, named in the hint for 401 and 403.
+fn oci_err(context: &str, registry: &str, e: ureq::Error) -> StackError {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
@@ -276,7 +457,9 @@ fn oci_err(context: &str, e: ureq::Error) -> StackError {
                 ),
             );
             if code == 401 || code == 403 {
-                err = err.hint("set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry");
+                err = err.hint(format!(
+                    "if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}; credentials are sent only to that origin"
+                ));
             }
             err
         }
@@ -325,7 +508,7 @@ impl Client {
                     challenged = true;
                     continue;
                 }
-                Err(e) => return Err(oci_err(&format!("{method} {}", target.as_str()), e)),
+                Err(e) => return Err(oci_err(&format!("{method} {}", target.as_str()), &registry, e)),
                 Ok(resp) => resp,
             };
             if [301, 302, 303, 307, 308].contains(&resp.status()) {
@@ -346,7 +529,14 @@ impl Client {
         }
     }
 
+    /// Answer `challenge` from `challenged`, which must be the request's own registry origin.
+    /// Credentials go only to the origin the operator bound them to (see [`CredentialEnv`]),
+    /// and through it only to its own or an approved token service.
     fn authenticate(&self, challenge: &str, challenged: &Url, registry: &str) -> Result<()> {
+        self.authenticate_with(challenge, challenged, registry, &CredentialEnv::from_env())
+    }
+
+    fn authenticate_with(&self, challenge: &str, challenged: &Url, registry: &str, credentials: &CredentialEnv) -> Result<()> {
         let target_origin = challenged.origin().ascii_serialization();
         if target_origin != registry {
             return Err(StackError::new(
@@ -369,22 +559,23 @@ impl Client {
                 &realm,
                 registry,
                 &std::env::var("STACK_OCI_AUTH_REALMS").unwrap_or_default(),
-            );
+            )?;
             if !trusted {
                 return Err(StackError::new("oci_auth_untrusted", format!("token origin {} is not approved", realm.origin().ascii_serialization()))
                     .hint("approve the registry's token service origin in STACK_OCI_AUTH_REALMS (comma-separated origins)"));
             }
+            let grant = credentials.grant(registry)?;
             let mut req = bounded(self.agent.get(realm.as_str()))?;
             for k in ["service", "scope"] {
                 if let Some(v) = field(k) {
                     req = req.query(k, &v);
                 }
             }
-            if let Some((u, p)) = creds() {
-                req = req.set("Authorization", &basic(&u, &p));
+            if let Grant::Credentials(u, p) = &grant {
+                req = req.set("Authorization", &basic(u, p));
             }
             // Auth requests never follow redirects, even to another approved origin.
-            let resp = req.call().map_err(|e| oci_err("authenticate", e))?;
+            let resp = req.call().map_err(|e| auth_err(&realm, registry, e))?;
             if resp.status() != 200 {
                 return Err(StackError::new(
                     "oci_auth_untrusted",
@@ -402,12 +593,19 @@ impl Client {
             *self.token.borrow_mut() = Some((target_origin, format!("Bearer {token}")));
             Ok(())
         } else if challenge.starts_with("Basic") {
-            let (u, p) = creds().ok_or_else(|| {
-                StackError::new("oci_unauthorized", "registry requires credentials")
-                    .hint("set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry")
-            })?;
-            *self.token.borrow_mut() = Some((target_origin, basic(&u, &p)));
-            Ok(())
+            match credentials.grant(registry)? {
+                Grant::Credentials(u, p) => {
+                    *self.token.borrow_mut() = Some((target_origin, basic(&u, &p)));
+                    Ok(())
+                }
+                Grant::Anonymous => Err(StackError::new("oci_unauthorized", format!("registry {registry} requires credentials"))
+                    .hint(format!("if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}"))),
+                Grant::Elsewhere(configured) => Err(StackError::new(
+                    "oci_unauthorized",
+                    format!("registry {registry} requires credentials; STACK_OCI_USERNAME and STACK_OCI_PASSWORD are bound to {configured}, so Stack sent none"),
+                )
+                .hint(format!("credentials are sent only to STACK_OCI_REGISTRY; if you trust {registry}, use credentials for it with STACK_OCI_REGISTRY={registry}"))),
+            }
         } else {
             Err(StackError::new(
                 "oci_unauthorized",
@@ -431,6 +629,7 @@ impl Client {
     /// Resolve a tag (or pass through a digest) to the manifest digest.
     pub fn resolve(&self, r: &Reference) -> Result<String> {
         if r.reference.starts_with("sha256:") {
+            digest(&r.reference, "source_invalid", "the reference's digest")?;
             return Ok(r.reference.clone());
         }
         let url = format!("{}/manifests/{}", r.base(), r.reference);
@@ -440,33 +639,78 @@ impl Client {
     }
 
     /// Download the bundle at `digest` and install it at `dest`, which may be shared by other
-    /// projects and processes. See [`install`].
-    pub fn pull(&self, r: &Reference, digest: &str, dest: &Path) -> Result<()> {
+    /// projects and processes, with the evidence that ties it to `digest` (see [`install`] and
+    /// [`Evidence`]). A `dest` already there is left as it is: whether it may be reused is the
+    /// caller's to decide (see [`Evidence::matches`] and [`Client::verify_cached`]).
+    pub fn pull(&self, r: &Reference, manifest: &str, dest: &Path) -> Result<()> {
+        digest(manifest, "oci_failed", "the manifest digest to pull")?;
         if dest.exists() {
             return Ok(());
         }
-        let url = format!("{}/manifests/{digest}", r.base());
+        let (layer, blob) = self.layer(r, manifest)?;
+        install_with(&blob, dest, EXTRACT_LIMITS, |staged| {
+            let content_hash = crate::hash::hash_dir(staged)?;
+            Evidence { manifest: manifest.to_string(), layer: layer.clone(), content_hash }.write(dest)
+        })
+    }
+
+    /// Check a bundle cached at `dest` with no evidence tying it to `manifest`, by fetching that
+    /// manifest and its layer (each verified against its digest) and expanding the layer beside
+    /// it: the cached tree is reused only when its content hash (`cached`) is the layer's, and its
+    /// evidence is then recorded, so that later uses need no registry. Anything else is
+    /// `content_hash_mismatch`, and the cached tree, which other projects may be using, is left
+    /// for a person to remove.
+    pub fn verify_cached(&self, r: &Reference, manifest: &str, dest: &Path, cached: &str) -> Result<()> {
+        digest(manifest, "oci_failed", "the manifest digest to verify")?;
+        let (layer, blob) = self.layer(r, manifest)?;
+        let (parent, name) = cache_slot(dest)?;
+        let _lock = FileLock::acquire(&parent.join(format!(".{name}.lock")))?;
+        let prefix = format!(".{name}.verify-");
+        // Only one verifier holds the lock: any other such directory was left by a crash.
+        for entry in fs::read_dir(parent).map_err(|e| io_error(parent.display(), e))?.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                remove_tree(&entry.path());
+            }
+        }
+        let staging = Staging(tempfile::Builder::new().prefix(&prefix).tempdir_in(parent).map_err(|e| io_error(parent.display(), e))?.keep());
+        extract(&blob, &staging.0, EXTRACT_LIMITS)?;
+        let content_hash = crate::hash::hash_dir(&staging.0)?;
+        if content_hash != cached {
+            return Err(StackError::new(
+                "content_hash_mismatch",
+                format!("the bundle cached at {} is not what {manifest} holds (its content hash is {cached}, the layer's {content_hash})", dest.display()),
+            )
+            .hint(format!("delete {} and retry", dest.display())));
+        }
+        Evidence { manifest: manifest.to_string(), layer, content_hash }.write(dest)
+    }
+
+    /// The manifest at `manifest` and its bundle layer, each verified against its digest, the
+    /// layer's checked to be one before it is asked for.
+    fn layer(&self, r: &Reference, manifest: &str) -> Result<(String, Vec<u8>)> {
+        let url = format!("{}/manifests/{manifest}", r.base());
         let resp = self.send("GET", &url, Some(MANIFEST_TYPE), None)?;
         let bytes = Self::read_limited(resp)?;
-        verify_digest(&bytes, digest, "manifest")?;
-        let manifest: Value = serde_json::from_slice(&bytes)
+        verify_digest(&bytes, manifest, "manifest")?;
+        let parsed: Value = serde_json::from_slice(&bytes)
             .map_err(|e| StackError::new("oci_failed", format!("manifest is not JSON: {e}")))?;
-        let layer = manifest["layers"]
+        let layer = parsed["layers"]
             .as_array()
             .and_then(|ls| ls.iter().find(|l| l["mediaType"] == LAYER_TYPE))
             .ok_or_else(|| {
                 StackError::new(
                     "bundle_invalid",
-                    format!("{digest} is not a stack bundle (no {LAYER_TYPE} layer)"),
+                    format!("{manifest} is not a stack bundle (no {LAYER_TYPE} layer)"),
                 )
             })?;
         let layer_digest = layer["digest"].as_str().unwrap_or_default();
+        digest(layer_digest, "bundle_invalid", &format!("the bundle layer manifest {manifest} names"))?;
 
         let url = format!("{}/blobs/{layer_digest}", r.base());
         let resp = self.send("GET", &url, None, None)?;
         let blob = Self::read_limited(resp)?;
         verify_digest(&blob, layer_digest, "layer")?;
-        install(&blob, dest, EXTRACT_LIMITS)
+        Ok((layer_digest.to_string(), blob))
     }
 
     /// Publish `dir` as a bundle artifact tagged `r.reference`. Returns the manifest digest.
@@ -567,16 +811,24 @@ impl Client {
 /// published `dest` counts as success. Staging directories left by a crashed installer are
 /// removed by the next one, which is safe because staging only exists while the lock is held.
 pub fn install(blob: &[u8], dest: &Path, limits: ExtractLimits) -> Result<()> {
-    let (parent, name) = match (dest.parent(), dest.file_name()) {
-        (Some(parent), Some(name)) => (parent, name.to_string_lossy()),
-        _ => {
-            return Err(StackError::new(
-                "io",
-                format!("invalid cache path {}", dest.display()),
-            ))
+    install_with(blob, dest, limits, |_| Ok(()))
+}
+
+/// The directory holding the cache entry `dest`, created if need be, and its name.
+fn cache_slot(dest: &Path) -> Result<(&Path, String)> {
+    match (dest.parent(), dest.file_name()) {
+        (Some(parent), Some(name)) => {
+            fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
+            Ok((parent, name.to_string_lossy().into_owned()))
         }
-    };
-    fs::create_dir_all(parent).map_err(|e| io_error(parent.display(), e))?;
+        _ => Err(StackError::new("io", format!("invalid cache path {}", dest.display()))),
+    }
+}
+
+/// [`install`], running `before` on the complete staged tree just before it is published (and
+/// publishing nothing if that fails).
+fn install_with(blob: &[u8], dest: &Path, limits: ExtractLimits, before: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let (parent, name) = cache_slot(dest)?;
     let _lock = FileLock::acquire(&parent.join(format!(".{name}.lock")))?;
     if dest.exists() {
         return Ok(());
@@ -598,8 +850,49 @@ pub fn install(blob: &[u8], dest: &Path, limits: ExtractLimits) -> Result<()> {
             .keep(),
     );
     extract(blob, &staging.0, limits)?;
+    before(&staging.0)?;
     // Once renamed, nothing is left at the staging path for the guard to remove.
     fs::rename(&staging.0, dest).map_err(|e| io_error(dest.display(), e))
+}
+
+/// What ties a bundle cached at `dest` to the manifest it was installed from, kept beside it
+/// (`.<name>.evidence.json`, never inside the tree its content hash covers): the manifest and
+/// layer digests, each verified when the layer was downloaded, and the content hash of the tree
+/// expanded from that layer. Written before the tree is published, so every tree this Stack
+/// installed has it.
+///
+/// It is evidence against a cache Stack did not fill this way (one an earlier Stack filled, one
+/// restored from elsewhere, one changed since), not a signature: like the cache itself it is
+/// written by, and trusted to, the user Stack runs as.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Evidence {
+    pub manifest: String,
+    pub layer: String,
+    pub content_hash: String,
+}
+
+impl Evidence {
+    fn path(dest: &Path) -> Option<std::path::PathBuf> {
+        Some(dest.parent()?.join(format!(".{}.evidence.json", dest.file_name()?.to_string_lossy())))
+    }
+
+    fn write(&self, dest: &Path) -> Result<()> {
+        let path = Self::path(dest).ok_or_else(|| StackError::new("io", format!("invalid cache path {}", dest.display())))?;
+        let parent = path.parent().expect("a parent");
+        let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| io_error(parent.display(), e))?;
+        io::Write::write_all(&mut tmp, &serde_json::to_vec(self).expect("evidence serializes")).map_err(|e| io_error(path.display(), e))?;
+        tmp.persist(&path).map_err(|e| io_error(path.display(), e.error))?;
+        Ok(())
+    }
+
+    /// Whether the evidence kept for the bundle cached at `dest` ties it to `manifest`, and the
+    /// tree there still has the content hash it was installed with (`content_hash`, just
+    /// computed).
+    pub fn matches(dest: &Path, manifest: &str, content_hash: &str) -> bool {
+        let Some(path) = Self::path(dest) else { return false };
+        let Ok(bytes) = fs::read(&path) else { return false };
+        serde_json::from_slice::<Self>(&bytes).is_ok_and(|e| e.manifest == manifest && is_digest(&e.layer) && e.content_hash == content_hash)
+    }
 }
 
 /// A staging directory, removed with everything in it when dropped (under the install lock).
@@ -636,7 +929,7 @@ fn remove_tree(path: &Path) {
 }
 
 /// Unpack only regular files and directories, within `limits`, refusing any entry that would
-/// land outside `into`. The whole gzip stream is then read through the same budget: its length
+/// land outside `into`, inside a directory the content hash excludes, or under a non-UTF-8 name. The whole gzip stream is then read through the same budget: its length
 /// and CRC must check out, anything after the tar end marker must be zero padding, and nothing
 /// may follow the single gzip member.
 fn extract(blob: &[u8], into: &Path, limits: ExtractLimits) -> Result<()> {
@@ -692,6 +985,17 @@ fn extract(blob: &[u8], into: &Path, limits: ExtractLimits) -> Result<()> {
         let mut relative = std::path::PathBuf::new();
         for part in path.components() {
             match part {
+                // Never hashed, so never let into the shared cache (`archive` never writes them).
+                std::path::Component::Normal(part) if crate::hash::excluded(part) => {
+                    return Err(malformed(&format!(
+                        "entry {} is inside {}, which bundles cannot contain",
+                        path.display(),
+                        part.to_string_lossy()
+                    )))
+                }
+                std::path::Component::Normal(part) if part.to_str().is_none() => {
+                    return Err(malformed(&format!("entry {} is not valid UTF-8", path.display())))
+                }
                 std::path::Component::Normal(part) => relative.push(part),
                 std::path::Component::ParentDir => {
                     return Err(malformed(&format!(
@@ -823,9 +1127,26 @@ fn validate_transport_with(target: &Url, registry: &str, plain_http: bool) -> Re
     Ok(())
 }
 
-fn trusted_realm(realm: &Url, registry: &str, approved: &str) -> bool {
+/// Whether a token service at `realm` may be asked: the registry's own origin, or one listed in
+/// `approved` (comma-separated origins, normalized like `STACK_OCI_REGISTRY`). A listed value that
+/// is not an origin is an error rather than silently ignored or loosely matched.
+fn trusted_realm(realm: &Url, registry: &str, approved: &str) -> Result<bool> {
     let origin = realm.origin().ascii_serialization();
-    origin == registry || approved.split(',').any(|v| v.trim() == origin)
+    if origin == registry {
+        return Ok(true);
+    }
+    let mut trusted = false;
+    for (index, value) in approved.split(',').map(str::trim).enumerate() {
+        if value.is_empty() {
+            continue;
+        }
+        let listed = registry_origin(value).ok_or_else(|| {
+            StackError::new("oci_auth_untrusted", format!("STACK_OCI_AUTH_REALMS entry {} is not an origin", index + 1))
+                .hint("list token service origins as scheme://host[:port], comma-separated, e.g. https://auth.docker.io")
+        })?;
+        trusted |= listed == origin;
+    }
+    Ok(trusted)
 }
 
 fn verify_digest(bytes: &[u8], expected: &str, what: &str) -> Result<()> {
@@ -879,10 +1200,11 @@ mod tests {
             ),
             ("ghcr.io", "acme/pybase", "1.0.0")
         );
-        let r = Reference::parse("localhost:5000/pybase@sha256:abc").unwrap();
+        let pinned = format!("sha256:{}", "ab".repeat(32));
+        let r = Reference::parse(&format!("localhost:5000/pybase@{pinned}")).unwrap();
         assert_eq!(
             (r.registry.as_str(), r.reference.as_str()),
-            ("localhost:5000", "sha256:abc")
+            ("localhost:5000", pinned.as_str())
         );
         assert_eq!(
             Reference::parse("ghcr.io/acme/pybase").unwrap_err().code,
@@ -892,6 +1214,75 @@ mod tests {
             Reference::parse("pybase:1").unwrap_err().code,
             "source_invalid"
         );
+    }
+
+    /// Only a digest may name a cache directory or a registry path; a tag, repository and
+    /// registry only what their grammars allow, so nothing in a reference adds a path, query,
+    /// fragment or userinfo to a request.
+    #[test]
+    fn references_carry_only_digests_tags_and_names_their_grammars_allow() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(is_digest(&format!("sha256:{hex}")));
+        for bad in [
+            "sha256:abc".to_string(),
+            format!("sha256:{}", hex.to_uppercase()),
+            format!("sha512:{hex}"),
+            format!("sha256:{hex}0"),
+            format!("sha256:{}/..", &hex[..61]),
+            format!("sha256:../../{}", &hex[..58]),
+            format!(" sha256:{hex}"),
+            String::new(),
+        ] {
+            assert!(!is_digest(&bad), "{bad}");
+            let err = digest(&bad, "lock_invalid", "the digest").unwrap_err();
+            assert_eq!(err.code, "lock_invalid");
+        }
+        // A value is shown bounded and escaped.
+        let err = digest(&format!("x\u{1b}[31m{}", "y".repeat(500)), "oci_failed", "it").unwrap_err();
+        assert!(!err.message.contains('\u{1b}') && err.message.len() < 200, "{}", err.message);
+        for good in ["ghcr.io/acme/pybase:1.0.0", "localhost:5000/a/b-c/d__e:v_1.2-rc", "127.0.0.1:5000/x:Latest", "[::1]:5000/x:1"] {
+            assert!(Reference::parse(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "ghcr.io/acme/pybase@sha256:abc",
+            "ghcr.io/acme/pybase@sha256:../../../../etc/x",
+            "ghcr.io/acme/pybase@latest",
+            "ghcr.io/acme/../pybase:1",
+            "ghcr.io/Acme/pybase:1",
+            "ghcr.io/acme//pybase:1",
+            "ghcr.io/acme/pybase-:1",
+            "ghcr.io/acme/pybase:.hidden",
+            "ghcr.io/acme/pybase:1?x=y",
+            "ghcr.io/acme/pybase:1#f",
+            "user@ghcr.io/acme/pybase:1",
+            "ghcr.io?x/acme/pybase:1",
+        ] {
+            assert_eq!(Reference::parse(bad).unwrap_err().code, "source_invalid", "{bad}");
+        }
+        assert_eq!(Reference::parse(&format!("ghcr.io/a:{}", "t".repeat(129))).unwrap_err().code, "source_invalid");
+    }
+
+    /// A token service's failure is told by its origin alone: its realm's path and query come
+    /// from the registry's challenge, and its reply from the service, and neither is echoed.
+    #[test]
+    fn token_service_failures_never_echo_the_realm_or_the_reply() {
+        let realm = Url::parse("https://auth.example/realm-path/x?service=s&scope=dummy-scope").unwrap();
+        let status = ureq::Error::Status(403, ureq::Response::new(403, "Forbidden", "dummy-reply-body").unwrap());
+        let err = auth_err(&realm, "https://registry.example", status);
+        assert_eq!(err.code, "oci_unauthorized");
+        assert!(err.message.contains("https://auth.example") && err.message.contains("HTTP 403"), "{}", err.message);
+        for hidden in ["realm-path", "dummy-scope", "dummy-reply-body"] {
+            assert!(!err.message.contains(hidden), "{hidden}: {}", err.message);
+        }
+        // A connection refused names its kind, never the URL tried.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let realm = Url::parse(&format!("http://127.0.0.1:{port}/realm-path?scope=dummy-scope")).unwrap();
+        let transport = ureq::get(realm.as_str()).call().unwrap_err();
+        let err = auth_err(&realm, "http://127.0.0.1", transport);
+        assert_eq!(err.code, "oci_unreachable");
+        assert!(!err.message.contains("realm-path") && !err.message.contains("dummy-scope"), "{}", err.message);
     }
 
     #[test]
@@ -956,6 +1347,132 @@ mod tests {
         for target in [&remote_http, &local_http] {
             assert!(validate_transport_with(target, "https://registry.example", true).is_err());
         }
+    }
+
+    fn env(user: Option<&str>, pass: Option<&str>, registry: Option<&str>) -> CredentialEnv {
+        CredentialEnv {
+            username: user.map(String::from),
+            password: pass.map(String::from),
+            registry: registry.map(String::from),
+        }
+    }
+
+    #[test]
+    fn registry_origins_include_scheme_and_effective_port_and_nothing_else() {
+        for (value, origin) in [
+            ("https://ghcr.io", "https://ghcr.io"),
+            ("https://ghcr.io/", "https://ghcr.io"),
+            ("https://GHCR.io:443", "https://ghcr.io"),
+            ("http://localhost:5000", "http://localhost:5000"),
+            ("http://127.0.0.1:80/", "http://127.0.0.1"),
+            ("https://registry.example:8443", "https://registry.example:8443"),
+            (" https://ghcr.io".trim(), "https://ghcr.io"),
+        ] {
+            assert_eq!(registry_origin(value).as_deref(), Some(origin), "{value}");
+        }
+        for value in [
+            "ghcr.io",
+            "ghcr.io:443",
+            "https:ghcr.io",
+            "https://ghcr.io/v2",
+            "https://ghcr.io/acme/",
+            "https://ghcr.io?x=1",
+            "https://ghcr.io#x",
+            "https://user@ghcr.io",
+            "https://user:pw@ghcr.io",
+            "ftp://ghcr.io",
+            "file:///tmp",
+            "",
+        ] {
+            assert_eq!(registry_origin(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn credentials_are_granted_only_to_the_configured_origin() {
+        let bound = env(Some("u"), Some("p"), Some("https://registry.example"));
+        assert_eq!(bound.grant("https://registry.example").unwrap(), Grant::Credentials("u".into(), "p".into()));
+        // A default port written out is the same origin; anything else is not.
+        let explicit_port = env(Some("u"), Some("p"), Some("https://registry.example:443/"));
+        assert_eq!(explicit_port.grant("https://registry.example").unwrap(), Grant::Credentials("u".into(), "p".into()));
+        for other in [
+            "http://registry.example",
+            "https://registry.example:8443",
+            "https://registry.example.attacker.test",
+            "https://attacker.test",
+            "https://sub.registry.example",
+        ] {
+            assert_eq!(bound.grant(other).unwrap(), Grant::Elsewhere("https://registry.example".into()), "{other}");
+        }
+    }
+
+    #[test]
+    fn missing_credentials_stay_anonymous_and_broken_ones_fail_closed() {
+        for registry in [None, Some(""), Some("https://registry.example"), Some("not an origin")] {
+            assert_eq!(env(None, None, registry).grant("https://registry.example").unwrap(), Grant::Anonymous, "{registry:?}");
+        }
+        for (case, credentials) in [
+            ("unbound", env(Some("u"), Some("p"), None)),
+            ("empty binding", env(Some("u"), Some("p"), Some("  "))),
+            ("host only", env(Some("u"), Some("p"), Some("registry.example"))),
+            ("path", env(Some("u"), Some("p"), Some("https://registry.example/v2/acme"))),
+            ("userinfo", env(Some("u"), Some("p"), Some("https://u:dummy-secret@registry.example"))),
+            ("no password", env(Some("u"), None, Some("https://registry.example"))),
+            ("no username", env(None, Some("p"), Some("https://registry.example"))),
+        ] {
+            let err = credentials.grant("https://registry.example").unwrap_err();
+            assert_eq!(err.code, "oci_credentials_unbound", "{case}");
+            assert!(err.message.contains("sent no credentials"), "{case}: {}", err.message);
+            assert!(!err.message.contains("dummy-secret"), "{case}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn token_realms_are_the_registry_origin_or_explicitly_approved_origins() {
+        let realm = |s: &str| Url::parse(s).unwrap();
+        let registry = "https://registry.example";
+        assert!(trusted_realm(&realm("https://registry.example/token"), registry, "").unwrap());
+        assert!(!trusted_realm(&realm("https://auth.example/token"), registry, "").unwrap());
+        for approved in ["https://auth.example", " https://auth.example/ ", "https://AUTH.example:443", "https://x.example, https://auth.example"] {
+            assert!(trusted_realm(&realm("https://auth.example/token"), registry, approved).unwrap(), "{approved}");
+        }
+        for approved in ["http://auth.example", "https://auth.example:8443", "https://auth.example.attacker.test", "https://example"] {
+            assert!(!trusted_realm(&realm("https://auth.example/token"), registry, approved).unwrap(), "{approved}");
+        }
+        // A listed value that is not an origin is reported, never loosely matched.
+        for approved in ["auth.example", "https://auth.example/token"] {
+            assert_eq!(trusted_realm(&realm("https://auth.example/token"), registry, approved).unwrap_err().code, "oci_auth_untrusted", "{approved}");
+        }
+    }
+
+    #[test]
+    fn basic_challenges_receive_credentials_only_at_the_configured_origin() {
+        let challenged = Url::parse("https://registry.example/v2/b/manifests/1").unwrap();
+        let registry = "https://registry.example";
+        let client = Client::default();
+        client
+            .authenticate_with("Basic realm=\"r\"", &challenged, registry, &env(Some("u"), Some("p"), Some(registry)))
+            .unwrap();
+        assert_eq!(client.token.borrow().as_ref().unwrap(), &(registry.to_string(), basic("u", "p")));
+
+        for (credentials, code) in [
+            (env(Some("u"), Some("p"), Some("https://other.example")), "oci_unauthorized"),
+            (env(None, None, None), "oci_unauthorized"),
+            (env(Some("u"), Some("p"), None), "oci_credentials_unbound"),
+        ] {
+            let client = Client::default();
+            let err = client.authenticate_with("Basic realm=\"r\"", &challenged, registry, &credentials).unwrap_err();
+            assert_eq!(err.code, code, "{credentials:?}");
+            assert!(client.token.borrow().is_none());
+        }
+        // A challenge from anywhere but the request's own registry is never answered.
+        let redirected = Url::parse("https://other.example/v2/b/manifests/1").unwrap();
+        let client = Client::default();
+        let err = client
+            .authenticate_with("Basic realm=\"r\"", &redirected, registry, &env(Some("u"), Some("p"), Some("https://other.example")))
+            .unwrap_err();
+        assert_eq!(err.code, "oci_auth_untrusted");
+        assert!(client.token.borrow().is_none());
     }
 
     #[test]
@@ -1154,6 +1671,53 @@ mod tests {
             assert!(err.message.contains(reason), "{}", err.message);
             assert_eq!(left, [".oci-x.lock"]);
         }
+    }
+
+    #[test]
+    fn layers_cannot_carry_content_the_hash_would_skip() {
+        let raw_name = |name: &[u8]| {
+            gzip(&tar(|t| {
+                let mut header = tar::Header::new_old();
+                header.as_old_mut().name[..name.len()].copy_from_slice(name);
+                header.set_size(1);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                t.append(&header, &b"x"[..]).unwrap();
+            }))
+        };
+        for (blob, reason) in [
+            (gzip(&tar(|t| file_entry(t, ".git/config", b"x"))), "inside .git"),
+            (gzip(&tar(|t| file_entry(t, "bin/.stack/tool", b"x"))), "inside .stack"),
+            (gzip(&tar(|t| dir_entry(t, ".stack", 0o755))), "inside .stack"),
+            // However a case-insensitive filesystem would spell them.
+            (gzip(&tar(|t| file_entry(t, ".GIT/config", b"x"))), "inside .GIT"),
+            (gzip(&tar(|t| file_entry(t, "bin/.Stack/tool", b"x"))), "inside .Stack"),
+            (gzip(&tar(|t| dir_entry(t, ".sTaCk", 0o755))), "inside .sTaCk"),
+            (raw_name(b"bin/\xff"), "not valid UTF-8"),
+        ] {
+            let (result, left) = install_into(&blob, EXTRACT_LIMITS);
+            let err = result.unwrap_err();
+            assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+            assert!(err.message.contains(reason), "{}", err.message);
+            assert_eq!(left, [".oci-x.lock"]);
+        }
+        // Names that merely resemble them are ordinary content.
+        let lookalikes = gzip(&tar(|t| {
+            file_entry(t, ".gitignore", b"x");
+            file_entry(t, ".GitHub/workflow", b"x");
+            file_entry(t, "bin/.stackrc", b"x");
+        }));
+        assert!(install_into(&lookalikes, EXTRACT_LIMITS).0.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publishing_refuses_links_instead_of_dropping_them() {
+        let source = bundle_dir();
+        std::os::unix::fs::symlink("/etc/hosts", source.path().join("bin/hosts")).unwrap();
+        let err = archive(source.path()).unwrap_err();
+        assert_eq!(err.code, "bundle_invalid");
+        assert!(err.message.contains("symbolic link"), "{}", err.message);
     }
 
     fn gzip(raw: &[u8]) -> Vec<u8> {

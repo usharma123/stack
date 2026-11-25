@@ -36,22 +36,40 @@ pub fn bin_dir() -> PathBuf {
     home.join(".local/share/stack/bin")
 }
 
-/// Puts the managed mise last on PATH, so every provider call, nested `mise` command and
-/// `stack exec` child finds it, while a mise the user installed still wins. Call before any
-/// thread starts.
+/// Beside the managed mise once `stack setup` installed it (with `--force`, or because the mise
+/// on PATH did not run): that mise goes first on PATH, ahead of the one it replaced.
+const PREFER_MANAGED: &str = "mise.first";
+
+/// Puts the managed mise on PATH, so every provider call, nested `mise` command and `stack exec`
+/// child finds it: last, so a mise the user installed still wins, unless `stack setup` installed
+/// it (see [`PREFER_MANAGED`]), when it goes first. Call before any thread starts.
 pub fn use_managed_tools() {
     let dir = bin_dir();
     if !dir.join("mise").is_file() {
         return;
     }
-    let mut paths: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    if paths.contains(&dir) {
-        return;
-    }
-    paths.push(dir);
-    if let Ok(joined) = std::env::join_paths(paths) {
+    let paths: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    if let Some(joined) = managed_path(paths, &dir, dir.join(PREFER_MANAGED).is_file()).and_then(|p| std::env::join_paths(p).ok()) {
         std::env::set_var("PATH", joined);
     }
+}
+
+/// PATH entries with `dir` added: first when `first`, else last unless already there. `None`
+/// when nothing changes.
+fn managed_path(mut paths: Vec<PathBuf>, dir: &Path, first: bool) -> Option<Vec<PathBuf>> {
+    if first {
+        if paths.first().is_some_and(|p| p == dir) {
+            return None;
+        }
+        paths.retain(|p| p != dir);
+        paths.insert(0, dir.to_path_buf());
+        return Some(paths);
+    }
+    if paths.iter().any(|p| p == dir) {
+        return None;
+    }
+    paths.push(dir.to_path_buf());
+    Some(paths)
 }
 
 #[derive(Debug, Serialize)]
@@ -60,13 +78,17 @@ pub struct Report {
     pub version: String,
     /// False when a usable mise was already on PATH.
     pub installed: bool,
+    /// The installed mise goes first on PATH for Stack and the commands it runs, ahead of any
+    /// other (true whenever `installed` is).
+    pub first_on_path: bool,
 }
 
 /// Leaves a working mise alone unless `force`; otherwise installs the pinned release.
 pub fn run(force: bool) -> Result<Report> {
     if !force {
         if let Some((path, version)) = find_on_path().and_then(|p| version(&p).map(|v| (p, v))) {
-            return Ok(Report { mise: path, version, installed: false });
+            let first_on_path = path.parent().is_some_and(|d| d == bin_dir()) && bin_dir().join(PREFER_MANAGED).is_file();
+            return Ok(Report { mise: path, version, installed: false, first_on_path });
         }
     }
     let (platform, sha256) = asset().ok_or_else(|| {
@@ -79,7 +101,7 @@ pub fn run(force: bool) -> Result<Report> {
     let version = version(&path).ok_or_else(|| {
         StackError::new("setup_failed", format!("{} was installed but does not run", path.display())).hint(MISE_INSTALL_HINT)
     })?;
-    Ok(Report { mise: path, version, installed: true })
+    Ok(Report { mise: path, version, installed: true, first_on_path: true })
 }
 
 pub const MISE_INSTALL_HINT: &str = "run `stack setup` to download mise, or install it yourself: https://mise.jdx.dev";
@@ -177,6 +199,10 @@ pub fn install(archive: &[u8], sha256: &str, dir: &Path) -> Result<PathBuf> {
         }
         let target = dir.join("mise");
         staged.persist(&target).map_err(|e| io_error(target.display(), e.error))?;
+        // Installed because it was asked for, or because the mise on PATH did not run: either
+        // way it must win over that one from now on.
+        let prefer = dir.join(PREFER_MANAGED);
+        std::fs::write(&prefer, "stack setup installed this mise; it goes first on PATH for Stack\n").map_err(|e| io_error(prefer.display(), e))?;
         return Ok(target);
     }
     Err(StackError::new("setup_failed", "mise archive does not contain mise/bin/mise"))
@@ -245,6 +271,21 @@ mod tests {
         assert_eq!(path, dir.path().join("mise"));
         assert_eq!(std::fs::read(&path).unwrap(), b"#!/bin/sh\n");
         assert!(crate::hash::is_executable(&path));
+        assert!(dir.path().join(PREFER_MANAGED).is_file(), "an installed mise goes first on PATH");
+    }
+
+    #[test]
+    fn the_managed_mise_goes_last_unless_setup_installed_it() {
+        let p = |entries: &[&str]| entries.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let dir = Path::new("/data/stack/bin");
+        // Found but not installed by setup: last, so a mise the user installed wins.
+        assert_eq!(managed_path(p(&["/usr/bin", "/bin"]), dir, false), Some(p(&["/usr/bin", "/bin", "/data/stack/bin"])));
+        assert_eq!(managed_path(p(&["/data/stack/bin", "/usr/bin"]), dir, false), None);
+        // Installed by setup: first, ahead of a broken mise elsewhere on PATH, and only once.
+        assert_eq!(managed_path(p(&["/usr/bin", "/bin"]), dir, true), Some(p(&["/data/stack/bin", "/usr/bin", "/bin"])));
+        assert_eq!(managed_path(p(&["/usr/bin", "/data/stack/bin"]), dir, true), Some(p(&["/data/stack/bin", "/usr/bin"])));
+        assert_eq!(managed_path(p(&["/data/stack/bin", "/usr/bin"]), dir, true), None);
+        assert_eq!(managed_path(Vec::new(), dir, true), Some(p(&["/data/stack/bin"])));
     }
 
     #[test]

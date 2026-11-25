@@ -244,6 +244,133 @@ fn mcp_logs_of_every_service_filtered() {
     assert_eq!(replies[1]["data"]["lines"], json!(["b"]), "{}", replies[1]);
 }
 
+impl Fixture {
+    fn log_file(&self, service: &str) -> PathBuf {
+        self.dir.path().join("state/supervisors").join(stack::state::project_key(&self.app())).join("logs").join(format!("{service}.log"))
+    }
+
+    fn logs_json(&self, args: &[&str]) -> Value {
+        let mut all = vec!["logs", "--json"];
+        all.extend_from_slice(args);
+        let r = json_result(&self.ok(&all));
+        assert_eq!(r["ok"], true, "{r}");
+        r["data"].clone()
+    }
+}
+
+#[test]
+fn a_log_cursor_returns_each_line_once_with_its_time_and_says_what_it_missed() {
+    let fixture = Fixture::new(TWO);
+    let log = fixture.log_file("web");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // The current writer starts every new log with its own generation, even on a reused inode.
+    let begin_generation = |generation: u128| fs::write(&log, format!("# stack log {generation:032x}\n")).unwrap();
+    begin_generation(1);
+    fixture.logs("web", "one\n");
+    // Without a cursor: as before, plus where the read got to.
+    let first = fixture.logs_json(&["web"]);
+    assert_eq!(first["lines"], json!(["one"]), "{first}");
+    assert!(first.get("timestamps").is_none(), "existing clients see what they saw: {first}");
+    let cursor = first["cursor"].as_str().unwrap().to_string();
+    // Repeated lines are each returned, once, with when they were read.
+    fixture.logs("web", "same\nsame\n");
+    let next = fixture.logs_json(&["web", "--cursor", &cursor]);
+    assert_eq!(next["lines"], json!(["same", "same"]), "{next}");
+    let stamps = next["timestamps"].as_array().unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    assert!(stamps.len() == 2 && stamps.iter().all(|t| t.as_u64().unwrap() <= now && t.as_u64().unwrap() + 60_000 > now), "{next}");
+    let cursor = next["cursor"].as_str().unwrap().to_string();
+    let none = fixture.logs_json(&["web", "--cursor", &cursor]);
+    assert_eq!(none["lines"], json!([]), "{none}");
+    assert!(none.get("gap").is_none() && none.get("more").is_none(), "{none}");
+    // A record still being written waits for its newline.
+    let mut file = fs::OpenOptions::new().append(true).open(fixture.log_file("web")).unwrap();
+    std::io::Write::write_all(&mut file, format!("{now} half").as_bytes()).unwrap();
+    assert_eq!(fixture.logs_json(&["web", "--cursor", &cursor])["lines"], json!([]));
+    std::io::Write::write_all(&mut file, b" done\n").unwrap();
+    let whole = fixture.logs_json(&["web", "--cursor", &cursor]);
+    assert_eq!(whole["lines"], json!(["half done"]), "{whole}");
+    let cursor = whole["cursor"].as_str().unwrap().to_string();
+    // --tail caps a read; `more` says to read again.
+    fixture.logs("web", "a\nb\nc\n");
+    let capped = fixture.logs_json(&["web", "--tail", "2", "--cursor", &cursor]);
+    assert_eq!((capped["lines"].clone(), capped["more"].clone()), (json!(["a", "b"]), json!(true)), "{capped}");
+    let rest = fixture.logs_json(&["web", "--tail", "2", "--cursor", capped["cursor"].as_str().unwrap()]);
+    assert_eq!(rest["lines"], json!(["c"]), "{rest}");
+    let cursor = rest["cursor"].as_str().unwrap().to_string();
+    // Rotated once: followed into the new file. Twice: the loss is said.
+    let older = fixture.log_file("web").with_extension("log.1");
+    fixture.logs("web", "before rotation\n");
+    fs::rename(fixture.log_file("web"), &older).unwrap();
+    begin_generation(2);
+    fixture.logs("web", "after rotation\n");
+    let rotated = fixture.logs_json(&["web", "--cursor", &cursor]);
+    assert_eq!(rotated["lines"], json!(["before rotation", "after rotation"]), "{rotated}");
+    assert!(rotated.get("gap").is_none(), "{rotated}");
+    fs::rename(fixture.log_file("web"), &older).unwrap();
+    begin_generation(3);
+    fixture.logs("web", "x\n");
+    fs::rename(fixture.log_file("web"), &older).unwrap();
+    begin_generation(4);
+    fixture.logs("web", "y\n");
+    let lost = fixture.logs_json(&["web", "--cursor", rotated["cursor"].as_str().unwrap()]);
+    assert_eq!((lost["lines"].clone(), lost["gap"].clone()), (json!(["x", "y"]), json!("rotated")), "{lost}");
+
+    // A cursor read compiles nothing: it works while stack.toml cannot be compiled.
+    let cursor = lost["cursor"].as_str().unwrap().to_string();
+    fixture.logs("web", "z\n");
+    fs::write(fixture.app().join("stack.toml"), "this is not toml [[[").unwrap();
+    assert_eq!(fixture.logs_json(&["web", "--cursor", &cursor])["lines"], json!(["z"]));
+    let out = fixture.command_in(&fixture.app(), &["logs", "web", "--json"]).output().unwrap();
+    assert_eq!(json_result(&out)["ok"], false, "a read without a cursor still checks the project");
+    let out = fixture.command_in(&fixture.app(), &["logs", "web", "--json", "--cursor", "nonsense"]).output().unwrap();
+    assert_eq!(json_result(&out)["error"]["code"], "usage");
+}
+
+#[test]
+fn a_service_with_no_log_yet_stays_in_a_cursor_of_several() {
+    let fixture = Fixture::new(TWO);
+    fixture.logs("web", "w1\n");
+    let begun = fixture.logs_json(&["--cursor", ""]);
+    assert_eq!(begun["services"]["web"]["lines"], json!(["w1"]), "{begun}");
+    assert_eq!(begun["errors"]["worker"]["code"], "logs_failed", "{begun}");
+    let cursor = begun["cursor"].as_str().unwrap().to_string();
+    let quiet = fixture.logs_json(&["--cursor", &cursor]);
+    assert_eq!(quiet["services"]["worker"]["lines"], json!([]), "named by the cursor, read without a log: {quiet}");
+    let cursor = quiet["cursor"].as_str().unwrap().to_string();
+    fixture.logs("worker", "k1\n");
+    fixture.logs("web", "w2\n");
+    let later = fixture.logs_json(&["--cursor", &cursor]);
+    assert_eq!((later["services"]["web"]["lines"].clone(), later["services"]["worker"]["lines"].clone()), (json!(["w2"]), json!(["k1"])), "{later}");
+    let last = fixture.logs_json(&["--cursor", later["cursor"].as_str().unwrap()]);
+    assert_eq!((last["services"]["web"]["lines"].clone(), last["services"]["worker"]["lines"].clone()), (json!([]), json!([])), "{last}");
+}
+
+#[test]
+fn mcp_logs_read_from_a_cursor_across_services() {
+    let fixture = Fixture::new(TWO);
+    fixture.logs("web", "w1\n");
+    fixture.logs("worker", "k1\n");
+    let app = fixture.app();
+    let begun = fixture.mcp(&app, &[("stack_logs", json!({ "dir": app, "cursor": "" }))]);
+    let data = &begun[0]["data"];
+    assert_eq!(data["services"]["web"]["lines"], json!(["w1"]), "{}", begun[0]);
+    assert_eq!(data["services"]["web"]["timestamps"].as_array().unwrap().len(), 1, "{}", begun[0]);
+    let cursor = data["cursor"].as_str().unwrap().to_string();
+    fixture.logs("worker", "k2\nk2\n");
+    let next = fixture.mcp(&app, &[
+        ("stack_logs", json!({ "dir": app, "cursor": cursor })),
+        ("stack_logs", json!({ "dir": app, "cursor": cursor, "service": "worker", "grep": "K2", "ignore_case": true, "tail": 1 })),
+        ("stack_logs", json!({ "dir": app, "cursor": 7 })),
+        ("stack_logs", json!({ "dir": app, "cursor": cursor, "project": true })),
+    ]);
+    assert_eq!(next[0]["data"]["services"]["web"]["lines"], json!([]), "{}", next[0]);
+    assert_eq!(next[0]["data"]["services"]["worker"]["lines"], json!(["k2", "k2"]), "{}", next[0]);
+    assert_eq!((next[1]["data"]["lines"].clone(), next[1]["data"]["more"].clone()), (json!(["k2"]), json!(true)), "{}", next[1]);
+    assert_eq!(next[2]["error"]["code"], "usage", "{}", next[2]);
+    assert_eq!(next[3]["error"]["code"], "usage", "{}", next[3]);
+}
+
 #[test]
 fn follow_prints_new_lines_until_interrupted() {
     let fixture = Fixture::new(TWO);
@@ -252,6 +379,9 @@ fn follow_prints_new_lines_until_interrupted() {
     let child = fixture.command_in(&fixture.app(), &["logs", "web", "--follow"]).stdout(Stdio::piped()).spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1500));
     fixture.logs("web", "two\n");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // The same line again in a later poll: printed again (no window is matched up).
+    fixture.logs("web", "two\n");
     std::thread::sleep(std::time::Duration::from_millis(2500));
     // SAFETY: signals a child this test started and has not reaped.
     unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
@@ -259,7 +389,7 @@ fn follow_prints_new_lines_until_interrupted() {
     // Like `tail -f`: the interrupt ends it, after every line read so far was written.
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(out.status.signal(), Some(libc::SIGINT), "{:?}", out.status);
-    assert_eq!(stdout(&out), "one\ntwo\n");
+    assert_eq!(stdout(&out), "one\ntwo\ntwo\n");
 
     let out = fixture.command_in(&fixture.app(), &["logs", "--follow", "--json"]).output().unwrap();
     assert_eq!(json_result(&out)["error"]["code"], "usage");

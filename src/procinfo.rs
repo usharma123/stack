@@ -156,9 +156,73 @@ pub fn boot_id() -> Option<String> {
     BOOT.get_or_init(imp::boot_id).clone()
 }
 
+/// This process's PID namespace, the only one in which a PID it reads names the process it
+/// means: on Linux the namespace `/proc/self/ns/pid` names (`None` when that cannot be read, as
+/// when `/proc` is another namespace's). Platforms without PID namespaces have none (`None`), and
+/// [`PID_NAMESPACES`] says which those are.
+pub fn pid_namespace() -> Option<u64> {
+    imp::pid_namespace()
+}
+
+/// Whether a process runs, as far as this process can show it (see [`liveness`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    /// A process has the PID: one this process may signal, or one the kernel refuses it
+    /// (another user's), which is there all the same.
+    Running,
+    /// No process has the PID, or the one there is a zombie: it has exited.
+    Gone,
+    /// Neither can be shown: why, said for a person.
+    Unknown(String),
+}
+
+/// Whether `pid` names a running process in this process's PID namespace, asked of the kernel
+/// itself (`kill(pid, 0)`), so that neither a status this process may not read (another user's
+/// process, `/proc` mounted with `hidepid`, another namespace's `/proc`) nor a refused signal is
+/// taken for an exit. Only `ESRCH`, or a zombie the kernel's own status shows, is [`Liveness::Gone`];
+/// any other failure is [`Liveness::Unknown`]. Unlike [`crate::state::pid_alive`], which answers
+/// whether this process may signal it, a process of another user counts as running.
+pub fn liveness(pid: u32) -> Liveness {
+    // 0 and values that wrap negative would address process groups: no process has them.
+    let Some(raw) = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0) else {
+        return Liveness::Gone;
+    };
+    // SAFETY: signal 0 performs only the existence and permission checks; nothing is delivered.
+    if unsafe { libc::kill(raw, 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::ESRCH) => return Liveness::Gone,
+            // There, but not ours to signal.
+            Some(libc::EPERM) => {}
+            _ => return Liveness::Unknown(format!("whether process {pid} runs cannot be told ({e})")),
+        }
+    }
+    // The kernel still has it; a zombie has exited all the same. A status that cannot be read
+    // leaves it running.
+    if imp::zombie(pid) == Some(true) {
+        Liveness::Gone
+    } else {
+        Liveness::Running
+    }
+}
+
+/// Whether PIDs on this platform are per namespace (Linux), so that one recorded by a process in
+/// another namespace may name another process here.
+pub const PID_NAMESPACES: bool = cfg!(target_os = "linux");
+
+/// The namespace number in a `/proc/<pid>/ns/pid` link's target, `pid:[4026531836]`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_namespace(link: &str) -> Option<u64> {
+    link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Process;
+
+    pub fn pid_namespace() -> Option<u64> {
+        None
+    }
 
     /// `kern.bootsessionuuid`: set once per boot. (`kern.boottime` is not an identity: the
     /// kernel rewrites it whenever the clock is stepped, after a sleep for instance.)
@@ -203,6 +267,29 @@ mod imp {
             info
         };
         (info.pbi_status != libc::SZOMB).then_some(info)
+    }
+
+    /// Whether `pid` is a zombie, when its status can be read: from `sysctl(KERN_PROC_PID)`,
+    /// which still describes a zombie (`proc_pidinfo` answers `ESRCH` for one). The `libc` crate
+    /// does not declare `struct kinfo_proc` for macOS, so its two fields are read where the SDK
+    /// puts them on every 64-bit macOS (`kp_proc.p_stat` at 36, `kp_proc.p_pid` at 40, of 648
+    /// bytes); the PID read back must be `pid`, or nothing is concluded.
+    pub fn zombie(pid: u32) -> Option<bool> {
+        const SIZE: usize = 648;
+        const P_STAT: usize = 36;
+        const P_PID: usize = 40;
+        #[repr(C, align(8))]
+        struct KinfoProc([u8; SIZE]);
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut info = KinfoProc([0; SIZE]);
+        let mut size = SIZE;
+        // SAFETY: sysctl writes at most `size` bytes into the buffer and sets `size`.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 4, info.0.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0 || size != SIZE {
+            return None;
+        }
+        let found = libc::c_int::from_ne_bytes(info.0[P_PID..P_PID + 4].try_into().ok()?);
+        (found == pid).then(|| u32::from(info.0[P_STAT]) == libc::SZOMB)
     }
 
     pub fn process(pid: u32) -> Option<Process> {
@@ -300,6 +387,10 @@ mod imp {
 mod imp {
     use super::Process;
 
+    pub fn pid_namespace() -> Option<u64> {
+        super::parse_namespace(std::fs::read_link("/proc/self/ns/pid").ok()?.to_str()?)
+    }
+
     pub fn boot_id() -> Option<String> {
         let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
         Some(id.trim().to_string()).filter(|i| !i.is_empty())
@@ -324,6 +415,18 @@ mod imp {
             group: fields.get(2)?.parse().ok()?,
             started: fields.get(19)?.parse().ok()?,
         })
+    }
+
+    /// Whether `pid` is a zombie, from its `/proc` status, provided `/proc` is this process's
+    /// PID namespace's (its own entry there has its own PID): another namespace's `/proc` would
+    /// describe another process with that number.
+    pub fn zombie(pid: u32) -> Option<bool> {
+        let me = std::fs::read_to_string("/proc/self/stat").ok()?;
+        if me.split(' ').next()?.parse::<u32>().ok()? != std::process::id() {
+            return None;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        Some(stat.get(stat.rfind(')')? + 2..)?.starts_with('Z'))
     }
 
     pub fn environ(pid: u32) -> Option<Vec<Vec<u8>>> {
@@ -354,6 +457,10 @@ mod imp {
 mod imp {
     use super::Process;
 
+    pub fn pid_namespace() -> Option<u64> {
+        None
+    }
+
     pub fn boot_id() -> Option<String> {
         None
     }
@@ -363,6 +470,10 @@ mod imp {
     }
 
     pub fn process(_: u32) -> Option<Process> {
+        None
+    }
+
+    pub fn zombie(_: u32) -> Option<bool> {
         None
     }
 
@@ -400,6 +511,17 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         assert_eq!(std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(), first);
+    }
+
+    #[test]
+    fn a_pid_namespace_is_read_where_pids_are_per_namespace() {
+        assert_eq!(parse_namespace("pid:[4026531836]"), Some(4026531836));
+        assert_eq!(parse_namespace("net:[4026531836]"), None);
+        assert_eq!(parse_namespace("pid:[x]"), None);
+        #[cfg(target_os = "linux")]
+        assert!(pid_namespace().is_some(), "this process's own namespace is readable");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!((pid_namespace(), PID_NAMESPACES), (None, false));
     }
 
     /// A child to describe: this test binary (not a platform binary, whose environment macOS

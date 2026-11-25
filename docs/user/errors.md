@@ -31,13 +31,14 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `gc_incomplete` | Some sessions of deleted checkouts could not be confirmed stopped; their records are kept. | For each service in details, run `recovery.inspect`, stop it only if the PID still matches, then run `stack gc` again. | yes | - |
 | `git_failed` | A git command failed while fetching a bundle. | Check the bundle's git URL and your network or credentials, then retry; the message carries git's output. | yes | - |
 | `git_unavailable` | git is not installed or cannot run. | Install git (git bundle sources need it), then retry; `stack doctor` checks it. | no | `stack doctor` |
+| `host_purge_disabled` | This MCP server does not delete service data of checkouts selected machine-wide (`stack_down` by `labels` with `purge`); nothing was stopped or removed. | Purge one project instead (`stack_down` with its `dir`, alone or with `project: true`), run `stack down --label K=V --purge` yourself, or start the server as `stack mcp --allow-host-purge`. | no | - |
 | `init_failed` | An init task of a service failed, or its data directory vanished; services are still running. | Read the task's output in details, fix the cause and run `stack up` again; it resumes from the failed task. | yes | `stack up` |
 | `init_invalid` | A service's `init` list names an unknown or repeated task, or one that excludes the service. | Fix the `init` list in stack.toml (details name the service and task), then run `stack compile`. | no | - |
 | `install_failed` | mise could not install a pinned tool or service binary. | Read mise's output in details; fix network or platform support, then run `stack install` again. | yes | - |
 | `invalid_env` | `[env]` sets a variable Stack reserves. | Remove the reserved variable (such as STACK_SESSION or MISE_*) from `[env]`. | no | - |
 | `invalid_path` | A configured path is not a directory inside the project. | Use a relative directory inside the project root, such as ".claude/skills". | no | - |
 | `invalid_secret` | A secret name cannot be granted. | Use an upper-case variable name that no service, `[env]` entry or Stack/mise variable uses. | no | - |
-| `invalid_service` | A service definition is malformed. | Set exactly one of `preset` or `run` for the service in stack.toml or the bundle. | no | - |
+| `invalid_service` | A service definition is malformed (its name is not one path component, say), or services collide (a name, an identity variable, or a second Postgres or Redis preset). | Follow the message: set exactly one of `preset` or `run`, name a service without `/` (and not `.` or `..`), rename a colliding service, or keep one service per Postgres or Redis preset. | no | - |
 | `invalid_tool` | A tool option or name is invalid. | Fix the `[tools]` entry the message names, then run `stack compile`. | no | - |
 | `io` | A file or directory could not be read or written. | Check the path and permissions in the message (and free disk space), then retry. | yes | - |
 | `lock_busy` | Another Stack command holds the lock this one needs. | Wait for the other Stack command in this checkout to finish, then retry. | yes | - |
@@ -58,10 +59,11 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `no_lease` | `renew` was called but the session has no lease to renew. | Nothing to renew: start the session with `stack up --ttl <duration>` or `--owner-pid` if it should expire. | no | - |
 | `no_session` | No session is running in this checkout. | Run `stack up` first. | no | `stack up` |
 | `not_ready` | Services started but failed verification. | Read each service's reason in details, check `stack logs <service>`, fix the cause and run `stack up` again. | yes | `stack status` |
-| `oci_auth_untrusted` | A registry redirected authentication to another origin; Stack refused. | Check the registry URL; credentials are only sent to the registry's own origin. | no | - |
+| `oci_auth_untrusted` | A registry redirected authentication to another origin or an unapproved token service; Stack refused. | Check the registry URL; approve a token service only by listing its origin in STACK_OCI_AUTH_REALMS. | no | - |
+| `oci_credentials_unbound` | STACK_OCI_USERNAME / STACK_OCI_PASSWORD are incomplete or not bound to a registry origin; Stack sent no credentials. | Set STACK_OCI_REGISTRY to the origin the credentials belong to (e.g. https://ghcr.io), or unset the credentials. | no | - |
 | `oci_failed` | An OCI registry request failed. | Read the HTTP status in the message, check the registry, then retry. | yes | - |
 | `oci_not_found` | The OCI reference does not exist in the registry. | Check the repository, tag or digest in the reference. | no | - |
-| `oci_unauthorized` | The OCI registry refused the credentials (HTTP 401/403). | Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry, then retry. | no | - |
+| `oci_unauthorized` | The OCI registry refused the credentials (HTTP 401/403). | Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD with STACK_OCI_REGISTRY set to this registry's origin, then retry. | no | - |
 | `oci_unreachable` | The OCI registry could not be reached. | Check the network and the registry host name, then retry. | yes | - |
 | `owner_not_found` | No ancestor process of Stack has the name given to `--owner-pid ancestor:<name>`. | Pick a name from the ancestor chain in details, pass a process ID with `--owner-pid <pid>`, or use `--ttl 30m` instead. | no | - |
 | `port_conflict` | Another program holds a port this checkout reserved. | Run `stack compile --reassign-ports`, then `stack up`; Stack never kills the other program. | no | `stack compile --reassign-ports`, then `stack up` |
@@ -73,6 +75,7 @@ filled in. `stack errors --json` (MCP: `stack_errors`) returns this table.
 | `ref_not_found` | A git bundle's `ref=` names no branch, tag or commit. | Fix the `?ref=` value in the bundle source. | no | - |
 | `ref_required` | An OCI reference has no tag or digest. | Pin a tag or digest, such as oci:ghcr.io/acme/pybase:1.0.0. | no | - |
 | `resolve_failed` | A version request could not be resolved; stack.lock and the provider config were not changed. | Check the version requests the message names exist, and the network, then run `stack compile` again. | yes | - |
+| `restore_incomplete` | A snapshot restore of several services could not be finished or undone, or was interrupted; its services are left stopped. | Run the snapshot command again or `stack up`: Stack first finishes or undoes the interrupted restore. Data marked `manual_recovery` must be moved back where details say, then the journal they name removed. | yes | - |
 | `root_unsupported` | PostgreSQL refuses to run as root, and Stack is running as root. | Run Stack as an unprivileged user that owns the checkout (e.g. `su dev -c 'stack up'`); installs and tools-only commands work as root. | no | - |
 | `secret_missing` | fnox does not know a granted secret. | Define the key in fnox.toml for the active profile (FNOX_PROFILE), or remove the grant. | no | - |
 | `secret_unavailable` | fnox could not be run or could not resolve the secrets. | Run `stack doctor`, then `fnox env --json --describe` in the project to see fnox's own message. | yes | - |

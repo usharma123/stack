@@ -14,9 +14,15 @@
 //!   last applied, and for each service its status, pid, process start time, process group,
 //!   port and data directory. Written only by the supervisor (or, once it is gone, by the command
 //!   that cleaned up after it), atomically.
+//! - Both records carry `schema_version` ([`SCHEMA_VERSION`]). One without it was written by
+//!   Stack 0.1.24 or earlier, or by a supervisor of such a release still running after Stack was
+//!   upgraded: the same layout, read as it is. One of a later version is refused (`state_invalid`),
+//!   never read as empty, and nothing is written over it or stopped on its word.
 //! - `lock`, held exclusively by the live supervisor, so two never run for one checkout.
 //! - `logs/<service>.log`, each line of the service's output prefixed with when it was read
-//!   (Unix milliseconds), which `stack logs` reads.
+//!   (Unix milliseconds), which `stack logs` reads (see the section on reading logs). One writer
+//!   thread per service writes it, from a queue bounded in bytes ([`LogQueue`]): output that
+//!   finds no room waits briefly, then is dropped and the drop noted in the log.
 //!
 //! A command changes `spec.json` and sends the supervisor `SIGHUP` (bound to the pid and start
 //! time `state.json` records), or starts one when none runs, then waits until `state.json` says
@@ -76,6 +82,12 @@ fn exempt_for(dir: &Path) -> crate::commands::Exempt {
     crate::commands::Exempt::load(state, project.as_deref())
 }
 
+/// The layout of `spec.json` and `state.json` this Stack writes, as their `schema_version`.
+/// Records without one (Stack 0.1.24 and earlier) have this layout too; a record of a higher
+/// version is refused (see [`check_schema`]). Raise it only for a change older readers would
+/// misread: an added field with a default is not one (every reader ignores unknown fields).
+pub const SCHEMA_VERSION: u64 = 1;
+
 fn spec_path(dir: &Path) -> PathBuf {
     dir.join("spec.json")
 }
@@ -87,6 +99,53 @@ fn state_path(dir: &Path) -> PathBuf {
 /// Where the supervisor keeps `service`'s output.
 pub fn log_path(dir: &Path, service: &str) -> PathBuf {
     dir.join("logs").join(format!("{service}.log"))
+}
+
+/// The name of `service`'s log file in the log directory (`older`: the rotated one), when the
+/// service has a name that is one (see [`crate::manifest::valid_service_name`]).
+fn log_name(service: &str, older: bool) -> std::io::Result<std::ffi::CString> {
+    if !crate::manifest::valid_service_name(service) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{service:?} names no service log")));
+    }
+    let name = if older { format!("{service}.log.1") } else { format!("{service}.log") };
+    std::ffi::CString::new(name).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+/// The log directory of the supervisor in `dir`, itself and never a link in its place: what is
+/// opened in it is in this checkout's directory, whatever a link would point at.
+fn logs_dir(dir: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let logs = dir.join("logs");
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&logs).map_err(|e| unfollowed(&logs, e))?;
+    Ok(file.into())
+}
+
+/// A log file `name` in the log directory `logs`, opened with `flags`: the file itself, never a
+/// link in its place, and only a regular file (a FIFO there would hold a reader forever).
+fn log_file(logs: &std::os::fd::OwnedFd, name: &std::ffi::CStr, flags: libc::c_int) -> std::io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let shown = Path::new(std::ffi::OsStr::from_bytes(name.to_bytes()));
+    // SAFETY: openat on a descriptor this function borrows, with a NUL-terminated name; the
+    // mode is read only with O_CREAT.
+    let fd = unsafe { libc::openat(logs.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o666 as libc::c_uint) };
+    if fd < 0 {
+        return Err(unfollowed(shown, std::io::Error::last_os_error()));
+    }
+    // SAFETY: a descriptor just opened, owned by nothing else.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(format!("{} is not a regular file", shown.display())));
+    }
+    Ok(file)
+}
+
+/// `e`, saying so when it is a link Stack would not follow.
+fn unfollowed(path: &Path, e: std::io::Error) -> std::io::Error {
+    if e.raw_os_error() == Some(libc::ELOOP) || (e.raw_os_error() == Some(libc::ENOTDIR) && path.is_symlink()) {
+        return std::io::Error::other(format!("{} is a symbolic link; Stack reads and writes service logs only in the checkout's own log directory", path.display()));
+    }
+    e
 }
 
 // ---- records -------------------------------------------------------------------------------
@@ -102,6 +161,10 @@ pub struct Spec {
     /// The checkout the services are of, so `gc` can tell when it is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<PathBuf>,
+    /// Where the checkout was, so `gc` takes it to be gone only when that can be shown (see
+    /// [`crate::checkout::Recorded`]).
+    #[serde(flatten)]
+    pub project_at: crate::checkout::Recorded,
     /// The checkout's token, which every process of its services carries: how what a dead
     /// supervisor left is told from other processes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,11 +325,122 @@ fn invalid(path: &Path, e: impl std::fmt::Display) -> StackError {
     StackError::new("state_invalid", format!("{}: {e}", path.display())).hint(hint)
 }
 
+/// A record whose `schema_version` is above [`SCHEMA_VERSION`]: written by a newer Stack, its
+/// meaning unknown, so neither read as nothing nor replaced.
+fn unsupported(path: &Path, version: u64) -> StackError {
+    StackError::new(
+        "state_invalid",
+        format!("{}: written by a newer Stack (schema_version {version}; this Stack reads {SCHEMA_VERSION} and unversioned records)", path.display()),
+    )
+    .hint("use the Stack release that wrote it, or a newer one, for this checkout: this one stops, starts, writes and removes nothing on the strength of a record it cannot read")
+    .with_detail(serde_json::json!({ "record": path, "schema_version": version, "supported": SCHEMA_VERSION }))
+}
+
+/// Whether this Stack reads a record of `value`'s `schema_version`: none (written before it
+/// existed) or one up to [`SCHEMA_VERSION`].
+fn check_schema(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let Some(version) = value.get("schema_version") else { return Ok(()) };
+    match version.as_u64() {
+        Some(1..=SCHEMA_VERSION) => Ok(()),
+        Some(n) if n > SCHEMA_VERSION => Err(unsupported(path, n)),
+        _ => Err(invalid(path, format!("schema_version must be a positive integer, not {version}"))),
+    }
+}
+
+/// A record read from `path`, checked for its schema before anything else is made of it.
+fn parse_record<T: serde::de::DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| invalid(path, e))?;
+    if !value.is_object() {
+        return Err(invalid(path, "not a JSON object"));
+    }
+    check_schema(path, &value)?;
+    serde_json::from_value(value).map_err(|e| invalid(path, e))
+}
+
+/// `record` as written: its fields after `schema_version` ([`SCHEMA_VERSION`]).
+fn record_bytes<T: Serialize>(record: &T) -> Vec<u8> {
+    let mut map = serde_json::Map::new();
+    map.insert("schema_version".into(), SCHEMA_VERSION.into());
+    if let serde_json::Value::Object(fields) = serde_json::to_value(record).expect("record serializes") {
+        map.extend(fields.into_iter().filter(|(k, _)| k != "schema_version"));
+    }
+    serde_json::to_vec_pretty(&serde_json::Value::Object(map)).expect("record serializes")
+}
+
+const SYMLINK: &str = "a symbolic link, which Stack does not follow";
+
+/// What a file of `kind` is, for an error saying a record path holds one instead of a file.
+fn kind_name(kind: fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    match kind {
+        k if k.is_dir() => "a directory",
+        k if k.is_symlink() => SYMLINK,
+        k if k.is_fifo() => "a FIFO",
+        k if k.is_socket() => "a socket",
+        k if k.is_block_device() || k.is_char_device() => "a device",
+        _ => "a file of another kind",
+    }
+}
+
+/// The error for a record path holding `kind` instead of a regular file: `InvalidData`, which
+/// only this gives (reading bytes never does), so a caller can tell it from a failed read.
+fn not_a_file(kind: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not a regular file: {kind}"))
+}
+
+/// The regular file at `path`, open for reading, with what its descriptor names; `None` when
+/// nothing is there. Anything else there (a symbolic link, never followed; a directory, a FIFO,
+/// a socket, a device) is a [`not_a_file`] error, found without blocking and before a byte is
+/// read: the path is looked at first, so what is not a file is normally not even opened, then
+/// opened non-blocking, without following a link or taking a terminal, and what the descriptor
+/// names is checked again (the path may have been replaced between the look and the open).
+/// Only the last component is not followed: the directories above it are Stack's own.
+fn open_regular(path: &Path) -> std::io::Result<Option<(fs::File, fs::Metadata)>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let absent = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => return Err(not_a_file(kind_name(meta.file_type()))),
+        Ok(_) => {}
+        Err(e) if absent(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC).open(path) {
+        Ok(file) => file,
+        Err(e) if absent(&e) => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_a_file(SYMLINK)),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(not_a_file(kind_name(meta.file_type())));
+    }
+    Ok(Some((file, meta)))
+}
+
+/// The bytes of the regular file at `path` (see [`open_regular`]); `None` when nothing is there.
+fn read_regular(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let Some((mut file, _)) = open_regular(path)? else { return Ok(None) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// A record's error for a failure to read `path`: one that is not a regular file is a record
+/// that cannot be read ([`invalid`]); any other failure (no permission, an I/O error) is `io`.
+fn read_failed(path: &Path, e: std::io::Error) -> StackError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        invalid(path, e)
+    } else {
+        io_error(path.display(), e)
+    }
+}
+
+/// The record at `path`: `None` when nothing is there; an error for anything there that is not
+/// a regular file holding a record this Stack reads (see [`open_regular`] and [`parse_record`]).
 fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| invalid(path, e)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_error(path.display(), e)),
+    match read_regular(path).map_err(|e| read_failed(path, e))? {
+        Some(bytes) => parse_record(path, &bytes).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -278,6 +452,14 @@ pub fn read_spec(dir: &Path) -> Result<Option<Spec>> {
 /// `state.json`: `None` when there is none; an error when one exists that cannot be read.
 pub fn read_state(dir: &Path) -> Result<Option<State>> {
     read_record(&state_path(dir))
+}
+
+/// Both records, when they exist, can be read: before anything is stopped or started on what
+/// the listing ([`daemons`], which takes an unreadable record for nothing) says.
+pub fn readable(dir: &Path) -> Result<()> {
+    read_spec(dir)?;
+    read_state(dir)?;
+    Ok(())
 }
 
 /// `state.json` for listing only: one that cannot be read lists as nothing.
@@ -359,7 +541,7 @@ pub fn daemons(dir: &Path, configured: &[(String, u16, Option<PathBuf>)]) -> Vec
 // ---- commands ------------------------------------------------------------------------------
 
 fn failed(code: &'static str, message: String, dir: &Path) -> StackError {
-    let log = fs::read_to_string(dir.join("supervisor.log")).unwrap_or_default();
+    let log = read_regular(&dir.join("supervisor.log")).ok().flatten().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     let tail: Vec<&str> = log.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
     let mut e = StackError::new(code, message).hint("retry; `stack down` stops whatever the supervisor started");
     if !tail.is_empty() {
@@ -483,7 +665,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
     let state = read_state(dir)?.unwrap_or_default();
     change(&mut spec);
     spec.revision = spec.revision.max(state.applied) + 1;
-    let bytes = serde_json::to_vec_pretty(&spec).expect("spec serializes");
+    let bytes = record_bytes(&spec);
     write_atomic(&spec_path(dir), &bytes).map_err(|e| io_error(spec_path(dir).display(), e))?;
     let mut spawned_at = None;
     if !signal_supervisor(&state, libc::SIGHUP) {
@@ -494,7 +676,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
         if spec.shutdown {
             // Nothing to start: record that the dead supervisor's services are gone.
             let done = State { supervisor: None, applied: spec.revision, services: settled(&state.services), project: spec.project.clone(), token: spec.token.clone() };
-            write_state(dir, &done).map_err(|e| io_error(state_path(dir).display(), e))?;
+            replace_state(dir, &done)?;
             return Ok(done);
         }
         spawn(dir)?;
@@ -504,7 +686,10 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
     let mut respawned = false;
     let mut pause = Duration::from_millis(1);
     loop {
-        let now = state_lossy(dir);
+        seam("apply_poll");
+        // A state that exists but cannot be read (damaged, a newer Stack's, not a file) says
+        // nothing of what runs: never a dead supervisor to replace, nor one to settle.
+        let now = read_state(dir)?.unwrap_or_default();
         if now.applied >= spec.revision && (alive(&now) || spec.shutdown) {
             return Ok(now);
         }
@@ -519,7 +704,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
             }
             if spec.shutdown {
                 let done = State { supervisor: None, applied: spec.revision, services: settled(&now.services), project: spec.project.clone(), token: spec.token.clone() };
-                write_state(dir, &done).map_err(|e| io_error(state_path(dir).display(), e))?;
+                replace_state(dir, &done)?;
                 return Ok(done);
             }
             respawned = true;
@@ -558,10 +743,24 @@ fn settled(services: &IndexMap<String, Instance>) -> IndexMap<String, Instance> 
 /// Never creates `dir`: a supervisor whose directory was removed must not bring it back (with
 /// every parent the removal took) by writing its last record.
 fn write_state(dir: &Path, state: &State) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(state).expect("state serializes");
+    let bytes = record_bytes(state);
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&bytes)?;
     tmp.persist(state_path(dir)).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// [`write_state`] by a command, over the record it read: staged completely first, then the
+/// record about to be replaced read again, and replaced only when it is still one this Stack
+/// can read (or gone). One that became unreadable meanwhile (damaged, a newer Stack's) is kept.
+fn replace_state(dir: &Path, state: &State) -> Result<()> {
+    let path = state_path(dir);
+    let bytes = record_bytes(state);
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| io_error(path.display(), e))?;
+    tmp.write_all(&bytes).map_err(|e| io_error(path.display(), e))?;
+    seam("state_replace");
+    read_state(dir)?;
+    tmp.persist(&path).map_err(|e| io_error(path.display(), e.error))?;
     Ok(())
 }
 
@@ -572,6 +771,9 @@ pub fn start(dir: &Path, project: &Path, specs: &IndexMap<String, ServiceSpec>, 
     apply(dir, |spec| {
         spec.shutdown = false;
         spec.project = Some(project.to_path_buf());
+        // Started for the checkout at `project`, which adopts the record (see
+        // [`crate::checkout::Recorded`]).
+        spec.project_at = crate::checkout::Recorded::adopted(project, &spec.project_at);
         spec.token = specs.values().find_map(|s| s.env.get(crate::checkout::TOKEN_VAR).cloned()).or(spec.token.take());
         let previous = std::mem::take(&mut spec.services);
         for (name, def) in specs {
@@ -669,7 +871,7 @@ pub fn shutdown_accounted(dir: &Path, expected: &Expected) -> Result<()> {
     // Staged completely first (mode included); then the spec about to be replaced is read
     // again, and must be the same file and still this checkout's; then only the rename.
     let path = spec_path(dir);
-    let bytes = serde_json::to_vec_pretty(&spec).expect("spec serializes");
+    let bytes = record_bytes(&spec);
     let staged = stage(&path, &bytes).map_err(|e| io_error(path.display(), e))?;
     seam("spec_staged");
     let (again, now) = read_spec_identified(dir)?;
@@ -723,7 +925,7 @@ fn settle_dead(dir: &Path, expected: &Expected, state: &State, revision: u64) ->
 /// about to be replaced read again and required to name this checkout, then only the rename.
 fn publish_state_checked(dir: &Path, expected: &Expected, state: &State) -> Result<()> {
     let path = state_path(dir);
-    let bytes = serde_json::to_vec_pretty(state).expect("state serializes");
+    let bytes = record_bytes(state);
     let staged = stage(&path, &bytes).map_err(|e| io_error(path.display(), e))?;
     seam("state_staged");
     identified_state(dir, expected)?;
@@ -736,11 +938,10 @@ fn read_spec_identified(dir: &Path) -> Result<(Spec, (u64, u64))> {
     use std::os::unix::fs::MetadataExt;
     let path = spec_path(dir);
     let gone = || not_evidence(dir, "its spec.json is gone".into());
-    let mut file = fs::File::open(&path).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { gone() } else { io_error(path.display(), e) })?;
-    let meta = file.metadata().map_err(|e| io_error(path.display(), e))?;
+    let (mut file, meta) = open_regular(&path).map_err(|e| read_failed(&path, e))?.ok_or_else(gone)?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_error(path.display(), e))?;
-    let spec = serde_json::from_slice(&bytes).map_err(|e| invalid(&path, e))?;
+    let spec = parse_record(&path, &bytes)?;
     Ok((spec, (meta.dev(), meta.ino())))
 }
 
@@ -810,12 +1011,11 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
     let deadline = Instant::now() + crate::process::bounded(STOP_WAIT);
     let mut pause = Duration::from_millis(2);
     loop {
-        if accounted.is_some() {
-            seam("wait_poll");
-        }
+        seam("wait_poll");
+        // One that cannot be read is no evidence that anything stopped.
         let state = match accounted {
             Some(expected) => evidence(dir, expected)?,
-            None => state_lossy(dir),
+            None => read_state(dir)?.unwrap_or_default(),
         };
         let left: Vec<serde_json::Value> = state
             .services
@@ -831,7 +1031,7 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
             // Recovering: the expected token, never what the spec says now.
             let token = match accounted {
                 Some(expected) => Some(expected.token.to_string()),
-                None => read_spec(dir).ok().flatten().and_then(|s| s.token),
+                None => read_spec(dir)?.and_then(|s| s.token),
             };
             let survivors = recover(dir, &state, token.as_deref());
             if !survivors.is_empty() {
@@ -841,7 +1041,7 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
                 let settled_state = State { supervisor: None, applied: state.applied, services: settled(&state.services), ..state.clone() };
                 match accounted {
                     Some(expected) => publish_state_checked(dir, expected, &settled_state)?,
-                    None => write_state(dir, &settled_state).map_err(|e| io_error(state_path(dir).display(), e))?,
+                    None => replace_state(dir, &settled_state)?,
                 }
             }
             return Ok(());
@@ -863,8 +1063,9 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
 /// Remove the supervisor directory `dir` (its spec, state and the services' logs) once nothing
 /// it recorded runs. Whether it was removed (or was not there).
 pub fn forget(dir: &Path) -> bool {
-    let state = state_lossy(dir);
-    if alive(&state) || !unresolved(dir).is_empty() {
+    // A record that cannot be read (damaged, or of a newer Stack) is no evidence nothing runs.
+    let Ok(state) = read_state(dir).map(Option::unwrap_or_default) else { return false };
+    if read_spec(dir).is_err() || alive(&state) || !unresolved(dir).is_empty() {
         return false;
     }
     match fs::remove_dir_all(dir) {
@@ -873,15 +1074,16 @@ pub fn forget(dir: &Path) -> bool {
     }
 }
 
-/// Supervisor directories in the Stack state `state` whose checkout no longer exists, with that
-/// checkout's path.
-pub fn orphaned_dirs(state: &Path) -> Vec<(PathBuf, PathBuf)> {
+/// Supervisor directories in the Stack state `state` whose checkout is shown to be gone (see
+/// [`crate::checkout::presence`]), with that checkout's path and where it was recorded.
+pub fn orphaned_dirs(state: &Path) -> Vec<(PathBuf, PathBuf, crate::checkout::Recorded)> {
     let Ok(entries) = fs::read_dir(state.join("supervisors")) else { return Vec::new() };
     entries
         .flatten()
         .filter_map(|e| {
-            let project = read_spec(&e.path()).ok()??.project?;
-            (!project.exists()).then(|| (e.path(), project))
+            let spec = read_spec(&e.path()).ok()??;
+            let project = spec.project?;
+            crate::checkout::gone(&project, &spec.project_at).then(|| (e.path(), project, spec.project_at))
         })
         .collect()
 }
@@ -1009,11 +1211,19 @@ pub fn recover(dir: &Path, state: &State, token: Option<&str>) -> Vec<serde_json
 /// to be the checkout's. Empty while the supervisor runs (it accounts for its services) and
 /// once nothing recorded remains. Data operations refuse while this is not empty.
 pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
-    let state = state_lossy(dir);
+    // One that cannot be read says nothing of what runs: that is not "nothing".
+    let state = match read_state(dir) {
+        Ok(state) => state.unwrap_or_default(),
+        Err(e) => return vec![serde_json::json!({ "record": state_path(dir), "reason": format!("cannot be read: {}", e.message) })],
+    };
     if alive(&state) {
         return Vec::new();
     }
-    let token = read_spec(dir).ok().flatten().and_then(|s| s.token);
+    // Nor one whose spec cannot be read: its token is how the services' processes are found.
+    let token = match read_spec(dir) {
+        Ok(spec) => spec.and_then(|s| s.token),
+        Err(e) => return vec![serde_json::json!({ "record": spec_path(dir), "reason": format!("cannot be read: {}", e.message) })],
+    };
     let (strays, others, mut unverified) = scan(&state, token.as_deref(), &exempt_for(dir));
     let mut found: Vec<serde_json::Value> = strays.iter().map(|s| serde_json::json!({ "service": s.service, "pid": s.chain[0].pid })).collect();
     found.extend(others.iter().map(|p| serde_json::json!({ "pid": p.pid })));
@@ -1021,48 +1231,441 @@ pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
     found
 }
 
-/// The last `tail` lines `service` wrote, oldest first, keeping only lines read at or after
-/// `since` (Unix milliseconds) when given; and whether older output was left unread.
-pub fn logs(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::io::Result<(Vec<String>, bool)> {
-    let path = log_path(dir, service);
-    let mut older = path.as_os_str().to_owned();
-    older.push(".1");
+// ---- reading logs ----------------------------------------------------------------------------
+//
+// A log is a sequence of records, each `<unix ms> <line>\n`, written whole by the service's one
+// writer (see [`write_log`]), which renames the file to `<service>.log.1` (replacing the one
+// before) once it passes [`LOG_ROTATE_BYTES`]. Every file that writer makes begins with a header
+// line naming its generation, a number drawn at random when the file is made (see
+// [`log_header`]); files an older Stack's writer made have none. A reader names where it got to
+// by a cursor ([`LogPos`]): which file (device and inode, its generation, and a check of the
+// record before the offset, so a rotation, a recreated file or a recycled inode is told apart
+// from more output) and the byte offset after the last whole record it read. Reading from a
+// cursor reads only what was written since: the rest of the rotated file if the cursor is in
+// it, then the current one, and says what it could not return ([`Gap`]). Only whole records are
+// returned: one still being written (no newline yet) is left for the next read, except at the
+// end of a rotated file, which no one writes again, where it is returned as it is.
+
+/// What a log file this Stack's writer makes begins with, before the generation (32 lowercase
+/// hex digits) and a newline. Every record the writer stores begins with a digit, so no record
+/// can be taken for it; readers skip it.
+const HEADER_PREFIX: &[u8] = b"# stack log ";
+/// The header's length: its prefix, the generation and the newline.
+const HEADER_LEN: usize = HEADER_PREFIX.len() + 32 + 1;
+
+/// The header line of a log file of generation `gen`.
+pub(crate) fn log_header(gen: u128) -> Vec<u8> {
+    format!("# stack log {gen:032x}\n").into_bytes()
+}
+
+/// The generation a file beginning with `bytes` names in its header, if it has one.
+fn header_generation(bytes: &[u8]) -> Option<u128> {
+    let rest = bytes.strip_prefix(HEADER_PREFIX)?;
+    let hex = rest.get(..32)?;
+    (rest.get(32) == Some(&b'\n') && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| u128::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok())
+        .flatten()
+}
+
+/// A new file's generation: 128 random bits, so no two files of a log (nor a file and the one a
+/// recycled inode held before) share one, whatever crashes, restarts or clocks did between them.
+fn new_generation() -> u128 {
+    // `/dev/urandom` on every platform Stack builds for (glibc, musl, macOS), where libc's
+    // `getentropy` is not declared for all of them.
+    let mut bytes = [0u8; 16];
+    if fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_ok() {
+        return u128::from_le_bytes(bytes);
+    }
+    // No entropy to be had (never seen): what this process has made distinct, hashed.
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seed = format!("{} {nanos} {}", std::process::id(), MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    u128::from_str_radix(&crate::hash::sha256_hex(seed.as_bytes())[..32], 16).unwrap_or(nanos)
+}
+
+/// Bytes of a record, from its start, a position's check covers (with the record's length).
+const CHECK_BYTES: u64 = 64;
+
+/// The check of a position after a record of `len` bytes beginning with `start` (at most
+/// [`CHECK_BYTES`] of them): FNV-1a over the length and those bytes.
+fn digest(len: u64, start: &[u8]) -> u64 {
+    len.to_le_bytes().iter().chain(start).fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The check of the position `offset` in `log` (at most its length): [`digest`] of the record
+/// that ends there, which begins after the last newline before its last byte (no more than
+/// [`LOGS_LIMIT`] back). A log file is only ever appended to, so the check of a position in it
+/// never changes; a file that is not the one a cursor was taken in has another record there.
+fn check_at(log: &Opened, offset: u64) -> std::io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let floor = offset.saturating_sub(LOGS_LIMIT);
+    let mut begin = floor;
+    let mut end = offset.saturating_sub(1);
+    while end > floor {
+        let from = end.saturating_sub(4096).max(floor);
+        let mut bytes = vec![0; (end - from) as usize];
+        log.file.read_exact_at(&mut bytes, from)?;
+        if let Some(i) = bytes.iter().rposition(|b| *b == b'\n') {
+            begin = from + i as u64 + 1;
+            break;
+        }
+        end = from;
+    }
+    let mut start = vec![0; (offset - begin).min(CHECK_BYTES) as usize];
+    log.file.read_exact_at(&mut start, begin)?;
+    Ok(digest(offset - begin, &start))
+}
+
+/// One line of a service's output: when the supervisor read it (Unix ms; 0 for a line that
+/// carries no stamp) and the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub at_ms: u64,
+    pub line: String,
+}
+
+impl Record {
+    fn parse(line: &str) -> Record {
+        match line.split_once(' ') {
+            Some((ms, rest)) if !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()) => Record { at_ms: ms.parse().unwrap_or(0), line: rest.to_string() },
+            _ => Record { at_ms: 0, line: line.to_string() },
+        }
+    }
+}
+
+/// Where a reader of one service's log got to: the file (device, inode, generation) and the
+/// offset just past the last whole record read, with a check of that record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPos {
+    pub dev: u64,
+    pub ino: u64,
+    pub offset: u64,
+    /// The file's generation (its header: see [`log_header`]); `None` for a file without one,
+    /// which an older Stack's writer made.
+    pub gen: Option<u128>,
+    /// [`check_at`] the offset when the position was taken; `None` for a cursor an older Stack
+    /// gave (`v1`), which names its file by device and inode alone.
+    pub check: Option<u64>,
+}
+
+/// Output a read from a cursor could not return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gap {
+    /// The file the cursor is in is now shorter than the cursor (it was truncated): what it held
+    /// past the cut is gone, and it is read again from its start. (Stack's writer never
+    /// truncates; a file cut by hand and written past the cursor again cannot be told from one
+    /// that grew.)
+    Truncated,
+    /// The file the cursor was in is no longer kept (rotated out, or removed and recreated,
+    /// whether or not the new file has its inode), or cannot be shown to be (a cursor an older
+    /// Stack gave, or a position in a file without a header whose record there differs): output
+    /// between the cursor and the oldest file kept is gone, and that file is read from its start.
+    Rotated,
+}
+
+/// What a read from a cursor returned.
+#[derive(Debug, Default)]
+pub struct LogRead {
+    pub records: Vec<Record>,
+    /// The cursor just past each record, for a caller that keeps only some of them.
+    pub ends: Vec<LogPos>,
+    /// The cursor after them; `None` when the service has no log yet.
+    pub pos: Option<LogPos>,
+    pub gap: Option<Gap>,
+    /// It stopped at a limit with whole records left: read again from `pos` for them.
+    pub more: bool,
+}
+
+/// A log file, open, with what it was when opened (from the descriptor, so a rotation after the
+/// open changes nothing read).
+struct Opened {
+    file: fs::File,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    /// Its generation, when it begins with a header.
+    gen: Option<u128>,
+    /// Where its first record begins: after its header, or 0.
+    head: u64,
+}
+
+impl Opened {
+    /// The position `offset` in this file.
+    fn pos(&self, offset: u64) -> std::io::Result<LogPos> {
+        Ok(LogPos { dev: self.dev, ino: self.ino, offset, gen: self.gen, check: Some(check_at(self, offset)?) })
+    }
+}
+
+/// How a kept log file stands to a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    /// The cursor's file, as it was: read on from the cursor.
+    Same,
+    /// The cursor's file, cut by hand since (shorter than the cursor, its header gone, or another
+    /// record before the cursor): read again from its start.
+    Cut,
+    /// Not shown to be the cursor's file.
+    Other,
+}
+
+/// How `log` stands to the cursor `pos`. A file of the same device and inode is the cursor's only
+/// when it shows it: of the same generation (or both without one) with the cursor's record still
+/// before the offset. A recycled inode holds a file of another generation (Stack's writer heads
+/// every file it makes), or, among files an older writer made, another record there. Of those
+/// older files, one shorter than the cursor is taken for the cursor's file cut, as before
+/// generations; a cursor from before generations (`v1`) shows nothing.
+fn kept(log: &Opened, pos: &LogPos) -> std::io::Result<Kept> {
+    if (log.dev, log.ino) != (pos.dev, pos.ino) {
+        return Ok(Kept::Other);
+    }
+    let Some(check) = pos.check else { return Ok(Kept::Other) };
+    Ok(match (pos.gen, log.gen) {
+        (Some(a), Some(b)) if a == b => {
+            if pos.offset < log.head || log.len < pos.offset || check_at(log, pos.offset)? != check {
+                Kept::Cut
+            } else {
+                Kept::Same
+            }
+        }
+        // The header is gone: only a cut by hand takes it.
+        (Some(_), None) => Kept::Cut,
+        (None, None) if log.len < pos.offset => Kept::Cut,
+        (None, None) if check_at(log, pos.offset)? == check => Kept::Same,
+        _ => Kept::Other,
+    })
+}
+
+/// `service`'s log in the supervisor directory `dir` (`older`: the rotated one), `None` when there
+/// is none. One that cannot be opened as the checkout's own regular file is an error, never
+/// taken for no output.
+fn open_log(dir: &Path, service: &str, older: bool) -> std::io::Result<Option<Opened>> {
+    use std::os::unix::fs::MetadataExt;
+    let absent = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let name = log_name(service, older)?;
+    let logs = match logs_dir(dir) {
+        Err(e) if absent(&e) => return Ok(None),
+        logs => logs?,
+    };
+    let file = match log_file(&logs, &name, libc::O_RDONLY | libc::O_NONBLOCK) {
+        Err(e) if absent(&e) => return Ok(None),
+        file => file?,
+    };
+    let meta = file.metadata()?;
+    let mut header = [0u8; HEADER_LEN];
+    let gen = if meta.len() >= HEADER_LEN as u64 {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut header, 0)?;
+        header_generation(&header)
+    } else {
+        None
+    };
+    let head = if gen.is_some() { HEADER_LEN as u64 } else { 0 };
+    Ok(Some(Opened { dev: meta.dev(), ino: meta.ino(), len: meta.len(), gen, head, file }))
+}
+
+/// Where a cursor read of `service`'s whole log begins: the start of the oldest file kept (the
+/// rotated one, else the current one); `None` while there is no log.
+pub fn log_start(dir: &Path, service: &str) -> std::io::Result<Option<LogPos>> {
+    let Some(log) = (match open_log(dir, service, true)? {
+        Some(older) => Some(older),
+        None => open_log(dir, service, false)?,
+    }) else {
+        return Ok(None);
+    };
+    log.pos(log.head).map(Some)
+}
+
+/// Records with the offset just past each and its check, the offset after the last, and whether
+/// a limit stopped the read with whole records left.
+type Chunk = (Vec<(Record, u64, u64)>, u64, bool);
+
+/// Whether a read of `log` from `offset` with `full` bytes would return a record: a whole one
+/// starts there, the trailing one of a `finished` (rotated) file, or one longer than any read
+/// allows (taken cut). A record still being written (no newline yet) is not one.
+fn record_at(log: &Opened, offset: u64, full: u64, finished: bool) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let left = log.len.saturating_sub(offset);
+    if left == 0 || left > full || finished {
+        return Ok(left > 0);
+    }
+    let mut bytes = vec![0; left as usize];
+    log.file.read_exact_at(&mut bytes, offset)?;
+    Ok(bytes.contains(&b'\n'))
+}
+
+/// Whole records of `log` from `offset`, at most `max_records` of them in at most `max_bytes`:
+/// the records, the offset after the last, and whether a limit stopped it with whole records
+/// left. `finished` (a rotated file) returns a trailing record without its newline too. `full`
+/// is all a read allows; only when `max_bytes` is that, not what an earlier file of the read
+/// left, is a record longer than `max_bytes` taken cut (it could never be read otherwise); a
+/// record that only the rest of a budget cannot hold is left whole for the next read.
+fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u64, full: u64, finished: bool) -> std::io::Result<Chunk> {
+    let whole = max_bytes == full;
+    let available = log.len.saturating_sub(offset);
+    let want = available.min(max_bytes);
+    if want == 0 || max_records == 0 {
+        return Ok((Vec::new(), offset, max_records == 0 && record_at(log, offset, full, finished)?));
+    }
+    log.file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut bytes = Vec::with_capacity(want as usize);
+    (&mut log.file).take(want).read_to_end(&mut bytes)?;
+    let mut records = Vec::new();
+    let mut consumed = 0;
+    // The check of the position after the record `bytes[begin..end]`: the first record's from
+    // the file (it may begin before `offset`, in the middle of a record cut by an earlier read),
+    // each later one's from what was read (it begins where the one before ended).
+    let check = |begin: usize, end: usize| -> std::io::Result<u64> {
+        let len = (end - begin) as u64;
+        if begin == 0 || len > LOGS_LIMIT {
+            return check_at(log, offset + end as u64);
+        }
+        Ok(digest(len, &bytes[begin..end.min(begin + CHECK_BYTES as usize)]))
+    };
+    while records.len() < max_records {
+        let rest = &bytes[consumed..];
+        let Some(end) = rest.iter().position(|b| *b == b'\n') else {
+            // A record still being written waits for its newline; at the end of a finished file,
+            // or one longer than any read allows (never written by Stack), it is taken as it is.
+            let complete = !rest.is_empty() && ((finished && want == available) || (whole && consumed == 0 && want == max_bytes && want < available));
+            if complete {
+                let begin = consumed;
+                consumed = bytes.len();
+                records.push((Record::parse(&String::from_utf8_lossy(rest)), offset + consumed as u64, check(begin, consumed)?));
+            }
+            break;
+        };
+        let begin = consumed;
+        consumed += end + 1;
+        records.push((Record::parse(&String::from_utf8_lossy(&rest[..end])), offset + consumed as u64, check(begin, consumed)?));
+    }
+    let next = offset + consumed as u64;
+    // Stopped by a limit with a whole record beyond it (a partial one at the end is not "more"):
+    // one already read, or else, past what was read, one the next read would return.
+    let stopped = records.len() == max_records || want < available;
+    let more = stopped
+        && log.len > next
+        && (bytes[consumed..].contains(&b'\n') || if want == available { finished } else { record_at(log, next, full, finished)? });
+    Ok((records, next, more))
+}
+
+/// Records of `service`'s log written after `pos`, oldest first, at most `max_records` in at most
+/// `max_bytes` (see the section above).
+pub fn read_after(dir: &Path, service: &str, pos: LogPos, max_records: usize, max_bytes: u64) -> std::io::Result<LogRead> {
+    let (current, older) = (open_log(dir, service, false)?, open_log(dir, service, true)?);
+    if current.is_none() && older.is_none() {
+        return Ok(LogRead { pos: Some(pos), ..LogRead::default() });
+    }
+    // The files to read, oldest first, with whether each is finished, where to begin, and what
+    // was lost: the cursor's file read on (or again, cut) and those after it, or, the cursor's
+    // file not shown to be kept, every file kept from its start.
+    let current_is = current.as_ref().map(|c| kept(c, &pos)).transpose()?.unwrap_or(Kept::Other);
+    let older_is = match current_is {
+        Kept::Other => older.as_ref().map(|o| kept(o, &pos)).transpose()?.unwrap_or(Kept::Other),
+        _ => Kept::Other,
+    };
+    let (is, files): (Kept, Vec<(Opened, bool)>) = match current_is {
+        Kept::Same | Kept::Cut => (current_is, current.into_iter().map(|c| (c, false)).collect()),
+        Kept::Other => (older_is, older.map(|o| (o, true)).into_iter().chain(current.map(|c| (c, false))).collect()),
+    };
+    let (start, gap) = match is {
+        Kept::Same => (pos.offset, None),
+        Kept::Cut => (files[0].0.head, Some(Gap::Truncated)),
+        Kept::Other => (files[0].0.head, Some(Gap::Rotated)),
+    };
+    let mut read = LogRead { gap, ..LogRead::default() };
+    let mut files = files;
+    let mut budget = max_bytes;
+    for i in 0..files.len() {
+        let from = if i == 0 { start } else { files[i].0.head };
+        let (log, finished) = &mut files[i];
+        let finished = *finished;
+        let (records, next, more) = records_from(log, from, max_records - read.records.len(), budget, max_bytes, finished)?;
+        let log = &files[i].0;
+        budget = budget.saturating_sub(next - from);
+        let last = records.last().map(|(_, _, check)| *check);
+        for (record, end, check) in records {
+            read.records.push(record);
+            read.ends.push(LogPos { dev: log.dev, ino: log.ino, offset: end, gen: log.gen, check: Some(check) });
+        }
+        read.pos = Some(match last {
+            Some(check) => LogPos { dev: log.dev, ino: log.ino, offset: next, gen: log.gen, check: Some(check) },
+            None if is == Kept::Same && i == 0 => pos,
+            None => log.pos(next)?,
+        });
+        // On to the newer file only once this one is read to its end; stopped there, the newer
+        // one is what the next read returns, if it holds a record yet.
+        if more || next < log.len || budget == 0 || read.records.len() == max_records {
+            let newer = files.get(i + 1).map(|(newer, _)| newer).filter(|_| next == log.len);
+            read.more = more || newer.map(|newer| record_at(newer, newer.head, max_bytes, false)).transpose()?.unwrap_or(false);
+            // At the end of the rotated file is at the start of the newer one: named by that file,
+            // which the next rotation keeps, so a read after it loses (and reports) nothing.
+            if let Some(newer) = newer {
+                read.pos = Some(newer.pos(newer.head)?);
+            }
+            break;
+        }
+    }
+    Ok(read)
+}
+
+/// The last `tail` records `service` wrote, oldest first, keeping only those read at or after
+/// `since` (Unix milliseconds) when given; whether older output was left unread; and the cursor
+/// just past the last whole record of the current file (`None` when there is none yet).
+pub fn tail(dir: &Path, service: &str, tail: usize, since: Option<u64>) -> std::io::Result<(Vec<Record>, bool, Option<LogPos>)> {
+    tail_within(dir, service, tail, since, LOGS_LIMIT)
+}
+
+/// [`tail`] reading at most `limit` bytes of the files.
+fn tail_within(dir: &Path, service: &str, tail: usize, since: Option<u64>, limit: u64) -> std::io::Result<(Vec<Record>, bool, Option<LogPos>)> {
+    use std::os::unix::fs::FileExt;
     let mut chunks: Vec<(String, bool)> = Vec::new();
-    let mut budget = LOGS_LIMIT;
-    for file in [path.clone(), PathBuf::from(older)] {
-        let Ok(mut f) = fs::File::open(&file) else { continue };
-        let len = f.metadata()?.len();
-        let start = len.saturating_sub(budget);
-        f.seek(std::io::SeekFrom::Start(start))?;
+    let mut budget = limit;
+    let mut pos = None;
+    for (n, older) in [false, true].into_iter().enumerate() {
+        let Some(mut log) = open_log(dir, service, older)? else { continue };
+        // The window of its records (its header is none): the last `budget` bytes of them.
+        let start = log.len.saturating_sub(budget).max(log.head);
+        log.file.seek(std::io::SeekFrom::Start(start))?;
         let mut bytes = Vec::new();
-        f.take(budget).read_to_end(&mut bytes)?;
+        (&mut log.file).take(budget).read_to_end(&mut bytes)?;
         budget -= bytes.len() as u64;
+        if n == 0 {
+            // The current file: a record still being written is left for the next read.
+            let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            bytes.truncate(whole);
+            pos = Some(log.pos(start + whole as u64)?);
+        }
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
-        if start > 0 {
-            // Begin at a whole line.
+        // Begin at a whole record: one the window begins with (the byte before it ends the one
+        // before, or the header) is kept; only the part of one the window cuts is dropped.
+        let partial = start > log.head && {
+            let mut before = [0u8; 1];
+            log.file.read_exact_at(&mut before, start - 1)?;
+            before[0] != b'\n'
+        };
+        if partial {
             text = text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default();
         }
-        chunks.push((text, start > 0));
-        if budget == 0 || start > 0 {
+        chunks.push((text, start > log.head));
+        if budget == 0 || start > log.head {
             break;
         }
     }
     let cut = chunks.last().is_some_and(|(_, cut)| *cut) || (budget == 0 && chunks.len() == 1);
-    let mut lines: Vec<String> = Vec::new();
+    let mut records: Vec<Record> = Vec::new();
     for (text, _) in chunks.iter().rev() {
-        for line in text.lines() {
-            let (secs, rest) = match line.split_once(' ') {
-                Some((s, rest)) if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() => (s.parse::<u64>().unwrap_or(0), rest),
-                _ => (0, line),
-            };
-            if since.map_or(true, |at| secs >= at) {
-                lines.push(rest.to_string());
-            }
-        }
+        records.extend(text.lines().map(Record::parse).filter(|r| since.map_or(true, |at| r.at_ms >= at)));
     }
-    let truncated = cut && lines.len() <= tail;
-    let skip = lines.len().saturating_sub(tail);
-    Ok((lines.split_off(skip), truncated))
+    let truncated = cut && records.len() <= tail;
+    let skip = records.len().saturating_sub(tail);
+    Ok((records.split_off(skip), truncated, pos))
+}
+
+/// [`tail`]'s lines alone, and whether older output was left unread.
+pub fn logs(dir: &Path, service: &str, lines: usize, since: Option<u64>) -> std::io::Result<(Vec<String>, bool)> {
+    let (records, truncated, _) = tail(dir, service, lines, since)?;
+    Ok((records.into_iter().map(|r| r.line).collect(), truncated))
 }
 
 // ---- the supervisor ------------------------------------------------------------------------
@@ -1187,11 +1790,12 @@ fn supervise(dir: &Path) -> std::io::Result<()> {
     let me = Proc::observe(std::process::id());
     // What a supervisor before this one left running is stopped first: this one cannot wait
     // for processes it did not start. What cannot be shown stopped keeps everything as it is.
-    let previous = state_lossy(dir);
-    let mut spec = match read_spec(dir) {
-        Ok(spec) => spec.unwrap_or_default(),
-        Err(e) => return Err(std::io::Error::other(e.message)),
-    };
+    // Only a record that is missing is a fresh start. One that is there but cannot be made sense
+    // of (damaged, a newer Stack's, not a regular file, or unreadable) may name what runs, which
+    // this supervisor would write over: it starts, stops and writes nothing, and exits.
+    let refused = |e: StackError| std::io::Error::other(format!("{}; nothing was started", e.message));
+    let previous = read_state(dir).map_err(refused)?.unwrap_or_default();
+    let mut spec = read_spec(dir).map_err(refused)?.unwrap_or_default();
     let left = recover(dir, &previous, spec.token.as_deref());
     if !left.is_empty() {
         return Err(std::io::Error::other(format!("processes an earlier supervisor left could not be confirmed stopped, so nothing was started: {}", serde_json::Value::Array(left))));
@@ -1626,7 +2230,7 @@ fn output_pipe() -> std::io::Result<(fs::File, fs::File)> {
     Ok(unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1])) })
 }
 
-fn spawn_service(name: &str, s: &ServiceSpec, log: std::sync::mpsc::Sender<Vec<u8>>) -> std::io::Result<Proc> {
+fn spawn_service(name: &str, s: &ServiceSpec, log: LogSender) -> std::io::Result<Proc> {
     use std::os::unix::process::CommandExt;
     let (program, args) = s.argv.split_first().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no command"))?;
     // Looked up on the service's PATH, not the supervisor's (which is empty).
@@ -1664,11 +2268,145 @@ fn spawn_service(name: &str, s: &ServiceSpec, log: std::sync::mpsc::Sender<Vec<u
     Ok(process)
 }
 
+/// Bytes of records one service's log queue holds at most; past it a pump waits (up to
+/// [`LOG_PUMP_WAIT`]) and the supervisor's own lines do not, and what does not fit is dropped and
+/// counted (see [`LogQueue`]).
+const LOG_QUEUE_BYTES: usize = 1024 * 1024;
+/// The longest record: a line longer than this is stored as several records.
+const LOG_RECORD_BYTES: usize = 64 * 1024;
+/// How long a pump waits for room in its service's queue before it drops a record: the
+/// service's own writes block meanwhile (its pipe fills), as they would on a slow terminal.
+const LOG_PUMP_WAIT: Duration = Duration::from_secs(1);
+
+/// One item of a [`LogQueue`]: a record, or how many records were dropped at that point.
+#[derive(Debug, PartialEq, Eq)]
+enum Queued {
+    Record(Vec<u8>),
+    Dropped { records: u64, bytes: u64 },
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: std::collections::VecDeque<Queued>,
+    /// Bytes of the records in `items`, at most the queue's capacity (a drop marker counts 0).
+    bytes: usize,
+    /// Live [`LogSender`]s: the writer ends once none is left and `items` is empty.
+    senders: usize,
+    /// Senders waiting for room now.
+    waiting: usize,
+}
+
+/// The records waiting for one service's log writer: at most `capacity` bytes, in chunks of at
+/// most [`LOG_RECORD_BYTES`] and a timestamp, so neither a flood of output nor a stalled disk
+/// grows the supervisor without bound. A record that finds no room within its wait is dropped,
+/// and the drop is queued in its place (consecutive drops merged), for the writer to note in
+/// the log: nothing is lost silently.
+struct LogQueue {
+    capacity: usize,
+    state: std::sync::Mutex<QueueState>,
+    /// Signalled when records are taken (room) and when records or the last sender's end
+    /// arrive (work).
+    room: std::sync::Condvar,
+    work: std::sync::Condvar,
+}
+
+impl LogQueue {
+    fn new(capacity: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { capacity, state: Default::default(), room: Default::default(), work: Default::default() })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue `record`, waiting up to `wait` for room; `false` when it was dropped.
+    fn push(&self, record: Vec<u8>, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        let mut state = self.lock();
+        // A record larger than the queue (never one of ours) is taken once the queue is empty.
+        while state.bytes > 0 && state.bytes + record.len() > self.capacity {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                let bytes = record.len() as u64;
+                match state.items.back_mut() {
+                    Some(Queued::Dropped { records: r, bytes: b }) => {
+                        *r += 1;
+                        *b += bytes;
+                    }
+                    _ => state.items.push_back(Queued::Dropped { records: 1, bytes }),
+                }
+                self.work.notify_one();
+                return false;
+            };
+            state.waiting += 1;
+            state = self.room.wait_timeout(state, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            state.waiting -= 1;
+        }
+        state.bytes += record.len();
+        state.items.push_back(Queued::Record(record));
+        self.work.notify_one();
+        true
+    }
+
+    /// The next item, waiting for one; `None` once every sender is gone and nothing is left.
+    fn pop(&self) -> Option<Queued> {
+        let mut state = self.lock();
+        loop {
+            if let Some(item) = state.items.pop_front() {
+                if let Queued::Record(r) = &item {
+                    state.bytes -= r.len();
+                    self.room.notify_all();
+                }
+                return Some(item);
+            }
+            if state.senders == 0 {
+                return None;
+            }
+            state = self.work.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Senders waiting for room now.
+    #[cfg(test)]
+    fn room_waiters(&self) -> usize {
+        self.lock().waiting
+    }
+
+    fn sender(self: &std::sync::Arc<Self>) -> LogSender {
+        self.lock().senders += 1;
+        LogSender(self.clone())
+    }
+}
+
+/// A producer of one service's log records: a pump, or the supervisor itself.
+struct LogSender(std::sync::Arc<LogQueue>);
+
+impl Clone for LogSender {
+    fn clone(&self) -> Self {
+        self.0.sender()
+    }
+}
+
+impl Drop for LogSender {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.senders -= 1;
+        if state.senders == 0 {
+            self.0.work.notify_all();
+        }
+    }
+}
+
+impl LogSender {
+    fn send(&self, record: Vec<u8>, wait: Duration) -> bool {
+        self.0.push(record, wait)
+    }
+}
+
 /// One writer per service log, for the supervisor's life: every process of the service (old
-/// generations still draining included) sends its lines here, so only one thread writes the
+/// generations still draining included) queues its records here, so only one thread writes the
 /// file and rotates it.
 struct LogWriters {
-    senders: IndexMap<String, std::sync::mpsc::Sender<Vec<u8>>>,
+    senders: IndexMap<String, LogSender>,
     done_tx: std::sync::mpsc::Sender<()>,
     done_rx: std::sync::mpsc::Receiver<()>,
     spawned: usize,
@@ -1682,27 +2420,29 @@ impl Default for LogWriters {
 }
 
 impl LogWriters {
-    fn sender(&mut self, dir: &Path, service: &str) -> std::sync::mpsc::Sender<Vec<u8>> {
+    fn sender(&mut self, dir: &Path, service: &str) -> LogSender {
         let done = self.done_tx.clone();
         let spawned = &mut self.spawned;
         self.senders
             .entry(service.to_string())
             .or_insert_with(|| {
-                let (send, receive) = std::sync::mpsc::channel::<Vec<u8>>();
-                let path = log_path(dir, service);
+                let queue = LogQueue::new(LOG_QUEUE_BYTES);
+                let sender = queue.sender();
+                let (dir, service) = (dir.to_path_buf(), service.to_string());
                 *spawned += 1;
                 std::thread::spawn(move || {
-                    write_log(receive, &path);
+                    write_log(&queue, &dir, &service);
                     let _ = done.send(());
                 });
-                send
+                sender
             })
             .clone()
     }
 
-    /// A line of the supervisor's own about `service`, in its log.
+    /// A line of the supervisor's own about `service`, in its log. Never waits: the
+    /// supervisor's loop must stay responsive, so a full queue drops it (and counts it).
     fn line(&mut self, dir: &Path, service: &str, line: &str) {
-        let _ = self.sender(dir, service).send(format!("{} {line}\n", now_ms()).into_bytes());
+        self.sender(dir, service).send(format!("{} {line}\n", now_ms()).into_bytes(), Duration::ZERO);
     }
 
     /// Close the supervisor's senders and wait up to `bound` for every writer thread to finish
@@ -1723,14 +2463,18 @@ impl LogWriters {
     }
 }
 
-/// Copy a service's output to its log writer, each line prefixed with when it was read (Unix
-/// ms). Ends when every process of the service closed its output.
-fn pump(reader: fs::File, log: std::sync::mpsc::Sender<Vec<u8>>) {
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
+/// Copy a service's output to its log, one record per line: the line prefixed with when it was
+/// read (Unix ms) and a space. A line longer than [`LOG_RECORD_BYTES`] becomes several records,
+/// and output that ends without a newline (the process exited mid-line) is completed with one,
+/// so the log holds only whole records. Ends when every process of the service closed its
+/// output.
+fn pump(reader: fs::File, log: LogSender) {
+    let mut reader = std::io::BufReader::with_capacity(LOG_RECORD_BYTES, reader);
     let mut line = Vec::new();
+    let mut dropping = false;
     loop {
         line.clear();
-        match reader.by_ref().take(64 * 1024).read_until(b'\n', &mut line) {
+        match reader.by_ref().take(LOG_RECORD_BYTES as u64).read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
@@ -1739,28 +2483,157 @@ fn pump(reader: fs::File, log: std::sync::mpsc::Sender<Vec<u8>>) {
         }
         let mut out = format!("{} ", now_ms()).into_bytes();
         out.extend_from_slice(&line);
-        if log.send(out).is_err() {
-            return;
-        }
+        // A record that finds no room is counted by the queue. Once one is dropped the pump
+        // stops waiting until a record fits again, so a stalled writer blocks the service's
+        // output once, for the wait, not for every line.
+        dropping = !log.send(out, if dropping { Duration::ZERO } else { LOG_PUMP_WAIT });
     }
 }
 
-/// The only writer of one service's log: appends what pumps send, and rotates the file (one
-/// older file kept) once it passes [`LOG_ROTATE_BYTES`].
-fn write_log(receive: std::sync::mpsc::Receiver<Vec<u8>>, log: &Path) {
-    let open = |log: &Path| fs::OpenOptions::new().create(true).append(true).open(log);
-    let mut file = open(log).ok();
-    for chunk in receive {
-        let Some(f) = file.as_mut() else {
-            file = open(log).ok();
+/// The record noting `records` records (`bytes` bytes) the queue dropped at this point.
+fn dropped_note(records: u64, bytes: u64) -> Vec<u8> {
+    format!("{} [stack] {records} line(s) of output ({bytes} bytes) dropped: the log writer fell behind\n", now_ms()).into_bytes()
+}
+
+/// One service's log, open for its writer, with the log directory it is in (for rotating it).
+struct LogOut {
+    logs: std::os::fd::OwnedFd,
+    file: fs::File,
+    /// Its length: only its writer appends to it.
+    len: u64,
+    /// It ends inside a record (one a crash or a failed write cut): the next write first ends
+    /// that line, so nothing written after is read as part of it.
+    cut: bool,
+}
+
+impl LogOut {
+    /// Open `service`'s log to append to it. A new file is made under another name, its header
+    /// (a new generation: see [`log_header`]) written, and only then renamed into place, so no
+    /// reader ever finds a file of this writer without one, a crash at any point included (what
+    /// a crash leaves under the other name is replaced by the next file made). A file that is
+    /// there but empty (cut by hand, or made by an older writer) is given a header first.
+    fn open(dir: &Path, service: &str) -> std::io::Result<LogOut> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let logs = logs_dir(dir)?;
+        let name = log_name(service, false)?;
+        let mut file = match log_file(&logs, &name, libc::O_RDWR | libc::O_APPEND) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let fresh = std::ffi::CString::new(format!("{service}.log.new")).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let mut file = log_file(&logs, &fresh, libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC)?;
+                file.write_all(&log_header(new_generation()))?;
+                // SAFETY: renameat within a directory descriptor this function owns, NUL-terminated names.
+                if unsafe { libc::renameat(logs.as_raw_fd(), fresh.as_ptr(), logs.as_raw_fd(), name.as_ptr()) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                file
+            }
+            file => file?,
+        };
+        if file.metadata()?.len() == 0 {
+            file.write_all(&log_header(new_generation()))?;
+        }
+        let len = file.metadata()?.len();
+        let mut last = [b'\n'];
+        if len > 0 {
+            file.read_exact_at(&mut last, len - 1)?;
+        }
+        Ok(LogOut { logs, file, len, cut: last[0] != b'\n' })
+    }
+
+    /// Append `chunk` (whole records). A write that fails is undone where the file can be cut
+    /// back to where it was; where it cannot, the cut record stays, and the writer opens the
+    /// file again, which finds it and ends its line before the next write (see `cut`).
+    fn append(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(chunk.len() + 1);
+        if self.cut {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(chunk);
+        let before = self.len;
+        if let Err(e) = self.file.write_all(&bytes) {
+            // What part of it went in is cut back off, where the file allows; what stays is
+            // found by the next open (see `cut`).
+            if self.file.metadata().is_ok_and(|m| m.len() > before) {
+                let _ = self.file.set_len(before);
+            }
+            return Err(e);
+        }
+        self.len = before + bytes.len() as u64;
+        self.cut = false;
+        Ok(())
+    }
+
+    /// Rename it to `<service>.log.1` (replacing the one before), in its own directory, and open
+    /// a new one in its place.
+    fn rotate(self, dir: &Path, service: &str) -> std::io::Result<LogOut> {
+        use std::os::fd::AsRawFd;
+        let (from, to) = (log_name(service, false)?, log_name(service, true)?);
+        // SAFETY: renameat within a directory descriptor this function owns, NUL-terminated names.
+        if unsafe { libc::renameat(self.logs.as_raw_fd(), from.as_ptr(), self.logs.as_raw_fd(), to.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        LogOut::open(dir, service)
+    }
+}
+
+/// The only writer of one service's log: appends what the queue holds, notes what it dropped,
+/// and rotates the file (one older file kept) once it passes [`LOG_ROTATE_BYTES`]. A file that
+/// cannot be opened or written still has its queue drained, so no producer waits on it; what
+/// could not be written is counted and noted once a write succeeds again. The file is opened
+/// in the checkout's log directory only (neither it nor the directory a link to elsewhere).
+///
+/// Every record is written whole or not at all as far as the file allows: a write that fails
+/// part way is cut back off. Where even that fails (the file shrinks only if the filesystem
+/// lets it), the cut record is kept and its line ended before anything else is written, so the
+/// dropped-output note after it is always a record of its own; that cut record is then the only
+/// one in the log not as it was read.
+fn write_log(queue: &LogQueue, dir: &Path, service: &str) {
+    let open = || LogOut::open(dir, service).ok();
+    let mut log = open();
+    // Records (and bytes) dropped by the queue or lost to a failed write, not yet noted.
+    let mut lost = (0u64, 0u64);
+    while let Some(item) = queue.pop() {
+        let chunk = match item {
+            Queued::Record(r) => r,
+            Queued::Dropped { records, bytes } => {
+                lost = (lost.0 + records, lost.1 + bytes);
+                continue;
+            }
+        };
+        if log.is_none() {
+            log = open();
+        }
+        let record_len = chunk.len() as u64;
+        let mut chunk = chunk;
+        if lost.0 > 0 {
+            let mut noted = dropped_note(lost.0, lost.1);
+            noted.extend_from_slice(&chunk);
+            chunk = noted;
+        }
+        let Some(out) = log.as_mut() else {
+            lost = (lost.0 + 1, lost.1 + record_len);
             continue;
         };
-        let _ = f.write_all(&chunk);
-        if f.metadata().is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
-            let mut older = log.as_os_str().to_owned();
-            older.push(".1");
-            let _ = fs::rename(log, PathBuf::from(older));
-            file = open(log).ok();
+        if out.append(&chunk).is_err() {
+            // Opened again for the next record (a file replaced meanwhile is written fresh), and
+            // whether it ends inside a record found again then.
+            log = None;
+            lost = (lost.0 + 1, lost.1 + record_len);
+            continue;
+        }
+        lost = (0, 0);
+        if out.len > LOG_ROTATE_BYTES {
+            log = log.take().and_then(|out| out.rotate(dir, service).ok()).or_else(open);
+        }
+    }
+    // Drops after the last record: noted before the writer ends.
+    if lost.0 > 0 {
+        if log.is_none() {
+            log = open();
+        }
+        if let Some(out) = log.as_mut() {
+            let _ = out.append(&dropped_note(lost.0, lost.1));
         }
     }
 }
@@ -2122,7 +2995,7 @@ pub fn legacy_data_dir(root: &Path, service: &str) -> Option<PathBuf> {
     let daemons = mise_state_dir()?.join("daemons");
     let wanted = root.to_string_lossy();
     for entry in fs::read_dir(&daemons).ok()?.flatten() {
-        let Ok(bytes) = fs::read(entry.path().join("state.json")) else { continue };
+        let Ok(Some(bytes)) = read_regular(&entry.path().join("state.json")) else { continue };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
         if v["root"].as_str() == Some(wanted.as_ref()) {
             let dir = entry.path().join("data").join(service);
@@ -2170,7 +3043,7 @@ mod tests {
             want: true,
             start_seq: 1,
         };
-        let spec = Spec { revision: applied.max(1), shutdown: false, project: Some(project.into()), token: Some(token.into()), services: IndexMap::from([("web".to_string(), service)]) };
+        let spec = Spec { revision: applied.max(1), shutdown: false, project: Some(project.into()), project_at: Default::default(), token: Some(token.into()), services: IndexMap::from([("web".to_string(), service)]) };
         let instance = Instance {
             status: if process.is_some() { "running" } else { "stopped" }.into(),
             group: process.as_ref().map(|p| p.pid),
@@ -2243,6 +3116,72 @@ mod tests {
         let e = result.expect_err(at);
         assert_eq!(e.code, "state_invalid", "{at}: {e:?}");
         assert!(e.message.contains("not this checkout's") || e.message.contains("does not name this checkout") || e.message.contains("was replaced"), "{at}: {e:?}");
+    }
+
+    #[test]
+    fn records_are_written_versioned_and_unversioned_ones_read_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, state) = record("/checkouts/mine", "mine-token", None, None, 3);
+        // Unversioned, as Stack 0.1.24 and its supervisors (still running after an upgrade) write.
+        write(dir.path(), &(spec.clone(), state.clone()));
+        assert_eq!(read_spec(dir.path()).unwrap(), Some(spec.clone()));
+        assert_eq!(read_state(dir.path()).unwrap(), Some(state.clone()));
+        assert_eq!(read_spec_identified(dir.path()).unwrap().0, spec);
+        // What this Stack writes says its version first, and reads back as it was.
+        write_state(dir.path(), &state).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(state_path(dir.path())).unwrap()).unwrap();
+        assert_eq!(written.as_object().unwrap().keys().next().map(String::as_str), Some("schema_version"));
+        assert_eq!(written["schema_version"], SCHEMA_VERSION);
+        assert_eq!(read_state(dir.path()).unwrap(), Some(state.clone()));
+        let bytes = record_bytes(&spec);
+        assert_eq!(parse_record::<Spec>(&spec_path(dir.path()), &bytes).unwrap(), spec);
+        // A field this Stack does not know, at its version, is ignored, as a reader of an older
+        // release ignores `schema_version` and any field added since.
+        let mut extra: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        extra["added_later"] = serde_json::json!({ "x": 1 });
+        assert_eq!(parse_record::<Spec>(&spec_path(dir.path()), extra.to_string().as_bytes()).unwrap(), spec);
+    }
+
+    #[test]
+    fn a_record_of_a_newer_schema_is_refused_and_nothing_is_written_over_it_or_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, state) = record("/checkouts/mine", "mine-token", None, None, 3);
+        let newer = |bytes: Vec<u8>| {
+            let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["schema_version"] = serde_json::json!(SCHEMA_VERSION + 1);
+            serde_json::to_vec(&v).unwrap()
+        };
+        let (spec_bytes, state_bytes) = (newer(record_bytes(&spec)), newer(record_bytes(&state)));
+        fs::write(spec_path(dir.path()), &spec_bytes).unwrap();
+        fs::write(state_path(dir.path()), record_bytes(&state)).unwrap();
+        let e = read_spec(dir.path()).unwrap_err();
+        assert_eq!(e.code, "state_invalid");
+        assert!(e.message.contains("written by a newer Stack") && e.message.contains(&format!("schema_version {}", SCHEMA_VERSION + 1)), "{e:?}");
+        assert!(read_spec_identified(dir.path()).is_err());
+        // A change is refused before anything is written; nothing is forgotten either.
+        assert_eq!(apply(dir.path(), |s| s.shutdown = true).unwrap_err().code, "state_invalid");
+        assert_eq!(fs::read(spec_path(dir.path())).unwrap(), spec_bytes);
+        assert!(!forget(dir.path()) && dir.path().exists());
+
+        // The same for a newer state: never read as "nothing runs".
+        fs::write(spec_path(dir.path()), record_bytes(&spec)).unwrap();
+        fs::write(state_path(dir.path()), &state_bytes).unwrap();
+        assert_eq!(read_state(dir.path()).unwrap_err().code, "state_invalid");
+        assert_eq!(apply(dir.path(), |s| s.shutdown = true).unwrap_err().code, "state_invalid");
+        assert_eq!(super::stop(dir.path(), &["web".to_string()]).unwrap_err().code, "state_invalid");
+        assert_eq!(fs::read(state_path(dir.path())).unwrap(), state_bytes);
+        let unresolved = unresolved(dir.path());
+        assert!(unresolved.len() == 1 && unresolved[0]["reason"].as_str().unwrap().contains("newer Stack"), "{unresolved:?}");
+        assert!(!forget(dir.path()) && dir.path().exists());
+
+        // A version that is no version at all is refused too.
+        for bad in [serde_json::json!(0), serde_json::json!("1"), serde_json::json!(-1), serde_json::json!(1.5)] {
+            let mut v: serde_json::Value = serde_json::from_slice(&record_bytes(&state)).unwrap();
+            v["schema_version"] = bad.clone();
+            let e = parse_record::<State>(&state_path(dir.path()), v.to_string().as_bytes()).unwrap_err();
+            assert!(e.code == "state_invalid" && e.message.contains("schema_version must be a positive integer"), "{bad}: {e:?}");
+        }
+        assert_eq!(parse_record::<State>(&state_path(dir.path()), b"[]").unwrap_err().code, "state_invalid");
     }
 
     #[test]
@@ -2356,6 +3295,251 @@ mod tests {
         let state = read_state(dir.path()).unwrap().unwrap();
         assert_eq!((state.project.as_deref(), state.token.as_deref()), (Some(Path::new("/checkouts/mine")), Some("mine-token")));
         assert!(state.services["web"].process.is_none() && read_spec(dir.path()).unwrap().unwrap().shutdown);
+    }
+
+    /// Run `f` with `action` done the `nth` (from 1) time the seam `at` is reached.
+    fn at_seam<T>(at: &'static str, nth: usize, action: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
+        let mut action = Some(action);
+        let mut seen = 0;
+        EVIDENCE_SEAM.with(|seam| {
+            *seam.borrow_mut() = Some(Box::new(move |point| {
+                if point == at {
+                    seen += 1;
+                    if seen == nth {
+                        if let Some(action) = action.take() {
+                            action();
+                        }
+                    }
+                }
+            }))
+        });
+        let result = f();
+        EVIDENCE_SEAM.with(|seam| *seam.borrow_mut() = None);
+        result
+    }
+
+    /// What is at a record path, as a test puts it there and finds it after.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Bad {
+        /// A regular file holding these bytes.
+        Bytes(Vec<u8>),
+        Dir,
+        Fifo,
+        /// A symbolic link to a copy of the record that was there: readable, were it followed.
+        Link,
+        /// The record that was there, mode 000.
+        Hidden,
+    }
+
+    /// Ways a record stops being one this Stack can read, with the code a read of it gives:
+    /// damaged, a newer Stack's, not a regular file, or one this user may not read (not shown
+    /// as root, who reads it whatever its mode).
+    fn unreadable() -> Vec<(&'static str, Bad, &'static str)> {
+        let mut all = vec![
+            ("damaged", Bad::Bytes(b"{\"applied\": ".to_vec()), "state_invalid"),
+            ("newer", Bad::Bytes(serde_json::json!({ "schema_version": SCHEMA_VERSION + 1, "applied": 99 }).to_string().into_bytes()), "state_invalid"),
+            ("a directory", Bad::Dir, "state_invalid"),
+            ("a FIFO", Bad::Fifo, "state_invalid"),
+            ("a link to a readable record", Bad::Link, "state_invalid"),
+        ];
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            all.push(("unreadable", Bad::Hidden, "io"));
+        }
+        all
+    }
+
+    /// Remove whatever is at `path`, if anything.
+    fn clear(path: &Path) {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir(path).unwrap(),
+            Ok(_) => fs::remove_file(path).unwrap(),
+            Err(_) => {}
+        }
+    }
+
+    /// Put `bad` where `path` (a record) is.
+    fn spoil(path: &Path, bad: &Bad) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        match bad {
+            Bad::Bytes(bytes) => replace(path, bytes),
+            Bad::Dir => {
+                clear(path);
+                fs::create_dir(path).unwrap();
+            }
+            Bad::Fifo => {
+                clear(path);
+                let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                // SAFETY: mkfifo with a NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{}", std::io::Error::last_os_error());
+            }
+            Bad::Link => {
+                let target = path.with_extension("elsewhere");
+                fs::copy(path, &target).unwrap();
+                clear(path);
+                std::os::unix::fs::symlink(&target, path).unwrap();
+            }
+            Bad::Hidden => {
+                let fresh = path.with_extension("hidden");
+                fs::copy(path, &fresh).unwrap();
+                fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
+                fs::rename(&fresh, path).unwrap();
+            }
+        }
+    }
+
+    /// What is at `path`, found without following a link or opening a FIFO.
+    fn found(path: &Path) -> Bad {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let meta = fs::symlink_metadata(path).unwrap();
+        match meta.file_type() {
+            t if t.is_dir() => Bad::Dir,
+            t if t.is_fifo() => Bad::Fifo,
+            t if t.is_symlink() => Bad::Link,
+            _ if meta.permissions().mode() & 0o777 == 0 => Bad::Hidden,
+            _ => Bad::Bytes(fs::read(path).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_state_that_becomes_unreadable_while_a_change_is_applied_is_never_taken_for_a_dead_supervisor() {
+        for (kind, bad, code) in unreadable() {
+            // A live supervisor that never acknowledges (it ignores the SIGHUP), so the change is
+            // waited for; the state goes bad on the second look.
+            let dir = tempfile::tempdir().unwrap();
+            let supervisor = child(true);
+            write(dir.path(), &record("/checkouts/mine", "mine-token", None, Proc::observe(supervisor.id()), 1));
+            let path = state_path(dir.path());
+            let (target, spoiled) = (path.clone(), bad.clone());
+            let result = at_seam("apply_poll", 2, move || spoil(&target, &spoiled), || apply(dir.path(), |s| s.shutdown = true));
+            let after = found(&path);
+            assert!(stop(supervisor), "{kind}: the supervisor did not outlive the wait");
+            let e = result.expect_err(kind);
+            assert_eq!(e.code, code, "{kind}: {e:?}");
+            assert_eq!(after, bad, "{kind}: the record was settled over");
+        }
+    }
+
+    #[test]
+    fn an_unversioned_state_acknowledging_a_change_is_read_as_before_while_it_is_waited_for() {
+        // As a supervisor of Stack 0.1.24, still running after an upgrade, acknowledges.
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = child(true);
+        let live = Proc::observe(supervisor.id());
+        write(dir.path(), &record("/checkouts/mine", "mine-token", None, live.clone(), 1));
+        let target = dir.path().to_path_buf();
+        let acknowledged = move || {
+            let mut state = record("/checkouts/mine", "mine-token", None, live, 2).1;
+            state.services.clear();
+            replace(&state_path(&target), &serde_json::to_vec(&state).unwrap());
+        };
+        let state = at_seam("apply_poll", 2, acknowledged, || apply(dir.path(), |s| s.services.clear()));
+        stop(supervisor);
+        assert_eq!(state.unwrap().applied, 2);
+    }
+
+    #[test]
+    fn a_state_that_becomes_unreadable_while_services_are_waited_for_is_no_evidence_they_stopped() {
+        for names in [Some(vec!["web".to_string()]), None] {
+            for (kind, bad, code) in unreadable() {
+                // A service still running under a live supervisor: the wait goes on until the
+                // state goes bad on its second look.
+                let dir = tempfile::tempdir().unwrap();
+                let (supervisor, service) = (child(true), child(false));
+                write(dir.path(), &record("/checkouts/mine", "mine-token", Proc::observe(service.id()), Proc::observe(supervisor.id()), 1));
+                let path = state_path(dir.path());
+                let (target, spoiled) = (path.clone(), bad.clone());
+                let result = at_seam("wait_poll", 2, move || spoil(&target, &spoiled), || wait_gone(dir.path(), names.as_deref()));
+                let after = found(&path);
+                assert!(stop(service) && stop(supervisor), "{kind}: a process was signalled");
+                let e = result.expect_err(kind);
+                assert_eq!(e.code, code, "{kind} ({names:?}): {e:?}");
+                assert_eq!(after, bad, "{kind}: the record was settled over");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_supervisors_state_that_becomes_unreadable_before_it_is_settled_is_kept() {
+        for (kind, bad, code) in unreadable() {
+            // The supervisor is gone and left a service running: it is stopped, and the record
+            // goes bad just before it would be settled.
+            let dir = tempfile::tempdir().unwrap();
+            let service = child(false);
+            write(dir.path(), &record("/checkouts/mine", "mine-token", Proc::observe(service.id()), None, 1));
+            let path = state_path(dir.path());
+            let (target, spoiled) = (path.clone(), bad.clone());
+            let result = at_seam("state_replace", 1, move || spoil(&target, &spoiled), || wait_gone(dir.path(), None));
+            stop(service);
+            assert_eq!(result.expect_err(kind).code, code, "{kind}");
+            assert_eq!(found(&path), bad, "{kind}: the record was settled over");
+        }
+    }
+
+    #[test]
+    fn what_may_run_is_unresolved_while_the_spec_naming_its_token_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+        assert!(unresolved(dir.path()).is_empty());
+        for (kind, bad, _) in unreadable() {
+            spoil(&spec_path(dir.path()), &bad);
+            let left = unresolved(dir.path());
+            assert!(left.len() == 1 && left[0]["record"] == serde_json::json!(spec_path(dir.path())), "{kind}: {left:?}");
+            assert!(!forget(dir.path()), "{kind}: forgotten");
+            assert_eq!(found(&spec_path(dir.path())), bad, "{kind}: the record changed");
+            clear(&spec_path(dir.path()));
+            write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+        }
+    }
+
+    /// Every record in `dir` other than the two, the copies [`spoil`] made aside: a staged
+    /// write left behind, or one published under another name.
+    fn strays(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !["spec.json", "state.json", "spec.elsewhere", "state.elsewhere"].contains(&n.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_record_that_is_not_one_this_stack_can_read_is_refused_before_anything_is_written() {
+        for path_of in [spec_path as fn(&Path) -> PathBuf, state_path] {
+            for (kind, bad, code) in unreadable() {
+                let dir = tempfile::tempdir().unwrap();
+                write(dir.path(), &record("/checkouts/mine", "mine-token", None, None, 1));
+                let path = path_of(dir.path());
+                spoil(&path, &bad);
+                let other = if path == spec_path(dir.path()) { state_path(dir.path()) } else { spec_path(dir.path()) };
+                let other_before = found(&other);
+                let read = if path == spec_path(dir.path()) { read_spec(dir.path()).map(drop) } else { read_state(dir.path()).map(drop) };
+                assert_eq!(read.unwrap_err().code, code, "{kind}");
+                assert_eq!(readable(dir.path()).unwrap_err().code, code, "{kind}");
+                // A change is refused before its spec is written, a recovering shutdown before
+                // anything is signalled or written, and nothing is forgotten.
+                assert_eq!(apply(dir.path(), |s| s.shutdown = true).unwrap_err().code, code, "{kind}");
+                let (asked, project) = mine();
+                assert!(shutdown_accounted(dir.path(), &Expected { project: &project, token: "mine-token", asked: &asked }).is_err(), "{kind}");
+                assert!(!forget(dir.path()), "{kind}: forgotten");
+                assert_eq!(found(&path), bad, "{kind}: the record changed");
+                assert_eq!(found(&other), other_before, "{kind}: the other record changed");
+                assert_eq!(strays(dir.path()), Vec::<String>::new(), "{kind}: something was written");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_record_is_nothing_and_a_regular_one_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_spec(dir.path()).unwrap().is_none() && read_state(dir.path()).unwrap().is_none());
+        readable(dir.path()).unwrap();
+        let (spec, state) = record("/checkouts/mine", "mine-token", None, None, 1);
+        write(dir.path(), &(spec.clone(), state.clone()));
+        assert_eq!(read_state(dir.path()).unwrap(), Some(state));
+        assert_eq!(read_spec(dir.path()).unwrap().map(|s| s.revision), Some(spec.revision));
+        assert!(read_spec_identified(dir.path()).is_ok());
     }
 
     #[test]
@@ -2488,5 +3672,577 @@ mod tests {
         assert_eq!(logs(dir.path(), "db", 2, None).unwrap(), (vec!["three".to_string(), "stray".to_string()], false));
         assert_eq!(logs(dir.path(), "db", 10, Some(200)).unwrap().0, vec!["two", "three"]);
         assert!(logs(dir.path(), "none", 10, None).unwrap().0.is_empty());
+    }
+
+    /// `count` records from `first`, each `<1000 + n> rec-<nn>\n` (12 bytes), stamped apart.
+    fn numbered(first: u64, count: u64) -> String {
+        (first..first + count).map(|n| format!("{} rec-{n:02}\n", 1000 + n)).collect()
+    }
+
+    fn stamped(records: &[Record]) -> Vec<(u64, String)> {
+        records.iter().map(|r| (r.at_ms, r.line.clone())).collect()
+    }
+
+    fn expect(range: std::ops::Range<u64>) -> Vec<(u64, String)> {
+        range.map(|n| (1000 + n, format!("rec-{n:02}"))).collect()
+    }
+
+    #[test]
+    fn a_tail_window_beginning_at_a_record_keeps_it_and_drops_only_a_record_it_cuts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        // One file of records 0..5 (60 bytes).
+        fs::write(&path, numbered(0, 5)).unwrap();
+        let cursor = Some(at(dir.path(), "db", false, 60));
+        // A window of 36 bytes begins exactly at record 2: it is kept whole.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 36).unwrap();
+        assert_eq!(stamped(&records), expect(2..5));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // One of 30 begins inside record 2: only that part is dropped.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 30).unwrap();
+        assert_eq!(stamped(&records), expect(3..5));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // The whole file: nothing cut.
+        assert_eq!(tail_within(dir.path(), "db", 10, None, 60).unwrap().0, records_of(0..5));
+        assert_eq!(tail_within(dir.path(), "db", 10, None, 61).unwrap(), (records_of(0..5), false, cursor));
+
+        // Rotated: records 0..5 in the older file, 5..7 (24 bytes) in the current one.
+        fs::rename(&path, older_log(&path)).unwrap();
+        fs::write(&path, numbered(5, 2)).unwrap();
+        let cursor = Some(at(dir.path(), "db", false, 24));
+        // The current file whole, then 36 bytes of the older one, beginning at its record 2.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 24 + 36).unwrap();
+        assert_eq!(stamped(&records), expect(2..7));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // 30 bytes of the older one, beginning inside its record 2.
+        let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 24 + 30).unwrap();
+        assert_eq!(stamped(&records), expect(3..7));
+        assert!(truncated);
+        assert_eq!(pos, cursor);
+        // A window of the current file alone, beginning at its record 6 or inside its record 5.
+        assert_eq!(stamped(&tail_within(dir.path(), "db", 10, None, 12).unwrap().0), expect(6..7));
+        assert_eq!(stamped(&tail_within(dir.path(), "db", 10, None, 18).unwrap().0), expect(6..7));
+        // A record still being written in the current file is left for the next read, and the
+        // window is measured from the end of what is there.
+        append(&path, "1007 rec-07 still bei");
+        let (records, _, pos) = tail_within(dir.path(), "db", 10, None, 21 + 24 + 36).unwrap();
+        assert_eq!(stamped(&records), expect(2..7));
+        assert_eq!(pos, cursor);
+        // `since` and `tail` apply to the records the window kept.
+        let (records, truncated, _) = tail_within(dir.path(), "db", 2, Some(1003), 21 + 24 + 36).unwrap();
+        assert_eq!(stamped(&records), expect(5..7));
+        assert!(!truncated, "more records than asked were kept: none of what was left unread is missing");
+    }
+
+    fn records_of(range: std::ops::Range<u64>) -> Vec<Record> {
+        expect(range).into_iter().map(|(at_ms, line)| Record { at_ms, line }).collect()
+    }
+
+    fn items(q: &LogQueue) -> Vec<Queued> {
+        let mut out = Vec::new();
+        let mut state = q.lock();
+        while let Some(item) = state.items.pop_front() {
+            out.push(item);
+        }
+        state.bytes = 0;
+        out
+    }
+
+    #[test]
+    fn a_log_queue_holds_bounded_bytes_and_counts_what_it_drops() {
+        let q = LogQueue::new(10);
+        let s = q.sender();
+        assert!(s.send(b"aaaaaa".to_vec(), Duration::ZERO));
+        // No room: dropped at once (the supervisor's own lines never wait), and counted.
+        assert!(!s.send(b"bbbbbb".to_vec(), Duration::ZERO));
+        assert!(s.send(b"ccc".to_vec(), Duration::ZERO), "a record that fits is taken");
+        assert!(!s.send(b"dd".to_vec(), Duration::ZERO));
+        assert!(!s.send(b"eee".to_vec(), Duration::ZERO), "consecutive drops are one marker");
+        assert!(s.send(b"f".to_vec(), Duration::ZERO));
+        assert_eq!(q.lock().bytes, 10, "never more than the capacity");
+        assert_eq!(
+            items(&q),
+            [
+                Queued::Record(b"aaaaaa".to_vec()),
+                Queued::Dropped { records: 1, bytes: 6 },
+                Queued::Record(b"ccc".to_vec()),
+                Queued::Dropped { records: 2, bytes: 5 },
+                Queued::Record(b"f".to_vec()),
+            ]
+        );
+        // The writer's end: once every sender is gone and nothing is left.
+        let other = s.clone();
+        drop(s);
+        assert!(other.send(b"g".to_vec(), Duration::ZERO));
+        drop(other);
+        assert_eq!(q.pop(), Some(Queued::Record(b"g".to_vec())));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn a_waiting_pump_gets_room_as_the_writer_drains() {
+        let q = LogQueue::new(10);
+        let s = q.sender();
+        assert!(s.send(vec![b'x'; 8], Duration::ZERO));
+        let waiting = {
+            let s = s.clone();
+            std::thread::spawn(move || s.send(vec![b'y'; 8], Duration::from_secs(30)))
+        };
+        // The pump waits (backpressure) rather than dropping while the writer catches up.
+        while q.room_waiters() == 0 {
+            std::thread::yield_now();
+        }
+        assert_eq!(q.pop(), Some(Queued::Record(vec![b'x'; 8])));
+        assert!(waiting.join().unwrap(), "taken once there was room");
+        assert_eq!(q.pop(), Some(Queued::Record(vec![b'y'; 8])));
+        // Past its wait it drops instead, so a stalled writer never stalls the pump for longer.
+        assert!(s.send(vec![b'z'; 8], Duration::ZERO));
+        let started = Instant::now();
+        assert!(!s.send(vec![b'w'; 8], Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_writer_notes_dropped_output_in_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "svc");
+        let q = LogQueue::new(32);
+        let s = q.sender();
+        assert!(s.send(b"1 first\n".to_vec(), Duration::ZERO));
+        assert!(s.send(b"1 ................\n".to_vec(), Duration::ZERO));
+        assert!(!s.send(b"2 lost one\n".to_vec(), Duration::ZERO));
+        drop(s);
+        write_log(&q, dir.path(), "svc");
+        let text = fs::read_to_string(&path).unwrap();
+        // A file the writer made begins with its header, then the records.
+        assert!(header_generation(text.as_bytes()).is_some(), "{text}");
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines[0], "1 first");
+        assert!(lines[2].ends_with(" [stack] 1 line(s) of output (11 bytes) dropped: the log writer fell behind"), "{text}");
+        assert!(lines[2].split(' ').next().unwrap().parse::<u64>().is_ok(), "the note is a stamped record: {text}");
+    }
+
+    #[test]
+    fn a_long_line_is_stored_as_bounded_records_and_a_last_partial_line_completed() {
+        let (reader, mut writer) = output_pipe().unwrap();
+        let q = LogQueue::new(LOG_QUEUE_BYTES);
+        let pumping = {
+            let s = q.sender();
+            std::thread::spawn(move || pump(reader, s))
+        };
+        let long = vec![b'a'; LOG_RECORD_BYTES + 10];
+        writer.write_all(&long).unwrap();
+        writer.write_all(b"\nend without newline").unwrap();
+        drop(writer);
+        pumping.join().unwrap();
+        let records: Vec<Vec<u8>> = std::iter::from_fn(|| q.pop()).map(|i| match i {
+            Queued::Record(r) => r,
+            other => panic!("{other:?}"),
+        }).collect();
+        assert_eq!(records.len(), 3, "the long line in two records, then the partial one");
+        assert!(records.iter().all(|r| r.len() <= LOG_RECORD_BYTES + 20 && r.ends_with(b"\n")));
+        let body = |r: &[u8]| r.splitn(2, |b| *b == b' ').nth(1).unwrap().to_vec();
+        assert_eq!(body(&records[0]).len(), LOG_RECORD_BYTES + 1);
+        assert_eq!(body(&records[1]), b"aaaaaaaaaa\n");
+        assert_eq!(body(&records[2]), b"end without newline\n");
+    }
+
+    /// The position `offset` in `service`'s current (or, `older`, rotated) log, as a read gives it.
+    fn at(dir: &Path, service: &str, older: bool, offset: u64) -> LogPos {
+        open_log(dir, service, older).unwrap().unwrap().pos(offset).unwrap()
+    }
+
+    fn older_log(path: &Path) -> PathBuf {
+        let mut older = path.as_os_str().to_owned();
+        older.push(".1");
+        PathBuf::from(older)
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn lines(read: &LogRead) -> Vec<(u64, &str)> {
+        read.records.iter().map(|r| (r.at_ms, r.line.as_str())).collect()
+    }
+
+    #[test]
+    fn a_record_the_rest_of_a_rotated_reads_budget_cannot_hold_is_left_whole_for_the_next_read() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        append(&path, "100 a\n");
+        let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+        // Rotated, with a record and a repeat of it in the new file, each 15 bytes: the 16 a read
+        // allows hold one of them, but not what the rest of the old file leaves of it.
+        append(&path, "200 bb\n");
+        fs::rename(&path, older_log(&path)).unwrap();
+        append(&path, "300 cccccccccc\n300 cccccccccc\n");
+        let first = read_after(dir.path(), "db", pos, 100, 16).unwrap();
+        assert_eq!((lines(&first), first.more, first.gap), (vec![(200, "bb")], true, None));
+        let second = read_after(dir.path(), "db", first.pos.unwrap(), 100, 16).unwrap();
+        assert_eq!((lines(&second), second.more), (vec![(300, "cccccccccc")], true));
+        let third = read_after(dir.path(), "db", second.pos.unwrap(), 100, 16).unwrap();
+        assert_eq!((lines(&third), third.more), (vec![(300, "cccccccccc")], false));
+        // A record longer than any read allows is still taken cut, rather than never.
+        let long = read_after(dir.path(), "db", first.pos.unwrap(), 100, 8).unwrap();
+        assert_eq!(lines(&long), [(300, "cccc")]);
+    }
+
+    #[test]
+    fn a_log_is_read_and_written_only_as_a_file_of_the_checkouts_own_log_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("other.log");
+        fs::write(&outside, "1 dummy line of another checkout\n").unwrap();
+        let pos = LogPos { dev: 0, ino: 0, offset: 0, gen: None, check: None };
+        let refused = |service: &str, why: &str| {
+            let e = tail(dir.path(), service, 10, None).expect_err(service);
+            assert!(e.to_string().contains(why), "{service}: {e}");
+            let e = read_after(dir.path(), service, pos, 10, LOGS_LIMIT).expect_err(service);
+            assert!(e.to_string().contains(why), "{service}: {e}");
+        };
+        // A name that is no service's (a path out of the directory) opens nothing.
+        fs::write(dir.path().join("spec.log"), "1 dummy\n").unwrap();
+        for name in ["../spec", "a/b", "..", "", "nul\0"] {
+            assert_eq!(tail(dir.path(), name, 10, None).unwrap_err().kind(), std::io::ErrorKind::InvalidInput, "{name:?}");
+            assert_eq!(read_after(dir.path(), name, pos, 10, LOGS_LIMIT).unwrap_err().kind(), std::io::ErrorKind::InvalidInput, "{name:?}");
+        }
+        // A link in a log's place, current or rotated, is not followed, for reading or writing.
+        symlink(&outside, logs.join("web.log")).unwrap();
+        refused("web", "symbolic link");
+        let q = LogQueue::new(1024);
+        let s = q.sender();
+        assert!(s.send(b"2 a dummy record\n".to_vec(), Duration::ZERO));
+        drop(s);
+        write_log(&q, dir.path(), "web");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "1 dummy line of another checkout\n", "written through the link");
+        fs::remove_file(logs.join("web.log")).unwrap();
+        symlink(&outside, logs.join("web.log.1")).unwrap();
+        refused("web", "symbolic link");
+        fs::remove_file(logs.join("web.log.1")).unwrap();
+        // Nor is a link in the log directory's place.
+        let moved = dir.path().join("logs-elsewhere");
+        fs::rename(&logs, &moved).unwrap();
+        fs::write(elsewhere.path().join("web.log"), "1 dummy\n").unwrap();
+        symlink(elsewhere.path(), &logs).unwrap();
+        refused("web", "symbolic link");
+        fs::remove_file(&logs).unwrap();
+        fs::rename(&moved, &logs).unwrap();
+        // A FIFO in a log's place is refused at once, never waited on.
+        let fifo = std::ffi::CString::new(logs.join("pipe.log").into_os_string().into_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        refused("pipe", "not a regular file");
+        // Ordinary names read as before; no log yet is no output, not an error.
+        for name in ["api.v2", "My Service", "...", "web"] {
+            append(&log_path(dir.path(), name), "5 dummy\n");
+            let (records, _, at) = tail(dir.path(), name, 10, None).unwrap();
+            assert_eq!(records, [Record { at_ms: 5, line: "dummy".into() }], "{name}");
+            assert!(read_after(dir.path(), name, at.unwrap(), 10, LOGS_LIMIT).unwrap().records.is_empty());
+        }
+        assert!(tail(dir.path(), "quiet", 10, None).unwrap().2.is_none());
+        fs::remove_dir_all(&logs).unwrap();
+        assert!(tail(dir.path(), "web", 10, None).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn a_record_left_cut_in_the_log_is_ended_before_the_note_of_what_was_dropped() {
+        // What a crash, or a failed write the filesystem would not cut back, leaves: a record
+        // without its newline. The writer ends that line before anything else.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "svc");
+        fs::write(&path, "1 first\n2 cut sho").unwrap();
+        let q = LogQueue::new(8);
+        let s = q.sender();
+        assert!(s.send(b"3 kept\n".to_vec(), Duration::ZERO));
+        assert!(!s.send(b"4 dropped\n".to_vec(), Duration::ZERO));
+        drop(s);
+        // The record that was kept is written; the one dropped after it is noted at the end.
+        write_log(&q, dir.path(), "svc");
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[..3], ["1 first", "2 cut sho", "3 kept"], "{text}");
+        assert!(lines[3].ends_with(" [stack] 1 line(s) of output (10 bytes) dropped: the log writer fell behind"), "{text}");
+        assert!(text.ends_with('\n') && lines.len() == 4, "{text}");
+        let (records, _, _) = tail(dir.path(), "svc", 10, None).unwrap();
+        assert!(records[3].at_ms > 0 && records[3].line.starts_with("[stack] "), "the note is a record of its own: {records:?}");
+
+        // A write that fails with nothing written leaves the file as it was: no line is ended
+        // that was not cut.
+        let mut out = LogOut::open(dir.path(), "svc").unwrap();
+        assert!(!out.cut);
+        out.file = fs::File::open(&path).unwrap();
+        assert!(out.append(b"5 never\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        let mut again = LogOut::open(dir.path(), "svc").unwrap();
+        again.append(b"6 after\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{text}6 after\n"));
+    }
+
+    #[test]
+    fn a_cursor_returns_each_record_once_with_its_stamp_repeats_included() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        append(&path, "100 same\n200 same\n300 part");
+        // A tail leaves a record still being written for the next read.
+        let (records, _, pos) = tail(dir.path(), "db", 10, None).unwrap();
+        assert_eq!(records.iter().map(|r| (r.at_ms, r.line.as_str())).collect::<Vec<_>>(), [(100, "same"), (200, "same")]);
+        let pos = pos.unwrap();
+        assert_eq!(pos.offset, 18);
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert!(read.records.is_empty() && read.pos == Some(pos) && read.gap.is_none() && !read.more);
+        append(&path, "ial\n400 same\nunstamped\n");
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert_eq!(lines(&read), [(300, "partial"), (400, "same"), (0, "unstamped")]);
+        // Nothing new: nothing read again.
+        let again = read_after(dir.path(), "db", read.pos.unwrap(), 100, LOGS_LIMIT).unwrap();
+        assert!(again.records.is_empty() && again.pos == read.pos);
+        // Limits: a record count and a byte count, each resumed from where it stopped.
+        append(&path, "500 a\n600 b\n700 c\n");
+        let first = read_after(dir.path(), "db", read.pos.unwrap(), 2, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&first), first.more), (vec![(500, "a"), (600, "b")], true));
+        let rest = read_after(dir.path(), "db", first.pos.unwrap(), 2, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&rest), rest.more), (vec![(700, "c")], false));
+        let bytes = read_after(dir.path(), "db", read.pos.unwrap(), 100, 8).unwrap();
+        assert_eq!((lines(&bytes), bytes.more), (vec![(500, "a")], true));
+    }
+
+    #[test]
+    fn a_read_says_more_only_while_whole_records_are_left_never_for_one_still_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        append(&path, "100 a\n200 b\n300 par");
+        let start = log_start(dir.path(), "db").unwrap().unwrap();
+        // Stopped by the record limit with only a record still being written after it.
+        let read = read_after(dir.path(), "db", start, 2, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(100, "a"), (200, "b")], false));
+        // Stopped by the byte limit, likewise; and with a whole record left, more.
+        let read = read_after(dir.path(), "db", start, 100, 12).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(100, "a"), (200, "b")], false));
+        let read = read_after(dir.path(), "db", start, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(100, "a")], true));
+        // A limit of no records says more only for a whole one.
+        let end = read_after(dir.path(), "db", start, 2, LOGS_LIMIT).unwrap().pos.unwrap();
+        assert!(!read_after(dir.path(), "db", end, 0, LOGS_LIMIT).unwrap().more);
+        // The rotated file read to its end at the limit: more only if the newer file holds a
+        // whole record.
+        fs::rename(&path, older_log(&path)).unwrap();
+        append(&path, "400 c");
+        let read = read_after(dir.path(), "db", end, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(300, "par")], false));
+        append(&path, "\n");
+        let read = read_after(dir.path(), "db", end, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(300, "par")], true));
+        let rest = read_after(dir.path(), "db", read.pos.unwrap(), 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&rest), rest.more), (vec![(400, "c")], false));
+    }
+
+    /// `service`'s log rotated twice since a cursor was taken at the end of its file `A`: once as
+    /// the writer does (`A` becomes the rotated file, `B` the current one), then again with the
+    /// new current file recycling `A`'s inode, as ext4 may once `A` is replaced: `B` is rotated
+    /// and `A`'s inode holds `text`, under the header of generation `gen` (none: an older
+    /// writer's file).
+    fn rotate_twice_recycling(dir: &Path, service: &str, b: &str, gen: Option<u128>, text: &str) {
+        let path = log_path(dir, service);
+        let (older, spare) = (older_log(&path), dir.join("spare"));
+        fs::rename(&path, &older).unwrap();
+        fs::write(&path, b).unwrap();
+        // `A`, replaced by the second rotation, kept open by its inode alone ...
+        fs::rename(&older, &spare).unwrap();
+        fs::rename(&path, &older).unwrap();
+        // ... and reused for the new current file.
+        let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&spare).unwrap();
+        file.write_all(&gen.map(log_header).unwrap_or_default()).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        fs::rename(&spare, &path).unwrap();
+    }
+
+    #[test]
+    fn a_cursor_two_rotations_behind_is_never_taken_for_a_new_file_on_its_recycled_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let a = "100 a1\n200 a2\n";
+        // The new file on `A`'s inode: as long as `A` was when the cursor was taken, longer, or
+        // holding the very records `A` did; and shorter.
+        let equal = "400 c1\n500 c2\n";
+        let grown = "400 c1\n500 c2\n600 c3\n";
+        let shorter = "4 c\n";
+        let b = |gen: Option<u128>| format!("{}300 b\n", gen.map(|g| String::from_utf8(log_header(g)).unwrap()).unwrap_or_default());
+        let records = |text: &str| -> Vec<(u64, String)> { text.lines().map(Record::parse).map(|r| (r.at_ms, r.line)).collect() };
+        let got = |read: &LogRead| -> Vec<(u64, String)> { read.records.iter().map(|r| (r.at_ms, r.line.clone())).collect() };
+        // Files Stack's writer made (each with its header): whatever the new file holds, the
+        // cursor's file is gone, and every file kept is read from its start.
+        for (case, text) in [("equal", equal), ("grown", grown), ("the same records", a), ("shorter", shorter)] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("logs")).unwrap();
+            let path = log_path(dir.path(), "db");
+            fs::write(&path, [log_header(1), a.as_bytes().to_vec()].concat()).unwrap();
+            let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+            assert_eq!((pos.gen, pos.offset), (Some(1), (HEADER_LEN + a.len()) as u64));
+            rotate_twice_recycling(dir.path(), "db", &b(Some(2)), Some(3), text);
+            assert_eq!((fs::metadata(&path).unwrap().dev(), fs::metadata(&path).unwrap().ino()), (pos.dev, pos.ino), "{case}: the inode was recycled");
+            let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+            assert_eq!((got(&read), read.gap), ([records("300 b\n"), records(text)].concat(), Some(Gap::Rotated)), "{case}");
+            // And the cursor it gave reads on from there.
+            append(&path, "700 next\n");
+            let next = read_after(dir.path(), "db", read.pos.unwrap(), 100, LOGS_LIMIT).unwrap();
+            assert_eq!((got(&next), next.gap), (records("700 next\n"), None), "{case}");
+        }
+        // Files an older writer made (no header): another record before the cursor's offset shows
+        // another file. Within what headerless files can show: the same record there is taken
+        // for the cursor's file, and a file shorter than the cursor for it cut.
+        for (case, text, expected, gap) in [
+            ("equal", equal, [records("300 b\n"), records(equal)].concat(), Some(Gap::Rotated)),
+            ("grown", grown, [records("300 b\n"), records(grown)].concat(), Some(Gap::Rotated)),
+            ("the same records", a, Vec::new(), None),
+            ("shorter", shorter, records(shorter), Some(Gap::Truncated)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("logs")).unwrap();
+            let path = log_path(dir.path(), "db");
+            fs::write(&path, a).unwrap();
+            let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+            assert_eq!((pos.gen, pos.offset), (None, a.len() as u64));
+            rotate_twice_recycling(dir.path(), "db", &b(None), None, text);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), pos.ino, "{case}: the inode was recycled");
+            let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+            assert_eq!((got(&read), read.gap), (expected, gap), "{case}, without headers");
+        }
+    }
+
+    #[test]
+    fn a_cursor_an_older_stack_gave_or_one_in_a_file_cut_by_hand_rereads_rather_than_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        fs::write(&path, [log_header(7), b"100 a\n200 b\n".to_vec()].concat()).unwrap();
+        let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+        // A `v1` cursor names the file by device and inode alone: never trusted, the oldest file
+        // kept is read again from its start, said as a gap.
+        let v1 = LogPos { gen: None, check: None, ..pos };
+        let read = read_after(dir.path(), "db", v1, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(100, "a"), (200, "b")], Some(Gap::Rotated)));
+        assert_eq!(read.pos, Some(pos), "the cursor it gives is a checked one");
+        fs::rename(&path, older_log(&path)).unwrap();
+        fs::write(&path, [log_header(8), b"300 c\n".to_vec()].concat()).unwrap();
+        let read = read_after(dir.path(), "db", v1, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(100, "a"), (200, "b"), (300, "c")], Some(Gap::Rotated)));
+        let at_c = read.pos.unwrap();
+        // Cut by hand below the cursor, its header kept, and written past the cursor again:
+        // another record before the cursor's offset, so it is read again from its start.
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(HEADER_LEN as u64).unwrap();
+        append(&path, "4 xxxxxxx\n5 y\n");
+        let read = read_after(dir.path(), "db", at_c, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(4, "xxxxxxx"), (5, "y")], Some(Gap::Truncated)));
+        // Cut to nothing (its header gone) and written again by the writer that has it open.
+        let at_y = read.pos.unwrap();
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        append(&path, "6 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n");
+        let read = read_after(dir.path(), "db", at_y, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(6, "z".repeat(61).as_str())], Some(Gap::Truncated)));
+        // From there, the headerless file is read on by its records.
+        append(&path, "7 w\n");
+        let read = read_after(dir.path(), "db", read.pos.unwrap(), 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(7, "w")], None));
+    }
+
+    #[test]
+    fn the_writer_heads_every_file_it_makes_with_a_generation_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "svc");
+        let generation = |path: &Path| header_generation(&fs::read(path).unwrap());
+        // What a crash between making a file and renaming it into place leaves is replaced.
+        fs::write(dir.path().join("logs/svc.log.new"), "junk").unwrap();
+        let mut out = LogOut::open(dir.path(), "svc").unwrap();
+        let first = generation(&path).expect("a header");
+        assert!(!dir.path().join("logs/svc.log.new").exists());
+        assert_eq!((out.len, out.cut), (HEADER_LEN as u64, false));
+        out.append(b"1 a\n").unwrap();
+        let out = out.rotate(dir.path(), "svc").unwrap();
+        let second = generation(&path).expect("a header");
+        assert_eq!(generation(&older_log(&path)), Some(first));
+        assert_ne!(first, second);
+        drop(out);
+        // Opened again (a restart): the file is kept, header and all.
+        let mut again = LogOut::open(dir.path(), "svc").unwrap();
+        again.append(b"2 b\n").unwrap();
+        assert_eq!(generation(&path), Some(second));
+        // An empty file in its place (cut by hand, or an older writer's) is given one.
+        fs::write(&path, "").unwrap();
+        LogOut::open(dir.path(), "svc").unwrap();
+        assert!(generation(&path).is_some_and(|g| g != second));
+        // Readers never see a header as a record, at the start of a window or of a read.
+        fs::write(&path, [log_header(9), b"3 c\n4 d\n".to_vec()].concat()).unwrap();
+        let (records, truncated, pos) = tail(dir.path(), "svc", 10, None).unwrap();
+        assert_eq!(records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>(), ["a", "c", "d"]);
+        assert!(!truncated);
+        let start = log_start(dir.path(), "svc").unwrap().unwrap();
+        assert_eq!((start.gen, start.offset), (Some(first), HEADER_LEN as u64));
+        let read = read_after(dir.path(), "svc", start, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap, read.pos), (vec![(1, "a"), (3, "c"), (4, "d")], None, pos));
+        for limit in [4, HEADER_LEN as u64 + 4, HEADER_LEN as u64 + 8] {
+            let (records, _, _) = tail_within(dir.path(), "svc", 10, None, limit).unwrap();
+            assert!(records.iter().all(|r| r.at_ms > 0), "{limit}: {records:?}");
+        }
+    }
+
+    #[test]
+    fn a_cursor_follows_a_rotation_and_reports_what_it_could_not_return() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        let older = older_log(&path);
+        append(&path, "100 a\n");
+        let (_, _, pos) = tail(dir.path(), "db", 10, None).unwrap();
+        let pos = pos.unwrap();
+        // Rotated once: the rest of the old file, then the new one.
+        append(&path, "200 b\n");
+        fs::rename(&path, &older).unwrap();
+        append(&path, "300 c\n");
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(200, "b"), (300, "c")], None));
+        let at_c = read.pos.unwrap();
+        // A limit inside the rotated file resumes in it.
+        let one = read_after(dir.path(), "db", pos, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&one), one.more), (vec![(200, "b")], true));
+        let next = read_after(dir.path(), "db", one.pos.unwrap(), 1, LOGS_LIMIT).unwrap();
+        assert_eq!(lines(&next), [(300, "c")]);
+        // Rotated twice since: what was between is gone, and said so.
+        fs::rename(&path, &older).unwrap();
+        append(&path, "400 d\n");
+        fs::rename(&path, &older).unwrap();
+        append(&path, "500 e\n");
+        let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(400, "d"), (500, "e")], Some(Gap::Rotated)));
+        // A rotated file cut mid-record (a crash) gives that record as it is.
+        let cursor = read.pos.unwrap();
+        append(&path, "600 cut");
+        fs::rename(&path, &older).unwrap();
+        append(&path, "700 f\n");
+        let read = read_after(dir.path(), "db", cursor, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(600, "cut"), (700, "f")], None));
+        // Truncated under the cursor: read again from its start.
+        let cursor = read.pos.unwrap();
+        fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+        append(&path, "8 g\n");
+        let read = read_after(dir.path(), "db", cursor, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(8, "g")], Some(Gap::Truncated)));
+        // No log at all: nothing, and the cursor kept.
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&older).unwrap();
+        let read = read_after(dir.path(), "db", at_c, 100, LOGS_LIMIT).unwrap();
+        assert!(read.records.is_empty() && read.pos == Some(at_c) && read.gap.is_none());
     }
 }

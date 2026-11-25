@@ -140,11 +140,18 @@ fn command(dir: &TempDir) -> Command {
         .env("STACK_STATE_DIR", dir.path().join("state"))
         .env("STACK_OCI_USERNAME", "review-user")
         .env("STACK_OCI_PASSWORD", "dummy-review-password")
+        .env_remove("STACK_OCI_REGISTRY")
         .env_remove("STACK_OCI_AUTH_REALMS")
         .env_remove("STACK_OCI_PLAIN_HTTP");
     command
 }
-fn compile(dir: &TempDir, registry: &Server, approved: Option<&str>) -> Value {
+/// Compile a project using `registry`, with the dummy credentials bound to `bound` (if any).
+fn compile_bound(
+    dir: &TempDir,
+    registry: &Server,
+    approved: Option<&str>,
+    bound: Option<&str>,
+) -> Value {
     std::fs::write(
         dir.path().join("stack.toml"),
         format!(
@@ -157,9 +164,23 @@ fn compile(dir: &TempDir, registry: &Server, approved: Option<&str>) -> Value {
     if let Some(origin) = approved {
         command.env("STACK_OCI_AUTH_REALMS", origin);
     }
+    if let Some(origin) = bound {
+        command.env("STACK_OCI_REGISTRY", origin);
+    }
     let output = command.arg("compile").output().unwrap();
     assert!(!output.status.success());
     serde_json::from_slice(&output.stdout).unwrap()
+}
+/// [`compile_bound`] with the credentials bound to `registry` itself.
+fn compile(dir: &TempDir, registry: &Server, approved: Option<&str>) -> Value {
+    compile_bound(dir, registry, approved, Some(&registry.origin))
+}
+fn authorized(server: &Server) -> Vec<Request> {
+    server
+        .seen()
+        .into_iter()
+        .filter(|r| r.headers.contains_key("authorization"))
+        .collect()
 }
 
 #[test]
@@ -243,6 +264,7 @@ fn absolute_upload_locations_do_not_receive_registry_authorization() {
         registry.origin.trim_start_matches("http://")
     );
     let output = command(&dir)
+        .env("STACK_OCI_REGISTRY", &registry.origin)
         .args(["publish", dir.path().to_str().unwrap(), &target])
         .output()
         .unwrap();
@@ -260,6 +282,175 @@ fn absolute_upload_locations_do_not_receive_registry_authorization() {
     }
 }
 
+/// A registry that answers every request with a Basic challenge.
+fn basic_registry() -> Server {
+    Server::new(|_| Response::new(401, "").header("WWW-Authenticate", "Basic realm=\"registry\""))
+}
+
+#[test]
+fn credentials_are_withheld_from_origins_they_are_not_bound_to() {
+    let registry = basic_registry();
+    let elsewhere = Server::new(|_| Response::new(404, ""));
+    let port = registry.origin.rsplit(':').next().unwrap();
+    // Another port, another scheme, and a lookalike host are all other origins.
+    for bound in [
+        elsewhere.origin.clone(),
+        format!("https://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1.attacker.invalid:{port}"),
+    ] {
+        let result = compile_bound(&tempfile::tempdir().unwrap(), &registry, None, Some(&bound));
+        assert_eq!(result["error"]["code"], "oci_unauthorized", "{bound}: {result}");
+        let message = result["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Stack sent none"), "{bound}: {message}");
+        assert!(!message.contains("dummy-review-password"), "{message}");
+    }
+    assert!(authorized(&registry).is_empty(), "{:?}", registry.seen());
+    assert!(elsewhere.seen().is_empty());
+}
+
+#[test]
+fn unbound_credentials_fail_closed_without_being_sent() {
+    let registry = basic_registry();
+    for bound in [None, Some(""), Some("127.0.0.1"), Some("http://127.0.0.1/v2/")] {
+        let result = compile_bound(&tempfile::tempdir().unwrap(), &registry, None, bound);
+        assert_eq!(result["error"]["code"], "oci_credentials_unbound", "{bound:?}: {result}");
+        let hint = result["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains(&format!("this request was for {}", registry.origin)), "{hint}");
+    }
+    assert!(authorized(&registry).is_empty(), "{:?}", registry.seen());
+}
+
+#[test]
+fn bound_credentials_are_sent_to_their_origin_however_it_is_spelled() {
+    let registry = Server::new(|request| {
+        if request.headers.contains_key("authorization") {
+            Response::new(404, "")
+        } else {
+            Response::new(401, "").header("WWW-Authenticate", "Basic realm=\"registry\"")
+        }
+    });
+    let spelled = format!("{}/", registry.origin.replace("http://", "HTTP://"));
+    let result = compile_bound(&tempfile::tempdir().unwrap(), &registry, None, Some(&spelled));
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+    assert!(authorized(&registry)[0].headers["authorization"].starts_with("Basic "));
+}
+
+/// A registry that issues anonymous tokens from its own origin, as public registries do.
+fn anonymous_token_registry() -> Server {
+    Server::new(|request| {
+        if request.path.starts_with("/token") {
+            Response::new(200, "{\"token\":\"anonymous-token\"}")
+        } else if request.headers.get("authorization").map(String::as_str) == Some("Bearer anonymous-token") {
+            Response::new(404, "")
+        } else {
+            let realm = format!("http://{}/token", request.headers["host"]);
+            Response::new(401, "").header("WWW-Authenticate", &format!("Bearer realm=\"{realm}\""))
+        }
+    })
+}
+
+#[test]
+fn anonymous_registries_keep_working_beside_bound_credentials() {
+    let registry = anonymous_token_registry();
+    let elsewhere = Server::new(|_| Response::new(404, ""));
+    let result = compile_bound(&tempfile::tempdir().unwrap(), &registry, None, Some(&elsewhere.origin));
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+    let token_requests: Vec<_> = registry.seen().into_iter().filter(|r| r.path.starts_with("/token")).collect();
+    assert_eq!(token_requests.len(), 1);
+    assert!(!token_requests[0].headers.contains_key("authorization"), "credentials reached the token service");
+
+    // Without any credentials, too; and a registry that never challenges never consults them.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("stack.toml"),
+        format!("[[use]]\nbundle='oci:{}/bundle:1'\n", registry.origin.trim_start_matches("http://")),
+    )
+    .unwrap();
+    let output = command(&dir)
+        .env_remove("STACK_OCI_USERNAME")
+        .env_remove("STACK_OCI_PASSWORD")
+        .arg("compile")
+        .output()
+        .unwrap();
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+    let open = Server::new(|_| Response::new(404, ""));
+    let result = compile_bound(&tempfile::tempdir().unwrap(), &open, None, None);
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+}
+
+#[test]
+fn an_approved_realm_named_by_an_unbound_registry_receives_no_credentials() {
+    let token = Server::new(|_| Response::new(200, "{\"token\":\"anonymous-token\"}"));
+    let realm = format!("{}/token", token.origin);
+    let registry = Server::new(move |request| {
+        if request.headers.contains_key("authorization") {
+            Response::new(404, "")
+        } else {
+            Response::new(401, "").header("WWW-Authenticate", &format!("Bearer realm=\"{realm}\""))
+        }
+    });
+    let elsewhere = Server::new(|_| Response::new(404, ""));
+    let result = compile_bound(
+        &tempfile::tempdir().unwrap(),
+        &registry,
+        Some(&token.origin),
+        Some(&elsewhere.origin),
+    );
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+    assert_eq!(token.seen().len(), 1);
+    assert!(authorized(&token).is_empty(), "credentials reached the token service");
+    assert_eq!(registry.seen()[1].headers["authorization"], "Bearer anonymous-token");
+}
+
+#[test]
+fn a_repository_selected_registry_cannot_redirect_into_the_bound_origin() {
+    let trusted = basic_registry();
+    let location = format!("{}/v2/bundle/manifests/1", trusted.origin);
+    let selected = Server::new(move |_| Response::new(307, "").header("Location", &location));
+    let result = compile_bound(&tempfile::tempdir().unwrap(), &selected, None, Some(&trusted.origin));
+    assert_eq!(result["error"]["code"], "oci_auth_untrusted", "{result}");
+    assert_eq!(trusted.seen().len(), 1, "the redirect was followed once, anonymously");
+    assert!(authorized(&trusted).is_empty());
+    assert!(authorized(&selected).is_empty());
+}
+
+/// What the bound registry authorized stays with its origin: a request it redirects elsewhere
+/// (a blob store, say) goes there without the Authorization the registry was sent.
+#[test]
+fn an_authorized_request_redirected_to_another_origin_carries_no_authorization() {
+    let elsewhere = Server::new(|_| Response::new(404, ""));
+    let location = format!("{}/blob", elsewhere.origin);
+    let registry = Server::new(move |request| {
+        if request.headers.contains_key("authorization") {
+            Response::new(307, "").header("Location", &location)
+        } else {
+            Response::new(401, "").header("WWW-Authenticate", "Basic realm=\"registry\"")
+        }
+    });
+    let result = compile(&tempfile::tempdir().unwrap(), &registry, None);
+    assert_eq!(result["error"]["code"], "oci_not_found", "{result}");
+    assert!(authorized(&registry)[0].headers["authorization"].starts_with("Basic "));
+    assert_eq!(elsewhere.seen().len(), 1, "the redirect was followed once");
+    assert!(authorized(&elsewhere).is_empty(), "{:?}", elsewhere.seen());
+}
+
+#[test]
+fn a_malformed_realm_approval_is_reported_not_loosely_matched() {
+    let token = Server::new(|_| Response::new(200, "{\"token\":\"t\"}"));
+    let realm = format!("{}/token", token.origin);
+    let registry = Server::new(move |_| {
+        Response::new(401, "").header("WWW-Authenticate", &format!("Bearer realm=\"{realm}\""))
+    });
+    let approved = format!("{}, https://example.invalid/?token=dummy-secret", token.origin);
+    let result = compile(&tempfile::tempdir().unwrap(), &registry, Some(&approved));
+    assert_eq!(result["error"]["code"], "oci_auth_untrusted", "{result}");
+    assert!(result["error"]["message"].as_str().unwrap().contains("entry 2 is not an origin"), "{result}");
+    assert!(!result.to_string().contains("dummy-secret"), "{result}");
+    assert!(token.seen().is_empty());
+}
+
 /// Each case runs in its own process so the opt-in never leaks between tests.
 fn compile_with_plain_http(
     registry: &str,
@@ -273,6 +464,7 @@ fn compile_with_plain_http(
     )
     .unwrap();
     let mut command = command(&dir);
+    command.env("STACK_OCI_REGISTRY", format!("http://{registry}"));
     if let Some(value) = plain_http {
         command.env("STACK_OCI_PLAIN_HTTP", value);
     }

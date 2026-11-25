@@ -10,7 +10,7 @@
 | `stack up [--ttl 30m] [--owner-pid N \| ancestor:NAME] [--timeout D] [--reassign-ports] [--no-init \| --reinit S] [--from-snapshot NAME] [--label K=V]...` | Start services, verify them, run pending [init tasks](data.md), record a session |
 | `stack status [--project[=PATH] \| --all] [--label K=V]...` | Verify every service now (exit 1 if any fails in a started checkout) and renew the lease; with a [fleet selection](#fleet-selections), of every matching checkout |
 | `stack restart [service... \| --changed] [--timeout D]` | Restart services (all when none named) and verify again |
-| `stack run <task> [--timeout D] [--up [--ttl D]] [-- args]` | Run a `[tasks.<name>]` once every service verifies |
+| `stack run [--timeout D] [--up [--ttl D]] <task> [args]` | Run a `[tasks.<name>]` once every service verifies |
 | `stack exec [--require S \| --require-all] [--timeout D] [--secret KEY]... [--up [--ttl D]] [--install] -- <cmd>` | Run a command with the stack's tools and env |
 | `stack logs [service...] [--tail N] [--since-start] [--since D] [--grep TEXT [-i]] [--follow \| --project[=PATH] \| --label K=V]` | Show services' recent output (default 100 lines each) |
 | `stack env [--shell bash\|zsh\|fish]` | Print the environment `exec` would give a command, for `eval` |
@@ -22,12 +22,12 @@
 | `stack ps [--no-size] [--project[=PATH]] [--state S] [--label K=V]... [--worktrees]` | List every checkout Stack has records for on this machine (read-only), or those selected |
 | `stack mv <old> <new>` | After moving a checkout, carry its session, ports, tokens and data to the new path |
 | `stack publish <dir> oci:<registry>/<repo>:<tag> [--force]` | Publish a bundle to an [OCI registry](registries.md) |
-| `stack setup [--force]` | Get mise, unless one is already on `PATH` |
+| `stack setup [--force]` | Get mise, unless a working one is already on `PATH`; one it installs comes first on `PATH` for Stack |
 | `stack setup --gc-agent [--print \| --remove] [--enable]` | Write a launchd agent or systemd user unit that runs `gc --watch` |
 | `stack completions <bash\|zsh\|fish\|elvish\|powershell>` | Print a shell completion script |
 | `stack doctor` | Check mise, git, tar, and that the project compiles |
 | `stack errors [--markdown]` | List every [error code](errors.md) with its meaning, default hint and whether a retry can succeed |
-| `stack mcp` | Serve these operations over MCP (stdio); `--profile core` offers only the daily loop. See [coding agents](agents.md) |
+| `stack mcp [--profile core] [--allow-host-purge]` | Serve these operations over MCP (stdio); `--profile core` offers only the daily loop; `--allow-host-purge` lets `stack_down` purge checkouts selected by label. See [coding agents](agents.md) |
 
 Every command accepts `-C <dir>` (the project directory), `--json` (one result object on
 stdout; see [reading results](agents.md#reading-results)) and `--quiet` (`-q`).
@@ -159,7 +159,8 @@ as usual.
 
 - **Leases.** `--ttl 30m` expires the session after 30 minutes without use (`exec`, `run`,
   `status` and `renew` extend it). `--owner-pid N` ties it to a process that lives as long as
-  your work. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
+  your work: that very process, by PID, start time and boot, so a later process given its PID
+  does not keep the session. `--owner-pid ancestor:<name>` finds that process for you: Stack walks up from its
   own parent and uses the nearest ancestor whose command name (or `argv[0]`) is `<name>`, for
   example `ancestor:claude` from a hook Claude Code runs. With no match it fails with
   `owner_not_found`, listing the ancestors it saw, and starts nothing. With neither flag, a
@@ -284,6 +285,11 @@ and `NATS_MONITORING_URL`; SpiceDB's `SPICEDB_ENDPOINT`, `SPICEDB_HTTP_PORT` and
 is left out, and a password inside a URL is shown as `***`. A service that does not verify has
 no `endpoints`; what it would have had is under `withheld`.
 
+Without `--json`, `up`, `restart` and `status` print a verified service's endpoints under its
+line, the same masked values: its URLs, or every variable when it has none. A service without an
+assigned port shows `port -`. A service that does not verify shows its reason and the variables
+withheld from commands, never an address.
+
 ### Reason codes
 
 A service that is not ready has a `reason` for people and a `reason_code` to branch on:
@@ -310,7 +316,9 @@ A service that is not ready has a `reason` for people and a `reason_code` to bra
 `save <name>` copies this checkout's postgres and redis data, `restore <name>` replaces it,
 `list` and `rm <name>` manage them. Only the data directory `up` recorded for this checkout is
 copied or replaced. Running services, and those that depend on them, are stopped for the copy,
-then started and verified again. Snapshots are shared by every checkout of the same
+then started and verified again. A restore replaces every snapshotted service's data or none;
+a failure lists what each service holds (`unchanged`, `rolled_back`, or `manual_recovery`
+with where its old data is, `restore_incomplete`). Snapshots are shared by every checkout of the same
 repository. See [service data](data.md#snapshots).
 
 ## restart
@@ -388,6 +396,11 @@ says; for a command that should run with services down, use `exec`. A task gets 
 declares, and installs any missing pinned tool before it starts. `unknown_task` lists the
 tasks the project defines. `--up` and `--ttl` work as for [`exec`](#exec).
 
+Stack's options, global ones such as `--json` included, go before the task's name. Every
+argument after the name is the task's: `stack run test --timeout 3` gives the task `--timeout 3`,
+while `stack run --timeout 5m test` bounds the run. A `--` right after the name only separates
+(`stack run test -- -x` gives the task `-x`); any later `--` is passed on.
+
 ## logs
 
 Prints up to `--tail` lines (default 100, at most 10000) that the supervisor kept for a
@@ -401,12 +414,51 @@ single-service result.
 - `--since 10m` keeps only output from the last 10 minutes.
 - `--grep TEXT` keeps lines containing `TEXT` (a plain substring, not a regex); `-i` ignores
   case. `--tail` then counts matching lines, out of the last 10000.
-- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. Stack
-  reads the log again every second. Not with `--json`, and not over MCP.
+- `--follow` (`-f`) keeps printing new lines until Ctrl-C ends it, as it ends `tail -f`. Every
+  second Stack reads what each log gained since the last read (and nothing else: no window is
+  read again and nothing is compiled), so every line is printed once, repeated lines included;
+  output a rotation or truncation took before it was read is said on stderr. Not with `--json`;
+  use `--cursor` there.
+- `--cursor CURSOR` (with `--json`; MCP `stack_logs` takes `cursor`) reads only what was written
+  after the position a previous result gave. Every result carries `cursor` (one per service, and
+  one for all of them in a several-service result); pass it back, or `""` to begin. A cursor read
+  returns each line once, repeated lines included, adds `timestamps` (when the supervisor read
+  each line, Unix milliseconds, 0 for a line it did not stamp), caps the lines per read at
+  `--tail` (`more: true` says to read again), and reports `gap: "rotated"` or `gap: "truncated"`
+  when output was lost between the cursor and what is kept. It compiles nothing and reads only
+  the new bytes (at most 1 MiB per read). The cursor names the log file (device, inode, and the
+  generation in the header line each file the supervisor makes begins with) and the byte offset
+  after the last whole line read, with a check of that line, so a rotation is followed into the
+  new file, and a new file that reuses the inode of one rotated away is never read from the old
+  file's offset: the read reports `gap: "rotated"` and returns the oldest file kept from its
+  start. Files written by an older Stack's supervisor have no header; there the check of the
+  line before the offset tells a new file from the old one, except one holding the very same
+  line at that offset, and a file shorter than the cursor is taken for one truncated. A cursor
+  an older Stack gave (it begins `v1`) is still accepted, but cannot show its file is still
+  kept: its first read returns the oldest file kept from its start with `gap: "rotated"`
+  (lines already read may come again), and the cursor it gives back is a new one (`v2`).
+  A line still being written is left for the next read, and so is one that the rest of a read's
+  1 MiB cannot hold after a rotation (it comes whole, with its timestamp, on the next read). A
+  cursor naming a service no project can have (a name with `/` or NUL, `.` or `..`) is a
+  `usage` error. A cursor of several services reads those
+  services, a service with no log yet included (its output appears once it has some); a service
+  added to the project since needs a new cursor. Services an older Stack started under Pitchfork
+  have no cursor reads until the next `up`.
 
 The output is read from `logs/<service>.log` in the checkout's supervisor directory (see
 [worktrees](worktrees.md#services-and-the-supervisor)); no process is started for it. Each log is
-rotated at 16 MiB, one older file kept; at most the last 1 MiB is read. For services an older
+rotated at 16 MiB, one older file kept; at most the last 1 MiB is read. Each line is one record,
+stamped with the millisecond the supervisor read it; a line longer than 64 KiB is stored as
+several records, and output that ends without a newline is completed with one. The supervisor
+holds at most 1 MiB of each service's output it has not written yet: a service's output waits
+for room for up to a second (its writes block meanwhile, as on a slow terminal), then is
+dropped, and the log says so (`[stack] N line(s) of output (B bytes) dropped`); the supervisor's
+own lines never wait. A write that fails part way is cut back off the file where the filesystem
+allows; where it does not (or a crash cut a record), the cut record's line is ended before
+anything else is written, so the dropped-output note is always a record of its own, and that cut
+record is the only one not as it was read. Logs are read and written only as regular files of
+the checkout's own `logs` directory: a symbolic link in a log's place, or in the directory's, is
+an error, never followed. For services an older
 Stack started under Pitchfork, `logs` asks Pitchfork (`pitchfork logs`) until the next `up`.
 `unknown_service` lists the project's services; `logs_failed` means the output could not be read
 (or the service never started in this checkout).
@@ -613,10 +665,28 @@ with `no_lease`, whose hint says how to give it one.
 | `ttl_secs` | The TTL, when there is one |
 | `renewed_at` | When it was last renewed (Unix seconds; 0 without a lease) |
 | `expires_at` | When a TTL lease runs out unless something renews it first (Unix seconds) |
-| `owner_pid`, `owner_alive` | The owner process, and whether it is alive now |
+| `owner_pid`, `owner_alive` | The owner process, and whether it is alive now (absent when that cannot be told) |
+| `owner_identity` | `pid+start_time+boot`, or `pid` for a lease an earlier Stack recorded |
+| `owner_unknown` | Why whether the owner runs cannot be told; the lease is kept meanwhile |
 | `expired`, `expired_reason` | The lease ran out, and why; `gc` or the next `up` anywhere reclaims the session |
 
 `status` keeps `lease_expired`, the reason with what to do about it, beside it.
+
+An owner is the process the PID named when the lease was taken: `up` records its start time,
+the boot it runs in and, on Linux, the PID namespace `up` saw it from. The lease runs out once
+that process exits: no process has the PID, the PID now names a process with another start
+time (a reused PID), or the machine restarted. When that cannot be told, the lease is kept, as
+for a live owner (a TTL beside it still runs out): on Linux, when the PID namespace it was
+recorded from is not this one or cannot be read (a container sharing `STACK_STATE_DIR` with
+the host, say, where the PID names another process), and when a process has the PID but its
+start time cannot be read, now or when the lease was taken. Whether any process has the PID is
+asked of the kernel itself (`kill(pid, 0)`): another user's process counts as running though it
+may not be signalled, and only no process at all, or a zombie, counts as exited. A probe that
+fails otherwise (refused, an I/O error, a status that is hidden) is never taken for an exit: it
+cannot be told, for a bare-PID lease too. A command that keeps the session's
+lease (`exec --up`, `run --up`, `renew`) keeps its owner as recorded. A lease Stack 0.1.24 or
+earlier recorded names its owner by PID alone (`owner_identity` `pid`): it stays alive while
+any process has that PID, as before, until a command names an owner again.
 
 Which lease a session gets, when the command starting it names none:
 
@@ -666,6 +736,65 @@ one in place, if it cannot be renamed): `dir`, `reason` and `bytes`;
 one a build holds is left out, as a pass would skip it.
 `gc` removes them without listing them in its result.
 
+A checkout counts as deleted only when that can be shown: its path is not found and the
+deepest directory above it that is there is on the very mount the checkout was on. With its
+session, port reservations, identity tokens, data records and supervisor, Stack records the
+filesystem's device and the mount: that mount's root (the highest directory above the checkout
+on it), which directory the root is (device, inode, and birth time where the filesystem keeps
+one) and, on Linux, the kernel's mount id with the boot and mount namespace it was read in
+(Linux mount ids are reused once a mount is gone; the unique id of Linux 6.8 and later is
+compared where both sides have it). The directory above the missing path must be on a mount
+rooted at the same place, at the same directory; on Linux it must also be the same mount, by
+id in the same boot and mount namespace, and by the root's birth time otherwise (with no birth
+time to go by, a checkout deleted across a restart stays `unavailable`). So a lookup refused for
+permission or failing for I/O, a volume that is not mounted right now (its directory under
+`/Volumes` gone, or its mount point left empty), a bind mount that is not mounted (on Linux,
+even one of a directory of the same filesystem, whose mount point has the same device), or a
+directory at the path on another filesystem, shows nothing: such a checkout is `unavailable`,
+and nothing of it is stopped, reclaimed, released or removed, not even an expired lease's
+services. The same holds for a checkout whose session recorded it as the root of its own mount
+when another directory is at its path on another mount: that is what the mount point looks like
+while it is not mounted, so it is `unavailable` rather than `replaced`. `gc` lists it
+(`left_alone`, with `stopped` false since nothing was stopped, the reason after `checkout
+unavailable:`) without failing (Stack 0.1.24 and earlier said `stopped: true` there),
+`--dry-run` under `unavailable`, `ps` with directory `unavailable`, and `up`'s pass under
+`skipped` (`"skipped": "unavailable"`). After a reboot gives a filesystem another device number
+(removable or network volumes, btrfs subvolumes), a checkout deleted from it stays
+`unavailable` rather than being taken for deleted; one still there is still recognised by its
+inode and the birth time its session recorded (with none recorded, the same inode under another
+device may be another volume mounted there: `unavailable`, and `up` does not adopt its session).
+A root birth time recorded on one side only (recorded but unreadable now, or readable now but
+never recorded) is not taken for the same mount either.
+
+Two things update where a record says its checkout is. A command run in the checkout (`up`, any
+compile of it, the supervisor started for it) adopts the path's records for the checkout there
+now and records its mount; where the mount cannot be learned it keeps what was recorded, unless
+the checkout is now on another filesystem. Everything else, `gc` and other checkouts' commands
+included, only observes: it brings a record up to date only where what is at the path is shown
+to be on the very mount recorded (the same mount seen again after a restart gets its new ids),
+so the empty mount point a volume or bind mount that is not mounted leaves at a checkout's path,
+or another volume mounted there, never replaces the mount recorded, and once that mount point is
+gone too the checkout is still `unavailable`, never deleted.
+
+Records an earlier Stack kept (0.1.24 and earlier) name no mount. While their checkout is there,
+a command run in it records its mount; `gc` completes them by observation only where that cannot
+pass a mount point off as the checkout: data records whose checkout token is the directory's at
+the path, and, where every mount has a device of its own (macOS), records whose device is the one
+there. Once the checkout is gone they decide nothing on their own: one with only a device is
+deleted only where every mount has a device of its own (macOS), never on Linux, where an unmounted
+bind mount of the same filesystem leaves the same behind; one with no device at all is never
+shown deleted, whatever its parent directory holds. On Linux an earlier Stack's session whose
+path holds another directory on the same filesystem is `unavailable` rather than `replaced`, for
+the same reason. Such a checkout stays `unavailable`, its reason saying so. To let Stack reclaim
+it, first make sure it is not a volume or bind mount that is merely not mounted (mounting it
+again is all that takes: it is found as it was). If it was deleted, recreate the checkout at that
+path (its `stack.toml` with it) and run `stack up` there: that adopts the path's records for the
+new checkout and records its mount if there is no conflicting session. `stack down --purge`
+there then releases its ports and identities, or deleting the directory lets `gc` reclaim them.
+If `up` reports `session_conflict` and `gc` still reports `unavailable`, the old session needs
+manual recovery. Confirm its services are stopped before changing its records. A directory
+recreated at the path and left alone does not give `gc` evidence about the original checkout.
+
 A deleted checkout that has no session left (it ran `down` before it was removed, or `gc`
 confirmed its services stopped) gets its port reservations released at once, and its
 supervisor directory (records and logs) removed. Its services' data, which Stack keeps under
@@ -681,6 +810,16 @@ reported with its size and kept; `--reclaim-data` removes it. Data is removed on
   put in its place marker and all, is left alone; it is removed through the directory checked,
   never by looking its path up again. Data recorded before its directory existed is kept until
   an `up` sees it,
+- nothing of it is on another mount: the directory is no mount point itself and nothing under
+  it is one, a bind mount of the same filesystem included, whether of a directory or of a
+  single file (Linux tells those apart by the kernel's mount id, from `statx`, else
+  `/proc/self/fdinfo`; a kernel that gives neither keeps the data). Each directory is checked
+  as it was opened and each other entry as named in the directory held open, not as a path
+  names it. A mount found keeps all of the data, and one put there while the data is being
+  removed stops the removal before it; either way the result says where, and the record is
+  kept. Everything is checked before anything is removed: a directory that cannot be listed
+  whole (`readdir` failing), or opened, keeps all of the data. Links inside are removed
+  themselves, never followed,
 - the supervisor recorded with it confirms the service is not running, and
 - no process carrying the checkout's token runs.
 
@@ -724,12 +863,13 @@ while something may be starting services at a deleted checkout's path.
 
 Lists every checkout this machine's Stack state has records of: a session, port reservations,
 identity tokens or a data directory `up` recorded. For each: its path, whether the directory
-still exists (`dir` is `present`, `missing` or `replaced`), the session id and `state`, the
+still exists (`dir` is `present`, `missing`, `replaced`, or `unavailable` when that cannot be
+shown: see [gc](#gc)), the session id and `state`, the
 lease (see [leases](#leases)), and for each service its port, pid and
 data directory, with the directory's size on disk. `state` is `running` (every service live),
 `partial`, `stopped`, `launching`, `recorded` (a session without services) or `reserved`
 (records but no session). `reclaimable` marks a checkout [`gc`](#gc) reclaims: its directory is
-gone and no session of it is left, so gc releases its ports and reports its data, which
+shown to be gone and no session of it is left, so gc releases its ports and reports its data, which
 `--reclaim-data` removes where it is safe. `totals` adds it all up, with the data of reclaimable
 checkouts in `reclaimable_bytes`.
 
@@ -764,6 +904,10 @@ state `unstarted` (one `git worktree list` for the repository). `totals` count w
 `--all` (every checkout with records). Only checkouts whose directory is still there are acted
 on, one after another, each under its own lock. Labels are set by `stack up --label K=V`, kept
 while the session lives (a later `up --label` adds or replaces keys) and gone after `down`.
+A path is given only as `--project=PATH`: `--project PATH` (with a space) is refused as a usage
+error naming that spelling, in `ps` too, rather than taking the path for a service of `logs`.
+`stack logs --project web` is still the `web` service of every checkout: for `logs`, only a word
+with a `/`, or `.` or `..`, is taken for a misplaced path.
 
 - `stack status --project` returns `{checkouts: [{path, branch, labels, status | error}],
   total, running, healthy, passed}` and exits 0 only when every started checkout is healthy and

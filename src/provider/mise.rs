@@ -1236,8 +1236,11 @@ fn since_argument_in(at: u64, now: u64, local_datetime: impl Fn(u64) -> Option<S
 /// `YYYY-MM-DD HH:MM:SS` in local time, the form Pitchfork's `--since` takes for an instant.
 #[cfg(unix)]
 fn local_datetime(secs: u64) -> Option<String> {
-    let t = libc::time_t::try_from(secs).ok()?;
-    // SAFETY: localtime_r writes only the provided struct.
+    // `localtime_r`'s own parameter types `t`, so it converts to whatever width this target's
+    // `time_t` has (which the deprecated `libc::time_t` alias may not name correctly on musl),
+    // and a time that does not fit is refused.
+    let t = secs.try_into().ok()?;
+    // SAFETY: localtime_r reads `t` and writes only the provided struct.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {

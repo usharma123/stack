@@ -1,0 +1,14 @@
+# config, expected TLC exit code, invariant it must violate (- for a pass), distinct states (one worker).
+config	exit	violated	distinct_states
+FALSE.cfg	0	-	4235172
+WITNESS-StopUnconfirmed.cfg	12	NoUnconfirmedRefusal	5
+WITNESS-RetryRecovers.cfg	12	RetryNeverCommits	752003
+TRUE-CommitWithoutChecks-old.cfg	12	OldDataKeptUntilRecorded	547763
+TRUE-CommitWithoutChecks-records.cfg	12	MarkersDescribeData	1206621
+TRUE-InvalidPublishedHidesAside.cfg	12	ValidGenerationNeverLost	23834
+TRUE-NoAsideRecovery.cfg	12	ReaderFindsGeneration	95
+TRUE-NoGenerationRecheck.cfg	12	RestoresChosenGeneration	19153
+TRUE-OneAtATime.cfg	12	AllOrNothing	1556
+TRUE-ReplayUnconfirmed.cfg	12	NeverTouchesRunningService	73103
+TRUE-RereadChosen.cfg	12	ReaderFindsGeneration	3450
+TRUE-RestartIgnoresJournal.cfg	12	NoStartOnPendingRestore	8860

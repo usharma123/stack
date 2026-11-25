@@ -388,6 +388,27 @@ fn pinned_ports_cannot_collide_across_projects() {
     assert_eq!(sb.compile(&b, Mode::UseLock).unwrap_err().code, "port_conflict");
 }
 
+/// A pin added to a project that already compiled, on the port Stack gave another of its
+/// services: the next ordinary compile gives the pinned service that port and moves the other,
+/// whether the pinned service comes after it (redis) or before it (postgres).
+#[test]
+fn a_pin_added_on_a_port_its_own_project_was_given_moves_the_other_service() {
+    let sb = Sandbox::new();
+    let repo = sb.bundle("pybase", PYBASE);
+    for (pinned, other, version) in [("redis", "postgres", "8"), ("postgres", "redis", "17")] {
+        let dir = sb.path(&format!("pin-{pinned}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("stack.toml"), use_git(&repo, "v1")).unwrap();
+        let port = sb.compile(&dir, Mode::UseLock).unwrap().ports[other];
+        let pin = format!("[override.services.{pinned}]\npreset = \"{pinned}\"\nversion = \"{version}\"\nport = {port}\n");
+        fs::write(dir.join("stack.toml"), format!("{}{pin}", use_git(&repo, "v1"))).unwrap();
+        let after = sb.compile(&dir, Mode::UseLock).unwrap_or_else(|e| panic!("{pinned}: {}: {}", e.code, e.message)).ports;
+        assert_eq!(after[pinned], port, "{pinned}");
+        assert_ne!(after[other], port, "{pinned}");
+        assert_eq!(stack::ports::lookup(&sb.path("state"), &dir).unwrap(), after, "{pinned}");
+    }
+}
+
 #[test]
 fn deleted_projects_release_their_ports() {
     let sb = Sandbox::new();
@@ -1188,4 +1209,159 @@ fn service_names_colliding_with_preset_secondary_ports_are_rejected() {
     assert!(report.ports.contains_key("db") && report.ports.contains_key("api.v2"));
     assert!(report.secondary_ports.contains_key("db.http"));
     assert_ne!(report.ports["api.v2"], report.secondary_ports["db.http"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn links_in_git_and_local_bundles_are_refused_not_left_unhashed() {
+    let sb = Sandbox::new();
+    let secret = sb.path("outside/secret");
+    fs::create_dir_all(secret.parent().unwrap()).unwrap();
+    fs::write(&secret, "not covered by any hash\n").unwrap();
+    let repo = sb.bundle("linked", "[bundle]\nname = 'linked'\n");
+    std::os::unix::fs::symlink(&secret, repo.join("fixtures/secret")).unwrap();
+    commit_all(&repo, "link");
+    git(&repo, &["tag", "v2"]);
+
+    // Git: the checkout holds the link exactly as committed.
+    let root = sb.project(&use_git(&repo, "v2"));
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+    assert!(err.message.contains("fixtures/secret is a symbolic link"), "{}", err.message);
+
+    // Local: the same directory as a path source.
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", repo.display())).unwrap();
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+
+    // A symlinked bundle.toml is refused too.
+    let other = sb.path("bundles/manifest-link");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(sb.path("outside/bundle.toml"), "[bundle]\nname = 'elsewhere'\n").unwrap();
+    std::os::unix::fs::symlink(sb.path("outside/bundle.toml"), other.join("bundle.toml")).unwrap();
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", other.display())).unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap_err().code, "bundle_invalid");
+
+    // Without the link the same bundle compiles, and both transports agree on its hash.
+    fs::remove_file(repo.join("fixtures/secret")).unwrap();
+    commit_all(&repo, "unlink");
+    git(&repo, &["tag", "v3"]);
+    fs::write(root.join("stack.toml"), use_git(&repo, "v3")).unwrap();
+    let by_git = sb.compile(&root, Mode::UseLock).unwrap().bundles[0].content_hash.clone();
+    fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", repo.display())).unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().bundles[0].content_hash, by_git);
+}
+
+#[cfg(unix)]
+#[test]
+fn paths_bin_must_stay_inside_the_hashed_bundle() {
+    let sb = Sandbox::new();
+    let outside = sb.path("bundles/tools");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("tool"), "#!/bin/sh\n").unwrap();
+    let root = sb.project("");
+    // (paths.bin, expected code)
+    for (bin, code) in [("../tools", "bundle_invalid"), ("bin/../../tools", "bundle_invalid"), (".git", "bundle_invalid"), ("nope", "missing_path")] {
+        let dir = sb.path(&format!("bundles/b-{}", bin.replace(['/', '.'], "_")));
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bundle.toml"), format!("[bundle]\nname = 'b'\n[paths]\nbin = [{bin:?}]\n")).unwrap();
+        fs::write(root.join("stack.toml"), format!("[[use]]\nbundle = \"path:{}\"\n", dir.display())).unwrap();
+        let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+        assert_eq!(err.code, code, "{bin}: {}", err.message);
+    }
+
+    // A committed link to a directory outside the checkout: refused by the hash before paths.bin
+    // is looked at, so the target never reaches PATH.
+    let repo = sb.bundle("escape", "[bundle]\nname = 'escape'\n[paths]\nbin = ['tools']\n");
+    std::os::unix::fs::symlink(&outside, repo.join("tools")).unwrap();
+    commit_all(&repo, "link");
+    git(&repo, &["tag", "v2"]);
+    fs::write(root.join("stack.toml"), use_git(&repo, "v2")).unwrap();
+    let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+    assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+    assert!(err.message.contains("symbolic link"), "{}", err.message);
+}
+
+#[test]
+fn a_second_postgres_or_redis_service_fails_compile_before_anything_starts() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project("");
+    // (stack.toml, preset, services named, in composed order with their layers)
+    for (toml, preset, named) in [
+        (
+            "[services.db]\npreset = 'postgres'\n[services.analytics]\npreset = 'postgres'\nversion = '16'\n".to_string(),
+            "postgres",
+            "'db' (project), 'analytics' (project)",
+        ),
+        (
+            "[services.cache]\npreset = 'redis'\n[services.queue]\npreset = 'redis'\n".to_string(),
+            "redis",
+            "'cache' (project), 'queue' (project)",
+        ),
+        // Composed: the bundle's postgres beside the project's.
+        (
+            format!("{}[services.reports]\npreset = 'postgres'\n", use_git(&base, "v1")),
+            "postgres",
+            "'postgres' (bundle:pybase), 'reports' (project)",
+        ),
+        // An override can introduce the duplicate, too.
+        (
+            format!("{}[override.services.cache]\npreset = 'redis'\n", use_git(&base, "v1")),
+            "redis",
+            "'redis' (bundle:pybase), 'cache' (override)",
+        ),
+    ] {
+        fs::write(root.join("stack.toml"), &toml).unwrap();
+        let err = sb.compile(&root, Mode::UseLock).unwrap_err();
+        assert_eq!(err.code, "invalid_service", "{toml}: {}", err.message);
+        assert!(err.message.contains(&format!("2 services use preset '{preset}': {named}")), "{}", err.message);
+        let hint = err.hint.as_deref().unwrap();
+        assert!(hint.contains(&format!("keep one {preset} service")) && hint.contains("[override.services."), "{hint}");
+        assert_eq!(err.details.len(), 2, "{:?}", err.details);
+        assert!(!root.join("stack.lock").exists(), "{toml}: compile wrote a lock");
+        assert!(!mise::output_path(&root).exists(), "{toml}: compile wrote provider config");
+    }
+
+    // Locked operations (`up`, `exec`, `run`) refuse it too, ahead of any lock check.
+    fs::write(root.join("stack.toml"), use_git(&base, "v1")).unwrap();
+    sb.compile(&root, Mode::UseLock).unwrap();
+    let lock = fs::read_to_string(root.join("stack.lock")).unwrap();
+    fs::write(root.join("stack.toml"), format!("{}[services.reports]\npreset = 'postgres'\n", use_git(&base, "v1"))).unwrap();
+    let err = sb.compile(&root, Mode::Frozen).unwrap_err();
+    assert_eq!(err.code, "invalid_service", "{}", err.message);
+    assert_eq!(fs::read_to_string(root.join("stack.lock")).unwrap(), lock);
+}
+
+#[test]
+fn distinct_or_agreeing_postgres_and_redis_services_still_compile() {
+    let sb = Sandbox::new();
+    let base = sb.bundle("pybase", PYBASE);
+    let root = sb.project(&use_git(&base, "v1"));
+    // The bundle's one postgres and one redis.
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().stack.services.len(), 2);
+    // The project repeating the bundle's definition is one service, not two.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{}[services.postgres]\npreset = 'postgres'\nversion = '17'\n", use_git(&base, "v1")),
+    )
+    .unwrap();
+    assert_eq!(sb.compile(&root, Mode::UseLock).unwrap().stack.services.len(), 2);
+    // A second database as a service of the project's own, as the hint suggests.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{}[services.reports]\nrun = 'exec ./reports-db'\n", use_git(&base, "v1")),
+    )
+    .unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.stack.services.len(), 3);
+    // And an override replacing a preset service resolves a duplicate.
+    fs::write(
+        root.join("stack.toml"),
+        format!("{}[services.reports]\npreset = 'postgres'\n[override.services.postgres]\nrun = 'exec ./legacy-db'\n", use_git(&base, "v1")),
+    )
+    .unwrap();
+    let report = sb.compile(&root, Mode::UseLock).unwrap();
+    assert_eq!(report.stack.services["reports"].value.preset.as_deref(), Some("postgres"));
+    assert_eq!(report.stack.services["postgres"].value.preset, None);
 }

@@ -1,0 +1,66 @@
+# Stack's dependency policy, checked by `cargo deny` through scripts/ci/dependency-policy.sh,
+# which pins cargo-deny's version and checksum and the RustSec database commit.
+#
+# - Every pull request and main push (validate.yml, job "Dependency policy") runs it `pinned`:
+#   bans, licenses and sources, which depend only on Cargo.lock, and advisories against the
+#   database at ADVISORY_DB_COMMIT, offline. A pull request's result therefore depends on its own
+#   content alone, never on an advisory published or a crate yanked meanwhile.
+# - audit.yml runs it `latest` every week, on each push to main and on demand: advisories and
+#   yanked crates against the newest database and index, so a new one is reported there. Move
+#   ADVISORY_DB_COMMIT forward, with the lockfile fix or an exception below, in the pull request
+#   that addresses it.
+#
+# Exceptions: an advisory may be ignored only with its id, the reason it does not affect Stack,
+# and the narrowest scope (one crate version) in `[advisories] ignore`, reviewed like code.
+# There are none.
+
+[graph]
+# The shipped targets (validate.yml's native matrix); dev-dependencies are included.
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
+[advisories]
+# cargo-deny's default; scripts/ci/dependency-policy.sh replaces it with its own directory.
+db-path = "$CARGO_HOME/advisory-dbs"
+# The pinned database ages by design: its age is never a reason to fail a pull request
+# (audit.yml keeps up with new advisories).
+maximum-db-staleness = "P3650D"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+# What the dependency graph uses today; anything else needs a review and an entry here.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+# Stack itself is `publish = false` and carries no license field.
+ignore = true
+
+[bans]
+# ureq's webpki-roots 0.26 re-exports 1.x: two versions, reported but not refused.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

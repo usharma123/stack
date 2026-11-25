@@ -1,0 +1,32 @@
+name: Dependency audit
+# The newest RustSec advisories and yanked crates against Cargo.lock. Pull requests check the
+# pinned database instead (validate.yml, job "Dependency policy"), so their result depends on
+# their content alone; a failure here is fixed in a pull request that moves the pin (deny.toml).
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  advisories:
+    name: Newest advisories
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.93.1 --profile minimal
+        timeout-minutes: 5
+      - run: scripts/ci/dependency-policy.sh latest
+        timeout-minutes: 8
+        env:
+          CARGO: cargo +1.93.1

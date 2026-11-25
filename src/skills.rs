@@ -8,9 +8,10 @@
 //! every entry is `unavailable` and a `skills_unavailable` warning says why: discovery never
 //! fails the command that asked.
 //!
-//! Skills of tools stack adds for its provider (Pitchfork) are never listed by default, never
-//! returned and never linked: Pitchfork's skill teaches an agent to drive daemons directly,
-//! around stack's ownership and identity checks.
+//! Skills of a provider tool (Pitchfork, which Stack 0.1.23 and earlier pinned to run services,
+//! as a lock such a release wrote may still) are never listed by default, never returned and
+//! never linked: Pitchfork's skill teaches an agent to drive daemons directly, around stack's
+//! ownership and identity checks.
 //!
 //! Sync (`[skills] dir`, project only) links each available skill into a directory inside the
 //! project and records what it linked in `<dir>/.stack-skills.json`. Only a symbolic link whose

@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn exec_up_keeps_a_sessions_lease_and_gives_one_without_a_default_ttl() {
-        let lease = |ttl_secs, owner_pid| Lease { ttl_secs, owner_pid, renewed_at: 0 };
+        let lease = |ttl_secs, owner_pid| Lease { ttl_secs, owner_pid, owner: None, renewed_at: 0 };
         let resolved = |ttl: Option<u64>, previous: Option<&Lease>, project: Option<u64>| {
             prepared_lease(ttl).resolve_with_previous(project, previous, |pid| pid == 7)
         };
