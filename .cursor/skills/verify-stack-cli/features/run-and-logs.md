@@ -18,4 +18,4 @@ A fixture service prints what each request asks for, so every expected line and 
 
 ## Gotchas
 
-The supervisor writes a line a moment after the service prints it: the scenario reads on from its cursor until the lines arrive.
+The supervisor writes a line a moment after the service prints it: the scenario reads on from its cursor until the lines arrive, for at most `STACK_E2E_WAIT_SECONDS` (15 by default). Each `run` and `logs` call runs under `within` (`STACK_E2E_CALL_SECONDS`, 30 by default): a call that stalls is stopped and the scenario fails naming it, with the reads so far and the service log's tail. The `--follow` client is tracked and stopped however the scenario ends.

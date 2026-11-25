@@ -26,7 +26,8 @@ printf 'Evidence: %s\n' "$evidence"
   git status --porcelain
 } >"$evidence/source.log"
 target_dir="$root/target/verification/build"
-cargo build --locked --bin stack --target-dir "$target_dir"
+read -r -a cargo <<<"${CARGO:-cargo}"
+"${cargo[@]}" build --locked --bin stack --target-dir "$target_dir"
 binary="$target_dir/debug/stack"
 {
   "$binary" --version

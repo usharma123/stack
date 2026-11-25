@@ -31,6 +31,75 @@ assert_dead() {
   done
 }
 
+# Processes a scenario leaves running in the background: `track PID...` names them, and
+# `track_pids FILE` names a file its commands append their own PIDs to (one per line).
+# `stop_tracked`, run on exit however the scenario ends, stops each one still running with TERM
+# and, two seconds later, KILL, so neither a stalled client nor a command its server failed to
+# stop outlives the scenario. A scenario that sets its own EXIT trap calls it there.
+E2E_TRACKED=() E2E_TRACKED_FILES=()
+track() { E2E_TRACKED+=("$@"); }
+track_pids() { E2E_TRACKED_FILES+=("$@"); }
+stop_tracked() {
+  local pid file pids=() tenths
+  pids=(${E2E_TRACKED[@]+"${E2E_TRACKED[@]}"})
+  for file in ${E2E_TRACKED_FILES[@]+"${E2E_TRACKED_FILES[@]}"}; do
+    [[ -f "$file" ]] || continue
+    while read -r pid || [[ -n "$pid" ]]; do
+      if [[ "$pid" =~ ^[0-9]+$ ]]; then pids+=("$pid"); fi
+    done <"$file"
+  done
+  for pid in ${pids[@]+"${pids[@]}"}; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    for ((tenths = 0; tenths < 20; tenths++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+trap stop_tracked EXIT
+# within SECONDS COMMAND...: run COMMAND with this shell's standard input and return its status.
+# If it is still running after SECONDS, stop it (TERM, then KILL), print what `diagnose` prints
+# when the scenario defines that function, and fail naming the command and the limit.
+within() {
+  local limit=$1 pid tenths=0 status=0
+  shift
+  "$@" <&0 &
+  pid=$!
+  track "$pid"
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((tenths >= limit * 10)); then
+      kill -TERM "$pid" 2>/dev/null || true
+      for ((tenths = 0; tenths < 20; tenths++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      if declare -F diagnose >/dev/null; then diagnose >&2 || true; fi
+      fail "still running after ${limit}s, stopped: $*"
+    fi
+    sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  wait "$pid" || status=$?
+  return "$status"
+}
+# eventually SECONDS WHAT COMMAND...: run COMMAND every tenth of a second until it succeeds; if
+# it has not after SECONDS, print what `diagnose` prints and fail saying WHAT never happened.
+eventually() {
+  local limit=$1 what=$2 deadline
+  shift 2
+  deadline=$(($(date +%s) + limit))
+  until "$@"; do
+    if (($(date +%s) >= deadline)); then
+      if declare -F diagnose >/dev/null; then diagnose >&2 || true; fi
+      fail "$what (not within ${limit}s)"
+    fi
+    sleep 0.1
+  done
+}
+
 report_failure() {
   local status=$?
   echo "FAIL at line $1: $2" >&2
