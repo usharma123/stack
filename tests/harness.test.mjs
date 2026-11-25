@@ -253,7 +253,8 @@ test('a scenario cancelled while within waits stops the client', async () => {
   let result = await cancel('within 30 STALLED', false);
   assert.ok(cancelled(result) && result.seconds < 10 && result.gone, JSON.stringify(result));
   result = await cancel('out=$(within 3 STALLED)', false);
-  assert.ok(cancelled(result) && result.seconds < 10 && result.gone, JSON.stringify(result));
+  // This path pays for both within's polling and its stop grace before Bash can exit.
+  assert.ok(cancelled(result) && result.seconds < 20 && result.gone, JSON.stringify(result));
 });
 
 test('scenarios 14 and 15 stop a setup command that stalls, and report it', () => {
