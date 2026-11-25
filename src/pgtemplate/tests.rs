@@ -963,6 +963,17 @@ impl Drop for Mode {
 
 #[test]
 fn a_template_that_cannot_be_moved_aside_is_said_to_be_left_and_gc_does_not_list_it() {
+    const ISOLATED: &str = "STACK_TEST_PGTEMPLATE_GC_ISOLATED";
+    if std::env::var_os(ISOLATED).is_none() {
+        // A concurrent fork in this test binary can briefly inherit the flock descriptor. GC
+        // intentionally skips busy locks, so run the immediate reacquisition checks alone.
+        let name = "pgtemplate::tests::a_template_that_cannot_be_moved_aside_is_said_to_be_left_and_gc_does_not_list_it";
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([name, "--exact", "--test-threads=1"]).env(ISOLATED, "1");
+        let run = crate::process::capture(&mut command, Duration::from_secs(60), 1 << 20).unwrap();
+        assert!(run.exit_code == Some(0) && run.stdout.contains("1 passed"), "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+        return;
+    }
     let _settled = Settled::new();
     let p = Published::new();
     p.damage_wal();

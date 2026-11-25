@@ -117,18 +117,29 @@ stop_tracked() {
   rm -rf "$E2E_TRACKED"
 }
 trap stop_tracked EXIT
+# Turn cancellation into an ordinary exit so the scenario can run its cleanup, including when
+# Bash was waiting for a pipeline or command substitution.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # within SECONDS COMMAND...: run COMMAND with this shell's standard input and return its status.
 # If it is still running after SECONDS, stop it (TERM, then KILL), print what `diagnose` prints
 # when the scenario defines that function, and fail naming the command and the limit. COMMAND
 # is tracked only while it runs.
 within() {
-  local limit=$1 pid when tenths=0 status=0
+  local limit=$1 pid='' tenths=0 status=0
   shift
+  # Stop a tracked child here on cancellation. If it inherited the substitution's stdout, the
+  # outer shell cannot run its cleanup until the child closes the pipe.
+  if ((BASH_SUBSHELL > 0)); then
+    trap 'if [[ -f "$E2E_TRACKED/$pid" ]]; then stop_child "$pid"; fi; exit 130' INT
+    trap 'if [[ -f "$E2E_TRACKED/$pid" ]]; then stop_child "$pid"; fi; exit 143' TERM
+  fi
   "$@" <&0 &
   pid=$!
   track "$pid"
-  when=$(tracked "$pid")
-  while alive "$pid" "$when"; do
+  # Poll this shell's child without forking a second command substitution. stop_child still
+  # checks the tracked start time before sending a signal.
+  while kill -0 "$pid" 2>/dev/null; do
     if ((tenths >= limit * 10)); then
       stop_child "$pid"
       if declare -F diagnose >/dev/null; then diagnose >&2 || true; fi
@@ -139,6 +150,7 @@ within() {
   done
   wait "$pid" || status=$?
   untrack "$pid"
+  if ((BASH_SUBSHELL > 0)); then trap - INT TERM; fi
   return "$status"
 }
 # eventually SECONDS WHAT COMMAND...: run COMMAND every tenth of a second until it succeeds; if
