@@ -49,7 +49,7 @@ jobs:
           - { runner: macos-15-intel, platform: darwin-x64, target: x86_64-apple-darwin }
           - { runner: macos-15, platform: darwin-arm64, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       TARGET: ${{ matrix.target }}
       PLATFORM: ${{ matrix.platform }}
@@ -73,6 +73,11 @@ jobs:
       - run: node --test tests/*.test.mjs
         timeout-minutes: 5
       - run: cargo +1.93.1 clippy --locked --all-targets -- -D warnings
+        timeout-minutes: 15
+      # On Linux the host is glibc, the shipped binary musl: lint what ships too, with its libc.
+      - name: Clippy for the musl release target
+        if: runner.os == 'Linux'
+        run: cargo +1.93.1 clippy --locked --all-targets --target "$TARGET" -- -D warnings
         timeout-minutes: 15
       - run: cargo +1.93.1 test --locked --all-targets
         timeout-minutes: 15
@@ -106,9 +111,61 @@ jobs:
         timeout-minutes: 15
       - run: bash tests/e2e/ci-oci.sh target/debug/stack
         timeout-minutes: 10
-  # The service/session scenarios against real mise, natively on each OS using the packaged
-  # release binary (static musl on Linux x64, arm64 release on macOS).
-  # Scenario 5 (OCI) runs where Docker provides a registry; elsewhere it is reported as skipped.
+  # The TLA+ models (each skill's baseline, historical mutants, witnesses and limits, with the
+  # TLC jar pinned by SHA-256 and checked on every use) and the Rust regressions linked to them,
+  # one job per skill. psql is required so the libpq check never passes by skipping.
+  formal:
+    permissions:
+      contents: read
+    name: Formal verification (${{ matrix.skill }})
+    strategy:
+      fail-fast: false
+      matrix:
+        skill: [pgtemplate, session, snapshot, endpoints, bundles, ports-mcp]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SKILL: ${{ matrix.skill }}
+      CARGO: cargo +1.93.1
+      CARGO_BUILD_JOBS: '4'
+      STACK_REQUIRE_PSQL: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.93.1 --profile minimal
+        timeout-minutes: 5
+      - name: Require Java 17 and psql
+        timeout-minutes: 5
+        run: |
+          test -x "$JAVA_HOME_17_X64/bin/java" || { echo "no Java 17 at JAVA_HOME_17_X64=$JAVA_HOME_17_X64" >&2; exit 1; }
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          "$JAVA_HOME_17_X64/bin/java" -version
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -yqq postgresql-client
+          fi
+          psql --version
+      - run: verification/check.sh "$SKILL"
+        timeout-minutes: 40
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
+        with:
+          name: verification-${{ matrix.skill }}
+          path: |
+            target/verification/${{ matrix.skill }}.*/
+            !target/verification/**/*.states
+          if-no-files-found: warn
+          retention-days: 14
+  # The packaged binary from `native` (static musl on Linux) on a clean machine and against real
+  # mise and Postgres, natively on each OS. Linux x64 and arm64 are each a separately built musl
+  # binary with its own mise build, and macOS arm64 the release most users run; darwin-x64 is
+  # built, unit-tested and install-smoked in `native` and `install`, not run here: Intel macOS
+  # runners are scarce and slow, and its code paths are the arm64 build's.
+  # Scenario 5 (OCI) runs where Docker provides a registry (Linux); elsewhere it is reported as
+  # skipped. Each step that runs Stack gives it state of its own (a scenario's, a test's or the
+  # smoke's isolated HOME); none shares a STACK_STATE_DIR with another.
   services:
     permissions:
       contents: read
@@ -118,10 +175,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-24.04, platform: linux-x64, mise: linux-x64, mise_sha256: 4312f8fd72a8d6a869cd2aca7444929e2a0ef6f45d2c6f2866a1eacc5bdc2e84, registry: true, worktree_isolation: true }
-          - { runner: macos-15, platform: darwin-arm64, mise: macos-arm64, mise_sha256: b3539de1a9823505269481b71d09a9cf86e141c63ebfc6101b3cf561766a83e8, registry: false, worktree_isolation: false }
+          # The mise builds `stack setup` installs (src/setup.rs; tests/ci.test.mjs checks they agree).
+          - { runner: ubuntu-24.04, platform: linux-x64, mise: linux-x64-musl, mise_sha256: f7530faed716ec24457609c0278618770a1b4b8f856b61686ac685c148e3ffd1, registry: true, clone: copy }
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64, mise: linux-arm64-musl, mise_sha256: 581eff012396884044ba97b9e30c446492d2ee40bbf78388eecc0fc17973856d, registry: true, clone: copy }
+          - { runner: macos-15, platform: darwin-arm64, mise: macos-arm64, mise_sha256: b3539de1a9823505269481b71d09a9cf86e141c63ebfc6101b3cf561766a83e8, registry: false, clone: clonefile }
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
@@ -132,20 +191,39 @@ jobs:
         with:
           name: native-${{ matrix.platform }}
           path: dist-bin
-      - name: Prepare downloaded release binary
+      - name: Verify the packaged binary is the one built from this commit
         timeout-minutes: 1
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
           chmod +x dist-bin/stack
+          info=dist-bin/build-info.json
+          test "$(jq -r .platform "$info")" = "$PLATFORM"
+          test "$(jq -r .commit "$info")" = "$(git rev-parse HEAD)"
+          sum=$(shasum -a 256 dist-bin/stack | cut -d' ' -f1)
+          test "$sum" = "$(jq -r .sha256 "$info")" || { echo "dist-bin/stack has SHA-256 $sum, not build-info.json's" >&2; exit 1; }
+          if [ "$RUNNER_OS" = Linux ]; then file -b dist-bin/stack | grep -Eq 'statically linked|static-pie linked'; fi
           dist-bin/stack --version
+          mkdir -p "$RUNNER_TEMP/evidence/smoke" "$RUNNER_TEMP/evidence/scenarios"
+      # Before any mise is installed: the smoke's PATH holds none, and its setup must install one.
+      - name: Clean-machine smoke (setup, doctor, compile --locked, up, exec and run, down)
+        timeout-minutes: 20
+        run: bash tests/e2e/clean-machine.sh dist-bin/stack
+        env:
+          STACK_SMOKE_EVIDENCE: ${{ runner.temp }}/evidence/smoke
+          STACK_SMOKE_SECONDS: '600'
       - name: Install pinned mise
         timeout-minutes: 5
         env:
           MISE_PLATFORM: ${{ matrix.mise }}
           MISE_SHA256: ${{ matrix.mise_sha256 }}
         run: |
-          curl --connect-timeout 10 --max-time 120 --retry 2 --retry-max-time 240 -fsSL -o "$RUNNER_TEMP/mise.tgz" "https://github.com/jdx/mise/releases/download/v2026.9.18/mise-v2026.9.18-${MISE_PLATFORM}.tar.gz"
-          echo "$MISE_SHA256  $RUNNER_TEMP/mise.tgz" | shasum -a 256 -c -
+          version=$(sed -n 's/^pub const MISE_VERSION: &str = "\(.*\)";$/\1/p' src/setup.rs)
+          test -n "$version"
+          scripts/ci/fetch-verified.sh "https://github.com/jdx/mise/releases/download/v$version/mise-v$version-$MISE_PLATFORM.tar.gz" "$MISE_SHA256" "$RUNNER_TEMP/mise.tgz"
           tar -xzf "$RUNNER_TEMP/mise.tgz" -C "$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Linux ]; then file -b "$RUNNER_TEMP/mise/bin/mise" | grep -Eq 'statically linked|static-pie linked'; fi
+          "$RUNNER_TEMP/mise/bin/mise" --version
           echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
       - name: Verify real mise configuration isolation
         timeout-minutes: 5
@@ -168,24 +246,87 @@ jobs:
             exit 1
           fi
           echo "STACK_E2E_REGISTRY=localhost:5000" >> "$GITHUB_ENV"
+      # Every scenario, those added in pass 2 (13 port isolation, 14 run and log cursors, 15 MCP
+      # admission at input's end) included.
       - run: bash tests/e2e/native.sh dist-bin/stack
         timeout-minutes: 25
         env:
-          STACK_E2E_RESULTS: ${{ runner.temp }}/e2e-results.jsonl
+          STACK_E2E_RESULTS: ${{ runner.temp }}/evidence/e2e-results.jsonl
+          STACK_E2E_EVIDENCE: ${{ runner.temp }}/evidence/scenarios
       - if: always()
         timeout-minutes: 1
-        run: cat "$RUNNER_TEMP/e2e-results.jsonl" || true
-      - name: Run real multi-worktree isolation test against musl release binary
-        if: matrix.worktree_isolation
+        run: cat "$RUNNER_TEMP/evidence/e2e-results.jsonl" || true
+      - name: Install Rust, Postgres 17 and Redis 8 for the packaged-binary tests
         timeout-minutes: 15
         env:
           MISE_YES: '1'
-          STACK_TEST_BINARY: ${{ github.workspace }}/dist-bin/stack
-          STACK_REQUIRE_WORKTREE_ISOLATION: '1'
         run: |
           rustup toolchain install 1.93.1 --profile minimal
           mise install postgres@17 redis@8
-          cargo +1.93.1 test --locked --test worktree_isolation
+          cargo +1.93.1 test --locked --no-run --test worktree_isolation --test pg_template_preset --test linux_namespaces
+      - name: Real multi-worktree isolation against the packaged binary
+        timeout-minutes: 15
+        env:
+          STACK_TEST_BINARY: ${{ github.workspace }}/dist-bin/stack
+          STACK_REQUIRE_WORKTREE_ISOLATION: '1'
+        run: cargo +1.93.1 test --locked --test worktree_isolation -- --nocapture
+      # Linux runners' filesystems refuse FICLONE (ext4), so the default path is a copy; macOS
+      # (APFS) clones with clonefile. The test fails if any other path ran.
+      - name: Postgres template clone on the runner's filesystem (${{ matrix.clone }})
+        timeout-minutes: 10
+        env:
+          STACK_TEST_BINARY: ${{ github.workspace }}/dist-bin/stack
+          STACK_REQUIRE_PGTEMPLATE: '1'
+          STACK_PGTEMPLATE_CLONE: ${{ matrix.clone }}
+        run: cargo +1.93.1 test --locked --test pg_template_preset -- --nocapture
+      # A loop-mounted XFS image (reflink=1) in the runner's temp directory: the reflink path,
+      # its clones checked by FIEMAP to share extents. A filesystem that refuses FICLONE fails
+      # the test as unsupported, never as a pass.
+      - name: Postgres template clone on XFS with reflink (FICLONE)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        env:
+          STACK_TEST_BINARY: ${{ github.workspace }}/dist-bin/stack
+          STACK_REQUIRE_PGTEMPLATE: '1'
+          STACK_PGTEMPLATE_CLONE: reflink
+        run: |
+          if ! command -v mkfs.xfs >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -yqq xfsprogs
+          fi
+          image="$RUNNER_TEMP/reflink.img" mnt="$RUNNER_TEMP/reflink"
+          truncate -s 1G "$image"
+          mkfs.xfs -q -f -m reflink=1 "$image"
+          mkdir -p "$mnt"
+          sudo mount -o loop "$image" "$mnt"
+          sudo chown "$(id -u):$(id -g)" "$mnt"
+          findmnt -no FSTYPE,OPTIONS "$mnt"
+          sudo xfs_info "$mnt" | grep -o 'reflink=1'
+          status=0
+          STACK_PGTEMPLATE_DIR="$mnt" cargo +1.93.1 test --locked --test pg_template_preset -- --nocapture || status=$?
+          sudo umount "$mnt" || sudo umount -l "$mnt"
+          rm -f "$image"
+          exit "$status"
+      # The test re-runs its checks in a user, mount and PID namespace of their own, mounting
+      # nothing on the host. Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor;
+      # this ephemeral runner lifts that restriction for the test.
+      - name: Real bind mounts and PID namespace visibility (Linux namespaces)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        env:
+          STACK_REQUIRE_LINUX_NAMESPACES: '1'
+        run: |
+          restricted=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)
+          echo "kernel $(uname -r); apparmor_restrict_unprivileged_userns=$restricted"
+          if [ "$restricted" = 1 ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
+          cargo +1.93.1 test --locked --test linux_namespaces -- --nocapture
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
+        with:
+          name: services-evidence-${{ matrix.platform }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+          retention-days: 7
   package:
     permissions:
       contents: read
