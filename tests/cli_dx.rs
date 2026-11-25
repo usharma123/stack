@@ -261,6 +261,11 @@ impl Fixture {
 #[test]
 fn a_log_cursor_returns_each_line_once_with_its_time_and_says_what_it_missed() {
     let fixture = Fixture::new(TWO);
+    let log = fixture.log_file("web");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // The current writer starts every new log with its own generation, even on a reused inode.
+    let begin_generation = |generation: u128| fs::write(&log, format!("# stack log {generation:032x}\n")).unwrap();
+    begin_generation(1);
     fixture.logs("web", "one\n");
     // Without a cursor: as before, plus where the read got to.
     let first = fixture.logs_json(&["web"]);
@@ -297,13 +302,16 @@ fn a_log_cursor_returns_each_line_once_with_its_time_and_says_what_it_missed() {
     let older = fixture.log_file("web").with_extension("log.1");
     fixture.logs("web", "before rotation\n");
     fs::rename(fixture.log_file("web"), &older).unwrap();
+    begin_generation(2);
     fixture.logs("web", "after rotation\n");
     let rotated = fixture.logs_json(&["web", "--cursor", &cursor]);
     assert_eq!(rotated["lines"], json!(["before rotation", "after rotation"]), "{rotated}");
     assert!(rotated.get("gap").is_none(), "{rotated}");
     fs::rename(fixture.log_file("web"), &older).unwrap();
+    begin_generation(3);
     fixture.logs("web", "x\n");
     fs::rename(fixture.log_file("web"), &older).unwrap();
+    begin_generation(4);
     fixture.logs("web", "y\n");
     let lost = fixture.logs_json(&["web", "--cursor", rotated["cursor"].as_str().unwrap()]);
     assert_eq!((lost["lines"].clone(), lost["gap"].clone()), (json!(["x", "y"]), json!("rotated")), "{lost}");
