@@ -22,7 +22,7 @@ indexmap = { version = "2", features = ["serde"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tar = "0.4"
 tempfile = { version = "3", default-features = false }
 toml = { version = "0.8", features = ["preserve_order"] }
