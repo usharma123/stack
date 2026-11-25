@@ -308,3 +308,38 @@ esac
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the clean-machine smoke stops a stalled Stack that ignores TERM, itself and not a wrapper, and fails', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-bound-'));
+  let work;
+  try {
+    const pids = path.join(dir, 'stalled.pids');
+    // setup ignores TERM and never ends, after recording its PID and its parent's.
+    writeFileSync(path.join(dir, 'stack'), `#!/usr/bin/env bash
+case "$*" in
+  --version) echo 'stack fixture' ;;
+  '--json setup') trap '' TERM; echo "$$ $PPID" >>${pids}; while :; do sleep 0.2; done ;;
+esac
+`, { mode: 0o755 });
+    const started = Date.now();
+    const result = spawnSync('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+      { encoding: 'utf8', env: { ...process.env, STACK_SMOKE_SECONDS: '1' }, timeout: 60000 });
+    work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(work, result.stderr);
+    assert.match(result.stderr, /stack --json setup: still running after 1s, stopped/);
+    assert.match(result.stderr, /FAIL: stack setup did not succeed/);
+    assert.ok(Date.now() - started < 30000, 'the smoke outlived its bound');
+    const [pid, parent] = readFileSync(pids, 'utf8').trim().split(' ').map(Number);
+    // Stack's parent is the smoke's own shell: no subshell or env between them to survive it.
+    assert.equal(parent, result.pid, 'the stalled Stack was not the smoke\'s background job itself');
+    assert.ok(allGone(pids), 'the stalled Stack survived the smoke');
+    // Nothing started from the fixture's directory (Stack, or a wrapper naming it) outlives the run.
+    const survivors = execFileSync('ps', ['-A', '-o', 'pid=,command='], { encoding: 'utf8' })
+      .split('\n').filter(line => line.includes(dir));
+    assert.deepEqual(survivors, [], `processes outlived the smoke (stalled Stack ${pid})`);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

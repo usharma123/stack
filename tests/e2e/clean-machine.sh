@@ -43,27 +43,39 @@ for dir in "${dirs[@]}"; do
   fi
 done
 
-# clean COMMAND...: COMMAND in the clean environment, nothing inherited but what is named here.
-clean() {
-  env -i HOME="$home" PATH="$clean_path" USER="${USER:-runner}" LOGNAME="${LOGNAME:-runner}" \
-    TMPDIR="$work/tmp" LANG=C.UTF-8 GIT_CONFIG_GLOBAL="$home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 "$@"
-}
+# The clean environment: nothing inherited but what is named here.
+clean_env=(HOME="$home" PATH="$clean_path" USER="${USER:-runner}" LOGNAME="${LOGNAME:-runner}"
+  TMPDIR="$work/tmp" LANG=C.UTF-8 GIT_CONFIG_GLOBAL="$home/.gitconfig" GIT_CONFIG_NOSYSTEM=1)
+# clean COMMAND...: COMMAND in the clean environment.
+clean() { env -i "${clean_env[@]}" "$@"; }
 mkdir -p "$work/tmp"
 
 # stack NAME ARGS...: `stack ARGS...` in the app, cleanly, bounded by $seconds, with its output
-# in $out/NAME.out. Returns its status; on a stall, stops it (TERM, then KILL) and returns 124.
+# in $out/NAME.out. Returns its status; on a stall, stops it and returns 124. The background job
+# is Stack itself (the subshell execs env, which execs Stack), so what is stopped is Stack, and
+# no wrapper is left behind it.
 running() { jobs -r -p | grep -qx "$1"; }
+# stop PID: TERM, up to 5s for it to end, then KILL; reaped either way before it returns.
+stop() {
+  local pid=$1 tenths=0
+  kill -TERM "$pid" 2>/dev/null || true
+  while running "$pid" && [ "$tenths" -lt 50 ]; do
+    sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  if running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+  wait "$pid" 2>/dev/null || true
+}
+current=
 stack() {
-  local name=$1 pid tenths=0 status=0
+  local name=$1 tenths=0 status=0
   shift
-  (cd "$app" && clean "$binary" "$@") </dev/null >"$out/$name.out" 2>"$out/$name.err" &
-  pid=$!
-  while running "$pid"; do
+  (cd "$app" && exec env -i "${clean_env[@]}" "$binary" "$@") </dev/null >"$out/$name.out" 2>"$out/$name.err" &
+  current=$!
+  while running "$current"; do
     if [ "$tenths" -ge $((seconds * 10)) ]; then
-      kill -TERM "$pid" 2>/dev/null || true
-      sleep 2
-      if running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
-      wait "$pid" 2>/dev/null || true
+      stop "$current"
+      current=
       echo "stack $*: still running after ${seconds}s, stopped" >&2
       tail -c 4000 "$out/$name.err" >&2 || true
       return 124
@@ -71,7 +83,8 @@ stack() {
     sleep 0.1
     tenths=$((tenths + 1))
   done
-  wait "$pid" || status=$?
+  wait "$current" || status=$?
+  current=
   return "$status"
 }
 # ok NAME ARGS...: `stack --json ARGS...`, which must succeed with "ok": true.
@@ -92,6 +105,12 @@ accepting() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 up=false
 cleanup() {
   local status=$?
+  # A Stack command still running (the run interrupted) is stopped and reaped first.
+  if [ -n "$current" ]; then
+    stop "$current"
+    current=
+    status=1
+  fi
   if [ "$up" = true ]; then
     stack cleanup-down --json down || status=1
   fi
@@ -111,6 +130,8 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 step "binary: $("$binary" --version) on $(uname -sm)"
 step 'no mise is found before setup'
@@ -155,8 +176,10 @@ step 'up starts a verified Postgres'
 up=true
 ok up up --timeout 10m
 assert_json '(.data.checks | length) == 1 and .data.checks[0].service == "postgres" and .data.checks[0].ready and .data.checks[0].identity == "instance"' up
+assert_json '.data.checks[0].pid | type == "number" and . == floor and . > 0' up
 port=$(jq -r '.data.checks[0].port' "$out/up.out")
 pid=$(jq -r '.data.checks[0].pid' "$out/up.out")
+[[ $pid =~ ^[1-9][0-9]*$ ]] || fail "up reported Postgres' PID as $pid, not a positive integer"
 accepting "$port" || fail "nothing accepts on Postgres' port $port"
 
 step 'exec reaches the endpoint with the managed mise first on PATH'
