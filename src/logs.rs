@@ -369,36 +369,50 @@ pub fn follow(ctx: &Ctx, q: &Query, interval: Duration) -> Result<()> {
             }
             // Every line since the last read, in as many reads as a burst takes.
             loop {
-                let (lines, next, more) = match pos.get(name) {
-                    Some(p) => match supervisor::read_after(&dir, name, *p, MAX_LINES, supervisor::LOGS_LIMIT) {
-                        Ok(read) => {
-                            if let Some(gap) = read.gap {
-                                eprintln!("# {name}: some output was {} before it could be read", if gap == supervisor::Gap::Truncated { "truncated" } else { "rotated away" });
-                            }
-                            (read.records.into_iter().map(|r| r.line).collect::<Vec<_>>(), read.pos, read.more)
-                        }
-                        Err(_) => break,
-                    },
-                    // No log when following began: what was written since, once there is one.
-                    None => match supervisor::tail(&dir, name, MAX_LINES, Some(from * 1000)) {
-                        Ok((records, _, p)) => (records.into_iter().map(|r| r.line).collect(), p, false),
-                        Err(_) => break,
-                    },
-                };
-                let fresh: Vec<String> = lines.into_iter().filter(|l| q.matches(l)).collect();
+                let Ok(step) = poll(&dir, name, pos.get(name).copied(), from * 1000) else { break };
+                if let Some(gap) = step.gap {
+                    eprintln!("# {name}: some output was {} before it could be read", if gap == supervisor::Gap::Truncated { "truncated" } else { "rotated away" });
+                }
+                let fresh: Vec<String> = step.lines.into_iter().filter(|l| q.matches(l)).collect();
                 if print_lines(name, width, &fresh).is_err() {
                     return Ok(());
                 }
-                if let Some(p) = next {
+                if let Some(p) = step.pos {
                     pos.insert(name.clone(), p);
                 }
-                if !more {
+                if !step.more {
                     break;
                 }
             }
         }
         from = at;
     }
+}
+
+/// One read of `--follow`'s poll of a service.
+struct Polled {
+    lines: Vec<String>,
+    /// Where the next read starts; `None` while the service has no log.
+    pos: Option<LogPos>,
+    /// A limit left whole records for another read.
+    more: bool,
+    gap: Option<supervisor::Gap>,
+}
+
+/// What `name` wrote after `pos` (with what a rotation or truncation took first), or, while its
+/// log did not exist when following began (`pos` is `None`), what it has written at or after
+/// `from_ms` once it has one.
+fn poll(dir: &std::path::Path, name: &str, pos: Option<LogPos>, from_ms: u64) -> std::io::Result<Polled> {
+    Ok(match pos {
+        Some(p) => {
+            let read = supervisor::read_after(dir, name, p, MAX_LINES, supervisor::LOGS_LIMIT)?;
+            Polled { lines: read.records.into_iter().map(|r| r.line).collect(), pos: read.pos, more: read.more, gap: read.gap }
+        }
+        None => {
+            let (records, _, pos) = supervisor::tail(dir, name, MAX_LINES, Some(from_ms))?;
+            Polled { lines: records.into_iter().map(|r| r.line).collect(), pos, more: false, gap: None }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -481,5 +495,326 @@ mod tests {
         assert!(q.matches("an ERROR here"));
         assert_eq!(q.window(), MAX_LINES);
         assert_eq!(Query { tail: 7, ..Query::default() }.window(), 7);
+    }
+
+    /// Cursors as clients keep them: one naming several services, one of which has no log yet
+    /// (its tail next time, then a position), and positions in files that are gone or cut.
+    #[test]
+    fn cursors_naming_several_services_read_each_on_and_positions_in_lost_files_say_so() {
+        let (state, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ctx = ctx(state.path(), root.path());
+        let dir = supervisor::dir(&ctx.state, &ctx.root);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let append = |service: &str, text: &str| {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(supervisor::log_path(&dir, service)).unwrap().write_all(text.as_bytes()).unwrap();
+        };
+        append("web", "1 same\n2 same\n");
+        let both = Cursor(IndexMap::from([("web".to_string(), None), ("db".to_string(), None)])).encode();
+        let read = |cursor: &str| match fetch(&ctx, &Query { tail: 10, cursor: Some(Cursor::parse(cursor).unwrap()), ..Query::default() }).unwrap() {
+            Logs::Many(m) => m,
+            Logs::One(_) => panic!("several services"),
+        };
+        // Selected by the cursor alone (nothing compiled); `db` has no log and stays named.
+        let first = read(&both);
+        assert_eq!(first.services["web"].lines, ["same", "same"]);
+        assert!(first.services["db"].lines.is_empty() && first.errors.is_empty());
+        let cursor = first.cursor.unwrap();
+        let parsed = Cursor::parse(&cursor).unwrap();
+        assert!(parsed.entry("web").unwrap().is_some() && parsed.entry("db") == Some(None), "{cursor}");
+        append("web", "3 same\n");
+        append("db", "4 up\n");
+        let next = read(&cursor);
+        assert_eq!((next.services["web"].lines.clone(), next.services["db"].lines.clone()), (vec!["same".to_string()], vec!["up".to_string()]));
+        assert_eq!(next.services["web"].timestamps, Some(vec![3]));
+        let cursor = next.cursor.unwrap();
+        assert!(Cursor::parse(&cursor).unwrap().entry("db").unwrap().is_some());
+        // Nothing new: nothing again, and the same cursor.
+        let idle = read(&cursor);
+        assert!(idle.services.values().all(|r| r.lines.is_empty() && r.gap.is_none() && !r.more));
+        assert_eq!(idle.cursor.as_deref(), Some(cursor.as_str()));
+        // `web`'s file replaced (kept elsewhere, so the new one cannot reuse its inode), `db`'s
+        // cut under its cursor.
+        std::fs::rename(supervisor::log_path(&dir, "web"), dir.join("replaced")).unwrap();
+        append("web", "5 fresh\n");
+        std::fs::OpenOptions::new().write(true).open(supervisor::log_path(&dir, "db")).unwrap().set_len(0).unwrap();
+        let lost = read(&cursor);
+        assert_eq!((lost.services["web"].lines.clone(), lost.services["web"].gap), (vec!["fresh".to_string()], Some(supervisor::Gap::Rotated)));
+        assert_eq!((lost.services["db"].lines.len(), lost.services["db"].gap), (0, Some(supervisor::Gap::Truncated)));
+    }
+
+    /// A deterministic generator for the state machine below.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// One service's log, written as Stack's supervisor lays it out (`<ms> <line>\n` records,
+    /// rotated to `<service>.log.1`), with what each file holds: record ids, oldest first.
+    struct Writer {
+        path: std::path::PathBuf,
+        older_path: std::path::PathBuf,
+        /// Where each rotated-away file stays linked, so no later log file can reuse its inode (a
+        /// cursor names its file by device and inode; see the verify skill's limits).
+        kept: std::path::PathBuf,
+        /// Every record: when it was stamped, and its line (a cut record as it was cut).
+        records: Vec<(u64, String)>,
+        current: Vec<usize>,
+        current_exists: bool,
+        current_gen: u32,
+        older: Vec<usize>,
+        older_gen: Option<u32>,
+        /// A record still being written into the current file: its stamp, line and the part
+        /// of the line written so far.
+        partial: Option<(u64, String, usize)>,
+        clock: u64,
+    }
+
+    impl Writer {
+        fn append(&mut self, text: &str) {
+            use std::io::Write;
+            std::fs::OpenOptions::new().create(true).append(true).open(&self.path).unwrap().write_all(text.as_bytes()).unwrap();
+            self.current_exists = true;
+        }
+
+        fn write(&mut self, line: &str) {
+            self.append(&format!("{} {line}\n", self.clock));
+            self.records.push((self.clock, line.to_string()));
+            self.current.push(self.records.len() - 1);
+        }
+
+        fn begin(&mut self, line: &str, split: usize) {
+            self.append(&format!("{} {}", self.clock, &line[..split]));
+            self.partial = Some((self.clock, line.to_string(), split));
+        }
+
+        fn finish(&mut self) {
+            let (at, line, split) = self.partial.take().unwrap();
+            self.append(&format!("{}\n", &line[split..]));
+            self.records.push((at, line));
+            self.current.push(self.records.len() - 1);
+        }
+
+        /// Rename the current file over the older one: what that held is gone. A record cut
+        /// there (no newline yet) stays at the end of the rotated file as it is.
+        fn rotate(&mut self) -> Vec<usize> {
+            if let Some((at, line, split)) = self.partial.take() {
+                self.records.push((at, line[..split].to_string()));
+                self.current.push(self.records.len() - 1);
+            }
+            if let Some(gen) = self.older_gen {
+                std::fs::hard_link(&self.older_path, self.kept.join(gen.to_string())).unwrap();
+            }
+            std::fs::rename(&self.path, &self.older_path).unwrap();
+            let gone = std::mem::replace(&mut self.older, std::mem::take(&mut self.current));
+            self.older_gen = Some(self.current_gen);
+            self.current_gen += 1;
+            self.current_exists = false;
+            gone
+        }
+
+        /// Cut the current file to nothing by hand (Stack's writer never does).
+        fn truncate(&mut self) -> Vec<usize> {
+            std::fs::OpenOptions::new().write(true).open(&self.path).unwrap().set_len(0).unwrap();
+            std::mem::take(&mut self.current)
+        }
+    }
+
+    /// Where a reader got to, as the oracle sees it: a file (generation) and how many of its
+    /// records it took; every record it took, and every one gone before it could.
+    struct Reader {
+        at: (u32, usize),
+        took: Vec<usize>,
+        lost: std::collections::BTreeSet<usize>,
+    }
+
+    impl Reader {
+        /// What a read from here can return: the gap it must report, the records after the
+        /// cursor (each with the position just after it), and where a read of all of them ends.
+        fn plan(&self, w: &Writer) -> (Option<supervisor::Gap>, Vec<(usize, (u32, usize))>, (u32, usize)) {
+            let current = |from: usize| -> Vec<(usize, (u32, usize))> { (from..w.current.len()).map(|i| (w.current[i], (w.current_gen, i + 1))).collect() };
+            let older = |from: usize| -> Vec<(usize, (u32, usize))> { (from..w.older.len()).map(|i| (w.older[i], (w.older_gen.unwrap(), i + 1))).collect() };
+            let end = if w.current_exists { (w.current_gen, w.current.len()) } else { (w.older_gen.unwrap(), w.older.len()) };
+            let (gen, count) = self.at;
+            if w.current_exists && gen == w.current_gen {
+                if count > w.current.len() {
+                    (Some(supervisor::Gap::Truncated), current(0), end)
+                } else {
+                    (None, current(count), end)
+                }
+            } else if w.older_gen == Some(gen) {
+                (None, [older(count), current(0)].concat(), end)
+            } else {
+                (Some(supervisor::Gap::Rotated), [older(0), current(0)].concat(), end)
+            }
+        }
+
+        fn lose(&mut self, gone: &[usize]) {
+            let took: std::collections::BTreeSet<usize> = self.took.iter().copied().collect();
+            self.lost.extend(gone.iter().filter(|id| !took.contains(id)));
+        }
+    }
+
+    /// A log written with repeated lines, equal stamps, records written in two parts, rotations
+    /// (one and two between reads), cut records and truncation by hand, read on the way by two
+    /// readers: `stack logs --json --cursor` (through `fetch`, with the cursor passed back as the
+    /// text a client keeps, varying `--tail` and `--grep`) and `--follow`'s poll. Each read
+    /// returns exactly the whole records written after its cursor, in order, each once with its
+    /// stamp, none split; it stops after `--tail` lines, saying `more` exactly when whole records
+    /// are left; a record gone before it was read is gone only with the `gap` the read reports.
+    #[test]
+    fn a_seeded_log_read_by_cursor_and_by_follow_returns_each_record_once_or_reports_its_gap() {
+        use std::collections::BTreeSet;
+        let lines = ["same", "same", "x y", "", "sérvice ✓ done", "a longer line, 0123456789", "same"];
+        let mut seen = BTreeSet::new();
+        for seed in 1..=5u64 {
+            let (state, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let ctx = ctx(state.path(), root.path());
+            let dir = supervisor::dir(&ctx.state, &ctx.root);
+            std::fs::create_dir_all(dir.join("logs")).unwrap();
+            let path = supervisor::log_path(&dir, "web");
+            let mut older_path = path.clone().into_os_string();
+            older_path.push(".1");
+            let mut w = Writer {
+                path,
+                older_path: older_path.into(),
+                kept: state.path().to_path_buf(),
+                records: Vec::new(),
+                current: Vec::new(),
+                current_exists: false,
+                current_gen: 0,
+                older: Vec::new(),
+                older_gen: None,
+                partial: None,
+                clock: 1_700_000_000_000,
+            };
+            w.write("start");
+            // The first read names the service with no position yet: its tail, and a cursor.
+            let mut cursor = Cursor::one("web", None).encode();
+            let q = Query { services: vec!["web".into()], tail: 5, cursor: Some(Cursor::parse(&cursor).unwrap()), ..Query::default() };
+            let Logs::One(first) = fetch(&ctx, &q).unwrap() else { panic!("one service") };
+            assert_eq!(first.lines, ["start"]);
+            cursor = first.cursor.unwrap();
+            let mut by_cursor = Reader { at: (0, 1), took: vec![0], lost: BTreeSet::new() };
+            let (_, _, follow_pos) = supervisor::tail(&dir, "web", MAX_LINES, None).unwrap();
+            let mut follow_pos = follow_pos.unwrap();
+            let mut by_follow = Reader { at: (0, 1), took: vec![0], lost: BTreeSet::new() };
+            let mut rng = Lcg(seed);
+            for step in 0..300 {
+                let op = rng.below(10);
+                let label = format!("seed {seed} step {step} op {op}");
+                let mut read_now = false;
+                match op {
+                    0..=3 if w.partial.is_none() => {
+                        for _ in 0..=rng.below(3) {
+                            w.clock += rng.below(3);
+                            w.write(lines[rng.below(lines.len() as u64) as usize]);
+                        }
+                    }
+                    4 if w.partial.is_none() => {
+                        w.clock += 1;
+                        let line = lines[rng.below(lines.len() as u64) as usize];
+                        let splits: Vec<usize> = line.char_indices().map(|(i, _)| i).chain([line.len()]).collect();
+                        w.begin(line, splits[rng.below(splits.len() as u64) as usize]);
+                        seen.insert("partial");
+                    }
+                    5 if w.partial.is_some() => w.finish(),
+                    6 if w.current_exists => {
+                        if w.partial.is_some() {
+                            seen.insert("cut");
+                        }
+                        let gone = w.rotate();
+                        by_cursor.lose(&gone);
+                        by_follow.lose(&gone);
+                        seen.insert("rotated");
+                    }
+                    // Only where a read can tell (each reader in the current file, past its start)
+                    // and before the file grows past the cursor again: read at once.
+                    7 if w.current_exists && w.partial.is_none() && [&by_cursor, &by_follow].iter().all(|r| r.at.0 == w.current_gen && r.at.1 > 0) => {
+                        let gone = w.truncate();
+                        by_cursor.lose(&gone);
+                        by_follow.lose(&gone);
+                        read_now = true;
+                        seen.insert("truncated");
+                    }
+                    8 | 9 => read_now = true,
+                    _ => continue,
+                }
+                if !read_now {
+                    continue;
+                }
+                // `stack logs --json --cursor`: the cursor read back from its text.
+                let tail = [1, 2, 3, 7, 100][rng.below(5) as usize];
+                let grep = (rng.below(4) == 0).then(|| "same".to_string());
+                let (gap, available, end) = by_cursor.plan(&w);
+                let q = Query { services: vec!["web".into()], tail, grep: grep.clone(), cursor: Some(Cursor::parse(&cursor).unwrap()), ..Query::default() };
+                let Logs::One(report) = fetch(&ctx, &q).unwrap() else { panic!("one service") };
+                let mut shown = Vec::new();
+                let (mut taken, mut at, mut more) = (0, end, false);
+                for (i, (id, _)) in available.iter().enumerate() {
+                    if shown.len() == tail {
+                        (at, more) = (available[i - 1].1, true);
+                        break;
+                    }
+                    taken += 1;
+                    if q.matches(&w.records[*id].1) {
+                        shown.push(*id);
+                    }
+                }
+                let expected: Vec<&str> = shown.iter().map(|id| w.records[*id].1.as_str()).collect();
+                let stamps: Vec<u64> = shown.iter().map(|id| w.records[*id].0).collect();
+                assert_eq!(report.lines, expected, "{label}: tail {tail} grep {grep:?}");
+                assert_eq!(report.timestamps.as_ref(), Some(&stamps), "{label}");
+                assert_eq!(report.gap, gap, "{label}");
+                assert_eq!(report.more, more, "{label}: tail {tail} grep {grep:?}, {taken} of {} taken, writing {:?}", available.len(), w.partial);
+                let text = report.cursor.unwrap();
+                assert_eq!(Cursor::parse(&text).unwrap().encode(), text, "{label}: the cursor round-trips");
+                cursor = text;
+                by_cursor.took.extend(available[..taken].iter().map(|(id, _)| *id));
+                by_cursor.at = at;
+                if more {
+                    seen.insert("more");
+                }
+                if gap.is_some() {
+                    seen.insert("gap");
+                }
+                // `--follow`: one poll, in as many reads as it takes.
+                let (gap, available, end) = by_follow.plan(&w);
+                let mut got = Vec::new();
+                let mut gaps = Vec::new();
+                loop {
+                    let step = poll(&dir, "web", Some(follow_pos), 0).unwrap();
+                    got.extend(step.lines);
+                    gaps.extend(step.gap);
+                    follow_pos = step.pos.unwrap();
+                    if !step.more {
+                        break;
+                    }
+                }
+                let expected: Vec<&str> = available.iter().map(|(id, _)| w.records[*id].1.as_str()).collect();
+                assert_eq!(got, expected, "{label}: follow");
+                assert_eq!(gaps, gap.into_iter().collect::<Vec<_>>(), "{label}: follow");
+                by_follow.took.extend(available.iter().map(|(id, _)| *id));
+                by_follow.at = end;
+            }
+            // Every record either read once, in order, or lost with a reported gap.
+            for (name, reader) in [("cursor", &by_cursor), ("follow", &by_follow)] {
+                let complete: BTreeSet<usize> = (0..w.records.len()).collect();
+                let unread: BTreeSet<usize> = reader.plan(&w).1.iter().map(|(id, _)| *id).collect();
+                let took: BTreeSet<usize> = reader.took.iter().copied().collect();
+                assert_eq!(took.len(), reader.took.len(), "seed {seed} {name}: a record read twice");
+                assert!(reader.took.windows(2).all(|p| p[0] < p[1]), "seed {seed} {name}: out of order");
+                assert!(took.is_disjoint(&reader.lost), "seed {seed} {name}");
+                let accounted: BTreeSet<usize> = took.union(&reader.lost).chain(unread.iter()).copied().collect();
+                assert_eq!(accounted, complete, "seed {seed} {name}");
+            }
+        }
+        for case in ["partial", "cut", "rotated", "truncated", "more", "gap"] {
+            assert!(seen.contains(case), "no run reached {case}: {seen:?}");
+        }
     }
 }

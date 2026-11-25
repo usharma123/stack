@@ -472,4 +472,230 @@ mod tests {
         assert!(parse_lsof("").is_none());
         assert_eq!(parse_lsof("p77\n").unwrap().pid, 77);
     }
+
+    /// A deterministic generator for the state-machine tests below: the same sequence on every
+    /// host, with no dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// A directory made to refuse lookups (a checkout out of reach), reachable again when dropped.
+    struct Refused(PathBuf);
+
+    impl Refused {
+        fn new(dir: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            Refused(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Refused {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Every registry operation (compile with and without `--reassign-ports`, `up
+    /// --reassign-ports`, `down --purge`, `gc`), interleaved across three checkouts in a seeded
+    /// order, with a foreign listener coming and going, a checkout going out of reach and back,
+    /// and one deleted. After every step the real registry keeps what the port model
+    /// (verify-stack-ports-mcp) promises: one reservation per port, and each checkout still there
+    /// (out of reach or not) keeps exactly the ports it was last given; each assignment reuses a
+    /// port, or (reassigning) never gives one back, never takes a pinned port another checkout
+    /// holds, never one a foreign program listens on, and never one outgoing connections may
+    /// take; a failed assignment changes nothing; a deleted checkout's ports are released by the
+    /// next compile or `gc`. Only eight ports are free, so collisions and exhaustion happen.
+    #[test]
+    fn a_seeded_sequence_of_registry_operations_keeps_every_reservation_promise() {
+        use std::collections::{BTreeMap, BTreeSet};
+        // SAFETY: geteuid has no preconditions.
+        let can_refuse = unsafe { libc::geteuid() } != 0;
+        let ephemeral = RANGE_START..=RANGE_END - 8;
+        let window: Vec<u16> = (RANGE_END - 7..=RANGE_END).collect();
+        let pin = RANGE_END - 4;
+        let wanted = |c: usize| match c {
+            0 => requests(&[("web", None), ("db", None)]),
+            1 => requests(&[("web", None), ("db", Some(pin))]),
+            _ => requests(&[("web", None)]),
+        };
+        let pinned = |c: usize, service: &str| c == 1 && service == "db";
+        let sorted = |ports: &IndexMap<String, u16>| ports.iter().map(|(s, p)| (s.clone(), *p)).collect::<BTreeMap<_, _>>();
+        let mut seen = BTreeSet::new();
+        for seed in 1..=6u64 {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join("state");
+            let parents: Vec<PathBuf> = (0..3).map(|i| tmp.path().join(format!("p{i}"))).collect();
+            let roots: Vec<PathBuf> = parents.iter().map(|p| p.join("wt")).collect();
+            for (parent, root) in parents.iter().zip(&roots) {
+                std::fs::create_dir_all(root).unwrap();
+                std::fs::write(parent.join("sibling"), b"").unwrap();
+            }
+            let registry = || all(&state).unwrap().into_iter().map(|r| (r.project, r.service, r.port)).collect::<BTreeSet<_>>();
+            let mut given: Vec<IndexMap<String, u16>> = vec![IndexMap::new(); 3];
+            let mut deleted = [false; 3];
+            let mut foreign: Option<(u16, TcpListener)> = None;
+            // Dropped before `tmp`, so every directory is reachable again for its removal.
+            let mut refused: Vec<Option<Refused>> = vec![None, None, None];
+            let mut rng = Lcg(seed);
+            for step in 0..250 {
+                let (c, op) = (rng.below(3) as usize, rng.below(10));
+                let usable = !deleted[c] && refused[c].is_none();
+                let ctx = format!("seed {seed} step {step} op {op} checkout {c}");
+                let before = registry();
+                let mut prunes = false;
+                match op {
+                    0..=3 if usable => {
+                        let reassign = op == 3;
+                        match assign_outside(&state, &roots[c], &wanted(c), reassign, &ephemeral) {
+                            Ok(ports) => {
+                                for (service, port) in &ports {
+                                    if pinned(c, service) {
+                                        assert_eq!(*port, pin, "{ctx}");
+                                        continue;
+                                    }
+                                    assert!((RANGE_START..=RANGE_END).contains(port) && !ephemeral.contains(port), "{ctx}: {service} got {port}");
+                                    let old = given[c].get(service).copied();
+                                    if reassign {
+                                        assert!(!given[c].values().any(|o| o == port), "{ctx}: reassigning gave {service} back {port}: {:?}", given[c]);
+                                        seen.insert("reassign");
+                                    } else if let Some(old) = old.filter(|o| !ephemeral.contains(o)) {
+                                        assert_eq!(*port, old, "{ctx}: {service} moved without reassigning");
+                                        seen.insert("reuse");
+                                    } else if old.is_some() {
+                                        seen.insert("replaced in the ephemeral range");
+                                    }
+                                    if old != Some(*port) {
+                                        assert!(foreign.as_ref().map_or(true, |(f, _)| f != port), "{ctx}: {service} got the port a foreign program listens on");
+                                    }
+                                }
+                                given[c] = ports;
+                                prunes = true;
+                            }
+                            Err(e) => {
+                                assert_eq!(registry(), before, "{ctx}: a failed assignment changed the registry");
+                                match e.code {
+                                    "port_conflict" => {
+                                        let theirs = before.iter().any(|(p, s, port)| *port == pin && !(p == &roots[1] && s == "db"));
+                                        assert!(c == 1 && theirs, "{ctx}: {}", e.message);
+                                        seen.insert("pin conflict");
+                                    }
+                                    "ports_exhausted" => {
+                                        seen.insert("exhausted");
+                                    }
+                                    other => panic!("{ctx}: {other}: {}", e.message),
+                                }
+                            }
+                        }
+                    }
+                    // `up --reassign-ports` after a conflict: only a service Stack assigned.
+                    4 if usable => {
+                        let service = if c == 0 && rng.below(2) == 0 { "db" } else { "web" };
+                        let moved = reassign(&state, &roots[c], &[service.to_string()]).unwrap();
+                        match (moved.as_slice(), given[c].get(service).copied()) {
+                            ([(_, old, new)], Some(had)) => {
+                                assert_eq!(*old, had, "{ctx}");
+                                assert!(*new != had && !before.iter().any(|(_, _, p)| p == new), "{ctx}: moved {service} onto {new}");
+                                given[c].insert(service.to_string(), *new);
+                                seen.insert("up reassign");
+                            }
+                            ([], None) => {}
+                            (moved, had) => panic!("{ctx}: moved {moved:?}, had {had:?}"),
+                        }
+                    }
+                    5 if usable => {
+                        release(&state, &roots[c]).unwrap();
+                        given[c].clear();
+                    }
+                    6 => {
+                        release_gone(&state, |_| false).unwrap();
+                        prunes = true;
+                    }
+                    7 if can_refuse && !deleted[c] => {
+                        refused[c] = match refused[c].take() {
+                            Some(_) => None,
+                            None => {
+                                seen.insert("out of reach");
+                                Some(Refused::new(&parents[c]))
+                            }
+                        };
+                    }
+                    8 if c == 2 && usable && step > 100 => {
+                        std::fs::remove_dir_all(&roots[c]).unwrap();
+                        deleted[c] = true;
+                        seen.insert("deleted");
+                    }
+                    9 => {
+                        foreign = match foreign.take() {
+                            Some(_) => None,
+                            None => {
+                                let port = window[rng.below(window.len() as u64) as usize];
+                                TcpListener::bind(("127.0.0.1", port)).ok().map(|l| (port, l))
+                            }
+                        };
+                    }
+                    _ => continue,
+                }
+                let now = all(&state).unwrap();
+                let ports: BTreeSet<u16> = now.iter().map(|r| r.port).collect();
+                assert_eq!(ports.len(), now.len(), "{ctx}: a port reserved twice: {now:?}");
+                for i in 0..3 {
+                    let kept = lookup(&state, &roots[i]).unwrap();
+                    if deleted[i] {
+                        if prunes {
+                            assert!(kept.is_empty(), "{ctx}: deleted checkout {i} kept {kept:?}");
+                            seen.insert("released");
+                        }
+                    } else {
+                        assert_eq!(sorted(&kept), sorted(&given[i]), "{ctx}: checkout {i} (out of reach: {})", refused[i].is_some());
+                    }
+                }
+            }
+        }
+        let mut wanted = vec!["reassign", "reuse", "pin conflict", "up reassign", "replaced in the ephemeral range", "deleted", "released"];
+        if can_refuse {
+            wanted.push("out of reach");
+        }
+        for case in wanted {
+            assert!(seen.contains(case), "no run reached {case}: {seen:?}");
+        }
+    }
+
+    /// Checkouts compiling at once, each in its own thread, through the real registry lock:
+    /// whatever the interleaving, no two share a port, and each keeps what it was last given.
+    #[test]
+    fn checkouts_assigning_at_once_never_share_a_port_and_each_keeps_what_it_was_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let roots: Vec<PathBuf> = (0..8).map(|i| tmp.path().join(format!("wt{i}"))).collect();
+        for root in &roots {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let start = std::sync::Barrier::new(roots.len());
+        let last: Vec<IndexMap<String, u16>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = roots
+                .iter()
+                .map(|root| {
+                    let (state, start) = (&state, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        (0..5).map(|round| assign(state, root, &requests(&[("web", None), ("db", None)]), round == 2).unwrap()).last().unwrap()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        let ports: std::collections::BTreeSet<u16> = last.iter().flat_map(|p| p.values().copied()).collect();
+        assert_eq!(ports.len(), roots.len() * 2, "{last:?}");
+        for (root, given) in roots.iter().zip(&last) {
+            assert_eq!(&lookup(&state, root).unwrap(), given);
+        }
+        assert_eq!(all(&state).unwrap().len(), roots.len() * 2);
+    }
 }

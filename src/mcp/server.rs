@@ -1449,6 +1449,63 @@ mod tests {
         assert_eq!(gate.counts().0, MAX_RUNNING);
     }
 
+    /// The admission model's accounting (verify-stack-ports-mcp) on the real loop, step by step:
+    /// a direct call on each of two checkouts and one on none, then a batch with a ping and calls
+    /// on both checkouts that wait their turn, one of them cancelled while waiting. Calls on an
+    /// idle checkout or on none never wait behind a busy one; a cancelled waiting call never runs
+    /// and is owed nothing; once input ends every other accepted call runs in its checkout's
+    /// arrival order and is answered once, the batch together, exactly once.
+    #[test]
+    fn a_batch_across_checkouts_with_a_cancelled_waiting_call_is_answered_once_in_order_after_input_ends() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        let gate = Arc::new(Gate::default());
+        let order: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let caller: Caller = {
+            let (inner, order) = (gate.caller(), Arc::clone(&order));
+            Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| {
+                order.lock().unwrap().push(params["n"].as_u64().unwrap_or(0));
+                inner(params, roots)
+            })
+        };
+        let (events, received) = mpsc::channel();
+        let (messages, output) = mpsc::channel();
+        let out = Arc::new(Out(Mutex::new(Box::new(Sink { buffer: Vec::new(), messages }))));
+        let mut server = Server::new(out, caller, events, Profile::Full);
+        server.line(&initialize(BATCH_VERSION, json!({})).to_string());
+        assert_eq!(output.recv().unwrap()["id"], 0);
+        // A call on a checkout, tagged beside its arguments (outside the tool's schema) so the
+        // caller records the order calls reach their tools.
+        let call = |id: u64, dir: &PathBuf| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": dir }, "n": id } });
+        server.line(&call(1, &a).to_string());
+        server.line(&call(2, &b).to_string());
+        server.line(&json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": { "name": "stack_ps", "arguments": {}, "n": 6 } }).to_string());
+        server.line(&json!([call(3, &a), { "jsonrpc": "2.0", "id": "p", "method": "ping" }, call(4, &b), call(5, &a)]).to_string());
+        gate.running(3);
+        // Work-conserving: a worker is free, and every waiting call waits for its own checkout.
+        assert_eq!((server.running, server.waiting.len()), (3, 3));
+        assert!(server.running < MAX_RUNNING && server.waiting.iter().all(|w| w.project.as_ref().is_some_and(|p| server.busy.contains(p))));
+        server.line(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 4 } }).to_string());
+        assert_eq!(server.waiting.iter().map(|w| w.message["id"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 5]);
+        assert!(output.try_recv().is_err(), "nothing answered while every call is held");
+        // Input ends.
+        gate.open();
+        server.finish(&received);
+        let messages: Vec<Value> = output.try_iter().collect();
+        let direct: BTreeSet<u64> = messages.iter().filter_map(|m| m["id"].as_u64()).collect();
+        assert_eq!(direct, [1, 2, 6].into(), "{messages:?}");
+        let batches: Vec<&Value> = messages.iter().filter(|m| m.is_array()).collect();
+        assert_eq!(batches.len(), 1, "the batch went out exactly once: {messages:?}");
+        let in_batch: BTreeSet<String> = batches[0].as_array().unwrap().iter().map(|r| r["id"].to_string()).collect();
+        assert_eq!(in_batch, ["3", "5", "\"p\""].map(String::from).into(), "the cancelled call is owed nothing");
+        let order = order.lock().unwrap();
+        assert!(!order.contains(&4), "a cancelled waiting call ran: {order:?}");
+        let on_a: Vec<u64> = order.iter().copied().filter(|n| [1, 3, 5].contains(n)).collect();
+        assert_eq!(on_a, [1, 3, 5], "one checkout's calls ran in arrival order");
+        assert_eq!(order.len(), 5);
+        assert!(server.workers.is_empty() && server.busy.is_empty() && server.running == 0);
+    }
+
     #[test]
     fn a_busy_checkout_holds_only_its_own_calls_and_keeps_their_order() {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
