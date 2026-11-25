@@ -2077,6 +2077,19 @@ mod tests {
         out
     }
 
+    /// The name of a generation set aside by a `save --force` whose process is gone (an exited
+    /// child's pid: on Linux pid 1 always runs, so a fixed pid would be an owner still alive).
+    fn crashed(nanos: u64) -> String {
+        static GONE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let pid = *GONE.get_or_init(|| {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        });
+        format!(".old-base-{pid}-{nanos}")
+    }
+
     #[test]
     fn staging_names_say_their_kind_snapshot_and_owner() {
         let base = Path::new("/s");
@@ -2164,11 +2177,11 @@ mod tests {
     fn recovery_takes_the_newest_valid_generation_and_ignores_invalid_ones() {
         let state = tempfile::tempdir().unwrap();
         let base = state.path().join("store");
-        snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "three");
-        snapshot_dir(&base.join(".old-base-1-20"), "base", 2, "two");
+        snapshot_dir(&base.join(crashed(10)), "base", 3, "three");
+        snapshot_dir(&base.join(crashed(20)), "base", 2, "two");
         // Names another snapshot, and one with no metadata: neither is taken.
-        snapshot_dir(&base.join(".old-base-1-30"), "elsewhere", 9, "nine");
-        write(&base.join(".old-base-1-40/data/db/PG_VERSION"), "partial");
+        snapshot_dir(&base.join(crashed(30)), "elsewhere", 9, "nine");
+        write(&base.join(crashed(40)).join("data/db/PG_VERSION"), "partial");
         // An incomplete directory at the name (no meta.json) is set aside too.
         write(&base.join("base/data/db/PG_VERSION"), "partial");
         recover_store(&base).unwrap();
@@ -2186,13 +2199,13 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let project = ProjectId::checkout(Path::new("/checkout"));
         let base = store(state.path(), &project);
-        snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "valid");
+        snapshot_dir(&base.join(crashed(10)), "base", 3, "valid");
         for published in ["{ not json", r#"{"name":"elsewhere","format":1,"project":"p","created_at":9,"source":"/s","services":{}}"#] {
             let _ = fs::remove_dir_all(base.join("base"));
             write(&base.join("base/data/db/PG_VERSION"), "damaged");
             write(&base.join("base").join(META), published);
             // Readers take the valid generation set aside, not the damaged one at the name.
-            assert!(generation(state.path(), &project, "base").unwrap().unwrap().ends_with(".old-base-1-10"), "{published}");
+            assert!(generation(state.path(), &project, "base").unwrap().unwrap().ends_with(crashed(10)), "{published}");
             assert_eq!(read_meta(state.path(), &project, "base").unwrap().created_at, 3);
             assert_eq!(list_names(state.path(), &project), ["base"]);
             // Recovery puts the valid one in its place, never removes it.
@@ -2201,12 +2214,12 @@ mod tests {
             assert_eq!(fs::read_to_string(base.join("base/data/db/PG_VERSION")).unwrap(), "valid");
             assert_eq!(entries(&base), ["base"]);
             // Set aside again for the next round.
-            fs::rename(base.join("base"), base.join(".old-base-1-10")).unwrap();
+            fs::rename(base.join("base"), base.join(crashed(10))).unwrap();
         }
         // Damaged with nothing valid set aside: reported, and left for `rm`, never removed.
-        fs::remove_dir_all(base.join(".old-base-1-10")).unwrap();
+        fs::remove_dir_all(base.join(crashed(10))).unwrap();
         write(&base.join("base").join(META), "{ not json");
-        snapshot_dir(&base.join(".old-base-1-20"), "elsewhere", 1, "other");
+        snapshot_dir(&base.join(crashed(20)), "elsewhere", 1, "other");
         assert_eq!(read_meta(state.path(), &project, "base").unwrap_err().code, "snapshot_invalid");
         assert!(recover_store(&base).unwrap().is_empty());
         assert_eq!(entries(&base), ["base"], "the invalid generation set aside is staging; the name is left for `rm`");
@@ -2328,13 +2341,13 @@ mod tests {
         // generation set aside in its place does.
         for failing in [&["recover_stray"][..], &["recover_old"][..]] {
             let _ = fs::remove_dir_all(&base);
-            snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "valid");
+            snapshot_dir(&base.join(crashed(10)), "base", 3, "valid");
             write(&base.join("base/data/db/PG_VERSION"), "partial");
             FAIL_RENAMES.with(|c| c.set(failing));
             let e = recover_store(&base).unwrap_err();
             FAIL_RENAMES.with(|c| c.set(&[]));
             assert_eq!(e.code, "snapshot_failed", "{failing:?}: {e}");
-            assert!(e.message.contains(".old-base-1-10"), "{failing:?}: says where it is kept: {e}");
+            assert!(e.message.contains(&crashed(10)), "{failing:?}: says where it is kept: {e}");
             let old = staged(&base, "old");
             assert_eq!(old.len(), 1, "{failing:?}: the generation set aside is never removed");
             assert_eq!(fs::read_to_string(old[0].join("data/db/PG_VERSION")).unwrap(), "valid");
@@ -2352,8 +2365,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let project = ProjectId::checkout(Path::new("/checkout"));
         let base = store(state.path(), &project);
-        snapshot_dir(&base.join(".old-base-1-10"), "base", 3, "valid");
-        let old = base.join(".old-base-1-10");
+        snapshot_dir(&base.join(crashed(10)), "base", 3, "valid");
+        let old = base.join(crashed(10));
         fs::set_permissions(&old, fs::Permissions::from_mode(0o000)).unwrap();
         // Root reads it anyway: nothing to show then.
         let unreadable = fs::read_to_string(old.join(META)).is_err();
