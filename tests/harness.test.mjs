@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -78,7 +78,7 @@ function allGone(file) {
 
 // A client that ignores both its input's end and TERM, and first appends its PID and start time
 // to the file, as `record_pid` does.
-const stalledClient = (file) => `bash -c 'trap "" TERM; echo $$ $(ps -o lstart= -p $$) >>${file}; while :; do sleep 0.2; done'`;
+const stalledClient = (file) => `bash -c 'trap "" TERM; echo $$ $(ps -o lstart= -p $$) >>${file}; for ((i=0; i<300; i++)); do sleep 0.2; done'`;
 
 // Run BODY in bash after sourcing assert.sh, with a `diagnose` that prints DIAGNOSIS.
 function probeIn(env, body) {
@@ -217,19 +217,24 @@ test('cleanup signals a recorded PID only while the same process holds it', () =
 // return how the shell ended, how long after the signal, and whether the client is gone.
 async function cancel(call, group) {
   const { dir, env } = e2eFixture('exit 0');
+  const output = path.join(dir, 'stdout');
+  const stdoutFile = openSync(output, 'w');
   try {
     const pids = path.join(dir, 'cancelled.pids');
     const shell = spawn('bash', ['-c', `source "$STACK_E2E_ASSERT"; ${call.replace('STALLED', () => stalledClient(pids))}; echo unreachable`],
-      { env, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
-    let stdout = '';
-    shell.stdout.on('data', chunk => { stdout += chunk; });
+      { env, stdio: ['ignore', stdoutFile, 'ignore'], detached: true, timeout: 45000, killSignal: 'SIGKILL' });
     const ended = new Promise(resolve => shell.on('exit', (code, signal) => resolve({ code, signal })));
     await appeared(pids);
+    const [client] = readFileSync(pids, 'utf8').trim().split(/\s+/);
+    // A PID written by the client can precede the parent's track call. Send the signal only
+    // once within has entered its tracked wait, which is the phase this test exercises.
+    await appeared(path.join(env.STACK_E2E_TMP, `tracked.${shell.pid}`, client));
     const started = Date.now();
     process.kill(group ? -shell.pid : shell.pid, 'SIGTERM');
     const { code, signal } = await ended;
-    return { code, signal, seconds: (Date.now() - started) / 1000, stdout, gone: allGone(pids) };
+    return { code, signal, seconds: (Date.now() - started) / 1000, stdout: readFileSync(output, 'utf8'), gone: allGone(pids) };
   } finally {
+    closeSync(stdoutFile);
     rmSync(dir, { recursive: true, force: true });
   }
 }
