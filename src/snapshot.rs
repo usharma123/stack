@@ -185,16 +185,44 @@ impl Staging {
     }
 }
 
-/// `meta.json` of the snapshot directory `dir`: `Some` when it parses and names `name`, `None`
-/// when there is none or it is not a generation of `name` (metadata that does not parse, or
-/// describes another snapshot). An error when it cannot be read: a generation is never judged
+/// `meta.json` of the snapshot directory `dir`, with that directory held open: `Some` when it
+/// parses and names `name`, `None` when there is none or it is not a generation of `name`
+/// (metadata that does not parse, or describes another snapshot, or a link where the directory
+/// or its metadata should be). An error when it cannot be read: a generation is never judged
 /// invalid, or valid, on a read that failed.
-fn meta_at(dir: &Path, name: &str) -> Result<Option<Meta>> {
-    use std::io::ErrorKind;
+///
+/// The metadata is read through the directory held, never by its path again, so it is that
+/// directory's even when a save replaces what is at `dir` meanwhile; and while it is held, no
+/// other directory can be given its device and inode (see [`Generation`]).
+fn meta_at(dir: &Path, name: &str) -> Result<Option<(Meta, fs::File)>> {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    let quiet = |e: &std::io::Error| {
+        matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory | ErrorKind::InvalidData) || e.raw_os_error() == Some(libc::ELOOP)
+    };
+    let held = match fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(dir) {
+        Ok(held) => held,
+        Err(e) if quiet(&e) => return Ok(None),
+        Err(e) => return Err(io_error(dir.display(), e)),
+    };
     let path = dir.join(META);
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str::<Meta>(&text).ok().filter(|m| m.name == name)),
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory | ErrorKind::InvalidData) => Ok(None),
+    let text = (|| {
+        let file = std::ffi::CString::new(META).expect("META has no NUL");
+        // SAFETY: openat on a descriptor held here, with a NUL-terminated name; the descriptor
+        // returned is owned here.
+        let fd = unsafe { libc::openat(held.as_raw_fd(), file.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor openat just returned, owned by nothing else.
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        let mut text = String::new();
+        file.read_to_string(&mut text).map(|_| text)
+    })();
+    match text {
+        Ok(text) => Ok(serde_json::from_str::<Meta>(&text).ok().filter(|m| m.name == name).map(|m| (m, held))),
+        Err(e) if quiet(&e) => Ok(None),
         Err(e) => Err(io_error(path.display(), e)),
     }
 }
@@ -218,28 +246,28 @@ fn staging(base: &Path) -> Result<Vec<(PathBuf, Staging)>> {
 
 /// The newest complete generation of `name` set aside by an interrupted `save --force`.
 fn set_aside(base: &Path, name: &str) -> Result<Option<PathBuf>> {
-    Ok(set_aside_read(base, name)?.0.map(|(path, _)| path))
+    Ok(set_aside_read(base, name)?.0.map(|(path, ..)| path))
 }
 
-/// A generation's directory, with the metadata read there.
-type Located = (PathBuf, Meta);
+/// A generation's directory, with the metadata read there and the directory held open.
+type Located = (PathBuf, Meta, fs::File);
 
 /// [`set_aside`] with the metadata it read, and the staging directories of `name` it saw
 /// (valid or not), in name order.
 fn set_aside_read(base: &Path, name: &str) -> Result<(Option<Located>, Vec<PathBuf>)> {
-    let mut old: Vec<(u64, u128, PathBuf, Meta)> = Vec::new();
+    let mut old: Vec<(u64, u128, Located)> = Vec::new();
     let mut seen = Vec::new();
     for (path, s) in staging(base)? {
         if s.kind == "old" && s.name == name {
             seen.push(path.clone());
-            if let Some(meta) = meta_at(&path, name)? {
-                old.push((meta.created_at, s.nanos, path, meta));
+            if let Some((meta, held)) = meta_at(&path, name)? {
+                old.push((meta.created_at, s.nanos, (path, meta, held)));
             }
         }
     }
     old.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     seen.sort();
-    Ok((old.pop().map(|(_, _, path, meta)| (path, meta)), seen))
+    Ok((old.pop().map(|(_, _, located)| located), seen))
 }
 
 /// How many times a reader without the lock looks for a generation while what it sees keeps
@@ -250,7 +278,7 @@ const LOOKUPS: usize = 100;
 /// while a `save --force` without an exchange has it renamed aside (or crashed with it so),
 /// the newest valid generation set aside. Read only (see [`lookup`]).
 fn generation(state: &Path, project: &ProjectId, name: &str) -> Result<Option<PathBuf>> {
-    Ok(lookup(&store(state, project), name)?.map(|(path, _)| path))
+    Ok(lookup(&store(state, project), name)?.map(|(path, ..)| path))
 }
 
 /// [`generation`] with the metadata it read there, which is what callers use: the directory is
@@ -265,8 +293,8 @@ fn lookup(base: &Path, name: &str) -> Result<Option<Located>> {
     let published = base.join(name);
     let mut before: Option<Vec<PathBuf>> = None;
     for _ in 0..LOOKUPS {
-        if let Some(meta) = meta_at(&published, name)? {
-            return Ok(Some((published, meta)));
+        if let Some((meta, held)) = meta_at(&published, name)? {
+            return Ok(Some((published, meta, held)));
         }
         let (aside, seen) = set_aside_read(base, name)?;
         if aside.is_some() {
@@ -283,7 +311,7 @@ fn lookup(base: &Path, name: &str) -> Result<Option<Located>> {
         }
         before = Some(seen);
     }
-    Ok(meta_at(&published, name)?.map(|meta| (published, meta)))
+    Ok(meta_at(&published, name)?.map(|(meta, held)| (published, meta, held)))
 }
 
 #[cfg(test)]
@@ -435,27 +463,41 @@ pub struct Meta {
     pub services: IndexMap<String, SnapService>,
 }
 
-/// One generation of a snapshot, as read: where it is, its metadata, and which directory it is
-/// (device, inode), which a rename keeps and a new `save` changes.
+/// One generation of a snapshot, as read: where it is, its metadata (read through the directory
+/// held), and which directory it is (device, inode), which a rename keeps and a new `save`
+/// changes.
+///
+/// The directory stays open for as long as this is kept, so its inode cannot be freed and given
+/// to another directory: a `save --force` that replaces it and removes it, followed by another
+/// save, could otherwise publish a new generation on the very inode, saved in the same second with
+/// the same services, and pass for it. A restore keeps the generation it chose from before it
+/// stops the services until it has compared it with the one read under the store lock.
 struct Generation {
     dir: PathBuf,
     meta: Meta,
-    identity: Option<[u64; 2]>,
+    identity: [u64; 2],
+    _held: fs::File,
 }
 
 impl Generation {
-    /// The same generation (the very directory, saved at the same time, of the same services):
-    /// put back from where an interrupted `save --force` set it aside counts, a new save does not.
+    fn new((dir, meta, held): Located) -> Result<Generation> {
+        use std::os::unix::fs::MetadataExt;
+        let st = held.metadata().map_err(|e| io_error(dir.display(), e))?;
+        Ok(Generation { identity: [st.dev(), st.ino()], dir, meta, _held: held })
+    }
+
+    /// The same generation: the very directory, which no other can be while `self` holds it
+    /// open (and so saved at the same time, of the same services). Put back from where an
+    /// interrupted `save --force` set it aside counts, a new save does not.
     fn same(&self, other: &Generation) -> bool {
-        self.identity.is_some() && self.identity == other.identity && self.meta.created_at == other.meta.created_at && self.meta.services.keys().eq(other.meta.services.keys())
+        self.identity == other.identity && self.meta.created_at == other.meta.created_at && self.meta.services.keys().eq(other.meta.services.keys())
     }
 }
 
 /// `name`'s snapshot (see [`generation`]), whose metadata must name it.
 fn read_generation(state: &Path, project: &ProjectId, name: &str) -> Result<Generation> {
-    if let Some((dir, meta)) = lookup(&store(state, project), name)? {
-        let identity = dir_at(&dir);
-        return Ok(Generation { dir, meta, identity });
+    if let Some(found) = lookup(&store(state, project), name)? {
+        return Generation::new(found);
     }
     // No generation: why, from what is at the name.
     let dir = store(state, project).join(name);
@@ -467,8 +509,11 @@ fn read_generation(state: &Path, project: &ProjectId, name: &str) -> Result<Gene
             if meta.name != name {
                 return Err(invalid(format!("it describes snapshot '{}'", meta.name)));
             }
-            let identity = dir_at(&dir);
-            Ok(Generation { dir, meta, identity })
+            // Published since the lookup: read again, through the directory held.
+            match meta_at(&dir, name)? {
+                Some((meta, held)) => Generation::new((dir, meta, held)),
+                None => Err(invalid("it is reached through a link, or changed while it was read".into())),
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found(state, project, name)),
         Err(e) => Err(io_error(path.display(), e)),
@@ -1481,7 +1526,7 @@ pub fn list(ctx: &Ctx) -> Result<ListReport> {
     let project = project_id(&ctx.root);
     let mut snapshots = Vec::new();
     for name in names(&ctx.state, &project) {
-        if let Some((_, meta)) = lookup(&store(&ctx.state, &project), &name)? {
+        if let Some((_, meta, _)) = lookup(&store(&ctx.state, &project), &name)? {
             snapshots.push(meta);
         }
     }
@@ -1942,6 +1987,22 @@ mod tests {
             assert_eq!(e.code, "snapshot_failed", "{created_at} {services:?}: {e}");
             assert!(e.message.contains("was replaced"), "{e}");
         }
+
+        // The chosen directory is removed by those saves, and a filesystem gives a freed inode to
+        // the next directory made (Linux does at once). Saves of the same second and services,
+        // each removing the one before, by exchange and by two renames, never publish a
+        // generation on the chosen one's inode while the restore holds it, so none passes for it.
+        assert_ne!(dir_at(&base.join("base")), Some(chosen.identity));
+        for round in 0..64 {
+            datadirs::NO_EXCHANGE.with(|c| c.set(round % 2 == 1));
+            let tmp = unique(&base, ".tmp-base");
+            with_db(&tmp, 1, &["db"]);
+            publish(&base, "base", &tmp, &base.join("base")).unwrap();
+            let now = read_generation(state.path(), &project, "base").unwrap();
+            assert_ne!(now.identity, chosen.identity, "round {round}: a new generation on the chosen directory's inode");
+            assert_eq!(check_same(&chosen, &now, &confirmed).unwrap_err().code, "snapshot_failed", "round {round}");
+        }
+        datadirs::NO_EXCHANGE.with(|c| c.set(false));
 
         // The same generation, put back from where an interrupted save set it aside, goes ahead.
         let _ = fs::remove_dir_all(&base);

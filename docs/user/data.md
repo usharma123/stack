@@ -166,7 +166,9 @@ The MCP tools are `stack_snapshot_save`, `stack_snapshot_restore`, `stack_snapsh
   removed. Otherwise the journal and the old data stay (`restore_incomplete`, the services that
   no longer match listed as `manual_recovery`). The snapshot is read again under the store's
   lock once its services are stopped: one replaced meanwhile (a `save --force` from another
-  checkout) is refused with `snapshot_failed` before anything is replaced.
+  checkout) is refused with `snapshot_failed` before anything is replaced. The restore holds the
+  snapshot directory it chose open until then, so a newer save cannot pass for it, even one of
+  the same second and services on a filesystem that reuses the freed directory's inode.
 - **A failed restore says what it changed.** A swap that fails puts back every service it
   replaced, judged by which directory is where: the error (`snapshot_failed`) lists each
   service as `unchanged` or `rolled_back`, and nothing is recorded as restored. A service that
