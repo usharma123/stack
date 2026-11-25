@@ -343,3 +343,82 @@ esac
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A fake Stack whose `--json setup` starts a client that ignores TERM, in the background without
+// detaching, then waits for it: Stack itself ends on TERM, and what it started does not. Each
+// appends its PID and process group to LEADER and CHILD; Stack also its parent's group.
+const leaderWithChild = (dir) => `#!/usr/bin/env bash
+case "$*" in
+  --version) echo 'stack fixture' ;;
+  '--json setup')
+    bash -c 'trap "" TERM; echo "$$ $(ps -o pgid= -p $$)" >>${dir}/child.pids; while :; do sleep 0.2; done' &
+    echo "$$ $(ps -o pgid= -p $$) $(ps -o pgid= -p $PPID)" >>${dir}/leader.pids
+    wait ;;
+esac
+`;
+
+// Each line of the file, as numbers.
+const fields = (file) => readFileSync(file, 'utf8').trim().split(/\s+/).map(Number);
+
+// Assert Stack led a process group of its own, apart from the smoke's, holding the client it
+// started, and that neither they nor anything started from the fixture's directory survived.
+function assertGroupStopped(dir) {
+  const [leader, leaderGroup, runnerGroup] = fields(path.join(dir, 'leader.pids'));
+  const [child, childGroup] = fields(path.join(dir, 'child.pids'));
+  assert.equal(leaderGroup, leader, 'Stack did not lead a process group of its own');
+  assert.notEqual(runnerGroup, leader, 'Stack shared the smoke\'s process group');
+  assert.equal(childGroup, leader, 'the client Stack started was not in Stack\'s group');
+  assert.ok(!exists(leader) && !exists(child), `Stack ${leader} or its client ${child} survived the smoke`);
+  const survivors = execFileSync('ps', ['-A', '-o', 'pid=,command='], { encoding: 'utf8' })
+    .split('\n').filter(line => line.includes(dir));
+  assert.deepEqual(survivors, [], 'processes outlived the smoke');
+}
+
+test('the clean-machine smoke stops what a stalled Stack started in its group, though Stack ends on TERM and that ignores it', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-group-'));
+  let work;
+  try {
+    writeFileSync(path.join(dir, 'stack'), leaderWithChild(dir), { mode: 0o755 });
+    const started = Date.now();
+    const result = spawnSync('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+      { encoding: 'utf8', env: { ...process.env, STACK_SMOKE_SECONDS: '1' }, timeout: 60000 });
+    work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(work, result.stderr);
+    assert.match(result.stderr, /stack --json setup: still running after 1s, stopped/);
+    assert.doesNotMatch(result.stderr, /still has members after KILL/);
+    assert.ok(Date.now() - started < 30000, 'the smoke outlived its bound');
+    assertGroupStopped(dir);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the clean-machine smoke, interrupted while Stack runs, stops Stack\'s group and fails', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-cancel-'));
+  let work;
+  try {
+    writeFileSync(path.join(dir, 'stack'), leaderWithChild(dir), { mode: 0o755 });
+    const smoke = spawn('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+      { env: { ...process.env, STACK_SMOKE_SECONDS: '60' }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    smoke.stderr.on('data', chunk => { stderr += chunk; });
+    const ended = new Promise(resolve => smoke.on('exit', (code, signal) => resolve({ code, signal })));
+    await appeared(path.join(dir, 'child.pids'));
+    await appeared(path.join(dir, 'leader.pids'));
+    const started = Date.now();
+    // To the smoke alone: Stack, in a group of its own, is reached only through the smoke's cleanup.
+    process.kill(smoke.pid, 'SIGTERM');
+    const { code, signal } = await ended;
+    work = stderr.match(/work dir kept: (\S+)/)?.[1];
+    // The cleanup fails the run whenever it had a Stack command to stop.
+    assert.equal(code, 1, `${signal} ${stderr}`);
+    assert.ok(work, stderr);
+    assert.ok(Date.now() - started < 15000, 'the cancelled smoke outlived its grace');
+    assertGroupStopped(dir);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

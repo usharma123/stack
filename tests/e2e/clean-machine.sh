@@ -52,29 +52,62 @@ mkdir -p "$work/tmp"
 
 # stack NAME ARGS...: `stack ARGS...` in the app, cleanly, bounded by $seconds, with its output
 # in $out/NAME.out. Returns its status; on a stall, stops it and returns 124. The background job
-# is Stack itself (the subshell execs env, which execs Stack), so what is stopped is Stack, and
-# no wrapper is left behind it.
+# is Stack itself (the subshell execs env, which execs Stack), so no wrapper is left behind it.
+# It is launched in monitor mode, so it leads a process group of its own (its PID is the group's
+# ID) holding whatever it starts that does not detach; a stall or an interruption stops that
+# whole group. A supervisor that detaches into a session of its own is not in it: it is the
+# cleanup `down`'s to stop.
 running() { jobs -r -p | grep -qx "$1"; }
-# stop PID: TERM, up to 5s for it to end, then KILL; reaped either way before it returns.
+# group PID: whether any process is still in the group PID leads. Only ever asked of a group
+# whose leader this shell started and has not yet waited for, or has waited for within the
+# last few seconds: the ID cannot name this shell's own group (that existed before the leader
+# did) and, while any member lives, no other process can take it.
+group() { kill -0 -- "-$1" 2>/dev/null; }
+# stop PID: TERM to its group (and to it, should it have left the group), up to 5s for every
+# member to end, then KILL to whatever remains; the leader is reaped before this returns, and
+# up to 2s more is given for the group to be empty. Fails if anything in the group survives.
 stop() {
   local pid=$1 tenths=0
-  kill -TERM "$pid" 2>/dev/null || true
-  while running "$pid" && [ "$tenths" -lt 50 ]; do
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  if running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+  while { running "$pid" || group "$pid"; } && [ "$tenths" -lt 50 ]; do
     sleep 0.1
     tenths=$((tenths + 1))
   done
+  if group "$pid"; then kill -KILL -- "-$pid" 2>/dev/null || true; fi
   if running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
   wait "$pid" 2>/dev/null || true
+  tenths=0
+  while group "$pid" && [ "$tenths" -lt 20 ]; do
+    sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  if group "$pid"; then
+    echo "process group $pid still has members after KILL" >&2
+    return 1
+  fi
 }
+# This bash must give a monitor-mode job a group of its own, or a stall's descendants could
+# outlive it: checked once, on a job that cannot have ended yet.
+set -m
+sleep 30 >/dev/null 2>&1 &
+probe=$!
+set +m
+if group "$probe"; then own_group=true; else own_group=false; fi
+kill -KILL -- "-$probe" 2>/dev/null || kill -KILL "$probe" 2>/dev/null || true
+wait "$probe" 2>/dev/null || true
+[ "$own_group" = true ] || fail "bash $BASH_VERSION did not start a monitor-mode job in a process group of its own"
 current=
 stack() {
   local name=$1 tenths=0 status=0
   shift
+  set -m
   (cd "$app" && exec env -i "${clean_env[@]}" "$binary" "$@") </dev/null >"$out/$name.out" 2>"$out/$name.err" &
   current=$!
+  set +m
   while running "$current"; do
     if [ "$tenths" -ge $((seconds * 10)) ]; then
-      stop "$current"
+      stop "$current" || true
       current=
       echo "stack $*: still running after ${seconds}s, stopped" >&2
       tail -c 4000 "$out/$name.err" >&2 || true
@@ -107,7 +140,7 @@ cleanup() {
   local status=$?
   # A Stack command still running (the run interrupted) is stopped and reaped first.
   if [ -n "$current" ]; then
-    stop "$current"
+    stop "$current" || true
     current=
     status=1
   fi
