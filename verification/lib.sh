@@ -5,9 +5,11 @@
 set -euo pipefail
 
 VERIFY_ROOT=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
-TLA_URL=https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+TLA_URL=${VERIFY_TLA_URL:-https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar}
 TLA_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
-TLA_JAR="$VERIFY_ROOT/target/verification/tla2tools.jar"
+# VERIFY_TLA_URL and VERIFY_TLA_JAR move the download and the cached jar (tests/verification.test.mjs);
+# the checksum is fixed.
+TLA_JAR=${VERIFY_TLA_JAR:-"$VERIFY_ROOT/target/verification/tla2tools.jar"}
 
 # Whether the file $1 has the pinned TLA+ v1.7.4 checksum.
 tla_checksum_ok() {
@@ -27,7 +29,11 @@ tla_jar() {
   if [ ! -f "$TLA_JAR" ]; then
     local partial
     partial=$(mktemp "$TLA_JAR.XXXXXX")
-    curl -fsSL "$TLA_URL" -o "$partial"
+    if ! curl --connect-timeout 10 --max-time 300 --retry 3 --retry-delay 5 --retry-max-time 900 -fsSL "$TLA_URL" -o "$partial"; then
+      rm -f "$partial"
+      echo "cannot download $TLA_URL" >&2
+      return 1
+    fi
     if ! tla_checksum_ok "$partial"; then
       rm -f "$partial"
       echo "downloaded tla2tools.jar does not match sha256 $TLA_SHA256" >&2
