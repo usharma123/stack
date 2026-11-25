@@ -5,6 +5,7 @@
 //! other's data, ports or services, and stop completely at once.
 
 use serde_json::Value;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -13,12 +14,33 @@ const WORKTREES: usize = 5;
 
 const MANIFEST: &str = "[services.postgres]\npreset = 'postgres'\nversion = '17'\n\n[services.redis]\npreset = 'redis'\nversion = '8'\n";
 
+/// mise's data directory, as mise finds it from the variables `var` gives: a nonempty
+/// `MISE_DATA_DIR`, else a nonempty `XDG_DATA_HOME`'s `mise`, else `~/.local/share/mise`.
+fn mise_data_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let set = |name: &str| var(name).filter(|v| !v.is_empty());
+    set("MISE_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| set("XDG_DATA_HOME").map(|d| PathBuf::from(d).join("mise")))
+        .or_else(|| set("HOME").map(|h| PathBuf::from(h).join(".local/share/mise")))
+}
+
+#[test]
+fn mise_data_dir_is_found_as_mise_finds_it() {
+    let from = |vars: &[(&str, &str)]| {
+        let vars: Vec<(String, OsString)> = vars.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
+        mise_data_dir(|name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+    };
+    assert_eq!(from(&[("MISE_DATA_DIR", "/m"), ("XDG_DATA_HOME", "/x"), ("HOME", "/h")]), Some(PathBuf::from("/m")));
+    assert_eq!(from(&[("MISE_DATA_DIR", ""), ("XDG_DATA_HOME", "/x"), ("HOME", "/h")]), Some(PathBuf::from("/x/mise")));
+    assert_eq!(from(&[("MISE_DATA_DIR", ""), ("XDG_DATA_HOME", ""), ("HOME", "/h")]), Some(PathBuf::from("/h/.local/share/mise")));
+    assert_eq!(from(&[("HOME", "")]), None);
+}
+
 /// mise's installs directory, when mise is on PATH and it holds a Postgres 17 and a Redis 8.
 fn installs() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|d| d.join("mise")).find(|m| m.is_file())?;
-    let data = std::env::var_os("MISE_DATA_DIR").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/mise")))?;
-    let installs = data.join("installs");
+    let installs = mise_data_dir(|name| std::env::var_os(name))?.join("installs");
     let has = |tool: &str, major: &str, bin: &str| {
         std::fs::read_dir(installs.join(tool)).into_iter().flatten().flatten().any(|e| {
             let name = e.file_name().to_string_lossy().into_owned();

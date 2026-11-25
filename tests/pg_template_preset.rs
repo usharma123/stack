@@ -3,6 +3,12 @@
 //! set): a new data directory is cloned from a template, and one whose template directory cannot
 //! be used is initialised by `initdb`, the reason in the service's log either way.
 //!
+//! mise's installs are found where mise keeps them: a nonempty `MISE_DATA_DIR`, else a nonempty
+//! `XDG_DATA_HOME`'s `mise`, else `~/.local/share/mise`. With `STACK_REQUIRE_PGTEMPLATE` set,
+//! every selected Postgres must have its own `psql` beside it (an executable reporting that
+//! release) before any cluster starts; without it, a release lacking one is still tested, its
+//! servers' identifiers and data not queried, and says so.
+//!
 //! Which way a clone was made is checked, not only that one was:
 //! - `STACK_PGTEMPLATE_CLONE` names the path the clone must take: `clonefile` (macOS APFS),
 //!   `reflink` (Linux `FICLONE`, Btrfs or XFS) or `copy` (any other Linux filesystem). With
@@ -15,15 +21,38 @@
 //! Each clone must be its own cluster: a system identifier unlike the template's and the other
 //! clone's, which the running server reports, and data written in one never seen in another.
 
+use std::ffi::OsString;
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The newest release's `bin` of each installed major.
-fn pg_bins() -> Vec<(String, PathBuf)> {
-    let data = std::env::var_os("MISE_DATA_DIR").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/mise")));
-    let Some(entries) = data.and_then(|d| std::fs::read_dir(d.join("installs/postgres")).ok()) else { return Vec::new() };
+/// mise's data directory, as mise finds it from the variables `var` gives: a nonempty
+/// `MISE_DATA_DIR`, else a nonempty `XDG_DATA_HOME`'s `mise`, else `~/.local/share/mise`.
+fn mise_data_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let set = |name: &str| var(name).filter(|v| !v.is_empty());
+    set("MISE_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| set("XDG_DATA_HOME").map(|d| PathBuf::from(d).join("mise")))
+        .or_else(|| set("HOME").map(|h| PathBuf::from(h).join(".local/share/mise")))
+}
+
+#[test]
+fn mise_data_dir_is_found_as_mise_finds_it() {
+    let from = |vars: &[(&str, &str)]| {
+        let vars: Vec<(String, OsString)> = vars.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect();
+        mise_data_dir(|name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+    };
+    assert_eq!(from(&[("MISE_DATA_DIR", "/m"), ("XDG_DATA_HOME", "/x"), ("HOME", "/h")]), Some(PathBuf::from("/m")));
+    assert_eq!(from(&[("MISE_DATA_DIR", ""), ("XDG_DATA_HOME", "/x"), ("HOME", "/h")]), Some(PathBuf::from("/x/mise")));
+    assert_eq!(from(&[("MISE_DATA_DIR", ""), ("XDG_DATA_HOME", ""), ("HOME", "/h")]), Some(PathBuf::from("/h/.local/share/mise")));
+    assert_eq!(from(&[("HOME", "")]), None);
+}
+
+/// The newest release's `bin` of each installed major under mise's data directory `data`.
+fn pg_bins(data: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(data.join("installs/postgres")) else { return Vec::new() };
     let mut by_major: std::collections::BTreeMap<u32, (Vec<u32>, String, PathBuf)> = Default::default();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -39,6 +68,26 @@ fn pg_bins() -> Vec<(String, PathBuf)> {
         }
     }
     by_major.into_values().map(|(_, version, bin)| (version, bin)).collect()
+}
+
+/// Why `bin` holds no `psql` of `version` (an executable file whose `--version` reports that
+/// release), or `None` when it does.
+fn psql_mismatch(bin: &Path, version: &str) -> Option<String> {
+    let psql = bin.join("psql");
+    match std::fs::metadata(&psql) {
+        Err(e) => return Some(format!("{}: {e}", psql.display())),
+        Ok(meta) if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 => return Some(format!("{} is not an executable file", psql.display())),
+        Ok(_) => {}
+    }
+    let out = match Command::new(&psql).arg("--version").env_clear().env("LC_ALL", "C.UTF-8").stdin(Stdio::null()).output() {
+        Ok(out) => out,
+        Err(e) => return Some(format!("{} --version: {e}", psql.display())),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // `psql (PostgreSQL) 17.2`
+    let reported = text.split_whitespace().nth(2);
+    (!(out.status.success() && reported == Some(version)))
+        .then(|| format!("{} --version reported {:?} ({}), not {version}", psql.display(), text.trim(), out.status))
 }
 
 fn stack_bin() -> PathBuf {
@@ -61,11 +110,14 @@ fn run_preset(bin: &Path, version: &str, data: &Path, templates: &Path, log: &Pa
         .unwrap();
     let until = Instant::now() + Duration::from_secs(30);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        if child.try_wait().unwrap().is_some() || Instant::now() > until {
-            // SAFETY: signals only the child this test started, not yet reaped.
-            unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        // Ended (and so reaped): nothing to signal.
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("the preset {version} exited ({status}) before it listened on {port}: {}", std::fs::read_to_string(log).unwrap_or_default());
+        }
+        if Instant::now() > until {
+            let _ = child.kill();
             let _ = child.wait();
-            panic!("the preset did not listen: {}", std::fs::read_to_string(log).unwrap_or_default());
+            panic!("the preset {version} did not listen on {port} within 30s, stopped: {}", std::fs::read_to_string(log).unwrap_or_default());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -221,16 +273,29 @@ fn the_preset_clones_a_template_and_falls_back_to_initdb_when_it_cannot() {
             panic!("UNSUPPORTED FILESYSTEM, not a pass: {} refuses FICLONE ({why}), so the reflink path cannot run there", base.display());
         }
     }
-    let bins = pg_bins();
+    let required = std::env::var_os("STACK_REQUIRE_PGTEMPLATE").is_some();
+    let data = mise_data_dir(|name| std::env::var_os(name));
+    let bins = data.as_deref().map(pg_bins).unwrap_or_default();
     if bins.is_empty() {
-        assert!(std::env::var_os("STACK_REQUIRE_PGTEMPLATE").is_none(), "STACK_REQUIRE_PGTEMPLATE is set, but mise's installs hold no Postgres");
-        eprintln!("skipping: no Postgres in mise's installs");
+        assert!(!required, "STACK_REQUIRE_PGTEMPLATE is set, but mise's installs (under {data:?}) hold no Postgres");
+        eprintln!("skipping: no Postgres in mise's installs (under {data:?})");
         return;
     }
-    for (version, bin) in bins {
+    // Every selected release's psql, checked before any cluster starts.
+    let bins: Vec<(String, PathBuf, Option<String>)> = bins.into_iter().map(|(version, bin)| { let why = psql_mismatch(&bin, &version); (version, bin, why) }).collect();
+    let missing: Vec<String> = bins.iter().filter_map(|(version, _, why)| why.as_ref().map(|why| format!("{version}: {why}"))).collect();
+    assert!(
+        !required || missing.is_empty(),
+        "STACK_REQUIRE_PGTEMPLATE is set, but not every selected Postgres has its psql, so the servers' identifiers and data cannot be queried:\n{}",
+        missing.join("\n")
+    );
+    for line in &missing {
+        eprintln!("{line}; the servers of this release will not be queried");
+    }
+    for (version, bin, why) in bins {
         let tmp = tempfile::tempdir_in(&base).unwrap();
         let templates = tmp.path().join("templates");
-        let has_psql = bin.join("psql").is_file();
+        let has_psql = why.is_none();
         let mut first_id = None;
         let log = run_preset(&bin, &version, &tmp.path().join("a/postgres"), &templates, &tmp.path().join("a.log"), |port| {
             if has_psql {
