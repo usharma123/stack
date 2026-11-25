@@ -1,0 +1,51 @@
+# Rust tests that run the real code behind PortAndMcpContract's transitions, and the log cursor,
+# follow and CLI parsing behavior the model leaves to them (see SKILL.md). Library tests by path;
+# integration tests as `tests/<crate>.rs <name>`; the `stack` binary's own as `src/main.rs <name>`.
+# ports: assign / reassign / release / release_gone, presence, pins, the ephemeral range
+ports::tests::a_seeded_sequence_of_registry_operations_keeps_every_reservation_promise
+ports::tests::checkouts_assigning_at_once_never_share_a_port_and_each_keeps_what_it_was_given
+ports::tests::compile_reassign_gives_every_assigned_service_a_new_port_and_keeps_pins
+ports::tests::a_service_is_never_assigned_the_port_another_service_of_its_checkout_pins
+ports::tests::reassign_moves_only_the_named_services_and_never_back_to_the_old_port
+ports::tests::ports_come_from_outside_the_ports_outgoing_connections_take
+ports::tests::a_reserved_port_outgoing_connections_may_take_is_replaced_and_a_pinned_one_kept
+checkout::tests::on_disk_a_refused_lookup_is_unknown_and_a_deletion_is_gone
+session::tests::a_checkout_out_of_reach_is_left_alone_and_a_deleted_one_is_reclaimed
+tests/compile.rs pinned_ports_cannot_collide_across_projects
+tests/compile.rs deleted_projects_release_their_ports
+tests/runtime.rs a_foreign_listener_on_an_assigned_port_is_a_port_conflict_not_a_stop_failure
+tests/parallel_safety.rs up_reassign_ports_moves_a_port_another_program_holds_and_leaves_the_program_alone
+# mcp: read_frames / Credit, line / batch, accept / admit / start / done / finish, cancel, signals
+mcp::server::tests::a_batch_across_checkouts_with_a_cancelled_waiting_call_is_answered_once_in_order_after_input_ends
+mcp::server::tests::calls_past_the_worker_bound_wait_without_a_thread_and_past_the_waiting_bound_are_refused
+mcp::server::tests::calls_on_one_checkout_take_turns_and_others_run_alongside
+mcp::server::tests::a_busy_checkout_holds_only_its_own_calls_and_keeps_their_order
+mcp::server::tests::a_call_cancelled_while_waiting_its_turn_never_runs
+mcp::server::tests::a_cancelled_call_stops_its_command_and_gets_no_response
+mcp::server::tests::after_a_signal_a_call_ending_admits_no_waiting_call
+mcp::server::tests::a_batch_whose_held_calls_a_signal_drops_still_gets_its_other_responses
+mcp::server::tests::a_signal_after_a_call_got_its_worker_and_before_its_tool_runs_drops_it_and_holds_up_nothing
+mcp::server::tests::a_call_with_no_signal_at_its_admission_runs
+mcp::server::tests::a_reader_holds_at_most_the_pending_bound_and_a_call_ending_still_reaches_the_loop
+mcp::server::tests::input_that_ends_at_once_or_mid_line_still_has_every_accepted_call_answered
+mcp::server::tests::calls_waiting_for_a_worker_are_answered_after_input_ends
+mcp::server::tests::batches_are_answered_together_only_in_the_revision_that_has_them
+tests/runtime.rs sigterm_to_the_mcp_server_stops_a_running_command_answers_and_ends_the_server
+# logs: cursors, read_after, tail, follow's poll (not modeled; see SKILL.md)
+logs::tests::a_seeded_log_read_by_cursor_and_by_follow_returns_each_record_once_or_reports_its_gap
+logs::tests::cursors_naming_several_services_read_each_on_and_positions_in_lost_files_say_so
+logs::tests::cursors_round_trip_and_refuse_anything_else
+logs::tests::a_cursor_read_of_no_lines_takes_none_and_keeps_its_place
+supervisor::tests::a_read_says_more_only_while_whole_records_are_left_never_for_one_still_being_written
+supervisor::tests::a_cursor_returns_each_record_once_with_its_stamp_repeats_included
+supervisor::tests::a_cursor_follows_a_rotation_and_reports_what_it_could_not_return
+supervisor::tests::a_tail_window_beginning_at_a_record_keeps_it_and_drops_only_a_record_it_cuts
+supervisor::tests::a_record_the_rest_of_a_rotated_reads_budget_cannot_hold_is_left_whole_for_the_next_read
+tests/cli_dx.rs a_log_cursor_returns_each_line_once_with_its_time_and_says_what_it_missed
+tests/cli_dx.rs mcp_logs_read_from_a_cursor_across_services
+tests/cli_dx.rs follow_prints_new_lines_until_interrupted
+# CLI: run's flag forwarding, --project spelling (not modeled)
+src/main.rs tests::run_gives_the_task_every_argument_after_its_name
+src/main.rs tests::a_project_path_after_a_space_is_refused_with_the_spelling_that_works
+src/main.rs tests::a_directory_named_like_a_subcommand_is_never_taken_for_one
+tests/fleet.rs ps_status_logs_and_down_act_on_a_projects_worktrees_or_a_label

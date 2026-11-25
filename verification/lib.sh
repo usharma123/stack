@@ -92,8 +92,8 @@ verify_model() {
 }
 
 # Run the named Rust tests, each exactly, and require each to pass. A name is a library test
-# (`module::tests::name`), or an integration test as `tests/<crate>.rs <name>`; each target is
-# built and run once. Set VERIFY_SKIP_RUST=1 to check only the models; CARGO overrides the
+# (`module::tests::name`), an integration test as `tests/<crate>.rs <name>`, or a test of the
+# `stack` binary itself as `src/main.rs <name>`; each target is built and run once. Set VERIFY_SKIP_RUST=1 to check only the models; CARGO overrides the
 # command (e.g. CARGO="cargo +1.93.1"), and CARGO_BUILD_JOBS bounds the build as usual.
 verify_rust() {
   if [ "${VERIFY_SKIP_RUST:-0}" = 1 ]; then
@@ -106,6 +106,7 @@ verify_rust() {
   for entry in "$@"; do
     case "$entry" in
       "tests/"*" "*) target=${entry%% *}; target=${target#tests/}; target=${target%.rs} ;;
+      "src/main.rs "*) target=bin ;;
       *) target=lib ;;
     esac
     case " ${targets[*]-} " in *" $target "*) ;; *) targets+=("$target") ;; esac
@@ -116,16 +117,22 @@ verify_rust() {
       case "$entry" in
         "tests/$target.rs "*) names+=("${entry#* }") ;;
         "tests/"*) ;;
+        "src/main.rs "*) [ "$target" = bin ] && names+=("${entry#* }") ;;
         *) [ "$target" = lib ] && names+=("$entry") ;;
       esac
     done
     local select=(--lib)
-    [ "$target" = lib ] || select=(--test "$target")
+    case "$target" in
+      lib) ;;
+      bin) select=(--bin stack) ;;
+      *) select=(--test "$target") ;;
+    esac
     (cd "$VERIFY_ROOT" && "${cargo[@]}" test --locked --target-dir "$VERIFY_ROOT/target/verification/build" "${select[@]}" -- --exact "${names[@]}") \
       >>"$EVIDENCE/rust.log" 2>&1 || { tail -40 "$EVIDENCE/rust.log" >&2; return 1; }
   done
   for entry in "$@"; do
     name=${entry#tests/* }
+    name=${name#src/main.rs }
     grep -Fxq "test $name ... ok" "$EVIDENCE/rust.log" || { echo "Rust test $entry did not pass; see $EVIDENCE/rust.log" >&2; return 1; }
   done
   echo "Rust: $# tests passed (${targets[*]}; $EVIDENCE/rust.log)"
