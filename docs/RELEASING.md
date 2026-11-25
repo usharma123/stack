@@ -42,8 +42,9 @@ builds the artifact that releases promote and does the following:
 - Installs the packed tarball on all four runners with scripts disabled and tests
   version/help, argument errors, compilation in a path with spaces, and locked replay.
 
-Actions are pinned to commit SHAs, and every downloaded tool to its SHA-256; Dependabot
-proposes action and cargo updates a week after their release. Builds use Cargo.lock and no
+Actions are pinned to commit SHAs. CI checks the SHA-256 of the downloaded linters, cargo-deny,
+mise archives and TLC jar. Dependabot proposes action and Cargo updates a week after their
+release. Builds use Cargo.lock and no
 shared caches. Packaging starts as soon as native builds pass; independent checks still
 block the final `CI passed` result. The four-runner install matrix tests the uploaded
 tarball; packaging does not repeat its Linux smoke test. Every runner job and step

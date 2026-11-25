@@ -47,7 +47,7 @@ if [ ${#cargo[@]} -eq 2 ] && [[ "${cargo[1]}" == +* ]]; then deny+=(RUSTUP_TOOLC
 deny+=("$work/cargo-deny")
 
 dbs="$tools/advisory-dbs-$mode"
-case "$dbs" in *\"*|*\|*|*\\*) echo "cannot name $dbs in a TOML string" >&2; exit 2 ;; esac
+case "$dbs" in *\"*|*\|*|*\\*|*\&*) echo "cannot substitute $dbs as the advisory database path" >&2; exit 2 ;; esac
 grep -q '^db-path = ' deny.toml || { echo 'deny.toml has no db-path line to replace' >&2; exit 1; }
 sed "s|^db-path = .*|db-path = \"$dbs\"|" deny.toml >"$work/deny.toml"
 db="$dbs/$ADVISORY_DB_DIR"

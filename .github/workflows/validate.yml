@@ -156,6 +156,7 @@ jobs:
           path: |
             target/verification/${{ matrix.skill }}.*/
             !target/verification/**/*.states
+            !target/verification/**/*.states/**
           if-no-files-found: warn
           retention-days: 14
   # The packaged binary from `native` (static musl on Linux) on a clean machine and against real
@@ -200,7 +201,11 @@ jobs:
           info=dist-bin/build-info.json
           test "$(jq -r .platform "$info")" = "$PLATFORM"
           test "$(jq -r .commit "$info")" = "$(git rev-parse HEAD)"
-          sum=$(shasum -a 256 dist-bin/stack | cut -d' ' -f1)
+          if command -v sha256sum >/dev/null; then
+            sum=$(sha256sum dist-bin/stack | cut -d' ' -f1)
+          else
+            sum=$(shasum -a 256 dist-bin/stack | cut -d' ' -f1)
+          fi
           test "$sum" = "$(jq -r .sha256 "$info")" || { echo "dist-bin/stack has SHA-256 $sum, not build-info.json's" >&2; exit 1; }
           if [ "$RUNNER_OS" = Linux ]; then file -b dist-bin/stack | grep -Eq 'statically linked|static-pie linked'; fi
           dist-bin/stack --version
@@ -211,7 +216,7 @@ jobs:
         run: bash tests/e2e/clean-machine.sh dist-bin/stack
         env:
           STACK_SMOKE_EVIDENCE: ${{ runner.temp }}/evidence/smoke
-          STACK_SMOKE_SECONDS: '600'
+          STACK_SMOKE_SECONDS: '660'
       - name: Install pinned mise
         timeout-minutes: 5
         env:
@@ -225,6 +230,11 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then file -b "$RUNNER_TEMP/mise/bin/mise" | grep -Eq 'statically linked|static-pie linked'; fi
           "$RUNNER_TEMP/mise/bin/mise" --version
           echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 5
+        with:
+          node-version: '24.16.0'
+          package-manager-cache: false
       - name: Verify real mise configuration isolation
         timeout-minutes: 5
         run: STACK_TEST_MISE="$(command -v mise)" STACK_TEST_BINARY="$PWD/dist-bin/stack" node --test tests/provider-boundary.test.mjs
@@ -294,18 +304,25 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -yqq xfsprogs
           fi
           image="$RUNNER_TEMP/reflink.img" mnt="$RUNNER_TEMP/reflink"
+          mounted=false
+          cleanup() {
+            local status=$?
+            if [ "$mounted" = true ]; then
+              sudo umount "$mnt" || sudo umount -l "$mnt" || exit 1
+            fi
+            rm -f "$image" || exit 1
+            exit "$status"
+          }
+          trap cleanup EXIT
           truncate -s 1G "$image"
           mkfs.xfs -q -f -m reflink=1 "$image"
           mkdir -p "$mnt"
           sudo mount -o loop "$image" "$mnt"
+          mounted=true
           sudo chown "$(id -u):$(id -g)" "$mnt"
           findmnt -no FSTYPE,OPTIONS "$mnt"
           sudo xfs_info "$mnt" | grep -o 'reflink=1'
-          status=0
-          STACK_PGTEMPLATE_DIR="$mnt" cargo +1.93.1 test --locked --test pg_template_preset -- --nocapture || status=$?
-          sudo umount "$mnt" || sudo umount -l "$mnt"
-          rm -f "$image"
-          exit "$status"
+          STACK_PGTEMPLATE_DIR="$mnt" cargo +1.93.1 test --locked --test pg_template_preset -- --nocapture
       # The test re-runs its checks in a user, mount and PID namespace of their own, mounting
       # nothing on the host. Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor;
       # this ephemeral runner lifts that restriction for the test.

@@ -2,7 +2,7 @@
 // enforce on their own, or what only this repository requires.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 
 const dir = '.github/workflows';
 const workflows = Object.fromEntries(readdirSync(dir).filter(f => /\.ya?ml$/.test(f))
@@ -15,12 +15,13 @@ function runScripts(text) {
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(/^(\s*)(?:- )?run:\s?(.*)$/);
     if (!m) continue;
+    const line = i + 1;
     const indent = m[1].length;
     const body = [m[2]];
     if (/^[|>][-+]?\s*$/.test(m[2])) {
       while (i + 1 < lines.length && (lines[i + 1].trim() === '' || lines[i + 1].match(/^\s*/)[0].length > indent)) body.push(lines[++i]);
     }
-    scripts.push({ line: i + 1, text: body.join('\n') });
+    scripts.push({ line, text: body.join('\n') });
   }
   return scripts;
 }
@@ -76,6 +77,7 @@ test('the services job installs the mise builds stack setup installs, by the sam
     .map(([, os, arch, asset, sha]) => [`${os === 'macos' ? 'darwin' : 'linux'}-${arch === 'x86_64' ? 'x64' : 'arm64'}`, { asset, sha }]));
   assert.equal(Object.keys(assets).length, 4, 'src/setup.rs names four mise builds');
   const services = jobs(workflows['validate.yml']).find(j => j.name === 'services').text;
+  assert.match(services, /uses: actions\/setup-node@[0-9a-f]{40}[\s\S]*?node-version: '24\.16\.0'[\s\S]*?node --test tests\/provider-boundary\.test\.mjs/);
   const rows = [...services.matchAll(/platform: ([\w-]+), mise: ([\w-]+), mise_sha256: ([0-9a-f]{64})/g)];
   assert.deepEqual(rows.map(r => r[1]).sort(), ['darwin-arm64', 'linux-arm64', 'linux-x64'], 'services platforms');
   for (const [, platform, mise, sha] of rows) {
@@ -103,8 +105,13 @@ test('the CI check that gates merging depends on all of validation', () => {
 
 test('the formal verification jobs run every skill the verifier knows', () => {
   const known = readFileSync('verification/check.sh', 'utf8').match(/\|\| skills=\(([^)]+)\)$/m)[1].split(/\s+/).filter(Boolean);
+  const skillRoot = '.cursor/skills';
+  const onDisk = readdirSync(skillRoot)
+    .filter(name => name.startsWith('verify-stack-') && existsSync(`${skillRoot}/${name}/check.sh`))
+    .map(name => name.slice('verify-stack-'.length));
+  assert.deepEqual(known.sort(), onDisk.sort());
   const formal = jobs(workflows['validate.yml']).find(j => j.name === 'formal').text;
   const listed = formal.match(/skill: \[([^\]]+)\]/)[1].split(',').map(s => s.trim());
-  assert.deepEqual(listed.sort(), known.sort());
+  assert.deepEqual(listed.sort(), onDisk);
   assert.match(formal, /STACK_REQUIRE_PSQL: '1'/);
 });
