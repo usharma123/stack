@@ -1,0 +1,15 @@
+# actionlint 1.7.12 (pinned in scripts/ci/lint.sh, the newest release) predates two forms GitHub
+# documents. Each exclusion names one file and the one message that form produces there.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      # `concurrency.queue: max`: up to 100 release runs wait in order instead of the newest
+      # replacing the pending one (docs.github.com, Workflow syntax: concurrency). actionlint:
+      # rhysd/actionlint#654.
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/ci.yml:
+    ignore:
+      # `uses: $/...`, the self-repository reference to a reusable workflow at the running commit
+      # (GitHub changelog 2026-07-30), which zizmor's self-repository audit requires.
+      # actionlint: rhysd/actionlint#711.
+      - 'reusable workflow call "\$/\.github/workflows/validate\.yml" at "uses" is not following the format'

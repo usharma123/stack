@@ -3,6 +3,20 @@ on:
   workflow_call:
 permissions: {}
 jobs:
+  lint:
+    name: Workflow and script lint
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      # Pinned actionlint, zizmor and shellcheck, each checked against its SHA-256.
+      - run: scripts/ci/lint.sh
+        timeout-minutes: 8
   native:
     permissions:
       contents: read
