@@ -57,7 +57,10 @@ run) rather than let the command reach the wrong server. See the [agent guide](h
 
 ## Some notes
 
-Stack is early. Expect rough edges, and pin a version in CI.
+Stack is early. Expect rough edges, and pin a version in CI. Postgres and Redis are the generally
+available service presets; CockroachDB, NATS and SpiceDB are experimental. Services listen on
+loopback without authentication: Stack keeps checkouts apart, not local users (see
+[SECURITY.md](https://github.com/usharma123/stack/blob/main/SECURITY.md)).
 
 Bundles are code you run: review them like any other dependency. Sessions with a `--ttl` are
 cleaned up by `stack gc` or the next `stack up`. Nothing runs in the background unless you ask:

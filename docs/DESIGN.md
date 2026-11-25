@@ -92,17 +92,21 @@ output (mise's answer when no release matches) is an error, not a version.
   across restarts; never inside the system's ephemeral range, where an outgoing connection can
   hold a stopped service's port (a reservation made there earlier is replaced); pruned when a
   project directory disappears (by the next compile anywhere, and by `gc` once no session of
-  it is left); `--reassign-ports` after a foreign program takes one. Projects
+  it is left); `--reassign-ports` after a foreign program takes one (`compile
+  --reassign-ports` gives every assigned service a new port, never one the checkout gives up,
+  even when the old one is free at that moment). Projects
   may pin ports in `[override.services]`; pins are checked against other projects'
-  reservations. Service defaults (5432, 6379) are never used. Before starting,
+  reservations, and a pin added on a port Stack had given another service of the same checkout
+  takes it at the next compile (that service is assigned another). Service defaults (5432, 6379) are never used. Before starting,
   `up` checks every assigned port: one that accepts connections without a running or starting
   supervisor daemon of that service behind it is a `port_conflict`, naming the service, the port
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
   assigned ports and the override for pinned ones. Stack never reassigns on its own: `down`
   removes the session while reservations persist, so "no session" does not mean "never used".
   `up --reassign-ports` is the explicit opt-in: on a `port_conflict` at the `ports` step with no
-  pinned port involved, only the conflicting services get new reservations (the old port stays
-  excluded while choosing) and `up` runs again once, reporting `reassigned_ports`.
+  pinned port involved, only the conflicting services get new reservations (every port they
+  give up stays excluded until each has its new one, even once nothing holds it; with no free
+  port for one, none moves) and `up` runs again once, reporting `reassigned_ports`.
 - **Fewer round-trips.** `exec`/`run --up` run a live `status` first and `up` only when it finds
   no session, a launching, stale or expired one, or a service that does not verify; the lease is
   carried over unless `--ttl` is given. `exec --install` runs `install` when a pin is missing.
@@ -153,8 +157,9 @@ output (mise's answer when no release matches) is an error, not a version.
   variables (`PGHOST`, `PGHOSTADDR`, `PGSERVICE`, `*_HOST`) get the invalid host outright, and
   `PGHOST` is set even when absent so libpq cannot use its default. Empty or malformed endpoints
   become a URL that names only the invalid host. Only values that name no host (ports, users,
-  databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services. `--require`
-  turns this into a refusal to run.
+  databases, passwords) are removed. `STACK_UNVERIFIED` lists affected services, and is
+  removed when every service verifies, so a list the caller carried (from an earlier `stack
+  env`) never reaches a command. `--require` turns this into a refusal to run.
 - **Provider environment.** `exec`, `run`, `env`, `status` and `up` need `mise env --json` and
   whether every pin is installed (`mise ls --json` in a scratch root). Stack keeps the two
   answers together in `$STACK_STATE_DIR/projects/<checkout key>.provider-env.json` (mode 0600,
@@ -205,8 +210,14 @@ output (mise's answer when no release matches) is an error, not a version.
   `--owner-pid ancestor:<name>` walks the parent chain of the stack process (kernel process
   info through `procinfo`, no subprocess) and takes the nearest process whose `comm` or
   `argv[0]` basename is `<name>`; none is `owner_not_found` listing the chain.
+  The lease records the owner's identity (`lease::OwnerIdentity`: start time, boot id and,
+  on Linux, the observer's PID namespace) and `lease::owner_state` judges it Alive, Exited
+  (gone, a reused PID, another boot) or Unknown (another or unreadable namespace, an
+  unreadable start time); Unknown keeps the lease. Leases without an identity (0.1.24 and
+  earlier) stay PID-only; carrying a lease never rebinds it.
   `status`, `up` and `ps` report the lease as one structured `lease` object (`kind`,
-  `ttl_secs`, `renewed_at`, `expires_at`, `owner_alive`, `expired`).
+  `ttl_secs`, `renewed_at`, `expires_at`, `owner_alive`, `owner_identity`, `owner_unknown`,
+  `expired`).
   Reclaimed by `stack gc`, at the start of every `stack up`, and by each pass of
   `stack gc --watch`, an opt-in foreground loop meant to run under a supervisor the user
   chooses. stack installs no background service.
@@ -404,7 +415,8 @@ output (mise's answer when no release matches) is an error, not a version.
   - *Clone.* `clonefile` of the directory on macOS, and nothing else: on another volume, or a
     filesystem that cannot clone (HFS+), `initdb` runs at the data directory, since a copy saves
     little and would need every file flushed. On Linux `FICLONE` per file (Btrfs, XFS), else a
-    plain copy, then `syncfs`; the Linux path has been type-checked, not run. Stack never starts
+    plain copy, then `syncfs`. On Linux the test suite runs the copy-and-`syncfs` fallback (CI's
+    Linux runners, ext4); the `FICLONE` success path (Btrfs, XFS) has been type-checked, not run. Stack never starts
     a server on a template. After each clone the template's digest is taken again and must be
     the recorded one: any write, chmod, link, rename or new entry since the build changes some
     change time, which cannot be set back, so the clone is of what was built; otherwise the
@@ -476,8 +488,20 @@ output (mise's answer when no release matches) is an error, not a version.
   which macOS rewrites when the clock is stepped); a record without a boot, or
   from another boot, names nothing alive and is never signalled. A request gets a revision above
   both the spec's and the last one the supervisor acknowledged, and a `spec.json` or
-  `state.json` that exists but cannot be read is `state_invalid`, not a fresh start, so an
-  acknowledgment only ever comes from a supervisor that read the request. A start asked of a
+  `state.json` that exists but cannot be read is `state_invalid` (or an I/O error), not a fresh
+  start, so an acknowledgment only ever comes from a supervisor that read the request. That holds
+  on every look, not only the first: one that goes bad while a command waits for the
+  acknowledgment or for services to stop ends the wait with that error, and is never taken for
+  a dead supervisor to replace, for services gone, or for a record to settle over (a command
+  reads the state again after staging its write, and keeps one it can no longer read). A
+  supervisor starts over a `state.json` it may not read only when a directory is in its place;
+  any other read error stops it before anything starts. Both records carry
+  `schema_version` (1). One without it was written by Stack 0.1.24 or earlier, or by a
+  supervisor of such a release still running after an upgrade, and is read as before (every
+  reader ignores fields it does not know, so such a supervisor reads this Stack's spec too). One
+  of a later version is `state_invalid`: `up`, `restart`, `down` and `gc` stop, start, write and
+  remove nothing on its word, `up` checks both records before its port check could take a
+  listed-as-gone service for a stray, and a supervisor refuses to start over such a state. A start asked of a
   service already running is consumed by it: it is not started again when it later exits. A
   start asked while it is stopping is kept, and starts it once the stop completed. The
   supervisor retries a `state.json` it could not write every pass; if services run without a
@@ -553,6 +577,38 @@ output (mise's answer when no release matches) is an error, not a version.
   and nothing after: no session, no stop, no start. It is locked like `up`.
 - **Logs.** A service's stdout and stderr are pipes to its supervisor; one thread per service
   writes its log and rotates it past 16 MiB to one older file, so rotation never races a writer.
+  Pumps hand it records (at most 64 KiB of line plus its stamp) through a queue bounded at 1 MiB
+  per service: a pump waits up to a second for room (backpressure on the service's pipe), then
+  drops and stops waiting until a record fits again; the supervisor's own lines never wait; every
+  drop is counted and noted in the log as a stamped `[stack]` record. A write that fails part
+  way is cut back off with `ftruncate`; where that fails too, or a crash cut a record, the writer
+  finds the file ending without a newline when it opens it and ends that line first, so a note
+  or record written next is never read as part of the cut one (the cut record itself stays, the
+  one record not as it was read). Log files are opened through a descriptor of the checkout's
+  `logs` directory (`O_DIRECTORY | O_NOFOLLOW`) with `openat(O_NOFOLLOW)`, rotated with
+  `renameat` in it, and must be regular files; a service name is one path component (see
+  `manifest::valid_service_name`), checked when a manifest is composed, when a cursor is parsed,
+  and again when a log is opened. Every log file the writer makes begins with a header line,
+  `# stack log <generation>`, the generation 128 random bits: the file is made under
+  `<service>.log.new`, headed, and only then renamed into place, so no file of this writer is
+  ever seen without one (an empty file found in its place is headed first); readers skip it. A
+  cursor (log file device, inode and generation, byte offset after the last whole record, and a
+  check of that record: FNV-1a of its length and first 64 bytes) lets `logs --cursor`, MCP
+  `stack_logs` and `logs --follow` read only what was written since, following one rotation and
+  reporting a `gap` for output rotated away or truncated, with no compile and no re-read window.
+  A file is the cursor's only if it shows it: same device and inode, same generation, and the
+  same record before the offset (a log file is only appended to, so that never changes). A file
+  on a recycled inode has another generation, so the read reports `rotated` and returns the
+  oldest file kept; one of the same generation cut by hand (shorter, or another record there),
+  or whose header was cut away, is `truncated` and read again from its start. Files an older
+  writer made have no header: the record check alone tells them apart (a file holding the same
+  record at that offset cannot be told from the cursor's, and one shorter than the cursor is
+  taken for it truncated, as before). A `v1` cursor (device, inode, offset) shows nothing: it
+  reads the oldest file kept from its start, reporting `rotated`. A read that ends at the end of
+  the rotated file returns the start of the newer one, the same place, so a rotation after it
+  costs nothing. A record
+  in the newer file that the rest of a read's byte budget cannot hold is left for the next read,
+  whole; only a record longer than a whole read's budget is ever returned cut.
   The pipes end with the supervisor: a service that writes after its supervisor died gets
   `SIGPIPE` (or `EPIPE`) and may exit. `logs <service> --tail N` reads the supervisor's
   `logs/<service>.log` (and the one older rotated file), at most its last 1 MiB, never following. `--since-start` keeps lines
@@ -671,7 +727,9 @@ output (mise's answer when no release matches) is an error, not a version.
   SIGINT, SIGTERM and SIGHUP on to the process group of every command running then. For a
   user's command (`exec`, `run`, MCP calls) Stack then goes on waiting, kills the group 10 seconds
   after the first signal or at the second, and reports the command once it is done; the MCP
-  server then answers the call and exits with 128 + the signal. A service's `setup` is run the
+  server then answers the call and exits with 128 + the signal; no call waiting to start is
+  admitted after the signal, by a call ending, roots arriving or input ending alike (a batch
+  such a call was in is owed nothing more for it). A service's `setup` is run the
   same way, and the signal cancels the start whatever the setup's exit status: `up` and
   `restart` run no later setup, request nothing more, and fail `cancelled`. A signal that comes
   as the command exits, too late to reach it, is still owed. The handler only records a
@@ -703,7 +761,10 @@ output (mise's answer when no release matches) is an error, not a version.
   copy and replace only the data directory recorded for the checkout (held as `gc
   --reclaim-data` holds it), only while its service and its dependents are confirmed stopped,
   keyed by the Git common directory, and restore by exchanging a complete sibling copy into
-  place, then bind the record to the new directory. The instance check compares the server's
+  place through the held directory, every service or none (a journal lets a failure or crash
+  be undone, judged by which directory is where, before it commits), then write the init
+  markers in one write and bind the record to the new directories. Restored data carries the
+  init state it was saved with (done, failed with the tasks completed, or none). The instance check compares the server's
   reported directory (from `-D`/`--dir`, not stored in the data) with the supervisor's, so
   restored data verifies as the restoring checkout's. See [service data](user/data.md).
 - **Partial failure.** `up` returns completed steps, whether services may have been started
@@ -713,10 +774,22 @@ output (mise's answer when no release matches) is an error, not a version.
 
 `git+<url>?ref=[&dir=<subdir>]` pins a commit (other parameters are rejected); `oci:<registry>/<repo>:<tag>` pins a manifest digest; `path:` pins
 a content hash. A bundle's content hash is identical across transports (deterministic archives).
+Every transport holds a bundle to one rule: regular files and directories with UTF-8 names, `.git`
+and `.stack` excluded. Hashing refuses a symbolic link or special file anywhere in the tree
+(`bundle_invalid`) instead of skipping it, so nothing is readable through a bundle that its hash
+does not cover; `bundle.toml` is read only as a regular file, OCI layers carrying excluded
+directories are refused at extraction, and each `paths.bin` entry must name a real directory
+inside the bundle (no `..`, absolute path, link or excluded directory), checked when the bundle
+is loaded and again when it is composed.
 OCI bundles are artifacts (`application/vnd.stack.bundle.v1`) with one deterministic tar.gz layer.
 
-OCI authorization is scoped to the original registry origin. Bearer token realms must share
-that origin or appear explicitly in `STACK_OCI_AUTH_REALMS`. HTTP is allowed for exact loopback
+OCI credentials (`STACK_OCI_USERNAME` / `STACK_OCI_PASSWORD`) are bound to the one origin the
+operator names in `STACK_OCI_REGISTRY` (scheme, host and effective port). They are offered only
+when that origin challenges a request for a reference naming it; references, redirects and
+challenges cannot widen the scope, other registries are reached anonymously, and credentials
+without a valid binding fail closed (`oci_credentials_unbound`). Authorization is scoped to the
+original registry origin. Bearer token realms must share that origin or appear explicitly, as
+origins, in `STACK_OCI_AUTH_REALMS`. HTTP is allowed for exact loopback
 hosts or the explicit development opt-in `STACK_OCI_PLAIN_HTTP=1` (exactly `1`; empty, `0` or
 `false` keep HTTPS); an HTTPS origin can never downgrade to HTTP. Token
 requests do not follow redirects, and upload/registry redirects do not receive another origin's

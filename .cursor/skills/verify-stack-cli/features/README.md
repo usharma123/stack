@@ -6,3 +6,5 @@ Follow the launch, doctor, evidence, and cleanup instructions in [the skill](../
 - [Service identity](service-identity.md)
 - [Leases](leases.md)
 - [MCP](mcp.md)
+- [Port isolation](port-isolation.md)
+- [Run and logs](run-and-logs.md)

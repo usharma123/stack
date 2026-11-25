@@ -24,6 +24,12 @@ test('promotion accepts only push CI from main in this repository at the exact c
   ]) assert.throws(() => selectRun([{ ...run, ...mutation }], commit), /No eligible CI/);
 });
 
+test('the selected run ID is a positive integer before it reaches a workflow output', () => {
+  for (const id of ['42\nartifact-id=1', 0, -1, 4.2, 2 ** 53]) {
+    assert.throws(() => selectRun([{ ...run, id }], commit), /Invalid run ID/, String(id));
+  }
+});
+
 test('latest run must pass; never fall back to an older success', () => {
   for (const mutation of [{ status: 'in_progress', conclusion: null },
     { conclusion: 'failure' }, { conclusion: 'cancelled' }, { conclusion: 'skipped' }]) {

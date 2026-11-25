@@ -105,8 +105,42 @@ impl Supervisor {
         assert!(gone_soon(pid));
     }
 
+    /// The state, `Null` when it is not a regular file holding one (never opening a FIFO).
     fn state(&self) -> Value {
-        fs::read(self.path().join("state.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+        let path = self.path().join("state.json");
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            return Value::Null;
+        }
+        fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(self.path().join("supervisor.log")).unwrap_or_default()
+    }
+
+    /// Wait (up to `secs`) until the supervisor's log holds `text`.
+    fn until_logged(&self, secs: u64, text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let log = self.log();
+            if log.contains(text) {
+                return log;
+            }
+            assert!(Instant::now() < deadline, "never logged {text:?}: {log}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until no supervisor holds the directory's lock (one holds it for life).
+    fn until_no_supervisor(&self) {
+        use std::os::fd::AsRawFd;
+        let lock = fs::File::open(self.path().join("lock")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // SAFETY: flock on a descriptor this function owns.
+        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            assert!(Instant::now() < deadline, "a supervisor still holds the lock");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Wait (up to `secs`) until `done` holds for the state.
@@ -338,12 +372,14 @@ fn output_is_kept_per_service_with_when_each_line_was_read() {
     sup.start();
     let log = sup.path().join("logs/talk.log");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while fs::read_to_string(&log).map_or(true, |t| t.lines().count() < 2) {
+    // The file begins with its header (its generation), then a record per line.
+    while fs::read_to_string(&log).map_or(true, |t| t.lines().count() < 3) {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(10));
     }
     let text = fs::read_to_string(&log).unwrap();
-    let mut lines: Vec<(u128, &str)> = text.lines().map(|l| l.split_once(' ').map(|(t, r)| (t.parse().unwrap(), r)).unwrap()).collect();
+    assert!(text.starts_with("# stack log ") && text.lines().next().unwrap().len() == 44, "{text}");
+    let mut lines: Vec<(u128, &str)> = text.lines().skip(1).map(|l| l.split_once(' ').map(|(t, r)| (t.parse().unwrap(), r)).unwrap()).collect();
     lines.sort_by_key(|(_, l)| *l);
     assert_eq!(lines.iter().map(|(_, l)| *l).collect::<Vec<_>>(), ["err", "out"]);
     assert!(lines.iter().all(|(t, _)| *t >= before), "{text}");
@@ -439,31 +475,150 @@ fn a_readiness_probe_is_killed_with_its_group_when_its_service_stops_and_shutdow
 
 // ---- publishing the state (council item 3) ---------------------------------------------------
 
+/// Make the running supervisor's next publication fail, once it started over a valid record and
+/// published its own: a directory replaces `state.json` (a rename cannot replace one), and a
+/// change it must record (a new revision) makes it publish again. The supervisor's pid.
+fn fail_publication(sup: &Supervisor, services: Value) -> u32 {
+    let supervisor = sup.supervisor_pid();
+    let state = sup.path().join("state.json");
+    fs::remove_file(&state).unwrap();
+    fs::create_dir(&state).unwrap();
+    // `spec` tells only the supervisor a state names, and none does now.
+    sup.spec(services, false);
+    unsafe { libc::kill(supervisor as i32, libc::SIGHUP) };
+    supervisor
+}
+
 #[test]
 fn services_are_stopped_when_their_record_cannot_be_published() {
     let sup = Supervisor::new();
-    fs::create_dir_all(sup.path().join("state.json")).unwrap();
-    sup.spec(json!({ "a": sup.service("echo $$ >\"$OUT/a\"; exec sleep 600") }), false);
-    sup.start();
+    let services = json!({ "a": sup.service("echo $$ >\"$OUT/a\"; exec sleep 600") });
+    sup.spec(services.clone(), false);
+    sup.start_logged();
+    let state = sup.until(5, "a runs and is published", |s| s["services"]["a"]["status"] == "running");
     let a = sup.file_pid("a");
+    assert_eq!(state["services"]["a"]["process"]["pid"].as_u64(), Some(u64::from(a)));
+    let supervisor = fail_publication(&sup, services);
+    sup.until_logged(5, "cannot write");
     // Nothing may run that no record names for long.
     assert!(gone_soon(a), "a service ran with no record of it");
-    let log = fs::read_to_string(sup.path().join("supervisor.log")).unwrap_or_default();
-    let _ = log;
+    assert!(gone_soon(supervisor), "the supervisor outlived its services");
+    let log = sup.log();
+    assert!(log.contains("stopping every service"), "{log}");
+    assert!(sup.path().join("state.json").is_dir(), "the directory was replaced");
 }
 
 #[test]
 fn a_record_that_could_not_be_written_is_written_once_it_can_be() {
     let sup = Supervisor::new();
-    fs::create_dir_all(sup.path().join("state.json")).unwrap();
-    sup.spec(json!({ "a": sup.service("echo $$ >\"$OUT/a\"; exec sleep 600") }), false);
-    sup.start();
+    let services = json!({ "a": sup.service("echo $$ >\"$OUT/a\"; exec sleep 600") });
+    sup.spec(services.clone(), false);
+    sup.start_logged();
+    sup.until(5, "a runs", |s| s["services"]["a"]["status"] == "running");
     let a = sup.file_pid("a");
+    fail_publication(&sup, services);
+    sup.until_logged(5, "cannot write");
     fs::remove_dir(sup.path().join("state.json")).unwrap();
-    let state = sup.until(3, "the record is published once it can be", |s| s["services"]["a"]["process"]["pid"].as_u64() == Some(u64::from(a)));
+    let state = sup.until(3, "the record is published once it can be", |s| s["applied"] == 2 && s["services"]["a"]["process"]["pid"].as_u64() == Some(u64::from(a)));
     assert_eq!(state["services"]["a"]["status"], "running");
     sup.shutdown();
     assert!(!alive(a));
+}
+
+/// Put `kind` (`directory`, `fifo`, or `symlink` to `target`) at `path`, in place of anything.
+fn plant(path: &std::path::Path, kind: &str, target: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => fs::remove_dir(path).unwrap(),
+        Ok(_) => fs::remove_file(path).unwrap(),
+        Err(_) => {}
+    }
+    match kind {
+        "directory" => fs::create_dir(path).unwrap(),
+        "fifo" => {
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        "symlink" => std::os::unix::fs::symlink(target, path).unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+/// What kind of file is at `path`, without following a link or opening a FIFO.
+fn kind_at(path: &std::path::Path) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    let t = fs::symlink_metadata(path).ok()?.file_type();
+    Some(if t.is_dir() {
+        "directory"
+    } else if t.is_fifo() {
+        "fifo"
+    } else if t.is_symlink() {
+        "symlink"
+    } else {
+        "file"
+    })
+}
+
+#[test]
+fn a_supervisor_starts_nothing_over_a_record_that_is_not_a_regular_file() {
+    for record in ["state.json", "spec.json"] {
+        for kind in ["directory", "fifo", "symlink"] {
+            let what = format!("{record} as a {kind}");
+            let sup = Supervisor::new();
+            sup.spec(json!({ "a": sup.service("echo started > \"$OUT/a.ran\"; exec sleep 600") }), false);
+            let path = sup.path().join(record);
+            // What a link points to is a record this Stack reads (the spec asking for `a`, or a
+            // state naming nothing): only not following it keeps it from being taken.
+            let elsewhere = sup.dir.path().join("elsewhere.json");
+            if record == "spec.json" {
+                fs::copy(&path, &elsewhere).unwrap();
+            } else {
+                fs::write(&elsewhere, json!({ "applied": 0, "services": {}, "token": sup.token() }).to_string()).unwrap();
+            }
+            plant(&path, kind, &elsewhere);
+            sup.start_logged();
+            let log = sup.until_logged(10, "nothing was started");
+            assert!(log.contains("not a regular file"), "{what}: {log}");
+            sup.until_no_supervisor();
+            assert!(!sup.dir.path().join("a.ran").exists(), "{what}: a service started");
+            assert_eq!(kind_at(&path), Some(kind), "{what}: the record was replaced");
+            if record == "spec.json" {
+                assert_eq!(kind_at(&sup.path().join("state.json")), None, "{what}: a state was written");
+            }
+            // Nothing but its lock, its (empty) log directory and its log was made.
+            let mut made: Vec<String> = fs::read_dir(sup.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != "spec.json" && n != "state.json").collect();
+            made.sort();
+            assert_eq!(made, ["lock", "logs", "supervisor.log"], "{what}");
+            assert_eq!(fs::read_dir(sup.path().join("logs")).unwrap().count(), 0, "{what}: a service log was opened");
+        }
+    }
+}
+
+#[test]
+fn a_spec_replaced_by_what_is_not_a_regular_file_while_services_run_is_not_read_and_hangs_nothing() {
+    for kind in ["fifo", "directory", "symlink"] {
+        let sup = Supervisor::new();
+        let services = json!({ "a": sup.service("exec sleep 600") });
+        sup.spec(services.clone(), false);
+        sup.start_logged();
+        sup.until(5, "a runs", |s| s["services"]["a"]["status"] == "running");
+        let (supervisor, a) = (sup.supervisor_pid(), sup.pid("a").unwrap());
+        // A link points to a shutdown, which would stop `a` were it followed.
+        let elsewhere = sup.dir.path().join("elsewhere.json");
+        fs::write(&elsewhere, json!({ "revision": 9, "shutdown": true, "token": sup.token(), "services": {} }).to_string()).unwrap();
+        let path = sup.path().join("spec.json");
+        plant(&path, kind, &elsewhere);
+        sup.wake();
+        sup.until_logged(5, "keeping the last spec read");
+        thread::sleep(Duration::from_millis(300));
+        assert!(alive(a) && alive(supervisor), "{kind}: stopped on what it could not read");
+        assert_eq!(sup.state()["services"]["a"]["status"], "running", "{kind}");
+        // Still answering: a readable shutdown stops everything.
+        plant(&path, "directory", &elsewhere);
+        fs::remove_dir(&path).unwrap();
+        sup.shutdown();
+        assert!(!alive(a), "{kind}");
+    }
 }
 
 // ---- start requests a running service satisfied (council item 5) ---------------------------
@@ -611,9 +766,53 @@ fn one_writer_rotates_a_services_log_and_keeps_the_older_file() {
     let older = sup.path().join("logs/loud.log.1");
     let (now, before) = (fs::metadata(&log).unwrap().len(), fs::metadata(&older).unwrap().len());
     assert!(before > 16 * 1024 * 1024 && now < before, "{now} {before}");
-    // Every line went to one of the two files, none twice.
-    let lines = fs::read_to_string(&log).unwrap().lines().count() + fs::read_to_string(&older).unwrap().lines().count();
-    assert_eq!(lines, 20001);
+    // Every line went to one of the two files, none twice, each file under a header of its own.
+    let (text, older_text) = (fs::read_to_string(&log).unwrap(), fs::read_to_string(&older).unwrap());
+    let header = |t: &str| t.lines().next().filter(|h| h.starts_with("# stack log ")).map(str::to_string);
+    assert!(header(&text).is_some() && header(&older_text).is_some() && header(&text) != header(&older_text));
+    assert_eq!(text.lines().count() + older_text.lines().count(), 20001 + 2);
+    sup.shutdown();
+}
+
+#[test]
+fn a_cursor_reads_a_flooding_rotating_log_once_through_repeats_included() {
+    let sup = Supervisor::new();
+    // About 30 MB, one rotation: each line twice (the same text), numbered by pair.
+    sup.spec(json!({ "loud": sup.service(r#""$PY" -c 'import sys; [sys.stdout.write("%06d" % (i // 2) + "x" * 994 + "\n") for i in range(30000)]; sys.stdout.flush()'; echo done; exec sleep 600"#) }), false);
+    sup.start();
+    let log = sup.path().join("logs/loud.log");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // A cursor at the start of the first file, as soon as there is one.
+    let mut pos = loop {
+        assert!(Instant::now() < deadline, "no log");
+        // Already rotated (a slow machine): its first file is the older one.
+        if let Some(p) = stack::supervisor::log_start(&sup.path(), "loud").unwrap() {
+            break p;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "the output never reached the log: {} lines", lines.len());
+        let read = stack::supervisor::read_after(&sup.path(), "loud", pos, 10_000, stack::supervisor::LOGS_LIMIT).unwrap();
+        assert_eq!(read.gap, None, "one rotation never loses a line");
+        assert!(read.records.iter().all(|r| r.at_ms > 0), "every line stamped");
+        lines.extend(read.records.into_iter().map(|r| r.line));
+        pos = read.pos.unwrap();
+        if lines.last().is_some_and(|l| l == "done") {
+            break;
+        }
+        if !read.more {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    assert!(sup.path().join("logs/loud.log.1").exists(), "it rotated");
+    assert_eq!(lines.len(), 30001);
+    for (i, line) in lines[..30000].iter().enumerate() {
+        assert!(line.starts_with(&format!("{:06}x", i / 2)) && line.len() == 1000, "line {i}: {}", &line[..12.min(line.len())]);
+    }
+    let text = fs::read_to_string(&log).unwrap() + &fs::read_to_string(sup.path().join("logs/loud.log.1")).unwrap();
+    assert!(!text.contains("[stack]"), "nothing was dropped while the writer kept up");
     sup.shutdown();
 }
 
@@ -717,4 +916,42 @@ time.sleep(600)
     sup.start();
     sup.until(5, "after runs", |s| s["services"]["after"]["status"] == "running");
     sup.shutdown();
+}
+
+#[test]
+fn a_supervisor_never_starts_over_a_state_a_newer_stack_wrote() {
+    let sup = Supervisor::new();
+    fs::create_dir_all(sup.path()).unwrap();
+    let newer = json!({ "schema_version": 99, "applied": 4, "services": {}, "token": sup.token() }).to_string();
+    fs::write(sup.path().join("state.json"), &newer).unwrap();
+    sup.spec(json!({ "a": sup.service("echo started > \"$OUT/a.ran\"; exec sleep 600") }), false);
+    sup.start_logged();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(!sup.dir.path().join("a.ran").exists(), "a service started");
+    assert_eq!(fs::read_to_string(sup.path().join("state.json")).unwrap(), newer, "the record was written over");
+    let log = fs::read_to_string(sup.path().join("supervisor.log")).unwrap();
+    assert!(log.contains("written by a newer Stack") && log.contains("nothing was started"), "{log}");
+}
+
+#[test]
+fn a_supervisor_never_starts_over_a_state_it_may_not_read() {
+    // Root reads a file whatever its mode: nothing to show there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let sup = Supervisor::new();
+    fs::create_dir_all(sup.path()).unwrap();
+    let record = json!({ "applied": 4, "services": {}, "token": sup.token() }).to_string();
+    let state = sup.path().join("state.json");
+    fs::write(&state, &record).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    sup.spec(json!({ "a": sup.service("echo started > \"$OUT/a.ran\"; exec sleep 600") }), false);
+    sup.start_logged();
+    thread::sleep(Duration::from_millis(1500));
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!sup.dir.path().join("a.ran").exists(), "a service started");
+    assert_eq!(fs::read_to_string(&state).unwrap(), record, "the record was written over");
+    let log = fs::read_to_string(sup.path().join("supervisor.log")).unwrap();
+    assert!(log.contains("nothing was started"), "{log}");
 }

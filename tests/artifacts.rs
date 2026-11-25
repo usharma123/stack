@@ -671,11 +671,13 @@ fn sidecars_are_stripped_unsupported_and_never_rendered() {
 
 #[test]
 fn several_releases_of_one_tool_and_unknown_provider_fields_survive() {
-    let sb = Sandbox::new("[services.a]\npreset = \"postgres\"\nversion = \"17.6\"\n[services.b]\npreset = \"postgres\"\nversion = \"16.4\"\n[lock]\nplatforms = [\"linux-x64\"]\n");
+    // One release through a preset service, another as a tool: a stack has at most one
+    // Postgres service (`invalid_service`), but may still pin several releases of its tool.
+    let sb = Sandbox::new("[services.a]\npreset = \"postgres\"\nversion = \"17.6\"\n[tools]\npostgres = \"16.4\"\n[lock]\nplatforms = [\"linux-x64\"]\n");
     sb.compile(Mode::UseLock).unwrap();
     let embedded = sb.embedded();
     let versions: Vec<&str> = embedded["tools"]["postgres"].as_array().unwrap().iter().map(|e| e["version"].as_str().unwrap()).collect();
-    assert_eq!(versions, ["17.6", "16.4"]);
+    assert_eq!(versions, ["16.4", "17.6"]);
     let config: Table = toml::from_str(&sb.mise.calls()[0].config).unwrap();
     assert_eq!(config["tools"]["postgres"].as_array().unwrap().len(), 2);
     // A field stack does not know, on a committed entry, survives an ordinary compile that
@@ -683,7 +685,7 @@ fn several_releases_of_one_tool_and_unknown_provider_fields_survive() {
     let text = fs::read_to_string(sb.root().join("stack.lock")).unwrap();
     let text = text.replacen("backend = \"conda:postgresql\"", "backend = \"conda:postgresql\"\nfuture_field = \"kept\"", 1);
     fs::write(sb.root().join("stack.lock"), text).unwrap();
-    sb.write("[services.a]\npreset = \"postgres\"\nversion = \"17.6\"\n[services.b]\npreset = \"postgres\"\nversion = \"16.4\"\n[lock]\nplatforms = [\"linux-x64\", \"linux-arm64\"]\n");
+    sb.write("[services.a]\npreset = \"postgres\"\nversion = \"17.6\"\n[tools]\npostgres = \"16.4\"\n[lock]\nplatforms = [\"linux-x64\", \"linux-arm64\"]\n");
     sb.compile(Mode::UseLock).unwrap();
     assert_eq!(sb.embedded()["tools"]["postgres"][0]["future_field"].as_str(), Some("kept"));
     assert!(sb.rendered().contains("future_field = \"kept\""));

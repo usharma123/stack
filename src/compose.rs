@@ -9,7 +9,8 @@ use crate::tool::{self, ToolSpec};
 use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 pub const BUNDLE_DIR_VAR: &str = "{{bundle_dir}}";
 
@@ -83,16 +84,51 @@ impl LoadedBundle {
             service.watch.iter_mut().for_each(expand);
         }
         for bin in &manifest.paths.bin {
-            let path = dir.join(bin);
-            if !path.is_dir() || !path.starts_with(&dir) {
-                return Err(StackError::new(
-                    "missing_path",
-                    format!("{origin} declares paths.bin '{bin}' but it is not a directory in the bundle"),
-                ));
-            }
+            bin_dir(&dir, bin, &origin)?;
         }
         Ok(Self { manifest, dir })
     }
+}
+
+/// `paths.bin` entry `bin` as a directory of the bundle at `dir`, whose content the bundle's hash
+/// covers: a relative path of plain names, none of them `..` or a directory the hash excludes
+/// (`.git`, `.stack`), each a real directory rather than a symbolic link. Checked on the tree as
+/// it is, so neither spelling nor a link can put a directory outside the bundle on PATH.
+fn bin_dir(dir: &Path, bin: &str, origin: &str) -> Result<()> {
+    let escapes = |why: &str| {
+        StackError::new("bundle_invalid", format!("{origin} declares paths.bin '{bin}', which {why}"))
+            .hint("name a directory inside the bundle by a relative path, e.g. paths.bin = [\"bin\"]")
+    };
+    let mut path = dir.to_path_buf();
+    let mut named = false;
+    for part in Path::new(bin).components() {
+        match part {
+            Component::CurDir => continue,
+            Component::Normal(name) if crate::hash::excluded(name) => {
+                return Err(escapes(&format!("is inside {}, which is not bundle content", name.to_string_lossy())))
+            }
+            Component::Normal(name) => path.push(name),
+            Component::ParentDir => return Err(escapes("leaves the bundle through '..'")),
+            Component::RootDir | Component::Prefix(_) => return Err(escapes("is not a relative path")),
+        }
+        named = true;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(escapes(&format!("passes through the symbolic link {}", path.display())))
+            }
+            Ok(meta) if meta.is_dir() => {}
+            _ => {
+                return Err(StackError::new(
+                    "missing_path",
+                    format!("{origin} declares paths.bin '{bin}' but it is not a directory in the bundle"),
+                ))
+            }
+        }
+    }
+    if !named {
+        return Err(escapes("names the bundle root rather than a directory in it"));
+    }
+    Ok(())
 }
 
 pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Composed> {
@@ -108,8 +144,11 @@ pub fn compose(bundles: &[LoadedBundle], project: &ProjectManifest) -> Result<Co
         merge("services", &mut out.services, &services, &origin, &mut conflicts);
         merge("init", &mut out.init, &init, &origin, &mut conflicts);
         merge("tasks", &mut out.tasks, &b.manifest.tasks, &origin, &mut conflicts);
-        out.bin_paths
-            .extend(b.manifest.paths.bin.iter().map(|p| b.dir.join(p)));
+        for bin in &b.manifest.paths.bin {
+            // Checked again here: compose may run long after the bundle was loaded.
+            bin_dir(&b.dir, bin, &origin)?;
+            out.bin_paths.push(b.dir.join(bin));
+        }
     }
 
     for (name, service) in &project.services {
@@ -295,4 +334,73 @@ fn validate_task_services(out: &Composed) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn manifest(bin: &[&str]) -> BundleManifest {
+        let bin: Vec<String> = bin.iter().map(|b| format!("{b:?}")).collect();
+        toml::from_str(&format!("[bundle]\nname = 'b'\n[paths]\nbin = [{}]\n", bin.join(", "))).unwrap()
+    }
+
+    /// A bundle directory (canonical, as fetched) with `bin/`, `tools/bin/` and a file, beside a
+    /// directory outside it.
+    fn layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().canonicalize().unwrap().join("bundle");
+        let outside = root.path().canonicalize().unwrap().join("outside");
+        for d in [bundle.join("bin"), bundle.join("tools/bin"), outside.clone(), bundle.join(".stack/bin"), bundle.join(".git/hooks")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(bundle.join("file"), "x").unwrap();
+        symlink(&outside, bundle.join("out")).unwrap();
+        symlink("tools", bundle.join("alias")).unwrap();
+        (root, bundle, outside)
+    }
+
+    #[test]
+    fn bin_paths_inside_the_bundle_are_kept() {
+        let (_root, bundle, _) = layout();
+        let loaded = LoadedBundle::new(manifest(&["bin", "./tools/bin", "tools/./bin"]), bundle.clone()).unwrap();
+        let stack = compose(&[loaded], &ProjectManifest::default()).unwrap();
+        assert_eq!(stack.bin_paths, [bundle.join("bin"), bundle.join("./tools/bin"), bundle.join("tools/./bin")]);
+    }
+
+    #[test]
+    fn bin_paths_cannot_leave_the_bundle_or_reach_unhashed_content() {
+        let (_root, bundle, outside) = layout();
+        let outside_name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        for (bin, code, why) in [
+            (format!("../{outside_name}"), "bundle_invalid", "'..'"),
+            (format!("bin/../../{outside_name}"), "bundle_invalid", "'..'"),
+            ("bin/..".to_string(), "bundle_invalid", "'..'"),
+            (outside.display().to_string(), "bundle_invalid", "not a relative path"),
+            ("out".to_string(), "bundle_invalid", "symbolic link"),
+            ("alias/bin".to_string(), "bundle_invalid", "symbolic link"),
+            (".stack/bin".to_string(), "bundle_invalid", "not bundle content"),
+            ("tools/.git".to_string(), "bundle_invalid", "not bundle content"),
+            (".git/hooks".to_string(), "bundle_invalid", "not bundle content"),
+            (".".to_string(), "bundle_invalid", "bundle root"),
+            ("".to_string(), "bundle_invalid", "bundle root"),
+            ("missing".to_string(), "missing_path", "not a directory"),
+            ("file".to_string(), "missing_path", "not a directory"),
+        ] {
+            let err = LoadedBundle::new(manifest(&[&bin]), bundle.clone()).err().unwrap_or_else(|| panic!("{bin:?} was accepted"));
+            assert_eq!(err.code, code, "{bin:?}: {}", err.message);
+            assert!(err.message.contains(why), "{bin:?}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn compose_rechecks_bin_paths_that_changed_after_loading() {
+        let (_root, bundle, outside) = layout();
+        let loaded = LoadedBundle::new(manifest(&["bin"]), bundle.clone()).unwrap();
+        fs::remove_dir(bundle.join("bin")).unwrap();
+        symlink(&outside, bundle.join("bin")).unwrap();
+        let err = compose(&[loaded], &ProjectManifest::default()).unwrap_err();
+        assert_eq!(err.code, "bundle_invalid", "{}", err.message);
+    }
 }

@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 
 const overrides = ['STACK_STATE_DIR', 'STACK_CACHE_DIR', 'PITCHFORK_STATE_DIR', 'PITCHFORK_CONFIG_DIR',
   'PITCHFORK_LOGS_DIR', 'MISE_CONFIG_FILE', 'MISE_DATA_DIR', 'MISE_STATE_DIR', 'MISE_CACHE_DIR', 'MISE_CONFIG_DIR',
@@ -52,3 +52,460 @@ test('native runner isolates every override before any Stack or mise invocation'
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A scratch e2e environment: STACK_E2E_* naming fresh directories, with `stack` on PATH being the
+// shell script given (run with the arguments it was called with).
+function e2eFixture(stackScript) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-e2e-bound-'));
+  for (const sub of ['bin', 'w', 't']) mkdirSync(path.join(dir, sub));
+  writeFileSync(path.join(dir, 'bin', 'stack'), `#!/usr/bin/env bash\n${stackScript}\n`, { mode: 0o755 });
+  const env = {
+    ...process.env,
+    STACK_E2E_BIN: path.join(dir, 'bin'), STACK_E2E_WORK: path.join(dir, 'w'), STACK_E2E_TMP: path.join(dir, 't'),
+    STACK_E2E_ASSERT: path.resolve('tests/e2e/assert.sh'), STACK_E2E_WAIT_SECONDS: '2',
+  };
+  return { dir, env };
+}
+
+// Whether a process with this PID exists.
+function exists(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+
+// Whether the file lists PIDs (each line's first word) and every one is gone.
+function allGone(file) {
+  const pids = existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => Number(line.split(' ')[0])) : [];
+  return pids.length > 0 && pids.every(pid => Number.isInteger(pid) && pid > 0 && !exists(pid));
+}
+
+// A client that ignores both its input's end and TERM, and first appends its PID and start time
+// to the file, as `record_pid` does.
+const stalledClient = (file) => `bash -c 'trap "" TERM; echo $$ $(ps -o lstart= -p $$) >>${file}; while :; do sleep 0.2; done'`;
+
+// Run BODY in bash after sourcing assert.sh, with a `diagnose` that prints DIAGNOSIS.
+function probeIn(env, body) {
+  return spawnSync('bash', ['-c', `source "$STACK_E2E_ASSERT"; diagnose() { echo DIAGNOSIS; }; ${body}`],
+    { encoding: 'utf8', env, timeout: 30000 });
+}
+
+// Resolve once the file exists, or reject after the limit.
+async function appeared(file, ms = 10000) {
+  for (const deadline = Date.now() + ms; Date.now() < deadline; await new Promise(r => setTimeout(r, 50))) {
+    if (existsSync(file) && readFileSync(file, 'utf8').includes('\n')) return;
+  }
+  throw new Error(`${file} never appeared`);
+}
+
+test('within and eventually stop a stalled client, show the diagnosis and fail within their bound', () => {
+  const { dir, env } = e2eFixture('exit 0');
+  try {
+    const pids = path.join(dir, 'stalled.pids');
+    const stalled = stalledClient(pids);
+    const probe = (body) => probeIn(env, body);
+    const started = Date.now();
+    let result = probe(`within 1 ${stalled} </dev/null; echo unreachable`);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /DIAGNOSIS[\s\S]*FAIL: still running after 1s, stopped: bash -c/);
+    assert.doesNotMatch(result.stdout, /unreachable/);
+    assert.ok(Date.now() - started < 10000, 'within outlived its bound');
+    assert.ok(allGone(pids), 'the stalled client survived');
+
+    result = probe(`eventually 1 'the file appeared' test -e ${path.join(dir, 'never')}`);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /DIAGNOSIS[\s\S]*FAIL: the file appeared \(not within 1s\)/);
+
+    // Within its bound a command keeps its input, output and status.
+    result = probe(`out=$(echo in | within 5 cat); [[ $out == in ]] || exit 9; within 5 sh -c 'exit 3' || echo "status $?"`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'status 3\n');
+
+    // A refusal run under `within` is checked quietly: no ERR-trap report from its failing return.
+    result = probe(`expect_error usage within 5 sh -c 'echo "{\\"ok\\":false,\\"error\\":{\\"code\\":\\"usage\\"}}"; exit 2'`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, '');
+
+    // Whatever way a scenario ends, what it tracked is stopped, and its exit status kept.
+    const tracked = path.join(dir, 'tracked.pids');
+    result = probe(`${stalledClient(tracked)} & track $!; track_pids ${tracked}; sleep 0.5; exit 7`);
+    assert.equal(result.status, 7);
+    assert.ok(allGone(tracked), 'a tracked process outlived the scenario');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('scenario 15 stops an MCP server that never finishes after its input ends, and reports it', () => {
+  // compile and install succeed; mcp ignores its input's end and TERM.
+  const { dir, env } = e2eFixture(`case "$1" in mcp) trap '' TERM; echo $$ >>"$STACK_E2E_TMP/fake.pids"; while :; do sleep 0.2; done ;; esac`);
+  try {
+    const started = Date.now();
+    const result = spawnSync('bash', ['tests/e2e/15-mcp-eof.sh'], { encoding: 'utf8', env: { ...env, STACK_E2E_MCP_SECONDS: '2' }, timeout: 60000 });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /--- .*mcp-order[\s\S]*FAIL: still running after 2s, stopped: stack mcp/);
+    assert.ok(Date.now() - started < 30000, 'the scenario outlived its bound');
+    assert.ok(allGone(path.join(dir, 't', 'fake.pids')), 'the stalled server survived the scenario');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('scenario 14 stops a stalled run call and reports it', () => {
+  // compile and up succeed with one ready service; run ignores TERM and never ends.
+  const { dir, env } = e2eFixture(`case "$1" in
+  up) mkdir -p .stack; printf '{"provider":{"state_dir":"%s"}}' "$PWD/.stack" >.stack/session.json
+      echo '{"ok":true,"data":{"checks":[{"service":"talk","ready":true,"port":9}]}}' ;;
+  run) trap '' TERM; echo $$ >>"$STACK_E2E_TMP/fake.pids"; while :; do sleep 0.2; done ;;
+esac`);
+  try {
+    const started = Date.now();
+    const result = spawnSync('bash', ['tests/e2e/14-run-logs-cursor.sh'], { encoding: 'utf8', env: { ...env, STACK_E2E_CALL_SECONDS: '2' }, timeout: 60000 });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /FAIL: still running after 2s, stopped: stack run args --timeout 3 --json -q x/);
+    assert.ok(Date.now() - started < 30000, 'the scenario outlived its bound');
+    assert.ok(allGone(path.join(dir, 't', 'fake.pids')), 'the stalled call survived the scenario');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('within forgets a client once it ends, and stop_child ends one that ignores TERM', () => {
+  const { dir, env } = e2eFixture('exit 0');
+  try {
+    // A client that ended, successfully or not, is no longer tracked.
+    let result = probeIn(env, `within 5 true; within 5 sh -c 'exit 3' || true; out=$(within 5 true); ls -A "$E2E_TRACKED"; echo end`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'end\n');
+
+    // stop_child sends TERM, then KILL, collects the child and forgets it, within its grace.
+    const pids = path.join(dir, 'child.pids');
+    const started = Date.now();
+    result = probeIn(env, `${stalledClient(pids)} & child=$!; track $child
+      until [[ -s ${pids} ]]; do sleep 0.1; done
+      stop_child $child
+      if alive $child "$(started $child)"; then echo survived; fi
+      ls -A "$E2E_TRACKED"; echo end`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, 'end\n');
+    assert.ok(Date.now() - started < 10000, 'stop_child outlived its grace');
+    assert.ok(allGone(pids), 'the child that ignores TERM survived');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cleanup signals a recorded PID only while the same process holds it', () => {
+  const { dir, env } = e2eFixture('exit 0');
+  // A scratch process standing in for one that took a PID after a tracked process ended.
+  const bystander = spawn('sleep', ['60'], { stdio: 'ignore' });
+  try {
+    const recorded = path.join(dir, 'recorded.pids');
+    const stale = 'Thu Jan 1 00:00:00 1970';
+    writeFileSync(recorded, `${bystander.pid} ${stale}\n`);
+    const result = probeIn(env, `${stalledClient(recorded)} & track_pids ${recorded}
+      track ${bystander.pid}; echo '${stale}' >"$E2E_TRACKED/${bystander.pid}"
+      until [[ $(wc -l <${recorded}) -ge 2 ]]; do sleep 0.1; done; exit 5`);
+    assert.equal(result.status, 5, result.stderr);
+    const stalled = Number(readFileSync(recorded, 'utf8').trim().split('\n')[1].split(' ')[0]);
+    assert.ok(!exists(stalled), 'the recorded process survived');
+    assert.ok(exists(bystander.pid), 'cleanup signalled a process that took a recorded PID');
+  } finally {
+    bystander.kill('SIGKILL');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Run CALL (STALLED naming a client that ignores TERM) in a scenario shell, send TERM once the
+// client runs, to the shell alone or to its process group as a terminal or CI cancel does, and
+// return how the shell ended, how long after the signal, and whether the client is gone.
+async function cancel(call, group) {
+  const { dir, env } = e2eFixture('exit 0');
+  try {
+    const pids = path.join(dir, 'cancelled.pids');
+    const shell = spawn('bash', ['-c', `source "$STACK_E2E_ASSERT"; ${call.replace('STALLED', () => stalledClient(pids))}; echo unreachable`],
+      { env, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
+    let stdout = '';
+    shell.stdout.on('data', chunk => { stdout += chunk; });
+    const ended = new Promise(resolve => shell.on('exit', (code, signal) => resolve({ code, signal })));
+    await appeared(pids);
+    const started = Date.now();
+    process.kill(group ? -shell.pid : shell.pid, 'SIGTERM');
+    const { code, signal } = await ended;
+    return { code, signal, seconds: (Date.now() - started) / 1000, stdout, gone: allGone(pids) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('a scenario cancelled while within waits stops the client', async () => {
+  // bash runs the EXIT trap, then ends by the signal.
+  const cancelled = ({ code, signal }) => signal === 'SIGTERM' || code === 143;
+  for (const call of ['within 30 STALLED', 'out=$(within 30 STALLED)', 'echo | within 30 STALLED >/dev/null']) {
+    const result = await cancel(call, true);
+    assert.ok(cancelled(result) && !/unreachable/.test(result.stdout), `${call}: ${JSON.stringify(result)}`);
+    assert.ok(result.seconds < 10, `${call}: cleanup outlived its grace: ${result.seconds}s`);
+    assert.ok(result.gone, `${call}: the client survived the cancelled scenario`);
+  }
+  // A signal to the scenario's shell alone is taken at once while within runs in that shell;
+  // while it runs in a command substitution, bash takes it once within's limit has stopped the client.
+  let result = await cancel('within 30 STALLED', false);
+  assert.ok(cancelled(result) && result.seconds < 10 && result.gone, JSON.stringify(result));
+  result = await cancel('out=$(within 3 STALLED)', false);
+  assert.ok(cancelled(result) && result.seconds < 10 && result.gone, JSON.stringify(result));
+});
+
+test('scenarios 14 and 15 stop a setup command that stalls, and report it', () => {
+  for (const [scenario, stalls] of [['14-run-logs-cursor', 'compile'], ['15-mcp-eof', 'install']]) {
+    const { dir, env } = e2eFixture(`case "$1" in ${stalls}) trap '' TERM; echo $$ >>"$STACK_E2E_TMP/fake.pids"; while :; do sleep 0.2; done ;; esac`);
+    try {
+      const started = Date.now();
+      const result = spawnSync('bash', [`tests/e2e/${scenario}.sh`], { encoding: 'utf8', env: { ...env, STACK_E2E_SETUP_SECONDS: '1' }, timeout: 60000 });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, new RegExp(`FAIL: still running after 1s, stopped: stack ${stalls}`));
+      assert.ok(Date.now() - started < 30000, `${scenario} outlived its bound`);
+      assert.ok(allGone(path.join(dir, 't', 'fake.pids')), `${scenario}: the stalled ${stalls} survived`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+for (const stalled of ['down', 'lookup']) test(`native runner stops a stalled ${stalled} during cleanup, keeps its output and fails the run`, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-harness-'));
+  let work;
+  try {
+    const pids = path.join(dir, 'stalled.pids');
+    const hang = `trap '' TERM; echo $$ >>${pids}; while :; do sleep 0.2; done`;
+    // --version leaves one fixture checkout for cleanup.
+    writeFileSync(path.join(dir, 'stack'), `#!/usr/bin/env bash
+case "$*" in
+  --version) mkdir -p "$STACK_E2E_WORK/appZ"; touch "$STACK_E2E_WORK/appZ/stack.toml"; echo 'stack fixture' ;;
+  *' down --json') echo 'down started'; ${stalled === 'down' ? hang : 'exit 0'} ;;
+esac
+`, { mode: 0o755 });
+    writeFileSync(path.join(dir, 'mise'), `#!/bin/sh
+case "$1" in
+  --version) echo 'mise fixture' ;;
+  which) echo 'lookup started' >&2; ${stalled === 'lookup' ? hang : 'exit 1'} ;;
+esac
+`, { mode: 0o755 });
+    writeFileSync(path.join(dir, 'jq'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, STACK_E2E_CLEANUP_SECONDS: '1' };
+    delete env.STACK_E2E_REGISTRY;
+    delete env.STACK_E2E_KEEP;
+    const started = Date.now();
+    // Scenario 5 is skipped without a registry, so the run itself passes.
+    const result = spawnSync('bash', ['tests/e2e/native.sh', path.join(dir, 'stack'), '5-oci'], { encoding: 'utf8', env, timeout: 60000 });
+    work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+    assert.match(result.stdout, /5-oci: SKIPPED/);
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(work, result.stderr);
+    const log = stalled === 'down' ? 'cleanup-down-appZ.out' : 'cleanup-mise-appZ.out';
+    assert.match(result.stderr, /cleanup: still running after 1s, stopped:/);
+    assert.ok(result.stderr.includes(`--- ${path.join(work, log)}\n${stalled} started`));
+    assert.equal(readFileSync(path.join(work, log), 'utf8'), `${stalled} started\n`);
+    assert.ok(Date.now() - started < 30000, 'cleanup outlived its bound');
+    assert.ok(allGone(pids), `the stalled ${stalled} survived cleanup`);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the clean-machine smoke stops a stalled Stack that ignores TERM, itself and not a wrapper, and fails', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-bound-'));
+  let work;
+  try {
+    const pids = path.join(dir, 'stalled.pids');
+    // setup ignores TERM and never ends, after recording its PID and its parent's.
+    writeFileSync(path.join(dir, 'stack'), `#!/usr/bin/env bash
+case "$*" in
+  --version) echo 'stack fixture' ;;
+  '--json setup') trap '' TERM; echo "$$ $PPID" >>${pids}; while :; do sleep 0.2; done ;;
+esac
+`, { mode: 0o755 });
+    const started = Date.now();
+    const result = spawnSync('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+      { encoding: 'utf8', env: { ...process.env, STACK_SMOKE_SECONDS: '1' }, timeout: 60000 });
+    work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(work, result.stderr);
+    assert.match(result.stderr, /stack --json setup: still running after 1s, stopped/);
+    assert.match(result.stderr, /FAIL: stack setup did not succeed/);
+    assert.ok(Date.now() - started < 30000, 'the smoke outlived its bound');
+    const [pid, parent] = readFileSync(pids, 'utf8').trim().split(' ').map(Number);
+    // Stack's parent is the smoke's own shell: no subshell or env between them to survive it.
+    assert.equal(parent, result.pid, 'the stalled Stack was not the smoke\'s background job itself');
+    assert.ok(allGone(pids), 'the stalled Stack survived the smoke');
+    // Nothing started from the fixture's directory (Stack, or a wrapper naming it) outlives the run.
+    const survivors = execFileSync('ps', ['-A', '-o', 'pid=,command='], { encoding: 'utf8' })
+      .split('\n').filter(line => line.includes(dir));
+    assert.deepEqual(survivors, [], `processes outlived the smoke (stalled Stack ${pid})`);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A fake Stack whose `--json setup` starts a client that ignores TERM, in the background without
+// detaching, then waits for it: Stack itself ends on TERM, and what it started does not. Each
+// appends its PID and process group to LEADER and CHILD; Stack also its parent's group.
+const leaderWithChild = (dir) => `#!/usr/bin/env bash
+case "$*" in
+  --version) echo 'stack fixture' ;;
+  '--json setup')
+    bash -c 'trap "" TERM; echo "$$ $(ps -o pgid= -p $$)" >>${dir}/child.pids; while :; do sleep 0.2; done' &
+    echo "$$ $(ps -o pgid= -p $$) $(ps -o pgid= -p $PPID)" >>${dir}/leader.pids
+    wait ;;
+esac
+`;
+
+// Each line of the file, as numbers.
+const fields = (file) => readFileSync(file, 'utf8').trim().split(/\s+/).map(Number);
+
+// Assert Stack led a process group of its own, apart from the smoke's, holding the client it
+// started, and that neither they nor anything started from the fixture's directory survived.
+function assertGroupStopped(dir) {
+  const [leader, leaderGroup, runnerGroup] = fields(path.join(dir, 'leader.pids'));
+  const [child, childGroup] = fields(path.join(dir, 'child.pids'));
+  assert.equal(leaderGroup, leader, 'Stack did not lead a process group of its own');
+  assert.notEqual(runnerGroup, leader, 'Stack shared the smoke\'s process group');
+  assert.equal(childGroup, leader, 'the client Stack started was not in Stack\'s group');
+  assert.ok(!exists(leader) && !exists(child), `Stack ${leader} or its client ${child} survived the smoke`);
+  const survivors = execFileSync('ps', ['-A', '-o', 'pid=,command='], { encoding: 'utf8' })
+    .split('\n').filter(line => line.includes(dir));
+  assert.deepEqual(survivors, [], 'processes outlived the smoke');
+}
+
+test('the clean-machine smoke stops what a stalled Stack started in its group, though Stack ends on TERM and that ignores it', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-group-'));
+  let work;
+  try {
+    writeFileSync(path.join(dir, 'stack'), leaderWithChild(dir), { mode: 0o755 });
+    const started = Date.now();
+    const result = spawnSync('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+      { encoding: 'utf8', env: { ...process.env, STACK_SMOKE_SECONDS: '1' }, timeout: 60000 });
+    work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+    assert.equal(result.status, 1, result.stderr);
+    assert.ok(work, result.stderr);
+    assert.match(result.stderr, /stack --json setup: still running after 1s, stopped/);
+    assert.doesNotMatch(result.stderr, /still has members after KILL/);
+    assert.ok(Date.now() - started < 30000, 'the smoke outlived its bound');
+    assertGroupStopped(dir);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the clean-machine smoke, interrupted while Stack runs, stops Stack\'s group and fails', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-cancel-'));
+  let work;
+  try {
+    writeFileSync(path.join(dir, 'stack'), leaderWithChild(dir), { mode: 0o755 });
+    const smoke = spawn('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+      { env: { ...process.env, STACK_SMOKE_SECONDS: '60' }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    smoke.stderr.on('data', chunk => { stderr += chunk; });
+    const ended = new Promise(resolve => smoke.on('exit', (code, signal) => resolve({ code, signal })));
+    await appeared(path.join(dir, 'child.pids'));
+    await appeared(path.join(dir, 'leader.pids'));
+    const started = Date.now();
+    // To the smoke alone: Stack, in a group of its own, is reached only through the smoke's cleanup.
+    process.kill(smoke.pid, 'SIGTERM');
+    const { code, signal } = await ended;
+    work = stderr.match(/work dir kept: (\S+)/)?.[1];
+    // The cleanup fails the run whenever it had a Stack command to stop.
+    assert.equal(code, 1, `${signal} ${stderr}`);
+    assert.ok(work, stderr);
+    assert.ok(Date.now() - started < 15000, 'the cancelled smoke outlived its grace');
+    assertGroupStopped(dir);
+  } finally {
+    if (work) rmSync(work, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A fake Stack that passes every step of the smoke, with a TCP listener standing in for Postgres,
+// except that its first down behaves as FAULT says. Every call is appended to DIR/calls.
+function passingStack(dir, fault) {
+  const pinned = readFileSync('src/setup.rs', 'utf8').match(/^pub const MISE_VERSION: &str = "(.*)";$/m)[1];
+  writeFileSync(path.join(dir, 'listener.js'), `const fs = require('fs');
+const server = require('net').createServer(socket => socket.end()).listen(0, '127.0.0.1', () => {
+  fs.writeFileSync(process.argv[2] + '.new', String(server.address().port));
+  fs.renameSync(process.argv[2] + '.new', process.argv[2]);
+});
+`);
+  const ok = (data) => `echo '{"ok":true,"data":${data}}'`;
+  return `#!/usr/bin/env bash
+d=${dir}
+echo "$*" >>"$d/calls"
+mise="$HOME/.local/share/stack/bin/mise"
+stop_listener() {
+  local pid tries=0
+  pid=$(cat "$d/listener.pid")
+  kill -KILL "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 100 ]; do sleep 0.05; tries=$((tries + 1)); done
+}
+first_down() { [ "$(grep -cx -- '--json down' "$d/calls")" -eq 1 ]; }
+case "$*" in
+  --version) echo 'stack fixture' ;;
+  '--json setup')
+    if [ -x "$mise" ]; then installed=false; else
+      installed=true; mkdir -p "\${mise%/*}"; printf '#!/bin/sh\\n' >"$mise"; chmod +x "$mise"
+    fi
+    printf '{"ok":true,"data":{"installed":%s,"first_on_path":true,"mise":"%s","version":"%s"}}\\n' "$installed" "$mise" '${pinned}' ;;
+  '--json doctor'|'--json compile --locked') ${ok('{}')} ;;
+  '--json compile') : >stack.lock; ${ok('{}')} ;;
+  '--json up --timeout 10m')
+    '${process.execPath}' "$d/listener.js" "$d/port" </dev/null >/dev/null 2>&1 &
+    echo $! >"$d/listener.pid"
+    until [ -s "$d/port" ]; do sleep 0.05; done
+    printf '{"ok":true,"data":{"checks":[{"service":"postgres","ready":true,"identity":"instance","pid":%s,"port":%s}]}}\\n' "$(cat "$d/listener.pid")" "$(cat "$d/port")" ;;
+  '--json exec --require postgres -- sh -c '*)
+    printf '{"ok":true,"data":{"exit_code":0,"stdout":"42\\\\npostgres://smoke@127.0.0.1:%s/smoke\\\\n"}}\\n' "$(cat "$d/port")" ;;
+  '--json exec -- sh -c command -v mise') printf '{"ok":true,"data":{"exit_code":0,"stdout":"%s\\\\n"}}\\n' "$mise" ;;
+  'run smoke') echo 42 ;;
+  '--json down')
+    fault=${fault}
+    first_down || fault=none
+    case "$fault" in
+      fails) echo '{"ok":false,"error":{"code":"provider"}}'; exit 1 ;;
+      unconfirmed) stop_listener; ${ok('{"confirmed":false}')} ;;
+      leaves-listener) ${ok('{"confirmed":true}')} ;;
+      *) stop_listener; ${ok('{"confirmed":true}')} ;;
+    esac ;;
+  '--json status')
+    if [ "${fault}" = healthy-status ]; then ${ok('{"session":{},"healthy":true}')}; else ${ok('{"session":null,"healthy":false}')}; fi ;;
+  *) echo "unexpected: $*" >&2; exit 64 ;;
+esac
+`;
+}
+
+const faults = { none: '', fails: 'fails', unconfirmed: 'is not confirmed', 'leaves-listener': 'leaves the service process and port',
+  'healthy-status': 'leaves status healthy' };
+for (const [fault, says] of Object.entries(faults)) {
+  test(`the clean-machine smoke ${fault === 'none' ? 'passes, with one down' : `runs its own down after a first down that ${says}`}`, () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'stack-smoke-down-'));
+    let work;
+    try {
+      writeFileSync(path.join(dir, 'stack'), passingStack(dir, fault), { mode: 0o755 });
+      const result = spawnSync('bash', ['tests/e2e/clean-machine.sh', path.join(dir, 'stack')],
+        { encoding: 'utf8', env: { ...process.env, STACK_SMOKE_SECONDS: '20' }, timeout: 60000 });
+      work = result.stderr.match(/work dir kept: (\S+)/)?.[1];
+      const downs = readFileSync(path.join(dir, 'calls'), 'utf8').split('\n').filter(line => line === '--json down');
+      if (fault === 'none') {
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /clean-machine smoke passed/);
+        assert.equal(downs.length, 1);
+      } else {
+        assert.equal(result.status, 1, result.stderr);
+        assert.ok(work, result.stderr);
+        assert.match(result.stderr, /FAIL: /);
+        assert.equal(downs.length, 2, 'the smoke did not run its own down after the failed check');
+        assert.ok(existsSync(path.join(work, 'out', 'cleanup-down.out')));
+      }
+      assert.ok(!exists(Number(readFileSync(path.join(dir, 'listener.pid'), 'utf8'))), 'the listener survived');
+    } finally {
+      if (work) rmSync(work, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

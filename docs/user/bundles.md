@@ -52,6 +52,35 @@ A local path needs the `path:` prefix; a bare `../bundles/team` fails with `sour
 `stack.lock` records a local bundle's content hash, so after editing it run `stack compile`:
 `compile --locked` reports `lock_outdated` until you do.
 
+A bundle holds only regular files and directories, with UTF-8 names. Every transport (git, OCI,
+local path) refuses a symbolic link, socket or other special file anywhere in the bundle with
+`bundle_invalid`, rather than leave content readable through the bundle that its content hash
+does not cover; replace a link with a copy of what it points to. `.git` and `.stack` are never
+bundle content: they are not hashed or published, and an OCI layer containing them is refused.
+They are recognised however a case-insensitive filesystem (macOS) would spell them, on every
+platform: `.Git`, `.GIT` and `.Stack` are the same directories there, so a repository's metadata
+or Stack's own state is never hashed or published under another spelling (Unicode letters that
+fold to these and the code points HFS+ ignores in names are folded too, as Git does).
+
+If a local path bundle previously hashed one of those names, run `stack compile` to record the
+new hash. If a Git bundle reports `content_hash_mismatch` after this change, remove its
+`[[bundle]]` entry from `stack.lock` and run `stack compile` to record the hash again.
+An OCI artifact whose layer contains one of these names must be republished with that content
+removed. Keep the existing lock while waiting for a replacement. Once it is available, change
+the bundle reference to the corrected tag or digest and run `stack compile`. If the publisher
+reused the existing tag, run `stack compile --update` to resolve it again. Clearing the cache or
+removing the lock entry alone leaves the old artifact invalid.
+Each `paths.bin` entry must be a relative path to a real directory inside the bundle: `..`,
+absolute paths, symbolic links along the way, `.git` and `.stack` (under any spelling) are
+`bundle_invalid`, and a directory that does not exist is `missing_path`.
+
+A compile parses the very `bundle.toml` bytes its content hash covered, so the manifest it uses
+is the one `stack.lock` records, even if the file changes while it runs. The other files of a
+bundle (its tools, scripts and service commands) are read when they are used, from the cache or
+the local directory: Stack hashes them at compile time and does not keep an immutable copy, so a
+local path bundle edited afterwards, or a cache changed by another process running as you, is
+seen as it is then, until the next compile hashes it again.
+
 ```sh
 stack compile                          # resolve, lock, assign ports, write .config/mise/conf.d/stack.toml
 stack up --ttl 30m                     # start services, verify each is *this* instance, record a session
@@ -59,6 +88,10 @@ stack run test                         # the [tasks.test] command, once the serv
 stack exec --require postgres -- psql  # any other command
 stack down                             # succeeds only once the processes are confirmed gone
 ```
+
+A task's `services` names the services it uses; each must be one the stack defines
+(`unknown_service` otherwise). It does not narrow what `stack run` waits for: every service
+must verify first.
 
 A task can also list `secrets = ["DEPLOY_KEY"]`: names of fnox secrets `stack run` grants it.
 Bundles may declare names (never values); the stack must list `fnox` in `[tools]`, and a name
@@ -73,10 +106,13 @@ your own. Stack's own supervisor runs both, one per checkout (see
 
 Use each preset at most once per stack. Every service of a preset exports the same variable
 names (`DATABASE_URL` and `PG*` for every Postgres service, `REDIS_URL` for every Redis one),
-so with two of them only one service's values reach the app, and `up` fails for the other:
-its instance check reaches the wrong server (`DATABASE_URL reaches a different server`). Each
-still runs its own pinned release on its own port and data directory. For a second database
-of the same kind, use a service of your own with `run`.
+so with two of them only one service's values could reach the app and the other could never
+pass its instance check. A stack with two `postgres` or two `redis` services, from any mix of
+bundles, the project and `[override.services]`, therefore fails `stack compile` (and `up`,
+`exec` and `run`) with `invalid_service` naming each service and its layer, before any port is
+reserved or service started. A service several layers define identically is one service and is
+fine. For a second database of the same kind, use a service of your own with `run`; to replace
+a bundle's preset service, set `[override.services.<name>]` to such a definition.
 
 ```toml
 [services.web]

@@ -3,7 +3,16 @@
 //! Stdin is read on its own thread, so cheap requests (`ping`, `tools/list`, ...) are answered
 //! at once, also while a long `tools/call` runs. Each `tools/call` runs on a worker thread.
 //! Calls on the same checkout run one at a time, in the order they arrived; calls on different
-//! checkouts run concurrently. `notifications/cancelled` stops an in-flight call through its
+//! checkouts run concurrently. Admission is bounded before any thread is made: at most
+//! [`MAX_RUNNING`] calls run (each on one worker, plus a heartbeat when it asked for progress),
+//! a call waits without a thread while its checkout is busy or every worker is, and once
+//! [`MAX_WAITING`] calls wait, a new one is refused at once with a JSON-RPC error saying to retry.
+//! A waiting call can be cancelled; it never runs and is not answered. When input ends, every
+//! call already accepted still runs and is answered. Input is read a line (one message) at a
+//! time, at most [`MAX_FRAME`] bytes of it: a longer line is skipped to its end and answered with
+//! an `invalid request` error (id `null`), nothing else changing. At most [`MAX_PENDING_FRAMES`]
+//! lines read wait to be handled; the reader waits past that (the client's writes then block),
+//! never what a call ending or input ending tells the loop. `notifications/cancelled` stops an in-flight call through its
 //! [`Cancel`], which ends it exactly as its deadline would (subprocesses killed with their
 //! process groups, launched services recorded), and no response is sent for it. A call that
 //! carries `_meta.progressToken` gets `notifications/progress` for each lifecycle step and a
@@ -16,16 +25,34 @@
 
 #[cfg(test)]
 use super::call;
-use super::{call_in, needs_roots, negotiate, project_key, tools_for, Profile};
+use super::{call_in, needs_roots, negotiate, project_key, tools_for, Policy, Profile};
 use crate::process::Cancel;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Calls running at once, each on its own worker thread.
+const MAX_RUNNING: usize = 16;
+
+/// Calls accepted but not running (waiting for their checkout, a worker or the client's roots).
+/// One more is refused rather than held.
+const MAX_WAITING: usize = 256;
+
+/// The JSON-RPC error code of a call refused because [`MAX_WAITING`] calls already wait.
+const BUSY: i64 = -32000;
+
+/// The longest line (one message, or one batch) read; a longer one is answered with an error.
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// Lines read and not yet handled by the loop: the reader waits for room past it.
+const MAX_PENDING_FRAMES: usize = 16;
 
 /// How long calls that need the client's roots wait for its `roots/list` answer.
 const ROOTS_WAIT: Duration = Duration::from_secs(5);
@@ -52,37 +79,42 @@ pub(super) type Caller = Arc<dyn Fn(&Value, Option<&[PathBuf]>) -> Value + Send 
 /// What the loop waits for.
 enum Event {
     Line(std::io::Result<String>),
+    /// A line longer than [`MAX_FRAME`] was skipped.
+    Oversized,
     /// Input ended.
     End,
-    /// A call was answered after a signal was passed on to a command (see below).
-    Stop,
+    /// A call ended (answered or not), freeing its worker and its checkout.
+    Done(Option<PathBuf>),
 }
 
 /// Serve `profile`'s tools until `input` ends, then let calls in flight finish and answer them.
 /// `tools/list` lists only the tools `profile` offers, and `tools/call` refuses the others.
-pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, profile: Profile) -> std::io::Result<()> {
-    serve_with(input, output, Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| call_in(profile, params, roots)), profile)
+pub fn serve(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, profile: Profile, policy: Policy) -> std::io::Result<()> {
+    serve_with(input, output, Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| call_in(profile, policy, params, roots)), profile)
 }
 
 pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, caller: Caller, profile: Profile) -> std::io::Result<()> {
+    serve_signalled(input, output, caller, profile, Arc::new(|| crate::process::passed_on().is_some()))
+}
+
+/// Whether a signal that would have ended the server came (see the loop).
+type Signalled = Arc<dyn Fn() -> bool + Send + Sync>;
+
+fn serve_signalled(input: impl BufRead + Send + 'static, output: impl Write + Send + 'static, caller: Caller, profile: Profile, signalled: Signalled) -> std::io::Result<()> {
     let (events, received) = mpsc::channel();
-    let lines = events.clone();
-    std::thread::spawn(move || {
-        for line in input.lines() {
-            let end = line.is_err();
-            if lines.send(Event::Line(line)).is_err() || end {
-                return;
-            }
-        }
-        let _ = lines.send(Event::End);
-    });
+    let credit = Arc::new(Credit::default());
+    {
+        let (events, credit) = (events.clone(), credit.clone());
+        std::thread::spawn(move || read_frames(input, &events, &credit));
+    }
     let mut server = Server::new(Arc::new(Out(Mutex::new(Box::new(output)))), caller, events, profile);
+    server.signalled = signalled;
     let result = loop {
         // A signal that would have ended the server was passed on to the command a call ran
         // instead: nothing more starts, and the server ends as the signal asked once the calls
         // in flight are answered.
-        if crate::process::passed_on().is_some() {
-            server.deferred.clear();
+        if server.stopping() {
+            server.drop_waiting();
             break Ok(());
         }
         let next = match server.roots_deadline() {
@@ -90,15 +122,118 @@ pub(super) fn serve_with(input: impl BufRead + Send + 'static, output: impl Writ
             None => received.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match next {
-            Ok(Event::Line(Ok(line))) => server.line(&line),
+            Ok(Event::Line(Ok(line))) => {
+                server.line(&line);
+                credit.give();
+            }
+            Ok(Event::Oversized) => {
+                server.oversized();
+                credit.give();
+            }
             Ok(Event::Line(Err(e))) => break Err(e),
-            Ok(Event::Stop) => {}
+            Ok(Event::Done(project)) => server.done(project),
             Err(RecvTimeoutError::Timeout) => server.roots_failed("the client did not answer roots/list in time"),
             Ok(Event::End) | Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
     };
-    server.finish();
+    server.finish(&received);
     result
+}
+
+/// Room for lines read and not yet handled: at most [`MAX_PENDING_FRAMES`].
+#[derive(Default)]
+struct Credit {
+    pending: Mutex<usize>,
+    room: std::sync::Condvar,
+}
+
+impl Credit {
+    /// Wait for room for one more line.
+    fn take(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *pending >= MAX_PENDING_FRAMES {
+            pending = self.room.wait(pending).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *pending += 1;
+    }
+
+    /// A line was handled.
+    fn give(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending = pending.saturating_sub(1);
+        self.room.notify_one();
+    }
+}
+
+/// One line of input, as read.
+enum Frame {
+    Line(String),
+    /// Longer than [`MAX_FRAME`]: skipped to its end, nothing of it kept.
+    Oversized,
+}
+
+/// Read `input` line by line into `events`, each line only once there is room for it (see
+/// [`Credit`]), then [`Event::End`]. A read error, or a line that is not UTF-8, ends it as an
+/// `Event::Line` error.
+fn read_frames(mut input: impl BufRead, events: &mpsc::Sender<Event>, credit: &Credit) {
+    loop {
+        credit.take();
+        let event = match read_frame(&mut input, MAX_FRAME) {
+            Ok(Some(Frame::Line(line))) => Event::Line(Ok(line)),
+            Ok(Some(Frame::Oversized)) => Event::Oversized,
+            Ok(None) => {
+                let _ = events.send(Event::End);
+                return;
+            }
+            Err(e) => {
+                let _ = events.send(Event::Line(Err(e)));
+                return;
+            }
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+    }
+}
+
+/// The next line of `input` without its line ending (`\n` or `\r\n`), as `BufRead::lines` reads
+/// it, but holding at most `max` bytes of it; `None` at the end of input.
+fn read_frame(input: &mut impl BufRead, max: usize) -> std::io::Result<Option<Frame>> {
+    let mut line = Vec::new();
+    let (mut over, mut any, mut ended) = (false, false, false);
+    while !ended {
+        let buf = match input.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        any = true;
+        let newline = buf.iter().position(|b| *b == b'\n');
+        let chunk = &buf[..newline.unwrap_or(buf.len())];
+        if !over && line.len() + chunk.len() > max {
+            over = true;
+            line = Vec::new();
+        }
+        if !over {
+            line.extend_from_slice(chunk);
+        }
+        let used = newline.map_or(buf.len(), |at| at + 1);
+        ended = newline.is_some();
+        input.consume(used);
+    }
+    if !any {
+        return Ok(None);
+    }
+    if over {
+        return Ok(Some(Frame::Oversized));
+    }
+    if ended && line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line).map(|l| Some(Frame::Line(l))).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))
 }
 
 /// The output stream; one message at a time.
@@ -191,10 +326,22 @@ struct Server {
     deferred: VecDeque<(Value, Reply)>,
     /// The [`Cancel`] of each call in flight, by its request id.
     inflight: Arc<Mutex<HashMap<String, Cancel>>>,
-    queues: Arc<Queues>,
+    /// Calls accepted and not started, in arrival order: see [`Server::admit`].
+    waiting: VecDeque<Waiting>,
+    /// Checkouts with a call running; the next call on one starts when that one ends.
+    busy: HashSet<PathBuf>,
+    /// Calls running, at most [`MAX_RUNNING`].
+    running: usize,
     workers: Vec<JoinHandle<()>>,
     /// The least severe of [`LEVELS`] sent as `notifications/message`.
     log_level: usize,
+    /// Whether a signal that ends the server came: nothing starts from then on.
+    signalled: Signalled,
+    /// Calls not started were dropped for one: none is admitted again.
+    stopped: bool,
+    /// Run on a call's worker just before its admission point (see [`Server::start`]).
+    #[cfg(test)]
+    before_admission: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Server {
@@ -210,10 +357,29 @@ impl Server {
             requests_sent: 0,
             deferred: VecDeque::new(),
             inflight: Arc::default(),
-            queues: Arc::default(),
+            waiting: VecDeque::new(),
+            busy: HashSet::new(),
+            running: 0,
             workers: Vec::new(),
             log_level: DEFAULT_LOG_LEVEL,
+            signalled: Arc::new(|| crate::process::passed_on().is_some()),
+            stopped: false,
+            #[cfg(test)]
+            before_admission: None,
         }
+    }
+
+    /// A signal ends the server: nothing waiting may start.
+    fn stopping(&self) -> bool {
+        self.stopped || (self.signalled)()
+    }
+
+    /// A line longer than [`MAX_FRAME`] was skipped: said once, with no id (none was read), and
+    /// nothing else changes (the protocol revision, calls in line).
+    fn oversized(&self) {
+        self.out.send(&json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600,
+            "message": format!("invalid request: a message longer than {MAX_FRAME} bytes was skipped unread"),
+            "data": { "limit": MAX_FRAME } } }));
     }
 
     fn line(&mut self, line: &str) {
@@ -297,12 +463,17 @@ impl Server {
                 None => reply.error(&id, -32602, format!("invalid params: level must be one of {}", LEVELS.join(", "))),
             },
             "tools/call" => {
+                if self.waiting.len() + self.deferred.len() >= MAX_WAITING {
+                    return reply.send(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": BUSY,
+                        "message": format!("server busy: {MAX_WAITING} calls are waiting to start; retry once some finish"),
+                        "data": { "retryable": true, "running": self.running, "waiting": MAX_WAITING } } }));
+                }
                 // Calls after a held one are held too, so calls on one checkout keep their order.
                 if matches!(self.roots, Roots::Pending { .. }) && (needs_roots(self.profile, params) || !self.deferred.is_empty()) {
                     self.ask_roots_once();
                     self.deferred.push_back((message, reply));
                 } else {
-                    self.spawn_call(message, reply);
+                    self.accept(message, reply);
                 }
             }
             _ => reply.error(&id, -32601, format!("method not found: {method}")),
@@ -377,7 +548,7 @@ impl Server {
 
     fn run_deferred(&mut self) {
         while let Some((message, reply)) = self.deferred.pop_front() {
-            self.spawn_call(message, reply);
+            self.accept(message, reply);
         }
     }
 
@@ -405,6 +576,12 @@ impl Server {
             cancel.cancel();
             return;
         }
+        if let Some(at) = self.waiting.iter().position(|w| w.message["id"] == *request) {
+            if let Some(w) = self.waiting.remove(at) {
+                w.reply.skip();
+            }
+            return;
+        }
         if let Some(at) = self.deferred.iter().position(|(m, _)| m["id"] == *request) {
             if let Some((_, reply)) = self.deferred.remove(at) {
                 reply.skip();
@@ -412,20 +589,100 @@ impl Server {
         }
     }
 
-    fn spawn_call(&mut self, message: Value, reply: Reply) {
+    /// Calls not started yet are dropped unanswered, and none starts from now on: a signal ends
+    /// the server (see the loop). A batch each was in is owed nothing more for it, so the rest
+    /// of that batch's responses still go out.
+    fn drop_waiting(&mut self) {
+        self.stopped = true;
+        for (_, reply) in self.deferred.drain(..) {
+            reply.skip();
+        }
+        for w in self.waiting.drain(..) {
+            w.reply.skip();
+        }
+    }
+
+    /// Take a call in line. Its checkout and the roots it sees are fixed now, on the reading
+    /// thread, so calls on one checkout keep their arrival order and a later roots change does
+    /// not move a call already accepted.
+    fn accept(&mut self, message: Value, reply: Reply) {
+        let roots = self.roots_snapshot();
+        let project = project_key(&message["params"], roots.as_deref());
+        self.waiting.push_back(Waiting { message, reply, project, roots });
+        self.admit();
+    }
+
+    /// Start waiting calls, oldest first, while a worker is free: each whose checkout has no
+    /// call running (one on no checkout always may). A call passed over keeps its place, so the
+    /// next call on a checkout is always the oldest one waiting for it.
+    ///
+    /// Once a signal came, none starts, whatever asked (a call ending, roots arriving, input
+    /// ending): every waiting call is dropped instead. That check, like the loop's, only keeps
+    /// calls from getting a worker; whether a call's tool runs is settled on its worker, at its
+    /// admission point (see [`Server::start`]).
+    fn admit(&mut self) {
+        if self.stopping() {
+            return self.drop_waiting();
+        }
+        let mut at = 0;
+        while at < self.waiting.len() && self.running < MAX_RUNNING {
+            if self.waiting[at].project.as_ref().is_some_and(|p| self.busy.contains(p)) {
+                at += 1;
+                continue;
+            }
+            if let Some(call) = self.waiting.remove(at) {
+                self.start(call);
+            }
+        }
+    }
+
+    /// A call ended: its worker and checkout are free for the next.
+    fn done(&mut self, project: Option<PathBuf>) {
+        self.running = self.running.saturating_sub(1);
+        if let Some(project) = project {
+            self.busy.remove(&project);
+        }
+        self.admit();
+    }
+
+    /// Give `call` a worker. Every call reaches its tool only through here, whatever started it
+    /// (arriving, roots arriving, a call ending, input ending).
+    ///
+    /// The call's admission point is on that worker, just before the tool is called: the tool
+    /// runs only if the call was not cancelled and no signal that ends the server has been seen
+    /// ([`Server::signalled`]) by then. A signal seen after the loop's or [`Server::admit`]'s
+    /// check, and before that point, drops the call as a waiting one is dropped: unanswered, its
+    /// batch owed nothing more for it, its worker ending and freeing its checkout. A signal
+    /// that comes after that point comes during the call, and is handled as one coming while
+    /// any call runs (passed on to the commands it runs, or ending Stack while it runs none;
+    /// see [`crate::process::passed_on`]): the check and the tool's first step are not one
+    /// atomic step, and nothing here makes them one.
+    fn start(&mut self, call: Waiting) {
+        let Waiting { message, reply, project, roots } = call;
         let id = message["id"].clone();
         let key = id.to_string();
         let cancel = Cancel::new();
         self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone(), cancel.clone());
-        let roots = self.roots_snapshot();
+        self.running += 1;
+        if let Some(project) = &project {
+            self.busy.insert(project.clone());
+        }
         let params = message["params"].clone();
-        // Taken here, on the reading thread, so calls on one checkout keep their arrival order.
-        let ticket = project_key(&params, roots.as_deref()).map(|project| self.queues.take(project));
-        let (out, caller, inflight, queues, events) = (self.out.clone(), self.caller.clone(), self.inflight.clone(), self.queues.clone(), self.events.clone());
+        let (out, caller, inflight, signalled) = (self.out.clone(), self.caller.clone(), self.inflight.clone(), self.signalled.clone());
+        #[cfg(test)]
+        let before_admission = self.before_admission.clone();
+        let ended = Ended { events: self.events.clone(), project: project.clone() };
         self.workers.retain(|w| !w.is_finished());
-        self.workers.push(std::thread::spawn(move || {
-            let turn = Turn { queues: &queues, ticket };
-            let outcome = turn.wait(&cancel).then(|| {
+        let failed_reply = reply.clone();
+        let spawned = std::thread::Builder::new().name("stack-mcp-call".into()).spawn(move || {
+            let _ended = ended;
+            #[cfg(test)]
+            if let Some(seam) = &before_admission {
+                seam();
+            }
+            // The admission point.
+            let admitted = !cancel.is_cancelled() && !signalled();
+            let outcome = admitted.then(|| {
                 let token = &params["_meta"]["progressToken"];
                 let progress = (token.is_string() || token.is_i64() || token.is_u64())
                     .then(|| Progress::start(out.clone(), token.clone(), params["name"].as_str().unwrap_or_default()));
@@ -438,25 +695,43 @@ impl Server {
                 drop(progress);
                 outcome
             });
-            drop(turn);
             inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
             match outcome {
-                // Cancelled: the client expects no response.
+                // Cancelled, or dropped for a signal at its admission: no response.
                 _ if cancel.is_cancelled() => reply.skip(),
                 Some(Ok(result)) => reply.ok(&id, result),
                 Some(Err(_)) => reply.error(&id, -32603, "internal error: the call panicked"),
                 None => reply.skip(),
             }
-            if crate::process::passed_on().is_some() {
-                let _ = events.send(Event::Stop);
+        });
+        match spawned {
+            Ok(worker) => self.workers.push(worker),
+            // The closure, and its `Ended`, were dropped: the worker and checkout are freed by
+            // the `Done` it sent.
+            Err(e) => {
+                self.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&message["id"].to_string());
+                failed_reply.error(&message["id"], -32603, format!("internal error: no thread for the call: {e}"));
             }
-        }));
+        }
     }
 
-    /// Calls still held for roots run without them; then every call in flight is answered.
-    fn finish(&mut self) {
+    /// Calls still held for roots run without them; then every call accepted runs, as workers
+    /// free up, and is answered (unless a signal passed on to a command ends the server first:
+    /// then only the calls running finish).
+    fn finish(&mut self, received: &mpsc::Receiver<Event>) {
         if matches!(self.roots, Roots::Pending { .. }) {
             self.roots_failed("the client closed the connection before answering roots/list");
+        }
+        while self.running > 0 {
+            if self.stopping() {
+                self.drop_waiting();
+            }
+            match received.recv() {
+                Ok(Event::Done(project)) => self.done(project),
+                // Nothing more is read once input ended or failed.
+                Ok(Event::Line(_) | Event::Oversized | Event::End) => {}
+                Err(_) => break,
+            }
         }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
@@ -464,84 +739,24 @@ impl Server {
     }
 }
 
-/// Per-checkout lines of calls: each is served in the order its ticket was taken.
-#[derive(Default)]
-struct Queues {
-    lines: Mutex<HashMap<PathBuf, Line>>,
-    turn: Condvar,
+/// A call accepted and not started: see [`Server::admit`].
+struct Waiting {
+    message: Value,
+    reply: Reply,
+    /// The checkout it acts on; `None` when it acts on none or will fail before acting.
+    project: Option<PathBuf>,
+    roots: Option<Vec<PathBuf>>,
 }
 
-#[derive(Default)]
-struct Line {
-    next: u64,
-    serving: u64,
-    /// Tickets given up before their turn.
-    abandoned: BTreeSet<u64>,
+/// Says a call ended when dropped, also on a panic outside the caller.
+struct Ended {
+    events: mpsc::Sender<Event>,
+    project: Option<PathBuf>,
 }
 
-struct Ticket {
-    project: PathBuf,
-    number: u64,
-}
-
-impl Queues {
-    fn take(&self, project: PathBuf) -> Ticket {
-        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let line = lines.entry(project.clone()).or_default();
-        line.next += 1;
-        Ticket { project, number: line.next - 1 }
-    }
-
-    /// Wait for the ticket's turn; `false` if cancelled first.
-    fn wait(&self, ticket: &Ticket, cancel: &Cancel) -> bool {
-        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if lines.get(&ticket.project).is_some_and(|l| l.serving == ticket.number) {
-                return true;
-            }
-            if cancel.is_cancelled() {
-                return false;
-            }
-            lines = self.turn.wait_timeout(lines, Duration::from_millis(50)).unwrap_or_else(std::sync::PoisonError::into_inner).0;
-        }
-    }
-
-    /// The ticket is done with, served or not: the next one in line may go.
-    fn leave(&self, ticket: &Ticket) {
-        let mut lines = self.lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(line) = lines.get_mut(&ticket.project) else { return };
-        if line.serving == ticket.number {
-            line.serving += 1;
-            while line.abandoned.remove(&line.serving) {
-                line.serving += 1;
-            }
-        } else {
-            line.abandoned.insert(ticket.number);
-        }
-        if line.serving == line.next {
-            lines.remove(&ticket.project);
-        }
-        self.turn.notify_all();
-    }
-}
-
-/// A call's place in its checkout's line, given up when dropped (also on a panic).
-struct Turn<'a> {
-    queues: &'a Queues,
-    ticket: Option<Ticket>,
-}
-
-impl Turn<'_> {
-    fn wait(&self, cancel: &Cancel) -> bool {
-        self.ticket.as_ref().map_or(!cancel.is_cancelled(), |t| self.queues.wait(t, cancel))
-    }
-}
-
-impl Drop for Turn<'_> {
+impl Drop for Ended {
     fn drop(&mut self) {
-        if let Some(ticket) = &self.ticket {
-            self.queues.leave(ticket);
-        }
+        let _ = self.events.send(Event::Done(self.project.take()));
     }
 }
 
@@ -908,6 +1123,408 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 2);
     }
 
+    /// A caller that holds every call until opened, counting how many run at once.
+    #[derive(Default)]
+    struct Gate {
+        /// Open, running now, most ever running, calls run.
+        state: Mutex<(bool, usize, usize, usize)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn caller(self: &Arc<Self>) -> Caller {
+            let gate = Arc::clone(self);
+            Arc::new(move |params: &Value, _: Option<&[PathBuf]>| {
+                let mut state = gate.state.lock().unwrap();
+                state.1 += 1;
+                state.2 = state.2.max(state.1);
+                state.3 += 1;
+                gate.changed.notify_all();
+                while !state.0 && !crate::process::cancelled() {
+                    state = gate.changed.wait_timeout(state, Duration::from_millis(20)).unwrap().0;
+                }
+                state.1 -= 1;
+                json!({ "ran": params["arguments"] })
+            })
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().0 = true;
+            self.changed.notify_all();
+        }
+
+        /// Wait until `n` calls are running.
+        fn running(&self, n: usize) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut state = self.state.lock().unwrap();
+            while state.1 != n {
+                assert!(Instant::now() < deadline, "{} running, not {n}", state.1);
+                state = self.changed.wait_timeout(state, Duration::from_millis(20)).unwrap().0;
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            let state = self.state.lock().unwrap();
+            (state.2, state.3)
+        }
+    }
+
+    /// A call on no checkout (`stack_ps` without `project`), so only the worker bound holds it.
+    fn anywhere(id: u64) -> String {
+        tool_call(id, "stack_ps", json!({})).to_string()
+    }
+
+    #[test]
+    fn calls_past_the_worker_bound_wait_without_a_thread_and_past_the_waiting_bound_are_refused() {
+        let gate = Arc::new(Gate::default());
+        let (events, received) = mpsc::channel();
+        let (messages, output) = mpsc::channel();
+        let out = Arc::new(Out(Mutex::new(Box::new(Sink { buffer: Vec::new(), messages }))));
+        let mut server = Server::new(out, gate.caller(), events, Profile::Full);
+        let total = (MAX_RUNNING + MAX_WAITING + 1) as u64;
+        for id in 1..=total {
+            server.line(&anywhere(id));
+        }
+        // Only the bound got a thread; the rest wait as data, and the one past both is refused.
+        gate.running(MAX_RUNNING);
+        assert_eq!((server.workers.len(), server.running, server.waiting.len()), (MAX_RUNNING, MAX_RUNNING, MAX_WAITING));
+        let refused = output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((refused["id"].as_u64(), refused["error"]["code"].as_i64()), (Some(total), Some(BUSY)), "{refused}");
+        assert_eq!(refused["error"]["data"]["retryable"], true, "{refused}");
+        // A waiting call cancelled never runs and is not answered.
+        let cancelled = (MAX_RUNNING + 1) as u64;
+        server.line(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": cancelled } }).to_string());
+        assert_eq!(server.waiting.len(), MAX_WAITING - 1);
+        // Input ends; every accepted call still runs, never more at once than the bound.
+        gate.open();
+        server.finish(&received);
+        let answered: Vec<Value> = output.try_iter().collect();
+        let ids: BTreeSet<u64> = answered.iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        let expected: BTreeSet<u64> = (1..total).filter(|id| *id != cancelled).collect();
+        assert_eq!(ids, expected);
+        assert!(answered.iter().all(|m| m["result"]["ran"].is_object()), "every accepted call was answered by its result");
+        assert_eq!(gate.counts(), (MAX_RUNNING, (total - 2) as usize), "never more than the bound at once, and the cancelled call never ran");
+        assert!(server.workers.is_empty() && server.busy.is_empty());
+    }
+
+    /// A server writing to a channel, with a signal the test raises, and the loop's events.
+    fn signalled_server(caller: Caller) -> (Server, mpsc::Receiver<Event>, mpsc::Receiver<Value>, Arc<std::sync::atomic::AtomicBool>) {
+        let (events, received) = mpsc::channel();
+        let (messages, output) = mpsc::channel();
+        let out = Arc::new(Out(Mutex::new(Box::new(Sink { buffer: Vec::new(), messages }))));
+        let mut server = Server::new(out, caller, events, Profile::Full);
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        server.signalled = {
+            let signal = Arc::clone(&signal);
+            Arc::new(move || signal.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        (server, received, output, signal)
+    }
+
+    /// Handle `n` calls ending as the loop does.
+    fn ended(server: &mut Server, received: &mpsc::Receiver<Event>, n: usize) {
+        for _ in 0..n {
+            match received.recv_timeout(Duration::from_secs(20)).expect("a call ends") {
+                Event::Done(project) => server.done(project),
+                _ => panic!("only calls ending were expected"),
+            }
+        }
+    }
+
+    #[test]
+    fn after_a_signal_a_call_ending_admits_no_waiting_call() {
+        let gate = Arc::new(Gate::default());
+        let (mut server, received, output, signal) = signalled_server(gate.caller());
+        let total = (MAX_RUNNING + 3) as u64;
+        for id in 1..=total {
+            server.line(&anywhere(id));
+        }
+        gate.running(MAX_RUNNING);
+        // The signal comes while the loop waits; the calls running then end, each freeing a
+        // worker a waiting call would have taken.
+        signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        gate.open();
+        ended(&mut server, &received, MAX_RUNNING);
+        assert_eq!(gate.counts().1, MAX_RUNNING, "a waiting call started after the signal");
+        assert!(server.waiting.is_empty() && server.running == 0);
+        // Nor does anything else start one: roots arriving, input ending.
+        server.line(&anywhere(total + 1));
+        server.roots_failed("test");
+        server.finish(&received);
+        assert_eq!(gate.counts().1, MAX_RUNNING);
+        let answered: BTreeSet<u64> = output.try_iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        assert_eq!(answered, (1..=MAX_RUNNING as u64).collect(), "only the calls running were answered");
+    }
+
+    #[test]
+    fn a_batch_whose_held_calls_a_signal_drops_still_gets_its_other_responses() {
+        let gate = Arc::new(Gate::default());
+        let (mut server, received, output, signal) = signalled_server(gate.caller());
+        // The revision with batches, and a client with roots it has not given yet.
+        server.line(&initialize(BATCH_VERSION, json!({ "roots": {} })).to_string());
+        server.line(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string());
+        let (init, ask) = (output.recv().unwrap(), output.recv().unwrap());
+        assert_eq!((init["id"].clone(), ask["method"].clone()), (json!(0), json!("roots/list")));
+        for id in 1..=MAX_RUNNING as u64 {
+            server.line(&anywhere(id));
+        }
+        gate.running(MAX_RUNNING);
+        // One batch with a call waiting for a worker, one with a call held for the roots.
+        server.line(&json!([{ "jsonrpc": "2.0", "id": "a1", "method": "ping" }, tool_call(100, "stack_ps", json!({}))]).to_string());
+        server.line(&json!([{ "jsonrpc": "2.0", "id": "b1", "method": "ping" }, tool_call(200, "stack_status", json!({}))]).to_string());
+        assert_eq!((server.waiting.len(), server.deferred.len()), (1, 1));
+        assert!(output.try_recv().is_err(), "a batch went out before its calls were answered");
+        signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        gate.open();
+        ended(&mut server, &received, MAX_RUNNING);
+        server.finish(&received);
+        let messages: Vec<Value> = output.try_iter().collect();
+        let mut batches: Vec<&Value> = messages.iter().filter(|m| m.is_array()).collect();
+        batches.sort_by_key(|b| b[0]["id"].to_string());
+        assert_eq!(batches.len(), 2, "{messages:?}");
+        for (batch, ping) in batches.iter().zip(["a1", "b1"]) {
+            assert_eq!(**batch, json!([{ "jsonrpc": "2.0", "id": ping, "result": {} }]), "the dropped call's batch kept only its answered sibling");
+        }
+        assert_eq!(gate.counts().1, MAX_RUNNING, "a dropped call ran");
+    }
+
+    /// A signal seen after `admit`'s scan gave a call a worker and before that worker reaches
+    /// the call's tool: the seam raises it there, on the worker, every time.
+    #[test]
+    fn a_signal_after_a_call_got_its_worker_and_before_its_tool_runs_drops_it_and_holds_up_nothing() {
+        for batched in [false, true] {
+            let gate = Arc::new(Gate::default());
+            let (mut server, received, output, signal) = signalled_server(gate.caller());
+            server.line(&initialize(BATCH_VERSION, json!({})).to_string());
+            assert_eq!(output.recv().unwrap()["id"], 0);
+            let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            server.before_admission = Some(Arc::new({
+                let (signal, reached) = (Arc::clone(&signal), Arc::clone(&reached));
+                move || {
+                    signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                    reached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+            let call = tool_call(1, "stack_ps", json!({}));
+            if batched {
+                server.line(&json!([{ "jsonrpc": "2.0", "id": "p1", "method": "ping" }, call]).to_string());
+            } else {
+                server.line(&call.to_string());
+            }
+            // `admit`'s scan saw no signal: the call got a worker.
+            assert_eq!((server.running, server.workers.len()), (1, 1), "batched {batched}");
+            ended(&mut server, &received, 1);
+            assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(gate.counts().1, 0, "batched {batched}: the tool was called after the signal");
+            assert!(server.inflight.lock().unwrap().is_empty());
+            // The batch is owed nothing more for the dropped call: its sibling goes out.
+            if batched {
+                assert_eq!(output.recv_timeout(Duration::from_secs(5)).unwrap(), json!([{ "jsonrpc": "2.0", "id": "p1", "result": {} }]));
+            }
+            // Nothing starts after the signal, and input ending finishes at once.
+            server.line(&anywhere(2));
+            server.finish(&received);
+            assert_eq!(gate.counts().1, 0, "batched {batched}");
+            assert!(server.workers.is_empty() && server.waiting.is_empty() && server.busy.is_empty() && server.running == 0, "batched {batched}");
+            assert!(output.try_recv().is_err(), "batched {batched}: a dropped call was answered");
+        }
+    }
+
+    /// Without the signal, the seam changes nothing: the call runs and is answered.
+    #[test]
+    fn a_call_with_no_signal_at_its_admission_runs() {
+        let gate = Arc::new(Gate::default());
+        gate.open();
+        let (mut server, received, output, _signal) = signalled_server(gate.caller());
+        server.before_admission = Some(Arc::new(|| {}));
+        server.line(&anywhere(1));
+        ended(&mut server, &received, 1);
+        server.finish(&received);
+        assert_eq!(gate.counts().1, 1);
+        assert_eq!(output.recv_timeout(Duration::from_secs(5)).unwrap()["id"], 1);
+    }
+
+    #[test]
+    fn a_reader_holds_at_most_the_pending_bound_and_a_call_ending_still_reaches_the_loop() {
+        let (events, received) = mpsc::channel();
+        let credit = Arc::new(Credit::default());
+        let total = MAX_PENDING_FRAMES * 3;
+        let input: String = (0..total).map(|n| format!("{{\"n\":{n}}}\n")).collect();
+        let reader = {
+            let (events, credit) = (events.clone(), Arc::clone(&credit));
+            std::thread::spawn(move || read_frames(std::io::Cursor::new(input.into_bytes()), &events, &credit))
+        };
+        let line = |event: Event| match event {
+            Event::Line(Ok(line)) => serde_json::from_str::<Value>(&line).unwrap()["n"].as_u64().unwrap() as usize,
+            _ => panic!("a line was expected"),
+        };
+        let mut seen: Vec<usize> = (0..MAX_PENDING_FRAMES).map(|_| line(received.recv_timeout(Duration::from_secs(5)).unwrap())).collect();
+        // Saturated: nothing more is read until a line is handled.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(received.try_recv().is_err(), "the reader went past the bound");
+        // A call ending is never held behind the input.
+        events.send(Event::Done(None)).unwrap();
+        assert!(matches!(received.recv_timeout(Duration::from_secs(5)), Ok(Event::Done(None))));
+        // Each line handled makes room for one more: every line, in order, then the end.
+        loop {
+            credit.give();
+            match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::End => break,
+                event => seen.push(line(event)),
+            }
+        }
+        assert_eq!(seen, (0..total).collect::<Vec<_>>());
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn a_line_past_the_frame_bound_is_refused_and_nothing_else_changes() {
+        let session = Session::start(Arc::new(call));
+        session.send(initialize(BATCH_VERSION, json!({})));
+        assert_eq!(session.recv()["result"]["protocolVersion"], BATCH_VERSION);
+        let refused = |message: Value| {
+            assert_eq!((message["id"].clone(), message["error"]["code"].clone()), (Value::Null, json!(-32600)), "{message}");
+            assert_eq!(message["error"]["data"]["limit"], MAX_FRAME);
+        };
+        // Not JSON, and JSON naming an id: neither is read, so neither is answered as a request.
+        session.input.as_ref().unwrap().send("x".repeat(MAX_FRAME + 1)).unwrap();
+        refused(session.recv());
+        session.send(json!({ "jsonrpc": "2.0", "id": 7, "method": "ping", "params": { "pad": "y".repeat(MAX_FRAME) } }));
+        refused(session.recv());
+        // A line of exactly the bound is read.
+        let base = json!({ "jsonrpc": "2.0", "id": 8, "method": "ping", "params": { "pad": "" } }).to_string().len();
+        session.send(json!({ "jsonrpc": "2.0", "id": 8, "method": "ping", "params": { "pad": "z".repeat(MAX_FRAME - base) } }));
+        assert_eq!(session.recv(), json!({ "jsonrpc": "2.0", "id": 8, "result": {} }));
+        // The revision negotiated before still holds: batches are still answered.
+        session.send(json!([{ "jsonrpc": "2.0", "id": 9, "method": "ping" }]));
+        assert_eq!(session.recv(), json!([{ "jsonrpc": "2.0", "id": 9, "result": {} }]));
+        session.close();
+    }
+
+    #[test]
+    fn input_that_ends_at_once_or_mid_line_still_has_every_accepted_call_answered() {
+        // More calls than run at once plus the reader's bound, all in input that has ended
+        // before the first runs; the last line has no newline.
+        let gate = Arc::new(Gate::default());
+        let total = (MAX_RUNNING + 2 * MAX_PENDING_FRAMES) as u64;
+        let mut input: String = (1..=total).map(|id| format!("{}\n", anywhere(id))).collect();
+        input.push_str(&json!({ "jsonrpc": "2.0", "id": "last", "method": "ping" }).to_string());
+        let (messages, output) = mpsc::channel();
+        let server = {
+            let caller = gate.caller();
+            std::thread::spawn(move || serve_signalled(std::io::Cursor::new(input.into_bytes()), Sink { buffer: Vec::new(), messages }, caller, Profile::Full, Arc::new(|| false)))
+        };
+        gate.running(MAX_RUNNING);
+        gate.open();
+        server.join().unwrap().unwrap();
+        let answered: BTreeSet<String> = output.try_iter().map(|m| m["id"].to_string()).collect();
+        let expected: BTreeSet<String> = (1..=total).map(|id| id.to_string()).chain(["\"last\"".to_string()]).collect();
+        assert_eq!(answered, expected);
+        assert_eq!(gate.counts(), (MAX_RUNNING, total as usize));
+        // A line past the bound that input ends in is refused as well.
+        let (messages, output) = mpsc::channel();
+        serve_signalled(std::io::Cursor::new("y".repeat(MAX_FRAME + 1).into_bytes()), Sink { buffer: Vec::new(), messages }, Arc::new(call), Profile::Full, Arc::new(|| false)).unwrap();
+        assert_eq!(output.try_iter().map(|m| m["error"]["code"].clone()).collect::<Vec<_>>(), [json!(-32600)]);
+    }
+
+    #[test]
+    fn calls_waiting_for_a_worker_are_answered_after_input_ends() {
+        let gate = Arc::new(Gate::default());
+        let session = Session::start(gate.caller());
+        let total = (MAX_RUNNING + 5) as u64;
+        for id in 1..=total {
+            session.input.as_ref().unwrap().send(anywhere(id)).unwrap();
+        }
+        gate.running(MAX_RUNNING);
+        let opener = std::thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                gate.open();
+            }
+        });
+        let answered: BTreeSet<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        opener.join().unwrap();
+        assert_eq!(answered, (1..=total).collect());
+        assert_eq!(gate.counts().0, MAX_RUNNING);
+    }
+
+    /// The admission model's accounting (verify-stack-ports-mcp) on the real loop, step by step:
+    /// a direct call on each of two checkouts and one on none, then a batch with a ping and calls
+    /// on both checkouts that wait their turn, one of them cancelled while waiting. Calls on an
+    /// idle checkout or on none never wait behind a busy one; a cancelled waiting call never runs
+    /// and is owed nothing; once input ends every other accepted call runs in its checkout's
+    /// arrival order and is answered once, the batch together, exactly once.
+    #[test]
+    fn a_batch_across_checkouts_with_a_cancelled_waiting_call_is_answered_once_in_order_after_input_ends() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (a.path().canonicalize().unwrap(), b.path().canonicalize().unwrap());
+        let gate = Arc::new(Gate::default());
+        let order: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let caller: Caller = {
+            let (inner, order) = (gate.caller(), Arc::clone(&order));
+            Arc::new(move |params: &Value, roots: Option<&[PathBuf]>| {
+                order.lock().unwrap().push(params["n"].as_u64().unwrap_or(0));
+                inner(params, roots)
+            })
+        };
+        let (events, received) = mpsc::channel();
+        let (messages, output) = mpsc::channel();
+        let out = Arc::new(Out(Mutex::new(Box::new(Sink { buffer: Vec::new(), messages }))));
+        let mut server = Server::new(out, caller, events, Profile::Full);
+        server.line(&initialize(BATCH_VERSION, json!({})).to_string());
+        assert_eq!(output.recv().unwrap()["id"], 0);
+        // A call on a checkout, tagged beside its arguments (outside the tool's schema) so the
+        // caller records the order calls reach their tools.
+        let call = |id: u64, dir: &PathBuf| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": dir }, "n": id } });
+        server.line(&call(1, &a).to_string());
+        server.line(&call(2, &b).to_string());
+        server.line(&json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": { "name": "stack_ps", "arguments": {}, "n": 6 } }).to_string());
+        server.line(&json!([call(3, &a), { "jsonrpc": "2.0", "id": "p", "method": "ping" }, call(4, &b), call(5, &a)]).to_string());
+        gate.running(3);
+        // Work-conserving: a worker is free, and every waiting call waits for its own checkout.
+        assert_eq!((server.running, server.waiting.len()), (3, 3));
+        assert!(server.running < MAX_RUNNING && server.waiting.iter().all(|w| w.project.as_ref().is_some_and(|p| server.busy.contains(p))));
+        server.line(&json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 4 } }).to_string());
+        assert_eq!(server.waiting.iter().map(|w| w.message["id"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 5]);
+        assert!(output.try_recv().is_err(), "nothing answered while every call is held");
+        // Input ends.
+        gate.open();
+        server.finish(&received);
+        let messages: Vec<Value> = output.try_iter().collect();
+        let direct: BTreeSet<u64> = messages.iter().filter_map(|m| m["id"].as_u64()).collect();
+        assert_eq!(direct, [1, 2, 6].into(), "{messages:?}");
+        let batches: Vec<&Value> = messages.iter().filter(|m| m.is_array()).collect();
+        assert_eq!(batches.len(), 1, "the batch went out exactly once: {messages:?}");
+        let in_batch: BTreeSet<String> = batches[0].as_array().unwrap().iter().map(|r| r["id"].to_string()).collect();
+        assert_eq!(in_batch, ["3", "5", "\"p\""].map(String::from).into(), "the cancelled call is owed nothing");
+        let order = order.lock().unwrap();
+        assert!(!order.contains(&4), "a cancelled waiting call ran: {order:?}");
+        let on_a: Vec<u64> = order.iter().copied().filter(|n| [1, 3, 5].contains(n)).collect();
+        assert_eq!(on_a, [1, 3, 5], "one checkout's calls ran in arrival order");
+        assert_eq!(order.len(), 5);
+        assert!(server.workers.is_empty() && server.busy.is_empty() && server.running == 0);
+    }
+
+    #[test]
+    fn a_busy_checkout_holds_only_its_own_calls_and_keeps_their_order() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let log: Arc<Mutex<Vec<(String, Instant, Instant)>>> = Arc::default();
+        let session = Session::start(sleeper(Arc::clone(&log)));
+        // Many calls on `a` wait for one another without taking a worker each, so `b` still runs.
+        for id in 1..=(MAX_RUNNING as u64 + 2) {
+            session.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": a.path() }, "ms": 20 } }));
+        }
+        session.send(json!({ "jsonrpc": "2.0", "id": 100, "method": "tools/call", "params": { "name": "stack_status", "arguments": { "dir": b.path() }, "ms": 0 } }));
+        let answered: Vec<u64> = session.close().iter().map(|m| m["id"].as_u64().unwrap()).collect();
+        let on_a: Vec<u64> = answered.iter().copied().filter(|id| *id != 100).collect();
+        assert_eq!(on_a, (1..=(MAX_RUNNING as u64 + 2)).collect::<Vec<_>>(), "one checkout's calls run in arrival order");
+        assert!(answered.iter().position(|id| *id == 100).unwrap() < 3, "the other checkout did not wait behind them: {answered:?}");
+        let log = log.lock().unwrap();
+        let on_a: Vec<_> = log.iter().filter(|(d, _, _)| *d == a.path().to_str().unwrap()).collect();
+        assert!(on_a.windows(2).all(|w| w[1].1 >= w[0].2), "two calls on one checkout overlapped");
+    }
+
     #[test]
     fn progress_reports_each_step_before_the_response() {
         let caller: Caller = Arc::new(|_: &Value, _: Option<&[PathBuf]>| {
@@ -993,7 +1610,7 @@ mod tests {
 
     #[test]
     fn the_core_profile_lists_and_answers_only_its_tools() {
-        let session = Session::start_with(Arc::new(|params: &Value, roots: Option<&[PathBuf]>| call_in(Profile::Core, params, roots)), Profile::Core);
+        let session = Session::start_with(Arc::new(|params: &Value, roots: Option<&[PathBuf]>| call_in(Profile::Core, Policy::default(), params, roots)), Profile::Core);
         session.send(initialize("2025-06-18", json!({})));
         let instructions = session.recv()["result"]["instructions"].as_str().unwrap().to_string();
         assert!(instructions.contains("--profile core"), "{instructions}");

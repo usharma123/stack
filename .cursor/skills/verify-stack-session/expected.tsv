@@ -1,0 +1,14 @@
+# config, expected TLC exit code, invariant it must violate (- for a pass), distinct states (one worker).
+config	exit	violated	distinct_states
+FALSE.cfg	0	-	4472046
+TRUE-DeviceJudgesBindMount.cfg	12	NoReclaimOfExistingCheckout	31381
+TRUE-FileMountUnchecked.cfg	12	MountSeenAtPreflightKeepsData	2547902
+TRUE-ForeignNamespaceTrusted.cfg	12	ExpiryOnlyForExitedOwner	13200
+TRUE-MissingPathIsDeleted.cfg	12	NoReclaimOfExistingCheckout	18240
+TRUE-NoRemovalPreflight.cfg	12	NoRemovalAcrossMount	2333808
+TRUE-PidOnlyOwner.cfg	12	OwnerReportedAliveOnlyIfAlive	2006
+TRUE-RefreshAdoptsMountPoint.cfg	12	NoReclaimOfExistingCheckout	19089
+TRUE-UnknownOwnerExited.cfg	12	ExpiryOnlyForExitedOwner	6674
+TRUE-UnknownSchemaAsEmpty-confirm.cfg	12	ConfirmedMeansStopped	356480
+TRUE-UnknownSchemaAsEmpty-data.cfg	12	DataRemovedOnlyWhenStopped	2437664
+TRUE-UnknownSchemaAsEmpty-records.cfg	12	EveryProcessRecorded	827757

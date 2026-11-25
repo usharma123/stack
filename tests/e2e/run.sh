@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end tests against real mise + Pitchfork and a local OCI registry, in Docker.
+# End-to-end tests against real mise, Stack's own service supervisor and a local OCI registry, in Docker.
 # Needs the eval images (eval/images: ev-base, ev-mise) and Docker. Run from the repo root.
 # For the same scenarios on the host (macOS or Linux), see tests/e2e/native.sh.
 set -euo pipefail

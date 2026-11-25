@@ -212,6 +212,8 @@ codes! {
         "Check the bundle's git URL and your network or credentials, then retry; the message carries git's output.";
     "git_unavailable", false, [DOCTOR], "git is not installed or cannot run.",
         "Install git (git bundle sources need it), then retry; `stack doctor` checks it.";
+    "host_purge_disabled", false, [], "This MCP server does not delete service data of checkouts selected machine-wide (`stack_down` by `labels` with `purge`); nothing was stopped or removed.",
+        "Purge one project instead (`stack_down` with its `dir`, alone or with `project: true`), run `stack down --label K=V --purge` yourself, or start the server as `stack mcp --allow-host-purge`.";
     "init_failed", true, [UP], "An init task of a service failed, or its data directory vanished; services are still running.",
         "Read the task's output in details, fix the cause and run `stack up` again; it resumes from the failed task.";
     "init_invalid", false, [], "A service's `init` list names an unknown or repeated task, or one that excludes the service.",
@@ -224,8 +226,8 @@ codes! {
         "Use a relative directory inside the project root, such as \".claude/skills\".";
     "invalid_secret", false, [], "A secret name cannot be granted.",
         "Use an upper-case variable name that no service, `[env]` entry or Stack/mise variable uses.";
-    "invalid_service", false, [], "A service definition is malformed.",
-        "Set exactly one of `preset` or `run` for the service in stack.toml or the bundle.";
+    "invalid_service", false, [], "A service definition is malformed (its name is not one path component, say), or services collide (a name, an identity variable, or a second Postgres or Redis preset).",
+        "Follow the message: set exactly one of `preset` or `run`, name a service without `/` (and not `.` or `..`), rename a colliding service, or keep one service per Postgres or Redis preset.";
     "invalid_tool", false, [], "A tool option or name is invalid.",
         "Fix the `[tools]` entry the message names, then run `stack compile`.";
     "io", true, [], "A file or directory could not be read or written.",
@@ -266,14 +268,16 @@ codes! {
         "Run `stack up` first.";
     "not_ready", true, [STATUS], "Services started but failed verification.",
         "Read each service's reason in details, check `stack logs <service>`, fix the cause and run `stack up` again.";
-    "oci_auth_untrusted", false, [], "A registry redirected authentication to another origin; Stack refused.",
-        "Check the registry URL; credentials are only sent to the registry's own origin.";
+    "oci_auth_untrusted", false, [], "A registry redirected authentication to another origin or an unapproved token service; Stack refused.",
+        "Check the registry URL; approve a token service only by listing its origin in STACK_OCI_AUTH_REALMS.";
+    "oci_credentials_unbound", false, [], "STACK_OCI_USERNAME / STACK_OCI_PASSWORD are incomplete or not bound to a registry origin; Stack sent no credentials.",
+        "Set STACK_OCI_REGISTRY to the origin the credentials belong to (e.g. https://ghcr.io), or unset the credentials.";
     "oci_failed", true, [], "An OCI registry request failed.",
         "Read the HTTP status in the message, check the registry, then retry.";
     "oci_not_found", false, [], "The OCI reference does not exist in the registry.",
         "Check the repository, tag or digest in the reference.";
     "oci_unauthorized", false, [], "The OCI registry refused the credentials (HTTP 401/403).",
-        "Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for this registry, then retry.";
+        "Set STACK_OCI_USERNAME and STACK_OCI_PASSWORD with STACK_OCI_REGISTRY set to this registry's origin, then retry.";
     "oci_unreachable", true, [], "The OCI registry could not be reached.",
         "Check the network and the registry host name, then retry.";
     "owner_not_found", false, [], "No ancestor process of Stack has the name given to `--owner-pid ancestor:<name>`.",
@@ -296,6 +300,8 @@ codes! {
         "Pin a tag or digest, such as oci:ghcr.io/acme/pybase:1.0.0.";
     "resolve_failed", true, [], "A version request could not be resolved; stack.lock and the provider config were not changed.",
         "Check the version requests the message names exist, and the network, then run `stack compile` again.";
+    "restore_incomplete", true, [], "A snapshot restore of several services could not be finished or undone, or was interrupted; its services are left stopped.",
+        "Run the snapshot command again or `stack up`: Stack first finishes or undoes the interrupted restore. Data marked `manual_recovery` must be moved back where details say, then the journal they name removed.";
     "root_unsupported", false, [], "PostgreSQL refuses to run as root, and Stack is running as root.",
         "Run Stack as an unprivileged user that owns the checkout (e.g. `su dev -c 'stack up'`); installs and tools-only commands work as root.";
     "secret_missing", false, [], "fnox does not know a granted secret.",

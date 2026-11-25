@@ -31,6 +31,16 @@ there. Every result carries the checkout it acted on as `project`, an absolute p
 directory whose `stack.toml` was found. `stack_gc`, `stack_ps` and `stack_mv`
 act machine-wide and need no `dir`, as does `stack_errors`; their `dir` is never searched.
 
+**Roots and `dir` are where an agent works, not a sandbox.** They pick the checkout a call acts
+on and the project it searches for; they do not confine the server. It runs as your user and can
+reach every checkout Stack has records for: `stack_ps` lists them all, a fleet selection by
+`labels` matches checkouts anywhere on the machine, and `stack_gc` and `stack_mv` act
+machine-wide. One thing needs the server's consent: `stack_down` with `purge: true` and a
+`labels` selection (without `project`), which would delete the data of matching checkouts
+wherever they are, fails with `host_purge_disabled` and changes nothing unless the server was
+started as `stack mcp --allow-host-purge`. Purging the checkout `dir` names, or every checkout of
+its project (`project: true`), is unaffected, as is the CLI's `stack down --label K=V --purge`.
+
 | Tool | Does |
 |---|---|
 | `stack_status` | Checks every service now and renews the lease. Start here |
@@ -38,7 +48,7 @@ act machine-wide and need no `dir`, as does `stack_errors`; their `dir` is never
 | `stack_run` | Runs a `[tasks.<name>]` once every service checks out |
 | `stack_exec` | Runs any other command (an argv list) with the stack's tools and env |
 | `stack_restart` | Restarts services after you edit code they loaded |
-| `stack_logs` | Shows recent output of one service, or of every service; `grep`, `ignore_case` and `since` filter it |
+| `stack_logs` | Shows recent output of one service, or of every service; `grep`, `ignore_case` and `since` filter it; `cursor` (from a previous result, `""` to begin) returns only newer output, each line once with `timestamps` |
 | `stack_down` | Stops the services and confirms everything is gone; not confirmed while a command you started still runs |
 | `stack_ps` | Lists every checkout on the machine, its services and data size (liveness only) |
 | `stack_mv` | After a checkout moved, carries its records and data to the new path (`from`, `to`) |
@@ -111,7 +121,8 @@ A few things that are easy to get wrong:
   (MCP `owner_ancestor: "claude"`): Stack uses its nearest ancestor process with that command
   name, and fails with `owner_not_found`, listing the ancestors, if there is none.
 - **Leases are reported structured.** `status` and `up` return `lease` with `kind`,
-  `ttl_secs`, `expires_at` and, for an owner, `owner_alive`. `status`, `exec`, `run` and
+  `ttl_secs`, `expires_at` and, for an owner, `owner_alive` (absent, with `owner_unknown`
+  saying why, when Stack cannot tell whether the owner process still runs). `status`, `exec`, `run` and
   `renew` count as activity; `stack renew --ttl 1h` (MCP `ttl`) changes the TTL.
 - **`down` is confirmed only once your commands are gone too.** A command you started with
   `exec` or `run` (a dev server, a watcher, something you backgrounded) keeps the checkout's
@@ -245,7 +256,18 @@ try again.
 
 The server reads requests while a call runs, so `ping`, `tools/list` and calls on other
 checkouts are answered meanwhile. Calls on the same checkout run one at a time, in the order
-they arrived.
+they arrived. At most 16 calls run at once; others wait their turn without holding a thread, and
+once 256 calls are waiting a new `tools/call` is refused at once with JSON-RPC error `-32000`
+(`data.retryable: true`): retry it once some finish. When the client closes the server's input,
+every call it already accepted still runs and is answered before the server exits. A signal
+that ends the server (one passed on to a call's command) lets the calls running finish and be
+answered; calls still waiting then never start and are not answered, and a batch they were in
+still gets its other responses. A call counts as running once its tool is about to be called and
+no such signal has been seen: one given a thread just before the signal is dropped the same way. One message (or batch) is one line of at most 4 MiB: a longer
+line is skipped unread and answered with JSON-RPC error `-32600` (`id: null`,
+`data.limit`), and the session goes on as before. At most 16 lines read wait to be handled;
+past that the server stops reading until it catches up, so a client writing faster than that
+blocks rather than growing the server.
 
 - **Cancelling.** `notifications/cancelled` for a running call stops it the way its timeout
   would: its commands are killed with their process groups and no response is sent. A

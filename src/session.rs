@@ -138,6 +138,11 @@ pub struct Session {
     /// Older records and filesystems without birth times retain device/inode checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir_created: Option<std::time::SystemTime>,
+    /// The mount the project directory was on at launch (see [`crate::checkout::Location`]), so
+    /// a missing or replaced directory is told from that mount not being there right now.
+    /// Absent in records an earlier Stack kept, and where it could not be learned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_location: Option<crate::checkout::Location>,
     /// `stack up --label KEY=VALUE`: what the caller said this session is for, which `ps`,
     /// `status`, `logs` and `down` select checkouts by (see [`crate::labels`]). Kept across
     /// `up`s of the same checkout; a later `up --label` adds or replaces keys.
@@ -185,6 +190,11 @@ pub struct Lease {
     /// A long-lived runner process; the session expires when it exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_pid: Option<u32>,
+    /// Which process `owner_pid` was when the lease named it (start time, boot, PID namespace),
+    /// so a later process reusing the PID does not keep the session. Absent in a lease an
+    /// earlier Stack recorded, whose owner is a bare PID (see [`crate::lease::owner_state`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::lease::OwnerIdentity>,
     pub renewed_at: u64,
 }
 
@@ -196,10 +206,20 @@ impl Lease {
                 return Some(format!("lease expired: idle {idle}s > ttl {ttl}s"));
             }
         }
-        match self.owner_pid {
-            Some(pid) if !pid_alive(pid) => Some(format!("owner process {pid} exited")),
+        match self.owner_state()? {
+            crate::lease::OwnerState::Exited(why) => Some(why),
             _ => None,
         }
+    }
+
+    /// Whether the owner process still runs, when the lease has one.
+    pub fn owner_state(&self) -> Option<crate::lease::OwnerState> {
+        self.owner_pid.map(|pid| crate::lease::owner_state(pid, self.owner.as_ref()))
+    }
+
+    /// The lease has an owner, and it is shown to have exited.
+    pub fn owner_exited(&self) -> bool {
+        matches!(self.owner_state(), Some(crate::lease::OwnerState::Exited(_)))
     }
 }
 
@@ -266,6 +286,27 @@ pub struct Check {
     data_dir: Option<String>,
     #[serde(skip)]
     provider_id: Option<String>,
+}
+
+impl Check {
+    /// The port for people: `-` when the service has none assigned (never a made-up `0`).
+    pub fn port_label(&self) -> String {
+        self.port.map_or_else(|| "-".to_string(), |p| p.to_string())
+    }
+
+    /// The addresses a verified service gives commands, for people, as `NAME=value` (already
+    /// redacted: see [`endpoints`]): its URLs, or every variable when it has none. Nothing for a
+    /// service that is not verified: its connection variables are withheld, not shown.
+    pub fn endpoint_lines(&self) -> Vec<String> {
+        if !self.ready {
+            return Vec::new();
+        }
+        let urls: Vec<String> = self.endpoints.iter().filter(|(k, _)| k.ends_with("_URL")).map(|(k, v)| format!("{k}={v}")).collect();
+        if !urls.is_empty() {
+            return urls;
+        }
+        self.endpoints.iter().map(|(k, v)| format!("{k}={v}")).collect()
+    }
 }
 
 /// Why a service check failed, as a stable code beside the free-text `reason`. The values and
@@ -1060,6 +1101,22 @@ impl LeaseOptions {
     }
 }
 
+/// Which process the lease's owner is: one `named` by this command is bound to the process it is
+/// now (`observe`); one `kept` from the `previous` lease is bound as it was, and a lease an
+/// earlier Stack recorded stays a bare PID, never bound to whatever has the PID now.
+fn bind_owner(
+    named: Option<u32>,
+    kept: Option<u32>,
+    previous: Option<&Lease>,
+    observe: impl Fn(u32) -> crate::lease::OwnerIdentity,
+) -> Option<crate::lease::OwnerIdentity> {
+    match (named, kept) {
+        (Some(pid), _) => Some(observe(pid)),
+        (None, Some(pid)) => previous.filter(|l| l.owner_pid == Some(pid)).and_then(|l| l.owner.clone()),
+        (None, None) => None,
+    }
+}
+
 /// Largest owner PID a lease accepts. `pid_t` is a signed 32-bit integer on supported
 /// platforms; 0 and larger values name a process group, every process, or nothing, so a
 /// lease on them would never expire or would expire immediately depending on the platform.
@@ -1260,6 +1317,14 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     let provider = (!report.stack.services.is_empty()).then(|| ProviderRecord::native(supervisor_dir(ctx)));
     let project_dir_id = dir_id(&ctx.root);
     let project_dir_created = dir_created(&ctx.root);
+    // Where nothing can be learned now, the mount the previous session recorded is kept when it
+    // was this very directory (inode and birth time): evidence is never dropped for want of it.
+    let project_location = crate::checkout::location(&ctx.root).or_else(|| {
+        previous
+            .as_ref()
+            .filter(|p| project_dir_id.is_some() && p.project_dir_id == project_dir_id && p.project_dir_created == project_dir_created)
+            .and_then(|p| p.project_location.clone())
+    });
 
     // `start` can reuse an already-running daemon with an old definition. Stop it first
     // when changing generations, or when no launch record establishes its configuration.
@@ -1269,6 +1334,14 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     let legacy = legacy_provider(previous.as_ref()).cloned();
     let restart = legacy.is_some() || previous.as_ref().is_some_and(|s| !same_config(s, ctx, &report));
     let unrecorded = previous.is_none() && !report.stack.services.is_empty();
+    // What the supervisor's records say decides what is stopped below (the port check takes a
+    // service it does not list for a stray): records that cannot be read (damaged, or a newer
+    // Stack's) stop `up` before anything is.
+    if !report.stack.services.is_empty() {
+        if let Err(e) = supervisor::readable(&supervisor_dir(ctx)) {
+            return Err(steps.fail("stop_previous", e, false));
+        }
+    }
     if restart || unrecorded {
         match down_locked(ctx) {
             Err(e) => return Err(steps.fail("stop_previous", e, true)),
@@ -1320,6 +1393,13 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         }
         steps.ok("ports", if mine.is_empty() { json!(null) } else { json!({ "stopped": mine.iter().map(Stray::json).collect::<Vec<_>>() }) });
         timings.mark("ports");
+        // A snapshot restore interrupted here is finished before anything claims or starts on
+        // its data.
+        match crate::snapshot::recover_before_start(ctx, &statuses) {
+            Ok(Some(detail)) => steps.ok("recover_restore", detail),
+            Ok(None) => {}
+            Err(e) => return Err(steps.fail("recover_restore", e, false)),
+        }
         match claim_data(ctx, &report, &statuses, provider.as_ref()) {
             Ok(moved) => warnings.extend(moved),
             Err(e) => return Err(steps.fail("data", e, false)),
@@ -1344,12 +1424,12 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     // The labels this checkout's session had, with those given now added or replacing them.
     let mut labels = previous.as_ref().map(|p| p.labels.clone()).unwrap_or_default();
     labels.extend(opts.labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let (ttl_secs, owner_pid) = lease.resolve_with_previous(
-        report.default_ttl_secs,
-        previous.as_ref().and_then(|p| p.lease.as_ref()),
-        pid_alive,
-    );
-    let lease = (ttl_secs.is_some() || owner_pid.is_some()).then_some(Lease { ttl_secs, owner_pid, renewed_at: stamp });
+    let previous_lease = previous.as_ref().and_then(|p| p.lease.as_ref());
+    // A previous owner is kept unless it is shown to have exited (one whose state cannot be told
+    // is kept, as the lease it is part of would be).
+    let (ttl_secs, owner_pid) = lease.resolve_with_previous(report.default_ttl_secs, previous_lease, |_| previous_lease.is_some_and(|l| !l.owner_exited()));
+    let owner = bind_owner(lease.owner_pid, owner_pid, previous_lease, crate::lease::OwnerIdentity::observe);
+    let lease = (ttl_secs.is_some() || owner_pid.is_some()).then_some(Lease { ttl_secs, owner_pid, owner, renewed_at: stamp });
     let mut checks = Vec::new();
     if !report.stack.services.is_empty() {
         // Ownership is recorded before anything starts. If start or verification fails, or the
@@ -1386,6 +1466,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
                 provider: provider.clone(),
                 project_dir_id,
                 project_dir_created,
+                project_location: project_location.clone(),
                 labels: labels.clone(),
             };
             // Written once, with what the supervisor already shows (one synced write fewer).
@@ -1487,6 +1568,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
         provider: if report.stack.services.is_empty() { None } else { provider },
         project_dir_id,
         project_dir_created,
+        project_location,
         labels,
     };
     // The same verified instance found running again changes only when it was last verified
@@ -1610,6 +1692,7 @@ fn claim_each(
     claimed: &mut Vec<crate::datadirs::Entry>,
 ) -> Result<()> {
     let token = token.to_string();
+    let project_at = crate::checkout::Recorded::of(&ctx.root);
     for daemon in statuses {
         let Some(dir) = daemon.data_dir.as_deref().map(PathBuf::from) else { continue };
         let running = matches!(daemon.status.as_str(), "running" | "starting") || daemon.pid.is_some_and(pid_alive);
@@ -1621,7 +1704,16 @@ fn claim_each(
         // Where this checkout's data is, so `gc` can find it once the checkout is deleted.
         let supervisor = provider.map(|p| crate::datadirs::Supervisor { pitchfork: p.pitchfork.clone(), state_dir: p.state_dir.clone(), id: daemon.id.clone().unwrap_or_else(|| daemon.name.clone()) });
         let (location, identity) = crate::datadirs::locate(&dir);
-        let entry = crate::datadirs::Entry { project: ctx.root.clone(), service: daemon.name.clone(), dir: dir.clone(), checkout: token.clone(), supervisor, location, identity };
+        let entry = crate::datadirs::Entry {
+            project: ctx.root.clone(),
+            service: daemon.name.clone(),
+            dir: dir.clone(),
+            checkout: token.clone(),
+            supervisor,
+            location,
+            identity,
+            project_at: project_at.clone(),
+        };
         if running || owner.as_deref() == Some(token.as_str()) {
             if owner.as_deref() == Some(token.as_str()) {
                 claimed.push(entry);
@@ -2304,6 +2396,9 @@ fn restart_within(ctx: &Ctx, services: &[String], changed_only: bool) -> Result<
     if has_active_executions(&session) {
         return Err(busy(&session, "restart"));
     }
+    // Data a snapshot restore left to finish or undo is never started on or rebound here: that
+    // is for `up` or the snapshot command, which confirm every service it touched stopped.
+    crate::snapshot::refuse_pending(&ctx.state, &ctx.root, "restart")?;
     let report = ctx.compile(true)?;
     refuse_root(&report)?;
     mise::trust_once(&ctx.state, &ctx.root)?;
@@ -2434,7 +2529,10 @@ pub struct StoppedReport {
 
 /// Run `operation` with the named services confirmed stopped, under the project lock, then
 /// start and verify again those that were running (for snapshots, which copy data
-/// directories). Stopping and starting are `restart`'s: services that depend on a stopped one
+/// directories). The services an interrupted snapshot restore of this checkout names (see
+/// [`crate::snapshot::journaled`]) are confirmed stopped with them, since the operation finishes
+/// that restore first; one the configuration no longer defines cannot be stopped from here, and
+/// must already be shown not to run. `operation` gets every service confirmed stopped. Stopping and starting are `restart`'s: services that depend on a stopped one
 /// are stopped first and started after it, each service's `setup` runs before it starts, and
 /// the supervisor this environment names is the one addressed. `operation` gets the compiled
 /// report and the supervisor listing taken once they stopped. Services that run must belong to
@@ -2444,7 +2542,7 @@ pub struct StoppedReport {
 pub fn with_stopped(
     ctx: &Ctx,
     names: &[String],
-    operation: impl FnOnce(&Report, &[DaemonStatus]) -> Result<Value>,
+    operation: impl FnOnce(&Report, &[DaemonStatus], &[String]) -> Result<Value>,
 ) -> Result<StoppedReport> {
     let _deadline = crate::process::deadline_scope(Some(startup_deadline(DEFAULT_STARTUP_TIMEOUT)?));
     let mut steps = Steps::default();
@@ -2468,12 +2566,27 @@ pub fn with_stopped(
         return Err(StackError::new("session_stale", "these services were started by an older Stack under Pitchfork")
             .hint("run `stack up` (or `stack down`) first, then retry"));
     }
+    // Read under the project lock, which every restore holds while it writes its journal.
+    let mut confirm: Vec<String> = names.to_vec();
+    for service in crate::snapshot::journaled(&ctx.state, &ctx.root)?.unwrap_or_default() {
+        if !confirm.contains(&service) {
+            confirm.push(service);
+        }
+    }
     let statuses = listing(ctx, &report);
     let live = |n: &String| {
         statuses.iter().any(|d| d.name == *n && may_run(d))
             || session.as_ref().and_then(|s| s.services.get(n)).is_some_and(|r| r.pid.is_some_and(pid_alive))
     };
-    let mut stopping: Vec<String> = names.iter().filter(|n| live(n)).cloned().collect();
+    let undefined: Vec<&str> = confirm.iter().filter(|n| !report.stack.services.contains_key(*n) && live(n)).map(String::as_str).collect();
+    if !undefined.is_empty() {
+        return Err(StackError::new(
+            "stop_unconfirmed",
+            format!("an interrupted snapshot restore covers {}, which stack.toml no longer defines and which may still run; no data was touched", undefined.join(", ")),
+        )
+        .hint("run `stack down`, which stops what it can show is this checkout's, then retry"));
+    }
+    let mut stopping: Vec<String> = confirm.iter().filter(|n| report.stack.services.contains_key(*n) && live(n)).cloned().collect();
     if !stopping.is_empty() {
         let current = session.as_ref().is_some_and(|s| !s.launching && same_config(s, ctx, &report));
         if !current {
@@ -2494,7 +2607,7 @@ pub fn with_stopped(
     }
     // The supervisor must agree that nothing named still runs before any data is touched.
     let stopped = listing(ctx, &report);
-    let still: Vec<&str> = names
+    let still: Vec<&str> = confirm
         .iter()
         .filter(|n| stopped.iter().any(|d| d.name == **n && may_run(d)))
         .map(String::as_str)
@@ -2513,7 +2626,7 @@ pub fn with_stopped(
             .details(unresolved);
         return Err(steps.fail("confirm_stopped", err, !stopping.is_empty()));
     }
-    let outcome = operation(&report, &stopped);
+    let outcome = operation(&report, &stopped, &confirm);
     let result = match &outcome {
         Ok(v) => {
             steps.ok("copy", v.clone());
@@ -2525,6 +2638,20 @@ pub fn with_stopped(
         }
     };
     let mut checks = Vec::new();
+    // Data a restore could not finish (or put back) is not started on: the services stay
+    // stopped until the restore is finished or undone (see `snapshot::recover_restore`).
+    let left_stopped = matches!(&outcome, Err(e) if e.code == "restore_incomplete");
+    if left_stopped {
+        if let Some(mut session) = session.take().filter(|_| !stopping.is_empty()) {
+            for name in &stopping {
+                if let Some(record) = session.services.get_mut(name) {
+                    record.pid = None;
+                    record.started_at_ms = None;
+                }
+            }
+            let _ = save(ctx, &session);
+        }
+    }
     if let Some(mut session) = session.filter(|_| !stopping.is_empty()) {
         let started_at = now_ms();
         for name in &stopping {
@@ -2574,7 +2701,11 @@ pub fn with_stopped(
         Err(e) => {
             let changed = !stopping.is_empty();
             // The failed copy step is already recorded; attach the progress record.
-            Err(e.with_detail(json!({ "steps": steps.0, "retry_safe": true, "changed": changed })))
+            let mut progress = json!({ "steps": steps.0, "retry_safe": true, "changed": changed });
+            if left_stopped {
+                progress["left_stopped"] = json!(stopping);
+            }
+            Err(e.with_detail(progress))
         }
     }
 }
@@ -2738,6 +2869,26 @@ pub struct LogsReport {
     pub started_at: Option<u64>,
     /// Only lines since `started_at` were requested.
     pub since_start: bool,
+    /// Where this read got to in the service's log: passed back as `cursor`, the next read
+    /// returns only what was written since (see [`crate::logs::Cursor`]). Absent for output an
+    /// older Stack's provider kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// When the supervisor read each line (Unix ms; 0 for a line it did not stamp), on reads
+    /// given a cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamps: Option<Vec<u64>>,
+    /// Output a read from a cursor could not return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap: Option<supervisor::Gap>,
+    /// A read from a cursor stopped at its limit: read again from `cursor` for the rest.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
+    /// Each line's stamp, and the position in the log after the last line, for the caller.
+    #[serde(skip)]
+    pub stamps: Vec<u64>,
+    #[serde(skip)]
+    pub pos: Option<supervisor::LogPos>,
 }
 
 /// The last `tail` lines of a service's output, as the supervisor stored them. Bounded in
@@ -2774,7 +2925,7 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
         return Err(StackError::new("logs_failed", format!("no recorded start time for {service}"))
             .hint("sessions started before stack 0.1.18 lack one; `stack restart` records it"));
     }
-    let (lines, truncated) = match legacy {
+    let (stamps, lines, truncated, pos) = match legacy {
         // A session an older Stack started: Pitchfork kept its output, stamped in whole seconds.
         Some(provider) => {
             let since = match (since_start, started_at) {
@@ -2785,7 +2936,8 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
                 StackError::new("logs_failed", format!("no supervisor id was recorded for {service}")).hint("run `stack up`")
             })?;
             let out = mise::legacy_logs(provider.legacy().expect("legacy"), &provider.state_dir, &id, tail, since)?;
-            (out.stdout.lines().map(str::to_string).collect::<Vec<_>>(), out.stdout_truncated)
+            let lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
+            (vec![0; lines.len()], lines, out.stdout_truncated, None)
         }
         // Stack's supervisor stamps each line in milliseconds: since the start is exact.
         None => {
@@ -2793,7 +2945,9 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
                 (true, Some(at)) => Some(since.map_or(at, |s| (s * 1000).max(at))),
                 _ => since.map(|s| s * 1000),
             };
-            supervisor::logs(&dir, service, tail, since_ms).map_err(|e| StackError::new("logs_failed", format!("cannot read {service}'s output: {e}")))?
+            let (records, truncated, pos) = supervisor::tail(&dir, service, tail, since_ms).map_err(|e| StackError::new("logs_failed", format!("cannot read {service}'s output: {e}")))?;
+            let (stamps, lines) = records.into_iter().map(|r| (r.at_ms, r.line)).unzip();
+            (stamps, lines, truncated, pos)
         }
     };
     let skip = lines.len().saturating_sub(tail);
@@ -2803,7 +2957,26 @@ pub fn logs_since(ctx: &Ctx, service: &str, tail: usize, since_start: bool, sinc
         truncated,
         started_at,
         since_start,
+        cursor: None,
+        timestamps: None,
+        gap: None,
+        more: false,
+        stamps: stamps[skip..].to_vec(),
+        pos,
     })
+}
+
+/// When Stack last started `service`'s current process (Unix ms), if recorded.
+pub fn started_ms(ctx: &Ctx, service: &str) -> Result<Option<u64>> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    Ok(load(ctx)?.as_ref().and_then(|s| s.services.get(service)).and_then(|r| r.started_at_ms))
+}
+
+/// Whether this checkout's services were started by an older Stack under Pitchfork, which
+/// keeps their output itself (no cursor reads it).
+pub fn legacy_logs(ctx: &Ctx) -> Result<bool> {
+    let _guard = project_lock(&ctx.state, &ctx.root)?;
+    Ok(legacy_provider(load(ctx)?.as_ref()).is_some())
 }
 
 /// `unknown_service`, naming the services the project does define.
@@ -2839,9 +3012,17 @@ pub(crate) fn dir_created(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.created().ok()
 }
 
+/// Whether the directory at `path` is not shown to be the one `session` recorded, so `up` there
+/// must not adopt (or stop) its services: another inode, or (once recorded) another birth time
+/// or none. A device number alone is not compared: a reboot can renumber a filesystem
+/// (removable and network volumes, btrfs subvolumes), and the same inode with the same birth
+/// time is the same directory. Under another device, though, only a birth time recorded and
+/// matching shows that: every volume's root has the same few inodes, so the same inode alone
+/// may be another volume mounted where the checkout was. (Whether the old checkout is gone is
+/// [`checkout_state`]'s to say.)
 fn project_replaced(session: &Session, path: &Path) -> bool {
-    if let (Some(recorded), Some(current)) = (session.project_dir_id, dir_id(path)) {
-        if recorded != current {
+    if let (Some((dev, recorded)), Some((now_dev, current))) = (session.project_dir_id, dir_id(path)) {
+        if recorded != current || (dev != now_dev && session.project_dir_created.is_none()) {
             return true;
         }
     }
@@ -4722,7 +4903,12 @@ fn plan(ctx: &Ctx, target: Target<'_>) -> Result<ExecPlan> {
         .filter(|c| !c.ready)
         .map(|c| c.service.as_str())
         .collect();
-    if !unverified.is_empty() {
+    // Stack's own list, never the caller's: a shell that loaded `stack env` while a service was
+    // unverified still carries the list it got, which no longer holds once every one verifies.
+    if unverified.is_empty() {
+        env.shift_remove("STACK_UNVERIFIED");
+        removed.push("STACK_UNVERIFIED".into());
+    } else {
         env.insert("STACK_UNVERIFIED".into(), unverified.join(","));
     }
     let granted = if grant.keys.is_empty() {
@@ -4985,7 +5171,7 @@ pub fn renew_with(ctx: &Ctx, ttl_secs: Option<u64>) -> Result<Session> {
         StackError::new("no_session", "no session for this project").hint("run `stack up`")
     })?;
     if let (None, Some(ttl)) = (&session.lease, ttl_secs) {
-        session.lease = Some(Lease { ttl_secs: Some(ttl), owner_pid: None, renewed_at: now() });
+        session.lease = Some(Lease { ttl_secs: Some(ttl), owner_pid: None, owner: None, renewed_at: now() });
     }
     let lease = session.lease.as_mut().ok_or_else(|| {
         StackError::new(
@@ -5018,11 +5204,17 @@ fn renew_in_status(ctx: &Ctx, session: &mut Session) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct GcEntry {
     pub project: PathBuf,
     pub reason: String,
+    /// Every service of the session was confirmed stopped. False for an entry `left_alone`,
+    /// where nothing was stopped (and that is no failure).
     pub stopped: bool,
+    /// Whether the checkout is still there cannot be shown (`reason` says why): nothing of it was
+    /// stopped, reclaimed or released, and nothing needs to be until it can.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub left_alone: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Per-service outcomes for a gone project.
@@ -5088,21 +5280,23 @@ fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcE
         state: state.to_path_buf(),
     };
     let consumed = reconcile_executions(state, &ctx.root, &mut session);
+    let checkout = checkout_state(&session);
+    // A checkout whose presence cannot be shown is neither reclaimed as gone nor stopped as
+    // expired: both would act on a directory that may only be out of reach for now.
+    if let CheckoutState::Unavailable(_) = checkout {
+        return Ok(None);
+    }
     // Saved only for a project still there: a save would recreate a deleted checkout's
     // `.stack/`. A gone project's completion records go with its index.
-    if !consumed.is_empty() && project_gone(&session).is_none() {
+    if !consumed.is_empty() && checkout == CheckoutState::Present {
         save(&ctx, &session)?;
         forget_completions(&consumed);
     }
     // TTL describes idle time; an executing command is not idle. Owner death still
     // follows the explicit runner policy even if one of its commands has survived.
-    let owner_dead = session
-        .lease
-        .as_ref()
-        .and_then(|l| l.owner_pid)
-        .is_some_and(|p| !pid_alive(p));
+    let owner_dead = session.lease.as_ref().is_some_and(Lease::owner_exited);
     let busy = !owner_dead && has_active_executions(&session);
-    if let Some(reason) = project_gone(&session) {
+    if let Some(reason) = checkout.gone() {
         if busy {
             return Ok(None);
         }
@@ -5121,6 +5315,7 @@ fn gc_locked(state: &Path, path: &Path, stop_orphans: bool) -> Result<Option<GcE
         stopped: result.is_ok(),
         error: result.err().map(|e| e.to_string()),
         services: Vec::new(),
+        left_alone: false,
     }))
 }
 
@@ -5142,14 +5337,19 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         crate::provider::env_cache::forget(state, &reservation.project);
         note(&reservation.project, &reservation.service, format!("port {} released", reservation.port));
     }
+    // Data records of checkouts still there record where they are now (best effort: a record
+    // that cannot be completed now is judged as it is).
+    let _ = crate::datadirs::refresh_checkouts(state);
     let mut settled = Vec::new();
     for entry in crate::datadirs::entries(state)? {
-        if entry.project.exists() || recorded(&entry.project) {
+        // Only a checkout shown to be gone: one out of reach for now (its volume not mounted, a
+        // lookup refused) keeps its data.
+        if recorded(&entry.project) || !entry.checkout_gone() {
             continue;
         }
         // A checkout created at the path meanwhile takes this lock for `up`; checked again under it.
         let _guard = project_lock(state, &entry.project)?;
-        if entry.project.exists() {
+        if !entry.checkout_gone() {
             continue;
         }
         let (outcome, done) = reclaim_data(&entry, remove_data);
@@ -5164,12 +5364,12 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
     // A supervisor still running for it (every service stopped one by one, then the checkout
     // removed) is shut down first, under the checkout's lock, as `down` would.
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
-    for (dir, project) in supervisor::orphaned_dirs(state) {
+    for (dir, project, at) in supervisor::orphaned_dirs(state) {
         if recorded(&project) {
             continue;
         }
         let _guard = project_lock(state, &project)?;
-        if project.exists() || recorded(&project) {
+        if !crate::checkout::gone(&project, &at) || recorded(&project) {
             continue;
         }
         match supervisor::shutdown(&dir) {
@@ -5195,7 +5395,7 @@ fn reclaim_deleted(state: &Path, remove_data: bool) -> Result<Vec<GcEntry>> {
         .into_iter()
         .map(|(project, services)| {
             let errors: Vec<String> = services.iter().filter_map(|s| s.error.clone()).collect();
-            GcEntry { project, reason: "project directory deleted".into(), stopped: errors.is_empty(), error: (!errors.is_empty()).then(|| errors.join("; ")), services }
+            GcEntry { project, reason: "project directory deleted".into(), stopped: errors.is_empty(), error: (!errors.is_empty()).then(|| errors.join("; ")), services, left_alone: false }
         })
         .collect())
 }
@@ -5246,7 +5446,14 @@ fn purge_locked(ctx: &Ctx) -> Result<PurgeReport> {
 /// The directory is only ever the one `up` recorded, reached by its recorded location with no
 /// link followed (see [`crate::datadirs::hold`]); its marker is read, and it is removed, through
 /// the handles that check opened, never by looking a path up again.
+///
+/// Nothing on another mount is removed: a data directory that is a mount point, or holds one, is
+/// kept and reported (see [`crate::datadirs::Held::remove`]).
 fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) {
+    reclaim_data_with(entry, remove, |held| held.remove(MARKER_SUFFIX))
+}
+
+fn reclaim_data_with(entry: &crate::datadirs::Entry, remove: bool, removal: impl FnOnce(crate::datadirs::Held) -> std::io::Result<u64>) -> (String, bool) {
     use crate::datadirs::Found;
     let dir = &entry.dir;
     let shown = dir.display();
@@ -5276,25 +5483,115 @@ fn reclaim_data(entry: &crate::datadirs::Entry, remove: bool) -> (String, bool) 
     if !remove {
         return (format!("data kept in {shown} ({} bytes); `stack gc --reclaim-data` removes it", held.size()), false);
     }
-    match held.remove(MARKER_SUFFIX) {
+    match removal(held) {
         Ok(bytes) => (format!("data in {shown} removed ({bytes} bytes)"), true),
         Err(e) => (format!("data in {shown} could not be removed: {e}"), false),
     }
 }
 
-/// [`project_gone`], for the machine-wide commands (see [`crate::fleet`]).
-pub fn checkout_gone(session: &Session) -> Option<&'static str> {
-    project_gone(session)
+/// Whether a session's checkout is still the directory at its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutState {
+    Present,
+    /// Deleted, or replaced by another directory at the same path (which must never inherit the
+    /// authority to stop this session's services): why.
+    Gone(&'static str),
+    /// Neither can be shown (a lookup refused or failing, a volume that may not be mounted):
+    /// why. Nothing is reclaimed for it, and it is not taken to be there either.
+    Unavailable(String),
 }
 
-/// Why a session's project no longer exists: deleted, or replaced by another directory at the
-/// same path (which must never inherit the authority to stop this session's services).
-fn project_gone(session: &Session) -> Option<&'static str> {
-    if !session.project.exists() {
-        return Some("project directory deleted");
+impl CheckoutState {
+    /// The reason, when the checkout is gone.
+    pub fn gone(&self) -> Option<&'static str> {
+        match self {
+            Self::Gone(reason) => Some(reason),
+            _ => None,
+        }
     }
-    project_replaced(session, &session.project).then_some("project directory replaced")
 }
+
+/// [`checkout_state`], for the machine-wide commands (see [`crate::fleet`]).
+pub fn checkout_gone(session: &Session) -> Option<&'static str> {
+    checkout_state(session).gone()
+}
+
+/// Whether `session`'s checkout is still there (see [`CheckoutState`]). Deleted only when
+/// [`crate::checkout::presence`] can show it, judged by the mount the directory was on at
+/// launch. What is at the path is:
+/// - the checkout, when it is the very directory: the same device and inode (and birth time
+///   where one was recorded), or the same inode and recorded birth time under a renumbered
+///   device;
+/// - unavailable when that cannot be told: its birth time, recorded, cannot be read now; the
+///   same inode under another device with no birth time recorded (every volume's root has the
+///   same few inodes); another device and inode (a mount point whose volume is not mounted, or
+///   the volume mounted again);
+/// - replaced only when it is another directory on the same filesystem that is on the very mount
+///   the checkout was on (see [`crate::checkout::on_mount`]: the mount's root, its birth time and,
+///   on Linux, its id). Another directory on another mount is what a checkout that was itself a
+///   mount point (a bind mount of the same filesystem included) leaves while that is not
+///   mounted: unavailable. A session that recorded no mount is replaced on the device alone only
+///   where every mount has a device of its own (not Linux).
+pub fn checkout_state(session: &Session) -> CheckoutState {
+    use crate::checkout::Presence;
+    let path = &session.project;
+    let recorded = session.project_dir_id;
+    let at = crate::checkout::Recorded { device: recorded.map(|(dev, _)| dev), location: session.project_location.clone() };
+    match crate::checkout::presence(path, &at) {
+        Presence::Absent => return CheckoutState::Gone("project directory deleted"),
+        Presence::Unknown(why) => return CheckoutState::Unavailable(why),
+        Presence::Present => {}
+    }
+    let Some((dev, ino)) = recorded else { return CheckoutState::Present };
+    let Some((now_dev, now_ino)) = dir_id(path) else {
+        return CheckoutState::Unavailable(format!("{} cannot be looked up", path.display()));
+    };
+    let shown = path.display();
+    if now_ino == ino {
+        match (session.project_dir_created, dir_created(path)) {
+            (Some(was), Some(now)) if was == now => return CheckoutState::Present,
+            // Recorded without a birth time: the device and inode are all there is to go by.
+            (None, _) if now_dev == dev => return CheckoutState::Present,
+            (Some(_), None) => {
+                return CheckoutState::Unavailable(format!(
+                    "{shown} has the inode its session recorded, but no birth time to compare with the one recorded: whether \
+                     it is the same directory cannot be told"
+                ));
+            }
+            (None, _) => {
+                return CheckoutState::Unavailable(format!(
+                    "{shown} has the inode its session recorded, on another filesystem (device {now_dev}, not {dev}), and no \
+                     birth time was recorded to tell that directory renumbered from another volume mounted there"
+                ));
+            }
+            // Another birth time: another directory that was given the inode.
+            (Some(_), Some(_)) => {}
+        }
+    }
+    if now_dev != dev {
+        return CheckoutState::Unavailable(format!(
+            "{shown} is on another filesystem (device {now_dev}) than when its session started (device {dev}): a mount point \
+             whose volume is not mounted, or the volume mounted again"
+        ));
+    }
+    match &session.project_location {
+        Some(was) => match crate::checkout::on_mount(path, was) {
+            Ok(()) => CheckoutState::Gone("project directory replaced"),
+            Err(why) => CheckoutState::Unavailable(format!(
+                "{shown} is another directory than when its session started, but {why} (the checkout may have been a mount \
+                 point that is not mounted right now)"
+            )),
+        },
+        None if crate::mounts::BINDS => CheckoutState::Unavailable(format!(
+            "{shown} is another directory than when its session started, on the same filesystem, but its session (an earlier \
+             Stack's) recorded no mount: a bind mount of that filesystem at the path, not mounted right now, leaves the same \
+             behind. If it is mounted again, it is found as it was; if it was deleted, see records an earlier Stack kept \
+             under `stack gc` in the commands reference"
+        )),
+        None => CheckoutState::Gone("project directory replaced"),
+    }
+}
+
 
 /// Reconcile a gone project without signalling a daemon whose identity can be replaced.
 /// Pitchfork has no atomic compare-and-stop operation, so live or uncertain services retain
@@ -5339,6 +5636,7 @@ fn reclaim_gone(state: &Path, index: &Path, session: Session, reason: &str, stop
         stopped: problems.is_empty(),
         error: (!problems.is_empty()).then(|| problems.join("; ")),
         services,
+        left_alone: false,
     }
 }
 
@@ -5403,16 +5701,17 @@ fn reconcile_gone(provider: Option<&ProviderRecord>, record: &ServiceRecord, lau
                 return unconfirmed(format!("supervisor state {status:?} is not confirmed terminal cleanup for {id}; record retained"));
             }
             let Some(recorded) = record.pid else {
-                return unconfirmed(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.unwrap_or(0)));
+                return unconfirmed(format!("{id} is running as pid {}, but no verified pid was recorded for it; not signalled", pid.map_or_else(|| "?".into(), |p| p.to_string())));
             };
             if pid != Some(recorded) {
                 return unconfirmed(format!(
                     "{id} now runs pid {}, not the recorded pid {recorded} (restarted, or the path was reused); not signalled",
-                    pid.unwrap_or(0)
+                    pid.map_or_else(|| "?".into(), |p| p.to_string())
                 ));
             }
             if port != Some(record.port) {
-                return unconfirmed(format!("{id} now uses port {}, not the recorded port {}; not signalled", port.unwrap_or(0), record.port));
+                let now = port.map_or_else(|| "no port the supervisor reports".to_string(), |p| format!("port {p}"));
+                return unconfirmed(format!("{id} now uses {now}, not the recorded port {}; not signalled", record.port));
             }
             Err(Unconfirmed {
                 why: format!(
@@ -5486,11 +5785,21 @@ pub fn gc_checked(state: &Path, remove_data: bool, stop_orphans: bool) -> Result
     let pass = gc_with(state, &GcOptions { stop_orphans, ..GcOptions::default() })?;
     let mut entries = pass.reclaimed;
     entries.extend(pass.unreadable);
+    // A checkout whose presence cannot be shown is left alone: nothing of it was stopped, so
+    // `stopped` is false, and `left_alone` says that is not a failure (Stack 0.1.24 and earlier
+    // reported `stopped: true` for these).
+    entries.extend(pass.skipped.into_iter().filter(|s| s.skipped == "unavailable").map(|s| GcEntry {
+        project: s.project,
+        reason: format!("checkout unavailable: {}", s.reason),
+        stopped: false,
+        left_alone: true,
+        ..GcEntry::default()
+    }));
     entries.extend(reclaim_deleted(state, remove_data)?);
     // Postgres templates nothing can use any more (see `pgtemplate`): a cache, removed quietly;
     // `gc --dry-run` lists them.
     crate::pgtemplate::collect(state, false);
-    let failed = entries.iter().filter(|e| !e.stopped).count();
+    let failed = entries.iter().filter(|e| !e.stopped && !e.left_alone).count();
     if failed == 0 {
         return Ok(entries);
     }
@@ -6506,7 +6815,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let token = |c: char| c.to_string().repeat(64);
         let me = std::process::id();
-        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, owner: None, renewed_at: 100 }), ..Session::default() };
         for t in ['1', '2', '4', '6'] {
             session.active_executions.insert(token(t), me);
         }
@@ -6554,7 +6863,7 @@ mod tests {
         };
         let (finished, crashed) = ("f".repeat(64), "c".repeat(64));
         let (finished_pid, crashed_pid): (u32, u32) = (exited(()), exited(()));
-        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at: 100 }), ..Session::default() };
+        let mut session = Session { id: "s1".into(), lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, owner: None, renewed_at: 100 }), ..Session::default() };
         session.active_executions.insert(finished.clone(), finished_pid);
         session.active_executions.insert(crashed.clone(), crashed_pid);
         let path = dir.join(format!("{finished}.json"));
@@ -6590,7 +6899,7 @@ mod tests {
         let mut session = Session {
             id: "s1".into(),
             project: root.clone(),
-            lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, renewed_at }),
+            lease: Some(Lease { ttl_secs: Some(60), owner_pid: None, owner: None, renewed_at }),
             ..Session::default()
         };
         session.active_executions.insert("f".repeat(64), coordinator.id());
@@ -6937,6 +7246,7 @@ mod tests {
         let lease = Lease {
             ttl_secs: Some(60),
             owner_pid: None,
+            owner: None,
             renewed_at: 1000,
         };
         assert!(lease.expired(1060).is_none());
@@ -6945,6 +7255,7 @@ mod tests {
         let none = Lease {
             ttl_secs: None,
             owner_pid: None,
+            owner: None,
             renewed_at: 0,
         };
         assert!(none.expired(u64::MAX).is_none());
@@ -6952,6 +7263,7 @@ mod tests {
         let me = Lease {
             ttl_secs: None,
             owner_pid: Some(std::process::id()),
+            owner: None,
             renewed_at: 0,
         };
         assert!(
@@ -6961,6 +7273,7 @@ mod tests {
         let gone = Lease {
             ttl_secs: None,
             owner_pid: Some(u32::MAX - 1),
+            owner: None,
             renewed_at: 0,
         };
         assert!(gone.expired(now()).unwrap().contains("exited"));
@@ -7025,6 +7338,34 @@ mod tests {
     }
 
     #[test]
+    fn checks_show_people_their_redacted_urls_and_never_a_made_up_port() {
+        let check = |ready: bool, port: Option<u16>, endpoints: &[(&str, &str)]| Check {
+            service: "db".into(),
+            ready,
+            port,
+            pid: None,
+            identity: None,
+            reason: None,
+            reason_code: None,
+            withheld: Vec::new(),
+            endpoints: endpoints.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            changed_since_start: Vec::new(),
+            watch_incomplete: false,
+            checked_at: 0,
+            data_dir: None,
+            provider_id: None,
+        };
+        let pg = [("DATABASE_URL", "postgresql://app:***@127.0.0.1:41000/app"), ("PGHOST", "127.0.0.1"), ("PGPORT", "41000")];
+        // URLs when there are any; the rest are the same address spelled for one client.
+        assert_eq!(check(true, Some(41000), &pg).endpoint_lines(), ["DATABASE_URL=postgresql://app:***@127.0.0.1:41000/app"]);
+        assert_eq!(check(true, Some(41000), &pg[1..]).endpoint_lines(), ["PGHOST=127.0.0.1", "PGPORT=41000"]);
+        // Not verified: nothing, whatever the map holds.
+        assert!(check(false, Some(41000), &pg).endpoint_lines().is_empty());
+        assert_eq!(check(true, Some(41000), &[]).port_label(), "41000");
+        assert_eq!(check(true, None, &[]).port_label(), "-");
+    }
+
+    #[test]
     fn url_passwords_are_masked_and_nothing_else_changes() {
         for (key, value, masked) in [
             ("DATABASE_URL", "postgresql://u:p@h:5432/db", Some("postgresql://u:***@h:5432/db")),
@@ -7042,6 +7383,23 @@ mod tests {
         ] {
             assert_eq!(sanitize_endpoint(key, value).as_deref(), masked, "{key}={value}");
         }
+    }
+
+    /// `--owner-pid` binds the owner to the process it is now; a kept owner stays bound as it
+    /// was, and a bare PID an earlier Stack recorded stays bare; a renewal keeps the binding.
+    #[test]
+    fn an_owner_is_bound_when_named_and_kept_as_it_was() {
+        use crate::lease::OwnerIdentity;
+        let observed = |pid: u32| OwnerIdentity { started: Some(u64::from(pid) * 10), boot: Some("b".into()), pid_ns: None };
+        let bound = Lease { ttl_secs: None, owner_pid: Some(7), owner: Some(observed(7)), renewed_at: 1 };
+        let legacy = Lease { owner: None, ..bound.clone() };
+        assert_eq!(bind_owner(Some(9), None, Some(&bound), observed), Some(observed(9)), "named now: bound now");
+        assert_eq!(bind_owner(Some(7), None, Some(&legacy), observed), Some(observed(7)), "named again: bound, even over a bare PID");
+        assert_eq!(bind_owner(None, Some(7), Some(&bound), |_| panic!("not observed again")), Some(observed(7)));
+        assert_eq!(bind_owner(None, Some(7), Some(&legacy), |_| panic!("never bound to whatever has the PID")), None);
+        assert_eq!(bind_owner(None, None, Some(&bound), observed), None);
+        let renewed = Lease { renewed_at: 99, ..bound.clone() };
+        assert_eq!(renewed.owner, bound.owner);
     }
 
     #[test]
@@ -7159,7 +7517,7 @@ mod tests {
         let session = |pid: u32, at: u64, ttl: Option<u64>| Session {
             id: "s".into(),
             services: IndexMap::from([("db".to_string(), record(pid, at))]),
-            lease: ttl.map(|ttl| Lease { ttl_secs: Some(ttl), owner_pid: None, renewed_at: at }),
+            lease: ttl.map(|ttl| Lease { ttl_secs: Some(ttl), owner_pid: None, owner: None, renewed_at: at }),
             ..Default::default()
         };
         let before = session(10, 100, Some(60));
@@ -7463,6 +7821,305 @@ mod native_records {
         assert_eq!(serde_json::to_value(&data).unwrap()["pitchfork"], "");
     }
 
+    /// A checkout found where it was, on another filesystem than at launch, is a mount point
+    /// (or a volume mounted again), never another directory that took its path; the very
+    /// directory under a renumbered device is still it, but only by a birth time recorded.
+    #[test]
+    fn only_another_directory_on_the_same_mount_replaces_a_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+        let (dev, ino) = dir_id(&root).unwrap();
+        let born = dir_created(&root);
+        let at = |id: (u64, u64)| Session { project: root.clone(), project_dir_id: Some(id), project_dir_created: born, ..Session::default() };
+        let unavailable = |session: &Session| match checkout_state(session) {
+            CheckoutState::Unavailable(why) => why,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(checkout_state(&at((dev, ino))), CheckoutState::Present);
+        assert!(unavailable(&at((dev.wrapping_add(1), ino + 1))).contains("on another filesystem"));
+        assert!(project_replaced(&at((dev, ino + 1)), &root));
+        // An earlier Stack's session, which recorded no mount: another directory on the same
+        // filesystem replaced it only where mounts cannot share a device; on Linux it may be what
+        // a same-filesystem bind mount at the path leaves while not mounted.
+        if crate::mounts::BINDS {
+            assert!(unavailable(&at((dev, ino + 1))).contains("recorded no mount"));
+        } else {
+            assert_eq!(checkout_state(&at((dev, ino + 1))), CheckoutState::Gone("project directory replaced"));
+        }
+        if let Some(born) = born {
+            assert_eq!(checkout_state(&at((dev.wrapping_add(1), ino))), CheckoutState::Present, "renumbered: same inode and birth time");
+            assert!(!project_replaced(&at((dev.wrapping_add(1), ino)), &root), "up adopts it too");
+            // Another birth time: on the same filesystem another directory given the inode, on
+            // another one another volume.
+            let reborn = |dev| Session { project_dir_created: Some(born + std::time::Duration::from_secs(1)), ..at((dev, ino)) };
+            if !crate::mounts::BINDS {
+                assert_eq!(checkout_state(&reborn(dev)), CheckoutState::Gone("project directory replaced"), "same inode, another birth time");
+            }
+            assert!(unavailable(&reborn(dev.wrapping_add(1))).contains("on another filesystem"));
+        }
+        // The same inode under another device, no birth time recorded: every volume's root has
+        // the same few inodes, so that may be another volume mounted there. Neither gone nor
+        // adopted.
+        let legacy = Session { project_dir_created: None, ..at((dev.wrapping_add(1), ino)) };
+        assert!(unavailable(&legacy).contains("no birth time was recorded"));
+        assert!(project_replaced(&legacy, &root), "up does not adopt it");
+        let legacy_here = Session { project_dir_created: None, ..at((dev, ino)) };
+        assert_eq!(checkout_state(&legacy_here), CheckoutState::Present);
+        assert_eq!(checkout_session_gone(&root, dev), None);
+        // Recorded on the mount it is on now: another directory there replaced it.
+        let location = crate::checkout::location(&root).unwrap();
+        let on = |location: crate::checkout::Location| Session { project_location: Some(location), ..at((dev, ino + 1)) };
+        assert_eq!(checkout_state(&on(location.clone())), CheckoutState::Gone("project directory replaced"));
+        // Recorded as itself a mount's root (a bind mount of the same filesystem at the path,
+        // say): another directory there now, on another mount, is what that leaves behind while
+        // it is not mounted.
+        let mounted = crate::checkout::Location { mount_root: root.canonicalize().unwrap(), root: [dev, ino], ..location.clone() };
+        assert!(unavailable(&on(mounted)).contains("on another mount"));
+        // The mount root's birth time on one side only, or another one: not shown the same mount.
+        if let Some(root_born) = location.root_born.clone() {
+            assert!(unavailable(&on(crate::checkout::Location { root_born: None, ..location.clone() })).contains("where none was recorded"));
+            let remade = crate::checkout::Location { root_born: Some(format!("{root_born}1")), ..location.clone() };
+            assert!(unavailable(&on(remade)).contains("created at another time"));
+        }
+        // On Linux, another mount id in the same boot and namespace: another mount.
+        if let Some(mount) = location.mount.clone() {
+            let other = crate::checkout::Location { mount: Some(crate::checkout::MountInstance { id: mount.id + 1, unique: mount.unique.map(|u| u + 1), ..mount }), ..location };
+            assert!(unavailable(&on(other)).contains("another mount id"));
+        }
+    }
+
+    fn checkout_session_gone(root: &Path, dev: u64) -> Option<&'static str> {
+        checkout_gone(&Session { project: root.to_path_buf(), project_dir_id: Some((dev, dir_id(root).unwrap().1)), ..Session::default() })
+    }
+
+    /// A checkout whose presence cannot be shown (here its path is gone but the directory above
+    /// it is on another filesystem than the checkout was, as when its volume is not mounted) is
+    /// neither reclaimed as deleted nor stopped as expired, and its ports, identities and data
+    /// stay recorded; once the same absence is on its own filesystem, all of it is reclaimed.
+    #[test]
+    fn a_checkout_out_of_reach_is_left_alone_and_a_deleted_one_is_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let root = tmp.path().join("vol").join("app");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
+        let (_, ino) = dir_id(&root).unwrap();
+        // Where the checkout was, as `up` records it while it is there.
+        let here = crate::checkout::Recorded::of(&root);
+        let location = here.location.clone().expect("a temporary directory's mount can be learned");
+        crate::identity::assign(&state, &root, &["web".to_string()]).unwrap();
+        ports::assign(&state, &root, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        let record = |at: &crate::checkout::Recorded| {
+            let session = Session {
+                id: "s1".into(),
+                project: root.clone(),
+                project_dir_id: Some((at.device.unwrap(), ino)),
+                project_location: at.location.clone(),
+                lease: Some(Lease { ttl_secs: Some(1), owner_pid: None, owner: None, renewed_at: 1 }),
+                ..Session::default()
+            };
+            write_json(&index_path(&state, &root), &session).unwrap();
+            let recorded = serde_json::to_value(at).unwrap();
+            let mut registry: serde_json::Value = read_json(&state.join("ports.json")).unwrap();
+            for r in registry["reservations"].as_array_mut().unwrap() {
+                r["project_device"] = recorded["project_device"].clone();
+                r["project_location"] = recorded["project_location"].clone();
+            }
+            write_json(&state.join("ports.json"), &registry).unwrap();
+            let mut tokens: serde_json::Value = read_json(&state.join("identities.json")).unwrap();
+            for t in tokens["tokens"].as_array_mut().unwrap() {
+                t["project_device"] = recorded["project_device"].clone();
+                t["project_location"] = recorded["project_location"].clone();
+            }
+            write_json(&state.join("identities.json"), &tokens).unwrap();
+            crate::datadirs::forget(&state, |_| true).unwrap();
+            crate::datadirs::record(
+                &state,
+                crate::datadirs::Entry {
+                    project: root.clone(),
+                    service: "web".into(),
+                    dir: tmp.path().join("data"),
+                    checkout: "t1".into(),
+                    supervisor: None,
+                    location: None,
+                    identity: None,
+                    project_at: at.clone(),
+                },
+            )
+            .unwrap();
+        };
+        fs::remove_dir_all(&root).unwrap();
+        // As recorded on another filesystem, its volume not mounted now.
+        let device = here.device.unwrap().wrapping_add(1);
+        let elsewhere = crate::checkout::Recorded { device: Some(device), location: Some(crate::checkout::Location { root: [device, location.root[1]], ..location.clone() }) };
+        record(&elsewhere);
+
+        let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+        assert!(pass.reclaimed.is_empty(), "{:?}", pass.reclaimed);
+        assert_eq!(pass.skipped.iter().map(|s| (s.project.as_path(), s.skipped)).collect::<Vec<_>>(), [(root.as_path(), "unavailable")]);
+        assert!(pass.skipped[0].reason.contains("may not be there"), "{}", pass.skipped[0].reason);
+        assert!(index_path(&state, &root).exists(), "the session record is kept");
+        // Recorded for the checkout: released or removed only once it is shown gone.
+        fs::remove_file(index_path(&state, &root)).unwrap();
+        assert!(reclaim_deleted(&state, true).unwrap().is_empty());
+        assert_eq!(ports::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(crate::datadirs::entries(&state).unwrap().len(), 1);
+        // Another checkout's `up` prunes only checkouts shown gone.
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        ports::assign(&state, &other, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        assert_eq!(crate::identity::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(ports::lookup(&state, &root).unwrap().len(), 1);
+        let plan = gc_pass::gc_plan(&state, true).unwrap();
+        assert!(plan.deleted_checkouts.is_empty() && plan.unavailable.iter().any(|u| u.project == root), "{:?}", plan.unavailable);
+        // `stack gc` reports it, left alone, without failing.
+        let entries = gc_checked(&state, true, false).unwrap();
+        assert!(entries.iter().all(|e| e.project != root || e.left_alone), "nothing reclaimed for it");
+        assert!(entries.iter().filter(|e| e.left_alone).all(|e| !e.stopped), "nothing of it is claimed stopped");
+        // Recorded by an earlier Stack, with no location: never taken for deleted where a bind
+        // mount of the same filesystem would leave the same behind (Linux).
+        if crate::mounts::BINDS {
+            record(&crate::checkout::Recorded { device: here.device, location: None });
+            let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+            assert!(pass.reclaimed.is_empty() && pass.skipped.iter().any(|s| s.project == root && s.reason.contains("only the device")), "{:?}", pass.skipped);
+        }
+
+        // Deleted from its own filesystem: the session goes once nothing of it runs, then its
+        // ports and identities; its data, recorded before Stack could tell which directory it is,
+        // is reported and kept.
+        record(&here);
+        let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+        assert!(pass.skipped.is_empty(), "{:?}", pass.skipped);
+        assert_eq!(pass.reclaimed.iter().map(|e| (e.project.as_path(), e.reason.as_str(), e.stopped)).collect::<Vec<_>>(), [(root.as_path(), "project directory deleted", true)]);
+        assert!(!index_path(&state, &root).exists());
+        let entries = reclaim_deleted(&state, true).unwrap();
+        assert!(entries.iter().any(|e| e.project == root && e.services.iter().any(|s| s.outcome.as_deref().is_some_and(|o| o.contains("released")))), "{entries:?}");
+        assert!(ports::lookup(&state, &root).unwrap().is_empty());
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        assert!(crate::identity::lookup(&state, &root).unwrap().is_empty());
+    }
+
+    /// The lifecycle observation once got wrong: a checkout recorded as its own mount's root (a
+    /// bind mount of the same filesystem at its path, as `up` saw it) goes offline, and its mount
+    /// point, another directory on the mount above, is at the path. `gc` passes while the mount
+    /// point is there and again once it is gone: every record still names the checkout's own
+    /// mount, so its ports, data and identities are never reclaimed by what the mount point was
+    /// on. Deleted from the very mount it was on, they are.
+    #[test]
+    fn a_mount_point_left_where_a_checkout_was_is_never_taken_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let root = tmp.path().join("vol").join("app");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
+        let (dev, ino) = dir_id(&root).unwrap();
+        let here = crate::checkout::Recorded::of(&root);
+        let location = here.location.clone().expect("a temporary directory's mount can be learned");
+        let mounted = crate::checkout::Recorded {
+            device: here.device,
+            location: Some(crate::checkout::Location { mount_root: root.canonicalize().unwrap(), root: [dev, ino.wrapping_add(1000)], root_born: None, ..location }),
+        };
+        crate::identity::assign(&state, &root, &["web".to_string()]).unwrap();
+        ports::assign(&state, &root, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        let record = |at: &crate::checkout::Recorded| {
+            let recorded = serde_json::to_value(at).unwrap();
+            for (file, list) in [("ports.json", "reservations"), ("identities.json", "tokens")] {
+                let mut registry: serde_json::Value = read_json(&state.join(file)).unwrap();
+                for r in registry[list].as_array_mut().unwrap() {
+                    r["project_device"] = recorded["project_device"].clone();
+                    r["project_location"] = recorded["project_location"].clone();
+                }
+                write_json(&state.join(file), &registry).unwrap();
+            }
+            crate::datadirs::forget(&state, |_| true).unwrap();
+            // Even with the checkout token of the directory now at the path, observation does not
+            // let it stand in for the mount recorded.
+            let checkout = crate::checkout::token(&root).unwrap_or_else(|| "t1".into());
+            let entry = crate::datadirs::Entry { project: root.clone(), service: "web".into(), dir: tmp.path().join("data"), checkout, supervisor: None, location: None, identity: None, project_at: at.clone() };
+            crate::datadirs::record(&state, entry).unwrap();
+        };
+        record(&mounted);
+        let files = || ["ports.json", "data.json", "identities.json"].map(|f| fs::read(state.join(f)).unwrap());
+        let before = files();
+        // The mount point is there: present, and nothing is completed from it.
+        gc_checked(&state, true, false).unwrap();
+        assert!(files() == before, "observation changed a record from the mount point");
+        // The mount point gone too: unavailable, nothing released or removed.
+        fs::remove_dir(&root).unwrap();
+        let plan = gc_pass::gc_plan(&state, true).unwrap();
+        assert!(plan.deleted_checkouts.is_empty() && plan.unavailable.iter().any(|u| u.project == root && u.reason.contains("on another mount")), "{:?}", plan.unavailable);
+        gc_checked(&state, true, false).unwrap();
+        assert!(files() == before, "a record was reclaimed by the mount its mount point was on");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        ports::assign(&state, &other, &[ports::Request { service: "web".into(), fixed: None }], false).unwrap();
+        assert_eq!(ports::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(crate::identity::lookup(&state, &root).unwrap().len(), 1);
+        assert_eq!(crate::datadirs::entries(&state).unwrap().len(), 1);
+
+        // An ordinary deletion from the very mount the checkout was on: reclaimed.
+        fs::create_dir_all(&root).unwrap();
+        record(&crate::checkout::Recorded::of(&root));
+        fs::remove_dir(&root).unwrap();
+        let entries = gc_checked(&state, true, false).unwrap();
+        assert!(entries.iter().any(|e| e.project == root && e.services.iter().any(|s| s.outcome.as_deref().is_some_and(|o| o.contains("released")))), "{entries:?}");
+        assert!(ports::lookup(&state, &root).unwrap().is_empty());
+        crate::identity::assign(&state, &other, &["web".to_string()]).unwrap();
+        assert!(crate::identity::lookup(&state, &root).unwrap().is_empty());
+    }
+
+    /// `down --purge` and `gc --reclaim-data` (both through `reclaim_data`) keep data that holds
+    /// a mount, and its record, so a later pass can try again; with no mount it is removed.
+    #[cfg(unix)]
+    #[test]
+    fn reclaimed_data_holding_a_mount_is_kept_with_its_record() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = tmp.path().join("supervisor");
+        fs::create_dir_all(&sup).unwrap();
+        fs::write(sup.join("state.json"), serde_json::to_vec(&supervisor::State::default()).unwrap()).unwrap();
+        let dir = tmp.path().join("data/pg");
+        fs::create_dir_all(dir.join("mounted")).unwrap();
+        fs::write(dir.join("mounted/rows"), b"keep").unwrap();
+        fs::write(data_marker(&dir), json!({ "checkout": "t-mount" }).to_string()).unwrap();
+        let (location, identity) = crate::datadirs::locate(&dir);
+        let entry = crate::datadirs::Entry {
+            project: tmp.path().join("gone"),
+            service: "pg".into(),
+            dir: dir.clone(),
+            checkout: "t-mount".into(),
+            supervisor: Some(crate::datadirs::Supervisor { pitchfork: None, state_dir: sup, id: "pg".into() }),
+            location,
+            identity,
+            project_at: Default::default(),
+        };
+        // As the kernel would answer with a bind mount at `mounted`.
+        let mounted = fs::symlink_metadata(dir.join("mounted")).unwrap().ino();
+        struct Bind(u64);
+        impl crate::datadirs::imp_boundary::Boundary for Bind {
+            fn mount(&self, fd: &std::os::fd::OwnedFd, st: &libc::stat) -> std::io::Result<crate::datadirs::imp_boundary::Mount> {
+                let real = crate::datadirs::imp_boundary::Kernel.mount(fd, st)?;
+                #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+                let bind = st.st_ino as u64 == self.0;
+                Ok(if bind { crate::datadirs::imp_boundary::Mount { id: Some(real.id.unwrap_or(0) + 1000), ..real } } else { real })
+            }
+            fn entry_mount(&self, fd: &std::os::fd::OwnedFd, name: &std::ffi::CStr, st: &libc::stat) -> std::io::Result<crate::datadirs::imp_boundary::Mount> {
+                crate::datadirs::imp_boundary::Kernel.entry_mount(fd, name, st)
+            }
+        }
+        let (outcome, done) = reclaim_data_with(&entry, true, |held| held.remove_within(Some(MARKER_SUFFIX), &Bind(mounted)));
+        assert!(outcome.contains("could not be removed") && outcome.contains("mounted inside it is a mount point"), "{outcome}");
+        assert!(!done, "its record is kept");
+        assert_eq!(fs::read(dir.join("mounted/rows")).unwrap(), b"keep");
+        assert!(data_marker(&dir).exists());
+        let (outcome, done) = reclaim_data(&entry, true);
+        assert!(outcome.contains("removed (4 bytes)") && done, "{outcome}");
+        assert!(!dir.exists());
+    }
+
     /// Stack's supervisor confirms a recorded data directory's service stopped from its state
     /// file: a live process (by pid and start time) keeps the data.
     #[test]
@@ -7499,5 +8156,92 @@ mod native_records {
         fs::write(empty.path().join("state.json"), serde_json::to_vec(&supervisor::State::default()).unwrap()).unwrap();
         let gone = crate::datadirs::Supervisor { state_dir: empty.path().into(), ..record };
         assert!(service_stopped(&gone).is_ok());
+    }
+
+    /// Supervisor records Stack cannot read: one a newer Stack wrote, and one damaged in place.
+    fn unreadable_states() -> [(&'static str, Vec<u8>); 2] {
+        [("newer", br#"{"schema_version": 99, "services": {}}"#.to_vec()), ("damaged", b"{\"services\": {".to_vec())]
+    }
+
+    /// The data-removal check of `down --purge` and `gc --reclaim-data` (SessionLifecycle's
+    /// RmCheck): a supervisor record that cannot be read is never taken for one saying the
+    /// service stopped, so the data is kept, with its record, and nothing is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_data_record_whose_supervisor_record_cannot_be_read_is_never_confirmed_stopped() {
+        for (kind, bytes) in unreadable_states() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sup = tmp.path().join("supervisor");
+            fs::create_dir_all(&sup).unwrap();
+            fs::write(sup.join("state.json"), &bytes).unwrap();
+            let dir = tmp.path().join("data/pg");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("rows"), b"keep").unwrap();
+            fs::write(data_marker(&dir), json!({ "checkout": "t-unread" }).to_string()).unwrap();
+            let (location, identity) = crate::datadirs::locate(&dir);
+            let record = crate::datadirs::Supervisor { pitchfork: None, state_dir: sup.clone(), id: "pg".into() };
+            let why = service_stopped(&record).unwrap_err();
+            assert!(why.contains("could not be confirmed stopped") && why.contains("cannot be read"), "{kind}: {why}");
+            let entry = crate::datadirs::Entry {
+                project: tmp.path().join("gone"),
+                service: "pg".into(),
+                dir: dir.clone(),
+                checkout: "t-unread".into(),
+                supervisor: Some(record),
+                location,
+                identity,
+                project_at: Default::default(),
+            };
+            let (outcome, done) = reclaim_data_with(&entry, true, |_| panic!("{kind}: data removed on an unreadable record"));
+            assert!(outcome.contains("data kept") && !done, "{kind}: {outcome}");
+            assert_eq!(fs::read(dir.join("rows")).unwrap(), b"keep", "{kind}");
+            assert_eq!(fs::read(sup.join("state.json")).unwrap(), bytes, "{kind}: the record was written over");
+        }
+    }
+
+    /// GC of a deleted checkout (SessionLifecycle's GcGone): while its supervisor record cannot
+    /// be read, nothing is taken for stopped and the session record is kept, as is the
+    /// supervisor's; once the record reads as nothing running, the session is reclaimed.
+    #[test]
+    fn a_deleted_checkouts_session_is_kept_while_its_supervisor_record_cannot_be_read() {
+        for (kind, bytes) in unreadable_states() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join("state");
+            let root = tmp.path().join("vol").join("app");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(tmp.path().join("vol").join("sibling"), b"").unwrap();
+            let here = crate::checkout::Recorded::of(&root);
+            assert!(here.location.is_some(), "a temporary directory's mount can be learned");
+            let sup = supervisor::dir(&state, &root);
+            fs::create_dir_all(&sup).unwrap();
+            fs::write(sup.join("state.json"), &bytes).unwrap();
+            let session = Session {
+                id: "s1".into(),
+                project: root.clone(),
+                project_dir_id: dir_id(&root),
+                project_dir_created: dir_created(&root),
+                project_location: here.location.clone(),
+                provider: Some(ProviderRecord::native(sup.clone())),
+                services: [("web".to_string(), ServiceRecord { port: 0, pid: None, data_dir: None, identity: Identity::Liveness, verified_at: 1, started_at_ms: None, provider_id: None })].into_iter().collect(),
+                ..Session::default()
+            };
+            write_json(&index_path(&state, &root), &session).unwrap();
+            fs::remove_dir_all(&root).unwrap();
+            assert_eq!(checkout_state(&session), CheckoutState::Gone("project directory deleted"), "{kind}");
+
+            let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+            let entry = pass.reclaimed.iter().find(|e| e.project == root).unwrap_or_else(|| panic!("{kind}: {pass:?}"));
+            assert!(!entry.stopped && entry.error.as_deref().is_some_and(|e| e.contains("cannot be read")), "{kind}: {entry:?}");
+            assert!(index_path(&state, &root).exists(), "{kind}: the session record is kept");
+            assert_eq!(gc_checked(&state, true, false).unwrap_err().code, "gc_incomplete", "{kind}");
+            assert!(index_path(&state, &root).exists(), "{kind}");
+            assert_eq!(fs::read(sup.join("state.json")).unwrap(), bytes, "{kind}: the record was written over or forgotten");
+
+            // As the release that wrote it would leave it: nothing runs, so it is reclaimed.
+            fs::write(sup.join("state.json"), serde_json::to_vec(&supervisor::State::default()).unwrap()).unwrap();
+            let pass = gc_pass::gc_with(&state, &GcOptions::default()).unwrap();
+            assert!(pass.reclaimed.iter().any(|e| e.project == root && e.stopped), "{kind}: {pass:?}");
+            assert!(!index_path(&state, &root).exists(), "{kind}");
+        }
     }
 }

@@ -2,7 +2,7 @@
 //! because of, another checkout, what `gc --dry-run` reports, and the opt-in stop of a deleted
 //! checkout's services (`gc --stop-orphans`).
 
-use super::{accepting, gc_locked, index_path, is_unreadable, project_gone, session_record, GcEntry, ProviderRecord, ServiceRecord, Session, Steps, Unconfirmed, STOP_TIMEOUT};
+use super::{accepting, checkout_state, gc_locked, index_path, is_unreadable, session_record, CheckoutState, GcEntry, ProviderRecord, ServiceRecord, Session, Steps, Unconfirmed, STOP_TIMEOUT};
 use crate::error::{Result, StackError};
 use crate::provider::mise;
 use crate::state::{now, pid_alive, project_lock, project_try_lock, rfc3339};
@@ -42,7 +42,7 @@ pub const UNREADABLE: &str = "session record unreadable";
 
 /// The report for an unreadable record: the checkout when it is known, else the record.
 fn unreadable_entry(project: &Path, error: &StackError) -> GcEntry {
-    GcEntry { project: project.to_path_buf(), reason: UNREADABLE.into(), stopped: false, error: Some(error.to_string()), services: Vec::new() }
+    GcEntry { project: project.to_path_buf(), reason: UNREADABLE.into(), stopped: false, error: Some(error.to_string()), services: Vec::new(), left_alone: false }
 }
 
 /// What one checkout's index entry at `path` holds, both copies considered: the indexed
@@ -76,17 +76,30 @@ pub(crate) fn readable_session(state: &Path, path: &Path) -> Result<std::result:
 pub struct GcSkipped {
     pub project: PathBuf,
     pub reason: String,
-    /// Why it was not reclaimed now: `busy` (another stack command holds its lock).
+    /// Why it was not reclaimed now: `busy` (another stack command holds its lock), or
+    /// `unavailable` (whether the checkout is still there cannot be shown: a lookup refused or
+    /// failing, or its volume may not be mounted; `reason` says which).
     pub skipped: &'static str,
 }
 
 /// Why `session` may be reclaimed, judged from what it records without taking its lock. A
 /// session that is not a candidate is never locked; one that is gets checked again under
 /// the lock, since another command may renew or replace it meanwhile.
-pub(super) fn candidate(session: &Session, now: u64) -> Option<String> {
-    project_gone(session)
-        .map(String::from)
-        .or_else(|| session.lease.as_ref().and_then(|l| l.expired(now)))
+pub(super) fn candidate(session: &Session, checkout: &CheckoutState, now: u64) -> Option<String> {
+    match checkout {
+        CheckoutState::Gone(reason) => Some((*reason).to_string()),
+        CheckoutState::Unavailable(_) => None,
+        CheckoutState::Present => session.lease.as_ref().and_then(|l| l.expired(now)),
+    }
+}
+
+/// The report for a checkout whose presence cannot be shown (see [`CheckoutState`]): left for
+/// a later pass, as a busy one is.
+fn unavailable(session: &Session, checkout: &CheckoutState) -> Option<GcSkipped> {
+    match checkout {
+        CheckoutState::Unavailable(why) => Some(GcSkipped { project: session.project.clone(), reason: why.clone(), skipped: "unavailable" }),
+        _ => None,
+    }
 }
 
 /// The machine index's session records, in a stable order.
@@ -120,7 +133,12 @@ pub fn gc_with(state: &Path, opts: &GcOptions) -> Result<GcPass> {
                     return Ok(());
                 }
             };
-            let Some(reason) = candidate(&indexed, now()) else { return Ok(()) };
+            let checkout = checkout_state(&indexed);
+            if let Some(skipped) = unavailable(&indexed, &checkout) {
+                pass.skipped.push(skipped);
+                return Ok(());
+            }
+            let Some(reason) = candidate(&indexed, &checkout, now()) else { return Ok(()) };
             let _guard = if opts.background {
                 match project_try_lock(state, &indexed.project)? {
                     Some(guard) => guard,
@@ -254,6 +272,9 @@ pub struct GcDryRun {
     /// Checkouts whose session record cannot be read: a pass reports them and leaves them alone.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unreadable: Vec<GcEntry>,
+    /// Checkouts whose presence cannot be shown (see [`GcSkipped`]): a pass leaves them alone.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<GcSkipped>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deleted_checkouts: Vec<DeletedPlan>,
     /// Postgres templates nothing can use any more (see [`crate::pgtemplate`]), which a pass
@@ -271,6 +292,7 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
     let mut planned = Vec::new();
     let mut warnings = Vec::new();
     let mut unreadable = Vec::new();
+    let mut unavailable_checkouts = Vec::new();
     let now = now();
     for path in index_files(state) {
         // As the pass decides it (see `gc_with`): both copies, before anything is planned.
@@ -286,12 +308,17 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
                 continue;
             }
         };
-        let Some(reason) = candidate(&session, now) else { continue };
-        let owner_dead = session.lease.as_ref().and_then(|l| l.owner_pid).is_some_and(|p| !pid_alive(p));
+        let checkout = checkout_state(&session);
+        if let Some(skipped) = unavailable(&session, &checkout) {
+            unavailable_checkouts.push(skipped);
+            continue;
+        }
+        let Some(reason) = candidate(&session, &checkout, now) else { continue };
+        let owner_dead = session.lease.as_ref().is_some_and(super::Lease::owner_exited);
         let busy = !owner_dead && session.active_executions.values().any(|pid| pid_alive(*pid));
         planned.push(GcPlanned {
             session: session.id.clone(),
-            action: if project_gone(&session).is_some() { "release_if_stopped" } else { "stop" },
+            action: if checkout.gone().is_some() { "release_if_stopped" } else { "stop" },
             project: session.project.clone(),
             reason,
             busy,
@@ -328,18 +355,34 @@ pub fn gc_plan(state: &Path, reclaim_data: bool) -> Result<GcDryRun> {
         Err(e) => warnings.push(e.to_string()),
     }
     let mut found: Vec<(usize, Option<PlannedPort>, Option<PlannedData>)> = Vec::new();
-    for r in ports.into_iter().filter(|r| !r.project.exists()) {
-        found.push((entry(&r.project), Some(PlannedPort { service: r.service, port: r.port }), None));
+    // Only checkouts shown to be gone; one whose presence cannot be shown is reported, as a pass
+    // leaves its ports and data alone.
+    let mut gone = |project: &Path, at: &crate::checkout::Recorded| match crate::checkout::presence(project, at) {
+        crate::checkout::Presence::Absent => true,
+        crate::checkout::Presence::Present => false,
+        crate::checkout::Presence::Unknown(reason) => {
+            if !unavailable_checkouts.iter().any(|u: &GcSkipped| u.project == project) {
+                unavailable_checkouts.push(GcSkipped { project: project.to_path_buf(), reason, skipped: "unavailable" });
+            }
+            false
+        }
+    };
+    for r in ports {
+        if gone(&r.project, &r.project_at) {
+            found.push((entry(&r.project), Some(PlannedPort { service: r.service, port: r.port }), None));
+        }
     }
     let action = if reclaim_data { "remove_if_safe" } else { "report" };
-    for d in data.into_iter().filter(|d| !d.project.exists()) {
-        found.push((entry(&d.project), None, Some(PlannedData { service: d.service, dir: d.dir, action })));
+    for d in data {
+        if gone(&d.project, &d.project_at) {
+            found.push((entry(&d.project), None, Some(PlannedData { service: d.service, dir: d.dir, action })));
+        }
     }
     for (i, port, data) in found {
         deleted[i].ports.extend(port);
         deleted[i].data.extend(data);
     }
-    Ok(GcDryRun { dry_run: true, would_reclaim: planned, unreadable, deleted_checkouts: deleted, templates: crate::pgtemplate::collect(state, true), warnings })
+    Ok(GcDryRun { dry_run: true, would_reclaim: planned, unreadable, unavailable: unavailable_checkouts, deleted_checkouts: deleted, templates: crate::pgtemplate::collect(state, true), warnings })
 }
 
 /// How long before the recorded start a process may appear to have started: the recorded

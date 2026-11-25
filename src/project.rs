@@ -1,10 +1,10 @@
 //! `stack compile`: resolve bundles → lock → compose → render provider config.
 
 use crate::artifacts::{self, PinKey};
-use crate::compose::{compose, Composed, LoadedBundle};
+use crate::compose::{compose, Composed, Entry, LoadedBundle};
 use crate::error::{io_error, Result, StackError};
 use crate::lock::{self, LockedBundle, LockedVersion, Lockfile};
-use crate::manifest::{read_bundle, read_project};
+use crate::manifest::{read_project, Service};
 use crate::ports::{self, Request};
 use crate::provider::mise;
 use crate::source::{Mode, Source};
@@ -163,7 +163,8 @@ pub fn inspect_mode(root: &Path) -> Mode {
     }
 }
 
-/// Presets `mise daemons` documents. Newer mise releases may add more, so others only warn.
+/// Presets Stack's supervisor runs (`stack __preset`, see [`crate::supervisor::main_preset`]).
+/// Another name only warns here; `stack up` fails on it.
 const KNOWN_PRESETS: &[&str] = &["cockroachdb", "nats", "postgres", "redis", "spicedb"];
 
 fn warnings(stack: &Composed) -> Vec<String> {
@@ -172,7 +173,7 @@ fn warnings(stack: &Composed) -> Vec<String> {
         let Some(preset) = e.value.preset.as_deref() else { continue };
         if !KNOWN_PRESETS.contains(&preset) {
             out.push(format!(
-                "services.{name} ({}) uses preset '{preset}', which mise does not document (known: {}); `stack up` will fail if your mise lacks it",
+                "services.{name} ({}) uses preset '{preset}', which Stack does not know (known: {}); `stack up` will fail to start it",
                 e.origin,
                 KNOWN_PRESETS.join(", ")
             ));
@@ -329,7 +330,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
         let source = Source::parse(spec, &opts.root)?;
         let prior = previous.as_ref().and_then(|l| l.find(spec));
         let fetched = source.fetch(spec, prior, opts.mode, &opts.cache)?;
-        let manifest = read_bundle(&fetched.dir, spec)?;
+        let manifest = crate::manifest::parse_bundle(fetched.manifest.as_deref(), &fetched.dir, spec)?;
         let name = manifest.bundle.name.clone();
         if !names.insert(name.clone()) {
             return Err(StackError::new(
@@ -366,6 +367,7 @@ pub(crate) fn compile_checked(opts: &Options, preflight: Preflight) -> Result<Re
     let previous = previous.map(|lock| without_provider_pitchfork(lock, &stack));
     let probed = probed_services(&stack)?;
     check_secondary_collisions(&stack)?;
+    check_single_instance_presets(&stack)?;
     let (tools, services, mut versions) = lock_versions(&stack, previous.as_ref(), opts)?;
     let mut new_lock = Lockfile::new(locked, tools.clone(), services.clone());
     let pins = artifacts::pin_keys(&new_lock);
@@ -552,6 +554,44 @@ fn check_secondary_collisions(stack: &Composed) -> Result<()> {
                 .hint(format!("rename service '{key}' or '{name}' so neither matches '<service>.<role>'")));
             }
         }
+    }
+    Ok(())
+}
+
+/// Presets every service of which exports the same connection variables, through which Stack
+/// also verifies it is reaching that service's own server. With two in one stack only one
+/// service's values reach the app, and the other can never verify.
+const SINGLE_INSTANCE_PRESETS: [(&str, &str); 2] = [("postgres", "DATABASE_URL and PG*"), ("redis", "REDIS_URL")];
+
+/// At most one service per [`SINGLE_INSTANCE_PRESETS`] preset in the composed stack, whichever
+/// layers define them: refused at compile, before any port is reserved or service started,
+/// instead of `up` failing for one of them.
+fn check_single_instance_presets(stack: &Composed) -> Result<()> {
+    for (preset, vars) in SINGLE_INSTANCE_PRESETS {
+        let services: Vec<(&String, &Entry<Service>)> =
+            stack.services.iter().filter(|(_, e)| e.value.preset.as_deref() == Some(preset)).collect();
+        if services.len() < 2 {
+            continue;
+        }
+        let named: Vec<String> = services.iter().map(|(name, e)| format!("'{name}' ({})", e.origin)).collect();
+        let (keep, other) = (services[0].0, services[1].0);
+        return Err(StackError::new(
+            "invalid_service",
+            format!(
+                "{} services use preset '{preset}': {}; every {preset} service exports the same {vars}, so only one could be reached and verified",
+                services.len(),
+                named.join(", ")
+            ),
+        )
+        .hint(format!(
+            "keep one {preset} service ('{keep}') and point the app at it, or replace '{other}' in stack.toml with a service of your own, e.g. [override.services.{other}] run = \"...\""
+        ))
+        .details(
+            services
+                .iter()
+                .map(|(name, e)| serde_json::json!({ "service": name, "origin": e.origin, "preset": preset }))
+                .collect(),
+        ));
     }
     Ok(())
 }

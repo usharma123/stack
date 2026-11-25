@@ -64,8 +64,9 @@ enum Cmd {
     },
     /// Show the composed stack without writing anything
     Inspect {
-        /// Also list skills of tools stack adds for its provider (Pitchfork), under
-        /// `provider_skills`. For people: an agent should not drive the supervisor directly
+        /// Also list skills of provider tools (Pitchfork, which a lock written by Stack 0.1.23 or
+        /// earlier may still pin), under `provider_skills`. For people: an agent should not drive
+        /// a supervisor directly
         #[arg(long)]
         all_skills: bool,
     },
@@ -103,6 +104,11 @@ enum Cmd {
         /// Keep printing new lines until interrupted (polls the supervisor every second; not with --json)
         #[arg(short, long)]
         follow: bool,
+        /// Only output written after this position: the `cursor` a previous `--json` result
+        /// gave ("" to begin). Each line once, with `timestamps`, and a `gap` for output a
+        /// rotation took first; --tail caps the lines per read (`more` says there are more)
+        #[arg(long, value_name = "CURSOR", conflicts_with_all = ["follow", "project", "labels"])]
+        cursor: Option<String>,
         /// Logs of every checkout of this project (its repository's worktrees with Stack
         /// records), each line prefixed [<branch>:<service>]; --project=PATH names another
         #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true, conflicts_with = "follow")]
@@ -202,9 +208,10 @@ enum Cmd {
         cmd: Vec<String>,
     },
     /// Run a task from stack.toml once every service verifies, granted the secrets it declares
+    ///
+    /// Stack's options go before the task name; every argument after it is the task's
+    #[command(override_usage = "stack run [OPTIONS] <TASK> [--] [ARGS]...")]
     Run {
-        /// Task name, as in [tasks.<name>]
-        task: String,
         /// Give up after this long (e.g. 10m), killing the task, and exit 124. Counts from the
         /// call: planning, including installing missing pins, is included. Default: no limit
         #[arg(long, value_name = "DURATION")]
@@ -216,9 +223,11 @@ enum Cmd {
         /// session without one gets `[session] default_ttl` of stack.toml, else 30m)
         #[arg(long, value_name = "DURATION", requires = "up")]
         ttl: Option<String>,
-        /// Extra arguments, appended to the task's command
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Task name, as in [tasks.<name>], then extra arguments appended to the task's command.
+        /// Every argument after the name is the task's, `--timeout` and `--json` included; a `--`
+        /// right after the name is only a separator
+        #[arg(value_name = "TASK", required = true, num_args = 1.., trailing_var_arg = true)]
+        task: Vec<String>,
     },
     /// Stop services; succeeds only once their processes are gone. Stack's supervisor for the
     /// checkout exits with them (for services an older Stack started under Pitchfork, its
@@ -367,6 +376,11 @@ enum Cmd {
         /// clients that pay for every tool definition in their context
         #[arg(long, value_enum, default_value_t = mcp::Profile::Full)]
         profile: mcp::Profile,
+        /// Let `stack_down` purge checkouts selected by `labels` anywhere on this machine. Off by
+        /// default: a client's roots are only where it works, not a sandbox, and purging one
+        /// checkout or `dir`'s project (`project: true`) needs no consent
+        #[arg(long)]
+        allow_host_purge: bool,
     },
     /// Save, restore, list or remove snapshots of service data, shared by every checkout of
     /// the project
@@ -411,14 +425,30 @@ fn update_call(f: impl FnOnce(&mut Call)) {
 /// The subcommand named on the command line, for envelopes of calls clap refused: the first
 /// argument (before `--`) that names one. Empty when none does.
 fn command_from_args() -> String {
-    let cmd = Cli::command();
-    let names: Vec<String> = cmd.get_subcommands().map(|s| s.get_name().to_string()).collect();
-    std::env::args_os()
-        .skip(1)
-        .take_while(|a| a != "--")
-        .filter_map(|a| a.into_string().ok())
-        .find(|a| names.contains(a))
-        .unwrap_or_default()
+    let words: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    subcommand_in(&words).map(|at| words[at].clone()).unwrap_or_default()
+}
+
+/// Where the subcommand is in `words` (the arguments, without the program): the first word
+/// before `--` that names one and is not the value of a global option (`-C logs`, `--dir status`
+/// and `-qC down` name a directory, whatever it is called).
+fn subcommand_in(words: &[String]) -> Option<usize> {
+    let words = before_separator(words);
+    let names: Vec<String> = Cli::command().get_subcommands().map(|s| s.get_name().to_string()).collect();
+    let mut at = 0;
+    while let Some(word) = words.get(at).map(String::as_str) {
+        if names.iter().any(|n| n == word) {
+            return Some(at);
+        }
+        // `-C` alone, or ending a cluster of the other global short flag, takes the next word.
+        let short_dir = word.len() > 1 && word.starts_with('-') && !word.starts_with("--") && word.ends_with('C') && word[1..word.len() - 1].chars().all(|c| c == 'q');
+        at += if word == "--dir" || short_dir { 2 } else { 1 };
+    }
+    None
+}
+
+fn before_separator(words: &[String]) -> &[String] {
+    &words[..words.iter().position(|word| word == "--").unwrap_or(words.len())]
 }
 
 fn main() -> ExitCode {
@@ -434,6 +464,10 @@ fn main() -> ExitCode {
     }
     stack::setup::use_managed_tools();
     update_call(|_| {});
+    let words: Vec<String> = args.iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if let Some(e) = project_spelling(&words) {
+        return fail(json_requested(), e);
+    }
     let matches = match Cli::command().try_get_matches() {
         Ok(matches) => matches,
         Err(e) => return usage_error(e),
@@ -443,8 +477,8 @@ fn main() -> ExitCode {
         Err(e) => return usage_error(e),
     };
     update_call(|c| c.command = matches.subcommand_name().unwrap_or_default().to_string());
-    if let Cmd::Mcp { profile } = cli.cmd {
-        return match mcp::serve(profile) {
+    if let Cmd::Mcp { profile, allow_host_purge } = cli.cmd {
+        return match mcp::serve(profile, mcp::Policy { host_purge: allow_host_purge }) {
             Ok(()) => stack::process::passed_on().map_or(ExitCode::SUCCESS, |signal| ExitCode::from(contract::child_exit(None, Some(signal.into())))),
             Err(e) => fail(false, StackError::new("io", e.to_string())),
         };
@@ -552,7 +586,8 @@ fn main() -> ExitCode {
                         println!("{:<12} port {} -> {} (reassigned: another program held {})", p.service, p.old, p.new, p.old);
                     }
                     for c in &r.checks {
-                        println!("{:<12} port {:<5}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                        println!("{:<12} port {:<5}  {}", c.service, c.port_label(), identity_label(c.identity));
+                        print_endpoints(c);
                     }
                     for (service, o) in &r.init {
                         let ran = if o.ran.is_empty() { String::new() } else { format!(" (ran {})", o.ran.join(", ")) };
@@ -585,7 +620,7 @@ fn main() -> ExitCode {
                 }
             })
         }),
-        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow, project, labels } => fleet_filter(&root, project.as_ref(), labels, false).and_then(|fleet| logs(
+        Cmd::Logs { services, tail, since_start, since, grep, ignore_case, follow, cursor, project, labels } => fleet_filter(&root, project.as_ref(), labels, false).and_then(|fleet| logs(
             &ctx,
             cli.json,
             stack::logs::Query {
@@ -595,6 +630,7 @@ fn main() -> ExitCode {
                 since_secs: None,
                 grep: grep.clone(),
                 ignore_case: *ignore_case,
+                cursor: cursor.as_deref().map(stack::logs::Cursor::parse).transpose()?,
             },
             since.as_deref(),
             *follow,
@@ -606,7 +642,8 @@ fn main() -> ExitCode {
                 emit(cli.json, &r, || {
                     for c in &r.checks {
                         let note = if r.restarted.contains(&c.service) { "restarted" } else { "" };
-                        println!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port.unwrap_or(0), identity_label(c.identity));
+                        println!("{}", format!("{:<12} port {:<5}  {:<18} {note}", c.service, c.port_label(), identity_label(c.identity)).trim_end());
+                        print_endpoints(c);
                     }
                     println!("session {}", r.session.id);
                 })
@@ -634,7 +671,10 @@ fn main() -> ExitCode {
                 }
                 for c in &r.checks {
                     match &c.reason {
-                        None => println!("{:<12} ready  port {}  {}", c.service, c.port.unwrap_or(0), identity_label(c.identity)),
+                        None => {
+                            println!("{:<12} ready  port {}  {}", c.service, c.port_label(), identity_label(c.identity));
+                            print_endpoints(c);
+                        }
                         // Not started, a service is only worth a line when there is more to it
                         // than that (another program on its port, say).
                         Some(_) if !r.started => {
@@ -642,7 +682,12 @@ fn main() -> ExitCode {
                                 println!("{:<12} {note}", c.service);
                             }
                         }
-                        Some(reason) => println!("{:<12} NOT READY  {reason}", c.service),
+                        Some(reason) => {
+                            println!("{:<12} NOT READY  {reason}", c.service);
+                            if !c.withheld.is_empty() {
+                                println!("{:<12}   withheld from commands: {}", "", c.withheld.join(", "));
+                            }
+                        }
                     }
                 }
                 for (service, state) in r.init.iter().filter(|(_, s)| **s != stack::init_tasks::InitState::None) {
@@ -685,7 +730,8 @@ fn main() -> ExitCode {
                 })
             })
         }
-        Cmd::Run { task, timeout, up, ttl, args } => prepare(*up, ttl.as_deref(), false).and_then(|prepare| {
+        Cmd::Run { task, timeout, up, ttl } => prepare(*up, ttl.as_deref(), false).and_then(|prepare| {
+            let (task, args) = task_and_args(task);
             run_command(&ctx, cli.json, timeout.as_deref(), |captured| {
                 session::plan_prepared(&ctx, prepare, || session::plan_task(&ctx, task, args, captured))
             })
@@ -826,6 +872,13 @@ fn main() -> ExitCode {
     }
 }
 
+/// `stack run`'s words: the task's name and the arguments it is given. One `--` right after the
+/// name only separates them, as it did when clap parsed it; any other is the task's.
+fn task_and_args(words: &[String]) -> (&str, &[String]) {
+    let (task, rest) = words.split_first().map_or(("", &[][..]), |(t, rest)| (t.as_str(), rest));
+    (task, rest.strip_prefix(&["--".to_string()][..]).unwrap_or(rest))
+}
+
 /// The subcommand's name, as clap parsed the arguments it already accepted.
 fn subcommand() -> String {
     call().command
@@ -877,7 +930,7 @@ fn logs(ctx: &Ctx, as_json: bool, mut q: stack::logs::Query, since: Option<&str>
     if follow {
         if as_json {
             return Err(StackError::new("usage", "--follow cannot be combined with --json")
-                .hint("run `stack logs --json` repeatedly, or `stack logs --follow` without --json"));
+                .hint("run `stack logs --json --cursor <cursor>` repeatedly, passing back the `cursor` each result gives, or `stack logs --follow` without --json"));
         }
         return stack::logs::follow(ctx, &q, Duration::from_secs(1)).map(|()| ExitCode::SUCCESS);
     }
@@ -981,6 +1034,9 @@ fn print_gc_plan(plan: &session::GcDryRun) {
     for u in &plan.unreadable {
         println!("{}: {} (left alone; run `stack down` in it)", u.project.display(), u.reason);
     }
+    for u in &plan.unavailable {
+        println!("{}: checkout unavailable: {} (left alone)", u.project.display(), u.reason);
+    }
     for d in &plan.deleted_checkouts {
         let after = if d.after_session { " (once its session is reclaimed)" } else { "" };
         println!("{}: deleted checkout{after}", d.project.display());
@@ -998,14 +1054,21 @@ fn print_gc_plan(plan: &session::GcDryRun) {
     for w in &plan.warnings {
         eprintln!("warning: {w}");
     }
-    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() && plan.templates.is_empty() {
+    if plan.would_reclaim.is_empty() && plan.deleted_checkouts.is_empty() && plan.unreadable.is_empty() && plan.unavailable.is_empty() && plan.templates.is_empty() {
         println!("nothing to reclaim");
     }
 }
 
 fn print_gc(entries: &[session::GcEntry]) {
     for e in entries {
-        println!("{}: {} ({})", e.project.display(), e.reason, if e.stopped { "stopped" } else { "not stopped" });
+        let outcome = if e.left_alone {
+            "left alone"
+        } else if e.stopped {
+            "stopped"
+        } else {
+            "not stopped"
+        };
+        println!("{}: {} ({outcome})", e.project.display(), e.reason);
         if let Some(error) = &e.error {
             println!("  {error}");
         }
@@ -1069,6 +1132,13 @@ fn emit<T: Serialize>(as_json: bool, value: &T, human: impl FnOnce()) -> ExitCod
         human();
     }
     ExitCode::SUCCESS
+}
+
+/// A verified service's addresses under its line, as commands get them with credentials masked.
+fn print_endpoints(c: &session::Check) {
+    for line in c.endpoint_lines() {
+        println!("{:<12}   {line}", "");
+    }
 }
 
 fn identity_label(identity: Option<session::Identity>) -> &'static str {
@@ -1281,14 +1351,47 @@ fn usage_error(e: clap::Error) -> ExitCode {
     if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
         e.exit();
     }
-    // `--json` after `--` belongs to the command being run, not to stack.
-    // Compared as OS strings: arguments need not be Unicode, and this must not panic on them.
-    let as_json = std::env::args_os().skip(1).take_while(|a| a != "--").any(|a| a == "--json");
-    if !as_json {
+    if !json_requested() {
         e.exit();
     }
     let (message, hint) = usage_text(&e.render().to_string());
     fail(true, StackError::new("usage", message).hint(hint))
+}
+
+/// Whether `--json` was asked for, by arguments clap may not have accepted. `--json` after `--`
+/// belongs to the command being run, not to stack. Compared as OS strings: arguments need not be
+/// Unicode, and this must not panic on them.
+fn json_requested() -> bool {
+    std::env::args_os().skip(1).take_while(|a| a != "--").any(|a| a == "--json")
+}
+
+/// `--project PATH`, spelled with a space, where `--project` takes a path only as `--project=PATH`
+/// (alone, it means this checkout's project). clap would read the path as a service of `logs`, or
+/// refuse it as an unexpected argument without saying why; this says how to write it instead.
+/// For `logs`, whose services follow, only a word that looks like a path (has a `/`, or is `.`
+/// or `..`) is taken for one: `logs --project web` is the `web` service of every checkout.
+fn project_spelling(words: &[String]) -> Option<StackError> {
+    const FLEET: [&str; 4] = ["logs", "status", "down", "ps"];
+    // The subcommand: the first word naming one (`exec ls logs` runs `ls`, it is not `logs`),
+    // past the directory `-C` names.
+    let words = before_separator(words);
+    let at = subcommand_in(words)?;
+    let cmd = words[at].as_str();
+    if !FLEET.contains(&cmd) {
+        return None;
+    }
+    let rest = &words[at + 1..];
+    let i = rest.iter().position(|w| w == "--project")?;
+    let path = rest.get(i + 1)?;
+    let path_like = path.contains('/') || path == "." || path == "..";
+    if path.starts_with('-') || (cmd == "logs" && !path_like) {
+        return None;
+    }
+    let read_as = if cmd == "logs" { "a service name" } else { "an unexpected argument" };
+    Some(
+        StackError::new("usage", format!("`--project {path}`: --project takes a path only as --project=PATH; `{path}` would be read as {read_as}"))
+            .hint(format!("run `stack {cmd} --project={path}`, or `stack {cmd} --project` for this checkout's project")),
+    )
 }
 
 /// clap's rendered error as one message and a hint: the error with the lines that continue it
@@ -1383,4 +1486,113 @@ fn human_detail(detail: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `stack run` takes from these arguments: the global `--json`, its own `--timeout`,
+    /// the task and the task's arguments.
+    fn run(args: &[&str]) -> (bool, Option<String>, String, Vec<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("stack").chain(args.iter().copied())).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        let Cmd::Run { task, timeout, .. } = &cli.cmd else { panic!("{args:?}: not run") };
+        let (task, rest) = task_and_args(task);
+        (cli.json, timeout.clone(), task.to_string(), rest.to_vec())
+    }
+
+    fn words(w: &[&str]) -> Vec<String> {
+        w.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_project_path_after_a_space_is_refused_with_the_spelling_that_works() {
+        let refused = |args: &[&str]| project_spelling(&words(args));
+        for (args, cmd, path) in [
+            (&["logs", "--project", "/srv/app"][..], "logs", "/srv/app"),
+            (&["--json", "logs", "--project", "../app", "web"], "logs", "../app"),
+            (&["logs", "web", "--project", "."], "logs", "."),
+            (&["status", "--project", "app"], "status", "app"),
+            (&["down", "--project", "/srv/app"], "down", "/srv/app"),
+            (&["ps", "--project", "app"], "ps", "app"),
+        ] {
+            let e = refused(args).unwrap_or_else(|| panic!("{args:?}: accepted"));
+            assert_eq!(e.code, "usage", "{args:?}");
+            assert!(e.message.contains(&format!("`{path}` would be read as")), "{args:?}: {}", e.message);
+            assert!(e.hint.as_deref().unwrap().contains(&format!("stack {cmd} --project={path}")), "{args:?}");
+        }
+        for args in [
+            // The spellings that work, and a service of every checkout.
+            &["logs", "--project=/srv/app", "web"][..],
+            &["logs", "--project", "web"],
+            &["logs", "--project", "--since-start"],
+            &["status", "--project"],
+            // Not stack's: the command being run, or after `--`.
+            &["exec", "ls", "logs", "--project", "/x"],
+            &["exec", "--", "stack", "logs", "--project", "/x"],
+            &["run", "t", "status", "--project", "/x"],
+        ] {
+            assert!(refused(args).is_none(), "{args:?}: refused");
+        }
+    }
+
+    #[test]
+    fn a_directory_named_like_a_subcommand_is_never_taken_for_one() {
+        let refused = |args: &[&str]| project_spelling(&words(args));
+        // `-C`/`--dir` take the next word as the checkout's directory, whatever it is called.
+        for args in [
+            &["-C", "logs", "exec", "tool", "--project", "./x"][..],
+            &["--dir", "status", "logs", "--project", "web"],
+            &["-qC", "down", "run", "deploy", "--project", "/srv/app"],
+            &["--json", "-C", "ps", "exec", "ls", "--project", "."],
+        ] {
+            assert!(refused(args).is_none(), "{args:?}: refused");
+        }
+        // The real subcommand after them is still checked.
+        for (args, cmd) in [
+            (&["-C", "logs", "logs", "--project", "./x"][..], "logs"),
+            (&["--dir=status", "status", "--project", "app"], "status"),
+            (&["-Cdown", "down", "--project", "/srv/app"], "down"),
+            (&["-q", "-C", "app", "ps", "--project", "app"], "ps"),
+        ] {
+            let e = refused(args).unwrap_or_else(|| panic!("{args:?}: accepted"));
+            assert!(e.hint.as_deref().unwrap().contains(&format!("stack {cmd} --project=")), "{args:?}: {e:?}");
+        }
+        // Every word before the subcommand is one of these options or a flag: the envelope of a
+        // refused call names the subcommand, not the directory.
+        assert_eq!(subcommand_in(&words(&["-C", "logs", "exec", "x"])), Some(2));
+        assert_eq!(subcommand_in(&words(&["--dir", "run", "--json", "up"])), Some(3));
+        assert_eq!(subcommand_in(&words(&["-C"])), None);
+        for args in [
+            &["-C", "--", "logs"][..],
+            &["--dir", "--", "status", "--json"],
+            &["-qC", "--", "ps"],
+            &["--json", "-C", "--", "logs"],
+        ] {
+            assert_eq!(subcommand_in(&words(args)), None, "{args:?}");
+            assert!(refused(args).is_none(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn run_gives_the_task_every_argument_after_its_name() {
+        // Before the name, options are stack's, global ones included.
+        assert_eq!(run(&["--json", "run", "--timeout", "5m", "test"]), (true, Some("5m".into()), "test".into(), vec![]));
+        assert_eq!(run(&["run", "--json", "--timeout=5m", "test"]), (true, Some("5m".into()), "test".into(), vec![]));
+        // After it, every one is the task's, even those stack would know.
+        assert_eq!(
+            run(&["run", "test", "--timeout", "3", "--json", "-q", "--up", "x"]),
+            (false, None, "test".into(), words(&["--timeout", "3", "--json", "-q", "--up", "x"]))
+        );
+        assert_eq!(run(&["run", "--timeout", "1s", "test", "--timeout=9"]), (false, Some("1s".into()), "test".into(), words(&["--timeout=9"])));
+        // A `--` right after the name only separates; a later one, or a second one, is the task's.
+        assert_eq!(run(&["run", "test", "--", "--flag", "--"]), (false, None, "test".into(), words(&["--flag", "--"])));
+        assert_eq!(run(&["run", "test", "--", "--", "x"]), (false, None, "test".into(), words(&["--", "x"])));
+        assert_eq!(run(&["run", "test", "a", "--", "b"]), (false, None, "test".into(), words(&["a", "--", "b"])));
+        assert_eq!(run(&["run", "--", "test", "--x"]), (false, None, "test".into(), words(&["--x"])));
+        // Without a task, or with an option stack does not know before it, the call is refused.
+        assert!(Cli::try_parse_from(["stack", "run"]).is_err());
+        assert!(Cli::try_parse_from(["stack", "run", "--timeout", "5m"]).is_err());
+        assert!(Cli::try_parse_from(["stack", "run", "--nope", "test"]).is_err());
+    }
 }

@@ -63,11 +63,33 @@ fn duration_schema(what: &str) -> Value {
     json!({ "type": "string", "description": format!("{what}, e.g. \"5m\"") })
 }
 
+/// What a server lets its client do beyond its tools' own checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Policy {
+    /// `stack_down` may purge checkouts selected machine-wide (by `labels`, without `project`):
+    /// `stack mcp --allow-host-purge`. Off by default in every profile.
+    pub host_purge: bool,
+}
+
 /// Serve the tools of `profile` over stdio until the client closes stdin. Requests run
 /// concurrently (see [`server`]); every response and notification is written as one line.
-pub fn serve(profile: Profile) -> std::io::Result<()> {
+pub fn serve(profile: Profile, policy: Policy) -> std::io::Result<()> {
     crate::commands::serving_mcp();
-    server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), profile)
+    server::serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout(), profile, policy)
+}
+
+/// Refuse a call `policy` does not allow, before anything runs: a purge of checkouts selected
+/// machine-wide. A client's roots are where it works, not a sandbox, so a selection by labels
+/// reaches every checkout on the machine; deleting their data takes the server's consent.
+/// Purging one checkout, or `dir`'s project (`project: true`), is not affected.
+fn permitted(policy: Policy, name: &str, args: &Value) -> Result<()> {
+    if name == "stack_down" && args["purge"] == true && machine_wide(name, args) && !policy.host_purge {
+        return Err(StackError::new(
+            "host_purge_disabled",
+            "stack_down: purge with a `labels` selection would delete the service data of matching checkouts anywhere on this machine",
+        ));
+    }
+    Ok(())
 }
 
 fn send(out: &mut impl Write, v: Value) -> std::io::Result<()> {
@@ -487,7 +509,8 @@ fn tool_definitions() -> Value {
                 "since_start": { "type": "boolean", "description": "Current run only" },
                 "since": { "type": "string", "description": "Span, e.g. 10m" },
                 "grep": { "type": "string", "description": "Substring" },
-                "ignore_case": { "type": "boolean" }
+                "ignore_case": { "type": "boolean" },
+                "cursor": { "type": "string", "description": "A result's cursor: only newer output (\"\" to begin)" }
             }), "Read", false), &[])),
         tool("stack_env", annotations("Command env", true, None, true, false),
             "Return stack_exec env. Use it for unwrapped tools; prefer stack_exec.",
@@ -508,7 +531,7 @@ fn tool_definitions() -> Value {
             "Stop services; stop_unconfirmed while a started command runs. Use it when finished; keeps data unless purge.",
             schema(fleet_props(json!({
                 "stop_supervisor": { "type": "boolean", "description": "Stop idle supervisor (true)" },
-                "purge": { "type": "boolean", "description": "Delete service data" },
+                "purge": { "type": "boolean", "description": "Delete service data (with labels: server must allow)" },
                 "forget_unrecorded": { "type": "boolean", "description": "Forget dead unrecorded cmds" }
             }), "Stop", false), &[])),
         tool("stack_gc", annotations("Reclaim sessions", false, Some(true), true, false),
@@ -546,11 +569,11 @@ fn tool_definitions() -> Value {
 /// when it offers none.
 #[cfg(test)]
 fn call(params: &Value, roots: Option<&[PathBuf]>) -> Value {
-    call_in(Profile::Full, params, roots)
+    call_in(Profile::Full, Policy::default(), params, roots)
 }
 
-/// Run one `tools/call` on a server offering `profile`'s tools.
-fn call_in(profile: Profile, params: &Value, roots: Option<&[PathBuf]>) -> Value {
+/// Run one `tools/call` on a server offering `profile`'s tools under `policy`.
+fn call_in(profile: Profile, policy: Policy, params: &Value, roots: Option<&[PathBuf]>) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
     let mut call = crate::contract::Call::new(name.strip_prefix("stack_").unwrap_or(name));
     let mut resolved = None;
@@ -558,6 +581,7 @@ fn call_in(profile: Profile, params: &Value, roots: Option<&[PathBuf]>) -> Value
         .and_then(|()| validate(name, &params["arguments"]))
         .and_then(|args| {
             let args = Value::Object(args);
+            permitted(policy, name, &args)?;
             let found = locate(name, &args, roots)?;
             resolved = found.as_ref().map(|d| d.root.clone());
             let here = found.as_ref().map(|d| d.from.clone()).filter(|from| Some(from) != resolved.as_ref());
@@ -792,8 +816,16 @@ fn dispatch(name: &str, args: &Value, ctx: &Ctx, here: Option<PathBuf>) -> Resul
                 since_secs: args["since"].as_str().map(parse_duration).transpose()?,
                 grep: args["grep"].as_str().map(String::from),
                 ignore_case: args["ignore_case"] == true,
+                cursor: match &args["cursor"] {
+                    Value::Null => None,
+                    Value::String(c) => Some(crate::logs::Cursor::parse(c)?),
+                    v => return Err(StackError::new("usage", format!("cursor {v} must be a string a previous stack_logs result gave"))),
+                },
             };
             let fleet = fleet_filter(args, ctx)?;
+            if fleet.active() && q.cursor.is_some() {
+                return Err(StackError::new("usage", "cursor reads one checkout's logs").hint("drop `cursor`, or drop project/labels/all"));
+            }
             if fleet.active() {
                 return crate::fleet::logs(&ctx.state, &ctx.cache, &fleet, &q).map(to_value);
             }
@@ -1319,6 +1351,31 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_wide_purge_needs_the_servers_consent_and_a_scoped_one_does_not() {
+        let by_label = json!({ "labels": { "agent": "claude" }, "purge": true });
+        let allowed = Policy { host_purge: true };
+        for profile in [Profile::Full, Profile::Core] {
+            // Refused before anything is located or stopped: no dir, no roots, nothing runs.
+            let called = call_in(profile, Policy::default(), &json!({ "name": "stack_down", "arguments": by_label }), None);
+            let error = &called["structuredContent"]["error"];
+            assert_eq!(error["code"], "host_purge_disabled", "{profile:?}: {called}");
+            assert!(error["hint"].as_str().unwrap().contains("--allow-host-purge"), "{called}");
+            assert_eq!(error["retryable"], false, "{called}");
+        }
+        let refused = |args: Value| permitted(Policy::default(), "stack_down", &args).is_err();
+        assert!(refused(by_label.clone()));
+        assert!(refused(json!({ "dir": "/w", "labels": { "a": "b" }, "purge": true })), "dir does not scope a label selection");
+        // Scoped to one checkout or dir's project, or not purging: as before.
+        assert!(!refused(json!({ "dir": "/w", "purge": true })));
+        assert!(!refused(json!({ "dir": "/w", "project": true, "purge": true })));
+        assert!(!refused(json!({ "dir": "/w", "project": true, "labels": { "a": "b" }, "purge": true })));
+        assert!(!refused(json!({ "labels": { "a": "b" } })));
+        assert!(!refused(json!({ "labels": {}, "purge": true })), "an empty selection selects nothing machine-wide");
+        assert!(permitted(allowed, "stack_down", &by_label).is_ok());
+        assert!(permitted(Policy::default(), "stack_gc", &json!({ "reclaim_data": true })).is_ok(), "gc reclaims only deleted checkouts");
+    }
+
+    #[test]
     fn fleet_calls_by_label_or_all_need_no_checkout_and_by_project_need_one() {
         let needs = |name: &str, args: Value| needs_roots(Profile::Full, &json!({ "name": name, "arguments": args }));
         assert!(needs("stack_status", json!({})));
@@ -1397,16 +1454,16 @@ mod tests {
             same.as_object_mut().unwrap().remove("outputSchema");
             assert_eq!(*tool, same);
         }
-        let refused = call_in(Profile::Core, &json!({ "name": "stack_inspect", "arguments": { "dir": "/does/not/exist" } }), None);
+        let refused = call_in(Profile::Core, Policy::default(), &json!({ "name": "stack_inspect", "arguments": { "dir": "/does/not/exist" } }), None);
         let error = &refused["structuredContent"]["error"];
         assert_eq!((refused["isError"].clone(), error["code"].clone()), (json!(true), json!("unknown_tool")), "{refused}");
         assert!(error["hint"].as_str().unwrap().contains("--profile full"), "{error}");
         assert!(refused["structuredContent"].get("project").is_none(), "nothing was resolved: {refused}");
         // A name no profile has is unknown as on a full server; core tools are checked as ever.
-        let unknown = call_in(Profile::Core, &json!({ "name": "stack_nope", "arguments": {} }), None);
+        let unknown = call_in(Profile::Core, Policy::default(), &json!({ "name": "stack_nope", "arguments": {} }), None);
         assert_eq!(unknown["structuredContent"]["error"]["code"], "unknown_tool");
         assert!(!unknown["structuredContent"]["error"]["hint"].as_str().unwrap_or_default().contains("--profile"), "{unknown}");
-        let relative = call_in(Profile::Core, &json!({ "name": "stack_status", "arguments": { "dir": "relative" } }), None);
+        let relative = call_in(Profile::Core, Policy::default(), &json!({ "name": "stack_status", "arguments": { "dir": "relative" } }), None);
         assert_eq!(relative["structuredContent"]["error"]["code"], "usage", "{relative}");
         assert!(Profile::Core.instructions().contains("--profile core") && !Profile::Full.instructions().contains("--profile core"));
     }

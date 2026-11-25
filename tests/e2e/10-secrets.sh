@@ -32,7 +32,7 @@ assert_json '.ok and .data.stack.tasks.deploy.value.secrets == ["DEPLOY_KEY"]' "
 stack install --json >"$T/s-install.json"
 assert_json '.ok' "$T/s-install.json"
 
-stack run deploy --json >"$T/s-run.json" 2>"$T/s-run.err"
+stack run --json deploy >"$T/s-run.json" 2>"$T/s-run.err"
 assert_json '.ok and .data.exit_code == 0 and .data.secrets == ["DEPLOY_KEY"]' "$T/s-run.json"
 assert_json '(.data.stdout | contains("task got [redacted:DEPLOY_KEY]")) and (.data.stdout | contains("other unset"))' "$T/s-run.json"
 assert_json '.data.stderr | contains("err [redacted:DEPLOY_KEY]")' "$T/s-run.json"

@@ -266,12 +266,22 @@ fn gc_dry_run_reports_what_would_be_reclaimed_and_changes_nothing() {
     // A deleted checkout with no session left: a port reservation and a data directory.
     let gone = fixture.add_project("gone");
     let gone = gone.canonicalize().unwrap();
+    // Where it was, as `up` records it with each record (its device and mount).
+    let at = serde_json::to_value(stack::checkout::Recorded::of(&gone)).unwrap();
+    let with_at = |mut record: Value| {
+        record.as_object_mut().unwrap().extend(at.as_object().unwrap().clone());
+        record
+    };
+    // A checkout an earlier Stack recorded, with nothing of where it was: never shown deleted.
+    let legacy = fixture.add_project("legacy").canonicalize().unwrap();
     let mut ports: Value = serde_json::from_slice(&fs::read(fixture.path("state/ports.json")).unwrap()).unwrap();
-    ports["reservations"].as_array_mut().unwrap().push(json!({ "port": 41999, "project": gone, "service": "db" }));
+    ports["reservations"].as_array_mut().unwrap().push(with_at(json!({ "port": 41999, "project": gone, "service": "db" })));
+    ports["reservations"].as_array_mut().unwrap().push(json!({ "port": 41998, "project": legacy, "service": "db" }));
     fs::write(fixture.path("state/ports.json"), ports.to_string()).unwrap();
     let data_dir = fixture.path("mise-state/daemons/x/data/db");
-    fs::write(fixture.path("state/data.json"), json!({ "entries": [{ "project": gone, "service": "db", "dir": data_dir, "checkout": "token" }] }).to_string()).unwrap();
+    fs::write(fixture.path("state/data.json"), json!({ "entries": [with_at(json!({ "project": gone, "service": "db", "dir": data_dir, "checkout": "token" }))] }).to_string()).unwrap();
     fs::remove_dir_all(&gone).unwrap();
+    fs::remove_dir_all(&legacy).unwrap();
     thread::sleep(Duration::from_millis(2100));
     let state_files = || -> Vec<(PathBuf, Vec<u8>)> {
         let mut files: Vec<PathBuf> = fixture.index_files();
@@ -294,6 +304,9 @@ fn gc_dry_run_reports_what_would_be_reclaimed_and_changes_nothing() {
     assert!(deleted["ports"].as_array().unwrap().contains(&json!({ "service": "db", "port": 41999 })), "{deleted}");
     assert_eq!(deleted["data"], json!([{ "service": "db", "dir": data_dir, "action": "report" }]));
     assert!(deleted.get("after_session").is_none(), "{deleted}");
+    assert!(data["deleted_checkouts"].as_array().unwrap().iter().all(|d| d["project"] != json!(legacy)), "{data}");
+    let unavailable = data["unavailable"].as_array().unwrap().iter().find(|u| u["project"] == json!(legacy)).cloned().unwrap_or_else(|| panic!("{data}"));
+    assert!(unavailable["reason"].as_str().unwrap().contains("recorded no filesystem"), "{unavailable}");
     // With --reclaim-data, what it would remove.
     let (ok, result) = fixture.gc(&["--dry-run", "--reclaim-data"]);
     assert!(ok, "{result}");

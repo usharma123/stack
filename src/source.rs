@@ -2,8 +2,9 @@
 
 use crate::error::{io_error, Result, StackError};
 use crate::git;
-use crate::hash::hash_dir;
+use crate::hash::hash_keeping;
 use crate::lock::LockedBundle;
+use crate::manifest::BUNDLE_FILE;
 use crate::oci::{self, Reference};
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,9 @@ pub struct Fetched {
     pub commit: Option<String>,
     pub digest: Option<String>,
     pub content_hash: String,
+    /// The bytes of the bundle's `bundle.toml` exactly as `content_hash` covered them (see
+    /// [`crate::manifest::parse_bundle`]); `None` when the tree has none.
+    pub manifest: Option<Vec<u8>>,
     /// Set when `--update` moved a bundle to a different commit or digest.
     pub moved_from: Option<String>,
 }
@@ -140,6 +144,12 @@ fn fetch_git(
     let locked_commit = locked.and_then(|l| l.commit.clone());
     let (commit, moved_from) = match (mode, locked_commit) {
         (Mode::UseLock | Mode::Frozen, Some(commit)) => {
+            // It names a cache directory and is handed to git: only a commit id may.
+            if !is_commit(&commit) {
+                let shown: String = commit.chars().take(80).collect();
+                return Err(StackError::new("lock_invalid", format!("{spec}: the commit stack.lock records is not a commit id: \"{}\"", shown.escape_debug()))
+                    .hint("run `stack compile --update` to re-resolve, then review the change"));
+            }
             let mut mirror = git::ensure_mirror(cache, url, false)?;
             if !git::has_commit(&mirror, &commit) {
                 mirror = git::ensure_mirror(cache, url, true)?;
@@ -163,6 +173,9 @@ fn fetch_git(
         (_, previous) => {
             let mirror = git::ensure_mirror(cache, url, true)?;
             let commit = git::resolve(&mirror, reference)?;
+            if !is_commit(&commit) {
+                return Err(StackError::new("materialize_failed", format!("{spec}: git resolved {reference} to something that is not a commit id")));
+            }
             let moved = previous.filter(|p| *p != commit);
             (commit, moved)
         }
@@ -185,7 +198,7 @@ fn fetch_git(
             })?
         }
     };
-    let content_hash = hash_dir(&dir)?;
+    let (content_hash, manifest) = hash_keeping(&dir, BUNDLE_FILE)?;
 
     if let Some(locked) = locked {
         if locked.commit.as_deref() == Some(commit.as_str()) && locked.content_hash != content_hash {
@@ -202,8 +215,14 @@ fn fetch_git(
         commit: Some(commit),
         digest: None,
         content_hash,
+        manifest,
         moved_from,
     })
+}
+
+/// Whether `value` is a full Git object id (SHA-1 or SHA-256), lowercase hex.
+fn is_commit(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn fetch_oci(
@@ -216,7 +235,10 @@ fn fetch_oci(
     let client = oci::Client::default();
     let locked_digest = locked.and_then(|l| l.digest.clone());
     let (digest, moved_from) = match (mode, locked_digest) {
-        (Mode::UseLock | Mode::Frozen, Some(d)) => (d, None),
+        (Mode::UseLock | Mode::Frozen, Some(d)) => {
+            oci::digest(&d, "lock_invalid", &format!("{spec}: the digest stack.lock records"))?;
+            (d, None)
+        }
         (Mode::Frozen, None) => {
             return Err(StackError::new("lock_outdated", format!("{spec} is not in stack.lock"))
                 .hint("run `stack compile` and commit stack.lock"));
@@ -228,23 +250,42 @@ fn fetch_oci(
         }
     };
 
+    // Only a digest may name the cache directory (the registry's answer is hashed here, so it
+    // is one; a reference's and the lock's are checked above).
+    oci::digest(&digest, "oci_failed", &format!("{spec}: the manifest digest"))?;
     let dir = cache.join("bundles").join(format!("oci-{}", digest.trim_start_matches("sha256:")));
     client.pull(r, &digest, &dir)?;
-    let content_hash = hash_dir(&dir)?;
-    if let Some(locked) = locked {
-        if locked.digest.as_deref() == Some(digest.as_str()) && locked.content_hash != content_hash {
+    // A layer with any of these is refused when expanded; a cached tree with one was filled
+    // otherwise (an earlier Stack compared names exactly), with content no hash covers.
+    if let Some(found) = crate::hash::first_excluded(&dir)? {
+        return Err(StackError::new(
+            "bundle_invalid",
+            format!("{spec}: the bundle cached at {} holds {}, which bundles cannot contain", dir.display(), found.display()),
+        )
+        .hint(format!("delete {} and retry", dir.display())));
+    }
+    let (content_hash, manifest) = hash_keeping(&dir, BUNDLE_FILE)?;
+    // The cached tree is reused only with evidence that it is what `digest` holds: stack.lock
+    // pinning this digest with this content hash, or what this Stack recorded when it installed
+    // it (both checked offline); otherwise the registry is asked again (see
+    // `oci::Client::verify_cached`).
+    match locked.filter(|l| l.digest.as_deref() == Some(digest.as_str())) {
+        Some(locked) if locked.content_hash != content_hash => {
             return Err(StackError::new("content_hash_mismatch", format!("{spec}: contents of {digest} do not match stack.lock"))
                 .hint(format!("delete {} and retry; if it persists, the lock was edited", dir.display())));
         }
+        Some(_) => {}
+        None if oci::Evidence::matches(&dir, &digest, &content_hash) => {}
+        None => client.verify_cached(r, &digest, &dir, &content_hash)?,
     }
-    Ok(Fetched { dir, commit: None, digest: Some(digest), content_hash, moved_from })
+    Ok(Fetched { dir, commit: None, digest: Some(digest), content_hash, manifest, moved_from })
 }
 
 fn fetch_path(spec: &str, path: &Path, locked: Option<&LockedBundle>, mode: Mode) -> Result<Fetched> {
     let dir = path.canonicalize().map_err(|e| {
         StackError::new("bundle_not_found", format!("{spec}: {e}"))
     })?;
-    let content_hash = hash_dir(&dir)?;
+    let (content_hash, manifest) = hash_keeping(&dir, BUNDLE_FILE)?;
     if mode == Mode::Frozen && locked.map(|l| &l.content_hash) != Some(&content_hash) {
         return Err(StackError::new(
             "lock_outdated",
@@ -257,6 +298,7 @@ fn fetch_path(spec: &str, path: &Path, locked: Option<&LockedBundle>, mode: Mode
         commit: None,
         digest: None,
         content_hash,
+        manifest,
         moved_from: None,
     })
 }
@@ -267,6 +309,55 @@ mod tests {
 
     fn git(spec: &str) -> Result<Source> {
         Source::parse(spec, Path::new("/p"))
+    }
+
+    /// The manifest a compile parses is the one its content hash covered: changed after the
+    /// tree was hashed, the bytes kept are still the ones hashed.
+    #[test]
+    fn the_manifest_parsed_is_the_one_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bundle.toml"), "[bundle]\nname = 'hashed'\n").unwrap();
+        let fetched = Source::parse(&format!("path:{}", dir.path().display()), Path::new("/")).unwrap().fetch("path:b", None, Mode::UseLock, dir.path()).unwrap();
+        std::fs::write(dir.path().join("bundle.toml"), "[bundle]\nname = 'changed'\n").unwrap();
+        let manifest = crate::manifest::parse_bundle(fetched.manifest.as_deref(), &fetched.dir, "path:b").unwrap();
+        assert_eq!(manifest.bundle.name, "hashed");
+        assert_ne!(crate::hash::hash_dir(dir.path()).unwrap(), fetched.content_hash, "the hash was of the bytes parsed");
+        let e = crate::manifest::parse_bundle(None, dir.path(), "path:b").unwrap_err();
+        assert_eq!(e.code, "bundle_invalid");
+    }
+
+    /// A local bundle edited after stack.lock recorded it: locked mode refuses it (lock_outdated)
+    /// until an ordinary compile hashes it again, and that hash is the edited content's.
+    #[test]
+    fn a_local_bundle_edited_after_its_lock_is_outdated_until_compiled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bundle.toml"), "[bundle]\nname = 'b'\n").unwrap();
+        let source = Source::parse(&format!("path:{}", dir.path().display()), Path::new("/")).unwrap();
+        let first = source.fetch("path:b", None, Mode::UseLock, dir.path()).unwrap();
+        let locked = LockedBundle { source: "path:b".into(), name: "b".into(), commit: None, digest: None, content_hash: first.content_hash.clone() };
+        assert_eq!(source.fetch("path:b", Some(&locked), Mode::Frozen, dir.path()).unwrap().content_hash, first.content_hash);
+
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/tool"), "edited").unwrap();
+        let e = source.fetch("path:b", Some(&locked), Mode::Frozen, dir.path()).unwrap_err();
+        assert_eq!(e.code, "lock_outdated");
+        let again = source.fetch("path:b", Some(&locked), Mode::UseLock, dir.path()).unwrap();
+        assert_ne!(again.content_hash, first.content_hash);
+        assert_eq!(again.content_hash, crate::hash::hash_dir(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn only_commit_ids_name_git_bundle_checkouts() {
+        assert!(is_commit(&"a".repeat(40)) && is_commit(&"0".repeat(64)));
+        for bad in ["", "abc", "../../x", "-p", &"A".repeat(40), &"a".repeat(41)] {
+            assert!(!is_commit(bad), "{bad}");
+        }
+        let locked = LockedBundle { source: "git+https://example.invalid/r?ref=v1".into(), name: "b".into(), commit: Some("../../dummy".into()), digest: None, content_hash: String::new() };
+        let cache = tempfile::tempdir().unwrap();
+        let source = git("git+https://example.invalid/r?ref=v1").unwrap();
+        let e = source.fetch("git+https://example.invalid/r?ref=v1", Some(&locked), Mode::UseLock, cache.path()).unwrap_err();
+        assert_eq!(e.code, "lock_invalid", "{e:?}");
+        assert!(!cache.path().join("bundles").exists());
     }
 
     #[test]

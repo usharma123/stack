@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { buildReleaseNotes, previousTag, prepareReleaseAssets } from '../scripts/release-notes.mjs';
+import { buildReleaseNotes, outputLines, previousTag, prepareReleaseAssets } from '../scripts/release-notes.mjs';
 
 test('previousTag selects the newest earlier v* tag', () => {
   assert.equal(previousTag(['v0.1.24', 'v0.1.23', 'v0.1.22'], 'v0.1.24'), 'v0.1.23');
@@ -72,4 +72,11 @@ test('prepareReleaseAssets writes checksummed tarball, SHA256SUMS, and release n
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('workflow outputs are single lines, so a value can never add another output', () => {
+  assert.equal(outputLines({ title: 'Stack v0.1.24', prerelease: false }), 'title=Stack v0.1.24\nprerelease=false\n');
+  assert.throws(() => outputLines({ title: 'Stack v0.1.24\nasset=/etc/passwd' }), /spans lines/);
+  assert.throws(() => outputLines({ notes: 'a\rb' }), /spans lines/);
+  assert.throws(() => outputLines({ 'bad name': 'x' }), /Invalid output name/);
 });

@@ -4,7 +4,8 @@ Stack ships as `@ushawarma/stack`, with the `stack` command. The npm tarball
 contains four native binaries: macOS x64/arm64 and Linux x64/arm64. Installation
 needs Node.js 22.14 or later, and macOS 13 or later or any Linux distribution (the Linux
 binaries are statically linked with musl). Windows is unsupported. Rust is not needed to install the package.
-Mise and its service dependencies are still required for the commands that use them.
+Commands that install tools or run services still need mise (`stack setup` downloads it); Stack
+runs services under its own supervisor, so nothing else is needed for that.
 
 A single package keeps publication atomic. Its larger download includes all four
 binaries, so installation works without postinstall scripts or GitHub downloads,
@@ -15,27 +16,47 @@ including `npm install --ignore-scripts`.
 `ci.yml` runs on pull requests, main pushes, and manual dispatch. `validate.yml`
 builds the artifact that releases promote and does the following:
 
-- Runs locked Rust tests and Clippy on each supported OS and CPU.
+- Lints every workflow and the Dependabot configuration with pinned actionlint 1.7.12
+  (shellcheck on every `run:` script) and zizmor 1.32.0, and the scripts CI runs with
+  shellcheck 0.11.0 (`scripts/ci/lint.sh`); any finding fails.
+- Checks the dependency policy in `deny.toml` with pinned cargo-deny 0.20.2 against the
+  RustSec database at a pinned commit, offline (`scripts/ci/dependency-policy.sh pinned`),
+  so a pull request's result depends on its own content. `audit.yml` checks the newest
+  advisories and yanked crates weekly, on main and on demand.
+- Runs locked Rust tests and Clippy (`-D warnings`) on each supported OS and CPU, and on
+  Linux Clippy for the musl target that ships as well.
 - Builds with Rust 1.93.1 and executes each native binary to verify its version.
+- Model-checks each TLA+ verify skill (baseline, historical mutants, witnesses and limits,
+  with the TLC 1.7.4 jar checked against its SHA-256 on every use) and runs the Rust tests
+  linked to it, one job per skill, with psql required so no linked check passes by skipping.
 - Tests OCI publication, digest replay, moved-tag updates, and rejected uploads
   against a real Docker registry, with assertions and nonzero failure exits.
+- Runs the packaged binary of Linux x64, Linux arm64 and macOS arm64 (checked against its
+  build-info first) on a clean machine (`tests/e2e/clean-machine.sh`: `stack setup` must
+  install the pinned mise, then doctor, compile --locked, up, exec and run against Postgres,
+  and down), through every native service scenario, the multi-worktree isolation test and
+  the Postgres template clone with the path it must take (copy on ext4, clonefile on APFS,
+  reflink on a loop-mounted XFS image). Linux also runs the bind mount and PID namespace
+  regressions in namespaces of their own. macOS x64 is built, tested and install-smoked only.
 - Checks each artifact's commit, version, platform, and SHA-256 before packing.
 - Installs the packed tarball on all four runners with scripts disabled and tests
   version/help, argument errors, compilation in a path with spaces, and locked replay.
 
-Actions are pinned to commit SHAs. Builds use Cargo.lock and no shared caches.
-Packaging starts as soon as native builds pass; independent OCI/service checks still
+Actions are pinned to commit SHAs. CI checks the SHA-256 of the downloaded linters, cargo-deny,
+mise archives and TLC jar. Dependabot proposes action and Cargo updates a week after their
+release. Builds use Cargo.lock and no
+shared caches. Packaging starts as soon as native builds pass; independent checks still
 block the final `CI passed` result. The four-runner install matrix tests the uploaded
 tarball; packaging does not repeat its Linux smoke test. Every runner job and step
 has a timeout. Script subprocesses have hard kill deadlines: 30 seconds for local
 checks, 60 seconds for each GitHub API command, and three minutes for npm install
 or publish. Workflows default to no token permissions; jobs grant only the reads
-they need, with OIDC limited to publication. Checkouts never persist credentials.
+they need, with OIDC limited to publication; `tests/ci.test.mjs` keeps these policies,
+and no `run:` script interpolates an expression. Checkouts never persist credentials.
 PR runs can cancel older runs; releases cannot cancel an active
 publication. Release runs queue instead of replacing pending releases. Set the
 `CI passed` job as a required branch protection check.
-The existing `tests/e2e/run.sh` service scenarios remain an additional manual
-check; this pipeline does not claim full service lifecycle coverage on macOS.
+The Docker-based `tests/e2e/run.sh` remains an additional manual check.
 
 ## npm account setup
 
@@ -127,15 +148,10 @@ and reuse the selected artifact; if it is unavailable, release a new version.
 Fix authentication errors rather than repeatedly publishing. A newer failed or
 unfinished eligible run for the commit blocks promotion even if an older run passed.
 
-GitHub release concurrency uses `queue: max` to retain pending releases.
-Actionlint 1.7.12 does not recognize that GitHub-supported key yet. Until its schema
-catches up, ignore only that exact diagnostic:
-
-```sh
-actionlint -ignore '^unexpected key "queue" for "concurrency" section' \
-  .github/workflows/{ci,validate,release}.yml
-zizmor --no-progress .github/workflows/{ci,validate,release}.yml
-```
+GitHub release concurrency uses `queue: max` to retain pending releases, and `ci.yml`
+calls `validate.yml` with the self-repository form `uses: $/...`. actionlint 1.7.12 knows
+neither yet; `.github/actionlint.yaml` ignores exactly those two diagnostics in those two
+files. Run the same lint CI runs with `scripts/ci/lint.sh`.
 
 ## Local packaging check
 

@@ -1,5 +1,34 @@
 # What Stack guarantees
 
+What follows holds for what this page calls generally available; anything else is said where it
+differs.
+
+## Scope
+
+- **Generally available presets: Postgres and Redis.** Locked to an exact release, started by
+  Stack's supervisor on loopback, verified before every command to be this checkout's own server
+  (over the app's `DATABASE_URL` or `REDIS_URL`, by the data directory it reports), and covered
+  by init tasks, snapshots and `down --purge`.
+- **Experimental presets: CockroachDB, NATS and SpiceDB.** They are locked, started and given
+  their extra ports like the others, but are checked for liveness only (unless the project adds
+  an [identity probe](identity-probes.md)), are not covered by snapshots, and run in development
+  modes: CockroachDB `--insecure`, SpiceDB with a fixed development preshared key and an
+  in-memory datastore (its data does not survive a restart). Their arguments, readiness checks
+  and variables may change in any release. NATS's and SpiceDB's readiness checks run `curl`,
+  which must be on `PATH`.
+- **Services of your own** (`run = ...`) are checked for liveness only unless they declare an
+  identity probe, and labelled that way.
+- **Platforms.** macOS 13+ and Linux on x64 and arm64; Windows is not supported. Where a
+  guarantee below depends on the platform, it says so: on Linux, signals bound to a process
+  need pidfds (kernel 5.3 or later), and without them Stack signals nothing and reports
+  `stop_unconfirmed`; macOS has no such handle and leaves the gap described under stopping.
+- **Launch verification.** `up` and `restart` report success only once every service they
+  started passed its check; a launch that did not finish verifying is recorded and reported as
+  `launch_incomplete`, so a later command does not take it for verified. A check is what the
+  bullets below describe for that kind of service, nothing more.
+
+## Guarantees
+
 - **Bundles are pinned by commit.** `stack.lock` records each bundle's commit and content hash.
   Moving a tag upstream changes nothing until `stack compile --update`, which reports what
   moved.
@@ -39,9 +68,24 @@
   services count as unverified until `stack up` restarts them. Adding or editing a task needs
   no restart. A session started by Stack 0.1.22 or earlier, whose fingerprint included tasks,
   needs one restart after its first task edit.
-- **Lifetimes are owned.** A session can be leased for a TTL or to a process. Expired sessions
+- **Lifetimes are owned.** A session can be leased for a TTL or to a process. The owner is the
+  process the PID named when the lease was taken (its PID, start time and boot, and on Linux the
+  PID namespace it was seen from): the lease ends when that process exits or the machine
+  restarts, never kept alive by a later process given its PID. When that cannot be told (another
+  PID namespace, a start time that cannot be read, a process status this process may not read)
+the lease is kept and `owner_unknown` says
+  why; a lease Stack 0.1.24 or earlier recorded is checked by PID alone (see
+  [leases](commands.md#leases)). Expired sessions
   are reclaimed by `stack gc` and by every `stack up`, but never while a command is running in
-  them. The pass in `up` never waits for, or fails because of, another checkout. For a deleted
+  them. The pass in `up` never waits for, or fails because of, another checkout. A checkout counts as
+  deleted only once its path is gone and the mount it was on is there to show it: a lookup
+  refused or failing, a volume that is not mounted, or a bind mount that is not mounted (even
+  one of the same filesystem), leaves everything of it as it is, and so does a record that
+  names no mount (an earlier Stack's, on Linux, or one naming no filesystem at all). A mount
+  point left at a checkout's path while its volume or bind mount is not mounted, or another
+  volume mounted there, never stands in for it: only a command run in the checkout adopts what
+  is at the path, and `gc` updates a record only from the very mount it names (see
+  [gc](commands.md#gc)). For a deleted
   checkout, `gc` stops what Stack's supervisor recorded for it, each process only while its pid
   and process start time still match the record, and drops the record once they are gone.
   Services an older Stack started under Pitchfork are never stopped by name by default, because
@@ -79,6 +123,11 @@
   last search; an older Stack's commands beyond the first `down`; a command a service starts in
   the service's own process group, which ends with the service; and a recreated directory that
   inherits the old inode on a filesystem without creation times.
+- **Data is removed only where Stack recorded it.** `down --purge` and `gc --reclaim-data`
+  remove only the data directory `up` recorded, reached with no link followed, as that same
+  directory, its marker naming the checkout, and never across a mount: data that is a mount
+  point or holds one, a bind mount of the same filesystem included, is kept and reported (see
+  [gc](commands.md#gc)).
 - **Secrets go only where granted.** A command receives exactly the fnox secrets it was
   granted. Values never enter `stack.lock`, generated config, session records or logs, and
   are redacted from output captured with `--json` or MCP. Terminal output is not redacted, and
@@ -95,6 +144,28 @@
   (the site's own, or the code's default), `retryable`, `details` with the specifics where
   there are any and, where the fix is unambiguous, a machine-readable `next` step.
   Argument errors are `usage` and exit 2. `stack mcp` returns the same object. Git never prompts.
+
+## Security model
+
+Stack isolates checkouts from each other's mistakes, not users or processes from each other.
+
+- **Loopback is trusted.** Services listen on `127.0.0.1` without authentication: Postgres
+  with `trust` authentication, Redis without a password, CockroachDB `--insecure`, SpiceDB with
+  a well-known development key. Any process on the machine, of any user, can connect to them.
+  Do not put data in them that other local users must not read or change, and do not run
+  Stack on a host shared with users you do not trust.
+- **Your user is the boundary.** Stack, its supervisors, its services and `stack mcp` run as
+  you, with your files and environment. The supervisor's records are readable by your user
+  alone, but any process running as you can read or change Stack's state, and can run fnox for
+  secrets that were not granted. Instance tokens and identity checks tell instances apart;
+  they are not credentials and do not authenticate anyone.
+- **Bundles and tasks are code you run.** A bundle's tasks, `setup` commands, identity probes
+  and service commands run with your privileges. Review a bundle like any other dependency.
+- **MCP roots are not a sandbox.** An agent connected over MCP can act on every checkout Stack
+  has records for on the machine; see [coding agents](agents.md#connect-over-mcp). Deleting
+  service data of checkouts selected machine-wide by labels needs `stack mcp --allow-host-purge`.
+
+Reporting a vulnerability: see [SECURITY.md](../../SECURITY.md).
 
 ## mise configuration
 

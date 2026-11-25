@@ -17,20 +17,13 @@ pub struct Check {
 
 /// Every check, or `doctor_failed` listing them all when any fails.
 pub fn run(root: &Path, cache: &Path, state: &Path) -> Result<Vec<Check>> {
+    // Services run under Stack's own supervisor, not `mise daemons`: nothing about mise's
+    // daemon support is checked.
     let mut checks = vec![
         tool("mise", "mise", &["--version"], crate::setup::MISE_INSTALL_HINT),
         tool("git", "git", &["--version"], "install git; it fetches git+ bundles"),
         tool("tar", "tar", &["--version"], "install tar; it extracts git bundles"),
     ];
-    if checks[0].ok {
-        // Services run through `mise daemons`, which older mise releases lack.
-        checks.push(tool(
-            "mise_daemons",
-            "mise",
-            &["daemons", "--help"],
-            "upgrade mise (`mise self-update`); services need `mise daemons`",
-        ));
-    }
     checks.push(writable(state));
     checks.push(stack_release(root));
     if root.join(crate::manifest::PROJECT_FILE).exists() {
