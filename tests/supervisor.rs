@@ -372,12 +372,14 @@ fn output_is_kept_per_service_with_when_each_line_was_read() {
     sup.start();
     let log = sup.path().join("logs/talk.log");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while fs::read_to_string(&log).map_or(true, |t| t.lines().count() < 2) {
+    // The file begins with its header (its generation), then a record per line.
+    while fs::read_to_string(&log).map_or(true, |t| t.lines().count() < 3) {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(10));
     }
     let text = fs::read_to_string(&log).unwrap();
-    let mut lines: Vec<(u128, &str)> = text.lines().map(|l| l.split_once(' ').map(|(t, r)| (t.parse().unwrap(), r)).unwrap()).collect();
+    assert!(text.starts_with("# stack log ") && text.lines().next().unwrap().len() == 44, "{text}");
+    let mut lines: Vec<(u128, &str)> = text.lines().skip(1).map(|l| l.split_once(' ').map(|(t, r)| (t.parse().unwrap(), r)).unwrap()).collect();
     lines.sort_by_key(|(_, l)| *l);
     assert_eq!(lines.iter().map(|(_, l)| *l).collect::<Vec<_>>(), ["err", "out"]);
     assert!(lines.iter().all(|(t, _)| *t >= before), "{text}");
@@ -764,9 +766,11 @@ fn one_writer_rotates_a_services_log_and_keeps_the_older_file() {
     let older = sup.path().join("logs/loud.log.1");
     let (now, before) = (fs::metadata(&log).unwrap().len(), fs::metadata(&older).unwrap().len());
     assert!(before > 16 * 1024 * 1024 && now < before, "{now} {before}");
-    // Every line went to one of the two files, none twice.
-    let lines = fs::read_to_string(&log).unwrap().lines().count() + fs::read_to_string(&older).unwrap().lines().count();
-    assert_eq!(lines, 20001);
+    // Every line went to one of the two files, none twice, each file under a header of its own.
+    let (text, older_text) = (fs::read_to_string(&log).unwrap(), fs::read_to_string(&older).unwrap());
+    let header = |t: &str| t.lines().next().filter(|h| h.starts_with("# stack log ")).map(str::to_string);
+    assert!(header(&text).is_some() && header(&older_text).is_some() && header(&text) != header(&older_text));
+    assert_eq!(text.lines().count() + older_text.lines().count(), 20001 + 2);
     sup.shutdown();
 }
 
@@ -781,11 +785,9 @@ fn a_cursor_reads_a_flooding_rotating_log_once_through_repeats_included() {
     // A cursor at the start of the first file, as soon as there is one.
     let mut pos = loop {
         assert!(Instant::now() < deadline, "no log");
-        if let Some(p) = stack::supervisor::tail(&sup.path(), "loud", 1, None).unwrap().2 {
-            // Already rotated (a slow machine): its first file is the older one.
-            use std::os::unix::fs::MetadataExt;
-            let first = fs::metadata(sup.path().join("logs/loud.log.1")).map_or((p.dev, p.ino), |m| (m.dev(), m.ino()));
-            break stack::supervisor::LogPos { dev: first.0, ino: first.1, offset: 0 };
+        // Already rotated (a slow machine): its first file is the older one.
+        if let Some(p) = stack::supervisor::log_start(&sup.path(), "loud").unwrap() {
+            break p;
         }
         thread::sleep(Duration::from_millis(5));
     };

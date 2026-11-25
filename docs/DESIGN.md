@@ -588,10 +588,25 @@ output (mise's answer when no release matches) is an error, not a version.
   `logs` directory (`O_DIRECTORY | O_NOFOLLOW`) with `openat(O_NOFOLLOW)`, rotated with
   `renameat` in it, and must be regular files; a service name is one path component (see
   `manifest::valid_service_name`), checked when a manifest is composed, when a cursor is parsed,
-  and again when a log is opened. A cursor (log file device
-  and inode, byte offset after the last whole record) lets `logs --cursor`, MCP `stack_logs`
-  and `logs --follow` read only what was written since, following one rotation and reporting a
-  `gap` for output rotated away or truncated, with no compile and no re-read window. A record
+  and again when a log is opened. Every log file the writer makes begins with a header line,
+  `# stack log <generation>`, the generation 128 random bits: the file is made under
+  `<service>.log.new`, headed, and only then renamed into place, so no file of this writer is
+  ever seen without one (an empty file found in its place is headed first); readers skip it. A
+  cursor (log file device, inode and generation, byte offset after the last whole record, and a
+  check of that record: FNV-1a of its length and first 64 bytes) lets `logs --cursor`, MCP
+  `stack_logs` and `logs --follow` read only what was written since, following one rotation and
+  reporting a `gap` for output rotated away or truncated, with no compile and no re-read window.
+  A file is the cursor's only if it shows it: same device and inode, same generation, and the
+  same record before the offset (a log file is only appended to, so that never changes). A file
+  on a recycled inode has another generation, so the read reports `rotated` and returns the
+  oldest file kept; one of the same generation cut by hand (shorter, or another record there),
+  or whose header was cut away, is `truncated` and read again from its start. Files an older
+  writer made have no header: the record check alone tells them apart (a file holding the same
+  record at that offset cannot be told from the cursor's, and one shorter than the cursor is
+  taken for it truncated, as before). A `v1` cursor (device, inode, offset) shows nothing: it
+  reads the oldest file kept from its start, reporting `rotated`. A read that ends at the end of
+  the rotated file returns the start of the newer one, the same place, so a rotation after it
+  costs nothing. A record
   in the newer file that the rest of a read's byte budget cannot hold is left for the next read,
   whole; only a record longer than a whole read's budget is ever returned cut.
   The pipes end with the supervisor: a service that writes after its supervisor died gets

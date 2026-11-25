@@ -1235,13 +1235,85 @@ pub fn unresolved(dir: &Path) -> Vec<serde_json::Value> {
 //
 // A log is a sequence of records, each `<unix ms> <line>\n`, written whole by the service's one
 // writer (see [`write_log`]), which renames the file to `<service>.log.1` (replacing the one
-// before) once it passes [`LOG_ROTATE_BYTES`]. A reader names where it got to by a cursor
-// ([`LogPos`]): which file (device and inode, so a rotation or a recreated file is told apart
+// before) once it passes [`LOG_ROTATE_BYTES`]. Every file that writer makes begins with a header
+// line naming its generation, a number drawn at random when the file is made (see
+// [`log_header`]); files an older Stack's writer made have none. A reader names where it got to
+// by a cursor ([`LogPos`]): which file (device and inode, its generation, and a check of the
+// record before the offset, so a rotation, a recreated file or a recycled inode is told apart
 // from more output) and the byte offset after the last whole record it read. Reading from a
 // cursor reads only what was written since: the rest of the rotated file if the cursor is in
 // it, then the current one, and says what it could not return ([`Gap`]). Only whole records are
 // returned: one still being written (no newline yet) is left for the next read, except at the
 // end of a rotated file, which no one writes again, where it is returned as it is.
+
+/// What a log file this Stack's writer makes begins with, before the generation (32 lowercase
+/// hex digits) and a newline. Every record the writer stores begins with a digit, so no record
+/// can be taken for it; readers skip it.
+const HEADER_PREFIX: &[u8] = b"# stack log ";
+/// The header's length: its prefix, the generation and the newline.
+const HEADER_LEN: usize = HEADER_PREFIX.len() + 32 + 1;
+
+/// The header line of a log file of generation `gen`.
+pub(crate) fn log_header(gen: u128) -> Vec<u8> {
+    format!("# stack log {gen:032x}\n").into_bytes()
+}
+
+/// The generation a file beginning with `bytes` names in its header, if it has one.
+fn header_generation(bytes: &[u8]) -> Option<u128> {
+    let rest = bytes.strip_prefix(HEADER_PREFIX)?;
+    let hex = rest.get(..32)?;
+    (rest.get(32) == Some(&b'\n') && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| u128::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok())
+        .flatten()
+}
+
+/// A new file's generation: 128 random bits, so no two files of a log (nor a file and the one a
+/// recycled inode held before) share one, whatever crashes, restarts or clocks did between them.
+fn new_generation() -> u128 {
+    let mut bytes = [0u8; 16];
+    // SAFETY: getentropy fills the buffer it is given, of at most 256 bytes.
+    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0 {
+        return u128::from_le_bytes(bytes);
+    }
+    // No entropy to be had (never seen): what this process has made distinct, hashed.
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seed = format!("{} {nanos} {}", std::process::id(), MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    u128::from_str_radix(&crate::hash::sha256_hex(seed.as_bytes())[..32], 16).unwrap_or(nanos)
+}
+
+/// Bytes of a record, from its start, a position's check covers (with the record's length).
+const CHECK_BYTES: u64 = 64;
+
+/// The check of a position after a record of `len` bytes beginning with `start` (at most
+/// [`CHECK_BYTES`] of them): FNV-1a over the length and those bytes.
+fn digest(len: u64, start: &[u8]) -> u64 {
+    len.to_le_bytes().iter().chain(start).fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The check of the position `offset` in `log` (at most its length): [`digest`] of the record
+/// that ends there, which begins after the last newline before its last byte (no more than
+/// [`LOGS_LIMIT`] back). A log file is only ever appended to, so the check of a position in it
+/// never changes; a file that is not the one a cursor was taken in has another record there.
+fn check_at(log: &Opened, offset: u64) -> std::io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let floor = offset.saturating_sub(LOGS_LIMIT);
+    let mut begin = floor;
+    let mut end = offset.saturating_sub(1);
+    while end > floor {
+        let from = end.saturating_sub(4096).max(floor);
+        let mut bytes = vec![0; (end - from) as usize];
+        log.file.read_exact_at(&mut bytes, from)?;
+        if let Some(i) = bytes.iter().rposition(|b| *b == b'\n') {
+            begin = from + i as u64 + 1;
+            break;
+        }
+        end = from;
+    }
+    let mut start = vec![0; (offset - begin).min(CHECK_BYTES) as usize];
+    log.file.read_exact_at(&mut start, begin)?;
+    Ok(digest(offset - begin, &start))
+}
 
 /// One line of a service's output: when the supervisor read it (Unix ms; 0 for a line that
 /// carries no stamp) and the line.
@@ -1260,13 +1332,19 @@ impl Record {
     }
 }
 
-/// Where a reader of one service's log got to: the file (device, inode) and the offset just past
-/// the last whole record read.
+/// Where a reader of one service's log got to: the file (device, inode, generation) and the
+/// offset just past the last whole record read, with a check of that record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogPos {
     pub dev: u64,
     pub ino: u64,
     pub offset: u64,
+    /// The file's generation (its header: see [`log_header`]); `None` for a file without one,
+    /// which an older Stack's writer made.
+    pub gen: Option<u128>,
+    /// [`check_at`] the offset when the position was taken; `None` for a cursor an older Stack
+    /// gave (`v1`), which names its file by device and inode alone.
+    pub check: Option<u64>,
 }
 
 /// Output a read from a cursor could not return.
@@ -1278,8 +1356,10 @@ pub enum Gap {
     /// truncates; a file cut by hand and written past the cursor again cannot be told from one
     /// that grew.)
     Truncated,
-    /// The file the cursor was in is no longer kept (rotated out, or removed and recreated):
-    /// output between the cursor and the oldest file kept is gone.
+    /// The file the cursor was in is no longer kept (rotated out, or removed and recreated,
+    /// whether or not the new file has its inode), or cannot be shown to be (a cursor an older
+    /// Stack gave, or a position in a file without a header whose record there differs): output
+    /// between the cursor and the oldest file kept is gone, and that file is read from its start.
     Rotated,
 }
 
@@ -1303,6 +1383,56 @@ struct Opened {
     dev: u64,
     ino: u64,
     len: u64,
+    /// Its generation, when it begins with a header.
+    gen: Option<u128>,
+    /// Where its first record begins: after its header, or 0.
+    head: u64,
+}
+
+impl Opened {
+    /// The position `offset` in this file.
+    fn pos(&self, offset: u64) -> std::io::Result<LogPos> {
+        Ok(LogPos { dev: self.dev, ino: self.ino, offset, gen: self.gen, check: Some(check_at(self, offset)?) })
+    }
+}
+
+/// How a kept log file stands to a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    /// The cursor's file, as it was: read on from the cursor.
+    Same,
+    /// The cursor's file, cut by hand since (shorter than the cursor, its header gone, or another
+    /// record before the cursor): read again from its start.
+    Cut,
+    /// Not shown to be the cursor's file.
+    Other,
+}
+
+/// How `log` stands to the cursor `pos`. A file of the same device and inode is the cursor's only
+/// when it shows it: of the same generation (or both without one) with the cursor's record still
+/// before the offset. A recycled inode holds a file of another generation (Stack's writer heads
+/// every file it makes), or, among files an older writer made, another record there. Of those
+/// older files, one shorter than the cursor is taken for the cursor's file cut, as before
+/// generations; a cursor from before generations (`v1`) shows nothing.
+fn kept(log: &Opened, pos: &LogPos) -> std::io::Result<Kept> {
+    if (log.dev, log.ino) != (pos.dev, pos.ino) {
+        return Ok(Kept::Other);
+    }
+    let Some(check) = pos.check else { return Ok(Kept::Other) };
+    Ok(match (pos.gen, log.gen) {
+        (Some(a), Some(b)) if a == b => {
+            if pos.offset < log.head || log.len < pos.offset || check_at(log, pos.offset)? != check {
+                Kept::Cut
+            } else {
+                Kept::Same
+            }
+        }
+        // The header is gone: only a cut by hand takes it.
+        (Some(_), None) => Kept::Cut,
+        (None, None) if log.len < pos.offset => Kept::Cut,
+        (None, None) if check_at(log, pos.offset)? == check => Kept::Same,
+        _ => Kept::Other,
+    })
 }
 
 /// `service`'s log in the supervisor directory `dir` (`older`: the rotated one), `None` when there
@@ -1321,12 +1451,33 @@ fn open_log(dir: &Path, service: &str, older: bool) -> std::io::Result<Option<Op
         file => file?,
     };
     let meta = file.metadata()?;
-    Ok(Some(Opened { dev: meta.dev(), ino: meta.ino(), len: meta.len(), file }))
+    let mut header = [0u8; HEADER_LEN];
+    let gen = if meta.len() >= HEADER_LEN as u64 {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut header, 0)?;
+        header_generation(&header)
+    } else {
+        None
+    };
+    let head = if gen.is_some() { HEADER_LEN as u64 } else { 0 };
+    Ok(Some(Opened { dev: meta.dev(), ino: meta.ino(), len: meta.len(), gen, head, file }))
 }
 
-/// Records with the offset just past each, the offset after the last, and whether a limit
-/// stopped the read with whole records left.
-type Chunk = (Vec<(Record, u64)>, u64, bool);
+/// Where a cursor read of `service`'s whole log begins: the start of the oldest file kept (the
+/// rotated one, else the current one); `None` while there is no log.
+pub fn log_start(dir: &Path, service: &str) -> std::io::Result<Option<LogPos>> {
+    let Some(log) = (match open_log(dir, service, true)? {
+        Some(older) => Some(older),
+        None => open_log(dir, service, false)?,
+    }) else {
+        return Ok(None);
+    };
+    log.pos(log.head).map(Some)
+}
+
+/// Records with the offset just past each and its check, the offset after the last, and whether
+/// a limit stopped the read with whole records left.
+type Chunk = (Vec<(Record, u64, u64)>, u64, bool);
 
 /// Whether a read of `log` from `offset` with `full` bytes would return a record: a whole one
 /// starts there, the trailing one of a `finished` (rotated) file, or one longer than any read
@@ -1360,6 +1511,16 @@ fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u6
     (&mut log.file).take(want).read_to_end(&mut bytes)?;
     let mut records = Vec::new();
     let mut consumed = 0;
+    // The check of the position after the record `bytes[begin..end]`: the first record's from
+    // the file (it may begin before `offset`, in the middle of a record cut by an earlier read),
+    // each later one's from what was read (it begins where the one before ended).
+    let check = |begin: usize, end: usize| -> std::io::Result<u64> {
+        let len = (end - begin) as u64;
+        if begin == 0 || len > LOGS_LIMIT {
+            return check_at(log, offset + end as u64);
+        }
+        Ok(digest(len, &bytes[begin..end.min(begin + CHECK_BYTES as usize)]))
+    };
     while records.len() < max_records {
         let rest = &bytes[consumed..];
         let Some(end) = rest.iter().position(|b| *b == b'\n') else {
@@ -1367,13 +1528,15 @@ fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u6
             // or one longer than any read allows (never written by Stack), it is taken as it is.
             let complete = !rest.is_empty() && ((finished && want == available) || (whole && consumed == 0 && want == max_bytes && want < available));
             if complete {
+                let begin = consumed;
                 consumed = bytes.len();
-                records.push((Record::parse(&String::from_utf8_lossy(rest)), offset + consumed as u64));
+                records.push((Record::parse(&String::from_utf8_lossy(rest)), offset + consumed as u64, check(begin, consumed)?));
             }
             break;
         };
+        let begin = consumed;
         consumed += end + 1;
-        records.push((Record::parse(&String::from_utf8_lossy(&rest[..end])), offset + consumed as u64));
+        records.push((Record::parse(&String::from_utf8_lossy(&rest[..end])), offset + consumed as u64, check(begin, consumed)?));
     }
     let next = offset + consumed as u64;
     // Stopped by a limit with a whole record beyond it (a partial one at the end is not "more"):
@@ -1389,40 +1552,56 @@ fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u6
 /// `max_bytes` (see the section above).
 pub fn read_after(dir: &Path, service: &str, pos: LogPos, max_records: usize, max_bytes: u64) -> std::io::Result<LogRead> {
     let (current, older) = (open_log(dir, service, false)?, open_log(dir, service, true)?);
-    let named = |o: &Opened| o.dev == pos.dev && o.ino == pos.ino;
-    // The files to read, oldest first, with whether each is finished, and where to begin.
-    let (files, start, gap): (Vec<(Opened, bool)>, u64, Option<Gap>) = match (current, older) {
-        (Some(c), _) if named(&c) => {
-            let cut = c.len < pos.offset;
-            (vec![(c, false)], if cut { 0 } else { pos.offset }, cut.then_some(Gap::Truncated))
-        }
-        (c, Some(o)) if named(&o) => {
-            let cut = o.len < pos.offset;
-            let start = if cut { 0 } else { pos.offset };
-            (std::iter::once((o, true)).chain(c.map(|c| (c, false))).collect(), start, cut.then_some(Gap::Truncated))
-        }
-        (None, None) => return Ok(LogRead { pos: Some(pos), ..LogRead::default() }),
-        (c, o) => (o.map(|o| (o, true)).into_iter().chain(c.map(|c| (c, false))).collect(), 0, Some(Gap::Rotated)),
+    if current.is_none() && older.is_none() {
+        return Ok(LogRead { pos: Some(pos), ..LogRead::default() });
+    }
+    // The files to read, oldest first, with whether each is finished, where to begin, and what
+    // was lost: the cursor's file read on (or again, cut) and those after it, or, the cursor's
+    // file not shown to be kept, every file kept from its start.
+    let current_is = current.as_ref().map(|c| kept(c, &pos)).transpose()?.unwrap_or(Kept::Other);
+    let older_is = match current_is {
+        Kept::Other => older.as_ref().map(|o| kept(o, &pos)).transpose()?.unwrap_or(Kept::Other),
+        _ => Kept::Other,
+    };
+    let (is, files): (Kept, Vec<(Opened, bool)>) = match current_is {
+        Kept::Same | Kept::Cut => (current_is, current.into_iter().map(|c| (c, false)).collect()),
+        Kept::Other => (older_is, older.map(|o| (o, true)).into_iter().chain(current.map(|c| (c, false))).collect()),
+    };
+    let (start, gap) = match is {
+        Kept::Same => (pos.offset, None),
+        Kept::Cut => (files[0].0.head, Some(Gap::Truncated)),
+        Kept::Other => (files[0].0.head, Some(Gap::Rotated)),
     };
     let mut read = LogRead { gap, ..LogRead::default() };
     let mut files = files;
     let mut budget = max_bytes;
     for i in 0..files.len() {
-        let from = if i == 0 { start } else { 0 };
+        let from = if i == 0 { start } else { files[i].0.head };
         let (log, finished) = &mut files[i];
         let finished = *finished;
         let (records, next, more) = records_from(log, from, max_records - read.records.len(), budget, max_bytes, finished)?;
         let log = &files[i].0;
         budget = budget.saturating_sub(next - from);
-        for (record, end) in records {
+        let last = records.last().map(|(_, _, check)| *check);
+        for (record, end, check) in records {
             read.records.push(record);
-            read.ends.push(LogPos { dev: log.dev, ino: log.ino, offset: end });
+            read.ends.push(LogPos { dev: log.dev, ino: log.ino, offset: end, gen: log.gen, check: Some(check) });
         }
-        read.pos = Some(LogPos { dev: log.dev, ino: log.ino, offset: next });
+        read.pos = Some(match last {
+            Some(check) => LogPos { dev: log.dev, ino: log.ino, offset: next, gen: log.gen, check: Some(check) },
+            None if is == Kept::Same && i == 0 => pos,
+            None => log.pos(next)?,
+        });
         // On to the newer file only once this one is read to its end; stopped there, the newer
         // one is what the next read returns, if it holds a record yet.
         if more || next < log.len || budget == 0 || read.records.len() == max_records {
-            read.more = more || (next == log.len && files.get(i + 1).map(|(newer, _)| record_at(newer, 0, max_bytes, false)).transpose()?.unwrap_or(false));
+            let newer = files.get(i + 1).map(|(newer, _)| newer).filter(|_| next == log.len);
+            read.more = more || newer.map(|newer| record_at(newer, newer.head, max_bytes, false)).transpose()?.unwrap_or(false);
+            // At the end of the rotated file is at the start of the newer one: named by that file,
+            // which the next rotation keeps, so a read after it loses (and reports) nothing.
+            if let Some(newer) = newer {
+                read.pos = Some(newer.pos(newer.head)?);
+            }
             break;
         }
     }
@@ -1444,7 +1623,8 @@ fn tail_within(dir: &Path, service: &str, tail: usize, since: Option<u64>, limit
     let mut pos = None;
     for (n, older) in [false, true].into_iter().enumerate() {
         let Some(mut log) = open_log(dir, service, older)? else { continue };
-        let start = log.len.saturating_sub(budget);
+        // The window of its records (its header is none): the last `budget` bytes of them.
+        let start = log.len.saturating_sub(budget).max(log.head);
         log.file.seek(std::io::SeekFrom::Start(start))?;
         let mut bytes = Vec::new();
         (&mut log.file).take(budget).read_to_end(&mut bytes)?;
@@ -1453,12 +1633,12 @@ fn tail_within(dir: &Path, service: &str, tail: usize, since: Option<u64>, limit
             // The current file: a record still being written is left for the next read.
             let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
             bytes.truncate(whole);
-            pos = Some(LogPos { dev: log.dev, ino: log.ino, offset: start + whole as u64 });
+            pos = Some(log.pos(start + whole as u64)?);
         }
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
         // Begin at a whole record: one the window begins with (the byte before it ends the one
-        // before) is kept; only the part of one the window cuts is dropped.
-        let partial = start > 0 && {
+        // before, or the header) is kept; only the part of one the window cuts is dropped.
+        let partial = start > log.head && {
             let mut before = [0u8; 1];
             log.file.read_exact_at(&mut before, start - 1)?;
             before[0] != b'\n'
@@ -1466,8 +1646,8 @@ fn tail_within(dir: &Path, service: &str, tail: usize, since: Option<u64>, limit
         if partial {
             text = text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default();
         }
-        chunks.push((text, start > 0));
-        if budget == 0 || start > 0 {
+        chunks.push((text, start > log.head));
+        if budget == 0 || start > log.head {
             break;
         }
     }
@@ -2326,10 +2506,32 @@ struct LogOut {
 }
 
 impl LogOut {
+    /// Open `service`'s log to append to it. A new file is made under another name, its header
+    /// (a new generation: see [`log_header`]) written, and only then renamed into place, so no
+    /// reader ever finds a file of this writer without one, a crash at any point included (what
+    /// a crash leaves under the other name is replaced by the next file made). A file that is
+    /// there but empty (cut by hand, or made by an older writer) is given a header first.
     fn open(dir: &Path, service: &str) -> std::io::Result<LogOut> {
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::FileExt;
         let logs = logs_dir(dir)?;
-        let file = log_file(&logs, &log_name(service, false)?, libc::O_RDWR | libc::O_APPEND | libc::O_CREAT)?;
+        let name = log_name(service, false)?;
+        let mut file = match log_file(&logs, &name, libc::O_RDWR | libc::O_APPEND) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let fresh = std::ffi::CString::new(format!("{service}.log.new")).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                let mut file = log_file(&logs, &fresh, libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC)?;
+                file.write_all(&log_header(new_generation()))?;
+                // SAFETY: renameat within a directory descriptor this function owns, NUL-terminated names.
+                if unsafe { libc::renameat(logs.as_raw_fd(), fresh.as_ptr(), logs.as_raw_fd(), name.as_ptr()) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                file
+            }
+            file => file?,
+        };
+        if file.metadata()?.len() == 0 {
+            file.write_all(&log_header(new_generation()))?;
+        }
         let len = file.metadata()?.len();
         let mut last = [b'\n'];
         if len > 0 {
@@ -3486,14 +3688,12 @@ mod tests {
 
     #[test]
     fn a_tail_window_beginning_at_a_record_keeps_it_and_drops_only_a_record_it_cuts() {
-        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("logs")).unwrap();
         let path = log_path(dir.path(), "db");
         // One file of records 0..5 (60 bytes).
         fs::write(&path, numbered(0, 5)).unwrap();
-        let meta = fs::metadata(&path).unwrap();
-        let cursor = Some(LogPos { dev: meta.dev(), ino: meta.ino(), offset: 60 });
+        let cursor = Some(at(dir.path(), "db", false, 60));
         // A window of 36 bytes begins exactly at record 2: it is kept whole.
         let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 36).unwrap();
         assert_eq!(stamped(&records), expect(2..5));
@@ -3511,8 +3711,7 @@ mod tests {
         // Rotated: records 0..5 in the older file, 5..7 (24 bytes) in the current one.
         fs::rename(&path, older_log(&path)).unwrap();
         fs::write(&path, numbered(5, 2)).unwrap();
-        let meta = fs::metadata(&path).unwrap();
-        let cursor = Some(LogPos { dev: meta.dev(), ino: meta.ino(), offset: 24 });
+        let cursor = Some(at(dir.path(), "db", false, 24));
         // The current file whole, then 36 bytes of the older one, beginning at its record 2.
         let (records, truncated, pos) = tail_within(dir.path(), "db", 10, None, 24 + 36).unwrap();
         assert_eq!(stamped(&records), expect(2..7));
@@ -3619,7 +3818,9 @@ mod tests {
         drop(s);
         write_log(&q, dir.path(), "svc");
         let text = fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
+        // A file the writer made begins with its header, then the records.
+        assert!(header_generation(text.as_bytes()).is_some(), "{text}");
+        let lines: Vec<&str> = text.lines().skip(1).collect();
         assert_eq!(lines[0], "1 first");
         assert!(lines[2].ends_with(" [stack] 1 line(s) of output (11 bytes) dropped: the log writer fell behind"), "{text}");
         assert!(lines[2].split(' ').next().unwrap().parse::<u64>().is_ok(), "the note is a stamped record: {text}");
@@ -3648,6 +3849,11 @@ mod tests {
         assert_eq!(body(&records[0]).len(), LOG_RECORD_BYTES + 1);
         assert_eq!(body(&records[1]), b"aaaaaaaaaa\n");
         assert_eq!(body(&records[2]), b"end without newline\n");
+    }
+
+    /// The position `offset` in `service`'s current (or, `older`, rotated) log, as a read gives it.
+    fn at(dir: &Path, service: &str, older: bool, offset: u64) -> LogPos {
+        open_log(dir, service, older).unwrap().unwrap().pos(offset).unwrap()
     }
 
     fn older_log(path: &Path) -> PathBuf {
@@ -3697,7 +3903,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let outside = elsewhere.path().join("other.log");
         fs::write(&outside, "1 dummy line of another checkout\n").unwrap();
-        let pos = LogPos { dev: 0, ino: 0, offset: 0 };
+        let pos = LogPos { dev: 0, ino: 0, offset: 0, gen: None, check: None };
         let refused = |service: &str, why: &str| {
             let e = tail(dir.path(), service, 10, None).expect_err(service);
             assert!(e.to_string().contains(why), "{service}: {e}");
@@ -3817,8 +4023,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("logs")).unwrap();
         let path = log_path(dir.path(), "db");
         append(&path, "100 a\n200 b\n300 par");
-        let start = read_after(dir.path(), "db", LogPos { dev: 0, ino: 0, offset: 0 }, 0, LOGS_LIMIT).unwrap();
-        let start = LogPos { offset: 0, ..start.pos.unwrap() };
+        let start = log_start(dir.path(), "db").unwrap().unwrap();
         // Stopped by the record limit with only a record still being written after it.
         let read = read_after(dir.path(), "db", start, 2, LOGS_LIMIT).unwrap();
         assert_eq!((lines(&read), read.more), (vec![(100, "a"), (200, "b")], false));
@@ -3841,6 +4046,155 @@ mod tests {
         assert_eq!((lines(&read), read.more), (vec![(300, "par")], true));
         let rest = read_after(dir.path(), "db", read.pos.unwrap(), 1, LOGS_LIMIT).unwrap();
         assert_eq!((lines(&rest), rest.more), (vec![(400, "c")], false));
+    }
+
+    /// `service`'s log rotated twice since a cursor was taken at the end of its file `A`: once as
+    /// the writer does (`A` becomes the rotated file, `B` the current one), then again with the
+    /// new current file recycling `A`'s inode, as ext4 may once `A` is replaced: `B` is rotated
+    /// and `A`'s inode holds `text`, under the header of generation `gen` (none: an older
+    /// writer's file).
+    fn rotate_twice_recycling(dir: &Path, service: &str, b: &str, gen: Option<u128>, text: &str) {
+        let path = log_path(dir, service);
+        let (older, spare) = (older_log(&path), dir.join("spare"));
+        fs::rename(&path, &older).unwrap();
+        fs::write(&path, b).unwrap();
+        // `A`, replaced by the second rotation, kept open by its inode alone ...
+        fs::rename(&older, &spare).unwrap();
+        fs::rename(&path, &older).unwrap();
+        // ... and reused for the new current file.
+        let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&spare).unwrap();
+        file.write_all(&gen.map(log_header).unwrap_or_default()).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        fs::rename(&spare, &path).unwrap();
+    }
+
+    #[test]
+    fn a_cursor_two_rotations_behind_is_never_taken_for_a_new_file_on_its_recycled_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let a = "100 a1\n200 a2\n";
+        // The new file on `A`'s inode: as long as `A` was when the cursor was taken, longer, or
+        // holding the very records `A` did; and shorter.
+        let equal = "400 c1\n500 c2\n";
+        let grown = "400 c1\n500 c2\n600 c3\n";
+        let shorter = "4 c\n";
+        let b = |gen: Option<u128>| format!("{}300 b\n", gen.map(|g| String::from_utf8(log_header(g)).unwrap()).unwrap_or_default());
+        let records = |text: &str| -> Vec<(u64, String)> { text.lines().map(Record::parse).map(|r| (r.at_ms, r.line)).collect() };
+        let got = |read: &LogRead| -> Vec<(u64, String)> { read.records.iter().map(|r| (r.at_ms, r.line.clone())).collect() };
+        // Files Stack's writer made (each with its header): whatever the new file holds, the
+        // cursor's file is gone, and every file kept is read from its start.
+        for (case, text) in [("equal", equal), ("grown", grown), ("the same records", a), ("shorter", shorter)] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("logs")).unwrap();
+            let path = log_path(dir.path(), "db");
+            fs::write(&path, [log_header(1), a.as_bytes().to_vec()].concat()).unwrap();
+            let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+            assert_eq!((pos.gen, pos.offset), (Some(1), (HEADER_LEN + a.len()) as u64));
+            rotate_twice_recycling(dir.path(), "db", &b(Some(2)), Some(3), text);
+            assert_eq!((fs::metadata(&path).unwrap().dev(), fs::metadata(&path).unwrap().ino()), (pos.dev, pos.ino), "{case}: the inode was recycled");
+            let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+            assert_eq!((got(&read), read.gap), ([records("300 b\n"), records(text)].concat(), Some(Gap::Rotated)), "{case}");
+            // And the cursor it gave reads on from there.
+            append(&path, "700 next\n");
+            let next = read_after(dir.path(), "db", read.pos.unwrap(), 100, LOGS_LIMIT).unwrap();
+            assert_eq!((got(&next), next.gap), (records("700 next\n"), None), "{case}");
+        }
+        // Files an older writer made (no header): another record before the cursor's offset shows
+        // another file. Within what headerless files can show: the same record there is taken
+        // for the cursor's file, and a file shorter than the cursor for it cut.
+        for (case, text, expected, gap) in [
+            ("equal", equal, [records("300 b\n"), records(equal)].concat(), Some(Gap::Rotated)),
+            ("grown", grown, [records("300 b\n"), records(grown)].concat(), Some(Gap::Rotated)),
+            ("the same records", a, Vec::new(), None),
+            ("shorter", shorter, records(shorter), Some(Gap::Truncated)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("logs")).unwrap();
+            let path = log_path(dir.path(), "db");
+            fs::write(&path, a).unwrap();
+            let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+            assert_eq!((pos.gen, pos.offset), (None, a.len() as u64));
+            rotate_twice_recycling(dir.path(), "db", &b(None), None, text);
+            assert_eq!(fs::metadata(&path).unwrap().ino(), pos.ino, "{case}: the inode was recycled");
+            let read = read_after(dir.path(), "db", pos, 100, LOGS_LIMIT).unwrap();
+            assert_eq!((got(&read), read.gap), (expected, gap), "{case}, without headers");
+        }
+    }
+
+    #[test]
+    fn a_cursor_an_older_stack_gave_or_one_in_a_file_cut_by_hand_rereads_rather_than_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        fs::write(&path, [log_header(7), b"100 a\n200 b\n".to_vec()].concat()).unwrap();
+        let pos = tail(dir.path(), "db", 10, None).unwrap().2.unwrap();
+        // A `v1` cursor names the file by device and inode alone: never trusted, the oldest file
+        // kept is read again from its start, said as a gap.
+        let v1 = LogPos { gen: None, check: None, ..pos };
+        let read = read_after(dir.path(), "db", v1, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(100, "a"), (200, "b")], Some(Gap::Rotated)));
+        assert_eq!(read.pos, Some(pos), "the cursor it gives is a checked one");
+        fs::rename(&path, older_log(&path)).unwrap();
+        fs::write(&path, [log_header(8), b"300 c\n".to_vec()].concat()).unwrap();
+        let read = read_after(dir.path(), "db", v1, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(100, "a"), (200, "b"), (300, "c")], Some(Gap::Rotated)));
+        let at_c = read.pos.unwrap();
+        // Cut by hand below the cursor, its header kept, and written past the cursor again:
+        // another record before the cursor's offset, so it is read again from its start.
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(HEADER_LEN as u64).unwrap();
+        append(&path, "4 xxxxxxx\n5 y\n");
+        let read = read_after(dir.path(), "db", at_c, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(4, "xxxxxxx"), (5, "y")], Some(Gap::Truncated)));
+        // Cut to nothing (its header gone) and written again by the writer that has it open.
+        let at_y = read.pos.unwrap();
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        append(&path, "6 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n");
+        let read = read_after(dir.path(), "db", at_y, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(6, "z".repeat(61).as_str())], Some(Gap::Truncated)));
+        // From there, the headerless file is read on by its records.
+        append(&path, "7 w\n");
+        let read = read_after(dir.path(), "db", read.pos.unwrap(), 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap), (vec![(7, "w")], None));
+    }
+
+    #[test]
+    fn the_writer_heads_every_file_it_makes_with_a_generation_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "svc");
+        let generation = |path: &Path| header_generation(&fs::read(path).unwrap());
+        // What a crash between making a file and renaming it into place leaves is replaced.
+        fs::write(dir.path().join("logs/svc.log.new"), "junk").unwrap();
+        let mut out = LogOut::open(dir.path(), "svc").unwrap();
+        let first = generation(&path).expect("a header");
+        assert!(!dir.path().join("logs/svc.log.new").exists());
+        assert_eq!((out.len, out.cut), (HEADER_LEN as u64, false));
+        out.append(b"1 a\n").unwrap();
+        let out = out.rotate(dir.path(), "svc").unwrap();
+        let second = generation(&path).expect("a header");
+        assert_eq!(generation(&older_log(&path)), Some(first));
+        assert_ne!(first, second);
+        drop(out);
+        // Opened again (a restart): the file is kept, header and all.
+        let mut again = LogOut::open(dir.path(), "svc").unwrap();
+        again.append(b"2 b\n").unwrap();
+        assert_eq!(generation(&path), Some(second));
+        // An empty file in its place (cut by hand, or an older writer's) is given one.
+        fs::write(&path, "").unwrap();
+        LogOut::open(dir.path(), "svc").unwrap();
+        assert!(generation(&path).is_some_and(|g| g != second));
+        // Readers never see a header as a record, at the start of a window or of a read.
+        fs::write(&path, [log_header(9), b"3 c\n4 d\n".to_vec()].concat()).unwrap();
+        let (records, truncated, pos) = tail(dir.path(), "svc", 10, None).unwrap();
+        assert_eq!(records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>(), ["a", "c", "d"]);
+        assert!(!truncated);
+        let start = log_start(dir.path(), "svc").unwrap().unwrap();
+        assert_eq!((start.gen, start.offset), (Some(first), HEADER_LEN as u64));
+        let read = read_after(dir.path(), "svc", start, 100, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.gap, read.pos), (vec![(1, "a"), (3, "c"), (4, "d")], None, pos));
+        for limit in [4, HEADER_LEN as u64 + 4, HEADER_LEN as u64 + 8] {
+            let (records, _, _) = tail_within(dir.path(), "svc", 10, None, limit).unwrap();
+            assert!(records.iter().all(|r| r.at_ms > 0), "{limit}: {records:?}");
+        }
     }
 
     #[test]

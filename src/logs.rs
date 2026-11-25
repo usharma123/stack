@@ -13,12 +13,19 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use std::time::Duration;
 
-/// Where reads of services' logs got to: for each service, its log file (device, inode) and the
-/// offset after the last whole line read. Callers keep it as an opaque string: `v1`, then
-/// `;<service, hex>:<device>:<inode>:<offset>` per service, or `;<service, hex>` for one with no
-/// log yet (its tail is read next time). An empty string is a cursor with no services: every
+/// Where reads of services' logs got to: for each service, its log file (device, inode,
+/// generation) and the offset after the last whole line read, with a check of that line (see
+/// [`LogPos`]). Callers keep it as an opaque string: `v2`, then
+/// `;<service, hex>:<device>:<inode>:<offset>:<generation>:<check>` per service (the generation
+/// 32 hex digits, the check 16, either `-` when there is none), or `;<service, hex>` for one with
+/// no log yet (its tail is read next time). An empty string is a cursor with no services: every
 /// service's tail is read, as a cursor read reports it. A name no service can have (see
 /// [`crate::manifest::valid_service_name`]) makes the cursor invalid.
+///
+/// A `v1` cursor (`<device>:<inode>:<offset>`, from Stack before generations) is still read, but
+/// device and inode alone cannot show that a file is the one it was taken in (a recycled inode
+/// matches them): its read begins at the oldest file kept, with a `rotated` gap, and the cursor
+/// it gives back is `v2`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor(IndexMap<String, Option<LogPos>>);
 
@@ -30,15 +37,29 @@ impl Cursor {
             return Ok(cursor);
         }
         let mut parts = text.split(';');
-        if parts.next() != Some("v1") {
-            return Err(invalid());
-        }
+        let v2 = match parts.next() {
+            Some("v1") => false,
+            Some("v2") => true,
+            _ => return Err(invalid()),
+        };
         for part in parts {
             let fields: Vec<&str> = part.split(':').collect();
             let num = |v: &str| v.parse::<u64>().map_err(|_| invalid());
-            let (name, pos) = match fields.as_slice() {
-                [name] => (name, None),
-                [name, dev, ino, offset] => (name, Some(LogPos { dev: num(dev)?, ino: num(ino)?, offset: num(offset)? })),
+            // Exactly `digits` lowercase hex digits, or `-` for none.
+            let hex = |v: &str, digits: usize| -> Result<Option<u128>> {
+                match v {
+                    "-" => Ok(None),
+                    v if v.len() == digits && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => u128::from_str_radix(v, 16).map(Some).map_err(|_| invalid()),
+                    _ => Err(invalid()),
+                }
+            };
+            let (name, pos) = match (v2, fields.as_slice()) {
+                (_, [name]) => (name, None),
+                (false, [name, dev, ino, offset]) => (name, Some(LogPos { dev: num(dev)?, ino: num(ino)?, offset: num(offset)?, gen: None, check: None })),
+                (true, [name, dev, ino, offset, gen, check]) => {
+                    let check = hex(check, 16)?.map(|c| c as u64);
+                    (name, Some(LogPos { dev: num(dev)?, ino: num(ino)?, offset: num(offset)?, gen: hex(gen, 32)?, check }))
+                }
                 _ => return Err(invalid()),
             };
             // Only a name a service can have (see `crate::manifest::valid_service_name`): a cursor
@@ -50,13 +71,15 @@ impl Cursor {
     }
 
     pub fn encode(&self) -> String {
-        let mut out = String::from("v1");
+        let mut out = String::from("v2");
         for (name, p) in &self.0 {
             let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
             out.push(';');
             out.push_str(&hex);
             if let Some(p) = p {
-                out.push_str(&format!(":{}:{}:{}", p.dev, p.ino, p.offset));
+                let gen = p.gen.map_or("-".to_string(), |g| format!("{g:032x}"));
+                let check = p.check.map_or("-".to_string(), |c| format!("{c:016x}"));
+                out.push_str(&format!(":{}:{}:{}:{gen}:{check}", p.dev, p.ino, p.offset));
             }
         }
         out
@@ -437,21 +460,51 @@ mod tests {
     #[test]
     fn cursors_round_trip_and_refuse_anything_else() {
         let mut c = Cursor::default();
-        c.0.insert("db".into(), Some(LogPos { dev: 1, ino: 2, offset: 3 }));
-        c.0.insert("web:1;x".into(), Some(LogPos { dev: u64::MAX, ino: 0, offset: 99 }));
+        c.0.insert("db".into(), Some(LogPos { dev: 1, ino: 2, offset: 3, gen: Some(0xab), check: Some(0x1f) }));
+        c.0.insert("web:1;x".into(), Some(LogPos { dev: u64::MAX, ino: 0, offset: 99, gen: None, check: Some(u64::MAX) }));
+        c.0.insert("old".into(), Some(LogPos { dev: 5, ino: 6, offset: 7, gen: None, check: None }));
         c.0.insert("quiet".into(), None);
         let text = c.encode();
-        assert_eq!(text, "v1;6462:1:2:3;7765623a313b78:18446744073709551615:0:99;7175696574");
+        assert_eq!(
+            text,
+            "v2;6462:1:2:3:000000000000000000000000000000ab:000000000000001f;7765623a313b78:18446744073709551615:0:99:-:ffffffffffffffff;6f6c64:5:6:7:-:-;7175696574"
+        );
         assert_eq!(Cursor::parse(&text).unwrap(), c);
         assert!(Cursor::parse("").unwrap().is_empty());
         assert_eq!(Cursor::parse("v1").unwrap(), Cursor::default());
-        for bad in ["v2;6462:1:2:3", "v1;6462:1:2", "v1;6462:1", "v1;646:1:2:3", "v1;zz:1:2:3", "v1;6462:1:2:-3", "x", "v1;;"] {
-            assert_eq!(Cursor::parse(bad).unwrap_err().code, "usage", "{bad}");
+        assert_eq!(Cursor::parse("v2").unwrap(), Cursor::default());
+        // A cursor an older Stack gave: device, inode and offset, nothing to check them by.
+        let old = Cursor::parse("v1;6462:1:2:3;7175696574").unwrap();
+        assert_eq!(old.entry("db"), Some(Some(LogPos { dev: 1, ino: 2, offset: 3, gen: None, check: None })));
+        assert_eq!(old.entry("quiet"), Some(None));
+        assert_eq!(old.encode(), "v2;6462:1:2:3:-:-;7175696574");
+        let gen = "0".repeat(32);
+        let check = "0".repeat(16);
+        for bad in [
+            "v3;6462:1:2:3".to_string(),
+            "v1;6462:1:2".into(),
+            "v1;6462:1".into(),
+            "v1;646:1:2:3".into(),
+            "v1;zz:1:2:3".into(),
+            "v1;6462:1:2:-3".into(),
+            "x".into(),
+            "v1;;".into(),
+            format!("v1;6462:1:2:3:{gen}:{check}"),
+            "v2;6462:1:2:3".into(),
+            format!("v2;6462:1:2:3:{gen}"),
+            format!("v2;6462:1:2:3:{gen}:{check}:9"),
+            format!("v2;6462:1:2:3:{}:{check}", "0".repeat(31)),
+            format!("v2;6462:1:2:3:{gen}:{}", "0".repeat(17)),
+            format!("v2;6462:1:2:3:{}:{check}", "A".repeat(32)),
+            format!("v2;6462:1:2:3:{gen}:+{}", "0".repeat(15)),
+            format!("v2;6462:1:2:3:{gen}:"),
+        ] {
+            assert_eq!(Cursor::parse(&bad).unwrap_err().code, "usage", "{bad}");
         }
         // Names no service can have: a path out of the log directory, `.`, `..`, NUL.
         for name in ["../spec", "a/b", ".", "..", "/etc/x", "nul\0"] {
             let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
-            for text in [format!("v1;{hex}"), format!("v1;{hex}:1:2:3")] {
+            for text in [format!("v1;{hex}"), format!("v1;{hex}:1:2:3"), format!("v2;{hex}"), format!("v2;{hex}:1:2:3:-:-")] {
                 assert_eq!(Cursor::parse(&text).unwrap_err().code, "usage", "{name:?}");
             }
         }
@@ -472,8 +525,7 @@ mod tests {
         let dir = supervisor::dir(&ctx.state, &ctx.root);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         std::fs::write(supervisor::log_path(&dir, "db"), "100 dummy one\n200 dummy two\n").unwrap();
-        let start = supervisor::read_after(&dir, "db", supervisor::LogPos { dev: 0, ino: 0, offset: 0 }, 0, 0).unwrap().pos.unwrap();
-        let start = LogPos { offset: 0, ..start };
+        let start = supervisor::log_start(&dir, "db").unwrap().unwrap();
         for grep in [None, Some("dummy".to_string())] {
             let q = Query { services: vec!["db".into()], tail: 0, grep: grep.clone(), cursor: Some(Cursor::one("db", Some(start))), ..Query::default() };
             let Logs::One(report) = fetch(&ctx, &q).unwrap() else { panic!("one service") };
@@ -552,14 +604,18 @@ mod tests {
         }
     }
 
-    /// One service's log, written as Stack's supervisor lays it out (`<ms> <line>\n` records,
-    /// rotated to `<service>.log.1`), with what each file holds: record ids, oldest first.
+    /// One service's log, written as Stack's supervisor lays it out (each file it makes headed
+    /// with its generation, then `<ms> <line>\n` records, rotated to `<service>.log.1`), with what
+    /// each file holds: record ids, oldest first.
     struct Writer {
         path: std::path::PathBuf,
         older_path: std::path::PathBuf,
-        /// Where each rotated-away file stays linked, so no later log file can reuse its inode (a
-        /// cursor names its file by device and inode; see the verify skill's limits).
-        kept: std::path::PathBuf,
+        /// Where a rotation that recycles keeps the file it replaces, its inode then reused for
+        /// the next current file (as ext4 may reuse a freed inode at once).
+        spare: std::path::PathBuf,
+        /// The generation (as the oracle counts them) whose inode the current file recycled.
+        recycled: Option<u32>,
+        seed: u64,
         /// Every record: when it was stamped, and its line (a cut record as it was cut).
         records: Vec<(u64, String)>,
         current: Vec<usize>,
@@ -576,8 +632,16 @@ mod tests {
     impl Writer {
         fn append(&mut self, text: &str) {
             use std::io::Write;
-            std::fs::OpenOptions::new().create(true).append(true).open(&self.path).unwrap().write_all(text.as_bytes()).unwrap();
-            self.current_exists = true;
+            if !self.current_exists {
+                // A new file, headed before it is in place, as the writer makes one: on the inode of
+                // the file the last rotation replaced, when it recycles.
+                let fresh = if self.spare.exists() { self.spare.clone() } else { self.path.with_extension("log.new") };
+                let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&fresh).unwrap();
+                file.write_all(&supervisor::log_header(u128::from(self.current_gen) | u128::from(self.seed) << 64)).unwrap();
+                std::fs::rename(&fresh, &self.path).unwrap();
+                self.current_exists = true;
+            }
+            std::fs::OpenOptions::new().append(true).open(&self.path).unwrap().write_all(text.as_bytes()).unwrap();
         }
 
         fn write(&mut self, line: &str) {
@@ -598,15 +662,20 @@ mod tests {
             self.current.push(self.records.len() - 1);
         }
 
-        /// Rename the current file over the older one: what that held is gone. A record cut
-        /// there (no newline yet) stays at the end of the rotated file as it is.
-        fn rotate(&mut self) -> Vec<usize> {
+        /// Rename the current file over the older one: what that held is gone (and, `recycle`,
+        /// its inode is the next current file's). A record cut there (no newline yet) stays at
+        /// the end of the rotated file as it is.
+        fn rotate(&mut self, recycle: bool) -> Vec<usize> {
             if let Some((at, line, split)) = self.partial.take() {
                 self.records.push((at, line[..split].to_string()));
                 self.current.push(self.records.len() - 1);
             }
-            if let Some(gen) = self.older_gen {
-                std::fs::hard_link(&self.older_path, self.kept.join(gen.to_string())).unwrap();
+            self.recycled = None;
+            if let (true, Some(gen)) = (recycle, self.older_gen) {
+                std::fs::rename(&self.older_path, &self.spare).unwrap();
+                self.recycled = Some(gen);
+            } else {
+                let _ = std::fs::remove_file(&self.spare);
             }
             std::fs::rename(&self.path, &self.older_path).unwrap();
             let gone = std::mem::replace(&mut self.older, std::mem::take(&mut self.current));
@@ -662,8 +731,9 @@ mod tests {
     }
 
     /// A log written with repeated lines, equal stamps, records written in two parts, rotations
-    /// (one and two between reads), cut records and truncation by hand, read on the way by two
-    /// readers: `stack logs --json --cursor` (through `fetch`, with the cursor passed back as the
+    /// (one and two between reads, a new file sometimes on the inode of the file it replaced, so
+    /// a cursor two rotations behind names it by device and inode), cut records and truncation by
+    /// hand, read on the way by two readers: `stack logs --json --cursor` (through `fetch`, with the cursor passed back as the
     /// text a client keeps, varying `--tail` and `--grep`) and `--follow`'s poll. Each read
     /// returns exactly the whole records written after its cursor, in order, each once with its
     /// stamp, none split; it stops after `--tail` lines, saying `more` exactly when whole records
@@ -684,7 +754,9 @@ mod tests {
             let mut w = Writer {
                 path,
                 older_path: older_path.into(),
-                kept: state.path().to_path_buf(),
+                spare: state.path().join("spare"),
+                recycled: None,
+                seed,
                 records: Vec::new(),
                 current: Vec::new(),
                 current_exists: false,
@@ -729,7 +801,7 @@ mod tests {
                         if w.partial.is_some() {
                             seen.insert("cut");
                         }
-                        let gone = w.rotate();
+                        let gone = w.rotate(rng.below(2) == 0);
                         by_cursor.lose(&gone);
                         by_follow.lose(&gone);
                         seen.insert("rotated");
@@ -748,6 +820,12 @@ mod tests {
                 }
                 if !read_now {
                     continue;
+                }
+                // A reader whose file is gone while its inode holds the current file.
+                for (reader, name) in [(&by_cursor, "cursor across a recycled inode"), (&by_follow, "follow across a recycled inode")] {
+                    if w.current_exists && w.recycled == Some(reader.at.0) {
+                        seen.insert(name);
+                    }
                 }
                 // `stack logs --json --cursor`: the cursor read back from its text.
                 let tail = [1, 2, 3, 7, 100][rng.below(5) as usize];
@@ -815,7 +893,7 @@ mod tests {
                 assert_eq!(accounted, complete, "seed {seed} {name}");
             }
         }
-        for case in ["partial", "cut", "rotated", "truncated", "more", "gap"] {
+        for case in ["partial", "cut", "rotated", "truncated", "more", "gap", "cursor across a recycled inode", "follow across a recycled inode"] {
             assert!(seen.contains(case), "no run reached {case}: {seen:?}");
         }
     }

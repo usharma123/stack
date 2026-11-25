@@ -426,8 +426,17 @@ single-service result.
   each line, Unix milliseconds, 0 for a line it did not stamp), caps the lines per read at
   `--tail` (`more: true` says to read again), and reports `gap: "rotated"` or `gap: "truncated"`
   when output was lost between the cursor and what is kept. It compiles nothing and reads only
-  the new bytes (at most 1 MiB per read). The cursor names the log file (device and inode) and
-  the byte offset after the last whole line read, so a rotation is followed into the new file.
+  the new bytes (at most 1 MiB per read). The cursor names the log file (device, inode, and the
+  generation in the header line each file the supervisor makes begins with) and the byte offset
+  after the last whole line read, with a check of that line, so a rotation is followed into the
+  new file, and a new file that reuses the inode of one rotated away is never read from the old
+  file's offset: the read reports `gap: "rotated"` and returns the oldest file kept from its
+  start. Files written by an older Stack's supervisor have no header; there the check of the
+  line before the offset tells a new file from the old one, except one holding the very same
+  line at that offset, and a file shorter than the cursor is taken for one truncated. A cursor
+  an older Stack gave (it begins `v1`) is still accepted, but cannot show its file is still
+  kept: its first read returns the oldest file kept from its start with `gap: "rotated"`
+  (lines already read may come again), and the cursor it gives back is a new one (`v2`).
   A line still being written is left for the next read, and so is one that the rest of a read's
   1 MiB cannot hold after a rotation (it comes whole, with its timestamp, on the next read). A
   cursor naming a service no project can have (a name with `/` or NUL, `.` or `..`) is a
