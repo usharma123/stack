@@ -1328,17 +1328,32 @@ fn open_log(dir: &Path, service: &str, older: bool) -> std::io::Result<Option<Op
 /// stopped the read with whole records left.
 type Chunk = (Vec<(Record, u64)>, u64, bool);
 
+/// Whether a read of `log` from `offset` with `full` bytes would return a record: a whole one
+/// starts there, the trailing one of a `finished` (rotated) file, or one longer than any read
+/// allows (taken cut). A record still being written (no newline yet) is not one.
+fn record_at(log: &Opened, offset: u64, full: u64, finished: bool) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let left = log.len.saturating_sub(offset);
+    if left == 0 || left > full || finished {
+        return Ok(left > 0);
+    }
+    let mut bytes = vec![0; left as usize];
+    log.file.read_exact_at(&mut bytes, offset)?;
+    Ok(bytes.contains(&b'\n'))
+}
+
 /// Whole records of `log` from `offset`, at most `max_records` of them in at most `max_bytes`:
 /// the records, the offset after the last, and whether a limit stopped it with whole records
-/// left. `finished` (a rotated file) returns a trailing record without its newline too. `whole`
-/// says `max_bytes` is all a read allows, not what an earlier file of it left: only then is a
-/// record longer than `max_bytes` taken cut (it could never be read otherwise); a record that
-/// only the rest of a budget cannot hold is left whole for the next read.
-fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u64, finished: bool, whole: bool) -> std::io::Result<Chunk> {
+/// left. `finished` (a rotated file) returns a trailing record without its newline too. `full`
+/// is all a read allows; only when `max_bytes` is that, not what an earlier file of the read
+/// left, is a record longer than `max_bytes` taken cut (it could never be read otherwise); a
+/// record that only the rest of a budget cannot hold is left whole for the next read.
+fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u64, full: u64, finished: bool) -> std::io::Result<Chunk> {
+    let whole = max_bytes == full;
     let available = log.len.saturating_sub(offset);
     let want = available.min(max_bytes);
     if want == 0 || max_records == 0 {
-        return Ok((Vec::new(), offset, available > 0 && max_records == 0));
+        return Ok((Vec::new(), offset, max_records == 0 && record_at(log, offset, full, finished)?));
     }
     log.file.seek(std::io::SeekFrom::Start(offset))?;
     let mut bytes = Vec::with_capacity(want as usize);
@@ -1361,9 +1376,12 @@ fn records_from(log: &mut Opened, offset: u64, max_records: usize, max_bytes: u6
         records.push((Record::parse(&String::from_utf8_lossy(&rest[..end])), offset + consumed as u64));
     }
     let next = offset + consumed as u64;
-    let left = log.len - next;
-    // Stopped by a limit with a whole record beyond it (a partial one at the end is not "more").
-    let more = left > 0 && (records.len() == max_records || want < available);
+    // Stopped by a limit with a whole record beyond it (a partial one at the end is not "more"):
+    // one already read, or else, past what was read, one the next read would return.
+    let stopped = records.len() == max_records || want < available;
+    let more = stopped
+        && log.len > next
+        && (bytes[consumed..].contains(&b'\n') || if want == available { finished } else { record_at(log, next, full, finished)? });
     Ok((records, next, more))
 }
 
@@ -1387,22 +1405,24 @@ pub fn read_after(dir: &Path, service: &str, pos: LogPos, max_records: usize, ma
         (c, o) => (o.map(|o| (o, true)).into_iter().chain(c.map(|c| (c, false))).collect(), 0, Some(Gap::Rotated)),
     };
     let mut read = LogRead { gap, ..LogRead::default() };
-    // Bytes in the files after each one: what is left when a limit stops the read there.
-    let lens: Vec<u64> = files.iter().map(|(log, _)| log.len).collect();
+    let mut files = files;
     let mut budget = max_bytes;
-    for (i, (mut log, finished)) in files.into_iter().enumerate() {
+    for i in 0..files.len() {
         let from = if i == 0 { start } else { 0 };
-        let (records, next, more) = records_from(&mut log, from, max_records - read.records.len(), budget, finished, budget == max_bytes)?;
+        let (log, finished) = &mut files[i];
+        let finished = *finished;
+        let (records, next, more) = records_from(log, from, max_records - read.records.len(), budget, max_bytes, finished)?;
+        let log = &files[i].0;
         budget = budget.saturating_sub(next - from);
         for (record, end) in records {
             read.records.push(record);
             read.ends.push(LogPos { dev: log.dev, ino: log.ino, offset: end });
         }
         read.pos = Some(LogPos { dev: log.dev, ino: log.ino, offset: next });
-        let later = lens[i + 1..].iter().sum::<u64>() > 0;
-        // On to the newer file only once this one is read to its end.
+        // On to the newer file only once this one is read to its end; stopped there, the newer
+        // one is what the next read returns, if it holds a record yet.
         if more || next < log.len || budget == 0 || read.records.len() == max_records {
-            read.more = more || (later && (finished || next == log.len));
+            read.more = more || (next == log.len && files.get(i + 1).map(|(newer, _)| record_at(newer, 0, max_bytes, false)).transpose()?.unwrap_or(false));
             break;
         }
     }
@@ -3789,6 +3809,38 @@ mod tests {
         assert_eq!((lines(&rest), rest.more), (vec![(700, "c")], false));
         let bytes = read_after(dir.path(), "db", read.pos.unwrap(), 100, 8).unwrap();
         assert_eq!((lines(&bytes), bytes.more), (vec![(500, "a")], true));
+    }
+
+    #[test]
+    fn a_read_says_more_only_while_whole_records_are_left_never_for_one_still_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("logs")).unwrap();
+        let path = log_path(dir.path(), "db");
+        append(&path, "100 a\n200 b\n300 par");
+        let start = read_after(dir.path(), "db", LogPos { dev: 0, ino: 0, offset: 0 }, 0, LOGS_LIMIT).unwrap();
+        let start = LogPos { offset: 0, ..start.pos.unwrap() };
+        // Stopped by the record limit with only a record still being written after it.
+        let read = read_after(dir.path(), "db", start, 2, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(100, "a"), (200, "b")], false));
+        // Stopped by the byte limit, likewise; and with a whole record left, more.
+        let read = read_after(dir.path(), "db", start, 100, 12).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(100, "a"), (200, "b")], false));
+        let read = read_after(dir.path(), "db", start, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(100, "a")], true));
+        // A limit of no records says more only for a whole one.
+        let end = read_after(dir.path(), "db", start, 2, LOGS_LIMIT).unwrap().pos.unwrap();
+        assert!(!read_after(dir.path(), "db", end, 0, LOGS_LIMIT).unwrap().more);
+        // The rotated file read to its end at the limit: more only if the newer file holds a
+        // whole record.
+        fs::rename(&path, older_log(&path)).unwrap();
+        append(&path, "400 c");
+        let read = read_after(dir.path(), "db", end, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(300, "par")], false));
+        append(&path, "\n");
+        let read = read_after(dir.path(), "db", end, 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&read), read.more), (vec![(300, "par")], true));
+        let rest = read_after(dir.path(), "db", read.pos.unwrap(), 1, LOGS_LIMIT).unwrap();
+        assert_eq!((lines(&rest), rest.more), (vec![(400, "c")], false));
     }
 
     #[test]
