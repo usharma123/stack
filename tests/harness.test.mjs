@@ -267,19 +267,25 @@ test('scenarios 14 and 15 stop a setup command that stalls, and report it', () =
   }
 });
 
-test('native runner stops a down that stalls during cleanup, keeps its output and fails the run', () => {
+for (const stalled of ['down', 'lookup']) test(`native runner stops a stalled ${stalled} during cleanup, keeps its output and fails the run`, () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'stack-harness-'));
   let work;
   try {
-    const pids = path.join(dir, 'down.pids');
-    // --version leaves one fixture checkout to bring down; down ignores TERM and never ends.
+    const pids = path.join(dir, 'stalled.pids');
+    const hang = `trap '' TERM; echo $$ >>${pids}; while :; do sleep 0.2; done`;
+    // --version leaves one fixture checkout for cleanup.
     writeFileSync(path.join(dir, 'stack'), `#!/usr/bin/env bash
 case "$*" in
   --version) mkdir -p "$STACK_E2E_WORK/appZ"; touch "$STACK_E2E_WORK/appZ/stack.toml"; echo 'stack fixture' ;;
-  *' down --json') echo 'down started'; trap '' TERM; echo $$ >>${pids}; while :; do sleep 0.2; done ;;
+  *' down --json') echo 'down started'; ${stalled === 'down' ? hang : 'exit 0'} ;;
 esac
 `, { mode: 0o755 });
-    writeFileSync(path.join(dir, 'mise'), '#!/bin/sh\nprintf "mise fixture\\n"\n', { mode: 0o755 });
+    writeFileSync(path.join(dir, 'mise'), `#!/bin/sh
+case "$1" in
+  --version) echo 'mise fixture' ;;
+  which) echo 'lookup started' >&2; ${stalled === 'lookup' ? hang : 'exit 1'} ;;
+esac
+`, { mode: 0o755 });
     writeFileSync(path.join(dir, 'jq'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, STACK_E2E_CLEANUP_SECONDS: '1' };
     delete env.STACK_E2E_REGISTRY;
@@ -291,10 +297,12 @@ esac
     assert.match(result.stdout, /5-oci: SKIPPED/);
     assert.equal(result.status, 1, result.stderr);
     assert.ok(work, result.stderr);
-    assert.match(result.stderr, /cleanup: still running after 1s, stopped: \S+\/stack -C \S+\/appZ\/ down --json\n--- \S+\/cleanup-down-appZ\.out\ndown started/);
-    assert.equal(readFileSync(path.join(work, 'cleanup-down-appZ.out'), 'utf8'), 'down started\n');
+    const log = stalled === 'down' ? 'cleanup-down-appZ.out' : 'cleanup-mise-appZ.out';
+    assert.match(result.stderr, /cleanup: still running after 1s, stopped:/);
+    assert.ok(result.stderr.includes(`--- ${path.join(work, log)}\n${stalled} started`));
+    assert.equal(readFileSync(path.join(work, log), 'utf8'), `${stalled} started\n`);
     assert.ok(Date.now() - started < 30000, 'cleanup outlived its bound');
-    assert.ok(allGone(pids), 'the stalled down survived cleanup');
+    assert.ok(allGone(pids), `the stalled ${stalled} survived cleanup`);
   } finally {
     if (work) rmSync(work, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });

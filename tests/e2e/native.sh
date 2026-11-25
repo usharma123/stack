@@ -84,7 +84,7 @@ bounded() {
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 cleanup() {
   status=$?
-  local supervisor app
+  local supervisor app lookup
   # A command that fails is ignored, as before; one that stalls fails the run.
   for app in "$work"/w/*/; do
     [ -f "$app/stack.toml" ] || continue
@@ -94,7 +94,14 @@ cleanup() {
   supervisor=
   for app in "$work"/w/*/; do
     [ -f "$app/stack.toml" ] || continue
-    supervisor=$(cd "$app" && mise which pitchfork 2>/dev/null) && break
+    lookup="$work/cleanup-mise-$(basename "$app")"
+    # shellcheck disable=SC2016 # The child shell receives these paths as positional arguments.
+    if bounded "$lookup.out" bash -c 'cd "$1" && exec mise which pitchfork >"$2"' _ "$app" "$lookup.path"; then
+      supervisor=$(cat "$lookup.path")
+      break
+    elif [ "$?" -eq 124 ]; then
+      status=1
+    fi
   done
   # Only a fixture that pins Pitchfork has one to stop. Invoke the isolated binary directly with
   # its explicit state directory: `mise exec` would evaluate project env again while choosing
