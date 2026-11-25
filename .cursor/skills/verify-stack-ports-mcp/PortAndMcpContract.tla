@@ -6,12 +6,13 @@
 \*
 \* part = "ports": the machine-wide port registry (src/ports.rs: assign, reassign, release,
 \* release_gone; src/project.rs compile; src/session up's port check and up --reassign-ports).
-\* Two checkouts c1 (db, web) and c2 (db, web pinned to port 1) share ports 1..5, of which 5 lies
-\* where outgoing connections may take a port (the ephemeral range). A compile reads the registry
-\* under its lock and writes it whole: two steps, so without the lock two compiles interleave.
-\* Between steps a checkout can go out of reach (its volume unmounted: presence unknown), come
-\* back, or be deleted (presence absent; its services run until its supervisor reaps them), and
-\* a foreign program can listen on a free port and exit.
+\* Two checkouts c1 (db, web) and c2 (db, web, pinned to port 1 from the start or once the
+\* project configures it) share ports 1..5, of which 5 lies where outgoing connections may take a port (the
+\* ephemeral range). A compile reads the registry under its lock and writes it whole: two steps,
+\* so without the lock two compiles interleave; its services come in either order. Between steps
+\* a checkout can go out of reach (its volume unmounted: presence unknown), come back, or be
+\* deleted (presence absent; its services run until its supervisor reaps them), and foreign
+\* programs can listen on up to two free ports and exit.
 \*
 \* part = "mcp": the stdio MCP server's admission (src/mcp/server.rs: read_frames, Credit,
 \* Server::line/batch/request/cancel/accept/admit/start/done/finish/drop_waiting). A client sends
@@ -31,10 +32,10 @@ Fault(f) == f \in Faults
 \* ------------------------------------------------------------------ ports: constants
 Checkouts == {"c1", "c2"}
 Services == {"db", "web"}
-Order == <<"db", "web">>                     \* the order compile's requests come in
+Orders == {<<"db", "web">>, <<"web", "db">>}  \* the orders compile's requests can come in
+Order == <<"db", "web">>                     \* the order up --reassign-ports moves services in
 Ports == 1..5
 Ephemeral == {5}
-Pin(c, s) == IF c = "c2" /\ s = "web" THEN 1 ELSE 0
 NoPorts == [s \in Services |-> 0]
 
 \* ------------------------------------------------------------------ mcp: constants
@@ -57,8 +58,12 @@ VARIABLES
     snap,         \* the registry a compile read
     mode,         \* whether that compile reassigns
     steps,
+    pinOn,        \* c2's project pins web to port 1 (its configuration, read by its next compile)
+    ord,          \* per checkout: the order of the requests of the compile under way
     gaveBack,       \* history: a reassignment gave a service a port its checkout gave up
     ownPinConflict, \* history: a compile failed on a pin only its own other service held
+    pinTookOwn,     \* witness: a compile pinned a port its own unpinned service held
+    surrenderedFree, \* witness: up --reassign-ports moved two services while a port one gave up was free
     \* mcp
     pending,      \* lines written and read, waiting for the loop (the reader's bounded queue)
     closed,       \* the client closed its input (the reader reports the end after every line)
@@ -80,7 +85,8 @@ VARIABLES
     workerAfterSignal,  \* history: a call got a worker after the signal was raised
     toolAfterSignal     \* history: a call's tool began after the signal was raised
 
-portVars == <<res, given, run, foreign, presence, lock, pc, snap, mode, steps, gaveBack, ownPinConflict>>
+portVars == <<res, given, run, foreign, presence, lock, pc, snap, mode, steps, pinOn, ord,
+              gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 mcpVars == <<pending, closed, loop, proj, status, inBatch, waiting, busy, running,
              doneQ, cancelled, signal, stopped, owed, collected, batchSent, batchUsed, batchRead, cancelSent,
              accepted, startOrder, cancelHit, cancelBeforeTool, workerAfterSignal,
@@ -88,6 +94,7 @@ mcpVars == <<pending, closed, loop, proj, status, inBatch, waiting, busy, runnin
 vars == <<part, portVars, mcpVars>>
 
 \* ================================================================== ports
+Pin(c, s) == IF c = "c2" /\ s = "web" /\ pinOn THEN 1 ELSE 0
 Listening == (foreign \cup {run[c][s] : c \in Checkouts, s \in Services}) \ {0}
 Own(r, c) == {x \in r : x[1] = c}
 \* What a registry operation keeps of other checkouts: a checkout shown to be gone is dropped;
@@ -112,20 +119,36 @@ StepOutcomes(r, c, s, excluded) ==
        ELSE IF free = {} THEN {[ok |-> FALSE, r |-> r, p |-> 0, own |-> FALSE]}
        ELSE {[ok |-> TRUE, r |-> put(p), p |-> p, own |-> FALSE] : p \in free}
 
-\* `assign` for checkout c over the registry it read: every outcome ([ok, r, out, own]); the
-\* registry is written only when both requests succeed.
-Assign(c, reassign, read) ==
+\* The checkout's pinned ports.
+Pins(c) == {Pin(c, s) : s \in Services} \ {0}
+\* Its reservations a compile gives up before assigning: all when reassigning; else those on a
+\* port it pins held by a service not pinned there (a pin configured after Stack gave that port
+\* to another of its services takes it).
+GivenUpFirst(c, reassign, base) ==
+    IF reassign THEN Own(base, c)
+    ELSE IF Fault("PinKeepsOwnReservation") THEN {}
+    ELSE {x \in Own(base, c) : x[3] \in Pins(c) /\ Pin(c, x[2]) # x[3]}
+
+\* `assign` for checkout c over the registry it read, its requests in order o: every outcome
+\* ([ok, r, out, own, took]); the registry is written only when both requests succeed. `took`:
+\* a pinned port was held by one of its own unpinned services (the witness).
+Assign(c, reassign, read, o) ==
     LET base == Pruned(read)
-        start == IF reassign THEN base \ Own(base, c) ELSE base
-        pins == IF Fault("AllocateOverOwnPin") THEN {} ELSE ({Pin(c, s) : s \in Services} \ {0})
+        start == base \ GivenUpFirst(c, reassign, base)
+        pins == IF Fault("AllocateOverOwnPin") THEN {} ELSE Pins(c)
         givenUp == IF reassign /\ ~Fault("ReassignForgetsOld") THEN {x[3] : x \in Own(base, c)} ELSE {}
         excluded == pins \cup givenUp
+        took == \E x \in Own(base, c) : x[3] \in Pins(c) /\ Pin(c, x[2]) # x[3]
     IN UNION {
-         IF ~a.ok THEN {[ok |-> FALSE, r |-> read, out |-> NoPorts, own |-> a.own]}
+         IF ~a.ok THEN {[ok |-> FALSE, r |-> read, out |-> NoPorts, own |-> a.own, took |-> FALSE]}
          ELSE {[ok |-> b.ok, r |-> IF b.ok THEN b.r ELSE read,
-                out |-> [s \in Services |-> IF s = Order[1] THEN a.p ELSE b.p],
-                own |-> ~b.ok /\ b.own] : b \in StepOutcomes(a.r, c, Order[2], excluded)}
-         : a \in StepOutcomes(start, c, Order[1], excluded)}
+                out |-> [s \in Services |-> IF s = o[1] THEN a.p ELSE b.p],
+                own |-> ~b.ok /\ b.own, took |-> b.ok /\ took] : b \in StepOutcomes(a.r, c, o[2], excluded)}
+         : a \in StepOutcomes(start, c, o[1], excluded)}
+
+\* The orders a compile of c is checked in. Without a pin, every outcome of one order is one of
+\* the other (each request takes any eligible port), so only a checkout with a pin needs both.
+OrdersOf(c) == IF Pins(c) # {} THEN Orders ELSE {Order}
 
 Usable(c) == presence[c] = "present" /\ pc[c] = "idle"
 LockFree == lock = "none"
@@ -142,33 +165,40 @@ PortsInit ==
     /\ snap = [c \in Checkouts |-> {}]
     /\ mode = [c \in Checkouts |-> FALSE]
     /\ steps = 0
+    /\ pinOn \in IF part = "ports" THEN BOOLEAN ELSE {FALSE}   \* (not doubling the other machine)
+    /\ ord = [c \in Checkouts |-> Order]
     /\ gaveBack = FALSE
     /\ ownPinConflict = FALSE
+    /\ pinTookOwn = FALSE
+    /\ surrenderedFree = FALSE
 
 Step == steps < Steps /\ steps' = steps + 1
 
 \* project::compile -> ports::assign: read the registry under its lock ...
-CompileRead(c, reassign) ==
+CompileRead(c, reassign, o) ==
     /\ Usable(c) /\ LockFree /\ Step
     /\ lock' = Take(c)
     /\ pc' = [pc EXCEPT ![c] = "assigning"]
     /\ snap' = [snap EXCEPT ![c] = res]
     /\ mode' = [mode EXCEPT ![c] = reassign]
-    /\ UNCHANGED <<res, given, run, foreign, presence, gaveBack, ownPinConflict>>
+    /\ ord' = [ord EXCEPT ![c] = o]
+    /\ UNCHANGED <<res, given, run, foreign, presence, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
 \* ... then choose (find_free binds each candidate: a listened port is skipped), write it whole
 \* (only when the assignment succeeded) and release the lock; the checkout renders what it got.
 CompileWrite(c) ==
     /\ pc[c] = "assigning"
-    /\ \E o \in Assign(c, mode[c], snap[c]) :
+    /\ \E o \in Assign(c, mode[c], snap[c], ord[c]) :
           /\ res' = IF o.ok THEN o.r ELSE res
           /\ given' = IF o.ok THEN [given EXCEPT ![c] = o.out] ELSE given
           /\ gaveBack' = (gaveBack \/ (o.ok /\ mode[c] /\
                 \E s \in Services : Pin(c, s) = 0 /\ given[c][s] # 0 /\ o.out[s] \in {given[c][t] : t \in Services}))
           /\ ownPinConflict' = (ownPinConflict \/ (~o.ok /\ o.own))
+          /\ pinTookOwn' = (pinTookOwn \/ o.took)
     /\ lock' = "none"
     /\ pc' = [pc EXCEPT ![c] = "idle"]
-    /\ UNCHANGED <<run, foreign, presence, snap, mode, steps>>
+    /\ ord' = [ord EXCEPT ![c] = Order]
+    /\ UNCHANGED <<run, foreign, presence, snap, mode, steps, pinOn, surrenderedFree>>
 
 Conflicts(c) == {s \in Services : given[c][s] \in Listening \ {run[c][t] : t \in Services}}
 
@@ -179,30 +209,57 @@ Up(c) ==
     /\ \A s \in Services : given[c][s] # 0
     /\ Conflicts(c) = {}
     /\ run' = [run EXCEPT ![c] = given[c]]
-    /\ UNCHANGED <<res, given, foreign, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+    /\ UNCHANGED <<res, given, foreign, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
-\* up --reassign-ports after such a conflict naming no pinned port: ports::reassign keeps the
-\* old reservation while choosing, so the new port is neither it nor any reserved one.
+\* ports::reassign's moves of the services of `seq` (in turn) of checkout c over registry r: each
+\* service's old reservation replaced by a port in range, not reserved in r as it stands then, and
+\* not in `avoid`. Every outcome ([r, new]); none when a service finds no port (ports_exhausted:
+\* nothing is written, as if the command had not run).
+RECURSIVE Moves(_, _, _, _, _)
+Moves(c, seq, r, avoid, new) ==
+    IF seq = <<>> THEN {[r |-> r, new |-> new]}
+    ELSE LET s == Head(seq)
+             free == (Ports \ Ephemeral) \ ({x[3] : x \in r} \cup avoid)
+         IN UNION {Moves(c, Tail(seq), {x \in r : ~(x[1] = c /\ x[2] = s)} \cup {<<c, s, p>>}, avoid,
+                         [new EXCEPT ![s] = p]) : p \in free}
+
+\* up --reassign-ports after such a conflict naming no pinned port: ports::reassign moves the
+\* conflicting services one after another. Programs holding their ports may exit meanwhile
+\* (`freed`, taken as gone before the first choice: that only adds choices), so a port given up
+\* binds again once its service moved; every port the services give up stays excluded until
+\* each has its new one (a fault: only while its own service is moved).
 UpReassign(c) ==
     /\ Usable(c) /\ LockFree /\ Step
     /\ \A s \in Services : given[c][s] # 0
     /\ Conflicts(c) # {}
     /\ \A s \in Conflicts(c) : Pin(c, s) = 0
-    /\ \E new \in [Conflicts(c) -> Ports \ Ephemeral] :
-          /\ \A s \in Conflicts(c) : new[s] \notin {x[3] : x \in res} \cup Listening
-          /\ \A s, t \in Conflicts(c) : s # t => new[s] # new[t]
-          /\ LET moved == [s \in Services |-> IF s \in Conflicts(c) THEN new[s] ELSE given[c][s]]
-             IN /\ res' = {x \in res : ~(x[1] = c /\ x[2] \in Conflicts(c))}
-                          \cup {<<c, s, new[s]>> : s \in Conflicts(c)}
-                /\ given' = [given EXCEPT ![c] = moved]
-                /\ run' = [run EXCEPT ![c] = moved]
-                /\ gaveBack' = (gaveBack \/ \E s \in Conflicts(c) : new[s] = given[c][s])
-    /\ UNCHANGED <<foreign, presence, lock, pc, snap, mode, ownPinConflict>>
+    /\ \E freed \in SUBSET foreign :
+          LET conf == Conflicts(c)
+              surrendered == {x[3] : x \in {y \in Own(res, c) : y[2] \in conf}}
+              gaveUp == {given[c][s] : s \in conf}
+              avoid == (Listening \ freed) \cup (IF Fault("ReassignReusesSurrendered") THEN {} ELSE surrendered)
+          IN \E o \in Moves(c, SelectSeq(Order, LAMBDA s : s \in conf), res, avoid, NoPorts) :
+                LET moved == [s \in Services |-> IF s \in conf THEN o.new[s] ELSE given[c][s]]
+                IN /\ res' = o.r
+                   /\ given' = [given EXCEPT ![c] = moved]
+                   /\ run' = [run EXCEPT ![c] = moved]
+                   /\ foreign' = foreign \ freed
+                   /\ gaveBack' = (gaveBack \/ \E s \in conf : o.new[s] \in gaveUp)
+                   /\ surrenderedFree' = (surrenderedFree \/ (Cardinality(conf) > 1 /\ gaveUp \cap freed # {}))
+    /\ UNCHANGED <<presence, lock, pc, snap, mode, ord, pinOn, ownPinConflict, pinTookOwn>>
+
+\* The project configures c2's pin of port 1 (when it starts without one): its next compile reads
+\* it (one under way read the configuration before the registry). Removing a pin is a service
+\* no longer pinned, as c1's are, and is left out.
+ConfigurePin ==
+    /\ ~pinOn /\ pc["c2"] = "idle" /\ Step
+    /\ pinOn' = TRUE
+    /\ UNCHANGED <<res, given, run, foreign, presence, lock, pc, snap, mode, ord, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
 Down(c) ==
     /\ Usable(c) /\ Step
     /\ run' = [run EXCEPT ![c] = NoPorts]
-    /\ UNCHANGED <<res, given, foreign, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+    /\ UNCHANGED <<res, given, foreign, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
 \* down --purge: services stopped, every reservation of the checkout released.
 Purge(c) ==
@@ -210,41 +267,40 @@ Purge(c) ==
     /\ run' = [run EXCEPT ![c] = NoPorts]
     /\ res' = res \ Own(res, c)
     /\ given' = [given EXCEPT ![c] = NoPorts]
-    /\ UNCHANGED <<foreign, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+    /\ UNCHANGED <<foreign, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
 \* gc: release_gone, keeping a checkout whose session is still kept (its services run).
 Gc ==
     /\ LockFree /\ Step
     /\ res' = {x \in res : ~(Gone(x[1]) /\ run[x[1]] = NoPorts)}
-    /\ UNCHANGED <<given, run, foreign, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+    /\ UNCHANGED <<given, run, foreign, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
 Unmount(c) == /\ presence[c] = "present" /\ pc[c] = "idle" /\ Step
               /\ presence' = [presence EXCEPT ![c] = "unknown"]
-              /\ UNCHANGED <<res, given, run, foreign, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+              /\ UNCHANGED <<res, given, run, foreign, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 Remount(c) == /\ presence[c] = "unknown" /\ Step
               /\ presence' = [presence EXCEPT ![c] = "present"]
-              /\ UNCHANGED <<res, given, run, foreign, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+              /\ UNCHANGED <<res, given, run, foreign, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 Delete(c) ==  /\ presence[c] = "present" /\ pc[c] = "idle" /\ Step
               /\ presence' = [presence EXCEPT ![c] = "absent"]
-              /\ UNCHANGED <<res, given, run, foreign, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+              /\ UNCHANGED <<res, given, run, foreign, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 \* The deleted checkout's supervisor confirms its services gone.
 Reap(c) ==    /\ presence[c] = "absent" /\ run[c] # NoPorts /\ Step
               /\ run' = [run EXCEPT ![c] = NoPorts]
-              /\ UNCHANGED <<res, given, foreign, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
-ForeignListen(p) == /\ foreign = {} /\ p \notin Listening /\ Step
-                    /\ foreign' = {p}
-                    /\ UNCHANGED <<res, given, run, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
-ForeignExit == /\ foreign # {} /\ Step
-               /\ foreign' = {}
-               /\ UNCHANGED <<res, given, run, presence, lock, pc, snap, mode, gaveBack, ownPinConflict>>
+              /\ UNCHANGED <<res, given, foreign, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
+ForeignListen(p) == /\ Cardinality(foreign) < 2 /\ p \notin Listening /\ Step
+                    /\ foreign' = foreign \cup {p}
+                    /\ UNCHANGED <<res, given, run, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
+ForeignExit(p) == /\ p \in foreign /\ Step
+                  /\ foreign' = foreign \ {p}
+               /\ UNCHANGED <<res, given, run, presence, lock, pc, snap, mode, ord, pinOn, gaveBack, ownPinConflict, pinTookOwn, surrenderedFree>>
 
 PortsNext ==
-    \/ \E c \in Checkouts, r \in BOOLEAN : CompileRead(c, r)
+    \/ \E c \in Checkouts, r \in BOOLEAN : \E o \in OrdersOf(c) : CompileRead(c, r, o)
     \/ \E c \in Checkouts : CompileWrite(c) \/ Up(c) \/ UpReassign(c) \/ Down(c) \/ Purge(c)
                             \/ Unmount(c) \/ Remount(c) \/ Delete(c) \/ Reap(c)
-    \/ Gc
-    \/ \E p \in Ports : ForeignListen(p)
-    \/ ForeignExit
+    \/ Gc \/ ConfigurePin
+    \/ \E p \in Ports : ForeignListen(p) \/ ForeignExit(p)
 
 \* ------------------------------------------------------------------ ports: promises
 \* The registry never reserves one port twice, nor two ports for one service of a checkout.
@@ -262,12 +318,19 @@ AssignedOutsideEphemeral ==
     \A c \in Checkouts, s \in Services : Pin(c, s) = 0 /\ given[c][s] # 0 => given[c][s] \notin Ephemeral
 
 \* Reassigning (compile or up --reassign-ports) never gives a service back a port its checkout
-\* gave up.
+\* gave up: any of the ports the operation took from its services, not only the service's own.
 ReassignMoves == ~gaveBack
 
 \* A pin fails only for another checkout's (or another pinned service's) reservation, never for a
-\* port the same compile chose for one of the checkout's own services.
+\* port the same compile chose for one of the checkout's own services, nor one Stack gave one of
+\* them before the pin was configured.
 OwnPinNeverConflicts == ~ownPinConflict
+
+\* Witnesses (WITNESS configs, expected violated): the fixed model reaches a compile pinning a
+\* port its own unpinned service held, and up --reassign-ports moving two services while a port
+\* one of them gave up was free.
+NoPinOverOwnReservation == ~pinTookOwn
+NoSurrenderedPortFree == ~surrenderedFree
 
 \* Not promised (LIMIT config): a reservation keeps other checkouts off a port, not other
 \* programs; `up` then refuses with port_conflict instead of starting.
