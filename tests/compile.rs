@@ -388,6 +388,27 @@ fn pinned_ports_cannot_collide_across_projects() {
     assert_eq!(sb.compile(&b, Mode::UseLock).unwrap_err().code, "port_conflict");
 }
 
+/// A pin added to a project that already compiled, on the port Stack gave another of its
+/// services: the next ordinary compile gives the pinned service that port and moves the other,
+/// whether the pinned service comes after it (redis) or before it (postgres).
+#[test]
+fn a_pin_added_on_a_port_its_own_project_was_given_moves_the_other_service() {
+    let sb = Sandbox::new();
+    let repo = sb.bundle("pybase", PYBASE);
+    for (pinned, other, version) in [("redis", "postgres", "8"), ("postgres", "redis", "17")] {
+        let dir = sb.path(&format!("pin-{pinned}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("stack.toml"), use_git(&repo, "v1")).unwrap();
+        let port = sb.compile(&dir, Mode::UseLock).unwrap().ports[other];
+        let pin = format!("[override.services.{pinned}]\npreset = \"{pinned}\"\nversion = \"{version}\"\nport = {port}\n");
+        fs::write(dir.join("stack.toml"), format!("{}{pin}", use_git(&repo, "v1"))).unwrap();
+        let after = sb.compile(&dir, Mode::UseLock).unwrap_or_else(|e| panic!("{pinned}: {}: {}", e.code, e.message)).ports;
+        assert_eq!(after[pinned], port, "{pinned}");
+        assert_ne!(after[other], port, "{pinned}");
+        assert_eq!(stack::ports::lookup(&sb.path("state"), &dir).unwrap(), after, "{pinned}");
+    }
+}
+
 #[test]
 fn deleted_projects_release_their_ports() {
     let sb = Sandbox::new();

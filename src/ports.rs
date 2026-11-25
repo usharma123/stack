@@ -155,8 +155,9 @@ fn paths(state: &Path) -> (PathBuf, PathBuf) {
 /// Assign (or reuse) a port per service. Reservations persist across restarts, so a project
 /// keeps the same ports until `reassign` or until its directory is deleted. An assigned port
 /// the system may give an outgoing connection (one reserved before the range moved) is
-/// replaced; pinned ports are the project's to choose, and no other service of it is given one.
-/// With `reassign` (`compile
+/// replaced; pinned ports are the project's to choose, and no other service of it is given one
+/// (a service Stack gave a port the project pins since is moved to another, in whatever order
+/// the services come). With `reassign` (`compile
 /// --reassign-ports`) every service that is not pinned gets a new port: the ports the project
 /// gives up stay excluded while new ones are chosen, as [`reassign`] keeps the old one.
 pub fn assign(state: &Path, project: &Path, requests: &[Request], reassign: bool) -> Result<IndexMap<String, u16>> {
@@ -185,12 +186,19 @@ fn assign_outside(
     let at = crate::checkout::Recorded::adopted(project, &previous_at);
     // Never chosen for a service: the ports this checkout gives up when reassigning, and those
     // any of its services pins (a pin later in `requests` is not reserved yet).
-    let mut excluded: Vec<u16> = requests.iter().filter_map(|q| q.fixed).collect();
+    let pins: Vec<u16> = requests.iter().filter_map(|q| q.fixed).collect();
+    let mut excluded = pins.clone();
     if reassign {
         excluded.extend(reg.reservations.iter().filter(|r| r.project == project).map(|r| r.port));
     }
+    // Of this checkout's reservations, only those of services it still requests are kept (none
+    // when reassigning), and of those not one on a port another of its services now pins: a pin
+    // configured after Stack gave that port to a service of the same checkout takes it, and that
+    // service is assigned another (a pinned port is excluded from what it is chosen from).
     reg.reservations.retain(|r| {
-        r.project != project || (!reassign && requests.iter().any(|q| q.service == r.service))
+        let wanted = requests.iter().find(|q| q.service == r.service);
+        r.project != project
+            || (!reassign && wanted.is_some_and(|q| !pins.contains(&r.port) || q.fixed == Some(r.port)))
     });
 
     let mut out = IndexMap::new();
@@ -421,6 +429,47 @@ mod tests {
         }
     }
 
+    /// A pin configured after Stack assigned that port to another service of the same checkout:
+    /// an ordinary compile (no `--reassign-ports`) takes it for the pinned service and moves the
+    /// other, whichever comes first. A pin on another checkout's port is still a conflict, and a
+    /// compile that fails on one changes nothing, the move of its own service included.
+    #[test]
+    fn a_pin_configured_over_a_port_its_own_checkout_was_assigned_takes_it_in_either_order() {
+        for pinned_first in [false, true] {
+            let (state, project, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (state, project) = (state.path(), project.path());
+            let ordered = |pinned: (&'static str, u16), rest: &[&'static str]| {
+                let mut all: Vec<(&str, Option<u16>)> = rest.iter().map(|s| (*s, None)).collect();
+                all.insert(if pinned_first { 0 } else { all.len() }, (pinned.0, Some(pinned.1)));
+                requests(&all)
+            };
+            let ctx = format!("pinned first: {pinned_first}");
+            let before = assign(state, project, &requests(&[("web", None), ("db", None)]), false).unwrap();
+            let theirs = assign(state, other.path(), &requests(&[("api", None)]), false).unwrap()["api"];
+            let wanted = ordered(("db", before["web"]), &["web"]);
+            let after = assign(state, project, &wanted, false).unwrap_or_else(|e| panic!("{ctx}: {}: {}", e.code, e.message));
+            assert_eq!(after["db"], before["web"], "{ctx}");
+            assert!(![before["web"], theirs].contains(&after["web"]), "{ctx}: {before:?} -> {after:?}");
+            assert_eq!(lookup(state, project).unwrap(), after, "{ctx}");
+            assert_eq!(lookup(state, other.path()).unwrap()["api"], theirs, "{ctx}");
+            // Stable from then on.
+            assert_eq!(assign(state, project, &wanted, false).unwrap(), after, "{ctx}");
+            // Pinning `db` to `web`'s port again while `cache` pins the other checkout's: refused,
+            // and `web` keeps its port.
+            let registry = std::fs::read(paths(state).0).unwrap();
+            let mut conflict = ordered(("db", after["web"]), &["web"]);
+            conflict.push(Request { service: "cache".into(), fixed: Some(theirs) });
+            let e = assign(state, project, &conflict, false).unwrap_err();
+            assert_eq!(e.code, "port_conflict", "{ctx}: {}", e.message);
+            assert!(e.message.contains("'api'"), "{ctx}: {}", e.message);
+            assert_eq!(std::fs::read(paths(state).0).unwrap(), registry, "{ctx}: a failed compile changed the registry");
+            // Two services of one checkout pinning one port still conflict.
+            let twice = requests(&[("web", Some(after["db"])), ("db", Some(after["db"]))]);
+            assert_eq!(assign(state, project, &twice, false).unwrap_err().code, "port_conflict", "{ctx}");
+            assert_eq!(std::fs::read(paths(state).0).unwrap(), registry, "{ctx}");
+        }
+    }
+
     #[test]
     fn ports_come_from_outside_the_ports_outgoing_connections_take() {
         let (state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -503,15 +552,17 @@ mod tests {
     }
 
     /// Every registry operation (compile with and without `--reassign-ports`, `up
-    /// --reassign-ports`, `down --purge`, `gc`), interleaved across three checkouts in a seeded
-    /// order, with a foreign listener coming and going, a checkout going out of reach and back,
-    /// and one deleted. After every step the real registry keeps what the port model
-    /// (verify-stack-ports-mcp) promises: one reservation per port, and each checkout still there
-    /// (out of reach or not) keeps exactly the ports it was last given; each assignment reuses a
-    /// port, or (reassigning) never gives one back, never takes a pinned port another checkout
-    /// holds, never one a foreign program listens on, and never one outgoing connections may
-    /// take; a failed assignment changes nothing; a deleted checkout's ports are released by the
-    /// next compile or `gc`. Only eight ports are free, so collisions and exhaustion happen.
+    /// --reassign-ports`, `down --purge`, `gc`), interleaved across three
+    /// checkouts in a seeded order, with a foreign listener coming and going, a checkout going out
+    /// of reach and back, one deleted, and one whose pin is configured and removed again (its
+    /// services coming in either order). After every step the real registry keeps what the port
+    /// model (verify-stack-ports-mcp) promises: one reservation per port, and each checkout still
+    /// there (out of reach or not) keeps exactly the ports it was last given; each assignment
+    /// reuses a port (unless its own checkout now pins it), or (reassigning) never gives one back, never takes a pinned port another checkout holds, never one a
+    /// foreign program listens on, and never one outgoing connections may take; a pin fails only
+    /// on another checkout's reservation; a failed assignment changes nothing; a deleted
+    /// checkout's ports are released by the next compile or `gc`. Only eight ports are free, so
+    /// collisions and exhaustion happen.
     #[test]
     fn a_seeded_sequence_of_registry_operations_keeps_every_reservation_promise() {
         use std::collections::{BTreeMap, BTreeSet};
@@ -521,16 +572,21 @@ mod tests {
         // `ports_come_from_outside_the_ports_outgoing_connections_take`, which runs alongside).
         let ephemeral = RANGE_START + 8..=RANGE_END;
         let window: Vec<u16> = (RANGE_START..RANGE_START + 8).collect();
-        let pin = RANGE_START + 3;
-        let wanted = |c: usize| match c {
+        // The first port `find_free` reaches in the window, so a service of any checkout may hold it
+        // when checkout 1 pins it.
+        let pin = RANGE_START;
+        // Checkout 1 pins `db` once its pin is configured, its services in either order.
+        let wanted = |c: usize, pin_on: bool, db_first: bool| match c {
             0 => requests(&[("web", None), ("db", None)]),
-            1 => requests(&[("web", None), ("db", Some(pin))]),
+            1 => {
+                let db = ("db", pin_on.then_some(pin));
+                requests(&if db_first { [db, ("web", None)] } else { [("web", None), db] })
+            }
             _ => requests(&[("web", None)]),
         };
-        let pinned = |c: usize, service: &str| c == 1 && service == "db";
         let sorted = |ports: &IndexMap<String, u16>| ports.iter().map(|(s, p)| (s.clone(), *p)).collect::<BTreeMap<_, _>>();
         let mut seen = BTreeSet::new();
-        for seed in 1..=6u64 {
+        for seed in 1..=8u64 {
             let tmp = tempfile::tempdir().unwrap();
             let state = tmp.path().join("state");
             let parents: Vec<PathBuf> = (0..3).map(|i| tmp.path().join(format!("p{i}"))).collect();
@@ -541,13 +597,28 @@ mod tests {
             }
             let registry = || all(&state).unwrap().into_iter().map(|r| (r.project, r.service, r.port)).collect::<BTreeSet<_>>();
             let mut given: Vec<IndexMap<String, u16>> = vec![IndexMap::new(); 3];
+            // What earlier commands left: in half the runs, checkout 0's `db` holds a port
+            // reserved before the range moved (where outgoing connections may now take one); in
+            // half, checkout 1's `web` holds the port its checkout now pins.
+            let mut history = Vec::new();
+            for (on, c, service, port) in [(seed % 2 == 1, 0, "db", RANGE_START + 100), (seed % 4 >= 2, 1, "web", pin)] {
+                if on {
+                    history.push(Reservation { port, project: roots[c].clone(), service: service.into(), project_at: Default::default() });
+                    given[c].insert(service.into(), port);
+                }
+            }
+            if !history.is_empty() {
+                write_json(&paths(&state).0, &Registry { reservations: history }).unwrap();
+            }
             let mut deleted = [false; 3];
             let mut foreign: Option<(u16, TcpListener)> = None;
             // Dropped before `tmp`, so every directory is reachable again for its removal.
             let mut refused: Vec<Option<Refused>> = vec![None, None, None];
+            let mut pin_on = seed % 4 != 1;
+            let pinned = |c: usize, service: &str, pin_on: bool| pin_on && c == 1 && service == "db";
             let mut rng = Lcg(seed);
-            for step in 0..250 {
-                let (c, op) = (rng.below(3) as usize, rng.below(10));
+            for step in 0..300 {
+                let (c, op) = (rng.below(3) as usize, rng.below(11));
                 let usable = !deleted[c] && refused[c].is_none();
                 let ctx = format!("seed {seed} step {step} op {op} checkout {c}");
                 let before = registry();
@@ -555,18 +626,23 @@ mod tests {
                 match op {
                     0..=3 if usable => {
                         let reassign = op == 3;
-                        match assign_outside(&state, &roots[c], &wanted(c), reassign, &ephemeral) {
+                        // By the step, not the generator: its next draw follows the last too closely.
+                        let db_first = step % 2 == 0;
+                        match assign_outside(&state, &roots[c], &wanted(c, pin_on, db_first), reassign, &ephemeral) {
                             Ok(ports) => {
                                 for (service, port) in &ports {
-                                    if pinned(c, service) {
+                                    if pinned(c, service, pin_on) {
                                         assert_eq!(*port, pin, "{ctx}");
                                         continue;
                                     }
                                     assert!((RANGE_START..=RANGE_END).contains(port) && !ephemeral.contains(port), "{ctx}: {service} got {port}");
+                                    assert!(!(c == 1 && pin_on && *port == pin), "{ctx}: {service} got its checkout's pinned port");
                                     let old = given[c].get(service).copied();
                                     if reassign {
                                         assert!(!given[c].values().any(|o| o == port), "{ctx}: reassigning gave {service} back {port}: {:?}", given[c]);
                                         seen.insert("reassign");
+                                    } else if c == 1 && pin_on && old == Some(pin) {
+                                        seen.insert(if db_first { "pin over own reservation, pinned first" } else { "pin over own reservation, pinned last" });
                                     } else if let Some(old) = old.filter(|o| !ephemeral.contains(o)) {
                                         assert_eq!(*port, old, "{ctx}: {service} moved without reassigning");
                                         seen.insert("reuse");
@@ -584,8 +660,8 @@ mod tests {
                                 assert_eq!(registry(), before, "{ctx}: a failed assignment changed the registry");
                                 match e.code {
                                     "port_conflict" => {
-                                        let theirs = before.iter().any(|(p, s, port)| *port == pin && !(p == &roots[1] && s == "db"));
-                                        assert!(c == 1 && theirs, "{ctx}: {}", e.message);
+                                        let theirs = before.iter().any(|(p, _, port)| *port == pin && p != &roots[1]);
+                                        assert!(c == 1 && pin_on && theirs, "{ctx}: {}", e.message);
                                         seen.insert("pin conflict");
                                     }
                                     "ports_exhausted" => {
@@ -642,6 +718,11 @@ mod tests {
                             }
                         };
                     }
+                    // Checkout 1's pin configured, or removed (its next compile adopts that).
+                    10 => {
+                        pin_on = !pin_on;
+                        seen.insert(if pin_on { "pin configured" } else { "pin removed" });
+                    }
                     _ => continue,
                 }
                 let now = all(&state).unwrap();
@@ -660,7 +741,18 @@ mod tests {
                 }
             }
         }
-        let mut wanted = vec!["reassign", "reuse", "pin conflict", "up reassign", "replaced in the ephemeral range", "deleted", "released"];
+        let mut wanted = vec![
+            "reassign",
+            "reuse",
+            "pin conflict",
+            "pin configured",
+            "pin over own reservation, pinned first",
+            "pin over own reservation, pinned last",
+            "up reassign",
+            "replaced in the ephemeral range",
+            "deleted",
+            "released",
+        ];
         if can_refuse {
             wanted.push("out of reach");
         }

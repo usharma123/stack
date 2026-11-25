@@ -96,7 +96,8 @@ output (mise's answer when no release matches) is an error, not a version.
   --reassign-ports` gives every assigned service a new port, never one the checkout gives up,
   even when the old one is free at that moment). Projects
   may pin ports in `[override.services]`; pins are checked against other projects'
-  reservations. Service defaults (5432, 6379) are never used. Before starting,
+  reservations, and a pin added on a port Stack had given another service of the same checkout
+  takes it at the next compile (that service is assigned another). Service defaults (5432, 6379) are never used. Before starting,
   `up` checks every assigned port: one that accepts connections without a running or starting
   supervisor daemon of that service behind it is a `port_conflict`, naming the service, the port
   and, when `lsof` or `/proc` can say, the holding process. The hint is `--reassign-ports` for
