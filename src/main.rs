@@ -433,12 +433,10 @@ fn command_from_args() -> String {
 /// before `--` that names one and is not the value of a global option (`-C logs`, `--dir status`
 /// and `-qC down` name a directory, whatever it is called).
 fn subcommand_in(words: &[String]) -> Option<usize> {
+    let words = before_separator(words);
     let names: Vec<String> = Cli::command().get_subcommands().map(|s| s.get_name().to_string()).collect();
     let mut at = 0;
     while let Some(word) = words.get(at).map(String::as_str) {
-        if word == "--" {
-            return None;
-        }
         if names.iter().any(|n| n == word) {
             return Some(at);
         }
@@ -447,6 +445,10 @@ fn subcommand_in(words: &[String]) -> Option<usize> {
         at += if word == "--dir" || short_dir { 2 } else { 1 };
     }
     None
+}
+
+fn before_separator(words: &[String]) -> &[String] {
+    &words[..words.iter().position(|word| word == "--").unwrap_or(words.len())]
 }
 
 fn main() -> ExitCode {
@@ -1372,15 +1374,15 @@ fn project_spelling(words: &[String]) -> Option<StackError> {
     const FLEET: [&str; 4] = ["logs", "status", "down", "ps"];
     // The subcommand: the first word naming one (`exec ls logs` runs `ls`, it is not `logs`),
     // past the directory `-C` names.
+    let words = before_separator(words);
     let at = subcommand_in(words)?;
-    let words: Vec<&str> = words.iter().map(String::as_str).take_while(|w| *w != "--").collect();
-    let cmd = words[at];
+    let cmd = words[at].as_str();
     if !FLEET.contains(&cmd) {
         return None;
     }
     let rest = &words[at + 1..];
-    let i = rest.iter().position(|w| *w == "--project")?;
-    let path = *rest.get(i + 1)?;
+    let i = rest.iter().position(|w| w == "--project")?;
+    let path = rest.get(i + 1)?;
     let path_like = path.contains('/') || path == "." || path == "..";
     if path.starts_with('-') || (cmd == "logs" && !path_like) {
         return None;
@@ -1561,6 +1563,15 @@ mod tests {
         assert_eq!(subcommand_in(&words(&["-C", "logs", "exec", "x"])), Some(2));
         assert_eq!(subcommand_in(&words(&["--dir", "run", "--json", "up"])), Some(3));
         assert_eq!(subcommand_in(&words(&["-C"])), None);
+        for args in [
+            &["-C", "--", "logs"][..],
+            &["--dir", "--", "status", "--json"],
+            &["-qC", "--", "ps"],
+            &["--json", "-C", "--", "logs"],
+        ] {
+            assert_eq!(subcommand_in(&words(args)), None, "{args:?}");
+            assert!(refused(args).is_none(), "{args:?}");
+        }
     }
 
     #[test]
