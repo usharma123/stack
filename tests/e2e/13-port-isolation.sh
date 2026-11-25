@@ -120,3 +120,8 @@ stack down --json >"$T/down-portP1.json"
 assert_json '.ok and .data.confirmed' "$T/down-portP1.json"
 # shellcheck disable=SC2046
 assert_dead $(recorded_pids "$T/up-portP1.json")
+
+echo "gc reclaims the deleted checkout's records, and nothing of a checkout still there"
+# Later scenarios (3-leases) expect a machine-wide gc to find nothing of this one.
+stack gc --json >"$T/gc-ports.json"
+assert_json '.ok and (.data | length == 1) and (.data[0].project | endswith("/portP2")) and .data[0].reason == "project directory deleted"' "$T/gc-ports.json"
