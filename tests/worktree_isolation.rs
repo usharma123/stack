@@ -6,6 +6,8 @@
 
 use serde_json::Value;
 use std::ffi::OsString;
+use std::io::{Read, Seek};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -69,7 +71,9 @@ fn require_installs() -> Option<PathBuf> {
 
 impl Fleet {
     fn stack(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(stack_bin())
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        let mut child = Command::new(stack_bin())
             .args(["-C", dir.to_str().unwrap()])
             .args(args)
             .env("STACK_STATE_DIR", self.dir.path().join("state"))
@@ -79,8 +83,38 @@ impl Fleet {
             .env_remove("DATABASE_URL")
             .env_remove("REDIS_URL")
             .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // A descendant can inherit a capture pipe on macOS during concurrent spawns, keeping
+        // `Command::output` blocked even after the CLI exits. Files need no writer to close.
+        let timeout = Duration::from_secs(if args.contains(&"up") { 150 } else { 90 });
+        let started = Instant::now();
+        let (status, timed_out) = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break (status, false);
+            }
+            if started.elapsed() >= timeout {
+                // SAFETY: this is our still-unreaped child, which leads its own process group.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.kill();
+                break (child.wait().unwrap(), true);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let read = |file: &mut std::fs::File| {
+            let mut bytes = Vec::new();
+            file.rewind().unwrap();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        };
+        let out = Output { status, stdout: read(&mut stdout), stderr: read(&mut stderr) };
+        if timed_out {
+            eprintln!("{} {args:?} timed out after {timeout:?}\nstdout: {}\nstderr: {}", dir.display(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        }
+        out
     }
 
     /// `--json <args>` in `dir`, which must succeed; its `data`.
