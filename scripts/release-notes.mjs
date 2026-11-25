@@ -123,6 +123,15 @@ function githubGenerateNotes({ tag, previous }) {
   }
 }
 
+/** `name=value` lines for GITHUB_OUTPUT, each value one line, so none can add another output. */
+export function outputLines(outputs) {
+  return Object.entries(outputs).map(([name, value]) => {
+    assert.match(name, /^[a-z][a-z0-9-]*$/, `Invalid output name ${name}`);
+    assert.ok(!/[\r\n]/.test(String(value)), `Output ${name} spans lines`);
+    return `${name}=${value}\n`;
+  }).join('');
+}
+
 function main() {
   assert.equal(process.argv.length, 4, 'Usage: node scripts/release-notes.mjs <tarball> <out-dir>');
   const [, , tarball, outDir] = process.argv;
@@ -139,10 +148,11 @@ function main() {
     generateNotes: githubGenerateNotes,
   });
   if (process.env.GITHUB_OUTPUT) {
-    appendFileSync(
-      process.env.GITHUB_OUTPUT,
-      `title=Stack ${tag}\nprerelease=${prepared.prerelease}\nasset=${prepared.assetPath}\nsums=${prepared.sumsPath}\nnotes=${prepared.notesPath}\n`
-    );
+    assert.equal(typeof prepared.prerelease, 'boolean');
+    appendFileSync(process.env.GITHUB_OUTPUT, outputLines({
+      title: `Stack ${tag}`, prerelease: prepared.prerelease,
+      asset: prepared.assetPath, sums: prepared.sumsPath, notes: prepared.notesPath,
+    }));
   }
   console.log(`Prepared GitHub release assets for ${tag} (${prepared.usedCurated ? 'curated' : 'generated'} notes, sha256=${prepared.sha256})`);
 }

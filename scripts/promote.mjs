@@ -18,6 +18,8 @@ export function selectRun(runs, commit, tag) {
   assert.ok(run, 'No eligible CI run exists for the tagged commit; run main CI or dispatch CI on the release tag');
   assert.ok(run.status === 'completed' && run.conclusion === 'success',
     'The latest eligible CI run for this commit must finish successfully before releasing');
+  // Written to GITHUB_OUTPUT and passed to download-artifact: a positive integer, nothing else.
+  assert.ok(Number.isSafeInteger(run.id) && run.id > 0, 'Invalid run ID');
   return run;
 }
 
