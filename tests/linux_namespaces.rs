@@ -13,7 +13,9 @@
 //! Nothing is mounted on the host: the checks run in this test binary re-run under `unshare` in a
 //! user, mount (private propagation) and PID namespace of their own, as the root of that user
 //! namespace only. Where unprivileged namespaces are unavailable the test says SKIPPED and passes,
-//! unless `STACK_REQUIRE_LINUX_NAMESPACES` is set, when that fails it.
+//! unless `STACK_REQUIRE_LINUX_NAMESPACES` is set, when that fails it; so does, then, a kernel
+//! without unique mount ids, under which the remount case could not be checked. Each `unshare`
+//! runs with `--kill-child`, so stopping it at the bound also ends the PID namespace inside.
 
 use stack::checkout::{self, Presence, Recorded};
 use stack::datadirs::{self, Entry, Found};
@@ -30,13 +32,21 @@ const OWNER: &str = "STACK_NAMESPACE_OWNER";
 const OWNER_IDENTITY: &str = "STACK_NAMESPACE_OWNER_IDENTITY";
 /// What the checks print once all have passed, which the outer test requires.
 const PASSED: &str = "namespace checks passed:";
+/// Set when every check must run; the re-run under `unshare` inherits it.
+const REQUIRED: &str = "STACK_REQUIRE_LINUX_NAMESPACES";
+/// What the checks print when the kernel gives no unique mount ids to check the remount case by.
+const NO_UNIQUE_IDS: &str = "no unique mount ids on this kernel";
+/// How each `unshare` is run: its own user (root only in it), mount (private propagation) and
+/// PID namespace with its own `/proc`, its forked child killed when `unshare` itself is.
+const UNSHARE: [&str; 9] = ["--user", "--map-root-user", "--mount", "--propagation", "private", "--pid", "--fork", "--kill-child", "--mount-proc"];
 const BOUND: Duration = Duration::from_secs(120);
 
 fn on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-/// `command`'s exit status and output, killed once it has run for [`BOUND`].
+/// `command`'s exit status and output, killed once it has run for [`BOUND`] (with `--kill-child`,
+/// an `unshare` killed takes its PID namespace with it).
 fn bounded(mut command: Command) -> (Option<i32>, String) {
     let dir = tempfile::tempdir().unwrap();
     let (out, err) = (dir.path().join("out"), dir.path().join("err"));
@@ -64,9 +74,9 @@ fn bounded(mut command: Command) -> (Option<i32>, String) {
 
 #[test]
 fn real_bind_mounts_and_pid_namespaces_are_judged_as_the_kernel_reports_them() {
-    let required = std::env::var_os("STACK_REQUIRE_LINUX_NAMESPACES").is_some();
+    let required = std::env::var_os(REQUIRED).is_some();
     let skip = |why: String| {
-        assert!(!required, "STACK_REQUIRE_LINUX_NAMESPACES is set, but {why}");
+        assert!(!required, "{REQUIRED} is set, but {why}");
         eprintln!("SKIPPED (the namespace checks did not run): {why}");
     };
     let Some(unshare) = on_path("unshare") else { return skip("there is no unshare on PATH".into()) };
@@ -76,7 +86,7 @@ fn real_bind_mounts_and_pid_namespaces_are_judged_as_the_kernel_reports_them() {
     // Whether this machine lets an unprivileged process mount in namespaces of its own (Ubuntu
     // 24.04 restricts it with AppArmor's `apparmor_restrict_unprivileged_userns`).
     let mut probe = Command::new(&unshare);
-    probe.args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--pid", "--fork", "--mount-proc", "sh", "-c"]);
+    probe.args(UNSHARE).args(["sh", "-c"]);
     probe.arg(r#"mkdir "$1/probe-a" "$1/probe-b" && mount --bind "$1/probe-a" "$1/probe-b" && umount "$1/probe-b""#).arg("sh").arg(&base);
     let (status, output) = bounded(probe);
     if status != Some(0) {
@@ -93,7 +103,7 @@ fn real_bind_mounts_and_pid_namespaces_are_judged_as_the_kernel_reports_them() {
     assert!(identity.pid_ns.is_some() && identity.started.is_some(), "this process cannot be observed: {identity:?}");
     let mut inside = Command::new(&unshare);
     inside
-        .args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--pid", "--fork", "--mount-proc"])
+        .args(UNSHARE)
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", "inside_namespaces", "--ignored", "--nocapture", "--test-threads=1"])
         .env(INSIDE, &base)
@@ -103,6 +113,7 @@ fn real_bind_mounts_and_pid_namespaces_are_judged_as_the_kernel_reports_them() {
     eprintln!("{output}");
     assert_eq!(status, Some(0), "the checks inside the namespaces failed (exit {status:?}; none if stopped after {BOUND:?})");
     assert!(output.contains("test result: ok. 1 passed") && output.contains(PASSED), "the checks did not report passing");
+    assert!(!(required && output.contains(NO_UNIQUE_IDS)), "{REQUIRED} is set, but the remount case was not checked");
 }
 
 /// Mount `source` on `target` (a bind mount), in this process's own mount namespace.
@@ -168,7 +179,8 @@ fn same_device_directory_bind_mount(base: &Path) {
         let why = unknown(checkout::presence(&wt, &recorded));
         assert!(why.contains("another mount id"), "{why}");
     } else {
-        println!("no unique mount ids on this kernel: the remount case was not checked");
+        assert!(std::env::var_os(REQUIRED).is_none(), "{REQUIRED} is set, but there are {NO_UNIQUE_IDS} to check the remount case by");
+        println!("{NO_UNIQUE_IDS}: the remount case was not checked");
     }
     unmount(&repos);
 }
