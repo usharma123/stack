@@ -17,7 +17,7 @@ What Stack checked when it planned a command, not what stays true afterwards. A 
 | `ReportedEndpointsAreGiven` | An endpoint `status` reports for a ready service is what a command planned in the same state gets. | People and agents copy an address commands do not use. |
 | `ReportedEndpointsAreOwn` | A reported endpoint names the service's own port. | Another instance's address is shown as this service's. |
 | `ReportsCarryNoCredentials` | No report carries a password (URL user information, `?password=`, libpq `password=`). | A credential lands in logs, JSON output or an agent's context. |
-| `UpVerifiedMeansChecked` | `up` records a launch as verified only once every service passed a real check during it. | A later command trusts a launch nobody verified. |
+| `UpVerifiedMeansChecked` | `up` records a launch as verified only once every service passed a real check during it, of the very process the record names. | A later command trusts a launch, or a process, nobody verified. |
 | `NoCheckAnsweredBySibling` | No service's identity question is answered by another service of the same checkout. | Two Postgres or Redis services share one `DATABASE_URL`/`REDIS_URL`; one can never verify. |
 
 ## Action table (src/ at the sync commit)
