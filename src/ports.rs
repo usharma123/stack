@@ -517,9 +517,11 @@ mod tests {
         use std::collections::{BTreeMap, BTreeSet};
         // SAFETY: geteuid has no preconditions.
         let can_refuse = unsafe { libc::geteuid() } != 0;
-        let ephemeral = RANGE_START..=RANGE_END - 8;
-        let window: Vec<u16> = (RANGE_END - 7..=RANGE_END).collect();
-        let pin = RANGE_END - 4;
+        // Outgoing connections may take all but the bottom eight ports (the top ones are left to
+        // `ports_come_from_outside_the_ports_outgoing_connections_take`, which runs alongside).
+        let ephemeral = RANGE_START + 8..=RANGE_END;
+        let window: Vec<u16> = (RANGE_START..RANGE_START + 8).collect();
+        let pin = RANGE_START + 3;
         let wanted = |c: usize| match c {
             0 => requests(&[("web", None), ("db", None)]),
             1 => requests(&[("web", None), ("db", Some(pin))]),
@@ -685,7 +687,11 @@ mod tests {
                     let (state, start) = (&state, &start);
                     scope.spawn(move || {
                         start.wait();
-                        (0..5).map(|round| assign(state, root, &requests(&[("web", None), ("db", None)]), round == 2).unwrap()).last().unwrap()
+                        let mut last = IndexMap::new();
+                        for round in 0..5 {
+                            last = assign(state, root, &requests(&[("web", None), ("db", None)]), round == 2).unwrap();
+                        }
+                        last
                     })
                 })
                 .collect();

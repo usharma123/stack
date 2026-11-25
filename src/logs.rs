@@ -368,8 +368,7 @@ pub fn follow(ctx: &Ctx, q: &Query, interval: Duration) -> Result<()> {
                 continue;
             }
             // Every line since the last read, in as many reads as a burst takes.
-            loop {
-                let Ok(step) = poll(&dir, name, pos.get(name).copied(), from * 1000) else { break };
+            while let Ok(step) = poll(&dir, name, pos.get(name).copied(), from * 1000) {
                 if let Some(gap) = step.gap {
                     eprintln!("# {name}: some output was {} before it could be read", if gap == supervisor::Gap::Truncated { "truncated" } else { "rotated away" });
                 }
@@ -627,17 +626,20 @@ mod tests {
     /// Where a reader got to, as the oracle sees it: a file (generation) and how many of its
     /// records it took; every record it took, and every one gone before it could.
     struct Reader {
-        at: (u32, usize),
+        at: At,
         took: Vec<usize>,
         lost: std::collections::BTreeSet<usize>,
     }
 
+    /// A position as the oracle keeps it: a file generation and how many of its records were taken.
+    type At = (u32, usize);
+
     impl Reader {
         /// What a read from here can return: the gap it must report, the records after the
         /// cursor (each with the position just after it), and where a read of all of them ends.
-        fn plan(&self, w: &Writer) -> (Option<supervisor::Gap>, Vec<(usize, (u32, usize))>, (u32, usize)) {
-            let current = |from: usize| -> Vec<(usize, (u32, usize))> { (from..w.current.len()).map(|i| (w.current[i], (w.current_gen, i + 1))).collect() };
-            let older = |from: usize| -> Vec<(usize, (u32, usize))> { (from..w.older.len()).map(|i| (w.older[i], (w.older_gen.unwrap(), i + 1))).collect() };
+        fn plan(&self, w: &Writer) -> (Option<supervisor::Gap>, Vec<(usize, At)>, At) {
+            let current = |from: usize| -> Vec<(usize, At)> { (from..w.current.len()).map(|i| (w.current[i], (w.current_gen, i + 1))).collect() };
+            let older = |from: usize| -> Vec<(usize, At)> { (from..w.older.len()).map(|i| (w.older[i], (w.older_gen.unwrap(), i + 1))).collect() };
             let end = if w.current_exists { (w.current_gen, w.current.len()) } else { (w.older_gen.unwrap(), w.older.len()) };
             let (gen, count) = self.at;
             if w.current_exists && gen == w.current_gen {
