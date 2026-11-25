@@ -12,11 +12,12 @@ export GIT_CONFIG_GLOBAL="$T/stack-e2e-gitconfig"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_json() { jq -e "$1" "$2" >/dev/null || fail "JSON assertion $1 in $2"; }
+# The command's output goes to a file, not a command substitution: bash 3.2 runs the ERR trap
+# for a function's failing return inside one (as `within` returns), even under `if`.
 expect_error() {
-  local code="$1"; shift
-  local output
-  if output=$("$@"); then fail "expected $code, command succeeded: $*"; fi
-  printf '%s\n' "$output" | jq -e --arg code "$code" '.ok == false and .error.code == $code' >/dev/null || fail "expected $code: $output"
+  local code="$1" output="$T/expect-error.out"; shift
+  if "$@" >"$output"; then fail "expected $code, command succeeded: $*"; fi
+  jq -e --arg code "$code" '.ok == false and .error.code == $code' "$output" >/dev/null || fail "expected $code: $(cat "$output")"
 }
 # In-place edit that behaves the same with GNU and BSD userlands.
 edit() { perl -pi -e "$1" "$2"; }

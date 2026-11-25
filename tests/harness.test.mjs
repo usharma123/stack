@@ -98,6 +98,11 @@ test('within and eventually stop a stalled client, show the diagnosis and fail w
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, 'status 3\n');
 
+    // A refusal run under `within` is checked quietly: no ERR-trap report from its failing return.
+    result = probe(`expect_error usage within 5 sh -c 'echo "{\\"ok\\":false,\\"error\\":{\\"code\\":\\"usage\\"}}"; exit 2'`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, '');
+
     // Whatever way a scenario ends, what it tracked is stopped, and its exit status kept.
     const tracked = path.join(dir, 'tracked.pids');
     result = probe(`${stalled.replace(pids, tracked)} & track $!; track_pids ${tracked}; sleep 0.5; exit 7`);
