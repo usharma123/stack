@@ -1270,9 +1270,10 @@ fn header_generation(bytes: &[u8]) -> Option<u128> {
 /// A new file's generation: 128 random bits, so no two files of a log (nor a file and the one a
 /// recycled inode held before) share one, whatever crashes, restarts or clocks did between them.
 fn new_generation() -> u128 {
+    // `/dev/urandom` on every platform Stack builds for (glibc, musl, macOS), where libc's
+    // `getentropy` is not declared for all of them.
     let mut bytes = [0u8; 16];
-    // SAFETY: getentropy fills the buffer it is given, of at most 256 bytes.
-    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0 {
+    if fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_ok() {
         return u128::from_le_bytes(bytes);
     }
     // No entropy to be had (never seen): what this process has made distinct, hashed.
