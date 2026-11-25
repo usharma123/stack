@@ -212,7 +212,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/evidence/smoke" "$RUNNER_TEMP/evidence/scenarios"
       # Before any mise is installed: the smoke's PATH holds none, and its setup must install one.
       - name: Clean-machine smoke (setup, doctor, compile --locked, up, exec and run, down)
-        timeout-minutes: 20
+        # Leave room for the command watchdog and a subsequent bounded down on failure.
+        timeout-minutes: 25
         run: bash tests/e2e/clean-machine.sh dist-bin/stack
         env:
           STACK_SMOKE_EVIDENCE: ${{ runner.temp }}/evidence/smoke
