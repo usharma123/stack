@@ -9,6 +9,9 @@
 # Scenario 5 needs an OCI registry: set STACK_E2E_REGISTRY=host:port, otherwise it is skipped
 # and reported as skipped. Results: one line per scenario on stdout and $STACK_E2E_RESULTS.
 # STACK_E2E_EVIDENCE can name an existing directory outside the fixture for JSON, JSONL, and .out files.
+# On exit every fixture checkout is brought down; STACK_E2E_CLEANUP_SECONDS (default 60) bounds
+# each command that does so. One that stalls is stopped, its output shown and kept in the work
+# directory, and the run fails.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 binary="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -46,13 +49,48 @@ export STACK_E2E_EXAMPLES="$root/examples" STACK_E2E_SRV="$work/srv" STACK_E2E_W
   STACK_E2E_TMP="$work/t" STACK_E2E_BIN="$work/bin" STACK_E2E_ASSERT="$root/tests/e2e/assert.sh"
 export MISE_YES=1
 results=${STACK_E2E_RESULTS:-$work/results.jsonl}
+cleanup_seconds=${STACK_E2E_CLEANUP_SECONDS:-60}
+# bounded OUTPUT COMMAND...: run COMMAND with its output in the file OUTPUT and return its
+# status. If it is still running after $cleanup_seconds, stop it (TERM, then KILL two seconds
+# later), print the end of OUTPUT and return 124. It signals COMMAND only while this shell has
+# not collected its exit, so never a process that took the PID after COMMAND ended.
+# shellcheck disable=SC2329 # Invoked by cleanup, below.
+running() { jobs -r -p | grep -qx "$1"; }
+# shellcheck disable=SC2329
+bounded() {
+  local output=$1 pid tenths=0
+  shift
+  "$@" </dev/null >"$output" 2>&1 &
+  pid=$!
+  while running "$pid"; do
+    if [ "$tenths" -ge $((cleanup_seconds * 10)) ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for ((tenths = 0; tenths < 20; tenths++)); do
+        running "$pid" || break
+        sleep 0.1
+      done
+      if running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+      wait "$pid" 2>/dev/null || true
+      echo "cleanup: still running after ${cleanup_seconds}s, stopped: $*" >&2
+      echo "--- $output" >&2
+      tail -c 2000 "$output" >&2 || true
+      return 124
+    fi
+    sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  wait "$pid"
+}
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 cleanup() {
   status=$?
-  for app in "$work"/w/*/; do
-    [ -f "$app/stack.toml" ] && "$binary" -C "$app" down --json >/dev/null 2>&1 || true
-  done
   local supervisor app
+  # A command that fails is ignored, as before; one that stalls fails the run.
+  for app in "$work"/w/*/; do
+    [ -f "$app/stack.toml" ] || continue
+    bounded "$work/cleanup-down-$(basename "$app").out" "$binary" -C "$app" down --json \
+      || if [ $? -eq 124 ]; then status=1; fi
+  done
   supervisor=
   for app in "$work"/w/*/; do
     [ -f "$app/stack.toml" ] || continue
@@ -62,7 +100,9 @@ cleanup() {
   # its explicit state directory: `mise exec` would evaluate project env again while choosing
   # the supervisor to stop.
   case "$supervisor" in
-    "$work"/*) PITCHFORK_STATE_DIR="$work/pf" "$supervisor" supervisor stop >/dev/null 2>&1 || true ;;
+    "$work"/*)
+      bounded "$work/cleanup-pitchfork.out" env PITCHFORK_STATE_DIR="$work/pf" "$supervisor" supervisor stop \
+        || if [ $? -eq 124 ]; then status=1; fi ;;
   esac
   if [ "$status" -eq 0 ] && [ -z "${STACK_E2E_KEEP:-}" ]; then rm -rf "$work"; else echo "work dir kept: $work" >&2; fi
   exit "$status"

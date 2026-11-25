@@ -10,15 +10,16 @@ source "${STACK_E2E_ASSERT:-/tmp/stack-e2e-assert.sh}"
 # what runs. Every wait is bounded: a server that never finishes is stopped and fails the
 # scenario with what it answered and which commands ran, and every command a call started
 # records its PID so none outlives the scenario. STACK_E2E_MCP_SECONDS (default 60) bounds each
-# server, STACK_E2E_WAIT_SECONDS (default 15) each wait for a command or the signal's effect.
-limit=${STACK_E2E_MCP_SECONDS:-60} waits=${STACK_E2E_WAIT_SECONDS:-15}
+# server, STACK_E2E_WAIT_SECONDS (default 15) each wait for a command or the signal's effect, and
+# STACK_E2E_SETUP_SECONDS (default 600) each compile and install.
+limit=${STACK_E2E_MCP_SECONDS:-60} waits=${STACK_E2E_WAIT_SECONDS:-15} setup=${STACK_E2E_SETUP_SECONDS:-600}
 for app in appM appN; do
   mkdir -p "$W/$app"
   cd "$W/$app" || exit 1
   git init -q
   printf '[tools]\npython = "3.13"\n' >stack.toml
-  stack compile >/dev/null
-  stack install >/dev/null
+  within "$setup" stack compile >/dev/null
+  within "$setup" stack install >/dev/null
 done
 order="$T/mcp-order" started="$T/mcp-pids"
 : >"$order"
@@ -33,12 +34,12 @@ diagnose() {
 }
 # call ID APP SCRIPT: a stack_exec request running SCRIPT in APP, which first records its PID.
 call() {
-  jq -nc --argjson id "$1" --arg dir "$W/$2" --arg script "echo \$\$ >>$started; $3" \
+  jq -nc --argjson id "$1" --arg dir "$W/$2" --arg script "$(record_pid "$started"); $3" \
     '{jsonrpc: "2.0", id: $id, method: "tools/call", params: {name: "stack_exec", arguments: {dir: $dir, command: ["sh", "-c", $script]}}}'
 }
 note() { printf 'echo %s >>%s' "$1" "$order"; }
 # nap SECONDS: a sleep that records its PID too, so it is stopped even if its shell is not.
-nap() { printf 'sleep %s & echo $! >>%s; wait $!' "$1" "$started"; }
+nap() { printf 'sleep %s & %s; wait $!' "$1" "$(record_pid "$started" '$!')"; }
 
 echo 'Calls accepted before input ends are each answered once, in per-checkout order'
 {
@@ -76,9 +77,9 @@ call 2 appM "$(note started); $(nap 30); $(note finished)" >&3
 call 3 appM "$(note waiter)" >&3
 eventually "$waits" 'the first call started' grep -qx started "$order"
 kill -TERM "$server"
-server_ended() { ! kill -0 "$server" 2>/dev/null; }
+server_ended() { ! alive "$server" "$(tracked "$server")"; }
 eventually "$waits" 'the server ended after the signal' server_ended
-wait "$server" || true
+stop_child "$server"
 exec 3>&-
 jq -se 'map(.id) | sort == [1, 2]' "$T/mcp-signal.out" >/dev/null || fail "after the signal: $(cat "$T/mcp-signal.out")"
 ! grep -qx waiter "$order" || fail 'a waiting call ran after the signal'

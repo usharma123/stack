@@ -9,8 +9,9 @@ source "${STACK_E2E_ASSERT:-/tmp/stack-e2e-assert.sh}"
 # `--project` spelling, against a service that writes what it is asked to. Every client call is
 # bounded: one that stalls is stopped and fails the scenario with the log and reads so far.
 # STACK_E2E_CALL_SECONDS (default 30) bounds each call, STACK_E2E_WAIT_SECONDS (default 15) each
-# wait for lines to arrive.
-calls=${STACK_E2E_CALL_SECONDS:-30} waits=${STACK_E2E_WAIT_SECONDS:-15}
+# wait for lines to arrive, and STACK_E2E_SETUP_SECONDS (default 600) each compile, up and down,
+# which may install tools.
+calls=${STACK_E2E_CALL_SECONDS:-30} waits=${STACK_E2E_WAIT_SECONDS:-15} setup=${STACK_E2E_SETUP_SECONDS:-600}
 diagnose() {
   local file
   for file in "$T"/logs-*.json "$T"/follow.out "$T"/follow.err; do
@@ -52,8 +53,8 @@ ready_cmd = "curl -fsS http://127.0.0.1:\$PORT/ >/dev/null"
 [tasks.args]
 run = "printf '[%s]'"
 EOF
-stack compile >/dev/null
-stack up --json >"$T/up-appQ.json"
+within "$setup" stack compile >/dev/null
+within "$setup" stack up --json >"$T/up-appQ.json"
 assert_json '.ok and all(.data.checks[]; .ready)' "$T/up-appQ.json"
 port=$(checked talk port "$T/up-appQ.json")
 log="$(jq -r '.provider.state_dir' .stack/session.json)/logs/talk.log"
@@ -132,9 +133,8 @@ sleep 1.5
 say same 3
 say end 1
 eventually "$waits" '--follow printed the new lines' grep -qx end "$T/follow.out"
-kill -0 "$follower" 2>/dev/null || fail "--follow ended by itself: $(cat "$T/follow.err")"
-kill "$follower" 2>/dev/null || true
-wait "$follower" 2>/dev/null || true
+alive "$follower" "$(tracked "$follower")" || fail "--follow ended by itself: $(cat "$T/follow.err")"
+stop_child "$follower"
 [[ "$(tail -n +2 "$T/follow.out" | tr '\n' ' ')" == 'same same same end ' ]] || fail "follow printed: $(cat "$T/follow.out")"
 
 echo '--project takes a path only as --project=PATH; a word after a space is a service'
@@ -150,11 +150,11 @@ mkdir -p "$W/logs"
 cd "$W/logs" || exit 1
 git init -q
 printf '[tools]\npython = "3.13"\n' >stack.toml
-stack compile >/dev/null
+within "$setup" stack compile >/dev/null
 cd "$W" || exit 1
 out=$(within "$calls" stack -C logs exec printf '%s|' --project ./x)
 [[ "$out" == '--project|./x|' ]] || fail "exec in a checkout named logs: $out"
 
 cd "$W/appQ" || exit 1
-stack down --json >"$T/down-appQ.json"
+within "$setup" stack down --json >"$T/down-appQ.json"
 assert_json '.ok and .data.confirmed' "$T/down-appQ.json"
