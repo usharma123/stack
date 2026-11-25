@@ -70,7 +70,7 @@ assert_json '.ok and .data.exit_code == 0 and .data.stdout == "[a]"' "$T/run-jso
 
 echo 'A cursor read returns each new line once, repeats included, with its stamp'
 logs --json --cursor "" >"$T/logs-begin.json"
-assert_json '.ok and (.data.cursor | startswith("v1;"))' "$T/logs-begin.json"
+assert_json '.ok and (.data.cursor | startswith("v2;"))' "$T/logs-begin.json"
 cursor=$(jq -r '.data.cursor' "$T/logs-begin.json")
 say same 3
 # read_on WANT: read on from $cursor until WANT lines came (the supervisor writes them a moment
