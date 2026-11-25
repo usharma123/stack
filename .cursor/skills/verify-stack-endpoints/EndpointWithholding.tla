@@ -40,6 +40,7 @@ VARIABLES
     phase,        \* "idle" or "verifying" (up's verification loop)
     upCaller,     \* the environment `up` runs with
     kept,         \* up's kept checks: a service that passed is not checked again
+    keptPid,      \* the process each kept check saw (what the final record stores)
     keptTrue,     \* history: what each kept check's service really was when it passed
     holding,      \* history: a command was given the service's checked endpoint and may still run
     commands, events,
@@ -52,12 +53,12 @@ VARIABLES
     upUnchecked,         \* history: up recorded success for a service that never passed a real check
     siblingAnswered      \* history: a service's check was answered by another service of this checkout
 
-vars == <<dup, secret, cfg, session, pid, listener, phase, upCaller, kept, keptTrue, holding,
+vars == <<dup, secret, cfg, session, pid, listener, phase, upCaller, kept, keptPid, keptTrue, holding,
           commands, events, uncheckedReach, requiredUnverified, listWrong, reportedNotGiven,
           reportedForeign, reportedCredential, upUnchecked, siblingAnswered>>
 flags == <<uncheckedReach, requiredUnverified, listWrong, reportedNotGiven, reportedForeign,
            reportedCredential, upUnchecked, siblingAnswered>>
-upVars == <<phase, upCaller, kept, keptTrue>>
+upVars == <<phase, upCaller, kept, keptPid, keptTrue>>
 
 Svcs == IF dup THEN All ELSE {"pg", "rd"}
 
@@ -69,7 +70,7 @@ Init ==
     /\ pid = NoPid
     /\ listener = [s \in All |-> "none"]
     /\ phase = "idle" /\ upCaller = "clean"
-    /\ kept = [s \in All |-> FALSE] /\ keptTrue = [s \in All |-> FALSE]
+    /\ kept = [s \in All |-> FALSE] /\ keptPid = NoPid /\ keptTrue = [s \in All |-> FALSE]
     /\ holding = [s \in All |-> FALSE]
     /\ commands = Commands /\ events = Events
     /\ uncheckedReach = FALSE /\ requiredUnverified = FALSE /\ listWrong = FALSE
@@ -224,9 +225,13 @@ Masked == secret = "userinfo" \/ ~Fault("NaiveMask")
 
 Begin == phase = "idle" /\ commands > 0 /\ commands' = commands - 1 /\ Compiles
 
-\* up_within: compile, record the launch (launching: true) naming every service, start what is
-\* not running this configuration (28ffb43: nothing again when all run unchanged), recording the
-\* processes seen. A service whose port another program holds cannot bind and exits.
+\* up_within: compile; unless the session is this configuration's completed launch (`unverified`
+\* false), record a new launch (launching: true) naming every service; start what is not running
+\* (28ffb43: nothing again when all run unchanged), recording the processes seen. Over a completed
+\* launch of this configuration no launch record is written: a service that died is started
+\* again while the record keeps launching: false and the processes it named, so until up
+\* finishes (or if it fails) the new process is not the recorded one (ProcessChanged). A service
+\* whose port another program holds cannot bind and exits.
 UpBegin(c) ==
     /\ Begin
     /\ LET current == session.on /\ session.gen = cfg /\ ~session.launching
@@ -236,9 +241,10 @@ UpBegin(c) ==
                                     ELSE pid[s] + 1]
        IN /\ pid' = newPid
           /\ listener' = [s \in All |-> IF start(s) /\ listener[s] # "other" THEN "mine" ELSE listener[s]]
-          /\ session' = [on |-> TRUE, gen |-> cfg, launching |-> TRUE, pid |-> newPid]
+          /\ session' = IF current THEN session
+                        ELSE [on |-> TRUE, gen |-> cfg, launching |-> TRUE, pid |-> newPid]
     /\ phase' = "verifying" /\ upCaller' = c
-    /\ kept' = [s \in All |-> FALSE] /\ keptTrue' = [s \in All |-> FALSE]
+    /\ kept' = [s \in All |-> FALSE] /\ keptPid' = NoPid /\ keptTrue' = [s \in All |-> FALSE]
     /\ UNCHANGED <<dup, secret, cfg, holding, events, flags>>
 
 \* Whose server answered s's identity question, when it is another service of this checkout.
@@ -249,6 +255,7 @@ Sibling(s, c) == Server(ProbeTarget(s, c)) \in Svcs \ {s}
 UpCheck(s) ==
     /\ phase = "verifying" /\ s \in Svcs /\ ~kept[s]
     /\ kept' = [kept EXCEPT ![s] = VerifyOne(s, upCaller)]
+    /\ keptPid' = [keptPid EXCEPT ![s] = pid[s]]
     /\ keptTrue' = [keptTrue EXCEPT ![s] = pid[s] # 0 /\ Server(RealTarget(s, upCaller)) = s]
     /\ siblingAnswered' = (siblingAnswered \/ Sibling(s, upCaller))
     /\ UNCHANGED <<dup, secret, cfg, session, pid, listener, phase, upCaller, holding, commands,
@@ -260,18 +267,23 @@ UpCheck(s) ==
 UpFails ==
     /\ phase = "verifying"
     /\ phase' = "idle"
-    /\ UNCHANGED <<dup, secret, cfg, session, pid, listener, upCaller, kept, keptTrue, holding,
-                   commands, events, flags>>
+    /\ UNCHANGED <<dup, secret, cfg, session, pid, listener, upCaller, kept, keptPid, keptTrue,
+                   holding, commands, events, flags>>
 
-\* Every service kept and none exited: the final record (launching: false) with the processes
-\* the last listing showed.
+\* Every service kept: the final record (launching: false) names, for each service, the process
+\* its kept check saw (record_of(check)). exited_on_start looks at each pass's listing before
+\* that pass's checks, so a kept service that dies after the last listing is still recorded; the
+\* next plan's check finds it gone. (RecordListedPid, the description this model had before:
+\* the processes of the last listing are recorded instead, which differs only when a process is
+\* replaced inside the window, i.e. under SupervisorRetries.)
 UpFinish ==
     /\ phase = "verifying"
-    /\ \A s \in Svcs : kept[s] /\ pid[s] # 0
-    /\ session' = [session EXCEPT !.launching = FALSE, !.pid = pid]
+    /\ \A s \in Svcs : kept[s]
+    /\ LET recorded == IF Fault("RecordListedPid") THEN pid ELSE keptPid
+       IN /\ session' = [session EXCEPT !.launching = FALSE, !.pid = recorded]
+          /\ upUnchecked' = (upUnchecked \/ \E s \in Svcs : ~keptTrue[s] \/ recorded[s] # keptPid[s])
     /\ phase' = "idle"
-    /\ upUnchecked' = (upUnchecked \/ \E s \in Svcs : ~keptTrue[s])
-    /\ UNCHANGED <<dup, secret, cfg, pid, listener, upCaller, kept, keptTrue, holding, commands,
+    /\ UNCHANGED <<dup, secret, cfg, pid, listener, upCaller, kept, keptPid, keptTrue, holding, commands,
                    events, uncheckedReach, requiredUnverified, listWrong, reportedNotGiven,
                    reportedForeign, reportedCredential, siblingAnswered>>
 
@@ -324,10 +336,12 @@ PortTaken(s) ==
 
 \* A process replaced outside this checkout's lifecycle commands (an older Stack, someone using
 \* the supervisor directly): the same server and data, a process the record does not name.
-\* Never inside up's window: the supervisor starts only on a request (retries is 0), and the
-\* project lock keeps other Stack commands out while up runs.
+\* Never inside up's window: the supervisor starts a service only on a request (session.rs gives
+\* every ServiceSpec retries: 0), and the project lock keeps other Stack commands out while up
+\* runs. SupervisorRetries drops that assumption, as a supervisor restarting on its own would.
 Respawn(s) ==
-    /\ Event /\ phase = "idle" /\ s \in Svcs /\ pid[s] # 0 /\ listener[s] = "mine"
+    /\ Event /\ (phase = "idle" \/ Fault("SupervisorRetries")) /\ s \in Svcs /\ pid[s] # 0
+    /\ listener[s] = "mine"
     /\ pid' = [pid EXCEPT ![s] = @ + 1]
     /\ UNCHANGED <<dup, secret, cfg, session, listener, upVars, holding, commands, flags>>
 
@@ -381,7 +395,8 @@ ReportedEndpointsAreOwn == ~reportedForeign
 \* No report carries a password.
 ReportsCarryNoCredentials == ~reportedCredential
 
-\* `up` records a launch as verified only when every service passed a real check during it.
+\* `up` records a launch as verified only when every service passed a real check during it, of
+\* the very process it records.
 UpVerifiedMeansChecked == ~upUnchecked
 
 \* No service's identity question is answered by another service of the same checkout: each has

@@ -1362,6 +1362,69 @@ fn a_verified_service_is_withheld_once_its_launch_evidence_is_lost() {
     check("configuration changed", false, Some("config_changed"));
 }
 
+/// `up` over this configuration's verified launch writes no launch record (EndpointWithholding's
+/// partial launch): a service that died is started again while the record stays `launching:
+/// false` and names the process that died, so a failed `up` leaves the new process withheld
+/// (`process_changed`). The next `up` that verifies it records the process its check saw.
+#[test]
+fn an_up_that_restarts_a_dead_service_of_a_verified_launch_records_only_the_process_its_check_saw() {
+    let fixture = Fixture::with_bundle(WEB);
+    supervise_listener(&fixture, assigned_port(&fixture, "web"));
+    fixture.ok(&["up", "--json"]);
+    let recorded = |when: &str| {
+        let pids: Vec<(bool, u64)> = fixture
+            .session_paths()
+            .iter()
+            .map(|p| {
+                let record: Value = serde_json::from_slice(&fs::read(p).unwrap()).unwrap();
+                (record["launching"].as_bool().unwrap_or(false), record["services"]["web"]["pid"].as_u64().unwrap())
+            })
+            .collect();
+        assert!(pids.windows(2).all(|w| w[0] == w[1]), "{when}: {pids:?}");
+        pids[0]
+    };
+    let tracked = || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(pid) = fs::read_to_string(fixture.dir.path().join("pf-tracked-pid")).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the service never recorded its pid");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let first = tracked();
+    assert_eq!(recorded("verified"), (false, first));
+
+    // The service dies, and the process the next `up` starts again listens only after its
+    // deadline: that `up` fails.
+    fs::remove_file(fixture.dir.path().join("pf-tracked-pid")).unwrap();
+    unsafe { libc::kill(first as i32, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(first as u32) {
+        assert!(Instant::now() < deadline, "the service never died");
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(fixture.dir.path().join("slow-start"), "4").unwrap();
+    let out = fixture.command(&["up", "--timeout", "2s", "--json"]).output().unwrap();
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(recorded("after the failed up"), (false, first), "no launch record, and the dead process still named");
+
+    // Serving now, the new process is still not the launch's: withheld.
+    let second = tracked();
+    assert_ne!(second, first);
+    let status = json_result(&fixture.command(&["status", "--json"]).output().unwrap());
+    assert_eq!(status["data"]["checks"][0]["ready"], false, "{status}");
+    assert_eq!(status["data"]["checks"][0]["reason_code"], "process_changed", "{status}");
+
+    let up = json_result(&fixture.ok(&["up", "--json"]));
+    assert_eq!(up["data"]["checks"][0]["pid"], second, "{up}");
+    assert_eq!(recorded("verified again"), (false, second), "the process the check saw");
+    let status = json_result(&fixture.ok(&["status", "--json"]));
+    assert_eq!(status["data"]["checks"][0]["ready"], true, "{status}");
+    fixture.ok(&["down"]);
+}
+
 /// Counts connections to a TCP port and a Unix socket that a libpq client would use for it,
 /// closing each at once so the client fails fast.
 /// Each named variable's raw bytes as the command saw them, or `None` when unset.
