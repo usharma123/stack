@@ -251,24 +251,35 @@ fn reserved(reg: &Registry) -> Vec<(PathBuf, String, u16, crate::checkout::Recor
 }
 
 /// Give `services` of `project` new ports (after another program took theirs), keeping its
-/// other reservations. The old port stays reserved while the new one is chosen, so it is never
-/// picked again. Returns `(service, old, new)` for each service that had a reservation.
+/// other reservations. No service is given a port any of them gave up, nor one reserved; either
+/// every service moves or (no free port for one) none does. Returns `(service, old, new)` for
+/// each service that had a reservation.
 pub fn reassign(state: &Path, project: &Path, services: &[String]) -> Result<Vec<(String, u16, u16)>> {
+    reassign_outside(state, project, services, &ephemeral())
+}
+
+fn reassign_outside(state: &Path, project: &Path, services: &[String], ephemeral: &RangeInclusive<u16>) -> Result<Vec<(String, u16, u16)>> {
     let (file, lock) = paths(state);
     let _guard = FileLock::acquire(&lock)?;
     let mut reg: Registry = read_json(&file)?;
-    let ephemeral = ephemeral();
+    // Every port these services give up stays excluded until each has its new one: once one
+    // service has moved, its old port is no longer reserved, and the program that held it may
+    // have let it go (it binds again), but no other service of the move is given it.
+    let surrendered: Vec<u16> = reg.reservations.iter().filter(|r| r.project == project && services.contains(&r.service)).map(|r| r.port).collect();
     let mut moved = Vec::new();
     for service in services {
         let mine = |r: &Reservation| r.project == project && &r.service == service;
         let Some(old) = reg.reservations.iter().find(|r| mine(r)).map(|r| r.port) else { continue };
-        let new = find_free(&reg, project, service, &ephemeral, &[])?;
+        let new = find_free(&reg, project, service, ephemeral, &surrendered)?;
         let project_at = reg.reservations.iter().find(|r| mine(r)).map_or_else(|| crate::checkout::Recorded::of(project), |r| crate::checkout::Recorded::adopted(project, &r.project_at));
         reg.reservations.retain(|r| !mine(r));
         reg.reservations.push(Reservation { port: new, project: project.to_path_buf(), service: service.clone(), project_at });
         moved.push((service.clone(), old, new));
     }
-    write_json(&file, &reg)?;
+    // Nothing failed: every move is written at once (a failure above writes none of them).
+    if !moved.is_empty() {
+        write_json(&file, &reg)?;
+    }
     Ok(moved)
 }
 
@@ -470,6 +481,41 @@ mod tests {
         }
     }
 
+    /// `up --reassign-ports` moving several services: no service is given a port another of them
+    /// gave up, though nothing holds it once its service has moved; with no fresh port for one,
+    /// none moves.
+    #[test]
+    fn up_reassigning_several_services_never_gives_one_a_port_another_gave_up() {
+        // Outgoing connections may take all but the 20 lowest ports (above the eight the seeded
+        // test uses), and another checkout holds the lowest `blocked` of those.
+        let ephemeral = RANGE_START + 20..=RANGE_END;
+        let services = vec!["web".to_string(), "db".to_string()];
+        for blocked in [17, 16] {
+            let (state, project, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (state, project) = (state.path(), project.path());
+            let held = (RANGE_START..RANGE_START + blocked)
+                .map(|port| Reservation { port, project: other.path().to_path_buf(), service: format!("s{port}"), project_at: Default::default() })
+                .collect();
+            write_json(&paths(state).0, &Registry { reservations: held }).unwrap();
+            let before = assign_outside(state, project, &requests(&[("web", None), ("db", None)]), false, &ephemeral).unwrap();
+            let registry = std::fs::read(paths(state).0).unwrap();
+            match reassign_outside(state, project, &services, &ephemeral) {
+                // Three ports free of the other checkout: one left for two services.
+                Err(e) if blocked == 17 => {
+                    assert_eq!(e.code, "ports_exhausted", "{}", e.message);
+                    assert_eq!(std::fs::read(paths(state).0).unwrap(), registry, "a failed move changed the registry");
+                }
+                Ok(moved) if blocked == 16 => {
+                    let new: Vec<u16> = moved.iter().map(|(_, _, new)| *new).collect();
+                    assert_eq!(moved.iter().map(|(s, old, _)| (s.as_str(), *old)).collect::<Vec<_>>(), [("web", before["web"]), ("db", before["db"])]);
+                    assert!(new.iter().all(|p| !before.values().any(|old| old == p)) && new[0] != new[1], "{before:?} -> {moved:?}");
+                    assert_eq!(lookup(state, project).unwrap(), IndexMap::from([("web".to_string(), new[0]), ("db".to_string(), new[1])]));
+                }
+                other => panic!("{blocked} blocked: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn ports_come_from_outside_the_ports_outgoing_connections_take() {
         let (state, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -552,13 +598,14 @@ mod tests {
     }
 
     /// Every registry operation (compile with and without `--reassign-ports`, `up
-    /// --reassign-ports`, `down --purge`, `gc`), interleaved across three
+    /// --reassign-ports` of one service or two, `down --purge`, `gc`), interleaved across three
     /// checkouts in a seeded order, with a foreign listener coming and going, a checkout going out
     /// of reach and back, one deleted, and one whose pin is configured and removed again (its
     /// services coming in either order). After every step the real registry keeps what the port
     /// model (verify-stack-ports-mcp) promises: one reservation per port, and each checkout still
     /// there (out of reach or not) keeps exactly the ports it was last given; each assignment
-    /// reuses a port (unless its own checkout now pins it), or (reassigning) never gives one back, never takes a pinned port another checkout holds, never one a
+    /// reuses a port (unless its own checkout now pins it), or (reassigning) never gives back any
+    /// port the checkout gave up, never takes a pinned port another checkout holds, never one a
     /// foreign program listens on, and never one outgoing connections may take; a pin fails only
     /// on another checkout's reservation; a failed assignment changes nothing; a deleted
     /// checkout's ports are released by the next compile or `gc`. Only eight ports are free, so
@@ -672,19 +719,31 @@ mod tests {
                             }
                         }
                     }
-                    // `up --reassign-ports` after a conflict: only a service Stack assigned.
+                    // `up --reassign-ports` after a conflict: only services Stack assigned, one
+                    // or (checkout 0) both at once.
                     4 if usable => {
-                        let service = if c == 0 && rng.below(2) == 0 { "db" } else { "web" };
-                        let moved = reassign(&state, &roots[c], &[service.to_string()]).unwrap();
-                        match (moved.as_slice(), given[c].get(service).copied()) {
-                            ([(_, old, new)], Some(had)) => {
-                                assert_eq!(*old, had, "{ctx}");
-                                assert!(*new != had && !before.iter().any(|(_, _, p)| p == new), "{ctx}: moved {service} onto {new}");
-                                given[c].insert(service.to_string(), *new);
-                                seen.insert("up reassign");
+                        let services: Vec<String> = match (c, rng.below(3)) {
+                            (0, 0) => vec!["db".into()],
+                            (0, 1) => vec!["db".into(), "web".into()],
+                            _ => vec!["web".into()],
+                        };
+                        let had: Vec<(String, u16)> = services.iter().filter_map(|s| Some((s.clone(), *given[c].get(s)?))).collect();
+                        match reassign_outside(&state, &roots[c], &services, &ephemeral) {
+                            Ok(moved) => {
+                                assert_eq!(moved.iter().map(|(s, old, _)| (s.clone(), *old)).collect::<Vec<_>>(), had, "{ctx}");
+                                for (service, _, new) in &moved {
+                                    assert!(!ephemeral.contains(new) && !before.iter().any(|(_, _, p)| p == new), "{ctx}: moved {service} onto {new}, given up or reserved: {had:?}");
+                                    given[c].insert(service.clone(), *new);
+                                }
+                                if !moved.is_empty() {
+                                    seen.insert(if moved.len() > 1 { "up reassign of two" } else { "up reassign" });
+                                }
                             }
-                            ([], None) => {}
-                            (moved, had) => panic!("{ctx}: moved {moved:?}, had {had:?}"),
+                            Err(e) => {
+                                assert_eq!(e.code, "ports_exhausted", "{ctx}: {}", e.message);
+                                assert_eq!(registry(), before, "{ctx}: a failed move changed the registry");
+                                seen.insert("up reassign exhausted");
+                            }
                         }
                     }
                     5 if usable => {
@@ -749,6 +808,7 @@ mod tests {
             "pin over own reservation, pinned first",
             "pin over own reservation, pinned last",
             "up reassign",
+            "up reassign of two",
             "replaced in the ephemeral range",
             "deleted",
             "released",
