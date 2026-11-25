@@ -810,13 +810,22 @@ fn an_unreadable_orphan_is_not_seen_and_never_signalled() {
     let script = format!("/bin/sleep 60 >/dev/null 2>&1 & echo $! > '{}'", pidfile.display());
     fixture.ok(&["exec", "--", "/bin/sh", "-c", &script]);
     let orphan = reaper.pid(pid_in(&pidfile));
-    if stack::procinfo::environ_has(orphan, "STACK_COMMAND_MARK", &stack::checkout::command_mark(&fixture.path("app")).unwrap()) == Some(true) {
-        eprintln!("skipping: this machine shows /bin/sleep's environment");
-        return;
+    // The shell can report its background child's PID before that child execs sleep.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !stack::procinfo::named(orphan).is_some_and(|process| process.comm == "sleep") {
+        assert!(Instant::now() < deadline, "{orphan} never became /bin/sleep");
+        thread::sleep(Duration::from_millis(10));
     }
+    let mark = stack::checkout::command_mark(&fixture.path("app")).unwrap();
+    let visible = stack::procinfo::environ_has(orphan, stack::checkout::COMMAND_VAR, &mark) == Some(true);
     let (code, down) = fixture.json(&["down"]);
-    assert_confirmed(code, &down);
-    assert!(alive(orphan), "down signalled a process it could not see");
+    if visible {
+        assert_unconfirmed(code, &down);
+        assert_eq!(naming(&down["error"]["details"], orphan)["found_by"], "mark", "{down}");
+    } else {
+        assert_confirmed(code, &down);
+    }
+    assert!(alive(orphan), "down signalled the orphan");
 }
 
 /// A leftover process of this checkout's service (its token, its port, leading its group, no
