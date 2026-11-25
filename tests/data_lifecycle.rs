@@ -656,15 +656,24 @@ fn an_interrupted_restore_is_finished_only_with_every_service_it_covers_stopped(
     assert!(!fresh.exists() && !f.journal("A").exists());
     assert_eq!(f.ok(&a, &["status"])["healthy"], true);
     f.ok(&a, &["restart", "db"]);
-    f.ok(&a, &["down"]);
 
-    // A journaled service stack.toml no longer defines is checked all the same: not running, so
-    // the restore is finished.
+    // A journaled service stack.toml no longer defines is checked all the same. Still running,
+    // it cannot be stopped from here: the save is refused before anything stops or any data is
+    // touched (SnapshotAtomicity's StopRefused).
     fs::write(a.join("stack.toml"), STACK).unwrap();
     git(&a, &["commit", "-qam", "drop cache"]);
     f.ok(&a, &["compile"]);
     fs::create_dir(&fresh).unwrap();
     fs::write(f.journal("A"), journal("cache", &cache)).unwrap();
+    let refused = f.json(&a, &["snapshot", "save", "after", "--service", "db"]);
+    assert_eq!(refused["error"]["code"], "stop_unconfirmed", "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("no data was touched"), "{refused}");
+    assert!(f.journal("A").exists() && fresh.exists(), "the restore is left as it was");
+    assert_eq!(ino(&cache), before);
+    assert_eq!(f.json(&a, &["snapshot", "list"])["data"]["snapshots"].as_array().unwrap().iter().filter(|s| s["name"] == "after").count(), 0, "nothing saved");
+
+    // Not running, the restore is finished.
+    f.ok(&a, &["down"]);
     let saved = f.ok(&a, &["snapshot", "save", "after", "--service", "db"]);
     let copy = saved["steps"].as_array().unwrap().iter().find(|s| s["step"] == "copy").unwrap_or_else(|| panic!("{saved}"));
     assert_eq!(copy["detail"]["interrupted_restore"]["interrupted_restore"], "rolled_back", "{saved}");

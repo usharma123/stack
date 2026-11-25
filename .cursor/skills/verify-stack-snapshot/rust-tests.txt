@@ -1,4 +1,5 @@
-# Rust library tests that exercise the real functions behind SnapshotAtomicity's transitions (see SKILL.md).
+# Rust tests that exercise the real functions behind SnapshotAtomicity's transitions (see SKILL.md).
+# Library tests by path; integration tests as `tests/<crate>.rs <name>`.
 snapshot::tests::a_forced_save_replaces_the_published_generation_whole
 snapshot::tests::a_save_interrupted_between_its_renames_keeps_the_old_generation_readable_and_recovers_it
 snapshot::tests::recovery_takes_the_newest_valid_generation_and_ignores_invalid_ones
@@ -17,3 +18,6 @@ snapshot::tests::a_committed_restore_is_recorded_only_while_its_copies_checkout_
 snapshot::tests::recording_a_committed_restore_can_be_interrupted_anywhere_and_finished
 snapshot::tests::an_interrupted_restore_is_finished_only_with_every_service_it_names_confirmed_stopped
 snapshot::tests::restored_data_carries_the_init_state_it_was_saved_with
+snapshot::tests::readers_racing_forced_saves_without_an_exchange_always_find_a_generation
+snapshot::tests::a_reader_that_finds_neither_the_name_nor_a_generation_set_aside_reads_the_name_again
+tests/data_lifecycle.rs an_interrupted_restore_is_finished_only_with_every_service_it_covers_stopped
