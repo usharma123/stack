@@ -32,6 +32,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use ureq::http::{Request, Response, StatusCode, Uri};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use url::Url;
 
 pub const ARTIFACT_TYPE: &str = "application/vnd.stack.bundle.v1";
@@ -206,13 +209,14 @@ impl Default for Client {
 
 impl Client {
     fn with_resolver(resolver: Resolver) -> Self {
+        // Handle redirects explicitly so they cannot carry auth to another origin.
+        let config = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .proxy(None)
+            .build();
         Self {
-            // Redirects are handled explicitly so they cannot carry auth to another origin.
-            agent: ureq::AgentBuilder::new()
-                .redirects(0)
-                .timeout(REQUEST_TIMEOUT)
-                .resolver(resolver)
-                .build(),
+            agent: ureq::Agent::with_parts(config, DefaultConnector::default(), resolver),
             token: RefCell::new(None),
             credential_origin: RefCell::new(None),
         }
@@ -234,10 +238,33 @@ struct Resolver {
     max: usize,
 }
 
-impl ureq::Resolver for Resolver {
-    // ureq calls this on the requesting thread, whose deadline it therefore sees.
-    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
-        self.resolve_within(netloc, crate::process::bounded(REQUEST_TIMEOUT))
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolver").field("max", &self.max).finish_non_exhaustive()
+    }
+}
+
+impl ureq::unversioned::resolver::Resolver for Resolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        _config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let netloc = uri.scheme().zip(uri.authority())
+            .and_then(|(scheme, authority)| DefaultResolver::host_and_port(scheme, authority))
+            .ok_or(ureq::Error::HostNotFound)?;
+        let addresses = self.resolve_within(&netloc, *timeout.after)?;
+        let mut resolved = self.empty();
+        for address in addresses {
+            if resolved.try_push(address).is_err() {
+                break;
+            }
+        }
+        if resolved.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(resolved)
     }
 }
 
@@ -401,13 +428,12 @@ fn basic(user: &str, pass: &str) -> String {
     out
 }
 
-/// `req` bounded by REQUEST_TIMEOUT and by the caller's deadline, if any (as within `stack up`):
-/// host lookup, connection, and reading the response body all end by then.
-fn bounded(req: ureq::Request) -> Result<ureq::Request> {
+/// Bound DNS, connection and response body reads by the caller's remaining time.
+fn request_timeout(method: &str) -> Result<Duration> {
     if crate::process::expired() {
-        return Err(StackError::new("timed_out", format!("the deadline passed before a registry {} request", req.method())));
+        return Err(StackError::new("timed_out", format!("the deadline passed before a registry {method} request")));
     }
-    Ok(req.timeout(crate::process::bounded(REQUEST_TIMEOUT)))
+    Ok(crate::process::bounded(REQUEST_TIMEOUT))
 }
 
 /// A failed request to a token service at `realm`, said by its origin alone: the realm (its
@@ -416,7 +442,7 @@ fn bounded(req: ureq::Request) -> Result<ureq::Request> {
 fn auth_err(realm: &Url, registry: &str, e: ureq::Error) -> StackError {
     let at = realm.origin().ascii_serialization();
     match e {
-        ureq::Error::Status(code, _) => {
+        ureq::Error::StatusCode(code) => {
             let mut err = StackError::new(
                 if code == 401 || code == 403 { "oci_unauthorized" } else { "oci_failed" },
                 format!("authenticate at the token service {at}: HTTP {code}"),
@@ -428,43 +454,44 @@ fn auth_err(realm: &Url, registry: &str, e: ureq::Error) -> StackError {
             }
             err
         }
-        // Its kind and the underlying I/O error (a lookup or connection naming the host and
-        // port at most), never the URL ureq attaches.
-        ureq::Error::Transport(t) => {
-            let cause = std::error::Error::source(&t).map(|c| format!(" ({c})")).unwrap_or_default();
-            StackError::new("oci_unreachable", format!("authenticate at the token service {at}: {}{cause}", t.kind()))
+        // Report transport failures without displaying the URL or the underlying error.
+        other => {
+            let reason = match other {
+                ureq::Error::Io(e) if e.kind() == io::ErrorKind::TimedOut => "request did not finish in time".into(),
+                ureq::Error::Io(e) => e.kind().to_string(),
+                ureq::Error::Timeout(_) => "request timed out".into(),
+                ureq::Error::HostNotFound => "host not found".into(),
+                _ => "HTTP transport error".into(),
+            };
+            StackError::new("oci_unreachable", format!("authenticate at the token service {at}: {reason}"))
         }
     }
 }
 
-/// `registry` is the origin whose credentials would apply, named in the hint for 401 and 403.
-fn oci_err(context: &str, registry: &str, e: ureq::Error) -> StackError {
-    match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let code_name = if code == 404 {
-                "oci_not_found"
-            } else if code == 401 || code == 403 {
-                "oci_unauthorized"
-            } else {
-                "oci_failed"
-            };
-            let mut err = StackError::new(
-                code_name,
-                format!(
-                    "{context}: HTTP {code} {}",
-                    body.chars().take(200).collect::<String>()
-                ),
-            );
-            if code == 401 || code == 403 {
-                err = err.hint(format!(
-                    "if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}; credentials are sent only to that origin"
-                ));
-            }
-            err
-        }
-        other => StackError::new("oci_unreachable", format!("{context}: {other}")),
+fn oci_status_err(context: &str, registry: &str, mut resp: Response<ureq::Body>) -> StackError {
+    let code = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    let code_name = if code == 404 {
+        "oci_not_found"
+    } else if code == 401 || code == 403 {
+        "oci_unauthorized"
+    } else {
+        "oci_failed"
+    };
+    let mut err = StackError::new(
+        code_name,
+        format!("{context}: HTTP {code} {}", body.chars().take(200).collect::<String>()),
+    );
+    if code == 401 || code == 403 {
+        err = err.hint(format!(
+            "if you trust {registry}, set STACK_OCI_USERNAME and STACK_OCI_PASSWORD for it with STACK_OCI_REGISTRY={registry}; credentials are sent only to that origin"
+        ));
     }
+    err
+}
+
+fn response_header<'a>(resp: &'a Response<ureq::Body>, name: &str) -> Option<&'a str> {
+    resp.headers().get(name)?.to_str().ok()
 }
 
 impl Client {
@@ -475,7 +502,7 @@ impl Client {
         url: &str,
         accept: Option<&str>,
         body: Option<(&[u8], &str)>,
-    ) -> Result<ureq::Response> {
+    ) -> Result<Response<ureq::Body>> {
         let mut target = parse_url(url)?;
         let origin = target.origin().ascii_serialization();
         let registry = self
@@ -488,35 +515,41 @@ impl Client {
         loop {
             validate_transport(&target, &registry)?;
             let target_origin = target.origin().ascii_serialization();
-            let mut req = bounded(self.agent.request(method, target.as_str()))?;
+            let timeout = request_timeout(method)?;
+            let mut req = Request::builder().method(method).uri(target.as_str());
             if let Some(a) = accept {
-                req = req.set("Accept", a);
+                req = req.header("Accept", a);
             }
             if let Some((origin, token)) = self.token.borrow().as_ref() {
                 if origin == &target_origin {
-                    req = req.set("Authorization", token);
+                    req = req.header("Authorization", token.as_str());
                 }
             }
-            let response = match body {
-                Some((bytes, ct)) => req.set("Content-Type", ct).send_bytes(bytes),
-                None => req.call(),
-            };
-            let resp = match response {
-                Err(ureq::Error::Status(401, resp)) if !challenged => {
-                    let challenge = resp.header("WWW-Authenticate").unwrap_or_default();
-                    self.authenticate(challenge, &target, &registry)?;
-                    challenged = true;
-                    continue;
-                }
-                Err(e) => return Err(oci_err(&format!("{method} {}", target.as_str()), &registry, e)),
-                Ok(resp) => resp,
-            };
-            if [301, 302, 303, 307, 308].contains(&resp.status()) {
+            if let Some((_, ct)) = body {
+                req = req.header("Content-Type", ct);
+            }
+            let context = || format!("{method} {}", target.as_str());
+            let req = req.body(()).map_err(|e| StackError::new("oci_failed", format!("{}: {e}", context())))?;
+            let req = self.agent.configure_request(req).timeout_global(Some(timeout)).build();
+            let resp = match body {
+                Some((bytes, _)) => self.agent.run(req.map(|()| bytes)),
+                None => self.agent.run(req),
+            }.map_err(|e| StackError::new("oci_unreachable", format!("{}: {e}", context())))?;
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED && !challenged {
+                let challenge = response_header(&resp, "WWW-Authenticate").unwrap_or_default();
+                self.authenticate(challenge, &target, &registry)?;
+                challenged = true;
+                continue;
+            }
+            if status.is_client_error() || status.is_server_error() {
+                return Err(oci_status_err(&context(), &registry, resp));
+            }
+            if [301, 302, 303, 307, 308].contains(&status.as_u16()) {
                 if redirects == 5 {
                     return Err(StackError::new("oci_failed", "too many registry redirects"));
                 }
-                let location = resp
-                    .header("Location")
+                let location = response_header(&resp, "Location")
                     .ok_or_else(|| StackError::new("oci_failed", "redirect has no location"))?;
                 target = target
                     .join(location)
@@ -565,18 +598,23 @@ impl Client {
                     .hint("approve the registry's token service origin in STACK_OCI_AUTH_REALMS (comma-separated origins)"));
             }
             let grant = credentials.grant(registry)?;
-            let mut req = bounded(self.agent.get(realm.as_str()))?;
+            let timeout = request_timeout("GET")?;
+            let mut token_url = realm.clone();
             for k in ["service", "scope"] {
                 if let Some(v) = field(k) {
-                    req = req.query(k, &v);
+                    token_url.query_pairs_mut().append_pair(k, &v);
                 }
             }
+            let mut req = self.agent.get(token_url.as_str()).config()
+                .timeout_global(Some(timeout))
+                .http_status_as_error(true)
+                .build();
             if let Grant::Credentials(u, p) = &grant {
-                req = req.set("Authorization", &basic(u, p));
+                req = req.header("Authorization", basic(u, p));
             }
             // Auth requests never follow redirects, even to another approved origin.
             let resp = req.call().map_err(|e| auth_err(&realm, registry, e))?;
-            if resp.status() != 200 {
+            if resp.status() != StatusCode::OK {
                 return Err(StackError::new(
                     "oci_auth_untrusted",
                     "token service redirected authentication",
@@ -614,9 +652,9 @@ impl Client {
         }
     }
 
-    fn read_limited(resp: ureq::Response) -> Result<Vec<u8>> {
+    fn read_limited(resp: Response<ureq::Body>) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        resp.into_reader()
+        resp.into_body().into_reader()
             .take(MAX_BLOB + 1)
             .read_to_end(&mut buf)
             .map_err(|e| io_error("registry response", e))?;
@@ -784,8 +822,7 @@ impl Client {
             None,
             Some((&[], "application/octet-stream")),
         )?;
-        let location = resp
-            .header("Location")
+        let location = response_header(&resp, "Location")
             .ok_or_else(|| StackError::new("oci_failed", "registry gave no upload location"))?;
         let start_url = parse_url(&start)?;
         let mut put = start_url
@@ -1267,7 +1304,7 @@ mod tests {
     #[test]
     fn token_service_failures_never_echo_the_realm_or_the_reply() {
         let realm = Url::parse("https://auth.example/realm-path/x?service=s&scope=dummy-scope").unwrap();
-        let status = ureq::Error::Status(403, ureq::Response::new(403, "Forbidden", "dummy-reply-body").unwrap());
+        let status = ureq::Error::StatusCode(403);
         let err = auth_err(&realm, "https://registry.example", status);
         assert_eq!(err.code, "oci_unauthorized");
         assert!(err.message.contains("https://auth.example") && err.message.contains("HTTP 403"), "{}", err.message);
@@ -2014,7 +2051,7 @@ mod tests {
             ("latest", 0, "did not finish in time"),
             ("auth", 1, "did not finish in time"),
             ("redirect", 1, "did not finish in time"),
-            ("body", 1, "timed out"),
+            ("body", 1, "timeout: global"),
         ] {
             let lookups = StalledLookups::new();
             let client = Client::with_resolver(lookups.resolver(answered, addr, MAX_LOOKUPS));
