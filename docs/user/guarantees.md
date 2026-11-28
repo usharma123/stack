@@ -108,6 +108,20 @@ the lease is kept and `owner_unknown` says
   calls, so a process that exits in between, and whose pid is handed to a new process in that
   instant, would receive the signal instead. A group is signalled by its number on macOS only
   right after its leader was checked again, with the same gap.
+- **A command cut short does nothing more, unless it left its session.** `exec` and `run`
+  with `--timeout`, `--json` or over MCP start the command in a session of its own. When
+  the deadline passes, the call is cancelled, or the grace after a passed-on signal ends, Stack
+  kills the command's process group and then every process still in that session, whatever
+  group it moved to, before it reports `timed_out`; a `mise run` task, which mise puts in a
+  group of its own, ends with the call. Only what was forked inside a session is in it, so
+  nothing else is signalled. A process that called `setsid` left the session and is not
+  stopped: a daemon, a service `stack up` started, a nested `stack run --timeout`'s command.
+  Nor is one Stack may not signal (another user's, after `sudo`); Stack looks for two seconds.
+  Linux signals each process through a pidfd opened before its session is read again, so it
+  reaches a process of the session or none, and a kernel without pidfds (before 5.3) gets only
+  the group signal. macOS signals each process's group by its number right after seeing the
+  process in the session, with the gap described under stopping. A command that ends by
+  itself in time keeps what it started outside its own group, as before.
 - **`down` confirms only what is gone.** `down` reports a checkout confirmed only once its
   services' processes are gone, their ports closed, and no command Stack started for it
   (`exec`, `run`, an MCP call) still runs, or could be shown to. `down` itself signals no such

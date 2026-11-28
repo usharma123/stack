@@ -234,7 +234,7 @@ and `duration_ms` how long the call took:
 installing comes out of the command's share. On the CLI they have no default; over MCP they
 default to 10 minutes, so an unattended call is always bounded. `up` and `restart` default to
 10 minutes everywhere. Over MCP, give either `timeout`, a duration like the CLI's (`"90s"`,
-`"5m"`), or `timeout_secs`, a whole number of seconds, but not both. When a deadline passes, Stack kills the command's process group and returns
+`"5m"`), or `timeout_secs`, a whole number of seconds, but not both. When a deadline passes, Stack kills the command and everything it started that is still in its session (see [guarantees](guarantees.md)) and returns
 `timed_out` (CLI exit 124), with the output so far in `error.details`.
 
 A runner that cancels Stack with SIGTERM (or SIGINT, SIGHUP) cancels the command: Stack passes

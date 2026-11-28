@@ -148,6 +148,21 @@ pub fn in_group(group: u32) -> Vec<Process> {
     imp::pids().into_iter().filter(|pid| *pid != me).filter_map(process).filter(|p| p.group == group).collect()
 }
 
+/// The session `pid` is in, or `None` when there is no such process. A session's number is its
+/// first process's PID, and a process joins one only by being forked inside it; `setsid` leaves.
+pub fn session(pid: u32) -> Option<u32> {
+    let pid = libc::pid_t::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: getsid only reads.
+    u32::try_from(unsafe { libc::getsid(pid) }).ok().filter(|s| *s > 0)
+}
+
+/// Every live process seen in `session` (other than this one). A zombie is no process.
+pub fn in_session(session: u32) -> Vec<Process> {
+    let me = std::process::id();
+    let within = |pid: u32| self::session(pid) == Some(session);
+    imp::pids().into_iter().filter(|pid| *pid != me && *pid > 1 && within(*pid)).filter_map(|pid| process(pid).filter(|_| within(pid))).collect()
+}
+
 /// This boot of the machine: the kernel's boot id on Linux (`/proc/sys/kernel/random/boot_id`),
 /// the boot session UUID on macOS (`kern.bootsessionuuid`). A process identity recorded in
 /// another boot names nothing that runs now.
