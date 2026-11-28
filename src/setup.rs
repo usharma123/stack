@@ -159,15 +159,17 @@ fn download(url: &str) -> Result<Vec<u8>> {
     let fail = |why: String| {
         StackError::new("setup_failed", format!("cannot download {url}: {why}")).hint(MISE_INSTALL_HINT)
     };
-    let resp = ureq::AgentBuilder::new()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .try_proxy_from_env(true)
-        .build()
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .max_redirects(5)
+        .build();
+    let resp = ureq::Agent::new_with_config(config)
         .get(url)
         .call()
         .map_err(|e| fail(e.to_string()))?;
     let mut buf = Vec::new();
-    resp.into_reader().take(MAX_ARCHIVE + 1).read_to_end(&mut buf).map_err(|e| fail(e.to_string()))?;
+    resp.into_body().into_reader().take(MAX_ARCHIVE + 1).read_to_end(&mut buf).map_err(|e| fail(e.to_string()))?;
     if buf.len() as u64 > MAX_ARCHIVE {
         return Err(fail("archive exceeds 256 MiB".into()));
     }

@@ -55,7 +55,6 @@ confidence-threshold = 0.93
 ignore = true
 
 [bans]
-# ureq's webpki-roots 0.26 re-exports 1.x: two versions, reported but not refused.
 multiple-versions = "warn"
 wildcards = "deny"
 
