@@ -193,7 +193,7 @@ fn largest_file(dir: &Path) -> PathBuf {
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         let meta = entry.metadata().unwrap();
-        if meta.is_file() && best.as_ref().map_or(true, |(size, _)| meta.len() > *size) {
+        if meta.is_file() && best.as_ref().is_none_or(|(size, _)| meta.len() > *size) {
             best = Some((meta.len(), entry.path()));
         }
     }

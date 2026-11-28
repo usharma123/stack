@@ -642,7 +642,7 @@ fn exec_up_and_run_up_never_start_a_session_that_lives_forever() {
     // `stack up` alone still records no lease; a stale session without one gets the default
     // when `run --up` starts it again.
     fixture.ok(&["up"]);
-    assert!(saved_session(&fixture).get("lease").map_or(true, Value::is_null), "{}", saved_session(&fixture));
+    assert!(saved_session(&fixture).get("lease").is_none_or(Value::is_null), "{}", saved_session(&fixture));
     fs::write(fixture.path("app/stack.toml"), "[[use]]\nbundle='path:../bundle'\n[env]\nMODE='changed'\n").unwrap();
     let result = json_result(&fixture.ok(&["--json", "run", "--up", "t"]));
     assert!(result["data"]["prepared"][0]["reason"].as_str().unwrap().contains("configuration changed"), "{result}");

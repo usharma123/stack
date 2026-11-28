@@ -697,7 +697,7 @@ mod tests {
                                         seen.insert("replaced in the ephemeral range");
                                     }
                                     if old != Some(*port) {
-                                        assert!(foreign.as_ref().map_or(true, |(f, _)| f != port), "{ctx}: {service} got the port a foreign program listens on");
+                                        assert!(foreign.as_ref().is_none_or(|(f, _)| f != port), "{ctx}: {service} got the port a foreign program listens on");
                                     }
                                 }
                                 given[c] = ports;

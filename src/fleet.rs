@@ -362,7 +362,7 @@ pub fn ps_with(state: &Path, sizes: bool, opts: &PsOptions) -> Result<PsReport> 
         }
         checkouts.push(checkout);
     }
-    let unstarted_wanted = opts.worktrees && opts.labels.is_empty() && opts.state.as_deref().map_or(true, |s| s == "unstarted");
+    let unstarted_wanted = opts.worktrees && opts.labels.is_empty() && opts.state.as_deref().is_none_or(|s| s == "unstarted");
     if unstarted_wanted {
         if let Some(base) = opts.project.as_deref().or(opts.cwd.as_deref()) {
             for path in unstarted_worktrees(base, &paths) {

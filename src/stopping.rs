@@ -361,7 +361,7 @@ fn stop_observing(strays: &[Stray], others: &[Process], rescan: Option<&dyn Fn()
         n
     };
     let gone = |processes: &[(Process, i32, Known)], remembered: &[Vec<Process>]| {
-        strays.iter().all(|s| s.port.map_or(true, |p| !accepting(p)))
+        strays.iter().all(|s| s.port.is_none_or(|p| !accepting(p)))
             && processes.iter().all(|(p, _, _)| p.current().is_none())
             && remembered.iter().flatten().all(|p| p.current().is_none())
     };

@@ -415,7 +415,7 @@ fn verify_some(
         .stack
         .services
         .iter()
-        .filter(|(name, _)| only.map_or(true, |only| only.contains(name)))
+        .filter(|(name, _)| only.is_none_or(|only| only.contains(name)))
         .map(|(name, entry)| (name, &entry.value))
         .collect();
     concurrently(&services, VERIFY_CONCURRENCY, check)
@@ -1434,7 +1434,7 @@ fn up_within(ctx: &Ctx, lease: LeaseOptions, opts: &UpOptions) -> Result<UpRepor
     if !report.stack.services.is_empty() {
         // Ownership is recorded before anything starts. If start or verification fails, or the
         // service is later removed from the configuration, `down` still knows what to reconcile.
-        let unverified = restart || previous.as_ref().map_or(true, |p| p.launching || !same_config(p, ctx, &report));
+        let unverified = restart || previous.as_ref().is_none_or(|p| p.launching || !same_config(p, ctx, &report));
         // Retrying an incomplete launch of this same generation stopped nothing, so whatever it
         // recorded (a process an interrupted `up` or `restart` observed) may still run. Those
         // identifiers are kept until observations replace them or `down` confirms them gone.
@@ -2086,7 +2086,7 @@ fn declared_ready(ctx: &Ctx, report: &Report, env: &IndexMap<String, String>, na
         return Some(run_ready_cmd(ctx, report, env, name, command).is_ok_and(|out| !out.timed_out && out.exit_code == Some(0)));
     }
     match service.preset.as_deref() {
-        Some("postgres" | "redis") | None => Some(service.ready_port.map_or(true, accepting)),
+        Some("postgres" | "redis") | None => Some(service.ready_port.is_none_or(accepting)),
         Some(_) => None,
     }
 }

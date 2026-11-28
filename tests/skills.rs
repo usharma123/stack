@@ -224,7 +224,7 @@ fn inspect_lists_the_skills_of_exactly_the_locked_releases() {
     // People can ask for the provider's too; they are listed apart. Stack adds no provider
     // tool any more (services are its own), so there are none.
     let all = f.json(&["inspect", "--all-skills"]);
-    assert!(all["data"]["provider_skills"].as_array().map_or(true, |a| a.is_empty()), "{all}");
+    assert!(all["data"]["provider_skills"].as_array().is_none_or(|a| a.is_empty()), "{all}");
     assert_eq!(statuses(&all["data"]["skills"]), EXPECTED);
 
     // compile --json reports them too.
@@ -410,7 +410,7 @@ fn mcp_lists_and_returns_skills_but_never_the_providers() {
     assert_eq!(statuses(&inspect["data"]["skills"]), EXPECTED);
     assert!(inspect["data"].get("provider_skills").is_none());
     let all = mcp.call("stack_inspect", json!({ "all_skills": true }));
-    assert!(all["data"]["provider_skills"].as_array().map_or(true, |a| a.is_empty()), "{all}");
+    assert!(all["data"]["provider_skills"].as_array().is_none_or(|a| a.is_empty()), "{all}");
 
     let text = mcp.call("stack_skill", json!({ "tool": "mbx", "name": "mbx-advanced" }));
     assert_eq!(text["ok"], true, "{text}");

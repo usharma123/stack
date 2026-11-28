@@ -812,7 +812,7 @@ fn an_unreadable_orphan_is_not_seen_and_never_signalled() {
     let orphan = reaper.pid(pid_in(&pidfile));
     // The shell can report its background child's PID before that child execs sleep.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !stack::procinfo::named(orphan).is_some_and(|process| process.comm == "sleep") {
+    while stack::procinfo::named(orphan).is_none_or(|process| process.comm != "sleep") {
         assert!(Instant::now() < deadline, "{orphan} never became /bin/sleep");
         thread::sleep(Duration::from_millis(10));
     }

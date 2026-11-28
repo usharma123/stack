@@ -363,7 +363,7 @@ fn concurrent_compiles_of_many_projects_in_one_repository_each_keep_their_files_
     for out in &outs {
         let result = json_result(out);
         assert_eq!(result["ok"], true, "{result}");
-        assert!(result["data"].get("warnings").map_or(true, |w| !w.to_string().contains("exclude")), "{result}");
+        assert!(result["data"].get("warnings").is_none_or(|w| !w.to_string().contains("exclude")), "{result}");
     }
     assert_eq!(fs::read_to_string(&exclude).unwrap(), mine);
     assert!(!top.join(".git/info/exclude.lock").exists());
@@ -556,7 +556,7 @@ fn hold_project_lock_once_executing(state: &Path, app: &Path, session_file: &Pat
     let (state, app, session_file) = (state.to_path_buf(), app.to_path_buf(), session_file.to_path_buf());
     thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+        while read_value(&session_file)["active_executions"].as_object().is_none_or(|e| e.is_empty()) {
             assert!(Instant::now() < deadline, "execution never registered");
             thread::sleep(Duration::from_millis(10));
         }
@@ -678,7 +678,7 @@ fn a_renewal_made_while_a_finished_command_waits_for_the_lock_is_kept() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+    while read_value(&session_file)["active_executions"].as_object().is_none_or(|e| e.is_empty()) {
         assert!(Instant::now() < deadline, "execution never registered");
         thread::sleep(Duration::from_millis(5));
     }
@@ -760,7 +760,7 @@ fn a_command_that_cannot_start_and_cannot_be_recorded_says_so_with_its_error() {
         let (state, app, index) = (state.clone(), app.clone(), index.clone());
         thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while read_value(&index)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+            while read_value(&index)["active_executions"].as_object().is_none_or(|e| e.is_empty()) {
                 assert!(Instant::now() < deadline, "execution never registered");
             }
             let _lock = stack::state::project_lock(&state, &app).unwrap();
@@ -845,7 +845,7 @@ fn a_finished_execution_is_settled_and_a_running_one_still_keeps_the_session_bus
     // Another process's command, still running.
     let mut running = fixture.command(&["exec", "--", "sleep", "4"]).stdout(Stdio::null()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while read_value(&session_file)["active_executions"].as_object().map_or(true, |e| e.is_empty()) {
+    while read_value(&session_file)["active_executions"].as_object().is_none_or(|e| e.is_empty()) {
         assert!(Instant::now() < deadline, "execution never registered");
         thread::sleep(Duration::from_millis(10));
     }
