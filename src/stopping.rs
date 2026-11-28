@@ -126,6 +126,29 @@ fn signal_process(p: &Process, sig: i32) -> Sent {
     if unsafe { libc::kill(p.pid as libc::pid_t, sig) } == 0 { Sent::Delivered } else { Sent::Gone }
 }
 
+/// Kill `p` while it is in `session`, a session only the caller's own command and what it
+/// started can be in (see [`crate::process`]'s deadline runs). On Linux through a pidfd opened
+/// before the session is read again: the descriptor names `p`, or what took its pid, and
+/// whichever holds the pid when it is read is in the session, so the signal reaches a process
+/// of the session or none; without pidfd support nothing is sent. On macOS `p`'s group is
+/// killed by its number right after `p` was seen again in the session with that group: a group
+/// never spans sessions, and its number, unlike a pid, goes to another process only once that
+/// process makes itself a group leader, so the gap between check and signal (see the module
+/// documentation) is narrower than for a pid.
+pub(crate) fn kill_in_session(p: &Process, session: u32) {
+    let within = || crate::procinfo::session(p.pid) == Some(session);
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(bound)) = Bound::open(p).map(|bound| bound.filter(|_| within())) {
+        bound.send(libc::SIGKILL);
+    }
+    #[cfg(not(target_os = "linux"))]
+    // Never 0 or 1 as a group: negated, those would address this group or every process.
+    if p.group > 1 && p.current().is_some_and(|now| now.group == p.group) && within() {
+        // SAFETY: kill only sends a signal, to the group just observed in the caller's session.
+        unsafe { libc::kill(-(p.group as libc::pid_t), libc::SIGKILL) };
+    }
+}
+
 /// Whether `top`, the recorded leader, is still the process observed and still leads `group`.
 fn leads(top: &Process, group: u32) -> bool {
     top.current().is_some_and(|now| now.group == group)

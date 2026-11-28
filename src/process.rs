@@ -496,16 +496,24 @@ struct OwnedChild {
     terminated: bool,
     /// Set once `terminate` reaped the child.
     status: Option<std::process::ExitStatus>,
+    /// The child leads a session of its own (see [`own_session`]) and has not ended by itself:
+    /// `terminate` ends that whole session, not only the child's group.
+    session: bool,
 }
 
 impl OwnedChild {
     fn new(child: Child) -> Self {
-        Self { child, terminated: false, status: None }
+        Self { child, terminated: false, status: None, session: false }
+    }
+
+    /// A child started by a command [`own_session`] prepared.
+    fn leading_session(child: Child) -> Self {
+        Self { child, terminated: false, status: None, session: true }
     }
 
     /// Kill the child's process group, then reap the child. Callers observe exit with
     /// `exited`, which does not reap: until this `wait`, the child's PID (and so its group
-    /// ID) cannot be reused, and the group signal cannot reach an unrelated process.
+    /// and session ID) cannot be reused, and the group signal cannot reach an unrelated process.
     fn terminate(&mut self) {
         if self.terminated {
             return;
@@ -517,6 +525,9 @@ impl OwnedChild {
             // Negative PID targets that owned group, including descendants that hold its pipes.
             unsafe {
                 libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+            }
+            if self.session {
+                end_session(self.child.id());
             }
         }
         let _ = self.child.kill();
@@ -540,6 +551,47 @@ impl OwnedChild {
         }
         self.terminated = true;
         self.status = self.child.wait().ok();
+    }
+}
+
+/// Start `command` as the leader of a new session (and so of a new process group), for a user's
+/// command stack may have to cut short. A process group is left with one `setpgid`, as `mise
+/// run` does for each task, and a group signal then misses the task; a session is left only
+/// with `setsid`, which a command calls to outlive what started it. So the session is what the
+/// command still runs in, and [`end_session`] ends it. Not combined with `process_group`: a
+/// group leader cannot start a session.
+#[cfg(unix)]
+fn own_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| if libc::setsid() < 0 { Err(io::Error::last_os_error()) } else { Ok(()) });
+    }
+}
+
+/// Longest [`end_session`] keeps looking for processes that are still there.
+#[cfg(unix)]
+const SESSION_END_LIMIT: Duration = Duration::from_secs(2);
+
+/// Kill every process in the session `leader` leads, whatever group each moved to, until none
+/// is left: one that forked as it was killed is found on the next look. For an unreaped child
+/// started by [`own_session`]: until it is reaped its PID names no other session, and only
+/// processes forked inside a session are in it, so everything found there descends from the
+/// command, and none of it chose to leave. Each signal is bound to a process seen in the
+/// session (see [`crate::stopping::kill_in_session`]). Gives up after [`SESSION_END_LIMIT`]: a
+/// process stack may not signal (another user's, after `sudo`) stays.
+#[cfg(unix)]
+fn end_session(leader: u32) {
+    let start = Instant::now();
+    loop {
+        let members = crate::procinfo::in_session(leader);
+        if members.is_empty() || start.elapsed() >= SESSION_END_LIMIT {
+            return;
+        }
+        for member in &members {
+            crate::stopping::kill_in_session(member, leader);
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -702,7 +754,10 @@ pub fn capture(command: &mut Command, timeout: Duration, limit: usize) -> io::Re
 ///
 /// Interrupt, terminate and hangup signals stack receives meanwhile are passed on to the
 /// command's group, and stack waits for it (see [`CANCEL_GRACE`]) instead of ending at once and
-/// leaving it running. Whatever is left in the group is killed once the command is done.
+/// leaving it running. Whatever is left in the group is killed once the command is done. The
+/// command leads a session of its own: when it is cut short (the timeout, a cancellation, the
+/// grace after a signal), everything still in that session is killed too, whatever group it
+/// moved to (see [`end_session`]); what called `setsid` to leave is not.
 #[cfg(unix)]
 pub fn capture_redacted(command: &mut Command, timeout: Duration, limit: usize, redactor: Option<&Redactor>) -> io::Result<Captured> {
     if redactor.is_some_and(|r| !r.conflicts.is_empty()) {
@@ -726,8 +781,15 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
     unsafe {
         command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
     }
-    let (mut child, passed) = match spawn_named(command, passing, false, spawn_piped) {
-        Ok((child, passed)) => (OwnedChild::new(child), passing.then_some(passed)),
+    // A user's command leads a session, ended with it when it is cut short.
+    let spawned = if passing {
+        own_session(command);
+        spawn_named(command, true, false, spawn_leading).map(|(child, passed)| (OwnedChild::leading_session(child), Some(passed)))
+    } else {
+        spawn_named(command, false, false, spawn_piped).map(|(child, _)| (OwnedChild::new(child), None))
+    };
+    let (mut child, passed) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             let _ = set_mask(libc::SIG_SETMASK, &caller_mask);
             return Err(e);
@@ -735,7 +797,9 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
     };
     let mut retired = false;
     let piped = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
-        collect(&mut child, bounded(timeout), limit, redactor, passed, |child, _| {
+        collect(&mut child, bounded(timeout), limit, redactor, passed, |child, cut_short| {
+            // One that ended by itself keeps what it started outside its group, as before.
+            child.session &= cut_short;
             let _ = set_mask(libc::SIG_BLOCK, &held);
             retire(child, true);
             retired = true;
@@ -765,8 +829,14 @@ fn capture_with(command: &mut Command, timeout: Duration, limit: usize, redactor
 #[cfg(unix)]
 fn spawn_piped(command: &mut Command) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    spawn_leading(command)
+}
+
+/// [`spawn_piped`] for a command [`own_session`] prepared, which leads its group already.
+#[cfg(unix)]
+fn spawn_leading(command: &mut Command) -> io::Result<Child> {
     command
-        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1401,8 +1471,10 @@ fn restore_dispositions(previous: &[(libc::c_int, libc::sigaction)]) {
 }
 
 /// Run a command on the caller's stdout and stderr until it exits or `timeout` elapses, then
-/// kill its whole process group. The command gets its own group so descendants are stopped
-/// too; it therefore cannot read the terminal (stdin is empty). Interrupt, terminate and
+/// kill its whole process group. The command gets its own group, in a session of its own, so
+/// descendants are stopped too, and when it is cut short also those that moved to another group
+/// of that session, as each `mise run` task does (see [`end_session`]); it therefore cannot
+/// read the terminal (stdin is empty). Interrupt, terminate and
 /// hangup signals stack receives meanwhile are passed on to the group, unless ignored, and the
 /// group is killed once [`CANCEL_GRACE`] passes or a second one comes.
 ///
@@ -1427,18 +1499,21 @@ pub fn run_with_deadline(command: &mut Command, timeout: Duration) -> io::Result
         held: &libc::sigset_t,
         caller_mask: libc::sigset_t,
     ) -> io::Result<(Option<i32>, bool)> {
-        command.process_group(0).stdin(Stdio::null());
+        own_session(command);
+        command.stdin(Stdio::null());
         // SAFETY: sigprocmask is async-signal-safe, as pre_exec requires.
         unsafe {
             command.pre_exec(move || os_check(libc::sigprocmask(libc::SIG_SETMASK, &caller_mask, std::ptr::null_mut())));
         }
         let (child, mut passed) = spawn_named(command, true, false, Command::spawn)?;
-        let mut child = OwnedChild::new(child);
+        let mut child = OwnedChild::leading_session(child);
         let mut watch = ExitWatch::new(&child.child);
         let waited = set_mask(libc::SIG_SETMASK, &caller_mask).and_then(|_| {
             let start = Instant::now();
             loop {
                 if exited(&child.child)? {
+                    // It ended by itself: what it started outside its group is left, as before.
+                    child.session = false;
                     break Ok(false);
                 }
                 if start.elapsed() >= timeout {
@@ -2458,6 +2533,61 @@ mod tests {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         let quick = run_detached(Command::new("sh").args(["-c", "exit 4"]), Duration::from_secs(10)).unwrap();
         assert_eq!(quick.and_then(|s| s.code()), Some(4));
+    }
+
+    /// Starts `sleep 60` twice, once moved to a process group of its own (as `mise run` moves a
+    /// task) and ignoring SIGTERM, once in a session of its own, and records their PIDs in
+    /// `$1/moved` and `$1/left`.
+    const SCATTERS: &str = r#"
+        record='echo $$ >"$1.tmp" && mv "$1.tmp" "$1"; exec sleep 60'
+        perl -e 'setpgrp(0, 0); $SIG{TERM} = "IGNORE"; exec @ARGV' sh -c "$record" sh "$1/moved" >/dev/null 2>&1 &
+        perl -MPOSIX -e 'setsid(); exec @ARGV' sh -c "$record" sh "$1/left" >/dev/null 2>&1 &
+        until [ -s "$1/moved" ] && [ -s "$1/left" ]; do sleep 0.05; done
+    "#;
+
+    /// Run [`SCATTERS`], then `then`, under each kind of deadline run; returns whether it timed
+    /// out, and the two PIDs.
+    fn scatter(deadline_run: bool, then: &str, timeout: Duration) -> (bool, u32, u32) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("{SCATTERS}\n{then}"), "sh"]).arg(dir.path());
+        let timed_out = if deadline_run {
+            run_with_deadline(&mut command, timeout).unwrap().1
+        } else {
+            capture_redacted(&mut command, timeout, 1024, None).unwrap().timed_out
+        };
+        let pid = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap().trim().parse::<u32>().unwrap();
+        (timed_out, pid("moved"), pid("left"))
+    }
+
+    #[test]
+    fn a_users_command_cut_short_ends_what_moved_to_another_group_but_not_what_left_its_session() {
+        let mut sentinel = Sentinel::start();
+        for deadline_run in [false, true] {
+            let start = Instant::now();
+            let (timed_out, moved, left) = scatter(deadline_run, "wait", Duration::from_secs(2));
+            assert!(timed_out && start.elapsed() < Duration::from_secs(8), "deadline_run={deadline_run}");
+            assert!(ends_soon(moved), "deadline_run={deadline_run}: {moved} moved to another group and survived");
+            let detached = alive(left as i32);
+            // SAFETY: kills the test's own detached sleeper.
+            unsafe { libc::kill(left as i32, libc::SIGKILL) };
+            assert!(detached, "deadline_run={deadline_run}: {left} left the session and was killed");
+        }
+        assert!(sentinel.alive(), "an unrelated process was signalled");
+    }
+
+    #[test]
+    fn a_users_command_that_ends_in_time_leaves_what_moved_to_another_group() {
+        for deadline_run in [false, true] {
+            let (timed_out, moved, left) = scatter(deadline_run, "exit 0", Duration::from_secs(30));
+            let kept = alive(moved as i32) && alive(left as i32);
+            // SAFETY: kills the test's own sleepers.
+            unsafe {
+                libc::kill(moved as i32, libc::SIGKILL);
+                libc::kill(left as i32, libc::SIGKILL);
+            }
+            assert!(!timed_out && kept, "deadline_run={deadline_run}");
+        }
     }
 
     #[test]

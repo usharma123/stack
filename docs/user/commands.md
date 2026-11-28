@@ -358,8 +358,10 @@ neither mark, and `[env]` cannot set it.
   reaching another server. `--require <service>` or `--require-all` refuses to run instead
   (`service_unavailable`). Repeat `--require` for several services (`--require postgres
   --require redis`); `--require postgres,redis` names one service called `postgres,redis`.
-- `--timeout` counts from the call. When it expires the command's process group is killed and
-  Stack exits 124 (`timed_out`).
+- `--timeout` counts from the call. When it expires the command is killed with everything it
+  started that is still in its session, whatever process group that moved to (mise gives each
+  task its own), and Stack exits 124 (`timed_out`). What called `setsid` to outlive the command
+  (a daemon, a `stack up` service) is left running.
 - Several `exec` calls in one checkout plan at the same time, so a test runner that fans out
   does not queue behind itself. `up`, `restart`, `down`, `compile` and `gc` still run alone:
   they wait for commands that are being planned, and new ones wait for them. `run`, and `exec`
