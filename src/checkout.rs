@@ -134,7 +134,7 @@ impl Recorded {
         }
         match self.device {
             None => Self { device: previous.device, location: previous.location.clone() },
-            Some(device) if previous.device.map_or(true, |d| d == device) => Self { location: previous.location.clone(), ..self },
+            Some(device) if previous.device.is_none_or(|d| d == device) => Self { location: previous.location.clone(), ..self },
             Some(_) => self,
         }
     }

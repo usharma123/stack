@@ -242,7 +242,7 @@ fn validate(name: &str, args: &Value) -> Result<serde_json::Map<String, Value>> 
         }
     }
     for key in schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-        if args.get(key).map_or(true, Value::is_null) {
+        if args.get(key).is_none_or(Value::is_null) {
             return Err(usage(format!("`{key}` is required")));
         }
     }
@@ -698,7 +698,7 @@ fn needs_roots(profile: Profile, params: &Value) -> bool {
     if !profile.offers(name) {
         return false;
     }
-    validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").map_or(true, Value::is_null) && !machine_wide(name, &Value::Object(args)))
+    validate(name, &params["arguments"]).is_ok_and(|args| args.get("dir").is_none_or(Value::is_null) && !machine_wide(name, &Value::Object(args)))
 }
 
 /// The checkout a call will act on, for running calls on one checkout one at a time; `None`
@@ -1165,7 +1165,7 @@ mod tests {
             None => true,
         };
         let required = schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).all(|k| value.get(k).is_some());
-        let properties = schema["properties"].as_object().into_iter().flatten().all(|(k, s)| value.get(k).map_or(true, |v| fits(v, s)));
+        let properties = schema["properties"].as_object().into_iter().flatten().all(|(k, s)| value.get(k).is_none_or(|v| fits(v, s)));
         typed && required && properties
     }
 

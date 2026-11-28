@@ -380,7 +380,7 @@ impl Recipe {
         if tests::INSTALLS_SETTLED.with(|s| s.get()) {
             return true;
         }
-        self.newest.map_or(true, |at| SystemTime::now().duration_since(at).is_ok_and(|age| age >= SETTLE))
+        self.newest.is_none_or(|at| SystemTime::now().duration_since(at).is_ok_and(|age| age >= SETTLE))
     }
 }
 

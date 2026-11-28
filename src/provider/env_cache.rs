@@ -179,7 +179,7 @@ pub fn remember(caller: &Caller, state: &Path, root: &Path, pins: &[Pin], pendin
         }
     }
     let Some((digest, newest)) = snapshot(&watched) else { return };
-    let settled = pending.asked_at.checked_sub(SETTLE).is_some_and(|limit| newest.map_or(true, |n| n < limit));
+    let settled = pending.asked_at.checked_sub(SETTLE).is_some_and(|limit| newest.is_none_or(|n| n < limit));
     if !settled || self::key(caller, root, pins).as_deref() != Some(key.as_str()) {
         return;
     }
@@ -249,7 +249,7 @@ fn child_env(caller: &Caller, root: &Path) -> std::collections::BTreeMap<OsStrin
         .0
         .iter()
         .filter(|(k, _)| {
-            k.to_str().map_or(true, |k| !super::mise::config_key(k) && k != super::mise::OWNER_VAR && k != super::mise::BINDING_VAR)
+            k.to_str().is_none_or(|k| !super::mise::config_key(k) && k != super::mise::OWNER_VAR && k != super::mise::BINDING_VAR)
         })
         .cloned()
         .collect();
@@ -441,7 +441,7 @@ fn eligible(root: &Path, pins: &[Pin]) -> Option<Eligible> {
             }
             continue;
         }
-        if !v.as_str().is_some_and(|v| !v.contains('$')) {
+        if v.as_str().is_none_or(|v| v.contains('$')) {
             return None;
         }
     }

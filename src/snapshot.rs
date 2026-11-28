@@ -650,7 +650,7 @@ fn data_dir(ctx: &Ctx, statuses: &[DaemonStatus], service: &str) -> Result<DataD
         }
         // Nothing there yet: it may be created, at the place the record says.
         Found::Gone | Found::Unbound(_) if absent => {
-            let location = datadirs::locate(&dir).0.filter(|l| entry.location.as_ref().map_or(true, |r| r == l)).ok_or_else(|| {
+            let location = datadirs::locate(&dir).0.filter(|l| entry.location.as_ref().is_none_or(|r| r == l)).ok_or_else(|| {
                 failed(format!("{} no longer resolves where Stack recorded it", dir.display())).hint(rerun)
             })?;
             if !marked(fs::read(session::data_marker(&dir)).ok()) {

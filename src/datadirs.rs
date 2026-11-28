@@ -252,7 +252,7 @@ impl Rebind<'_> {
             && entry.dir == self.dir
             && entry.checkout == checkout
             && entry.location.as_deref().map_or(self.from.is_none(), |l| l == self.location)
-            && (entry.identity == Some(self.to) || self.from.map_or(true, |from| entry.identity == Some(from)))
+            && (entry.identity == Some(self.to) || self.from.is_none_or(|from| entry.identity == Some(from)))
     }
 }
 

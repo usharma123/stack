@@ -899,7 +899,7 @@ struct Named {
 #[cfg(unix)]
 impl Named {
     fn received(&self, arrival: u64, signal: libc::c_int) -> bool {
-        self.since < arrival && self.until.map_or(true, |until| arrival <= until) && (!self.leader || signal == libc::SIGTERM)
+        self.since < arrival && self.until.is_none_or(|until| arrival <= until) && (!self.leader || signal == libc::SIGTERM)
     }
 }
 
@@ -1319,7 +1319,7 @@ fn retire(child: &mut OwnedChild, cut_short: bool) {
 #[cfg(unix)]
 fn forget_settled(registry: &mut Registry) {
     let handled = HANDLED.load(std::sync::atomic::Ordering::SeqCst);
-    registry.commands.retain(|c| c.held || c.until.map_or(true, |until| until > handled));
+    registry.commands.retain(|c| c.held || c.until.is_none_or(|until| until > handled));
 }
 
 /// The signals `run_with_deadline` and `output` pass on to their command.

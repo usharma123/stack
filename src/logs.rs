@@ -101,7 +101,7 @@ impl Cursor {
 }
 
 fn unhex(text: &str) -> Option<String> {
-    if text.is_empty() || text.len() % 2 != 0 {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
     }
     let bytes: Option<Vec<u8>> = (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect();
@@ -237,7 +237,7 @@ fn after(ctx: &Ctx, service: &str, pos: LogPos, q: &Query) -> Result<LogsReport>
             (at, more) = (Some(i.checked_sub(1).map_or(pos, |last| read.ends[last])), true);
             break;
         }
-        if from.map_or(true, |f| record.at_ms >= f) && q.matches(&record.line) {
+        if from.is_none_or(|f| record.at_ms >= f) && q.matches(&record.line) {
             lines.push(record.line);
             stamps.push(record.at_ms);
         }

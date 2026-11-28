@@ -93,7 +93,7 @@ fn valid_platform(name: &str) -> bool {
     let (Some(os), Some(arch)) = (parts.next(), parts.next()) else { return false };
     matches!(os, "linux" | "macos" | "windows" | "android")
         && matches!(arch, "x64" | "arm64" | "x86" | "loongarch64" | "riscv64")
-        && parts.next().map_or(true, |q| matches!(q, "gnu" | "glibc" | "musl" | "msvc" | "baseline" | "musl-baseline"))
+        && parts.next().is_none_or(|q| matches!(q, "gnu" | "glibc" | "musl" | "msvc" | "baseline" | "musl-baseline"))
 }
 
 /// The C library of a Linux machine, as mise decides it.
@@ -982,7 +982,7 @@ fn restricted(tool: &str, entry: &Table, platforms: &[String]) -> Table {
     let backend = str_field(entry, "backend");
     entry
         .iter()
-        .filter(|(k, _)| k.strip_prefix(PLATFORM_PREFIX).map_or(true, |p| requested(backend, tool, p, platforms)))
+        .filter(|(k, _)| k.strip_prefix(PLATFORM_PREFIX).is_none_or(|p| requested(backend, tool, p, platforms)))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -1343,7 +1343,7 @@ impl Merge<'_> {
                 if fs.is_empty() || has_platforms {
                     let kept: Table = c
                         .iter()
-                        .filter(|(k, _)| k.strip_prefix(PLATFORM_PREFIX).map_or(true, |p| !covered(p)))
+                        .filter(|(k, _)| k.strip_prefix(PLATFORM_PREFIX).is_none_or(|p| !covered(p)))
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     let platforms: Vec<String> = platform_tables(&kept).map(|(p, _)| p.to_string()).collect();

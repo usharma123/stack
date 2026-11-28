@@ -694,7 +694,7 @@ pub fn apply(dir: &Path, change: impl FnOnce(&mut Spec)) -> Result<State> {
             return Ok(now);
         }
         // A supervisor exiting as the change was written never sees it: start another once.
-        if !alive(&now) && !respawned && spawned_at.map_or(true, |at| at.elapsed() > Duration::from_millis(500)) {
+        if !alive(&now) && !respawned && spawned_at.is_none_or(|at| at.elapsed() > Duration::from_millis(500)) {
             if now.applied >= spec.revision {
                 return Ok(now);
             }
@@ -1020,7 +1020,7 @@ fn wait_gone_with(dir: &Path, names: Option<&[String]>, accounted: Option<&Expec
         let left: Vec<serde_json::Value> = state
             .services
             .iter()
-            .filter(|(n, _)| names.map_or(true, |names| names.contains(n)))
+            .filter(|(n, _)| names.is_none_or(|names| names.contains(n)))
             .filter_map(|(n, i)| i.live().map(|p| serde_json::json!({ "service": n, "pid": p.pid })))
             .collect();
         let supervisor = names.is_none() && alive(&state);
@@ -1655,7 +1655,7 @@ fn tail_within(dir: &Path, service: &str, tail: usize, since: Option<u64>, limit
     let cut = chunks.last().is_some_and(|(_, cut)| *cut) || (budget == 0 && chunks.len() == 1);
     let mut records: Vec<Record> = Vec::new();
     for (text, _) in chunks.iter().rev() {
-        records.extend(text.lines().map(Record::parse).filter(|r| since.map_or(true, |at| r.at_ms >= at)));
+        records.extend(text.lines().map(Record::parse).filter(|r| since.is_none_or(|at| r.at_ms >= at)));
     }
     let truncated = cut && records.len() <= tail;
     let skip = records.len().saturating_sub(tail);
@@ -2965,7 +2965,7 @@ pub fn pinned_path(path: &str, tool: &str, version: &str) -> String {
     if !dirs.iter().any(|d| release(d).as_deref() == Some(version)) {
         return path.to_string();
     }
-    let (mine, rest): (Vec<PathBuf>, Vec<PathBuf>) = dirs.into_iter().filter(|d| release(d).map_or(true, |v| v == version)).partition(|d| release(d).is_some());
+    let (mine, rest): (Vec<PathBuf>, Vec<PathBuf>) = dirs.into_iter().filter(|d| release(d).is_none_or(|v| v == version)).partition(|d| release(d).is_some());
     std::env::join_paths(mine.into_iter().chain(rest)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
 }
 

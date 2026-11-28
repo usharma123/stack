@@ -150,7 +150,7 @@ impl Observer for Terminal {
 
 /// Colour only on a terminal, and never when `NO_COLOR` is set to anything non-empty.
 pub fn color_allowed() -> bool {
-    std::env::var_os("NO_COLOR").map_or(true, |v| v.is_empty()) && std::io::stderr().is_terminal()
+    std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()) && std::io::stderr().is_terminal()
 }
 
 #[cfg(test)]

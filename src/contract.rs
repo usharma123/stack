@@ -107,7 +107,7 @@ pub fn passed(command: &str, data: &Value) -> bool {
         "status" if data["passed"].is_boolean() => data["passed"] == true,
         "status" => data["healthy"] == true || data["started"] == false,
         // A fleet down counts the checkouts that failed; one checkout's down fails as an error.
-        "down" => data["failed"].as_u64().map_or(true, |failed| failed == 0),
+        "down" => data["failed"].as_u64().is_none_or(|failed| failed == 0),
         _ => true,
     }
 }
